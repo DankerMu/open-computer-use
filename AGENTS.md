@@ -31,7 +31,7 @@
 | --- | --- |
 | Unit tests (no Docker) | `uv run --no-project --with pytest --with-requirements computer-use-server/requirements.txt -- python -m pytest tests/ -q --import-mode=importlib --ignore=tests/integration` |
 | Integration tests (Docker daemon required) | same command without `--ignore=tests/integration` |
-| Structure and hygiene scripts | `./tests/test-no-corporate.sh`, `./tests/test-project-structure.sh` |
+| Structure check | `./tests/test-project-structure.sh` (`test-no-corporate.sh` named in `tests/README.md` does not exist at `7318b2e`) |
 | Docker image (always amd64) | `docker build --platform linux/amd64 -t open-computer-use:latest .` |
 | Install commit hooks (once per clone) | `uvx pre-commit install --hook-type pre-commit --hook-type commit-msg` |
 
