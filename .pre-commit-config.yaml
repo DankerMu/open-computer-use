@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# Installed by `uvx pre-commit install --hook-type pre-commit --hook-type commit-msg`.
+# Mirrors the sibling open-webui-ocu control plane (Plan 1, AGENTS.md § Enforcement):
+# naming/scratchpad guard, hygiene, secrets, commit message. No linter here — the
+# upstream OCU codebase has no ruff config and this fork must not rewrite it.
+repos:
+  - repo: local
+    hooks:
+      - id: code-canonicality-naming
+        name: Code canonicality — naming and scratchpad guard
+        entry: bash .git-hooks/check-naming.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: conventional-commit-msg
+        name: Conventional Commits
+        entry: bash .git-hooks/commit-msg
+        language: system
+        stages: [commit-msg]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

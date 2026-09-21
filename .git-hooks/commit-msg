@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+# .git-hooks/commit-msg — Conventional Commits guard (AGENTS.md § Conventions).
+# Wired via .pre-commit-config.yaml (stages: [commit-msg]).
+set -euo pipefail
+msg_file="${1:?commit message file required}"
+subject="$(sed -n '1p' "$msg_file")"
+case "$subject" in Merge\ *|Revert\ *|fixup!*|squash!*) exit 0 ;; esac
+if ! printf '%s' "$subject" | grep -Eq '^(feat|fix|refactor|chore|docs|test|ci|build|perf)(\([a-z0-9._/-]+\))?!?: .{1,72}$'; then
+  cat <<'EOF2'
+Commit message must use Conventional Commits:
+  type(scope): Subject under 72 chars
+
+Allowed types: feat, fix, refactor, chore, docs, test, ci, build, perf
+Example: feat(ocu): add workspace describe route
+EOF2
+  exit 1
+fi
