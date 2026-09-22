@@ -200,13 +200,13 @@ All settings via `.env`:
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | — | LLM API key (any OpenAI-compatible) |
 | `OPENAI_API_BASE_URL` | — | Custom API base URL (OpenRouter, etc.) |
-| `OCU_INTERNAL_TOKEN` | — | **Required** service credential; provide it to both `computer-use-server` and `open-webui`. The tool reads the Open WebUI process environment on every call, using REST Bearer and MCP `X-OCU-Internal-Token`; it is not a Valve. |
+| `OCU_INTERNAL_TOKEN` | — | **Required** service credential; provide it to both `computer-use-server` and `open-webui`. The tool and filter read the Open WebUI process environment on every call; the filter uses REST Bearer, while MCP uses `X-OCU-Internal-Token`. It is not a Valve. |
 | `MCP_API_KEY` | — | Optional second MCP Bearer credential; when configured it is required in addition to `OCU_INTERNAL_TOKEN` |
 | `DOCKER_IMAGE` | `open-computer-use:latest` | Sandbox container image |
 | `COMMAND_TIMEOUT` | `120` | Bash tool timeout (seconds) |
 | `SUB_AGENT_TIMEOUT` | `3600` | Sub-agent timeout (seconds) |
 | `SINGLE_USER_MODE` | — | Tool-level fallback only; protected entrypoints still require an explicit non-default chat ID |
-| `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-reachable URL of the Computer Use server. Baked into `/system-prompt` and returned to the Open WebUI filter in the `X-Public-Base-URL` response header — **single source of truth** for the public URL. [Open WebUI filter URL requirements](docs/openwebui-filter.md#two-url-roles--public-server-env-and-internal-filtertool-valve). |
+| `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-facing base of the Computer Use server. Baked into `/system-prompt` and returned to the Open WebUI filter in the `X-Public-Base-URL` response header — **single source of truth** for the public URL. It accepts an absolute `http(s)` base (for example `https://cu.example.com/ocu`) or root-relative `/ocu`; a configured value must not end with `/`. [Open WebUI filter URL requirements](docs/openwebui-filter.md#two-url-roles--public-server-env-and-internal-filtertool-valve). |
 | `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS`, `ORCHESTRATOR_URL`, `TOOL_RESULT_MAX_CHARS`, `TOOL_RESULT_PREVIEW_CHARS` | — | Settings on the **`open-webui` container** (not CU-server). Required when embedding — see [Required setup when embedding Open WebUI](#required-setup-when-embedding-open-webui-into-your-own-stack). |
 | `POSTGRES_PASSWORD` | `openwebui` | PostgreSQL password |
 | `VISION_API_KEY` | — | Vision API key (for describe-image) |
@@ -272,7 +272,7 @@ If you run Open WebUI separately, you need to manually:
 
 1. Go to **Workspace > Tools** → Create new tool → paste contents of `openwebui/tools/computer_use_tools.py`
 2. Set **Tool ID** to `ai_computer_use` (required for filter to work)
-3. Configure the `ORCHESTRATOR_URL` Valve to the internal URL of your Computer Use Server (`http://computer-use-server:8081` for Docker compose), and make `OCU_INTERNAL_TOKEN` available to the Open WebUI server process. The tool reads it on every call; it is not a Valve or tool argument.
+3. Configure the Tool and Filter `ORCHESTRATOR_URL` Valves to the internal URL of your Computer Use Server (`http://computer-use-server:8081` for Docker compose), and make `OCU_INTERNAL_TOKEN` available to the Open WebUI server process. Both read it on every call; it is not a Valve or argument.
 4. Open the tool's **⋯ → Share** menu and set access to **Public** (grants read to both `group:*` and `user:*` wildcards) — otherwise only your admin account sees the tool and non-admin users get an empty tool list with no error
 5. Go to **Workspace > Functions** → Create new function → paste `openwebui/functions/computer_link_filter.py`
 6. Enable the filter: toggle **Active** *and* toggle **Global** in the Functions list — these are two separate switches, and active-but-not-global means the filter loads but is never applied to chats
@@ -295,16 +295,15 @@ skipped all of them. Those patches are gone. Three of the problems they addresse
 since been fixed upstream; the rest live as source commits in a fork, which is a
 separate concern from running this integration.
 
-Preview URL detection needs no build-time host configuration either — the iframe origin
-is read from the URL the model wrote, which comes from the server's `PUBLIC_BASE_URL`.
+Concrete file links need no build-time host configuration: the filter uses the public base from the server's `X-Public-Base-URL` response header.
 
 #### Step 3 — Two URL settings, two roles (public vs internal)
 
-**v4.0.0:** the old "three `FILE_SERVER_URL` places that must match" footgun is gone. There are now only **two** places and **two** distinct roles — public (browser-reachable) vs internal (Docker-local). The `COMPUTER_USE_SERVER_URL` build-arg was removed in v0.9.2.0 — `fix_preview_url_detection` is now host-agnostic (see Step 2).
+**v4.0.0:** the old "three `FILE_SERVER_URL` places that must match" footgun is gone. There are now only two places and two distinct roles — public (browser-reachable) versus internal (Docker-local).
 
 | Where | Role | Who reads it | Prod (with domain) | Local dev (Docker Desktop) |
 |-------|------|-------------|--------------------|----------------------------|
-| `PUBLIC_BASE_URL` env on the **`computer-use-server`** container (`docker-compose.yml` / `.env`) | **PUBLIC** — baked into `/system-prompt` links + returned to filter via `X-Public-Base-URL` response header | Server (single source of truth for public URL) | `https://cu.your-domain.com` | `http://localhost:8081` |
+| `PUBLIC_BASE_URL` env on the **`computer-use-server`** container (`docker-compose.yml` / `.env`) | **PUBLIC** — baked into `/system-prompt` links + returned to filter via `X-Public-Base-URL` response header | Server (single source of truth for public URL) | `https://cu.your-domain.com/ocu` or `/ocu` (no trailing `/`) | `http://localhost:8081` |
 | Filter + Tool Valves `ORCHESTRATOR_URL` (seeded by `init.sh` from `ORCHESTRATOR_URL` env on the open-webui container) | **INTERNAL** — server↔server fetch of `/system-prompt`; MCP `tools/call` forwarding | Filter and tool (Docker network) | `http://computer-use-server:8081` | `http://computer-use-server:8081` |
 
 ⚠️ **Do NOT point `ORCHESTRATOR_URL` at your public domain.** It technically works, but every MCP request then goes browser→CDN→Traefik→container. Any hiccup in that chain kills the stream mid-tool-call and the user sees `MCP call failed: Session terminated`. Stay inside the Docker network.
@@ -377,7 +376,8 @@ docker exec open-webui env | grep -E 'CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS|TOO
 
 # 5. Server env (baked into system prompt AND returned to filter via header):
 docker exec computer-use-server env | grep ^PUBLIC_BASE_URL=
-# → must be a URL your browser can reach (e.g. http://localhost:8081 for local dev).
+# → must be a browser-reachable URL without a trailing `/` (for example
+#   http://localhost:8081 for local development).
 
 # 7. Filter is ACTIVE *and* GLOBAL (see Step 5):
 docker exec <postgres-container> psql -U openwebui -d openwebui -c \

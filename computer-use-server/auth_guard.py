@@ -52,6 +52,10 @@ def _is_http_safe_credential(value: str) -> bool:
 
 def startup_preflight() -> int:
     """Return 0 when startup config is usable, else 1. Never serves traffic."""
+    from docker_manager import validate_public_base_url
+
+    if validate_public_base_url():
+        return 1
     token = os.environ.get("OCU_INTERNAL_TOKEN", "")
     if not _is_http_safe_credential(token):
         print(

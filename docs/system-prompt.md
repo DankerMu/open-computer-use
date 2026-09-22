@@ -75,7 +75,7 @@ X-Chat-Id | X-OpenWebUI-Chat-Id   > ?chat_id=           > "default"
 X-User-Email | X-OpenWebUI-User-Email > ?user_email=   > None
 ```
 
-Header-priority rule consistent with the rest of the server (MCP middleware reads the same headers and aliases). Response header `X-Public-Base-URL` is still emitted so the filter's `outlet()` can build browser-facing archive/preview URLs from the server-owned `PUBLIC_BASE_URL`.
+Header-priority rule consistent with the rest of the server (MCP middleware reads the same headers and aliases). Response header `X-Public-Base-URL` is still emitted so the filter's `outlet()` can build browser-facing concrete-file and archive links from the server-owned `PUBLIC_BASE_URL`.
 
 ## Render cache
 

@@ -3,66 +3,31 @@
 """
 title: Computer Use Filter
 author: Open Computer Use Contributors
-version: 4.1.0
+version: 5.0.0
 required_open_webui_version: 0.5.17
-description: HTTP-fetches Computer Use system prompt from orchestrator, with LRU cache and stale-cache fallback. outlet() decorates assistant messages with a preview button and/or archive button based on PREVIEW_MODE and ARCHIVE_BUTTON Valves. The inline-iframe artifact is no longer emitted — the frontend fix_preview_url_detection patch promotes the preview URL into an artifact on its own.
+description: Authenticated HTTP-fetches the Computer Use system prompt from the internal orchestrator, with an LRU cache for transient failures. outlet() decorates assistant messages with a concrete-file preview link and optional archive link.
 
 This filter works in conjunction with Computer Use Tools (computer_use_tools.py).
 
 FUNCTIONALITY:
 - inlet(): When tool "ai_computer_use" is active and chat_id is present, fetches the
-  fully-baked system prompt from the orchestrator's /system-prompt endpoint (server
-  substitutes {file_base_url}, {archive_url}, {chat_id} and assembles <available_skills>)
-  and injects it into the system message. Cache: 5-minute TTL, max 100 entries,
-  O(1) LRU eviction. On fetch failure: serve stale cache if present; else skip injection.
-  The server returns its public URL in the X-Public-Base-URL response header; inlet()
-  caches it alongside the prompt so outlet() can decorate with browser-facing links.
-- outlet(): Decorates assistant messages whose content contains either a file URL for
-  the current chat_id OR a <details type="tool_calls"> block that references a browser
-  tool (playwright, chromium, screenshot, start-browser). Decoration is driven by two
-  Valves: PREVIEW_MODE ("button" | "off", default "button") and
-  ARCHIVE_BUTTON ("on" | "off", default "on"). All decorations are idempotent (substring
-  guarded) and scoped to the current chat_id. Archive button also requires a file URL.
+  fully-baked system prompt from the orchestrator's /system-prompt endpoint using the
+  process OCU_INTERNAL_TOKEN as Bearer authentication. It derives user_email only from
+  injected __user__, requires the X-Public-Base-URL response header, and caches that
+  header with the prompt per chat/user and current credential/orchestrator authority.
+  Transient transport failures may use a stale same-authority cache entry; missing
+  credentials, authorization failures, redirects, and missing public metadata skip
+  injection.
+- outlet(): Decorates assistant messages only when they contain a concrete file URL for
+  the current chat under the cached public base. PREVIEW_MODE="button" appends one
+  markdown link to the first matching file URL; ARCHIVE_BUTTON="on" appends the
+  current-chat archive link. Both decorations are idempotent.
 
-CHANGELOG (v4.1.0) — BREAKING:
-- Removed PREVIEW_MODE="artifact" / "both". outlet() no longer emits a fenced
-  ```html <iframe src="..."> block. The frontend fix_preview_url_detection patch
-  already promotes any /preview/ URL in message text into an inline artifact, so
-  the extra html block was redundant and, worse, suppressed the patch (its guard
-  `!htmlGroups.some(o=>o.html)` fails when the block is present, leaving the
-  iframe rendered as a raw code fence in chat). Only "button" and "off" remain;
-  "button" is the new default. Matches the internal prod behaviour (v3.8.0).
-
-CHANGELOG (v4.0.0) — BREAKING:
-- Removed FILE_SERVER_URL and SYSTEM_PROMPT_URL Valves. Replaced with a single
-  ORCHESTRATOR_URL Valve (internal URL, default "http://computer-use-server:8081").
-  The public URL is now owned by the server (PUBLIC_BASE_URL env) and delivered to
-  the filter via the X-Public-Base-URL response header on /system-prompt, so the
-  filter never needs to know the browser-facing URL.
-- _fetch_system_prompt() signature changed: now returns tuple[public_url, prompt]
-  instead of just prompt. outlet() reads the cached public_url when decorating.
-- Valves seeded via Open WebUI admin UI or init.sh with the new ORCHESTRATOR_URL
-  name; saved FILE_SERVER_URL / SYSTEM_PROMPT_URL values from earlier versions are
-  ignored and the default is used instead — re-seed after upgrade.
-
-CHANGELOG (v3.4.0):
-- Removed legacy v3.2.0 boolean Valves (ENABLE_PREVIEW_ARTIFACT,
-  ENABLE_PREVIEW_BUTTON, ENABLE_ARCHIVE_BUTTON) and their @model_validator bridge.
-
-CHANGELOG (v3.3.0):
-- Collapsed three boolean preview/archive Valves into two Literal Valves
-  (PREVIEW_MODE, ARCHIVE_BUTTON).
-
-CHANGELOG (v3.2.0):
-- Added ENABLE_PREVIEW_ARTIFACT Valve — outlet() emits an inline iframe artifact.
-- Added ENABLE_PREVIEW_BUTTON Valve — opt-in markdown button fallback.
-
-CHANGELOG (v3.1.0):
-- Removed hardcoded system prompt; server is now the single source of truth.
-- HTTP fetch + OrderedDict LRU cache + stale-cache fallback.
-
-CHANGELOG (v3.0.2):
-- Previous version with hardcoded prompt; see git history for details.
+Security:
+- OCU_INTERNAL_TOKEN is read from the Open WebUI process environment at request time.
+  It is not a Valve, browser payload field, result, or log value.
+- Redirects are rejected by the filter before a Bearer credential can leave the
+  configured orchestrator origin.
 
     VALVES:
         ORCHESTRATOR_URL (str, default "http://computer-use-server:8081"):
@@ -80,22 +45,19 @@ CHANGELOG (v3.0.2):
             If False, inlet() skips system-prompt injection entirely (useful when
             another filter owns the prompt).
         PREVIEW_MODE (Literal["button","off"], default "button"):
-            Where the preview link appears on assistant messages.
-            - "button": markdown [{PREVIEW_BUTTON_TEXT}]({public}/preview/{chat_id}).
-              The fix_preview_url_detection frontend patch detects this URL in
-              message text and auto-opens it as an inline artifact — no fenced
-              html block needed. Works on both patched and stock Open WebUI
-              (stock renders a clickable link; patched renders inline artifact).
-            - "off": no preview link.
+            Whether to append a markdown [{PREVIEW_BUTTON_TEXT}]({public}/files/{chat_id}/{file})
+            link for the first current-chat concrete file URL. "off" emits no preview
+            link.
         ARCHIVE_BUTTON (Literal["on","off"], default "on"):
             Append a markdown [{ARCHIVE_BUTTON_TEXT}]({public}/files/{chat_id}/archive)
-            link to assistant messages that contain files for the current chat_id.
+            link when a current-chat concrete file URL is present.
         PREVIEW_BUTTON_TEXT (str, default "🖥️ Open preview"):
             Label for the preview-button markdown link.
         ARCHIVE_BUTTON_TEXT (str, default "📦 Download all files as archive"):
             Label for the archive-download markdown link.
 """
 
+import os
 import re
 import time
 import urllib.error
@@ -135,51 +97,103 @@ def _find_block_start(content: str, pos: int) -> int:
     return boundary + 2 if boundary != -1 else 0
 
 
-# Open WebUI renders tool invocations into assistant content as
-# <details type="tool_calls" ... name="X" arguments="Y" result="Z" ...>.
-# The /api/chat/completed endpoint strips raw `tool_calls` / role="tool"
-# (Chat.svelte sends only {id, role, content, info, timestamp, usage, sources}),
-# so content-scan is the only reliable detection path in outlet() for sessions
-# that exercised browser tools without producing file URLs.
-_TOOL_CALL_DETAILS_RE = re.compile(
-    r'<details\s+[^>]*type="tool_calls"[^>]*>',
-    re.IGNORECASE,
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before authenticated headers can leave the configured origin."""
+
+    def redirect_request(self, request, response, code, message, headers, _new_url):
+        raise urllib.error.HTTPError(
+            request.full_url, code, "redirect blocked", headers, response
+        )
+
+
+_URL_RE = re.compile(
+    r"""
+    \]\(
+        (?:
+            <(?P<markdown_angle_url>[^\s<>]+)>
+            |(?P<markdown_url>[^\s()<>]+)
+        )
+    \)
+    |<(?P<angle_url>[^\s<>]+)>
+    |(?P<absolute_url>https?://[^\s<>\]\)"']+)
+    |(?P<root_relative_url>(?<![A-Za-z0-9._~%/@:+?&=;/\]\)"'-])/[^\s<>\]\)"']+)
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
-_NAME_ATTR_RE = re.compile(r'\bname="([^"]*)"')
-_ARGS_ATTR_RE = re.compile(r'\barguments="([^"]*)"')
-_BROWSER_TOOL_KEYWORDS = ("playwright", "start-browser", "chromium", "screenshot")
+_BARE_URL_TRAILING_SENTENCE_PUNCTUATION_RE = re.compile(r"[.,;:!?]+$")
 
 
-def _extract_tool_calls_from_content(content: str) -> list[tuple[str, str]]:
-    """Return [(name, arguments_raw), ...] from <details type="tool_calls"> tags.
-
-    Attribute values are html-escaped as delivered by Open WebUI; substring
-    keyword matching is robust to that — no need to unescape for detection.
-    """
-    if not content:
-        return []
-    out: list[tuple[str, str]] = []
-    for m in _TOOL_CALL_DETAILS_RE.finditer(content):
-        tag = m.group(0)
-        n = _NAME_ATTR_RE.search(tag)
-        a = _ARGS_ATTR_RE.search(tag)
-        out.append((n.group(1) if n else "", a.group(1) if a else ""))
-    return out
+def _url_candidate(match: re.Match[str]) -> str:
+    """Keep explicit destinations literal; trim sentence punctuation from prose."""
+    explicit_candidate = (
+        match.group("markdown_angle_url")
+        or match.group("markdown_url")
+        or match.group("angle_url")
+    )
+    if explicit_candidate is not None:
+        return explicit_candidate
+    return _BARE_URL_TRAILING_SENTENCE_PUNCTUATION_RE.sub(
+        "",
+        match.group("absolute_url") or match.group("root_relative_url") or "",
+    )
 
 
-def _content_has_browser_tool(content: str) -> bool:
-    """True when the assistant message embeds a tool_calls details block that
-    references a browser tool (playwright, chromium, screenshot, start-browser).
+def _is_http_safe_credential(value: str) -> bool:
+    return bool(value) and all(0x21 <= ord(character) <= 0x7E for character in value)
 
-    Scoped to <details type="tool_calls"> tags — free text in user/assistant
-    messages is never scanned, so keyword mentions ("how does playwright work?")
-    do not trigger a false positive.
-    """
-    for name, args in _extract_tool_calls_from_content(content):
-        blob = (name + " " + args).lower()
-        if any(kw in blob for kw in _BROWSER_TOOL_KEYWORDS):
-            return True
-    return False
+
+def _first_current_chat_file_url(
+    content: str, public_url: str, chat_id: str
+) -> Optional[str]:
+    """Return the first current-chat file URL, trimming bare sentence punctuation."""
+    try:
+        public_parts = urllib.parse.urlsplit(public_url)
+    except ValueError:
+        return None
+
+    is_root_relative_base = (
+        public_url.startswith("/")
+        and not public_url.startswith("//")
+        and not public_parts.scheme
+        and not public_parts.netloc
+    )
+    is_absolute_base = (
+        public_parts.scheme in ("http", "https") and bool(public_parts.netloc)
+    )
+    if not (is_root_relative_base or is_absolute_base):
+        return None
+
+    base_path = public_parts.path
+    file_prefix = f"{base_path}/files/{chat_id}/"
+    archive_path = f"{base_path}/files/{chat_id}/archive"
+    for match in _URL_RE.finditer(content):
+        candidate = _url_candidate(match)
+        try:
+            parts = urllib.parse.urlsplit(candidate)
+        except ValueError:
+            continue
+
+        if is_root_relative_base:
+            matches_base = (
+                candidate.startswith("/")
+                and not candidate.startswith("//")
+                and not parts.scheme
+                and not parts.netloc
+            )
+        else:
+            matches_base = (
+                parts.scheme == public_parts.scheme
+                and parts.netloc == public_parts.netloc
+            )
+
+        if (
+            matches_base
+            and parts.path.startswith(file_prefix)
+            and parts.path != archive_path
+            and parts.path[len(file_prefix):]
+        ):
+            return candidate
+    return None
 
 
 class Filter:
@@ -194,116 +208,125 @@ class Filter:
         )
         PREVIEW_MODE: Literal["button", "off"] = Field(
             default="button",
-            description="Where the preview link appears on assistant messages. button=markdown link (the fix_preview_url_detection frontend patch turns it into an inline artifact on patched builds; stock Open WebUI shows it as a clickable link). off=no preview link.",
+            description="Where the preview link appears on assistant messages. button=markdown link to the first concrete current-chat file. off=no preview link.",
         )
         ARCHIVE_BUTTON: Literal["on", "off"] = Field(
             default="on",
-            description="Append a 'Download all files as archive' link to assistant messages that contain files.",
+            description="Append a 'Download all files as archive' link when a concrete current-chat file is present.",
         )
         PREVIEW_BUTTON_TEXT: str = Field(
             default="🖥️ Open preview",
-            description="Text for the preview-button markdown link (used when PREVIEW_MODE is 'button').",
+            description="Text for the concrete-file preview markdown link.",
         )
         ARCHIVE_BUTTON_TEXT: str = Field(
             default="📦 Download all files as archive",
-            description="Text for the archive-download button (when ARCHIVE_BUTTON is on).",
+            description="Text for the archive-download markdown link.",
         )
 
     def __init__(self):
         self.valves = self.Valves()
-        # Per-(chat, user) LRU cache: (chat_id, user_email) -> (fetched_at, (public_url, prompt))
-        # - Keyed by user identity because the server bakes a user-specific <available_skills>
-        #   block — sharing across users would leak skills and break correctness.
-        # - Value is a tuple so outlet() can read the public URL (from the server's
-        #   X-Public-Base-URL response header) without its own URL Valve.
+        self._no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
+        # Per-(chat, user) LRU cache: (chat_id, user_email) ->
+        # (fetched_at, (public_url, prompt)). Its authority records the normalized
+        # internal origin and current process credential that produced every entry.
         self._prompt_cache: OrderedDict[
             tuple[str, str], tuple[float, tuple[str, str]]
         ] = OrderedDict()
+        self._cache_authority: Optional[tuple[str, str]] = None
 
-    def _fetch_system_prompt(
-        self, chat_id: str, user_email: str = ""
-    ) -> Optional[tuple[str, str]]:
-        """
-        Fetch system prompt from the orchestrator with per-(chat, user) caching.
+    def _configured_authority(self) -> Optional[tuple[str, str]]:
+        token = os.environ.get("OCU_INTERNAL_TOKEN", "")
+        if not _is_http_safe_credential(token):
+            self._prompt_cache.clear()
+            self._cache_authority = None
+            print("[ComputerUseFilter] OCU_INTERNAL_TOKEN is unavailable; skipping system prompt")
+            return None
 
-        Returns (public_url, prompt) on success, or the cached value on stale-cache
-        fallback if the fetch failed but a previous entry exists. Returns None when
-        the cache is cold AND the server is unreachable — caller must skip injection.
-
-        The public_url comes from the server's X-Public-Base-URL response header
-        (PUBLIC_BASE_URL env on the server). outlet() uses it to build browser-facing
-        preview/archive links. Fallback: if the header is absent (older server), the
-        ORCHESTRATOR_URL Valve is reused — only correct for bare-metal/co-located
-        deploys where internal == public.
-        """
-        now = time.time()
-        cache_key = (chat_id, user_email)
-        cached = self._prompt_cache.get(cache_key)
-
-        # Cache hit within TTL
-        if cached and (now - cached[0]) < _PROMPT_TTL_SECONDS:
-            self._prompt_cache.move_to_end(cache_key)
-            return cached[1]
-
-        # Build URL (resolved at request time so Valves updates are honoured)
+        # ORCHESTRATOR_URL remains trailing-slash tolerant because it is an
+        # internal endpoint setting, unlike the server-owned public base.
         orchestrator = self.valves.ORCHESTRATOR_URL.rstrip("/")
-        base_url = orchestrator + "/system-prompt"
-
-        # Only http(s) is a valid orchestrator transport. Reject file://, ftp://,
-        # data://, etc. — otherwise a misconfigured Valve could read arbitrary
-        # local files through urlopen (ruff S310).
-        parsed = urllib.parse.urlparse(base_url)
-        if parsed.scheme not in ("http", "https"):
+        parsed = urllib.parse.urlparse(orchestrator)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            self._prompt_cache.clear()
+            self._cache_authority = None
             print(
                 f"[ComputerUseFilter] Unsupported orchestrator URL scheme: "
                 f"{parsed.scheme!r} (expected http/https)"
             )
-            return cached[1] if cached else None
+            return None
+
+        authority = (orchestrator, token)
+        if self._cache_authority is not None and self._cache_authority != authority:
+            self._prompt_cache.clear()
+        self._cache_authority = authority
+        return authority
+
+    def _fetch_system_prompt(
+        self, chat_id: str, user_email: str = ""
+    ) -> Optional[tuple[str, str]]:
+        """Fetch an authorized prompt, retaining stale data only for transport failures."""
+        authority = self._configured_authority()
+        if authority is None:
+            return None
+        orchestrator, token = authority
+        now = time.time()
+        cache_key = (chat_id, user_email)
+        cached = self._prompt_cache.get(cache_key)
+
+        if cached and (now - cached[0]) < _PROMPT_TTL_SECONDS:
+            self._prompt_cache.move_to_end(cache_key)
+            return cached[1]
 
         params = {}
         if chat_id:
             params["chat_id"] = chat_id
         if user_email:
             params["user_email"] = user_email
-        url = base_url + ("?" + urllib.parse.urlencode(params) if params else "")
+        url = orchestrator + "/system-prompt"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
 
         try:
             req = urllib.request.Request(url, method="GET")
             req.add_header("Accept", "text/plain")
-            with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 — scheme validated above
+            req.add_header("Authorization", f"Bearer {token}")
+            with self._no_redirect_opener.open(req, timeout=10) as resp:  # noqa: S310
                 prompt = resp.read().decode("utf-8")
-                # X-Public-Base-URL header tells outlet() which URL to put in
-                # browser-facing iframe/archive links. When the header is
-                # missing (older server), fall back to the internal Valve —
-                # this is only correct when ORCHESTRATOR_URL == public URL
-                # (bare-metal co-located deploy).
-                public_url = (
-                    resp.headers.get("X-Public-Base-URL") or orchestrator
+                public_url = resp.headers.get("X-Public-Base-URL")
+            if not public_url:
+                self._prompt_cache.clear()
+                print(
+                    "[ComputerUseFilter] System prompt response omitted "
+                    "X-Public-Base-URL"
                 )
-                public_url = public_url.rstrip("/")
+                return None
 
             entry = (public_url, prompt)
-            # Cache the ready-to-use (public_url, prompt) pair
             self._prompt_cache[cache_key] = (now, entry)
             self._prompt_cache.move_to_end(cache_key)
-
-            # Evict oldest entry when over capacity (O(1) with OrderedDict)
             while len(self._prompt_cache) > _PROMPT_CACHE_MAX_SIZE:
                 self._prompt_cache.popitem(last=False)
-
             return entry
 
-        except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as e:
-            # Narrow to real transport/decoding failures. Broader Exception
-            # would swallow configuration bugs (e.g. attribute errors on the
-            # Valves model) behind the stale-cache fallback and make them
-            # invisible (ruff BLE001).
-            print(f"[ComputerUseFilter] Failed to fetch system prompt: {e}")
-            # Stale-cache fallback (any age) when available
-            if cached:
-                return cached[1]
-            # Cold cache + server down -> caller skips injection
-            return None
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403) or 300 <= error.code < 400:
+                self._prompt_cache.clear()
+                print(
+                    f"[ComputerUseFilter] System prompt request rejected "
+                    f"(HTTP {error.code})"
+                )
+                return None
+            print(
+                f"[ComputerUseFilter] Failed to fetch system prompt: "
+                f"HTTP {error.code}"
+            )
+        except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as error:
+            print(
+                f"[ComputerUseFilter] Failed to fetch system prompt: "
+                f"{type(error).__name__}"
+            )
+
+        return cached[1] if cached else None
 
     def inlet(
         self,
@@ -327,7 +350,7 @@ class Filter:
 
         fetched = self._fetch_system_prompt(chat_id, user_email)
         if not fetched:
-            # Cold cache + server down -> skip injection (same no-op path as missing chat_id)
+            # Unavailable, unauthorized, or incomplete prompt metadata leaves the body unchanged.
             return body
         _public_url, system_prompt = fetched
 
@@ -385,45 +408,16 @@ class Filter:
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ) -> dict:
-        """Append preview button and/or archive button to assistant messages with file links.
-
-        - PREVIEW_MODE="button" (default): markdown link to the preview page. The
-          frontend fix_preview_url_detection patch rewrites this URL into an inline
-          artifact; stock Open WebUI leaves it as a plain clickable link.
-        - PREVIEW_MODE="off":      no preview link.
-        - ARCHIVE_BUTTON="on" (default): markdown link to the archive endpoint (only when files exist).
-
-        The public URL used in browser-facing links comes from the cached
-        X-Public-Base-URL response header captured by inlet()/_fetch_system_prompt().
-        If no cache entry exists (outlet without prior inlet, e.g. re-render of an
-        old message after server restart), decoration is skipped — broken links are
-        worse than no links.
-
-        Invariants:
-        1. Only role=="assistant" messages are touched.
-        2. Non-string content is skipped.
-        3. file_url_pattern is scoped to the current chat_id (no cross-chat decoration).
-        4. public_url is rstripped before URL construction (no //preview/ or //files/).
-        5. Substring-based idempotency — repeated outlet() calls do not duplicate.
-        """
+        """Append concrete-file preview and archive links to assistant messages."""
         wants_button = self.valves.PREVIEW_MODE == "button"
         wants_archive = self.valves.ARCHIVE_BUTTON == "on"
-
         if not (wants_button or wants_archive):
             return body
 
         chat_id = __metadata__.get("chat_id") if __metadata__ else None
-        if not chat_id:
+        if not chat_id or self._configured_authority() is None:
             return body
 
-        # Pull the public URL from cache (populated by inlet() via the server's
-        # X-Public-Base-URL header). outlet() may run on re-renders where
-        # __user__ isn't passed, so the email-keyed cache entry inlet() wrote
-        # isn't directly reachable. Probe the exact (chat_id, user_email) and
-        # (chat_id, "") keys first, then fall back to ANY same-chat entry —
-        # outlet only needs public_url, not the prompt, so borrowing a URL
-        # from a different user's entry for the same chat is safe (public_url
-        # is chat-independent — it comes from the server's PUBLIC_BASE_URL env).
         user_email = __user__.get("email", "") if __user__ else ""
         cached = self._prompt_cache.get((chat_id, user_email)) or self._prompt_cache.get(
             (chat_id, "")
@@ -434,26 +428,14 @@ class Filter:
                     cached = entry
                     break
         if not cached:
-            # Cold-cache fallback: an Open WebUI restart wipes self._prompt_cache,
-            # and a re-render of an old assistant message can hit outlet() without
-            # inlet() running first (no new user message → no inlet pass). Rather
-            # than silently dropping preview/archive buttons, re-fetch from the
-            # orchestrator. This re-uses _fetch_system_prompt's own stale-cache
-            # fallback and url-scheme validation. Still respects the "broken links
-            # are worse than no links" invariant: if the server is unreachable AND
-            # we have no stale entry, _fetch_system_prompt returns None and we
-            # skip decoration.
             cached_pair = self._fetch_system_prompt(chat_id, user_email)
             if not cached_pair:
                 return body
             public_url, _prompt = cached_pair
         else:
             public_url, _prompt = cached[1]
-        base = public_url.rstrip("/")
-        file_url_pattern = re.escape(base) + r"/files/" + re.escape(chat_id) + r"/[^\s\)]+"
-        preview_url = f"{base}/preview/{chat_id}"
-        archive_url = f"{base}/files/{chat_id}/archive"
 
+        archive_url = f"{public_url}/files/{chat_id}/archive"
         for message in body.get("messages", []):
             if message.get("role") != "assistant":
                 continue
@@ -461,27 +443,17 @@ class Filter:
             if not content or not isinstance(content, str):
                 continue
 
-            # Two independent triggers:
-            # 1. A file URL scoped to the current chat_id — legacy v3.2.0 path.
-            # 2. A <details type="tool_calls"> block that references a browser
-            #    tool — covers sessions that exercised playwright/chromium
-            #    without producing a downloadable file (e.g. pure navigation).
-            has_file_link = bool(re.search(file_url_pattern, content))
-            has_browser_tool = _content_has_browser_tool(content)
-            if not (has_file_link or has_browser_tool):
+            file_url = _first_current_chat_file_url(content, public_url, chat_id)
+            if not file_url:
                 continue
 
             links: list[str] = []
-            if wants_button and preview_url not in content:
-                links.append(f"[{self.valves.PREVIEW_BUTTON_TEXT}]({preview_url})")
-            # Archive download only makes sense when files actually exist for
-            # this chat — gate it on has_file_link, not on the browser-tool
-            # trigger.
-            if wants_archive and has_file_link and archive_url not in content:
+            preview_link = f"[{self.valves.PREVIEW_BUTTON_TEXT}]({file_url})"
+            if wants_button and preview_link not in content:
+                links.append(preview_link)
+            if wants_archive and archive_url not in content:
                 links.append(f"[{self.valves.ARCHIVE_BUTTON_TEXT}]({archive_url})")
             if links:
-                content += "\n\n" + "\n".join(links)
-
-            message["content"] = content
+                message["content"] = content + "\n\n" + "\n".join(links)
 
         return body
