@@ -5,8 +5,8 @@ title: Computer Use Tools
 author: OpenWebUI Implementation
 version: 4.0.0
 
-Thin MCP client proxy to computer-use-orchestrator. All config lives server-side.
-Only ORCHESTRATOR_URL + MCP_API_KEY needed — everything else is auto.
+Thin MCP client proxy to computer-use-orchestrator. All tool configuration is server-side.
+ORCHESTRATOR_URL and optional MCP_API_KEY are Valves; OCU_INTERNAL_TOKEN is read from the process environment per call.
 
 Container naming: owui-chat-{chat_id}
 
@@ -53,6 +53,32 @@ def _looks_like_error(s: str) -> bool:
         return False
     return any(s.startswith(p) for p in _ERROR_PREFIXES)
 
+def _is_http_safe_credential(value: object) -> bool:
+    """Match the service guard's credential format without exposing a value."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and all(0x21 <= ord(character) <= 0x7E for character in value)
+    )
+
+
+def _is_transmittable_mcp_api_key(value: object) -> bool:
+    """Allow header-safe MCP keys without imposing the internal-token policy."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and all(character == "\t" or 0x20 <= ord(character) <= 0x7E for character in value)
+    )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before authenticated probe headers leave the configured origin."""
+
+    def redirect_request(self, request, response, code, message, headers, _new_url):
+        raise urllib.error.HTTPError(
+            request.full_url, code, "redirect blocked", headers, response
+        )
+
 
 # ============================================================================
 # MCP Streamable HTTP Client
@@ -67,12 +93,18 @@ class _MCPClient:
     _HEALTH_TTL_SECONDS = 30.0
     _HEALTH_TIMEOUT_SECONDS = 3.0
 
-    def __init__(self, orchestrator_url: str, mcp_api_key: str = ""):
+    def __init__(
+        self, orchestrator_url: str, mcp_api_key: str = "", internal_token: str = ""
+    ):
         base = orchestrator_url.rstrip("/")
         self.base_url = base
         self.mcp_url = f"{base}/mcp"
         self.health_url = f"{base}/health"
         self.api_key = mcp_api_key
+        self.internal_token = internal_token
+        self._no_redirect_opener = urllib.request.build_opener(
+            _NoRedirectHandler()
+        )
         # (checked_at, ok, err_str) — None on cold start.
         self._last_health: Optional[tuple] = None
 
@@ -113,14 +145,20 @@ class _MCPClient:
     def _http_probe_get(self, url: str) -> tuple[bool, str]:
         """GET probe with the standard error-message normalization."""
         try:
-            req = urllib.request.Request(url, method="GET")
-            if self.api_key:
-                req.add_header("Authorization", f"Bearer {self.api_key}")
-            with urllib.request.urlopen(req, timeout=self._HEALTH_TIMEOUT_SECONDS) as resp:
+            req = urllib.request.Request(
+                url,
+                method="GET",
+                headers={"Authorization": f"Bearer {self.internal_token}"},
+            )
+            with self._no_redirect_opener.open(
+                req, timeout=self._HEALTH_TIMEOUT_SECONDS
+            ) as resp:
                 if 200 <= resp.status < 300:
                     return True, ""
                 return False, f"HTTP {resp.status}"
         except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                return False, f"redirect blocked (HTTP {e.code})"
             return False, f"HTTP {e.code}: {e.reason}"
         except urllib.error.URLError as e:
             return False, f"{type(e).__name__}: {getattr(e, 'reason', e)}"
@@ -137,25 +175,28 @@ class _MCPClient:
             b'"clientInfo":{"name":"preflight","version":"1.0"}}}'
         )
         req = urllib.request.Request(
-            self.mcp_url, method="POST", data=body,
+            self.mcp_url,
+            method="POST",
+            data=body,
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
                 "X-Chat-Id": "preflight",
+                "X-OCU-Internal-Token": self.internal_token,
             },
         )
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
         try:
-            with urllib.request.urlopen(req, timeout=self._HEALTH_TIMEOUT_SECONDS) as resp:
+            with self._no_redirect_opener.open(
+                req, timeout=self._HEALTH_TIMEOUT_SECONDS
+            ) as resp:
                 if 200 <= resp.status < 300:
                     return True, ""
                 return False, f"HTTP {resp.status}"
         except urllib.error.HTTPError as e:
-            # 401/403 means the endpoint is up — auth is mismatched, not a
-            # broken server. That's surface-able by the actual MCP call later.
-            if e.code in (401, 403):
-                return True, ""
+            if 300 <= e.code < 400:
+                return False, f"redirect blocked (HTTP {e.code})"
             return False, f"HTTP {e.code}: {e.reason}"
         except urllib.error.URLError as e:
             return False, f"{type(e).__name__}: {getattr(e, 'reason', e)}"
@@ -164,6 +205,22 @@ class _MCPClient:
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
+    def _redirect_error_message(self, detail: str) -> str:
+        return (
+            "[CONFIG ERROR] Computer Use rejected an HTTP redirect.\n"
+            f"  Pre-flight: {detail}\n"
+            "  ORCHESTRATOR_URL must be a direct internal endpoint; "
+            "authenticated redirects are not followed."
+        )
+
+    def _authentication_error_message(self, detail: str) -> str:
+        return (
+            "[CONFIG ERROR] Computer Use authorization pre-flight was rejected.\n"
+            f"  Pre-flight: {detail}\n"
+            "  Verify OCU_INTERNAL_TOKEN matches the Computer Use server and "
+            "MCP_API_KEY matches when that optional credential is configured."
+        )
+
     def _config_error_message(self, err: str) -> str:
         """Build the [CONFIG ERROR] string the AI receives when /health fails.
 
@@ -171,6 +228,14 @@ class _MCPClient:
         chat) and to a downstream AI model that sees the tool result. It
         names the URL it tried, the underlying error, the most likely fix,
         and how to verify."""
+        if "redirect blocked" in err:
+            return self._redirect_error_message(err)
+        if err.startswith((
+            "POST /mcp -> HTTP 401",
+            "POST /mcp -> HTTP 403",
+        )):
+            return self._authentication_error_message(err)
+
         return (
             f"[CONFIG ERROR] Cannot use computer-use-server at {self.base_url}.\n"
             f"  Pre-flight: {err}\n"
@@ -194,7 +259,10 @@ class _MCPClient:
         user_name: str = "",
     ) -> dict:
         """Build HTTP headers — only per-request user context."""
-        headers = {"X-Chat-Id": chat_id}
+        headers = {
+            "X-Chat-Id": chat_id,
+            "X-OCU-Internal-Token": self.internal_token,
+        }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         if user_email:
@@ -213,15 +281,44 @@ class _MCPClient:
                 self.url = url
                 self.headers = headers
                 self.timeout = timeout
+                self.redirect_status = None
                 self._transport_cm = None
                 self._session_cm = None
                 self._session = None
+
+            async def _record_response(self, response):
+                if 300 <= response.status_code < 400:
+                    self.redirect_status = response.status_code
+
+            def _httpx_client_factory(self, headers=None, timeout=None, auth=None):
+                import httpx
+                from mcp.shared._httpx_utils import (
+                    MCP_DEFAULT_SSE_READ_TIMEOUT,
+                    MCP_DEFAULT_TIMEOUT,
+                )
+
+                if timeout is None:
+                    timeout = httpx.Timeout(
+                        MCP_DEFAULT_TIMEOUT,
+                        read=MCP_DEFAULT_SSE_READ_TIMEOUT,
+                    )
+                client_kwargs = {
+                    "follow_redirects": False,
+                    "timeout": timeout,
+                    "event_hooks": {"response": [self._record_response]},
+                }
+                if headers is not None:
+                    client_kwargs["headers"] = headers
+                if auth is not None:
+                    client_kwargs["auth"] = auth
+                return httpx.AsyncClient(**client_kwargs)
 
             async def __aenter__(self):
                 self._transport_cm = streamablehttp_client(
                     self.url,
                     headers=self.headers,
                     sse_read_timeout=timedelta(seconds=self.timeout + 60),
+                    httpx_client_factory=self._httpx_client_factory,
                 )
                 read, write, _ = await self._transport_cm.__aenter__()
                 self._session_cm = ClientSession(read, write)
@@ -291,8 +388,10 @@ class _MCPClient:
                 except Exception:
                     pass
 
+        session_context = self._create_session(headers, timeout)
+
         async def _execute():
-            async with self._create_session(headers, timeout) as session:
+            async with session_context as session:
                 result = await session.call_tool(
                     tool_name, arguments,
                     progress_callback=on_progress,
@@ -301,7 +400,19 @@ class _MCPClient:
                 return self._extract_text(result)
 
         try:
-            return await asyncio.wait_for(_execute(), timeout=timeout + 60)
+            try:
+                return await asyncio.wait_for(_execute(), timeout=timeout + 60)
+            except asyncio.CancelledError:
+                if session_context.redirect_status is None:
+                    raise
+            except Exception:
+                if session_context.redirect_status is None:
+                    raise
+            self._last_health = None
+            await _emit_error("Computer Use endpoint redirected request")
+            return self._redirect_error_message(
+                f"HTTP {session_context.redirect_status}"
+            )
         except asyncio.TimeoutError:
             await _emit_error(f"Timeout after {timeout}s")
             return (
@@ -473,18 +584,21 @@ class Tools:
         self.file_handler = True
         self.citation = True
         self._mcp_client = None
-        # Track the (url, api_key) tuple the current client was built for —
-        # invalidate if either changes so edits to MCP_API_KEY in Valves take
-        # effect without a process restart.
-        self._mcp_client_config: tuple[str, str] | None = None
+        # Track the URL, current environment credential, and MCP Valve credential
+        # used to construct the current client. A configuration change takes effect
+        # on the next tool call without a restart.
+        self._mcp_client_config: tuple[str, str, str] | None = None
 
     @property
     def mcp_client(self) -> _MCPClient:
-        """Lazy MCP client — recreated when valves change."""
+        """Lazy MCP client — recreated when configuration changes."""
         url = self.valves.ORCHESTRATOR_URL
-        config = (url, self.valves.MCP_API_KEY)
+        internal_token = os.environ.get("OCU_INTERNAL_TOKEN", "")
+        config = (url, internal_token, self.valves.MCP_API_KEY)
         if self._mcp_client is None or self._mcp_client_config != config:
-            self._mcp_client = _MCPClient(url, self.valves.MCP_API_KEY)
+            self._mcp_client = _MCPClient(
+                url, self.valves.MCP_API_KEY, internal_token
+            )
             self._mcp_client_config = config
             print(f"[MCP] Client initialized: {self._mcp_client.mcp_url}")
         return self._mcp_client
@@ -493,10 +607,55 @@ class Tools:
     # Helpers
     # =========================================================================
 
+    def _configuration_error(self) -> Optional[str]:
+        internal_token = os.environ.get("OCU_INTERNAL_TOKEN", "")
+        if not _is_http_safe_credential(internal_token):
+            return (
+                "[CONFIG ERROR] OCU_INTERNAL_TOKEN must be a non-empty "
+                "HTTP-safe server credential."
+            )
+        api_key = self.valves.MCP_API_KEY
+        if api_key not in (None, "") and not _is_transmittable_mcp_api_key(api_key):
+            return (
+                "[CONFIG ERROR] MCP_API_KEY must be empty or safely "
+                "transmittable as an HTTP header."
+            )
+        return None
+
+    def _call_error(self, chat_id: object) -> Optional[str]:
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            return "[TOOL ERROR] chat_id is required."
+        return self._configuration_error()
+
+    async def _emit_terminal_error(self, emitter, description: str) -> None:
+        if not emitter:
+            return
+        try:
+            await emitter({"type": "status", "data": {
+                "description": description, "status": "error", "done": True,
+            }})
+        except Exception:
+            pass
+
+    async def _prepare_tool_call(
+        self, metadata: Optional[dict], emitter
+    ) -> tuple[Optional[str], Optional[str]]:
+        chat_id = metadata.get("chat_id") if isinstance(metadata, dict) else None
+        error = self._call_error(chat_id)
+        if error:
+            description = (
+                "Chat ID is required"
+                if error.startswith("[TOOL ERROR]")
+                else "Computer Use configuration error"
+            )
+            await self._emit_terminal_error(emitter, description)
+            return None, error
+        return chat_id, None
+
     def _build_mcp_headers(self, chat_id: str, __user__: dict = None, request=None) -> dict:
-        """Build HTTP headers — per-request user context + MCP server names."""
-        user_email = __user__.get("email", "") if __user__ else ""
-        user_name = __user__.get("name", "") if __user__ else ""
+        """Build per-request MCP headers from injected server user context."""
+        user_email = __user__.get("email", "") if isinstance(__user__, dict) else ""
+        user_name = __user__.get("name", "") if isinstance(__user__, dict) else ""
         headers = self.mcp_client.build_headers(
             chat_id=chat_id,
             user_email=user_email,
@@ -521,8 +680,12 @@ class Tools:
         if __files__:
             try:
                 sync_result = await asyncio.to_thread(
-                    _sync_uploaded_files, self.valves.ORCHESTRATOR_URL, chat_id, __files__,
-                    debug=self.valves.DEBUG_LOGGING
+                    _sync_uploaded_files,
+                    self.valves.ORCHESTRATOR_URL,
+                    chat_id,
+                    __files__,
+                    os.environ.get("OCU_INTERNAL_TOKEN", ""),
+                    debug=self.valves.DEBUG_LOGGING,
                 )
                 if sync_result.get("synced", 0) > 0:
                     print(f"Synced {sync_result['synced']} file(s)")
@@ -553,17 +716,17 @@ class Tools:
         and they drifted (str_replace used `"error" in result.lower()[:20]` which
         false-positives on "errors fixed: 0", view only matched "Error:", etc).
 
-        NOTE for new tool wrappers:
-          - If your tool needs uploaded files, call `await self._sync_files_if_needed(...)`
-            BEFORE delegating here (this helper does NOT take __files__).
-          - chat_id is defaulted to "default" if empty/None — server-side
-            chat scoping needs a non-empty value.
+          - Every caller validates chat metadata before file synchronization.
         """
-        # Defense-in-depth: every per-tool wrapper already does
-        # `chat_id or "default"`, but if a future wrapper forgets, the
-        # server-side X-Chat-Id header would otherwise be empty and the
-        # MCP call would silently land in the wrong (or no) chat scope.
-        chat_id = chat_id or "default"
+        error = self._call_error(chat_id)
+        if error:
+            description = (
+                "Chat ID is required"
+                if error.startswith("[TOOL ERROR]")
+                else "Computer Use configuration error"
+            )
+            await self._emit_terminal_error(emitter, description)
+            return error
 
         async def emit(description: str, status: str, done: bool):
             if not emitter:
@@ -610,7 +773,9 @@ class Tools:
         :param description: Why I'm running this command
         :return: Command output (stdout/stderr)
         """
-        chat_id = (__metadata__.get("chat_id") if __metadata__ else None) or "default"
+        chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
+        if error:
+            return error
         await self._sync_files_if_needed(chat_id, command, __files__)
         return await self._run_tool(
             "bash_tool", {"command": command, "description": description},
@@ -640,7 +805,9 @@ class Tools:
         :param path: Path to the file to edit
         :return: Success message or error
         """
-        chat_id = (__metadata__.get("chat_id") if __metadata__ else None) or "default"
+        chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
+        if error:
+            return error
         if old_str == new_str:
             return "Error: old_str and new_str are identical."
         return await self._run_tool(
@@ -669,7 +836,9 @@ class Tools:
         :param path: Path to the file to create
         :return: Success message or error
         """
-        chat_id = (__metadata__.get("chat_id") if __metadata__ else None) or "default"
+        chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
+        if error:
+            return error
         return await self._run_tool(
             "create_file", {"description": description, "file_text": file_text, "path": path},
             chat_id, __event_emitter__, __request__, __user__,
@@ -696,7 +865,9 @@ class Tools:
         :param view_range: Optional [start_line, end_line]. Use [start, -1] for to-end.
         :return: File contents, directory listing, or error message
         """
-        chat_id = (__metadata__.get("chat_id") if __metadata__ else None) or "default"
+        chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
+        if error:
+            return error
         await self._sync_files_if_needed(chat_id, path, __files__)
         args = {"description": description, "path": path}
         if view_range:
@@ -735,7 +906,9 @@ class Tools:
         :param resume_session_id: Session ID to resume (from previous result)
         :return: Sub-agent's response with results, cost, turn count, session_id
         """
-        chat_id = (__metadata__.get("chat_id") if __metadata__ else None) or "default"
+        chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
+        if error:
+            return error
         if __files__:
             await self._sync_files_if_needed(chat_id, "/mnt/user-data/uploads", __files__)
         args = {
@@ -757,7 +930,13 @@ class Tools:
 # File sync helper (HTTP — no SSH needed)
 # ============================================================================
 
-def _sync_uploaded_files(orchestrator_url: str, chat_id: str, files: list, debug: bool = False) -> dict:
+def _sync_uploaded_files(
+    orchestrator_url: str,
+    chat_id: str,
+    files: list,
+    internal_token: str,
+    debug: bool = False,
+) -> dict:
     """Sync uploaded files from OpenWebUI to computer-use-orchestrator via HTTP."""
     import requests
     import hashlib
@@ -765,9 +944,16 @@ def _sync_uploaded_files(orchestrator_url: str, chat_id: str, files: list, debug
     if not files:
         return {"synced": 0, "skipped": 0, "errors": 0}
 
+    headers = {"Authorization": f"Bearer {internal_token}"}
     try:
         manifest_url = f"{orchestrator_url}/api/uploads/{chat_id}/manifest"
-        response = requests.get(manifest_url, timeout=5)
+        response = requests.get(
+            manifest_url, headers=headers, timeout=5, allow_redirects=False
+        )
+        if 300 <= response.status_code < 400:
+            raise requests.HTTPError(
+                f"redirect blocked (HTTP {response.status_code})"
+            )
         response.raise_for_status()
         remote_manifest = response.json()
     except Exception:
@@ -813,7 +999,17 @@ def _sync_uploaded_files(orchestrator_url: str, chat_id: str, files: list, debug
             upload_url = f"{orchestrator_url}/api/uploads/{chat_id}/{filename}"
             with open(source_path, "rb") as f:
                 files_data = {"file": (filename, f, "application/octet-stream")}
-                resp = requests.post(upload_url, files=files_data, timeout=30)
+                resp = requests.post(
+                    upload_url,
+                    files=files_data,
+                    headers=headers,
+                    timeout=30,
+                    allow_redirects=False,
+                )
+                if 300 <= resp.status_code < 400:
+                    raise requests.HTTPError(
+                        f"redirect blocked (HTTP {resp.status_code})"
+                    )
                 resp.raise_for_status()
             synced += 1
         except Exception:

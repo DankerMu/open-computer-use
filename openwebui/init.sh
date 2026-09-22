@@ -8,11 +8,13 @@
 # subsequent container starts so user edits in the Open WebUI admin UI are
 # never clobbered on restart.
 #
-# Valves are env-seeded on FIRST boot only. The only env that propagates into
-# Valves is ORCHESTRATOR_URL (internal URL, consumed by both the tool and the
-# filter). PUBLIC_BASE_URL lives on the computer-use-server container and
-# requires a server restart, not a Valve re-seed. To force a Valve re-seed
-# (e.g. after changing ORCHESTRATOR_URL in .env), delete the marker file and
+# Valves are env-seeded on FIRST boot only. ORCHESTRATOR_URL is persisted into
+# the Tool and Filter Valves; MCP_API_KEY is persisted only into the Tool Valve.
+# OCU_INTERNAL_TOKEN stays in the Open WebUI server environment and the Tool reads
+# it directly on every call; it is not a Valve and this script never writes it to
+# the persistent Valve payload. PUBLIC_BASE_URL lives on the computer-use-server
+# container. To force an ORCHESTRATOR_URL Valve re-seed (e.g. after changing it
+# in .env), delete the marker file and
 # restart this container:
 #
 #   docker compose -f docker-compose.webui.yml exec open-webui \
@@ -29,6 +31,7 @@ ADMIN_NAME="${ADMIN_NAME:-Admin}"
 # the open-webui container. Seeded into both Tool and Filter Valves. The public
 # URL (browser-facing) is NOT set here — it lives only on the server as the
 # PUBLIC_BASE_URL env var and is delivered to the filter via response header.
+# OCU_INTERNAL_TOKEN remains an environment-only tool credential, read on every call.
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://computer-use-server:8081}"
 MCP_API_KEY="${MCP_API_KEY:-}"
 MARKER_FILE="/app/backend/data/.computer-use-initialized"
@@ -39,13 +42,13 @@ if [[ "$ADMIN_PASSWORD" == "admin" || "$ADMIN_PASSWORD" == "change-me" ]]; then
     echo "[init] WARNING: ADMIN_PASSWORD is still the default (\"$ADMIN_PASSWORD\") — change it for anything beyond local dev."
 fi
 if [[ -z "$MCP_API_KEY" ]]; then
-    echo "[init] WARNING: MCP_API_KEY is empty — /mcp endpoints accept any caller. Fine for local dev, unsafe for public deploys."
+    echo "[init] WARNING: MCP_API_KEY is empty — /mcp still requires OCU_INTERNAL_TOKEN, but has no second Bearer credential. Set it for defense in depth."
 fi
 
 # Skip if already initialized
 if [ -f "$MARKER_FILE" ]; then
     echo "[init] Already initialized, skipping."
-    echo "[init] To re-seed Valves from env, delete $MARKER_FILE and restart the container."
+    echo "[init] To re-seed ORCHESTRATOR_URL and MCP_API_KEY Valves from env, delete $MARKER_FILE and restart the container."
     exit 0
 fi
 
