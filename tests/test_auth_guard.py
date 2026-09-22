@@ -13,13 +13,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from urllib import error as urlerror
-from urllib import request as urlrequest
 from urllib.parse import quote
 
 import pytest
@@ -34,20 +31,12 @@ OTHER = "not-the-configured-secret"
 ORIGIN = "https://webui.example"
 
 
-def _packaged_server_command(port: int) -> str:
-    return (
-        "python -c 'import auth_guard,sys; sys.exit(auth_guard.startup_preflight())' "
-        "&& exec python -m uvicorn app:app --host 0.0.0.0 --port "
-        f"{port} --workers 2 --no-proxy-headers"
-    )
+def _subprocess_env():
+    env = os.environ.copy()
+    env["PUBLIC_BASE_URL"] = "/ocu"
+    return env
 
 
-def _unused_local_port() -> int:
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    port = listener.getsockname()[1]
-    listener.close()
-    return port
 SUBNET = "10.90.0.0/24"
 SANDBOX_PEER = "10.90.0.8"
 OUTSIDE_PEER = "10.90.1.8"
@@ -219,7 +208,7 @@ def _raw_http_response(app, path, headers, method="GET"):
 class TestStartupFailClosed:
     def test_packaged_command_without_token_parent_exits_nonzero(self):
         """The production multi-worker command itself must fail, not a child."""
-        env = os.environ.copy()
+        env = _subprocess_env()
         env.pop("OCU_INTERNAL_TOKEN", None)
         env["OCU_SANDBOX_SUBNET"] = SUBNET
         env["OCU_WEBUI_ORIGIN"] = ORIGIN
@@ -265,7 +254,7 @@ class TestStartupFailClosed:
         )
 
     def test_trailing_public_base_stops_the_packaged_parent_before_listening(self):
-        env = os.environ.copy()
+        env = _subprocess_env()
         env["OCU_INTERNAL_TOKEN"] = INTERNAL
         env["MCP_API_KEY"] = MCP_KEY
         env["OCU_SANDBOX_SUBNET"] = SUBNET
@@ -321,7 +310,7 @@ class TestStartupFailClosed:
         )
 
     def test_malformed_subnet_prevents_packaged_startup(self):
-        env = os.environ.copy()
+        env = _subprocess_env()
         env["OCU_INTERNAL_TOKEN"] = INTERNAL
         env["OCU_SANDBOX_SUBNET"] = "not-a-cidr"
         env["OCU_WEBUI_ORIGIN"] = ORIGIN
@@ -340,7 +329,7 @@ class TestStartupFailClosed:
         assert completed.returncode != 0
 
     def test_malformed_origin_prevents_packaged_startup(self):
-        env = os.environ.copy()
+        env = _subprocess_env()
         env["OCU_INTERNAL_TOKEN"] = INTERNAL
         env["OCU_WEBUI_ORIGIN"] = "webui.example"
         completed = subprocess.run(
@@ -368,7 +357,7 @@ class TestStartupFailClosed:
         ),
     )
     def test_malformed_internal_token_prevents_startup(self, token):
-        env = os.environ.copy()
+        env = _subprocess_env()
         env["OCU_INTERNAL_TOKEN"] = token
         completed = subprocess.run(
             [
@@ -386,8 +375,8 @@ class TestStartupFailClosed:
         assert "OCU_INTERNAL_TOKEN" in completed.stderr
 
 
-    def test_configured_token_preflight_succeeds(self):
-        env = os.environ.copy()
+    def test_root_relative_public_base_preflight_succeeds(self):
+        env = _subprocess_env()
         env["OCU_INTERNAL_TOKEN"] = INTERNAL
         env["OCU_SANDBOX_SUBNET"] = SUBNET
         env["OCU_WEBUI_ORIGIN"] = ORIGIN
@@ -406,7 +395,7 @@ class TestStartupFailClosed:
         assert completed.returncode == 0, completed.stderr[-500:]
 
     def test_packaged_command_with_valid_public_base_serves_guarded_prompt_and_mcp(self):
-        env = os.environ.copy()
+        env = _subprocess_env()
         env["OCU_INTERNAL_TOKEN"] = INTERNAL
         env["MCP_API_KEY"] = MCP_KEY
         env["OCU_SANDBOX_SUBNET"] = SUBNET

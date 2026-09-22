@@ -15,10 +15,10 @@
 
 | Role | Configuration | Example | Contract |
 | --- | --- | --- | --- |
-| Public browser URL | `PUBLIC_BASE_URL` on `computer-use-server` | `https://webui.example/ocu` | The server bakes this value into prompt file links and returns it in `X-Public-Base-URL`. It must be browser-reachable and must not end with `/`. |
+| Public browser base | `PUBLIC_BASE_URL` on `computer-use-server` | `https://webui.example/ocu` or `/ocu` | The server bakes this value into prompt file links and returns it in `X-Public-Base-URL`. It accepts an absolute `http(s)` base or a root-relative path, neither with a trailing `/`. |
 | Internal service URL | `ORCHESTRATOR_URL` Filter and Tool Valves | `http://computer-use-server:8081` | Open WebUI uses this only for server-to-server requests. A trailing slash is tolerated. Browsers never use it. |
 
-The public value is the proxied `/ocu` base in deployments that use that path. Remove a trailing slash before rollout: a non-empty `PUBLIC_BASE_URL` ending in `/` now stops OCU at startup instead of being normalized. Unset or empty values retain the server default. Development configurations are not required to add an `/ocu` suffix.
+`PUBLIC_BASE_URL` accepts either an absolute `http(s)` base (such as `https://webui.example/ocu`) or a root-relative browser path (`/ocu`). In either form, remove a trailing slash before rollout: a non-empty value ending in `/` stops OCU at startup instead of being normalized. Unset or empty values retain the server default. Development configurations are not required to add an `/ocu` suffix.
 
 ## Prompt retrieval and cache
 
@@ -28,7 +28,7 @@ The server response must include `X-Public-Base-URL`; the filter does not substi
 
 ## Concrete file links
 
-For each assistant message, `outlet()` finds the first URL whose origin and path match `{PUBLIC_BASE_URL}/files/{chat_id}/`. It appends the configured preview label to that exact file URL, preserving percent-encoding, query string, and fragment. The label is added at most once even when the file URL was already ordinary message text.
+For each assistant message, `outlet()` finds the first URL under `{PUBLIC_BASE_URL}/files/{chat_id}/`: an absolute base matches its exact origin and path, while a root-relative base matches only root-relative links. It appends the configured preview label to that exact file URL, preserving percent-encoding, query string, and fragment. Bare-prose sentence punctuation is excluded from the target; explicit Markdown and angle destinations remain literal. The label is added at most once even when the file URL was already ordinary message text.
 
 The archive toggle retains its separate `{PUBLIC_BASE_URL}/files/{chat_id}/archive` link. An archive endpoint is not itself a concrete file, and neither decoration is added for browser-only output, another chat, another public base, non-assistant messages, or non-string content.
 

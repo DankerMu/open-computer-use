@@ -298,6 +298,31 @@ def test_missing_public_base_header_does_not_use_internal_url(monkeypatch):
     assert len(records) == 1
 
 
+def test_missing_public_base_header_does_not_reuse_stale_prompt_or_link_metadata(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    _configure_filter_token(monkeypatch)
+    records = []
+    public_base = "https://webui.example/ocu"
+    file_url = f"{public_base}/files/abc/report.html"
+    original = f"see {file_url}"
+    with _live_asgi(_prompt_app(records, "headerless prompt", None)) as origin:
+        filter_ = _make_filter(origin)
+        filter_._prompt_cache[("abc", "")] = (
+            time.time() - computer_link_filter._PROMPT_TTL_SECONDS - 1,
+            (public_base, "stale prompt"),
+        )
+        filter_._cache_authority = (origin, "filter-test-token")
+        inlet_result = filter_.inlet(_active_body(), __metadata__={"chat_id": "abc"})
+        outlet_result = filter_.outlet(
+            {"messages": [{"role": "assistant", "content": original}]},
+            __metadata__={"chat_id": "abc"},
+        )
+
+    assert _system_content(inlet_result) == ""
+    assert outlet_result["messages"][0]["content"] == original
+    assert len(records) == 2
+
+
 def test_cache_refreshes_when_token_or_internal_origin_changes(monkeypatch):
     _disable_proxy_env(monkeypatch)
     _configure_filter_token(monkeypatch, "first-filter-token")
@@ -445,6 +470,98 @@ def test_outlet_does_not_match_foreign_public_bases_or_chats(monkeypatch):
         __metadata__={"chat_id": "abc"},
     )
     assert result["messages"][0]["content"] == original
+
+def test_outlet_supports_root_relative_public_base_without_matching_foreign_absolute_urls(monkeypatch):
+    _configure_filter_token(monkeypatch)
+    public_base = "/ocu"
+    local_file = f"{public_base}/files/abc/report.html"
+    foreign_file = "https://foreign.example/ocu/files/abc/foreign.html"
+    filter_ = _make_filter()
+    _prime_cache(filter_, "abc", public_url=public_base)
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": f"foreign {foreign_file} then local {local_file}",
+            }
+        ]
+    }
+
+    result = filter_.outlet(body, __metadata__={"chat_id": "abc"})
+    content = result["messages"][0]["content"]
+    assert f"[🖥️ Open preview]({local_file})" in content
+    assert f"[🖥️ Open preview]({foreign_file})" not in content
+    assert f"[📦 Download all files as archive]({public_base}/files/abc/archive)" in content
+
+
+def test_outlet_trims_sentence_punctuation_from_bare_file_urls(monkeypatch):
+    _configure_filter_token(monkeypatch)
+    public_base = "https://webui.example/ocu"
+    punctuated_file = f"{public_base}/files/abc/report%20final.html?download=1#section."
+    expected_file = punctuated_file[:-1]
+    filter_ = _make_filter()
+    _prime_cache(filter_, "abc", public_url=public_base)
+
+    result = filter_.outlet(
+        {"messages": [{"role": "assistant", "content": f"Finished: {punctuated_file}"}]},
+        __metadata__={"chat_id": "abc"},
+    )
+
+    content = result["messages"][0]["content"]
+    assert f"[🖥️ Open preview]({expected_file})" in content
+    assert f"[🖥️ Open preview]({punctuated_file})" not in content
+
+
+@pytest.mark.parametrize("sentence_punctuation", ("!", "?"))
+def test_outlet_trims_terminal_exclamation_and_question_marks_from_bare_file_urls(
+    monkeypatch, sentence_punctuation
+):
+    _configure_filter_token(monkeypatch)
+    public_base = "https://webui.example/ocu"
+    file_url = f"{public_base}/files/abc/report.html"
+    filter_ = _make_filter()
+    _prime_cache(filter_, "abc", public_url=public_base)
+
+    result = filter_.outlet(
+        {"messages": [{"role": "assistant", "content": f"Finished: {file_url}{sentence_punctuation}"}]},
+        __metadata__={"chat_id": "abc"},
+    )
+
+    content = result["messages"][0]["content"]
+    assert f"[🖥️ Open preview]({file_url})" in content
+    assert f"[🖥️ Open preview]({file_url}{sentence_punctuation})" not in content
+
+
+@pytest.mark.parametrize(
+    ("message_content", "literal_file"),
+    (
+        (
+            "Open [report](https://webui.example/ocu/files/abc/report.html.)",
+            "https://webui.example/ocu/files/abc/report.html.",
+        ),
+        (
+            "Open <https://webui.example/ocu/files/abc/report.html!>",
+            "https://webui.example/ocu/files/abc/report.html!",
+        ),
+        (
+            "Open [report](https://webui.example/ocu/files/abc/report.html?)",
+            "https://webui.example/ocu/files/abc/report.html?",
+        ),
+    ),
+)
+def test_outlet_preserves_trailing_punctuation_in_explicit_file_url_destinations(
+    monkeypatch, message_content, literal_file
+):
+    _configure_filter_token(monkeypatch)
+    filter_ = _make_filter()
+    _prime_cache(filter_, "abc", public_url="https://webui.example/ocu")
+
+    result = filter_.outlet(
+        {"messages": [{"role": "assistant", "content": message_content}]},
+        __metadata__={"chat_id": "abc"},
+    )
+
+    assert f"[🖥️ Open preview]({literal_file})" in result["messages"][0]["content"]
 
 class OrchestratorUrlNormalisation(unittest.TestCase):
     """ORCHESTRATOR_URL remains trailing-slash tolerant."""
@@ -746,6 +863,20 @@ class PreviewButton(unittest.TestCase):
         f.valves.PREVIEW_MODE = "off"
         body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": "abc"})
         self.assertNotIn("[🖥️ Open preview]", body["messages"][0]["content"])
+        self.assertIn(
+            "[📦 Download all files as archive](http://localhost:8081/files/abc/archive)",
+            body["messages"][0]["content"],
+        )
+
+    def test_outlet_archive_button_off_skips_archive_without_disabling_preview(self):
+        f = self._filter()
+        f.valves.ARCHIVE_BUTTON = "off"
+        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": "abc"})
+        content = body["messages"][0]["content"]
+        self.assertIn(
+            "[🖥️ Open preview](http://localhost:8081/files/abc/report.pdf)", content
+        )
+        self.assertNotIn("[📦 Download all files as archive]", content)
 
     def test_outlet_preview_button_respects_other_chat_ids(self):
         f = self._filter()

@@ -206,7 +206,7 @@ All settings via `.env`:
 | `COMMAND_TIMEOUT` | `120` | Bash tool timeout (seconds) |
 | `SUB_AGENT_TIMEOUT` | `3600` | Sub-agent timeout (seconds) |
 | `SINGLE_USER_MODE` | — | Tool-level fallback only; protected entrypoints still require an explicit non-default chat ID |
-| `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-reachable URL of the Computer Use server. Baked into `/system-prompt` and returned to the Open WebUI filter in the `X-Public-Base-URL` response header — **single source of truth** for the public URL. A configured value must not end with `/`; deployments use their proxied `/ocu` base without that trailing slash. [Open WebUI filter URL requirements](docs/openwebui-filter.md#two-url-roles--public-server-env-and-internal-filtertool-valve). |
+| `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-facing base of the Computer Use server. Baked into `/system-prompt` and returned to the Open WebUI filter in the `X-Public-Base-URL` response header — **single source of truth** for the public URL. It accepts an absolute `http(s)` base (for example `https://cu.example.com/ocu`) or root-relative `/ocu`; a configured value must not end with `/`. [Open WebUI filter URL requirements](docs/openwebui-filter.md#two-url-roles--public-server-env-and-internal-filtertool-valve). |
 | `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS`, `ORCHESTRATOR_URL`, `TOOL_RESULT_MAX_CHARS`, `TOOL_RESULT_PREVIEW_CHARS` | — | Settings on the **`open-webui` container** (not CU-server). Required when embedding — see [Required setup when embedding Open WebUI](#required-setup-when-embedding-open-webui-into-your-own-stack). |
 | `POSTGRES_PASSWORD` | `openwebui` | PostgreSQL password |
 | `VISION_API_KEY` | — | Vision API key (for describe-image) |
@@ -303,7 +303,7 @@ Concrete file links need no build-time host configuration: the filter uses the p
 
 | Where | Role | Who reads it | Prod (with domain) | Local dev (Docker Desktop) |
 |-------|------|-------------|--------------------|----------------------------|
-| `PUBLIC_BASE_URL` env on the **`computer-use-server`** container (`docker-compose.yml` / `.env`) | **PUBLIC** — baked into `/system-prompt` links + returned to filter via `X-Public-Base-URL` response header | Server (single source of truth for public URL) | `https://cu.your-domain.com/ocu` (no trailing `/`) | `http://localhost:8081` |
+| `PUBLIC_BASE_URL` env on the **`computer-use-server`** container (`docker-compose.yml` / `.env`) | **PUBLIC** — baked into `/system-prompt` links + returned to filter via `X-Public-Base-URL` response header | Server (single source of truth for public URL) | `https://cu.your-domain.com/ocu` or `/ocu` (no trailing `/`) | `http://localhost:8081` |
 | Filter + Tool Valves `ORCHESTRATOR_URL` (seeded by `init.sh` from `ORCHESTRATOR_URL` env on the open-webui container) | **INTERNAL** — server↔server fetch of `/system-prompt`; MCP `tools/call` forwarding | Filter and tool (Docker network) | `http://computer-use-server:8081` | `http://computer-use-server:8081` |
 
 ⚠️ **Do NOT point `ORCHESTRATOR_URL` at your public domain.** It technically works, but every MCP request then goes browser→CDN→Traefik→container. Any hiccup in that chain kills the stream mid-tool-call and the user sees `MCP call failed: Session terminated`. Stay inside the Docker network.

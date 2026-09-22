@@ -106,7 +106,36 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         )
 
 
-_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+")
+_URL_RE = re.compile(
+    r"""
+    \]\(
+        (?:
+            <(?P<markdown_angle_url>[^\s<>]+)>
+            |(?P<markdown_url>[^\s()<>]+)
+        )
+    \)
+    |<(?P<angle_url>[^\s<>]+)>
+    |(?P<absolute_url>https?://[^\s<>\]\)"']+)
+    |(?P<root_relative_url>(?<![A-Za-z0-9._~%/@:+?&=;/-])/[^\s<>\]\)"']+)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_BARE_URL_TRAILING_SENTENCE_PUNCTUATION_RE = re.compile(r"[.,;:!?]+$")
+
+
+def _url_candidate(match: re.Match[str]) -> str:
+    """Keep explicit destinations literal; trim sentence punctuation from prose."""
+    explicit_candidate = (
+        match.group("markdown_angle_url")
+        or match.group("markdown_url")
+        or match.group("angle_url")
+    )
+    if explicit_candidate is not None:
+        return explicit_candidate
+    return _BARE_URL_TRAILING_SENTENCE_PUNCTUATION_RE.sub(
+        "",
+        match.group("absolute_url") or match.group("root_relative_url") or "",
+    )
 
 
 def _is_http_safe_credential(value: str) -> bool:
@@ -116,26 +145,49 @@ def _is_http_safe_credential(value: str) -> bool:
 def _first_current_chat_file_url(
     content: str, public_url: str, chat_id: str
 ) -> Optional[str]:
-    """Return the first concrete current-chat file URL without normalizing it."""
+    """Return the first current-chat file URL, trimming bare sentence punctuation."""
     try:
         public_parts = urllib.parse.urlsplit(public_url)
     except ValueError:
         return None
-    if public_parts.scheme not in ("http", "https") or not public_parts.netloc:
+
+    is_root_relative_base = (
+        public_url.startswith("/")
+        and not public_url.startswith("//")
+        and not public_parts.scheme
+        and not public_parts.netloc
+    )
+    is_absolute_base = (
+        public_parts.scheme in ("http", "https") and bool(public_parts.netloc)
+    )
+    if not (is_root_relative_base or is_absolute_base):
         return None
 
     base_path = public_parts.path
     file_prefix = f"{base_path}/files/{chat_id}/"
     archive_path = f"{base_path}/files/{chat_id}/archive"
     for match in _URL_RE.finditer(content):
-        candidate = match.group(0)
+        candidate = _url_candidate(match)
         try:
             parts = urllib.parse.urlsplit(candidate)
         except ValueError:
             continue
+
+        if is_root_relative_base:
+            matches_base = (
+                candidate.startswith("/")
+                and not candidate.startswith("//")
+                and not parts.scheme
+                and not parts.netloc
+            )
+        else:
+            matches_base = (
+                parts.scheme == public_parts.scheme
+                and parts.netloc == public_parts.netloc
+            )
+
         if (
-            parts.scheme == public_parts.scheme
-            and parts.netloc == public_parts.netloc
+            matches_base
             and parts.path.startswith(file_prefix)
             and parts.path != archive_path
             and parts.path[len(file_prefix):]
