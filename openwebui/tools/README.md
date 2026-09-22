@@ -32,8 +32,8 @@ The `docker-compose.webui.yml` stack does this automatically via `init.sh`.
 
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `ORCHESTRATOR_URL` | `http://computer-use-server:8081` | Internal URL of Computer Use server (MCP endpoint + file uploads). Not browser-facing. |
-| `MCP_API_KEY` | _(empty)_ | Optional second Bearer credential for `/mcp`; it is required only when the OCU server configures it. |
+| `ORCHESTRATOR_URL` | `http://computer-use-server:8081` | Direct, non-redirecting internal URL of the Computer Use server (MCP endpoint + file uploads). Not browser-facing. |
+| `MCP_API_KEY` | _(empty)_ | Optional second Bearer credential for `/mcp`; ordinary spaces are preserved, while CR/LF and untransmittable header values are rejected. |
 | `DEBUG_LOGGING` | `false` | Verbose debug logging |
 
 `OCU_INTERNAL_TOKEN` is required in the Open WebUI server process environment. The tool reads it on every call; it is not a Valve, so browser-facing Valve schema and values never contain it.

@@ -62,6 +62,24 @@ def _is_http_safe_credential(value: object) -> bool:
     )
 
 
+def _is_transmittable_mcp_api_key(value: object) -> bool:
+    """Allow header-safe MCP keys without imposing the internal-token policy."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and all(character == "\t" or 0x20 <= ord(character) <= 0x7E for character in value)
+    )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before authenticated probe headers leave the configured origin."""
+
+    def redirect_request(self, request, response, code, message, headers, _new_url):
+        raise urllib.error.HTTPError(
+            request.full_url, code, "redirect blocked", headers, response
+        )
+
+
 # ============================================================================
 # MCP Streamable HTTP Client
 # ============================================================================
@@ -84,6 +102,9 @@ class _MCPClient:
         self.health_url = f"{base}/health"
         self.api_key = mcp_api_key
         self.internal_token = internal_token
+        self._no_redirect_opener = urllib.request.build_opener(
+            _NoRedirectHandler()
+        )
         # (checked_at, ok, err_str) — None on cold start.
         self._last_health: Optional[tuple] = None
 
@@ -129,11 +150,15 @@ class _MCPClient:
                 method="GET",
                 headers={"Authorization": f"Bearer {self.internal_token}"},
             )
-            with urllib.request.urlopen(req, timeout=self._HEALTH_TIMEOUT_SECONDS) as resp:
+            with self._no_redirect_opener.open(
+                req, timeout=self._HEALTH_TIMEOUT_SECONDS
+            ) as resp:
                 if 200 <= resp.status < 300:
                     return True, ""
                 return False, f"HTTP {resp.status}"
         except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                return False, f"redirect blocked (HTTP {e.code})"
             return False, f"HTTP {e.code}: {e.reason}"
         except urllib.error.URLError as e:
             return False, f"{type(e).__name__}: {getattr(e, 'reason', e)}"
@@ -163,15 +188,15 @@ class _MCPClient:
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
         try:
-            with urllib.request.urlopen(req, timeout=self._HEALTH_TIMEOUT_SECONDS) as resp:
+            with self._no_redirect_opener.open(
+                req, timeout=self._HEALTH_TIMEOUT_SECONDS
+            ) as resp:
                 if 200 <= resp.status < 300:
                     return True, ""
                 return False, f"HTTP {resp.status}"
         except urllib.error.HTTPError as e:
-            # 401/403 means the endpoint is up — auth is mismatched, not a
-            # broken server. That's surface-able by the actual MCP call later.
-            if e.code in (401, 403):
-                return True, ""
+            if 300 <= e.code < 400:
+                return False, f"redirect blocked (HTTP {e.code})"
             return False, f"HTTP {e.code}: {e.reason}"
         except urllib.error.URLError as e:
             return False, f"{type(e).__name__}: {getattr(e, 'reason', e)}"
@@ -180,6 +205,22 @@ class _MCPClient:
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
+    def _redirect_error_message(self, detail: str) -> str:
+        return (
+            "[CONFIG ERROR] Computer Use rejected an HTTP redirect.\n"
+            f"  Pre-flight: {detail}\n"
+            "  ORCHESTRATOR_URL must be a direct internal endpoint; "
+            "authenticated redirects are not followed."
+        )
+
+    def _authentication_error_message(self, detail: str) -> str:
+        return (
+            "[CONFIG ERROR] Computer Use authorization pre-flight was rejected.\n"
+            f"  Pre-flight: {detail}\n"
+            "  Verify OCU_INTERNAL_TOKEN matches the Computer Use server and "
+            "MCP_API_KEY matches when that optional credential is configured."
+        )
+
     def _config_error_message(self, err: str) -> str:
         """Build the [CONFIG ERROR] string the AI receives when /health fails.
 
@@ -187,6 +228,14 @@ class _MCPClient:
         chat) and to a downstream AI model that sees the tool result. It
         names the URL it tried, the underlying error, the most likely fix,
         and how to verify."""
+        if "redirect blocked" in err:
+            return self._redirect_error_message(err)
+        if err.startswith((
+            "POST /mcp -> HTTP 401",
+            "POST /mcp -> HTTP 403",
+        )):
+            return self._authentication_error_message(err)
+
         return (
             f"[CONFIG ERROR] Cannot use computer-use-server at {self.base_url}.\n"
             f"  Pre-flight: {err}\n"
@@ -232,15 +281,44 @@ class _MCPClient:
                 self.url = url
                 self.headers = headers
                 self.timeout = timeout
+                self.redirect_status = None
                 self._transport_cm = None
                 self._session_cm = None
                 self._session = None
+
+            async def _record_response(self, response):
+                if 300 <= response.status_code < 400:
+                    self.redirect_status = response.status_code
+
+            def _httpx_client_factory(self, headers=None, timeout=None, auth=None):
+                import httpx
+                from mcp.shared._httpx_utils import (
+                    MCP_DEFAULT_SSE_READ_TIMEOUT,
+                    MCP_DEFAULT_TIMEOUT,
+                )
+
+                if timeout is None:
+                    timeout = httpx.Timeout(
+                        MCP_DEFAULT_TIMEOUT,
+                        read=MCP_DEFAULT_SSE_READ_TIMEOUT,
+                    )
+                client_kwargs = {
+                    "follow_redirects": False,
+                    "timeout": timeout,
+                    "event_hooks": {"response": [self._record_response]},
+                }
+                if headers is not None:
+                    client_kwargs["headers"] = headers
+                if auth is not None:
+                    client_kwargs["auth"] = auth
+                return httpx.AsyncClient(**client_kwargs)
 
             async def __aenter__(self):
                 self._transport_cm = streamablehttp_client(
                     self.url,
                     headers=self.headers,
                     sse_read_timeout=timedelta(seconds=self.timeout + 60),
+                    httpx_client_factory=self._httpx_client_factory,
                 )
                 read, write, _ = await self._transport_cm.__aenter__()
                 self._session_cm = ClientSession(read, write)
@@ -310,8 +388,10 @@ class _MCPClient:
                 except Exception:
                     pass
 
+        session_context = self._create_session(headers, timeout)
+
         async def _execute():
-            async with self._create_session(headers, timeout) as session:
+            async with session_context as session:
                 result = await session.call_tool(
                     tool_name, arguments,
                     progress_callback=on_progress,
@@ -320,7 +400,19 @@ class _MCPClient:
                 return self._extract_text(result)
 
         try:
-            return await asyncio.wait_for(_execute(), timeout=timeout + 60)
+            try:
+                return await asyncio.wait_for(_execute(), timeout=timeout + 60)
+            except asyncio.CancelledError:
+                if session_context.redirect_status is None:
+                    raise
+            except Exception:
+                if session_context.redirect_status is None:
+                    raise
+            self._last_health = None
+            await _emit_error("Computer Use endpoint redirected request")
+            return self._redirect_error_message(
+                f"HTTP {session_context.redirect_status}"
+            )
         except asyncio.TimeoutError:
             await _emit_error(f"Timeout after {timeout}s")
             return (
@@ -523,8 +615,11 @@ class Tools:
                 "HTTP-safe server credential."
             )
         api_key = self.valves.MCP_API_KEY
-        if api_key not in (None, "") and not _is_http_safe_credential(api_key):
-            return "[CONFIG ERROR] MCP_API_KEY must be empty or an HTTP-safe server credential."
+        if api_key not in (None, "") and not _is_transmittable_mcp_api_key(api_key):
+            return (
+                "[CONFIG ERROR] MCP_API_KEY must be empty or safely "
+                "transmittable as an HTTP header."
+            )
         return None
 
     def _call_error(self, chat_id: object) -> Optional[str]:
@@ -852,7 +947,13 @@ def _sync_uploaded_files(
     headers = {"Authorization": f"Bearer {internal_token}"}
     try:
         manifest_url = f"{orchestrator_url}/api/uploads/{chat_id}/manifest"
-        response = requests.get(manifest_url, headers=headers, timeout=5)
+        response = requests.get(
+            manifest_url, headers=headers, timeout=5, allow_redirects=False
+        )
+        if 300 <= response.status_code < 400:
+            raise requests.HTTPError(
+                f"redirect blocked (HTTP {response.status_code})"
+            )
         response.raise_for_status()
         remote_manifest = response.json()
     except Exception:
@@ -898,7 +999,17 @@ def _sync_uploaded_files(
             upload_url = f"{orchestrator_url}/api/uploads/{chat_id}/{filename}"
             with open(source_path, "rb") as f:
                 files_data = {"file": (filename, f, "application/octet-stream")}
-                resp = requests.post(upload_url, files=files_data, headers=headers, timeout=30)
+                resp = requests.post(
+                    upload_url,
+                    files=files_data,
+                    headers=headers,
+                    timeout=30,
+                    allow_redirects=False,
+                )
+                if 300 <= resp.status_code < 400:
+                    raise requests.HTTPError(
+                        f"redirect blocked (HTTP {resp.status_code})"
+                    )
                 resp.raise_for_status()
             synced += 1
         except Exception:

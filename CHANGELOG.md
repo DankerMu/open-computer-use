@@ -8,9 +8,10 @@
   The Open WebUI tool reads it from its process environment on every call, never
   persists it in a Valve, sends it as REST Bearer and MCP `X-OCU-Internal-Token`
   on probes, uploads, and calls, and rejects missing chat metadata before doing
-  work. When configured,
-  `MCP_API_KEY` remains a separate MCP Bearer credential. Shared `default` and
-  temporary chat IDs are rejected at the protected boundary.
+  work. Authenticated OCU requests reject redirects. When configured,
+  `MCP_API_KEY` remains a separate MCP Bearer credential and preserves
+  server-matching ordinary spaces. Shared `default` and temporary chat IDs are
+  rejected at the protected boundary.
 
 
 - **TypeScript 7 removes the JavaScript compiler API from the sandbox image.** The

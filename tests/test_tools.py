@@ -14,7 +14,8 @@ import socket
 import threading
 import time
 import types
-from contextlib import asynccontextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import asynccontextmanager, contextmanager
 
 import pytest
 import requests
@@ -102,7 +103,9 @@ def test_empty_chat_rejects_every_public_tool_before_work(monkeypatch, method, m
 
     monkeypatch.setattr(requests, "get", blocked)
     monkeypatch.setattr(requests, "post", blocked)
-    monkeypatch.setattr(computer_use_tools.urllib.request, "urlopen", blocked)
+    monkeypatch.setattr(
+        computer_use_tools.urllib.request.OpenerDirector, "open", blocked
+    )
     tools = computer_use_tools.Tools()
     result = asyncio.run(
         _call_with_empty_chat(tools, method, metadata, lambda e: _collect(events, e))
@@ -120,7 +123,8 @@ def test_empty_chat_rejects_every_public_tool_before_work(monkeypatch, method, m
     (
         ("", "", "OCU_INTERNAL_TOKEN", None),
         ("invalid internal token", "", "OCU_INTERNAL_TOKEN", "invalid internal token"),
-        (INTERNAL_TOKEN, "invalid mcp key", "MCP_API_KEY", "invalid mcp key"),
+        (INTERNAL_TOKEN, "invalid\r\nmcp key", "MCP_API_KEY", "invalid\r\nmcp key"),
+        (INTERNAL_TOKEN, "invalid-\u2603", "MCP_API_KEY", "invalid-\u2603"),
     ),
 )
 def test_unusable_credentials_reject_before_upload_or_probe(
@@ -135,7 +139,9 @@ def test_unusable_credentials_reject_before_upload_or_probe(
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", internal)
     monkeypatch.setattr(requests, "get", blocked)
     monkeypatch.setattr(requests, "post", blocked)
-    monkeypatch.setattr(computer_use_tools.urllib.request, "urlopen", blocked)
+    monkeypatch.setattr(
+        computer_use_tools.urllib.request.OpenerDirector, "open", blocked
+    )
     tools = computer_use_tools.Tools()
     tools.valves.MCP_API_KEY = mcp_key
     result = asyncio.run(
@@ -291,6 +297,87 @@ def _disable_proxy_env(monkeypatch):
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
 
 
+class _LocalOrigin:
+    """Small real HTTP origin that records requests for redirect-boundary tests."""
+
+    def __init__(self, responder):
+        self.requests = []
+        self._responder = responder
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self._respond()
+
+            def do_POST(self):
+                self._respond()
+
+            def do_DELETE(self):
+                self._respond()
+
+            def _respond(self):
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length:
+                    self.rfile.read(content_length)
+                request = {
+                    "method": self.command,
+                    "path": self.path,
+                    "headers": {
+                        name.lower(): value for name, value in self.headers.items()
+                    },
+                }
+                owner.requests.append(request)
+                status, headers, body = owner._responder(request)
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                return
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True
+        )
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+
+@contextmanager
+def _local_origin(responder):
+    origin = _LocalOrigin(responder)
+    origin.start()
+    try:
+        yield origin
+    finally:
+        origin.stop()
+
+
+def _redirect_to(target):
+    def responder(request):
+        return 302, {"Location": f"{target.url}{request['path']}"}, b""
+
+    return responder
+
+
+def _service_unavailable(request):
+    return 503, {}, b"redirect target"
+
+
 
 def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tmp_path):
     first_token, second_token = "test-internal-one", "test-internal-two"
@@ -340,6 +427,7 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
         assert all(r["headers"].get("x-ocu-internal-token") == first_token for r in probe + first_call)
         assert all(r["headers"].get("authorization") == f"Bearer {MCP_API_KEY}" for r in probe + first_call)
         assert all(r["headers"].get("x-user-email") != "forged@example.test" for r in first_call)
+        assert all(r["headers"].get("x-chat-id") == "chat-one" for r in first_call)
         assert not _records(ocu, "/api/uploads/chat-one/existing.txt")
 
         mcp_headers = {
@@ -366,6 +454,7 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
         second_call = _records(ocu, "/mcp", **{"x-user-email": "second@example.test"})
         assert second_call
         assert all(r["headers"].get("x-ocu-internal-token") == second_token for r in second_call)
+        assert all(r["headers"].get("x-chat-id") == "chat-two" for r in second_call)
         assert len(ocu.requests) > len(first_records)
 
 
@@ -389,6 +478,172 @@ def test_tool_omits_optional_mcp_bearer_when_unconfigured(monkeypatch):
         assert calls
         assert all(r["headers"].get("x-ocu-internal-token") == INTERNAL_TOKEN for r in calls)
         assert all("authorization" not in r["headers"] for r in calls)
+
+
+def test_mcp_api_key_with_spaces_reaches_the_real_guard(monkeypatch):
+    spaced_key = "mcp key with spaces"
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", spaced_key)
+    _disable_proxy_env(monkeypatch)
+    with _with_guard({}) as ocu:
+        tools = computer_use_tools.Tools()
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        tools.valves.MCP_API_KEY = spaced_key
+        result = asyncio.run(
+            tools.bash_tool(
+                "echo spaced key",
+                "check configured key",
+                __metadata__={"chat_id": "chat-spaced-key"},
+                __user__={"email": "spaced-key@example.test"},
+            )
+        )
+
+        calls = _records(
+            ocu, "/mcp", **{"x-user-email": "spaced-key@example.test"}
+        )
+    assert "ran:echo spaced key" in result
+    assert calls
+    assert all(
+        request["headers"].get("authorization") == f"Bearer {spaced_key}"
+        for request in calls
+    )
+
+
+def test_health_redirect_does_not_leave_the_configured_origin(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    with _local_origin(_service_unavailable) as target:
+        with _local_origin(_redirect_to(target)) as origin:
+            tools = computer_use_tools.Tools()
+            tools.valves.ORCHESTRATOR_URL = origin.url
+            result = asyncio.run(
+                tools.bash_tool(
+                    "echo health redirect",
+                    "check redirect",
+                    __metadata__={"chat_id": "chat-health-redirect"},
+                )
+            )
+
+    assert target.requests == []
+    assert result.startswith("[CONFIG ERROR]")
+    assert "redirect" in result.lower()
+
+
+def test_mcp_initialize_redirect_does_not_leave_the_configured_origin(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    with _local_origin(_service_unavailable) as target:
+        def origin_response(request):
+            if request["path"] == "/health":
+                return 200, {}, b"healthy"
+            return _redirect_to(target)(request)
+
+        with _local_origin(origin_response) as origin:
+            tools = computer_use_tools.Tools()
+            tools.valves.ORCHESTRATOR_URL = origin.url
+            tools.valves.MCP_API_KEY = MCP_API_KEY
+            result = asyncio.run(
+                tools.bash_tool(
+                    "echo initialize redirect",
+                    "check redirect",
+                    __metadata__={"chat_id": "chat-initialize-redirect"},
+                )
+            )
+
+    assert target.requests == []
+    assert result.startswith("[CONFIG ERROR]")
+    assert "redirect" in result.lower()
+
+
+def test_mcp_sdk_redirect_does_not_leave_the_configured_origin(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.delenv("MCP_API_KEY", raising=False)
+    with _with_guard({}) as target:
+        def origin_response(request):
+            if request["path"] == "/health":
+                return 200, {}, b"healthy"
+            if request["headers"].get("x-chat-id") == "preflight":
+                return 200, {}, b"ready"
+            return 307, {"Location": f"{target.url}{request['path']}"}, b""
+
+        with _local_origin(origin_response) as origin:
+            client = computer_use_tools._MCPClient(
+                origin.url, MCP_API_KEY, INTERNAL_TOKEN
+            )
+            result = asyncio.run(
+                client.call_tool(
+                    "bash_tool",
+                    {"command": "echo sdk redirect", "description": "check redirect"},
+                    headers=client.build_headers("chat-sdk-redirect"),
+                    timeout=1,
+                )
+            )
+
+    assert target.requests == []
+    assert result.startswith("[CONFIG ERROR]")
+    assert "redirect" in result.lower()
+    assert INTERNAL_TOKEN not in result
+
+
+def test_upload_redirect_does_not_leave_the_configured_origin(monkeypatch, tmp_path):
+    source = tmp_path / "upload.txt"
+    source.write_text("redirect upload")
+    _install_storage(monkeypatch, {"upload-source": source})
+    _disable_proxy_env(monkeypatch)
+    with _local_origin(_service_unavailable) as target:
+        with _local_origin(_redirect_to(target)) as origin:
+            result = computer_use_tools._sync_uploaded_files(
+                origin.url,
+                "chat-upload-redirect",
+                [{"name": "upload.txt", "path": "upload-source"}],
+                INTERNAL_TOKEN,
+            )
+
+    assert target.requests == []
+    assert result == {"synced": 0, "skipped": 0, "errors": 1}
+
+
+@pytest.mark.parametrize("status", (401, 403))
+def test_mcp_preflight_auth_rejection_is_a_configuration_error(monkeypatch, status):
+    client_token = "well-formed-but-wrong-internal-token"
+    client_mcp_key = "well-formed-but-wrong-mcp-key"
+    events = []
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", client_token)
+
+    def origin_response(request):
+        if request["path"] == "/health":
+            return 200, {}, b"healthy"
+        return status, {}, b"rejected"
+
+    with _local_origin(origin_response) as origin:
+        tools = computer_use_tools.Tools()
+        tools.valves.ORCHESTRATOR_URL = origin.url
+        tools.valves.MCP_API_KEY = client_mcp_key
+        result = asyncio.run(
+            tools.bash_tool(
+                "echo rejected",
+                "check credentials",
+                __event_emitter__=lambda event: _collect(events, event),
+                __metadata__={"chat_id": "chat-credential-rejection"},
+                __user__={"email": "rejected@example.test"},
+            )
+        )
+
+    mcp_requests = [
+        request for request in origin.requests if request["path"] == "/mcp"
+    ]
+    assert [request["headers"].get("x-chat-id") for request in mcp_requests] == [
+        "preflight"
+    ]
+    assert result.startswith("[CONFIG ERROR]")
+    assert f"HTTP {status}" in result
+    assert "traceback" not in result.lower()
+    assert client_token not in result
+    assert client_mcp_key not in result
+    assert events[-1]["data"]["status"] == "error"
+    assert events[-1]["data"]["done"] is True
 
 
 if __name__ == "__main__":
