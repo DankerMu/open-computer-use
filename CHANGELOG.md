@@ -12,6 +12,12 @@
   `MCP_API_KEY` remains a separate MCP Bearer credential and preserves
   server-matching ordinary spaces. Shared `default` and temporary chat IDs are
   rejected at the protected boundary.
+- **Generated-output isolation:** non-download file responses with `text/html`,
+  `image/svg+xml`, `application/xhtml+xml`, `text/xml`, or `application/xml` now
+  mirror generated-content isolation with `Content-Security-Policy: sandbox
+  allow-scripts allow-forms` and `X-Content-Type-Options: nosniff`. Forced
+  downloads and other response types are unchanged; #62 remains the separate
+  disposition follow-up.
 
 - **Breaking public-base validation and authenticated filter retrieval.** A configured
   `PUBLIC_BASE_URL` ending in `/` now stops OCU before it serves; remove that slash

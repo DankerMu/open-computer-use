@@ -27,7 +27,11 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 - `POST /mcp` — MCP Streamable HTTP endpoint (main interface)
 
 ### Files
-- `GET /files/{chat_id}/{filename}` — Download output file
+- `GET /files/{chat_id}/{filename}` — Serves output files. Non-download HTML,
+  SVG, XHTML, and XML responses mirror generated-content isolation with
+  `Content-Security-Policy: sandbox allow-scripts allow-forms` and
+  `X-Content-Type-Options: nosniff`; disposition is unchanged (#62 tracks its
+  follow-up).
 - `GET /files/{chat_id}/archive` — Download all outputs as ZIP
 - `GET /api/outputs/{chat_id}` — List output files with metadata
 - `POST /api/uploads/{chat_id}/{filename}` — Upload file to container
