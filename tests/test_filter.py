@@ -494,6 +494,35 @@ def test_outlet_supports_root_relative_public_base_without_matching_foreign_abso
     assert f"[📦 Download all files as archive]({public_base}/files/abc/archive)" in content
 
 
+@pytest.mark.parametrize(
+    "foreign_file",
+    (
+        "http://[::1]/ocu/files/abc/report.html",
+        "https://foreign.example/X_(name)/ocu/files/abc/report.html",
+    ),
+)
+def test_outlet_does_not_restart_root_relative_match_inside_foreign_absolute_url(
+    monkeypatch, foreign_file
+):
+    _configure_filter_token(monkeypatch)
+    public_base = "/ocu"
+    local_file = f"{public_base}/files/abc/report.html"
+    filter_ = _make_filter()
+    _prime_cache(filter_, "abc", public_url=public_base)
+
+    foreign_result = filter_.outlet(
+        {"messages": [{"role": "assistant", "content": foreign_file}]},
+        __metadata__={"chat_id": "abc"},
+    )
+
+    assert foreign_result["messages"][0]["content"] == foreign_file
+
+    local_result = filter_.outlet(
+        {"messages": [{"role": "assistant", "content": local_file}]},
+        __metadata__={"chat_id": "abc"},
+    )
+    assert f"[🖥️ Open preview]({local_file})" in local_result["messages"][0]["content"]
+
 def test_outlet_trims_sentence_punctuation_from_bare_file_urls(monkeypatch):
     _configure_filter_token(monkeypatch)
     public_base = "https://webui.example/ocu"

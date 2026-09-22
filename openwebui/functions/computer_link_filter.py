@@ -116,7 +116,7 @@ _URL_RE = re.compile(
     \)
     |<(?P<angle_url>[^\s<>]+)>
     |(?P<absolute_url>https?://[^\s<>\]\)"']+)
-    |(?P<root_relative_url>(?<![A-Za-z0-9._~%/@:+?&=;/-])/[^\s<>\]\)"']+)
+    |(?P<root_relative_url>(?<![A-Za-z0-9._~%/@:+?&=;/\]\)"'-])/[^\s<>\]\)"']+)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
