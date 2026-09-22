@@ -77,6 +77,7 @@ Stable users running `helm repo add open-computer-use https://wide-moat.github.i
 ```bash
 helm install ocu helm/computer-use-server \
   --namespace open-computer-use --create-namespace \
+  --set secrets.ocuInternalToken=$(openssl rand -hex 32) \
   --set secrets.mcpApiKey=$(openssl rand -hex 32) \
   --set orchestrator.env.PUBLIC_BASE_URL=https://orchestrator.example.com \
   --set ingress.enabled=true \
@@ -109,9 +110,10 @@ The full schema lives in [`values.yaml`](values.yaml). The knobs you most often 
 | `orchestrator.replicas` | `1` | **must stay 1** — single owner of the engine and the RWO PVCs |
 | `orchestrator.env.PUBLIC_BASE_URL` | `""` | **REQUIRED** — browser-facing URL (no trailing slash). Without it, chat file previews 404. |
 | `orchestrator.extraEnv` / `envFrom` | `[]` | inject `ANTHROPIC_*`, `VISION_*`, etc. from existing Secrets / ConfigMaps |
-| `secrets.create` | `true` | renders a Secret from `secrets.mcpApiKey` etc. (handy, bad for GitOps) |
-| `secrets.existingSecret` | `""` | when set, ignores `secrets.create` and uses your Secret via `envFrom`. Must include `MCP_API_KEY`. |
-| `secrets.mcpApiKey` | `""` | **REQUIRED** unless `existingSecret` is set |
+| `secrets.create` | `true` | renders a Secret from `secrets.ocuInternalToken`, `secrets.mcpApiKey`, etc. (handy, bad for GitOps) |
+| `secrets.existingSecret` | `""` | when set, ignores `secrets.create` and uses your Secret via `envFrom`. Must include `OCU_INTERNAL_TOKEN` and `MCP_API_KEY`. |
+| `secrets.ocuInternalToken` | `""` | **REQUIRED** unless `existingSecret` is set; service credential for REST/WS and MCP identity trust |
+| `secrets.mcpApiKey` | `""` | **REQUIRED** unless `existingSecret` is set; separate Bearer credential for MCP |
 | `persistence.userData.size` | `20Gi` | `/tmp/computer-use-data` — uploads + outputs |
 | `persistence.data.size` | `5Gi` | `/data` — long-lived orchestrator state |
 | `persistence.skillsCache.size` | `2Gi` | `/data/skills-cache` |
@@ -150,6 +152,7 @@ Recommended for anything you check into git:
 
 ```bash
 kubectl -n open-computer-use create secret generic ocu-server-creds \
+  --from-literal=OCU_INTERNAL_TOKEN=$(openssl rand -hex 32) \
   --from-literal=MCP_API_KEY=$(openssl rand -hex 32) \
   --from-literal=ANTHROPIC_AUTH_TOKEN=sk-ant-... \
   --from-literal=VISION_API_KEY=...

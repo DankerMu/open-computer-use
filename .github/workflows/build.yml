@@ -242,8 +242,13 @@ jobs:
           pip install -r computer-use-server/requirements.txt
           pip install pytest pytest-asyncio
 
-      - name: Run orchestrator pytest
-        run: pytest tests/orchestrator/ -v
+      - name: Run orchestrator and auth-guard pytest
+        env:
+          OCU_INTERNAL_TOKEN: ci-internal-token
+          MCP_API_KEY: ci-mcp-token
+        run: |
+          pytest tests/orchestrator/ -v
+          pytest tests/test_auth_guard.py -v
 
   smoke-mcp-endpoint:
     name: Smoke — POST /mcp returns 200
@@ -274,6 +279,8 @@ jobs:
           # only needs to boot, register MCP, and respond to /health + /mcp.
           # We don't exercise sandbox container creation here.
           docker run -d --name cu-server -p 8081:8081 \
+            -e OCU_INTERNAL_TOKEN=smoke-internal-token \
+            -e MCP_API_KEY=smoke-mcp-token \
             -e PUBLIC_BASE_URL=http://localhost:8081 \
             -e BASE_DATA_DIR=/tmp/data \
             cu-server:smoke
@@ -292,6 +299,9 @@ jobs:
           exit 1
 
       - name: Smoke /mcp endpoint
+        env:
+          OCU_INTERNAL_TOKEN: smoke-internal-token
+          MCP_API_KEY: smoke-mcp-token
         run: |
           chmod +x tests/test-mcp-endpoint-live.sh
           ./tests/test-mcp-endpoint-live.sh http://localhost:8081
@@ -385,6 +395,7 @@ jobs:
         env:
           OCU_TEST_BASE_URL: http://localhost:18081
           OCU_TEST_MCP_API_KEY: test-token-do-not-use-in-prod
+          OCU_TEST_INTERNAL_TOKEN: test-internal-token-do-not-use-in-prod
         run: pytest tests/integration/ -v
 
       - name: Orchestrator logs on failure

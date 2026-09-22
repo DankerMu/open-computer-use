@@ -34,6 +34,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./tests/integration/_tmp/user-data:/tmp/computer-use-data:rw
     environment:
+      - OCU_INTERNAL_TOKEN=test-internal-token-do-not-use-in-prod
       - MCP_API_KEY=test-token-do-not-use-in-prod
       - DOCKER_IMAGE=open-computer-use:test
       # Same path the workspace container will see — bind mount paths must

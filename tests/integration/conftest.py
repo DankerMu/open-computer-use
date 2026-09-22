@@ -17,6 +17,7 @@ Two ways to drive the stack:
   2. CI / external stack:
      export OCU_TEST_BASE_URL=http://localhost:18081
      export OCU_TEST_MCP_API_KEY=test-token-do-not-use-in-prod
+     export OCU_TEST_INTERNAL_TOKEN=test-internal-token-do-not-use-in-prod
      Stack is assumed to be already up; pytest only runs assertions and
      cleanup. Keeps build/test concerns separate in the CI matrix.
 
@@ -41,8 +42,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = REPO_ROOT / "docker-compose.test.yml"
 
-# Constant matches docker-compose.test.yml — keep these in sync.
+# Constants match docker-compose.test.yml — keep these in sync.
 DEFAULT_API_KEY = "test-token-do-not-use-in-prod"
+DEFAULT_INTERNAL_TOKEN = "test-internal-token-do-not-use-in-prod"
 DEFAULT_BASE_URL = "http://localhost:18081"
 HEALTH_TIMEOUT_S = 60
 HEALTH_POLL_INTERVAL_S = 1.0
@@ -160,7 +162,7 @@ def _reap_test_workspace_containers() -> int:
 
 @pytest.fixture(scope="session")
 def orchestrator() -> Iterator[dict]:
-    """Yield {url, api_key} after ensuring the stack is healthy.
+    """Yield credentials and URL after ensuring the stack is healthy.
 
     Skips the entire suite if Docker is unavailable — these tests are real
     integration, not unit tests, and pretending otherwise hides regressions.
@@ -170,12 +172,13 @@ def orchestrator() -> Iterator[dict]:
 
     external = os.environ.get("OCU_TEST_BASE_URL")
     api_key = os.environ.get("OCU_TEST_MCP_API_KEY", DEFAULT_API_KEY)
+    internal_token = os.environ.get("OCU_TEST_INTERNAL_TOKEN", DEFAULT_INTERNAL_TOKEN)
 
     if external:
         # CI / dev opted to manage the stack themselves. Just wait + yield.
         _wait_for_health(external, HEALTH_TIMEOUT_S)
         try:
-            yield {"url": external, "api_key": api_key}
+            yield {"url": external, "api_key": api_key, "internal_token": internal_token}
         finally:
             reaped = _reap_test_workspace_containers()
             if reaped:
@@ -189,7 +192,7 @@ def orchestrator() -> Iterator[dict]:
 
     try:
         _wait_for_health(DEFAULT_BASE_URL, HEALTH_TIMEOUT_S)
-        yield {"url": DEFAULT_BASE_URL, "api_key": api_key}
+        yield {"url": DEFAULT_BASE_URL, "api_key": api_key, "internal_token": internal_token}
     finally:
         import sys
         reaped = _reap_test_workspace_containers()
@@ -209,9 +212,10 @@ def orchestrator() -> Iterator[dict]:
 
 @pytest.fixture()
 def client(orchestrator) -> Iterator[httpx.Client]:
-    """HTTP client preconfigured with auth + sensible timeout for tool calls."""
+    """HTTP client preconfigured with both independent MCP credentials."""
     headers = {
         "Authorization": f"Bearer {orchestrator['api_key']}",
+        "X-OCU-Internal-Token": orchestrator["internal_token"],
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
@@ -221,7 +225,7 @@ def client(orchestrator) -> Iterator[httpx.Client]:
 
 @pytest.fixture()
 def chat_id() -> str:
-    """A fresh chat-id per test — each gets its own workspace container.
+    """A fresh chat-id per test — safely eligible for the finalizer reaper.
 
     The `itest-` prefix is load-bearing: the session finalizer uses it (via
     `owui-chat-itest-*` container-name match) to find and reap orphans
@@ -269,7 +273,7 @@ def parse_mcp_response(resp: httpx.Response) -> dict:
 
 def call_mcp(client: httpx.Client, chat_id: str, method: str,
              params: dict | None = None, req_id: int = 1) -> dict:
-    """POST /mcp with the X-Chat-Id header the orchestrator requires."""
+    """POST /mcp with the X-Chat-Id header after client auth defaults apply."""
     resp = client.post(
         "/mcp",
         json=mcp_request(method, params, req_id),

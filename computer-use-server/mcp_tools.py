@@ -17,10 +17,14 @@ Priority order for GitLab token:
 2. MCP Tokens Wrapper (fetches token by user email)
 3. No token (continue without GitLab auth)
 
-HTTP Headers — all optional except Chat ID. Headers override env var defaults.
+HTTP Headers — `X-OCU-Internal-Token` and Chat ID are required at the mounted
+transport boundary. `Authorization: Bearer <MCP_API_KEY>` remains additionally
+required when `MCP_API_KEY` is configured. Direct headers override OpenWebUI
+aliases after service authorization.
 
 | Parameter         | Header                 | Alt Header (OpenWebUI)         | Required | Fallback                        |
 |-------------------|------------------------|--------------------------------|----------|---------------------------------|
+| Service auth      | X-OCU-Internal-Token  | —                              | Yes      | —                               |
 | Chat ID           | X-Chat-Id              | X-OpenWebUI-Chat-Id            | Yes      | —                               |
 | User Email        | X-User-Email           | X-OpenWebUI-User-Email         | No       | —                               |
 | User Name         | X-User-Name            | X-OpenWebUI-User-Name          | No       | —                               |
@@ -123,6 +127,9 @@ def _validate_chat_id() -> tuple[str, str | None]:
     chat_id = current_chat_id.get()
 
     if SINGLE_USER_MODE == "true":
+        supplied = current_chat_id.get()
+        if supplied and supplied != "default":
+            return supplied, None
         return "default", None
 
     if chat_id == "default":
@@ -1353,78 +1360,63 @@ def set_context_from_headers(headers: dict):
         current_mcp_servers.set(headers["x-openwebui-mcp-servers"])
 
 
-class MCPAuthMiddleware:
-    """ASGI middleware for Bearer token auth on MCP endpoint."""
 
-    def __init__(self, app, api_key: Optional[str] = None):
-        self.app = app
-        self.api_key = api_key
 
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not self.api_key:
-            await self.app(scope, receive, send)
-            return
+_CONTEXT_DEFAULTS = (
+    (current_chat_id, "default"),
+    (current_user_email, None),
+    (current_user_name, None),
+    (current_gitlab_token, None),
+    (current_gitlab_host, "gitlab.com"),
+    (current_anthropic_auth_token, None),
+    (current_anthropic_base_url, None),
+    (current_mcp_tokens_url, ""),
+    (current_mcp_tokens_api_key, ""),
+    (current_mcp_servers, ""),
+    (current_instructions, None),
+)
 
-        # Extract Authorization header
-        headers = dict(scope.get("headers", []))
-        auth = headers.get(b"authorization", b"").decode()
 
-        if not auth.startswith("Bearer ") or auth[7:] != self.api_key:
-            # Return 401 Unauthorized
-            response_body = b'{"error": "Unauthorized"}'
-            await send({
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"www-authenticate", b"Bearer"),
-                ],
-            })
-            await send({
-                "type": "http.response.body",
-                "body": response_body,
-            })
-            return
-
-        await self.app(scope, receive, send)
+def _reset_request_context():
+    for var, default in _CONTEXT_DEFAULTS:
+        var.set(default)
 
 
 class MCPContextMiddleware:
-    """ASGI middleware: HTTP headers → ContextVars before MCP handler.
+    """ASGI middleware: authorized headers to ContextVars, then restore them.
 
-    Also pre-renders the system prompt and stores it in `current_instructions`
-    so the _DynamicInstructionsServer.instructions property can read it
-    synchronously when building InitializeResult (Tier 4).
-    Rendering is cache-backed (60s TTL per (chat_id, user_email)), so real
-    cost on a hot key is a dict lookup.
+    Also pre-renders the system prompt into ``current_instructions`` for the
+    synchronous InitializeResult path. Context is cleared on the way out so a
+    failure cannot leak chat identity or credentials into the next request.
     """
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        _reset_request_context()
+        try:
+            chat_id = scope["ocu_chat_id"]
             headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
+            # The outer auth guard canonicalized the direct/alias value before
+            # prompt rendering. Preserve that one trusted value at the direct
+            # header's precedence point.
+            headers["x-chat-id"] = chat_id
+            headers.pop("x-openwebui-chat-id", None)
             set_context_from_headers(headers)
-
-            # Pre-render system prompt for Tier 4 (dynamic instructions).
-            # Swallow errors — fall back to the static _STATIC_INSTRUCTIONS
-            # string that the _DynamicInstructionsServer getter returns when
-            # current_instructions is None.
             try:
-                chat_id = current_chat_id.get()
-                user_email = current_user_email.get()
-                rendered = await render_system_prompt(chat_id, user_email)
+                rendered = await render_system_prompt(chat_id, current_user_email.get())
                 current_instructions.set(rendered)
             except Exception as e:
                 print(f"[MCP] render_system_prompt warning: {e}")
-        await self.app(scope, receive, send)
+            await self.app(scope, receive, send)
+        finally:
+            _reset_request_context()
 
 
-def get_mcp_app(api_key: Optional[str] = None):
-    """Get the MCP ASGI app with auth and context middleware for mounting."""
-    app = mcp.streamable_http_app()
-    # Wrap with context middleware (inner) then auth (outer)
-    app = MCPContextMiddleware(app)
-    app = MCPAuthMiddleware(app, api_key=api_key)
-    return app
+def get_mcp_app():
+    """Get the MCP ASGI app; app-level auth runs before this mounted transport."""
+    return MCPContextMiddleware(mcp.streamable_http_app())

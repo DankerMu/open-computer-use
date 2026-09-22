@@ -17,7 +17,8 @@ persistence:
     storageClass: standard
 
 secrets:
-  # GitOps-friendly: chart reads MCP_API_KEY + tokens from the existing Secret.
+  # GitOps-friendly: existing Secret must include OCU_INTERNAL_TOKEN,
+  # MCP_API_KEY and any optional provider tokens.
   create: false
   existingSecret: ocu-shared
 

@@ -18,6 +18,8 @@ IMAGE_NAME="computer-use-server-test-sum"
 BASE_PORT=18081
 PASSED=0
 FAILED=0
+INTERNAL_TOKEN="single-user-mode-internal-token"
+MCP_API_KEY="single-user-mode-mcp-token"
 
 # Colors
 RED='\033[0;31m'
@@ -71,6 +73,8 @@ start_server() {
         --name "$name" \
         --label "test=single-user-mode" \
         -p "$port:8081" \
+        -e "OCU_INTERNAL_TOKEN=$INTERNAL_TOKEN" \
+        -e "MCP_API_KEY=$MCP_API_KEY" \
         $env_args \
         "$IMAGE_NAME" > /dev/null
 
@@ -93,11 +97,10 @@ start_server() {
 call_bash_tool() {
     local port="$1"
     local extra_header="${2:-}"
-    local header_args=""
+    local header_args="-H \"X-OCU-Internal-Token: $INTERNAL_TOKEN\" -H \"Authorization: Bearer $MCP_API_KEY\""
     if [ -n "$extra_header" ]; then
-        header_args="-H \"$extra_header\""
+        header_args="$header_args -H \"$extra_header\""
     fi
-
     # Step 1: Initialize MCP session
     eval curl -sf "http://localhost:$port/mcp" \
         -H "'Content-Type: application/json'" \
@@ -121,22 +124,18 @@ stop_server() {
 }
 
 # ============================================================================
-# Test 1: Lenient mode (SINGLE_USER_MODE unset) + no X-Chat-Id
-# Expected: tool response contains warning about SINGLE_USER_MODE
+# Test 1: Lenient mode without X-Chat-Id is rejected at the auth boundary.
 # ============================================================================
-echo "[1/6] Lenient mode + no X-Chat-Id → works (no required error)"
+echo "[1/6] Lenient mode + no X-Chat-Id → invalid chat ID"
 CONTAINER="test-sum-1"
 PORT=$((BASE_PORT))
 stop_server "$CONTAINER"
 if start_server "$CONTAINER" "$PORT"; then
     RESPONSE=$(call_bash_tool "$PORT")
-    if echo "$RESPONSE" | grep -qi "required.*SINGLE_USER_MODE=false\|X-Chat-Id header is required"; then
-        fail "Got chat_id required error — should be lenient without SINGLE_USER_MODE"
-    elif echo "$RESPONSE" | grep -qi "SINGLE_USER_MODE"; then
-        pass "Response contains SINGLE_USER_MODE warning (with Docker output or alone)"
+    if echo "$RESPONSE" | grep -qi "Invalid chat_id"; then
+        pass "Missing chat ID is rejected before tool work"
     else
-        # Docker socket not available — but chat_id validation PASSED (no "required" error)
-        pass "Chat-id validation passed (no 'required' error)"
+        fail "Expected invalid chat ID, got: $(echo "$RESPONSE" | head -c 200)"
     fi
 else
     fail "Server failed to start"
@@ -166,21 +165,18 @@ fi
 stop_server "$CONTAINER"
 
 # ============================================================================
-# Test 3: Single-user mode + no X-Chat-Id
-# Expected: works, NO warning
+# Test 3: SINGLE_USER_MODE cannot re-enable the shared default sandbox.
 # ============================================================================
-echo "[3/6] SINGLE_USER_MODE=true + no X-Chat-Id → works without warning"
+echo "[3/6] SINGLE_USER_MODE=true + no X-Chat-Id → invalid chat ID"
 CONTAINER="test-sum-3"
 PORT=$((BASE_PORT + 2))
 stop_server "$CONTAINER"
 if start_server "$CONTAINER" "$PORT" "SINGLE_USER_MODE=true"; then
     RESPONSE=$(call_bash_tool "$PORT")
-    if echo "$RESPONSE" | grep -qi "SINGLE_USER_MODE"; then
-        fail "Should NOT contain warning in single-user mode"
-    elif echo "$RESPONSE" | grep -qi "X-Chat-Id.*required"; then
-        fail "Should not require chat_id in single-user mode"
+    if echo "$RESPONSE" | grep -qi "Invalid chat_id"; then
+        pass "Single-user mode does not bypass chat identity"
     else
-        pass "No warning in single-user mode"
+        fail "Expected invalid chat ID, got: $(echo "$RESPONSE" | head -c 200)"
     fi
 else
     fail "Server failed to start"
@@ -188,21 +184,18 @@ fi
 stop_server "$CONTAINER"
 
 # ============================================================================
-# Test 4: Single-user mode + X-Chat-Id present (should be ignored)
-# Expected: works, NO warning, uses default container
+# Test 4: SINGLE_USER_MODE preserves a supplied valid chat ID.
 # ============================================================================
-echo "[4/6] SINGLE_USER_MODE=true + X-Chat-Id → works (header ignored)"
+echo "[4/6] SINGLE_USER_MODE=true + X-Chat-Id → works with supplied ID"
 CONTAINER="test-sum-4"
 PORT=$((BASE_PORT + 3))
 stop_server "$CONTAINER"
 if start_server "$CONTAINER" "$PORT" "SINGLE_USER_MODE=true"; then
-    RESPONSE=$(call_bash_tool "$PORT" "X-Chat-Id: should-be-ignored")
-    if echo "$RESPONSE" | grep -qi "SINGLE_USER_MODE"; then
-        fail "Should NOT contain warning in single-user mode"
-    elif echo "$RESPONSE" | grep -qi "X-Chat-Id.*required"; then
-        fail "Should not require chat_id in single-user mode"
+    RESPONSE=$(call_bash_tool "$PORT" "X-Chat-Id: must-be-preserved")
+    if echo "$RESPONSE" | grep -qi "Invalid chat_id\|X-Chat-Id.*required"; then
+        fail "A supplied valid chat ID must remain usable"
     else
-        pass "Header ignored in single-user mode"
+        pass "Supplied chat ID is not remapped to default"
     fi
 else
     fail "Server failed to start"
@@ -210,19 +203,18 @@ fi
 stop_server "$CONTAINER"
 
 # ============================================================================
-# Test 5: Strict multi-user mode + no X-Chat-Id
-# Expected: ERROR — chat_id required
+# Test 5: Strict multi-user mode also rejects a missing chat ID at transport.
 # ============================================================================
-echo "[5/6] SINGLE_USER_MODE=false + no X-Chat-Id → error"
+echo "[5/6] SINGLE_USER_MODE=false + no X-Chat-Id → invalid chat ID"
 CONTAINER="test-sum-5"
 PORT=$((BASE_PORT + 4))
 stop_server "$CONTAINER"
 if start_server "$CONTAINER" "$PORT" "SINGLE_USER_MODE=false"; then
     RESPONSE=$(call_bash_tool "$PORT")
-    if echo "$RESPONSE" | grep -qi "required"; then
-        pass "Correctly rejected — chat_id required"
+    if echo "$RESPONSE" | grep -qi "Invalid chat_id"; then
+        pass "Missing chat ID is rejected"
     else
-        fail "Expected 'required' error, got: $(echo "$RESPONSE" | head -c 200)"
+        fail "Expected invalid chat ID, got: $(echo "$RESPONSE" | head -c 200)"
     fi
 else
     fail "Server failed to start"

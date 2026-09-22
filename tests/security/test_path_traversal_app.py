@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 
 VALID_CHAT_ID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+INTERNAL_TOKEN = "ocu-test-internal-token"
 
 
 @pytest.fixture
@@ -37,11 +38,18 @@ def tmp_data(tmp_path):
 
 
 @pytest.fixture
-def client(tmp_data):
-    """TestClient with patched BASE_DATA_DIR."""
+def client(tmp_data, monkeypatch):
+    """TestClient with patched BASE_DATA_DIR and a valid service token."""
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     import app as app_module
+
     with patch.object(app_module, "BASE_DATA_DIR", tmp_data):
-        yield TestClient(app_module.app)
+        http = TestClient(app_module.app)
+        http.headers.update({"Authorization": f"Bearer {INTERNAL_TOKEN}"})
+        try:
+            yield http
+        finally:
+            http.close()
 
 
 class TestChatIdValidation:
@@ -107,11 +115,11 @@ class TestNormalOperations:
         resp = client.get(f"/api/uploads/{VALID_CHAT_ID}/list")
         assert resp.status_code == 200
 
-    def test_default_chat_id(self, client, tmp_data):
-        """chat_id='default' should be accepted."""
+    def test_default_chat_id_is_rejected(self, client, tmp_data):
+        """A shared default sandbox is forbidden even in single-user mode."""
         (tmp_data / "default" / "outputs").mkdir(parents=True)
         resp = client.get("/api/outputs/default")
-        assert resp.status_code == 200
+        assert resp.status_code == 400
 
 
 class TestSafePathDirectly:

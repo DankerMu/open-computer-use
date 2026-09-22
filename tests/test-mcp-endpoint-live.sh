@@ -16,6 +16,8 @@
 set -u
 
 SERVER_URL="${1:-http://localhost:8081}"
+INTERNAL_TOKEN="${OCU_INTERNAL_TOKEN:?set OCU_INTERNAL_TOKEN for the server and smoke client}"
+MCP_TOKEN="${MCP_API_KEY:?set MCP_API_KEY for the server and smoke client}"
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}'
 
 echo "Probing ${SERVER_URL}/mcp ..."
@@ -26,6 +28,8 @@ trap 'rm -f "$HDRS" "$BODY"' EXIT
 STATUS=$(curl -sS -D "$HDRS" -o "$BODY" -w '%{http_code}' -X POST "${SERVER_URL}/mcp" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
+  -H "X-OCU-Internal-Token: ${INTERNAL_TOKEN}" \
+  -H "Authorization: Bearer ${MCP_TOKEN}" \
   -H 'X-Chat-Id: smoke-live' \
   -d "$INIT" || echo "curl-failed")
 

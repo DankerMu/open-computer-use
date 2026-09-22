@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Tests for single-user mode and default chat_id fallback.
+"""Tests for SINGLE_USER_MODE's tool-level fallback behavior.
 
-Three modes via SINGLE_USER_MODE env var:
-- Not set (default): lenient — use 'default' container + warning in response
-- true: single-user — always 'default', no warnings
-- false: strict multi-user — error if no X-Chat-Id
+The service guard rejects missing/default IDs at the MCP transport boundary.
+These unit tests retain the tool-internal behavior only: a supplied valid ID
+must never be remapped to the shared default sandbox.
 
 Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_single_user_mode.py -v
 """
@@ -57,15 +56,15 @@ class TestValidateChatId(unittest.TestCase):
             self.assertEqual(chat_id, "my-session-123")
             self.assertIsNone(error)
 
-    def test_single_user_mode_always_returns_default(self):
-        """SINGLE_USER_MODE=true → always 'default', even if chat_id was set."""
+    def test_single_user_mode_preserves_explicit_chat_id(self):
+        """SINGLE_USER_MODE=true must not remap a real chat to default."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "true"}, clear=False):
             import importlib
             import mcp_tools
             importlib.reload(mcp_tools)
-            current_chat_id.set("should-be-ignored")
+            current_chat_id.set("must-be-preserved")
             chat_id, error = mcp_tools._validate_chat_id()
-            self.assertEqual(chat_id, "default")
+            self.assertEqual(chat_id, "must-be-preserved")
             self.assertIsNone(error)
 
     def test_single_user_mode_no_chat_id(self):

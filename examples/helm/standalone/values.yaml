@@ -40,7 +40,8 @@ persistence:
 
 secrets:
   create: true
-  # `openssl rand -hex 32` is a fine source
+  # `openssl rand -hex 32` is a fine source for each independent secret.
+  ocuInternalToken: "change-me-32-hex-chars"
   mcpApiKey: "change-me-32-hex-chars"
 
 orchestrator:

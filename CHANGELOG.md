@@ -3,6 +3,13 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **OCU service authorization is fail-closed.** `OCU_INTERNAL_TOKEN` is now
+  required before startup and on every chat-bound REST/WebSocket and identity
+  request. MCP carries it in `X-OCU-Internal-Token`; when configured,
+  `MCP_API_KEY` remains a separate Bearer credential. Set both deployment
+  values before rolling out the paired server/client change. Shared `default`
+  and temporary chat IDs are rejected at the protected boundary.
+
 
 - **TypeScript 7 removes the JavaScript compiler API from the sandbox image.** The
   image now ships `typescript@7.0.2`, the native compiler. `require('typescript')`

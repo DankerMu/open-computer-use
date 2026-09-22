@@ -54,6 +54,7 @@ jobs:
           # Should pass with all required keys set
           helm lint helm/computer-use-server \
             --set secrets.create=true \
+            --set secrets.ocuInternalToken=test-internal \
             --set secrets.mcpApiKey=test \
             --set orchestrator.env.PUBLIC_BASE_URL=https://x.example.com \
             --set persistence.userData.storageClass=standard \
@@ -72,6 +73,7 @@ jobs:
           # `required` in the PVC templates, which is why this is a template-time check.
           if helm template ocu helm/computer-use-server \
                --set secrets.create=true \
+               --set secrets.ocuInternalToken=test-internal \
                --set secrets.mcpApiKey=test \
                --set orchestrator.env.PUBLIC_BASE_URL=https://x.example.com \
                >/dev/null 2>&1; then

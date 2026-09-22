@@ -46,6 +46,7 @@ services:
       # Internal port is always 8081 — MCP_PORT is a host-side mapping and
       # irrelevant for container-to-container traffic on the Docker network.
       - ORCHESTRATOR_URL=http://computer-use-server:8081
+      - OCU_INTERNAL_TOKEN=${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
       - MCP_API_KEY=${MCP_API_KEY:-}
       # Allow complex multi-step tasks (browser + doc creation) to complete
       - CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS=${CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS:-200}

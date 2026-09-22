@@ -94,12 +94,15 @@ In addition, `/home/assistant/README.md` inside the sandbox carries the same pro
 
 ## Required Headers
 
-> **`X-Chat-Id` is mandatory.** Without it, the server returns an error. Every request must include a unique session identifier.
+> **`X-OCU-Internal-Token` and `X-Chat-Id` are mandatory.** The internal token
+> is distinct from the optional MCP Bearer credential; neither substitutes for
+> the other. Chat IDs must be explicit, non-default, and non-temporary.
 
 | Header | Description | Required |
 |--------|-------------|----------|
-| `X-Chat-Id` | **Session identifier** — one sandbox container per chat ID | **Yes** |
-| `Authorization` | `Bearer <MCP_API_KEY>` — required if `MCP_API_KEY` is set | Conditional |
+| `X-OCU-Internal-Token` | `OCU_INTERNAL_TOKEN` service credential | **Yes** |
+| `Authorization` | `Bearer <MCP_API_KEY>` — additionally required if `MCP_API_KEY` is set | Conditional |
+| `X-Chat-Id` | Unique session identifier — one sandbox container per chat ID | **Yes** |
 | `X-User-Email` | User email (for per-user skills, token lookup, logging) | No |
 | `X-User-Name` | Display name (URL-encoded) | No |
 | `X-MCP-Servers` | Comma-separated MCP server names for Claude Code sub-agent | No |
@@ -110,6 +113,7 @@ In addition, `/home/assistant/README.md` inside the sandbox carries the same pro
 
 ```bash
 curl -sD - -X POST "http://localhost:8081/mcp" \
+  -H "X-OCU-Internal-Token: $OCU_INTERNAL_TOKEN" \
   -H "Authorization: Bearer $MCP_API_KEY" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -123,6 +127,7 @@ Save the `mcp-session-id` header from the response.
 
 ```bash
 curl -s -X POST "http://localhost:8081/mcp" \
+  -H "X-OCU-Internal-Token: $OCU_INTERNAL_TOKEN" \
   -H "Authorization: Bearer $MCP_API_KEY" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -135,6 +140,7 @@ curl -s -X POST "http://localhost:8081/mcp" \
 
 ```bash
 curl -s -X POST "http://localhost:8081/mcp" \
+  -H "X-OCU-Internal-Token: $OCU_INTERNAL_TOKEN" \
   -H "Authorization: Bearer $MCP_API_KEY" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -155,6 +161,7 @@ mcp_servers:
     auth_type: "bearer_token"
     auth_value: "<MCP_API_KEY>"
     extra_headers:
+      X-OCU-Internal-Token: "<OCU_INTERNAL_TOKEN>"
       X-Chat-Id: "{chat_id}"
       X-User-Email: "{user_email}"
 ```
@@ -168,6 +175,7 @@ mcp_servers:
       "url": "http://localhost:8081/mcp",
       "transport": "streamable-http",
       "headers": {
+        "X-OCU-Internal-Token": "<OCU_INTERNAL_TOKEN>",
         "Authorization": "Bearer <MCP_API_KEY>",
         "X-Chat-Id": "desktop-session"
       }
