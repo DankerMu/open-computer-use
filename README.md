@@ -200,7 +200,7 @@ All settings via `.env`:
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | — | LLM API key (any OpenAI-compatible) |
 | `OPENAI_API_BASE_URL` | — | Custom API base URL (OpenRouter, etc.) |
-| `OCU_INTERNAL_TOKEN` | — | **Required** service credential; REST/WS use Bearer and MCP uses `X-OCU-Internal-Token` |
+| `OCU_INTERNAL_TOKEN` | — | **Required** service credential; provide it to both `computer-use-server` and `open-webui`. The tool reads the Open WebUI process environment on every call, using REST Bearer and MCP `X-OCU-Internal-Token`; it is not a Valve. |
 | `MCP_API_KEY` | — | Optional second MCP Bearer credential; when configured it is required in addition to `OCU_INTERNAL_TOKEN` |
 | `DOCKER_IMAGE` | `open-computer-use:latest` | Sandbox container image |
 | `COMMAND_TIMEOUT` | `120` | Bash tool timeout (seconds) |
@@ -257,7 +257,7 @@ On first `docker compose up`, the init script automatically:
 1. Creates an admin user (`admin@open-computer-use.dev` / `admin`)
 2. Installs the Computer Use tool via `POST /api/v1/tools/create`
 3. Installs the Computer Use filter via `POST /api/v1/functions/create`
-4. Configures tool and filter valves (`ORCHESTRATOR_URL=http://computer-use-server:8081` — internal URL for server↔server, seeded into both Valves)
+4. Configures tool and filter valves (`ORCHESTRATOR_URL=http://computer-use-server:8081` — internal URL for server↔server, seeded into both Valves) while the tool reads `OCU_INTERNAL_TOKEN` from the Open WebUI process environment on every call; it is never written to a Valve.
 5. Marks the tool **public-read** (access grants for both `group:*` and `user:*` wildcards) — so non-admin users see the tool in their workspace
 6. Marks the filter both **active and global** (two separate toggles: `/toggle` and `/toggle/global`) — active-but-not-global is silently inert and a common manual-setup mistake
 7. Merges `{function_calling: "native", stream_response: true}` into `DEFAULT_MODEL_PARAMS` via `POST /api/v1/configs/models` — every model gets the right defaults without per-model Advanced Params clicks
@@ -272,7 +272,7 @@ If you run Open WebUI separately, you need to manually:
 
 1. Go to **Workspace > Tools** → Create new tool → paste contents of `openwebui/tools/computer_use_tools.py`
 2. Set **Tool ID** to `ai_computer_use` (required for filter to work)
-3. Configure **Valves**: `ORCHESTRATOR_URL` = internal URL of your Computer Use Server (`http://computer-use-server:8081` for Docker compose)
+3. Configure the `ORCHESTRATOR_URL` Valve to the internal URL of your Computer Use Server (`http://computer-use-server:8081` for Docker compose), and make `OCU_INTERNAL_TOKEN` available to the Open WebUI server process. The tool reads it on every call; it is not a Valve or tool argument.
 4. Open the tool's **⋯ → Share** menu and set access to **Public** (grants read to both `group:*` and `user:*` wildcards) — otherwise only your admin account sees the tool and non-admin users get an empty tool list with no error
 5. Go to **Workspace > Functions** → Create new function → paste `openwebui/functions/computer_link_filter.py`
 6. Enable the filter: toggle **Active** *and* toggle **Global** in the Functions list — these are two separate switches, and active-but-not-global means the filter loads but is never applied to chats

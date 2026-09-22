@@ -3,12 +3,14 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
-- **OCU service authorization is fail-closed.** `OCU_INTERNAL_TOKEN` is now
-  required before startup and on every chat-bound REST/WebSocket and identity
-  request. MCP carries it in `X-OCU-Internal-Token`; when configured,
-  `MCP_API_KEY` remains a separate Bearer credential. Set both deployment
-  values before rolling out the paired server/client change. Shared `default`
-  and temporary chat IDs are rejected at the protected boundary.
+- **OCU service authorization is fail-closed.** `OCU_INTERNAL_TOKEN` is required
+  before startup and on every chat-bound REST/WebSocket and identity request.
+  The Open WebUI tool reads it from its process environment on every call, never
+  persists it in a Valve, sends it as REST Bearer and MCP `X-OCU-Internal-Token`
+  on probes, uploads, and calls, and rejects missing chat metadata before doing
+  work. When configured,
+  `MCP_API_KEY` remains a separate MCP Bearer credential. Shared `default` and
+  temporary chat IDs are rejected at the protected boundary.
 
 
 - **TypeScript 7 removes the JavaScript compiler API from the sandbox image.** The
