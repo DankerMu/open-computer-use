@@ -135,6 +135,7 @@ jobs:
           # where that one is checked.
           helm lint "${{ env.CHART_PATH }}" \
             --set secrets.create=true \
+            --set secrets.ocuInternalToken=lint-internal \
             --set secrets.mcpApiKey=lint-only \
             --set orchestrator.env.PUBLIC_BASE_URL=https://lint.example.com
 

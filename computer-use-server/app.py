@@ -24,7 +24,7 @@ from typing import Optional, Dict, List, Any
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body
-from fastapi.middleware.cors import CORSMiddleware
+from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -159,6 +159,7 @@ HTTP API for file upload/download and **MCP (Model Context Protocol)** endpoint 
 ```bash
 # Step 1: Initialize (get session ID)
 curl -sD - -X POST "http://localhost:8081/mcp" \\
+  -H "X-OCU-Internal-Token: <OCU_INTERNAL_TOKEN>" \\
   -H "Authorization: Bearer <MCP_API_KEY>" \\
   -H "Content-Type: application/json" \\
   -H "Accept: application/json, text/event-stream" \\
@@ -168,6 +169,7 @@ curl -sD - -X POST "http://localhost:8081/mcp" \\
 
 # Step 2: Call a tool
 curl -s -X POST "http://localhost:8081/mcp" \\
+  -H "X-OCU-Internal-Token: <OCU_INTERNAL_TOKEN>" \\
   -H "Authorization: Bearer <MCP_API_KEY>" \\
   -H "Content-Type: application/json" \\
   -H "Accept: application/json, text/event-stream" \\
@@ -200,6 +202,8 @@ async def lifespan(app):
 
     If imports fail, crash loudly so the deploy is obviously broken.
     """
+    if startup_preflight():
+        raise RuntimeError("OCU authorization startup preflight failed")
     warn_if_public_base_url_is_default()
     warn_if_mcp_api_key_missing()
     warn_subagent_cli()
@@ -229,13 +233,9 @@ app = FastAPI(
     ]
 )
 
-# CORS — needed for preview SPA loaded inside iframe (opaque origin → cross-origin fetch)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+# CORS is applied by AuthGuardMiddleware: only OCU_WEBUI_ORIGIN, never "*".
+# Registration after the HTTP normalizer makes it outermost, covering the raw
+# /mcp Route and WebSocket handshakes before route code runs.
 
 # Normalize chat_id in URL paths to lowercase.
 # Docker container names are case-sensitive, but browser URLs may contain
@@ -253,6 +253,7 @@ async def normalize_chat_id_case(request, call_next):
     if normalized != path:
         request.scope["path"] = normalized
     return await call_next(request)
+app.add_middleware(AuthGuardMiddleware)
 
 # Static files (bundled JS/CSS libraries)
 _static_dir = Path(__file__).parent / "static"
@@ -1235,11 +1236,13 @@ async def system_prompt(
         or chat_id
         or _extract_chat_id_from_legacy_url(file_base_url)
     )
-    # Sanitize at the boundary — same invariant other endpoints in this
-    # file enforce (see /files/{chat_id}/archive). Without this,
-    # untrusted chat_id from headers/query lands in /system-prompt URLs
-    # via the renderer.
-    effective_chat_id = sanitize_chat_id(raw_chat_id) if raw_chat_id else None
+    if raw_chat_id:
+        try:
+            effective_chat_id = canonical_chat_id(raw_chat_id)
+        except AuthGuardError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+    else:
+        effective_chat_id = None
     effective_user_email = (
         _header("x-user-email", "x-openwebui-user-email") or user_email
     )
@@ -1493,12 +1496,11 @@ def _init_mcp():
 from mcp_tools import get_mcp_app
 from starlette.routing import Route
 
-_mcp_asgi_app = get_mcp_app(api_key=MCP_API_KEY)
+_mcp_asgi_app = get_mcp_app()
 
 
 async def _mcp_endpoint(request):
-    """Forward to MCP ASGI app."""
-    # Rewrite path to "/" (root of MCP app)
+    """Forward an already authorized request to the mounted MCP ASGI app."""
     scope = dict(request.scope)
     scope["path"] = "/"
     scope["raw_path"] = b"/"

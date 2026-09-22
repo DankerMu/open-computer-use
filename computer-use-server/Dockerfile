@@ -25,7 +25,7 @@ COPY ./docker_manager.py .
 COPY ./context_vars.py .
 COPY ./docs_html.py .
 COPY ./security.py .
-# Multi-CLI sub-agent runtime (v0.9.2.1) — resolver + adapter package
+COPY ./auth_guard.py .
 COPY ./cli_runtime.py .
 COPY ./cli_adapters/ ./cli_adapters/
 COPY ./static/ ./static/
@@ -40,5 +40,6 @@ EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"
 
-# Run uvicorn (production mode, no reload)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "2"]
+# Preflight runs in this process. A worker-only lifespan check is not enough:
+# uvicorn --workers respawns a worker that exits during startup.
+CMD ["sh", "-c", "python -c 'import auth_guard,sys; sys.exit(auth_guard.startup_preflight())' && exec python -m uvicorn app:app --host 0.0.0.0 --port 8081 --workers 2 --no-proxy-headers"]

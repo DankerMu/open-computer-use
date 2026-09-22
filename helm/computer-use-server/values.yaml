@@ -191,6 +191,7 @@ secrets:
   create: false
   existingSecret: ""
 
+  ocuInternalToken: ""
   mcpApiKey: ""
   visionApiKey: ""
   anthropicAuthToken: ""

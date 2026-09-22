@@ -12,7 +12,8 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 
 | Module | Purpose |
 |--------|---------|
-| `app.py` | FastAPI application: MCP endpoint, file serving, browser/terminal proxy, system prompt API |
+| `app.py` | FastAPI application: guarded MCP endpoint, file serving, browser/terminal proxy, system prompt API |
+| `auth_guard.py` | Fail-closed startup validation, service auth, peer denial and CORS policy |
 | `mcp_tools.py` | MCP tool definitions: `bash_tool`, `view`, `create_file`, `str_replace`, `sub_agent` |
 | `docker_manager.py` | Container lifecycle: create, stop, cleanup, health checks, volume mounts |
 | `skill_manager.py` | Skill registry: fetch user skills, cache ZIPs, generate system prompt XML |
@@ -52,7 +53,10 @@ All via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_API_KEY` | _(empty)_ | Bearer token for MCP endpoint auth |
+| `OCU_INTERNAL_TOKEN` | _(required)_ | Service credential; REST/WS use `Authorization: Bearer`, MCP uses `X-OCU-Internal-Token` |
+| `MCP_API_KEY` | _(empty)_ | Optional second MCP Bearer credential; required in addition to the internal token when set |
+| `OCU_SANDBOX_SUBNET` | _(empty)_ | Optional denied transport subnet, validated at startup |
+| `OCU_WEBUI_ORIGIN` | _(empty)_ | Optional sole CORS origin, validated at startup |
 | `DOCKER_IMAGE` | `open-computer-use:latest` | Sandbox container image |
 | `COMMAND_TIMEOUT` | `120` | Bash command timeout (seconds) |
 | `SUB_AGENT_TIMEOUT` | `3600` | Sub-agent timeout (seconds) |
@@ -70,7 +74,7 @@ All via environment variables:
 ```bash
 cd computer-use-server
 pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port 8081
+OCU_INTERNAL_TOKEN=replace-me uvicorn app:app --host 0.0.0.0 --port 8081 --no-proxy-headers
 ```
 
 Requires Docker socket access and a built workspace image.

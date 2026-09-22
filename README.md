@@ -184,6 +184,8 @@ The server speaks standard MCP over Streamable HTTP. Point any MCP client at you
 - **Self-hosted**: `http://localhost:8081/mcp`. Quick sanity check:
   ```bash
   curl -X POST http://localhost:8081/mcp \
+    -H "X-OCU-Internal-Token: $OCU_INTERNAL_TOKEN" \
+    -H "Authorization: Bearer $MCP_API_KEY" \
     -H "Content-Type: application/json" \
     -H "X-Chat-Id: test" \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
@@ -198,11 +200,12 @@ All settings via `.env`:
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | — | LLM API key (any OpenAI-compatible) |
 | `OPENAI_API_BASE_URL` | — | Custom API base URL (OpenRouter, etc.) |
-| `MCP_API_KEY` | — | Bearer token for MCP endpoint |
+| `OCU_INTERNAL_TOKEN` | — | **Required** service credential; REST/WS use Bearer and MCP uses `X-OCU-Internal-Token` |
+| `MCP_API_KEY` | — | Optional second MCP Bearer credential; when configured it is required in addition to `OCU_INTERNAL_TOKEN` |
 | `DOCKER_IMAGE` | `open-computer-use:latest` | Sandbox container image |
 | `COMMAND_TIMEOUT` | `120` | Bash tool timeout (seconds) |
 | `SUB_AGENT_TIMEOUT` | `3600` | Sub-agent timeout (seconds) |
-| `SINGLE_USER_MODE` | — | `true` = one container, no chat ID needed; `false` = require X-Chat-Id; unset = lenient |
+| `SINGLE_USER_MODE` | — | Tool-level fallback only; protected entrypoints still require an explicit non-default chat ID |
 | `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-reachable URL of the Computer Use server. Baked into `/system-prompt` and returned to the Open WebUI filter in the `X-Public-Base-URL` response header — **single source of truth** for the public URL. [Open WebUI filter URL requirements](docs/openwebui-filter.md#two-url-roles--public-server-env-and-internal-filtertool-valve). |
 | `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS`, `ORCHESTRATOR_URL`, `TOOL_RESULT_MAX_CHARS`, `TOOL_RESULT_PREVIEW_CHARS` | — | Settings on the **`open-webui` container** (not CU-server). Required when embedding — see [Required setup when embedding Open WebUI](#required-setup-when-embedding-open-webui-into-your-own-stack). |
 | `POSTGRES_PASSWORD` | `openwebui` | PostgreSQL password |
@@ -411,14 +414,14 @@ docker exec <postgres-container> psql -U openwebui -d openwebui -c \
 ### Current model
 
 - **Docker socket**: The server needs Docker socket access to manage sandbox containers. This grants significant host access — run in a trusted environment only.
-- **MCP_API_KEY**: Set a strong random key in production. Without it, anyone with network access to port 8081 can execute arbitrary commands in containers.
+- **Service authorization**: `OCU_INTERNAL_TOKEN` is mandatory at startup and on every chat-bound HTTP/WebSocket request plus identity endpoints. It is never accepted from a URL. MCP carries it in `X-OCU-Internal-Token`; `MCP_API_KEY`, when configured, remains a separate Bearer credential.
+- **Sandbox peer and browser controls**: `OCU_SANDBOX_SUBNET` denies transport peers before handlers, and `OCU_WEBUI_ORIGIN` permits only that origin via CORS. These are defense-in-depth controls, not a substitute for network isolation.
 - **Sandbox isolation**: Each chat session runs in a separate container with resource limits (2GB RAM, 1 CPU). On Docker Compose, containers use the standard runtime (runc) and share the host kernel. The [Kubernetes Helm chart](docs/kubernetes.md) defaults to rootless Podman — user namespaces plus AppArmor, and no privileged container — and can opt into [Kata Containers](docs/kata-runtime.md) for a hypervisor-grade boundary. On Compose, switch to gVisor (see roadmap). Containers have network access by default.
 - **POSTGRES_PASSWORD**: Change the default password in `.env` for production.
 
 ### Known limitations
 
-- **Unauthenticated file/preview endpoints**: `/files/{chat_id}/`, `/api/outputs/{chat_id}`, `/browser/{chat_id}/`, `/terminal/{chat_id}/` — accessible to anyone who knows the chat ID. Chat IDs are UUIDs (hard to guess but not a real security boundary).
-- **No per-user auth on server**: The MCP server trusts whoever sends a valid `MCP_API_KEY`. User identity (`X-User-Email`) is passed by the client but not verified server-side.
+- **No per-user authorization inside OCU**: OCU trusts user identity only after the WebUI service authorization boundary. It does not verify user sessions itself.
 - **Credentials in HTTP headers**: API keys (GitLab, Anthropic, MCP tokens) are passed as HTTP headers from client to server. Safe within Docker network, but use HTTPS if exposing externally.
 - **Default admin credentials**: `admin@open-computer-use.dev` / `admin` — change immediately in multi-user setups.
 

@@ -94,12 +94,16 @@
     },
     "secrets": {
       "type": "object",
-      "$comment": "Either secrets.create=true with mcpApiKey, or secrets.existingSecret must be set.",
+      "$comment": "Either secrets.create=true with both service credentials, or secrets.existingSecret must be set.",
       "oneOf": [
         {
           "properties": {
             "create": {
               "const": true
+            },
+            "ocuInternalToken": {
+              "type": "string",
+              "minLength": 1
             },
             "mcpApiKey": {
               "type": "string",
@@ -108,6 +112,7 @@
           },
           "required": [
             "create",
+            "ocuInternalToken",
             "mcpApiKey"
           ]
         },

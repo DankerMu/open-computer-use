@@ -4,12 +4,12 @@ End-to-end tests against a real `computer-use-server` container that spawns real
 
 ## What's covered
 
-| Concern | Test file | Why it matters |
+| Contract | Test | Regression prevented |
 |---|---|---|
-| `MCP_API_KEY` auth (valid / missing / wrong) | `test_mcp_auth.py` | Refactoring out the `verify_mcp_auth` dependency would silently make `/mcp` public. Unit tests can't catch this — the dependency is wired at app construction. |
+| Independent `OCU_INTERNAL_TOKEN` and `MCP_API_KEY` auth (valid / missing / wrong / substituted) | `test_mcp_auth.py` | A mounted MCP refactor cannot open identity trust or let either credential replace the other. |
 | `tools/list` matches expected name set | `test_mcp_tools.py` | A typo (`bash_tool` → `bash_too1`) ships green today; this pins the surface. |
 | `tools/call bash_tool` end-to-end echo | `test_mcp_tools.py` | Catches workspace image misconfig, Docker socket missing, response wrapping regressions, sub-agent dispatch breakage. |
-| `/health` is unauthenticated and returns `healthy` | `test_mcp_tools.py` | k8s probes break if either changes. |
+| `/health` is unauthenticated and returns `healthy` | `test_mcp_tools.py` | Kubernetes probes break if either changes. |
 | Workspace container has the prod labels (managed-by, chat-id, tool) | `test_workspace_lifecycle.py` | Drift in any of these labels breaks the cleanup cron's filter in prod. |
 | `/mnt/user-data/{uploads,outputs}` bind mounts | `test_workspace_lifecycle.py` | Compose USER_DATA_BASE_PATH must round-trip into the spawned container. |
 

@@ -101,7 +101,7 @@
     <div class="section" style="background: #e8f5e9; padding: 20px; border-radius: 8px; border: 2px solid #4CAF50;">
         <h2>MCP Endpoint</h2>
         <p><strong>URL:</strong> <code>POST http://localhost:8081/mcp</code></p>
-        <p><strong>Auth:</strong> <code>Authorization: Bearer &lt;MCP_API_KEY&gt;</code> (the value of the <code>MCP_API_KEY</code> env var on the server).</p>
+        <p><strong>Auth:</strong> <code>X-OCU-Internal-Token: &lt;OCU_INTERNAL_TOKEN&gt;</code> is required. <code>Authorization: Bearer &lt;MCP_API_KEY&gt;</code> is also required when <code>MCP_API_KEY</code> is configured.</p>
 
         <h3>Available Tools</h3>
         <ul class="tool-list">
@@ -114,6 +114,7 @@
 
         <h3>Step 1: Initialize (get session ID)</h3>
         <pre>curl -sD - -X POST "http://localhost:8081/mcp" \
+  -H "X-OCU-Internal-Token: &lt;OCU_INTERNAL_TOKEN&gt;" \
   -H "Authorization: Bearer &lt;MCP_API_KEY&gt;" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -124,6 +125,7 @@
 
         <h3>Step 2: Call a tool</h3>
         <pre>curl -s -X POST "http://localhost:8081/mcp" \
+  -H "X-OCU-Internal-Token: &lt;OCU_INTERNAL_TOKEN&gt;" \
   -H "Authorization: Bearer &lt;MCP_API_KEY&gt;" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -134,9 +136,10 @@
         <h3>Required Headers</h3>
         <table>
             <tr><th>Header</th><th>Description</th></tr>
-            <tr><td><code>Authorization</code></td><td><code>Bearer &lt;MCP_API_KEY&gt;</code></td></tr>
+            <tr><td><code>X-OCU-Internal-Token</code></td><td><code>OCU_INTERNAL_TOKEN</code> service credential</td></tr>
+            <tr><td><code>Authorization</code></td><td><code>Bearer &lt;MCP_API_KEY&gt;</code> when configured</td></tr>
             <tr><td><code>Accept</code></td><td><code>application/json, text/event-stream</code></td></tr>
-            <tr><td><code>X-Chat-Id</code></td><td>Unique session ID (one sandbox container per chat ID)</td></tr>
+            <tr><td><code>X-Chat-Id</code></td><td>Unique non-default session ID (one sandbox container per chat ID)</td></tr>
             <tr><td><code>Mcp-Session-Id</code></td><td>Session ID from the <em>initialize</em> response (required on subsequent calls)</td></tr>
             <tr><td><code>X-MCP-Servers</code></td><td><em>(optional)</em> Comma-separated external MCP servers for <code>sub_agent</code> — see below</td></tr>
         </table>
@@ -181,7 +184,7 @@
     <div class="section" style="background: #e3f2fd; padding: 20px; border-radius: 8px; border: 2px solid #1976d2;">
         <h2>System Prompt</h2>
         <p>Ready-made system prompt that teaches an AI how to use this server (files, skills, tools). Use it in n8n, custom agents, or any integration.</p>
-        <pre>curl http://localhost:8081/system-prompt</pre>
+        <pre>curl -H "Authorization: Bearer &lt;OCU_INTERNAL_TOKEN&gt;" http://localhost:8081/system-prompt</pre>
         <p>The server owns the public URL (<code>PUBLIC_BASE_URL</code> env var) and bakes it into the returned prompt; callers no longer need to pass <code>file_base_url</code>/<code>archive_url</code> query params (legacy, still accepted for backward compatibility).</p>
     </div>
 

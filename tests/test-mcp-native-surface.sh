@@ -17,6 +17,13 @@
 set -euo pipefail
 
 SERVER_URL="${1:-http://localhost:8081}"
+INTERNAL_TOKEN="${OCU_INTERNAL_TOKEN:?set OCU_INTERNAL_TOKEN for the server and smoke client}"
+MCP_TOKEN="${MCP_API_KEY:?set MCP_API_KEY for the server and smoke client}"
+REST_AUTH=(-H "Authorization: Bearer ${INTERNAL_TOKEN}")
+MCP_AUTH=(
+    -H "X-OCU-Internal-Token: ${INTERNAL_TOKEN}"
+    -H "Authorization: Bearer ${MCP_TOKEN}"
+)
 PASSED=0
 FAILED=0
 
@@ -50,21 +57,21 @@ pass "server reachable at ${SERVER_URL}"
 
 banner "Tier 6 — HTTP /system-prompt (header priority + aliases + response header)"
 
-BODY=$(curl -sS "${SERVER_URL}/system-prompt?chat_id=smoke-qry")
+BODY=$(curl -sS "${REST_AUTH[@]}" "${SERVER_URL}/system-prompt?chat_id=smoke-qry")
 if echo "$BODY" | grep -q "/files/smoke-qry"; then
     pass "query chat_id substituted into /files/ URL"
 else
     fail "query chat_id NOT substituted (expected /files/smoke-qry)"
 fi
 
-BODY=$(curl -sS -H "X-Chat-Id: smoke-hdr" "${SERVER_URL}/system-prompt?chat_id=smoke-qry-loses")
+BODY=$(curl -sS "${REST_AUTH[@]}" -H "X-Chat-Id: smoke-hdr" "${SERVER_URL}/system-prompt?chat_id=smoke-qry-loses")
 if echo "$BODY" | grep -q "/files/smoke-hdr" && ! echo "$BODY" | grep -q "/files/smoke-qry-loses"; then
     pass "header wins over query (smoke-hdr present, smoke-qry-loses absent)"
 else
     fail "header priority broken"
 fi
 
-BODY=$(curl -sS -H "X-OpenWebUI-Chat-Id: smoke-alias" "${SERVER_URL}/system-prompt")
+BODY=$(curl -sS "${REST_AUTH[@]}" -H "X-OpenWebUI-Chat-Id: smoke-alias" "${SERVER_URL}/system-prompt")
 if echo "$BODY" | grep -q "/files/smoke-alias"; then
     pass "X-OpenWebUI-Chat-Id alias honored"
 else
@@ -72,7 +79,7 @@ else
 fi
 
 # X-Public-Base-URL response header present (Open WebUI filter depends on it)
-HDRS=$(curl -sS -D - -o /dev/null "${SERVER_URL}/system-prompt?chat_id=smoke")
+HDRS=$(curl -sS "${REST_AUTH[@]}" -D - -o /dev/null "${SERVER_URL}/system-prompt?chat_id=smoke")
 if echo "$HDRS" | grep -qi "^x-public-base-url:"; then
     pass "X-Public-Base-URL response header emitted"
 else
@@ -80,7 +87,7 @@ else
 fi
 
 # Foundation: self-identification header first
-BODY=$(curl -sS "${SERVER_URL}/system-prompt?chat_id=smoke-id")
+BODY=$(curl -sS "${REST_AUTH[@]}" "${SERVER_URL}/system-prompt?chat_id=smoke-id")
 if echo "$BODY" | grep -q "This is the contents of /home/assistant/README.md"; then
     pass "rendered prompt carries README.md self-identification header"
 else
@@ -146,6 +153,7 @@ INIT_PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolV
 # Without it, tools/list / resources/list error out (or worse, silently
 # allocate a fresh session and lose the chat context that initialize set).
 STATUS=$(curl -s -D /tmp/mcp-init.hdrs -o /tmp/mcp-init.out -w '%{http_code}' -X POST "${SERVER_URL}/mcp" \
+    "${MCP_AUTH[@]}" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     -H 'X-Chat-Id: smoke-mcp' \
@@ -166,6 +174,7 @@ if [ "$STATUS" = "200" ]; then
     else
         # tools/list — pass session id so we stay on the same logical session
         curl -sS -X POST "${SERVER_URL}/mcp" \
+            "${MCP_AUTH[@]}" \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
             -H 'X-Chat-Id: smoke-mcp' \
@@ -181,6 +190,7 @@ if [ "$STATUS" = "200" ]; then
         # for a fresh smoke chat that has no uploads; the test verifies the
         # method itself works (not an error response).
         curl -sS -X POST "${SERVER_URL}/mcp" \
+            "${MCP_AUTH[@]}" \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
             -H 'X-Chat-Id: smoke-mcp' \

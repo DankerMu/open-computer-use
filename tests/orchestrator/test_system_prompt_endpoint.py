@@ -28,7 +28,11 @@ class SystemPromptEndpointContract(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        os_token = "ocu-test-internal-token"
+        import os
+        os.environ["OCU_INTERNAL_TOKEN"] = os_token
         cls.client = TestClient(app_module.app)
+        cls.client.headers.update({"Authorization": f"Bearer {os_token}"})
         cls.public_base_url = app_module.PUBLIC_BASE_URL
 
     def setUp(self):
