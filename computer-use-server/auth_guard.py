@@ -7,8 +7,7 @@ REST and WebSocket handshakes accept only ``Authorization: Bearer`` with
 ``X-OCU-Internal-Token`` and keeps ``Authorization: Bearer`` for
 ``MCP_API_KEY``. The two secrets do not substitute for each other.
 
-Policy is read at request time so test reloads and worker processes see the
-environment they were started with. ``startup_preflight`` is the process-level
+Policy is read at request time. ``startup_preflight`` is the process-level
 check the packaged command runs before uvicorn's multi-worker supervisor.
 """
 
@@ -25,9 +24,9 @@ from security import sanitize_chat_id
 INTERNAL_HEADER = "x-ocu-internal-token"
 _TRANSIENT_PREFIXES = ("temporary:", "local:", "channel:")
 
-# Chat-bound and identity surfaces. Health, runtime-cli, docs and static stay
-# outside this set; the sandbox-peer deny rule still applies to every HTTP
-# and WebSocket scope.
+# Chat-bound route prefixes and exact identity routes are separate policies.
+# Health, runtime-cli, docs and static stay outside both lists; the sandbox-peer
+# deny rule still applies to every HTTP and WebSocket scope.
 _GUARDED_PREFIXES = (
     "/api/uploads/",
     "/files/",
@@ -35,10 +34,8 @@ _GUARDED_PREFIXES = (
     "/browser/",
     "/terminal/",
     "/preview/",
-    "/system-prompt",
-    "/skill-list",
-    "/skill-mounts",
 )
+_IDENTITY_PATHS = frozenset(("/system-prompt", "/skill-list", "/skill-mounts"))
 
 
 class AuthGuardError(Exception):
@@ -48,12 +45,17 @@ class AuthGuardError(Exception):
         self.detail = detail
 
 
+def _is_http_safe_credential(value: str) -> bool:
+    """Accept visible ASCII only, valid in both Bearer and internal-header forms."""
+    return bool(value) and all(0x21 <= ord(character) <= 0x7E for character in value)
+
+
 def startup_preflight() -> int:
     """Return 0 when startup config is usable, else 1. Never serves traffic."""
     token = os.environ.get("OCU_INTERNAL_TOKEN", "")
-    if not token.strip():
+    if not _is_http_safe_credential(token):
         print(
-            "OCU_INTERNAL_TOKEN is required and must be non-blank. "
+            "OCU_INTERNAL_TOKEN must be a non-empty HTTP-safe credential. "
             "Refusing to start.",
             file=sys.stderr,
         )
@@ -76,11 +78,6 @@ def startup_preflight() -> int:
         )
         return 1
     return 0
-
-
-def reload_policy() -> None:
-    """Tests change env after import; policy is read live, so this is a no-op."""
-    return None
 
 
 def _valid_origin(value: str) -> bool:
@@ -136,19 +133,30 @@ def peer_denied(scope) -> bool:
     return address in network
 
 
+def _credential_matches(presented: str, secret: str) -> bool:
+    """Compare raw HTTP field bytes without changing configured secret policy."""
+    try:
+        return hmac.compare_digest(
+            presented.encode("latin-1"),
+            secret.encode("latin-1"),
+        )
+    except UnicodeEncodeError:
+        return False
+
+
 def bearer_matches(headers: dict[str, str], secret: str) -> bool:
     presented = headers.get("authorization", "")
     if not presented.startswith("Bearer ") or not secret:
         return False
-    return hmac.compare_digest(presented[7:], secret)
+    return _credential_matches(presented[7:], secret)
 
 
 def internal_header_matches(headers: dict[str, str]) -> bool:
     presented = headers.get(INTERNAL_HEADER, "")
     secret = _token()
-    if not presented or not secret.strip():
+    if not presented or not secret:
         return False
-    return hmac.compare_digest(presented, secret)
+    return _credential_matches(presented, secret)
 
 
 def canonical_chat_id(value: str) -> str:
@@ -196,15 +204,15 @@ def _query_chat_id(scope) -> str | None:
 
 
 def _is_identity_path(path: str) -> bool:
-    return path in {"/system-prompt", "/skill-list", "/skill-mounts"}
+    return path in _IDENTITY_PATHS
 
 
 
 
 def _guarded(path: str) -> bool:
-    if _is_identity_path(path):
-        return True
-    return any(path.startswith(prefix) for prefix in _GUARDED_PREFIXES if prefix.endswith("/"))
+    return _is_identity_path(path) or any(
+        path.startswith(prefix) for prefix in _GUARDED_PREFIXES
+    )
 
 
 def authorize_http(scope) -> None:
@@ -215,7 +223,7 @@ def authorize_http(scope) -> None:
     if not _guarded(path):
         return
     headers = _headers(scope)
-    if not bearer_matches(headers, _token().strip()):
+    if not bearer_matches(headers, _token()):
         raise AuthGuardError(401, "Unauthorized")
     raw = _chat_id_from_path(path)
     if raw is None and _is_identity_path(path):
@@ -247,13 +255,11 @@ def authorize_mcp(scope) -> str:
 
 
 def cors_allow_origin(request_origin: str | None) -> str | None:
-    """Return the configured origin only. Missing config grants nothing."""
+    """Return the configured ASCII origin only. Missing config grants nothing."""
     allowed = _origin()
-    if not allowed or not request_origin:
+    if not allowed or not request_origin or not request_origin.isascii():
         return None
-    if hmac.compare_digest(request_origin, allowed):
-        return allowed
-    return None
+    return allowed if request_origin == allowed else None
 
 
 _CORS_ALLOW_HEADERS = (

@@ -10,6 +10,7 @@ the guard.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -158,6 +159,45 @@ def _peer_client(app, host, port):
 
     return TestClient(_app)
 
+
+def _raw_http_response(app, path, headers, method="GET"):
+    """Exercise the ASGI boundary with raw header bytes TestClient cannot send."""
+    messages = []
+    received = False
+
+    async def receive():
+        nonlocal received
+        if received:
+            return {"type": "http.disconnect"}
+        received = True
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": headers,
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "root_path": "",
+    }
+    asyncio.run(app(scope, receive, send))
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    response_headers = {
+        name.lower(): value for name, value in start.get("headers") or []
+    }
+    return start["status"], response_headers
+
+
+
 class TestStartupFailClosed:
     def test_packaged_command_without_token_parent_exits_nonzero(self):
         """The production multi-worker command itself must fail, not a child."""
@@ -242,6 +282,35 @@ class TestStartupFailClosed:
             timeout=15,
         )
         assert completed.returncode != 0
+
+    @pytest.mark.parametrize(
+        "token",
+        (
+            f" {INTERNAL}",
+            f"{INTERNAL} ",
+            f"{INTERNAL}\n",
+            f"{INTERNAL}\x7f",
+            f"{INTERNAL}\u00e9",
+        ),
+    )
+    def test_malformed_internal_token_prevents_startup(self, token):
+        env = os.environ.copy()
+        env["OCU_INTERNAL_TOKEN"] = token
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import auth_guard; raise SystemExit(auth_guard.startup_preflight())",
+            ],
+            cwd=SERVER_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert completed.returncode != 0
+        assert "OCU_INTERNAL_TOKEN" in completed.stderr
+
 
     def test_configured_token_preflight_succeeds(self):
         env = os.environ.copy()
@@ -422,6 +491,27 @@ class TestHttpAuthorization:
         )
         assert response.status_code == 400
 
+    @pytest.mark.parametrize("path", IDENTITY_ROUTES)
+    @pytest.mark.parametrize("chat_id", ("default", quote("temporary:abc", safe="")))
+    def test_each_identity_endpoint_rejects_supplied_invalid_query_chat_id(
+        self, client, path, chat_id
+    ):
+        response = client.get(
+            path,
+            headers=_bearer(),
+            params={"chat_id": chat_id},
+        )
+        assert response.status_code == 400
+
+    def test_system_prompt_rejects_invalid_legacy_file_base_url_chat_id(self, client):
+        response = client.get(
+            "/system-prompt",
+            headers=_bearer(),
+            params={"file_base_url": "https://legacy.example/files/temporary%3Aabc"},
+        )
+        assert response.status_code == 400
+
+
     @pytest.mark.parametrize("path", ("/health", "/api/runtime/cli", "/", "/static/preview.js"))
     def test_public_routes_stay_available_without_token(self, client, path):
         response = client.get(path)
@@ -454,9 +544,6 @@ class TestHttpAuthorization:
 
     def test_missing_origin_grants_no_cross_origin_header(self, client, monkeypatch):
         monkeypatch.delenv("OCU_WEBUI_ORIGIN", raising=False)
-        import auth_guard
-
-        auth_guard.reload_policy()
         response = client.get(
             "/health",
             headers={"Origin": "https://foreign.example"},
@@ -494,6 +581,59 @@ class TestHttpAuthorization:
         assert foreign.headers.get("access-control-allow-origin") != "*"
         assert preflight.headers.get("access-control-allow-origin") != "https://foreign.example"
         assert preflight.headers.get("access-control-allow-origin") != "*"
+
+
+
+class TestMalformedHeaderBytes:
+    def test_non_ascii_bearer_bytes_are_401(self, app_module):
+        status, _ = _raw_http_response(
+            app_module.app,
+            f"/api/outputs/{CHAT}",
+            [(b"authorization", b"Bearer \xff")],
+        )
+        assert status == 401
+
+    def test_non_ascii_internal_header_bytes_are_401(self, app_module):
+        status, _ = _raw_http_response(
+            app_module.app,
+            "/mcp",
+            [(b"x-ocu-internal-token", b"\xff")],
+            method="POST",
+        )
+        assert status == 401
+
+    @pytest.mark.parametrize(
+        ("path", "headers", "method", "expected_status"),
+        (
+            ("/health", [(b"origin", b"https://foreign.\xff")], "GET", 200),
+            (
+                f"/api/outputs/{CHAT}",
+                [(b"origin", b"https://foreign.\xff")],
+                "GET",
+                401,
+            ),
+            (
+                f"/api/outputs/{CHAT}",
+                [
+                    (b"origin", b"https://foreign.\xff"),
+                    (b"access-control-request-method", b"GET"),
+                ],
+                "OPTIONS",
+                403,
+            ),
+        ),
+    )
+    def test_non_ascii_origin_never_grants_cors(
+        self, app_module, path, headers, method, expected_status
+    ):
+        status, response_headers = _raw_http_response(
+            app_module.app,
+            path,
+            headers,
+            method=method,
+        )
+        assert status == expected_status
+        assert b"access-control-allow-origin" not in response_headers
 
 
 class TestUnsafeChatIds:
@@ -600,22 +740,40 @@ class TestWebSockets:
 
 class TestMountedMcp:
     def test_mcp_without_internal_token_is_401_even_with_api_key(self, client):
-        response = client.post(
+        empty = client.post(
             "/mcp",
             headers=_mcp_headers(internal=""),
             json=INIT_BODY,
         )
-        # Drop the empty header the helper inserted.
+        assert empty.status_code == 401
+        assert INTERNAL not in empty.text
         headers = _mcp_headers()
         headers.pop("X-OCU-Internal-Token")
-        response = client.post("/mcp", headers=headers, json=INIT_BODY)
-        assert response.status_code == 401
+        missing = client.post("/mcp", headers=headers, json=INIT_BODY)
+        assert missing.status_code == 401
+        assert INTERNAL not in missing.text
 
     def test_mcp_without_api_key_is_401_even_with_internal_token(self, client):
         headers = _mcp_headers()
         headers.pop("Authorization")
         response = client.post("/mcp", headers=headers, json=INIT_BODY)
         assert response.status_code == 401
+
+    def test_mcp_without_api_key_keeps_internal_token_mandatory(self, client, monkeypatch):
+        monkeypatch.delenv("MCP_API_KEY", raising=False)
+        headers = _mcp_headers()
+        headers.pop("Authorization")
+        allowed = client.post("/mcp", headers=headers, json=INIT_BODY)
+        assert allowed.status_code == 200
+        assert f"/files/{CHAT}" in _instructions(allowed)
+
+        missing = dict(headers)
+        missing.pop("X-OCU-Internal-Token")
+        assert client.post("/mcp", headers=missing, json=INIT_BODY).status_code == 401
+
+        wrong = _mcp_headers(internal=OTHER)
+        wrong.pop("Authorization")
+        assert client.post("/mcp", headers=wrong, json=INIT_BODY).status_code == 401
 
     def test_credentials_do_not_substitute(self, client):
         internal_as_bearer = _mcp_headers(mcp=INTERNAL)
