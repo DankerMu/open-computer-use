@@ -54,6 +54,7 @@ All via environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OCU_INTERNAL_TOKEN` | _(required)_ | Service credential; REST/WS use `Authorization: Bearer`, MCP uses `X-OCU-Internal-Token` |
+| `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-facing base baked into prompt file links and emitted as `X-Public-Base-URL`. A configured value must not end with `/`; use the deployed proxied `/ocu` base without the trailing slash. |
 | `MCP_API_KEY` | _(empty)_ | Optional second MCP Bearer credential; required in addition to the internal token when set |
 | `OCU_SANDBOX_SUBNET` | _(empty)_ | Optional denied transport subnet, validated at startup |
 | `OCU_WEBUI_ORIGIN` | _(empty)_ | Optional sole CORS origin, validated at startup |

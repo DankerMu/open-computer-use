@@ -18,6 +18,8 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from urllib.parse import quote
 
 import pytest
@@ -30,6 +32,22 @@ INTERNAL = "ocu-test-internal-token"
 MCP_KEY = "ocu-test-mcp-api-key"
 OTHER = "not-the-configured-secret"
 ORIGIN = "https://webui.example"
+
+
+def _packaged_server_command(port: int) -> str:
+    return (
+        "python -c 'import auth_guard,sys; sys.exit(auth_guard.startup_preflight())' "
+        "&& exec python -m uvicorn app:app --host 0.0.0.0 --port "
+        f"{port} --workers 2 --no-proxy-headers"
+    )
+
+
+def _unused_local_port() -> int:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    listener.close()
+    return port
 SUBNET = "10.90.0.0/24"
 SANDBOX_PEER = "10.90.0.8"
 OUTSIDE_PEER = "10.90.1.8"
@@ -246,6 +264,62 @@ class TestStartupFailClosed:
             f"stdout={completed.stdout[-500:]}\nstderr={completed.stderr[-800:]}"
         )
 
+    def test_trailing_public_base_stops_the_packaged_parent_before_listening(self):
+        env = os.environ.copy()
+        env["OCU_INTERNAL_TOKEN"] = INTERNAL
+        env["MCP_API_KEY"] = MCP_KEY
+        env["OCU_SANDBOX_SUBNET"] = SUBNET
+        env["OCU_WEBUI_ORIGIN"] = ORIGIN
+        env["PUBLIC_BASE_URL"] = "https://webui.example/ocu/"
+        script = textwrap.dedent(
+            """
+            import os, socket, subprocess, sys, time
+            os.chdir(sys.argv[1])
+            sock = socket.socket(); sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            command = (
+                "python -c 'import auth_guard,sys; sys.exit(auth_guard.startup_preflight())' "
+                "&& exec python -m uvicorn app:app --host 0.0.0.0 --port %s "
+                "--workers 2 --no-proxy-headers"
+            ) % port
+            proc = subprocess.Popen(
+                ["sh", "-c", command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                code = proc.poll()
+                if code is not None:
+                    stdout, stderr = proc.communicate()
+                    sys.exit(
+                        0
+                        if code != 0 and "PUBLIC_BASE_URL" in stdout + stderr
+                        else 2
+                    )
+                time.sleep(0.1)
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            sys.exit(3)
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(SERVER_DIR)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert completed.returncode == 0, (
+            "packaged command did not reject trailing PUBLIC_BASE_URL before "
+            f"listening: rc={completed.returncode}"
+        )
+
     def test_malformed_subnet_prevents_packaged_startup(self):
         env = os.environ.copy()
         env["OCU_INTERNAL_TOKEN"] = INTERNAL
@@ -331,12 +405,13 @@ class TestStartupFailClosed:
         )
         assert completed.returncode == 0, completed.stderr[-500:]
 
-    def test_packaged_command_with_credentials_serves_health_and_mcp(self):
+    def test_packaged_command_with_valid_public_base_serves_guarded_prompt_and_mcp(self):
         env = os.environ.copy()
         env["OCU_INTERNAL_TOKEN"] = INTERNAL
         env["MCP_API_KEY"] = MCP_KEY
         env["OCU_SANDBOX_SUBNET"] = SUBNET
         env["OCU_WEBUI_ORIGIN"] = ORIGIN
+        env["PUBLIC_BASE_URL"] = "https://webui.example/ocu"
         script = textwrap.dedent(
             """
             import json, os, socket, subprocess, sys, time, urllib.request
@@ -346,7 +421,7 @@ class TestStartupFailClosed:
             sock.close()
             command = (
                 "python -c 'import auth_guard,sys; sys.exit(auth_guard.startup_preflight())' "
-                "&& exec python -m uvicorn app:app --host 127.0.0.1 --port %s "
+                "&& exec python -m uvicorn app:app --host 0.0.0.0 --port %s "
                 "--workers 2 --no-proxy-headers"
             ) % port
             proc = subprocess.Popen(["sh", "-c", command])
@@ -365,6 +440,18 @@ class TestStartupFailClosed:
                         time.sleep(0.1)
                 else:
                     sys.exit(3)
+                prompt_request = urllib.request.Request(
+                    "http://127.0.0.1:%s/system-prompt?chat_id=startup-health-chat" % port,
+                    headers={"Authorization": "Bearer " + sys.argv[2]},
+                )
+                with urllib.request.urlopen(prompt_request, timeout=5) as response:
+                    prompt = response.read()
+                    public_base = response.headers.get("X-Public-Base-URL")
+                if (
+                    public_base != sys.argv[4]
+                    or (sys.argv[4] + "/files/startup-health-chat").encode() not in prompt
+                ):
+                    sys.exit(5)
                 body = json.dumps({
                     "jsonrpc": "2.0", "id": 1, "method": "initialize",
                     "params": {"protocolVersion": "2025-03-26", "capabilities": {},
@@ -395,14 +482,22 @@ class TestStartupFailClosed:
             """
         )
         completed = subprocess.run(
-            [sys.executable, "-c", script, str(SERVER_DIR), INTERNAL, MCP_KEY],
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(SERVER_DIR),
+                INTERNAL,
+                MCP_KEY,
+                "https://webui.example/ocu",
+            ],
             env=env,
             capture_output=True,
             text=True,
             timeout=25,
         )
         assert completed.returncode == 0, (
-            f"packaged command did not serve health and MCP: rc={completed.returncode}\n"
+            f"packaged command did not serve guarded prompt and MCP: rc={completed.returncode}\n"
             f"stdout={completed.stdout[-500:]}\nstderr={completed.stderr[-800:]}"
         )
 

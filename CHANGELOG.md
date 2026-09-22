@@ -13,6 +13,20 @@
   server-matching ordinary spaces. Shared `default` and temporary chat IDs are
   rejected at the protected boundary.
 
+- **Breaking public-base validation and authenticated filter retrieval.** A configured
+  `PUBLIC_BASE_URL` ending in `/` now stops OCU before it serves; remove that slash
+  before rollout and keep the deployed value at the proxied `/ocu` base. Unset and
+  empty values retain the default, and internal `ORCHESTRATOR_URL` remains
+  trailing-slash tolerant. The filter reads `OCU_INTERNAL_TOKEN` only from its process
+  environment, sends it as Bearer authentication, rejects redirects and missing
+  public-base metadata instead of falling back to its internal `ORCHESTRATOR_URL`,
+  and does not reuse cached prompts after missing credentials, authorization failures,
+  or an authority change.
+- **Concrete-file preview links replace preview-shell decoration.** The filter labels
+  the first current-chat file URL under the public base, preserves its encoded suffix,
+  keeps the archive toggle separate, and leaves browser-only output and archive-only
+  URLs unchanged.
+
 
 - **TypeScript 7 removes the JavaScript compiler API from the sandbox image.** The
   image now ships `typescript@7.0.2`, the native compiler. `require('typescript')`

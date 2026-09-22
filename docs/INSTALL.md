@@ -28,7 +28,7 @@ docker compose -f docker-compose.webui.yml up --build
 
 `scripts/check-config.sh` reports `[OK]` / `[WARN]` / `[ERR]` for each setting and exits 1 if anything is likely to break end-to-end (e.g. `PUBLIC_BASE_URL` left at the internal-DNS default, half-configured Vision group). WARNs are fine for local dev.
 
-**Re-seeding Valves after editing `.env`.** The `open-webui` container runs an init script that writes the persistent `ORCHESTRATOR_URL` Valve on **first start only** — a marker file (`/app/backend/data/.computer-use-initialized`) guards re-runs so your admin UI edits are never clobbered. `OCU_INTERNAL_TOKEN` stays in the Open WebUI server environment and the tool reads it directly on every call; it is not a Valve and is never written to the persistent Valve payload. To pick up a changed `ORCHESTRATOR_URL`, delete the marker on `open-webui` and restart it:
+**Re-seeding Valves after editing `.env`.** The `open-webui` container runs an init script that writes the persistent `ORCHESTRATOR_URL` Valve on **first start only** — a marker file (`/app/backend/data/.computer-use-initialized`) guards re-runs so your admin UI edits are never clobbered. `OCU_INTERNAL_TOKEN` stays in the Open WebUI server environment and the tool and filter read it directly on every call; it is not a Valve and is never written to the persistent Valve payload. To pick up a changed `ORCHESTRATOR_URL`, delete the marker on `open-webui` and restart it:
 
 ```bash
 docker compose -f docker-compose.webui.yml exec open-webui \
@@ -36,7 +36,7 @@ docker compose -f docker-compose.webui.yml exec open-webui \
 docker compose -f docker-compose.webui.yml restart open-webui
 ```
 
-`PUBLIC_BASE_URL` lives only on the `computer-use-server` container — it is **not** propagated into Open WebUI Valves. If you change it in `.env`, restart the server container instead: `docker compose up -d --force-recreate computer-use-server`.
+`PUBLIC_BASE_URL` lives only on the `computer-use-server` container — it is **not** propagated into Open WebUI Valves. It must not end with `/`. If you change it in `.env`, restart the server container instead: `docker compose up -d --force-recreate computer-use-server`.
 
 Open http://localhost:3000 — login with `admin@open-computer-use.dev` / `admin`.
 
@@ -48,7 +48,7 @@ Edit `.env` before starting. Key variables:
 |----------|----------|-------------|
 | `OPENAI_API_KEY` | Yes | LLM API key (any OpenAI-compatible provider) |
 | `OPENAI_API_BASE_URL` | No | Custom API URL (OpenRouter, local vLLM, etc.) |
-| `OCU_INTERNAL_TOKEN` | Yes | Required service credential on both the Computer Use Server and Open WebUI. The tool reads it from the Open WebUI process environment on every call, sending REST Bearer and MCP `X-OCU-Internal-Token`; it is not a Valve or model tool argument. |
+| `OCU_INTERNAL_TOKEN` | Yes | Required service credential on both the Computer Use Server and Open WebUI. The tool and filter read it from the Open WebUI process environment on every call; the filter sends REST Bearer and MCP uses `X-OCU-Internal-Token`. It is not a Valve or model tool argument. |
 | `MCP_API_KEY` | No | Optional second MCP Bearer credential, required only when configured on the Computer Use Server |
 | `ANTHROPIC_AUTH_TOKEN` | No | For Claude Code sub-agent |
 | `VISION_API_KEY` | No | For describe-image skill |
