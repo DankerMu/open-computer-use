@@ -69,8 +69,9 @@ All via environment variables:
 | `BASE_DATA_DIR` | `/data` | Server-side path to chat data |
 | `CONTAINER_MEM_LIMIT` | `2g` | Container memory limit |
 | `CONTAINER_CPU_LIMIT` | `1.0` | Container CPU limit |
-| `CONTAINER_IDLE_TIMEOUT` | `600` | Auto-stop idle containers (seconds) |
-| `ENABLE_NETWORK` | `true` | Container network access |
+| `CONTAINER_IDLE_TIMEOUT` | `600` | Host-owned idle stop for a continuously observed running sandbox (seconds). Paused time and OCU downtime do not count. |
+| `OCU_IDLE_POLL_SECONDS` | `30` | Idle observation cadence. Must be a positive integer shorter than `CONTAINER_IDLE_TIMEOUT`. |
+| `OCU_SANDBOX_NO_AUTOSTART` | unset | When exactly `1`, created sandboxes receive `NO_AUTOSTART=1`. |
 | `MCP_TOKENS_URL` | _(empty)_ | Settings wrapper URL (optional) |
 | `MCP_TOKENS_API_KEY` | _(empty)_ | Settings wrapper auth key |
 

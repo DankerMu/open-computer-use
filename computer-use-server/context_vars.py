@@ -16,6 +16,10 @@ current_mcp_tokens_url: ContextVar[str] = ContextVar("current_mcp_tokens_url", d
 current_mcp_tokens_api_key: ContextVar[str] = ContextVar("current_mcp_tokens_api_key", default="")
 current_mcp_servers: ContextVar[str] = ContextVar("current_mcp_servers", default="")
 
+
+# "request" reads the calling context. "server" ignores request credentials and
+# uses only server-side fallbacks plus saved non-secret metadata.
+current_credential_source: ContextVar[str] = ContextVar("current_credential_source", default="request")
 # Pre-rendered system prompt for this request. Set by MCPContextMiddleware
 # after awaiting render_system_prompt(); read synchronously by the lowlevel
 # Server's @property def instructions when building InitializeResult.

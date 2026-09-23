@@ -39,6 +39,13 @@ from docker_manager import (
     warn_if_public_base_url_is_default,
     warn_if_mcp_api_key_missing,
     warn_subagent_cli,
+    launch_sandbox,
+    describe_sandbox,
+    record_heartbeat,
+    startup_idle_sweep,
+    reap_known_sandboxes,
+    validate_idle_configuration,
+    LifecycleError,
 )
 from security import sanitize_chat_id, safe_path
 import skill_manager
@@ -204,20 +211,38 @@ async def lifespan(app):
     """
     if startup_preflight():
         raise RuntimeError("OCU authorization startup preflight failed")
+    validate_idle_configuration()
     warn_if_public_base_url_is_default()
     warn_if_mcp_api_key_missing()
     warn_subagent_cli()
     from mcp_tools import mcp as _mcp_server
-    # Import-for-side-effect: registers @mcp.resource handlers on the
-    # FastMCP singleton. Must happen BEFORE streamable_http_app() so the
-    # resources capability is advertised in InitializeResult.
     import mcp_resources  # noqa: F401
     if _mcp_server._session_manager is None:
-        _mcp_server.streamable_http_app()  # triggers lazy init of session_manager
+        _mcp_server.streamable_http_app()
+    stop_idle = asyncio.Event()
+
+    async def _idle_reaper():
+        await asyncio.to_thread(startup_idle_sweep)
+        _timeout, poll = validate_idle_configuration()
+        while not stop_idle.is_set():
+            try:
+                await asyncio.wait_for(stop_idle.wait(), timeout=poll)
+            except asyncio.TimeoutError:
+                await asyncio.to_thread(reap_known_sandboxes)
+
+    reaper = asyncio.create_task(_idle_reaper())
     async with _mcp_server.session_manager.run():
         print("[MCP] session_manager.run() entered — /mcp endpoint is live")
-        yield
-        print("[MCP] session_manager.run() exiting")
+        try:
+            yield
+        finally:
+            stop_idle.set()
+            reaper.cancel()
+            try:
+                await reaper
+            except asyncio.CancelledError:
+                pass
+            print("[MCP] session_manager.run() exiting")
 
 app = FastAPI(
     title="Computer Use File Server + MCP",
@@ -885,92 +910,41 @@ async def stop_ttyd(chat_id: str):
 
 @app.post("/terminal/{chat_id}/restart-container", tags=["Terminal"])
 async def restart_container(chat_id: str):
-    """Restart a stopped container. Handles dead networks after deploy."""
-    chat_id = sanitize_chat_id(chat_id)
-    container = _get_container_stopped(chat_id)
-    if not container:
-        raise HTTPException(404, "No stopped container found")
-    try:
-        from docker_manager import get_docker_client, _get_compose_network_name
-        client = get_docker_client()
-
-        # Disconnect from dead networks (left over after docker-compose down/up)
-        container.reload()
-        old_nets = list(container.attrs.get("NetworkSettings", {}).get("Networks", {}).keys())
-        for net_name in old_nets:
-            try:
-                net = client.networks.get(net_name)
-                net.disconnect(container, force=True)
-            except Exception:
-                pass  # Network already dead — ignore
-
-        # Connect to current compose network (force refresh — network ID changed after deploy)
-        compose_net = _get_compose_network_name(force_refresh=True)
-        if compose_net:
-            try:
-                net = client.networks.get(compose_net)
-                net.connect(container)
-            except Exception as e:
-                print(f"[RESTART] Warning: could not connect to {compose_net}: {e}")
-
-        await asyncio.to_thread(container.start)
-        await asyncio.sleep(2)  # Wait for entrypoint
-        return {"restarted": True}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to restart: {e}")
+    """Alias of explicit internal launch. Same auth, lock, and state matrix."""
+    return await _launch_response(chat_id)
 
 
 @app.post("/terminal/{chat_id}/resurrect-container", tags=["Terminal"])
 async def resurrect_container(chat_id: str):
-    """Recreate a removed container using saved .meta.json and existing host data.
+    """Alias of explicit internal launch. Does not keep a separate recreate path."""
+    return await _launch_response(chat_id)
 
-    Used when container was removed by cron but /data/{chat_id}/.meta.json
-    still exists. Restores user identity (email, name, MCP servers) from saved metadata.
-    """
-    chat_id = sanitize_chat_id(chat_id)
-    import re as _re
-    from docker_manager import load_container_meta, _create_container, _ensure_gitlab_token
-    from context_vars import (
-        current_chat_id, current_user_email, current_user_name,
-        current_mcp_servers,
-    )
 
-    # Guard: container must not already exist
-    existing = _get_container_for_terminal(chat_id) or _get_container_stopped(chat_id)
-    if existing:
-        raise HTTPException(409, "Container already exists. Use restart-container instead.")
+def _lifecycle_http_error(exc: LifecycleError) -> HTTPException:
+    body = {"detail": str(exc), "reason": exc.reason}
+    return HTTPException(status_code=exc.status_code, detail=body)
 
-    meta = load_container_meta(chat_id)
-    if not meta:
-        raise HTTPException(404, "No .meta.json found for this chat")
 
-    # Set context vars from saved metadata (non-secret only).
-    # Tokens (ANTHROPIC_AUTH_TOKEN, VISION_*) come from computer-use-orchestrator ENV
-    # via fallback in _create_container.
-    current_chat_id.set(chat_id)
-    user_email = meta.get("user_email", "")
-    user_name = meta.get("user_name", "")
-    mcp_servers = meta.get("mcp_servers", "")
-    if user_email:
-        current_user_email.set(user_email)
-    if user_name:
-        current_user_name.set(user_name)
-    if mcp_servers:
-        current_mcp_servers.set(mcp_servers)
-
-    # Fetch fresh GitLab token by email (never stored on disk)
-    await _ensure_gitlab_token()
-
-    sanitized_id = _re.sub(r'[^a-zA-Z0-9_.-]', '-', chat_id)
-    container_name = f"owui-chat-{sanitized_id}"
-
+async def _launch_response(chat_id: str):
     try:
-        print(f"[RESURRECT] Recreating {container_name} for {user_email}")
-        await asyncio.to_thread(_create_container, chat_id, container_name)
-        await asyncio.sleep(2)  # Wait for entrypoint
-        return {"resurrected": True, "user_email": user_email}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to resurrect container: {e}")
+        return await asyncio.to_thread(launch_sandbox, canonical_chat_id(chat_id), "server")
+    except LifecycleError as exc:
+        raise _lifecycle_http_error(exc) from exc
+
+
+@app.post("/internal/launch/{chat_id}", tags=["System"])
+async def internal_launch(chat_id: str):
+    """Token-protected explicit launch. Success is observed running only."""
+    return await _launch_response(chat_id)
+
+
+@app.get("/internal/describe/{chat_id}", tags=["System"])
+async def internal_describe(chat_id: str):
+    """Token-protected non-mutating sandbox description."""
+    try:
+        return await asyncio.to_thread(describe_sandbox, canonical_chat_id(chat_id))
+    except LifecycleError as exc:
+        raise _lifecycle_http_error(exc) from exc
 
 
 @app.get("/terminal/{chat_id}/sessions", tags=["Terminal"])
@@ -1072,12 +1046,8 @@ async def kill_terminal_process(chat_id: str, pid: int):
 
 @app.get("/terminal/{chat_id}/heartbeat", tags=["Terminal"])
 async def terminal_heartbeat(chat_id: str):
-    """Reset container idle timer. Called by JS every 2 min while page is open."""
-    chat_id = sanitize_chat_id(chat_id)
-    container = _get_container_for_terminal(chat_id)
-    if container:
-        from docker_manager import _reset_shutdown_timer
-        await asyncio.to_thread(_reset_shutdown_timer, container)
+    """Extend host-owned idle expiry. Called by JS every 2 min while the page is open."""
+    await asyncio.to_thread(record_heartbeat, canonical_chat_id(chat_id))
     return {"ok": True}
 
 

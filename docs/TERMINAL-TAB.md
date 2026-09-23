@@ -32,17 +32,25 @@ Browser (xterm.js)  ←WebSocket→  Computer Use Server  ←WebSocket→  Conta
 
 ## Lifecycle
 
-1. AI calls `sub_agent` → sandbox container is created
-2. Filter injects preview link → Artifacts panel opens
-3. User sees dashboard with processes and sessions
-4. Click **"Open terminal"** → ttyd starts, Claude Code launches
-5. tmux session is persistent — reconnectable on disconnect
-6. Container stays alive while WebSocket is connected (keep-alive heartbeat)
-7. Container auto-stops after idle timeout (default: 10 min)
+1. AI calls `sub_agent` → sandbox container is created only when neither a container nor valid metadata exists.
+2. Filter injects preview link → Artifacts panel opens.
+3. User sees dashboard with processes and sessions.
+4. Click **"Open terminal"** → ttyd starts, Claude Code launches.
+5. tmux session is persistent — reconnectable on disconnect.
+6. While the page is open, `/terminal/{chat_id}/heartbeat` extends the host-owned idle window.
+7. OCU stops a continuously observed running sandbox after `CONTAINER_IDLE_TIMEOUT` (default: 10 min). External Docker pause time does not count, and no idle stop runs while OCU is down.
 
-## Dangerous Mode
+A stopped, paused, created, restarting, dead, or removed-but-metadata sandbox is not started by a tool call. Resume is explicit `POST /internal/launch/{chat_id}` or its `/terminal/{chat_id}/restart-container` and `resurrect-container` aliases. Launch answers `{"state":"running"}` only after observing running. `GET /internal/describe/{chat_id}` reads state and does not change it. Both require the internal bearer token.
 
-Toggle **"Skip permission prompts"** to run Claude Code without confirmation dialogs. Sets `NO_AUTOSTART=1` environment variable so .bashrc skips its autostart and the frontend can inject `claude --dangerously-skip-permissions` instead. Use only for trusted tasks.
+## Existing sleeper cutover
+
+Containers created before this change may contain a detached `sleep && kill 1` timer. Quiesce the old orchestrator before deploying this one.
+
+1. Running sandboxes: the first explicit launch or host reap retires that sleeper under its in-container flock, verifies it is gone, and records the container id. A failed retirement is an explicit migration error; the sandbox is not adopted silently.
+2. Exited or created sandboxes have no live sleeper. Explicit launch starts the same container and does not exec a retirement command first.
+3. Paused pre-upgrade sandboxes cannot run retirement code. Stop that container with Docker yourself, preserve the container and mounts, verify it is stopped, then deploy. Launch reports `migration-required` and does not unpause, delete, or recreate it until that operator stop is done. After the stop, explicit launch starts the same container.
+
+The pause-aware idle guarantee applies after this cutover. An upgrade is incomplete while a legacy paused sandbox remains. Real Docker evidence for this cutover is deferred to epic task 19.0.
 
 ## Sub-agent Timeout
 
