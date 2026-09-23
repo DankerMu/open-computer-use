@@ -94,6 +94,7 @@ class TestDockerManagerEnvInjection(unittest.TestCase):
         _clear_gateway_env()
         for k, v in overrides.items():
             os.environ[k] = v
+        os.environ.setdefault("BASE_DATA_DIR", os.path.join(os.environ.get("TMPDIR", "/tmp"), "ocu-docker-manager-tests"))
         import docker_manager
         importlib.reload(docker_manager)
         return docker_manager

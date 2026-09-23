@@ -3,6 +3,26 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Explicit sandbox lifecycle.** Tool and MCP calls return a running sandbox or
+  create one only when neither a container nor valid metadata exists. Stopped
+  and absent-with-metadata states return a workspace-stopped error without
+  starting or recreating anything. `POST /internal/launch/{chat_id}` returns
+  200 `{"state":"running"}` only after observing running; dead, timeout, engine
+  refusal, and corrupt metadata fail without deleting the sandbox. Missing
+  sandbox and metadata return 409 `never_created`. Restart and resurrect are
+  aliases of launch. `GET /internal/describe/{chat_id}` is non-mutating and
+  returns revision 0 until the broker exists. Credentials are read inside the
+  per-chat lock; recreation uses server-side fallbacks only.
+  `OCU_INTERNAL_TOKEN` and `MCP_API_KEY` never enter sandbox environment, and
+  `NO_AUTOSTART=1` is present exactly when `OCU_SANDBOX_NO_AUTOSTART=1`.
+- **Host-owned idle reclamation.** The detached in-container sleeper is removed.
+  While OCU is online, workers share one idle-state file and exclude externally
+  paused time, including pauses shorter than the idle timeout. Tracking gaps and
+  process startup grant a fresh idle window. Recreation from metadata restores
+  per-user skills and a trusted server-side GitLab token lookup by metadata
+  email, never launch-request credentials. Nothing reclaims idle sandboxes while
+  OCU is down. See `docs/TERMINAL-TAB.md` for the required operator cutover of
+  existing sleeper-equipped containers.
 - **OCU service authorization is fail-closed.** `OCU_INTERNAL_TOKEN` is required
   before startup and on every chat-bound REST/WebSocket and identity request.
   The Open WebUI tool reads it from its process environment on every call, never

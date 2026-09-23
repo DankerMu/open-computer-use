@@ -5,10 +5,10 @@ Docker container management for Computer Use.
 
 Handles:
 - Docker client initialization (local socket)
-- Container lifecycle (get/create/start)
-- Network management (compose network, CDP proxy)
+- Explicit per-chat lifecycle (get/create/launch/describe)
+- Shared thread lock plus filesystem flock
+- Host-owned pause-aware idle reclamation
 - Command execution (bash, python with stdin)
-- Shutdown timer (idle timeout)
 
 Extracted from mcp_tools.py to reduce file size and separate concerns.
 """
@@ -20,6 +20,9 @@ import json
 import shlex
 import time
 import datetime
+import fcntl
+import threading
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -34,6 +37,7 @@ from context_vars import (
     current_gitlab_token, current_gitlab_host,
     current_anthropic_auth_token, current_anthropic_base_url,
     current_mcp_tokens_url, current_mcp_tokens_api_key, current_mcp_servers,
+    current_credential_source,
 )
 from system_prompt import render_system_prompt_sync
 
@@ -73,6 +77,150 @@ def validate_public_base_url() -> int:
     return 0
 
 CONTAINER_IDLE_TIMEOUT = int(os.getenv("CONTAINER_IDLE_TIMEOUT", "600"))
+
+_IDLE_POLL_RAW = os.getenv("OCU_IDLE_POLL_SECONDS", "30")
+try:
+    IDLE_POLL_SECONDS = int(_IDLE_POLL_RAW)
+except (TypeError, ValueError):
+    IDLE_POLL_SECONDS = -1
+RESTART_WAIT_SECONDS = 5
+RESTART_POLL_SECONDS = 0.05
+STOPPED_MESSAGE = "workspace is stopped and needs an explicit launch"
+
+
+class LifecycleError(Exception):
+    status_code = 500
+    reason = "lifecycle_error"
+
+    def __init__(self, message=None, status_code=None, reason=None):
+        self.status_code = self.status_code if status_code is None else status_code
+        self.reason = self.reason if reason is None else reason
+        super().__init__(message or self.reason)
+
+
+class SandboxStopped(LifecycleError):
+    def __init__(self, message=STOPPED_MESSAGE):
+        super().__init__(message, status_code=409, reason="sandbox_stopped")
+
+
+class NeverCreated(LifecycleError):
+    def __init__(self):
+        super().__init__(
+            "sandbox was never created",
+            status_code=409,
+            reason="never_created",
+        )
+
+
+class MetadataCorrupt(LifecycleError):
+    def __init__(self, message="sandbox metadata is corrupt"):
+        super().__init__(message, status_code=500, reason="metadata_corrupt")
+
+
+class LaunchFailed(LifecycleError):
+    def __init__(self, status_code, message):
+        super().__init__(message, status_code=status_code, reason="launch_failed")
+
+
+class MigrationRequired(LifecycleError):
+    def __init__(self, message="migration_required"):
+        super().__init__(message, status_code=409, reason="migration_required")
+
+
+class LifecycleConfigError(LifecycleError):
+    def __init__(self, message):
+        super().__init__(message, status_code=500, reason="invalid_idle_configuration")
+
+
+_CHAT_LOCKS_GUARD = threading.Lock()
+_chat_locks: dict[str, threading.RLock] = {}
+_FLOCK_DEPTH: dict[str, int] = {}
+
+
+def validate_idle_configuration(idle_timeout=None, poll_seconds=None):
+    """Reject a poll that can miss a whole idle window."""
+    timeout = CONTAINER_IDLE_TIMEOUT if idle_timeout is None else idle_timeout
+    poll = IDLE_POLL_SECONDS if poll_seconds is None else poll_seconds
+    if not isinstance(timeout, int) or timeout <= 0 or not isinstance(poll, int) or poll <= 0 or poll >= timeout:
+        raise LifecycleConfigError(
+            f"OCU_IDLE_POLL_SECONDS ({poll}) must be a positive integer shorter than "
+            f"CONTAINER_IDLE_TIMEOUT ({timeout})"
+        )
+    return timeout, poll
+
+
+def canonical_lock_chat_id(chat_id: str) -> str:
+    from security import sanitize_chat_id
+    return sanitize_chat_id(chat_id or "")
+
+def get_chat_lock(chat_id: str) -> threading.RLock:
+    """Return the stable process-local lock for one canonical chat."""
+    key = canonical_lock_chat_id(chat_id)
+    with _CHAT_LOCKS_GUARD:
+        lock = _chat_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _chat_locks[key] = lock
+        return lock
+
+
+def _control_dir(chat_id: str) -> Path:
+    key = canonical_lock_chat_id(chat_id)
+    return BASE_DATA_DIR / key
+
+class _CombinedLock:
+    """Process lock first, then one shared flock. Reentrant on the owner thread.
+
+    threading.RLock replaces a plain Lock so a lifecycle transaction can call
+    another locked helper without deadlocking. Flock depth is per chat and is
+    mutated only while that RLock is held, so two threads cannot interleave it.
+    """
+
+    def __init__(self, chat_id: str):
+        self.chat_id = canonical_lock_chat_id(chat_id)
+        self._thread_lock = get_chat_lock(self.chat_id)
+        self._file = None
+
+    def __enter__(self):
+        self._thread_lock.acquire()
+        try:
+            depth = _FLOCK_DEPTH.get(self.chat_id, 0)
+            if depth:
+                _FLOCK_DEPTH[self.chat_id] = depth + 1
+                return self
+            path = _control_dir(self.chat_id) / ".lifecycle.lock"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a+")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except BaseException:
+                handle.close()
+                raise
+            self._file = handle
+            _FLOCK_DEPTH[self.chat_id] = 1
+            return self
+        except BaseException:
+            self._thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            depth = _FLOCK_DEPTH.get(self.chat_id, 1)
+            if depth > 1:
+                _FLOCK_DEPTH[self.chat_id] = depth - 1
+            else:
+                _FLOCK_DEPTH.pop(self.chat_id, None)
+                if self._file is not None:
+                    fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+                    self._file.close()
+                    self._file = None
+        finally:
+            self._thread_lock.release()
+        return False
+
+
+def _combined_lock(chat_id: str) -> _CombinedLock:
+    return _CombinedLock(chat_id)
 DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
 ORCHESTRATOR_CONTAINER_NAME = os.getenv("ORCHESTRATOR_CONTAINER_NAME", "computer-use-server")
 # Service ports INSIDE the sandbox. Fixed by the workspace image; only the host side of each
@@ -327,6 +475,17 @@ async def _ensure_gitlab_token():
         if token:
             current_gitlab_token.set(token)
 
+def _server_gitlab_token(email: str):
+    """Trusted server-side GitLab token lookup by metadata email. Never uses request credentials."""
+    if not email or not MCP_TOKENS_URL or not MCP_TOKENS_API_KEY:
+        return None
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_fetch_gitlab_token(email, MCP_TOKENS_URL, MCP_TOKENS_API_KEY))
+    return None
+
+
 
 
 # Global Docker client (lazy init)
@@ -567,112 +726,108 @@ def _fix_dead_networks(client, container):
         print(f"[MCP] Warning: network fix failed: {e}")
 
 
-def _get_or_create_container(chat_id: str) -> docker.models.containers.Container:
-    """Get existing container or create new one for this chat."""
-    chat_id = chat_id.lower()
-    client = get_docker_client()
+def _container_name(chat_id: str) -> str:
+    sanitized_id = re.sub(r'[^a-zA-Z0-9_.-]', '-', canonical_lock_chat_id(chat_id))
+    return f"owui-chat-{sanitized_id}"
 
-    # Sanitize chat_id for Docker container naming
-    sanitized_id = re.sub(r'[^a-zA-Z0-9_.-]', '-', chat_id)
-    container_name = f"owui-chat-{sanitized_id}"
 
+def _reload_container(container):
+    container.reload()
+    return (container.status or "").lower()
+
+
+def _lookup_container(chat_id: str):
     try:
-        container = client.containers.get(container_name)
-        container.reload()
-
-        if container.status == "exited":
-            _fix_dead_networks(client, container)
-            container.start()
-            print(f"[MCP] Started existing container: {container_name}")
-        elif container.status == "running":
-            if DEBUG_LOGGING:
-                print(f"[MCP] Reusing running container: {container_name}")
-        else:
-            container.start()
-            print(f"[MCP] Started container in state '{container.status}': {container_name}")
-
-        return container
-
+        container = get_docker_client().containers.get(_container_name(chat_id))
     except docker.errors.NotFound:
-        print(f"[MCP] Creating new container: {container_name}")
-        return _create_container(chat_id, container_name)
+        return None
+    _reload_container(container)
+    return container
+
+
+def _get_or_create_container(chat_id: str) -> docker.models.containers.Container:
+    """Return a running sandbox, or create one only when nothing exists.
+
+    Stopped, paused, created, restarting, dead, and absent-with-metadata
+    raise SandboxStopped. Corrupt metadata fails closed.
+    """
+    chat_id = canonical_lock_chat_id(chat_id)
+    with _combined_lock(chat_id):
+        container = _lookup_container(chat_id)
+        meta = load_container_meta(chat_id)
+        if container is not None:
+            if container.status != "running":
+                raise SandboxStopped()
+            note_running_activity(chat_id, container)
+            return container
+        if meta is not None:
+            raise SandboxStopped()
+        print(f"[MCP] Creating new container: {_container_name(chat_id)}")
+        container = _create_container(chat_id, _container_name(chat_id))
+        note_running_activity(chat_id, container)
+        return container
 
 
 def _create_container(chat_id: str, container_name: str) -> docker.models.containers.Container:
     """Create a new persistent container for this chat."""
     client = get_docker_client()
+    credential_source = current_credential_source.get()
+    if credential_source == "server":
+        gitlab_token = _server_gitlab_token(_server_meta_value(chat_id, "user_email"))
+        user_name = _server_meta_value(chat_id, "user_name")
+        user_email = _server_meta_value(chat_id, "user_email")
+        mcp_servers = _server_meta_value(chat_id, "mcp_servers")
+        anthropic_key = ANTHROPIC_AUTH_TOKEN
+        anthropic_base = ANTHROPIC_BASE_URL
+        request_scoped_anthropic = None
+    else:
+        gitlab_token = current_gitlab_token.get()
+        user_name = current_user_name.get()
+        user_email = current_user_email.get()
+        mcp_servers = current_mcp_servers.get()
+        anthropic_key = current_anthropic_auth_token.get() or ANTHROPIC_AUTH_TOKEN
+        anthropic_base = current_anthropic_base_url.get() or ANTHROPIC_BASE_URL
+        request_scoped_anthropic = current_anthropic_auth_token.get()
 
-    # Build extra env from context variables
-    extra_env = {
-        "GITLAB_HOST": current_gitlab_host.get(),
-    }
-
-    gitlab_token = current_gitlab_token.get()
+    extra_env = {"GITLAB_HOST": current_gitlab_host.get()}
     if gitlab_token:
         extra_env["GITLAB_TOKEN"] = gitlab_token
-        print(f"[MCP] Injecting GITLAB_TOKEN into container environment")
+        print("[MCP] Injecting GITLAB_TOKEN into container environment")
 
     # Phase 3 gateway-path injection — only active when SUBAGENT_CLI=claude
     # (AUTH-01: no Anthropic gateway vars bleed into codex/opencode containers).
-    if SUBAGENT_CLI == "claude":
-        anthropic_key = current_anthropic_auth_token.get() or ANTHROPIC_AUTH_TOKEN
-        anthropic_base = current_anthropic_base_url.get() or ANTHROPIC_BASE_URL
-        if anthropic_key:
-            extra_env["ANTHROPIC_AUTH_TOKEN"] = anthropic_key
-            extra_env["ANTHROPIC_BASE_URL"] = anthropic_base
+    if SUBAGENT_CLI == "claude" and anthropic_key:
+        extra_env["ANTHROPIC_AUTH_TOKEN"] = anthropic_key
+        extra_env["ANTHROPIC_BASE_URL"] = anthropic_base
 
-    # Inject only the active CLI's auth allowlist (AUTH-01 / Pitfall 1: no
-    # auth bleed across CLIs — e.g. when SUBAGENT_CLI=opencode, OPENAI_API_KEY
-    # and OPENROUTER_API_KEY land in extra_env but ANTHROPIC_* gateway vars
-    # do NOT, even if set on the host).
+    # Inject only the active CLI's auth allowlist (AUTH-01 / Pitfall 1).
     for _name, _value in _PASSTHROUGH_BY_CLI[SUBAGENT_CLI]:
         if _value:
             extra_env[_name] = _value
 
-    # Sub-agent runtime selector (CLI-01) — propagated to every container so
-    # the Phase 7 .bashrc autostart `exec "${SUBAGENT_CLI:-claude}"` can read it
-    # and `docker inspect <sandbox>` shows the chosen runtime in Env.
     extra_env["SUBAGENT_CLI"] = SUBAGENT_CLI
-
-    # OpenCode reads its config from $OPENCODE_CONFIG. Pin it to /tmp so docker
-    # exec'd subprocesses (e.g. mcp_tools.sub_agent dispatch) inherit it — the
-    # entrypoint `export OPENCODE_CONFIG=/tmp/opencode.json` only affects the
-    # entrypoint shell session, NOT subsequent `docker exec` invocations.
-    # Without this pin, OpenCode would fall back to ~/.local/share/opencode/auth.json
-    # and reopen the Pitfall 7 leak vector. ROADMAP success #2: `docker inspect`
-    # must show this env in the container Env.
     if SUBAGENT_CLI == "opencode":
         extra_env["OPENCODE_CONFIG"] = "/tmp/opencode.json"
-        # Propagate request-scoped X-Anthropic-Api-Key into the env name OpenCode
-        # expects (`{env:ANTHROPIC_API_KEY}` per docs/multi-cli.md and the
-        # entrypoint heredoc in Dockerfile). Without this, header-authenticated
-        # runs lose their credential when SUBAGENT_CLI=opencode because the claude
-        # branch above is not active. Process-level ANTHROPIC_AUTH_TOKEN env is
-        # the host-level fallback (covered by OPENCODE_PASSTHROUGH_ENVS — but the
-        # request-scoped header path was missed). Per CodeRabbit PR#75 review.
-        request_scoped_anthropic = current_anthropic_auth_token.get()
         if request_scoped_anthropic:
             extra_env["ANTHROPIC_API_KEY"] = request_scoped_anthropic
 
-    # Vision API for describe-image / upd-processing skills
     if VISION_API_KEY:
         extra_env["VISION_API_KEY"] = VISION_API_KEY
         extra_env["VISION_API_URL"] = VISION_API_URL
         extra_env["VISION_MODEL"] = VISION_MODEL
 
-    user_name = current_user_name.get()
-    user_email = current_user_email.get()
     if user_name:
         extra_env["GIT_AUTHOR_NAME"] = user_name
         extra_env["GIT_COMMITTER_NAME"] = user_name
     if user_email:
         extra_env["GIT_AUTHOR_EMAIL"] = user_email
         extra_env["GIT_COMMITTER_EMAIL"] = user_email
-        # Anthropic-specific custom header — only emit for the claude runtime
-        # so codex / opencode containers do not get spurious anthropic env.
         if SUBAGENT_CLI == "claude":
             extra_env["ANTHROPIC_CUSTOM_HEADERS"] = f"x-openwebui-user-email: {user_email}"
-
+    if os.getenv("OCU_SANDBOX_NO_AUTOSTART") == "1":
+        extra_env["NO_AUTOSTART"] = "1"
+    extra_env.pop("OCU_INTERNAL_TOKEN", None)
+    extra_env.pop("MCP_API_KEY", None)
     # Workspace volume for this chat
     workspace_volume = f"chat-{chat_id}-workspace"
 
@@ -736,7 +891,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
             uploads_path: {"bind": "/mnt/user-data/uploads", "mode": "ro"},
             outputs_path: {"bind": "/mnt/user-data/outputs", "mode": "rw"},
             **skill_manager.get_skill_mounts(
-                skill_manager.get_user_skills_sync(current_user_email.get())
+                skill_manager.get_user_skills_sync(user_email)
             ),
         },
         "labels": {
@@ -768,25 +923,21 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
     try:
         container = client.containers.create(**config)
     except docker.errors.APIError as e:
-        if e.status_code == 409:
-            # Container name exists (stale after deploy) — remove and retry
-            print(f"[MCP] [409] Removing stale container: {container_name}")
-            try:
-                old = client.containers.get(container_name)
-                old.remove(force=True)
-            except Exception:
-                pass
-            container = client.containers.create(**config)
+        if getattr(e, "status_code", None) == 409:
+            winner = _lookup_container(chat_id)
+            if winner is not None and winner.status == "running":
+                print(f"[MCP] Adopting running container after name conflict: {container_name}")
+                return winner
+            raise SandboxStopped()
         elif "host UTS namespace" in str(e):
-            # Rootless Podman inherits the pod's UTS namespace and refuses a per-container
-            # hostname there. The hostname is cosmetic — it only shows up in the sandbox's shell
-            # prompt — so drop it rather than fail the whole sandbox.
-            print(f"[MCP] Engine refuses a per-container hostname; creating without one")
+            print("[MCP] Engine refuses a per-container hostname; creating without one")
             config.pop("hostname", None)
             container = client.containers.create(**config)
         else:
             raise
     container.start()
+
+    _reload_container(container)
 
     # Connect to compose network so computer-use-orchestrator can proxy CDP (port 9222) to this container
     try:
@@ -800,27 +951,16 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
 
     print(f"[MCP] Created and started new container: {container_name}")
 
-    # Save metadata for resurrection after container removal by cron
-    save_container_meta(
-        chat_id,
-        current_user_email.get(),
-        current_user_name.get(),
-        current_mcp_servers.get(),
-    )
+    save_container_meta(chat_id, user_email, user_name, mcp_servers)
+    mark_sleeper_retired(chat_id, container)
 
-    # Write MCP config on creation so terminal users have it immediately
     try:
-        mcp_servers_str = current_mcp_servers.get()
-        if mcp_servers_str:
-            mcp_cfg = build_mcp_config(
-                mcp_servers_str,
-                current_anthropic_base_url.get(),
-                current_user_email.get() or "",
-            )
+        if mcp_servers:
+            mcp_cfg = build_mcp_config(mcp_servers, anthropic_base, user_email or "")
             if mcp_cfg:
                 write_cmd = build_mcp_config_write_script(mcp_cfg)
                 _execute_bash(container, write_cmd, 15)
-                print(f"[MCP] Wrote MCP config on container creation: {mcp_servers_str}")
+                print(f"[MCP] Wrote MCP config on container creation: {mcp_servers}")
     except Exception as e:
         print(f"[MCP] Warning: MCP setup on create failed: {e}")
 
@@ -833,7 +973,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
     # with no running event loop → no nested-loop error.
     try:
         _, workdir = _get_container_user_and_workdir()
-        readme_text = render_system_prompt_sync(chat_id, current_user_email.get())
+        readme_text = render_system_prompt_sync(chat_id, user_email)
         _write_file_to_container(container, workdir, "README.md", readme_text)
         print(f"[MCP] Wrote {workdir}/README.md ({len(readme_text)} chars)")
     except Exception as e:
@@ -898,39 +1038,14 @@ def _get_container_user_and_workdir() -> tuple:
     else:
         return None, "/root"  # None = use container default
 
-
-def _reset_shutdown_timer(container, timeout: int = None):
-    """Reset container auto-shutdown timer.
-
-    Args:
-        container: Docker container instance
-        timeout: Custom timeout in seconds. If None, uses CONTAINER_IDLE_TIMEOUT.
-                 Used by long-running commands (e.g. sub_agent) to prevent
-                 the idle timer from killing the container mid-execution.
-    """
-    user, _ = _get_container_user_and_workdir()
-    exec_kwargs = {} if user is None else {"user": user}
-
-    effective_timeout = timeout if timeout else CONTAINER_IDLE_TIMEOUT
-
-    # Atomic timer reset: flock serializes concurrent resets so only one timer exists.
-    # The outer bash PID (MYPID=$$) is tracked in the file.
-    # When a new reset arrives: kill children (sleep) FIRST, then the bash parent.
-    # Order matters: killing bash first reparents sleep to PID 1, making pkill -P miss it.
-    # flock is released before sleep starts, so it doesn't block future resets.
-    timer_cmd = (
-        f"bash -c '"
-        f"MYPID=$$; "
-        f"(flock -x 9; "
-        f"OLD=$(cat /tmp/.shutdown-timer-pid 2>/dev/null); "
-        f'[ -n "$OLD" ] && pkill -P "$OLD" 2>/dev/null; '
-        f'[ -n "$OLD" ] && kill "$OLD" 2>/dev/null; '
-        f"echo $MYPID > /tmp/.shutdown-timer-pid"
-        f") 9>/tmp/.shutdown-timer-lock; "
-        f"sleep {effective_timeout} && kill 1"
-        f"'"
-    )
-    container.exec_run(timer_cmd, detach=True, **exec_kwargs)
+def _reset_shutdown_timer(container, timeout: int = None, now=None):
+    """Extend host-owned idle protection. No in-container sleeper is started."""
+    chat_id = _chat_id_from_container(container)
+    if not chat_id:
+        return
+    effective = timeout if timeout else CONTAINER_IDLE_TIMEOUT
+    with _combined_lock(chat_id):
+        extend_idle(chat_id, container, effective, now=time.time() if now is None else now)
 
 
 def _execute_bash(container, command: str, timeout: int = None) -> dict:
@@ -939,11 +1054,9 @@ def _execute_bash(container, command: str, timeout: int = None) -> dict:
 
     try:
         cmd_timeout = timeout if timeout is not None else COMMAND_TIMEOUT
-        # Ensure shutdown timer won't kill container before command finishes
         shutdown_timeout = max(CONTAINER_IDLE_TIMEOUT, cmd_timeout + 60)
-        _reset_shutdown_timer(container, shutdown_timeout)
+        _reset_shutdown_timer(container, shutdown_timeout, now=time.time())
         timed_command = f"timeout {cmd_timeout} bash -c {shlex.quote(command)}"
-
         exec_result = container.exec_run(
             cmd=["bash", "-c", timed_command],
             stdout=True,
@@ -1102,34 +1215,33 @@ def _get_meta_path(chat_id: str) -> Path:
 
 def save_container_meta(chat_id: str, user_email: str, user_name: str,
                         mcp_servers: str):
-    """Persist non-secret metadata needed to recreate a container after removal.
-
-    NO secrets/tokens stored — they come from computer-use-orchestrator ENV at resurrect time.
-    """
+    """Atomically persist non-secret metadata. Secrets stay server-side."""
     meta = {
         "user_email": user_email or "",
         "user_name": user_name or "",
         "mcp_servers": mcp_servers or "",
-        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     meta_path = _get_meta_path(chat_id)
-    try:
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
-        print(f"[META] Saved metadata: {meta_path}")
-    except Exception as e:
-        print(f"[META] Warning: failed to save metadata: {e}")
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = meta_path.with_name(f".meta.json.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    os.replace(temporary, meta_path)
+    print(f"[META] Saved metadata: {meta_path}")
 
 
 def load_container_meta(chat_id: str) -> Optional[dict]:
-    """Load saved metadata for container recreation. Returns dict or None."""
+    """Return metadata, None when absent, or raise MetadataCorrupt."""
     meta_path = _get_meta_path(chat_id)
+    if not meta_path.exists():
+        return None
     try:
-        if meta_path.exists():
-            return json.loads(meta_path.read_text())
-    except Exception as e:
-        print(f"[META] Warning: failed to load metadata: {e}")
-    return None
+        loaded = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MetadataCorrupt(f"sandbox metadata is corrupt: {meta_path}") from exc
+    if not isinstance(loaded, dict):
+        raise MetadataCorrupt(f"sandbox metadata is corrupt: {meta_path}")
+    return loaded
 
 
 def _execute_python_with_stdin(container, script: str, data: str) -> dict:
@@ -1202,3 +1314,407 @@ def _execute_python_with_stdin(container, script: str, data: str) -> dict:
             "output": f"Execution error: {str(e)}",
             "success": False
         }
+
+
+def _chat_id_from_container(container) -> Optional[str]:
+    labels = {}
+    attrs = getattr(container, "attrs", None)
+    if isinstance(attrs, dict):
+        labels = ((attrs.get("Config") or {}).get("Labels") or {})
+    if not labels:
+        raw_labels = getattr(container, "labels", None)
+        labels = raw_labels if isinstance(raw_labels, dict) else {}
+    chat_id = labels.get("chat-id")
+    if chat_id:
+        return canonical_lock_chat_id(chat_id)
+    name = getattr(container, "name", "") or ""
+    prefix = "owui-chat-"
+    if name.startswith(prefix):
+        return name[len(prefix):]
+    return None
+
+
+def _server_meta_value(chat_id: str, key: str) -> str:
+    meta = load_container_meta(chat_id) or {}
+    return meta.get(key) or ""
+
+
+def _idle_path(chat_id: str) -> Path:
+    return _control_dir(chat_id) / ".idle.json"
+
+
+def read_idle_state(chat_id: str):
+    path = _idle_path(chat_id)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def write_idle_state(chat_id: str, state: dict) -> None:
+    path = _idle_path(chat_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".idle.json.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(state))
+    os.replace(temporary, path)
+
+
+def _container_identity(container) -> str:
+    return str(getattr(container, "id", "") or "")
+
+
+def _fresh_idle(container, now: float, sleeper_retired_for=None, status="running") -> dict:
+    identity = _container_identity(container)
+    state = {
+        "container_id": identity,
+        "status": status,
+        "observed_at": now,
+        "idle_expiry": now + CONTAINER_IDLE_TIMEOUT,
+    }
+    if sleeper_retired_for:
+        state["sleeper_retired_for"] = sleeper_retired_for
+    return state
+
+
+def _preserved_retirement(state, identity):
+    if isinstance(state, dict) and state.get("sleeper_retired_for") == identity:
+        return identity
+    return None
+
+
+def note_running_activity(chat_id: str, container, now=None) -> None:
+    current = time.time() if now is None else now
+    identity = _container_identity(container)
+    prior = read_idle_state(chat_id)
+    write_idle_state(
+        chat_id,
+        _fresh_idle(container, current, sleeper_retired_for=_preserved_retirement(prior, identity)),
+    )
+
+
+def extend_idle(chat_id: str, container, minimum_seconds: int, now=None) -> None:
+    current = time.time() if now is None else now
+    state = read_idle_state(chat_id)
+    identity = _container_identity(container)
+    if not isinstance(state, dict) or state.get("container_id") != identity:
+        state = _fresh_idle(container, current, sleeper_retired_for=_preserved_retirement(state, identity))
+    else:
+        state = dict(state)
+        if state.get("sleeper_retired_for") != identity:
+            state.pop("sleeper_retired_for", None)
+    state["status"] = "running"
+    state["observed_at"] = current
+    state["idle_expiry"] = max(float(state.get("idle_expiry") or 0), current + minimum_seconds)
+    write_idle_state(chat_id, state)
+
+
+def mark_sleeper_retired(chat_id: str, container, now=None) -> None:
+    current = time.time() if now is None else now
+    identity = _container_identity(container)
+    state = read_idle_state(chat_id)
+    if not isinstance(state, dict) or state.get("container_id") != identity:
+        state = _fresh_idle(container, current, sleeper_retired_for=identity)
+    else:
+        state = dict(state)
+        state["sleeper_retired_for"] = identity
+    write_idle_state(chat_id, state)
+
+
+def record_heartbeat(chat_id: str, now=None) -> None:
+    chat_id = canonical_lock_chat_id(chat_id)
+    with _combined_lock(chat_id):
+        container = _lookup_container(chat_id)
+        if container is None or container.status != "running":
+            return
+        extend_idle(chat_id, container, CONTAINER_IDLE_TIMEOUT, now=now)
+
+def _migration_verified(state, container) -> bool:
+    identity = _container_identity(container)
+    return isinstance(state, dict) and state.get("container_id") == identity and state.get("sleeper_retired_for") == identity
+
+
+def retire_legacy_sleeper(chat_id: str, container) -> None:
+    """Terminate a detached pre-upgrade sleeper and bind evidence to this container."""
+    chat_id = canonical_lock_chat_id(chat_id)
+    script = (
+        "bash -lc '"
+        "set -e; "
+        "exec 9>/tmp/.shutdown-timer-lock; "
+        "flock -x 9; "
+        "OLD=$(cat /tmp/.shutdown-timer-pid 2>/dev/null || true); "
+        "if [ -z \"$OLD\" ]; then exit 0; fi; "
+        "pkill -P \"$OLD\" 2>/dev/null || true; "
+        "kill \"$OLD\" 2>/dev/null || true; "
+        "i=0; "
+        "while [ \"$i\" -lt 20 ]; do "
+        "if ! kill -0 \"$OLD\" 2>/dev/null; then rm -f /tmp/.shutdown-timer-pid; exit 0; fi; "
+        "i=$((i + 1)); "
+        "sleep 0.05; "
+        "done; "
+        "if kill -0 \"$OLD\" 2>/dev/null; then exit 1; fi; "
+        "rm -f /tmp/.shutdown-timer-pid"
+        "'"
+    )
+    user, _workdir = _get_container_user_and_workdir()
+    try:
+        result = container.exec_run(script, user=user)
+    except docker.errors.APIError as exc:
+        raise MigrationRequired("legacy sleeper retirement failed") from exc
+    exit_code = getattr(result, "exit_code", 1)
+    if exit_code != 0:
+        raise MigrationRequired("legacy sleeper retirement failed")
+    mark_sleeper_retired(chat_id, container)
+
+
+def _ensure_retired_before_reaping(chat_id: str, container, state) -> bool:
+    if _migration_verified(state, container):
+        return True
+    try:
+        retire_legacy_sleeper(chat_id, container)
+    except MigrationRequired:
+        return False
+    return _migration_verified(read_idle_state(chat_id), container)
+
+
+def _wait_until_running(container) -> bool:
+    deadline = time.monotonic() + RESTART_WAIT_SECONDS
+    remaining = max(1, int(RESTART_WAIT_SECONDS / max(RESTART_POLL_SECONDS, 0.001)))
+    while time.monotonic() < deadline and remaining > 0:
+        remaining -= 1
+        if _reload_container(container) == "running":
+            return True
+        if container.status in {"dead", "exited"}:
+            return False
+        time.sleep(min(RESTART_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    return _reload_container(container) == "running"
+
+def launch_sandbox(chat_id: str, credential_source: str = "server") -> dict:
+    """Observe running, or return an explicit failure without deleting anything."""
+    chat_id = canonical_lock_chat_id(chat_id)
+    token = current_credential_source.set(credential_source)
+    try:
+        with _combined_lock(chat_id):
+            return _launch_locked(chat_id, credential_source)
+    finally:
+        current_credential_source.reset(token)
+
+
+def _launch_locked(chat_id: str, credential_source: str) -> dict:
+    try:
+        meta = load_container_meta(chat_id)
+    except MetadataCorrupt:
+        raise
+    try:
+        container = _lookup_container(chat_id)
+    except docker.errors.DockerException as exc:
+        raise LaunchFailed(500, f"engine lookup failed: {exc}") from exc
+    if container is None and meta is None:
+        raise NeverCreated()
+    if container is None:
+        created = _create_container(chat_id, _container_name(chat_id))
+        if _reload_container(created) != "running":
+            raise LaunchFailed(500, "recreated sandbox is not running")
+        return {"state": "running"}
+
+    status = container.status
+    state = read_idle_state(chat_id)
+    if status == "paused" and not _migration_verified(state, container):
+        raise MigrationRequired()
+    if status == "running":
+        if not _migration_verified(state, container):
+            try:
+                retire_legacy_sleeper(chat_id, container)
+            except docker.errors.APIError as exc:
+                raise LaunchFailed(500, f"engine refused retirement: {exc}") from exc
+        else:
+            note_running_activity(chat_id, container)
+        return {"state": "running"}
+    if status == "paused":
+        note_running_activity(chat_id, container)
+        try:
+            container.unpause()
+        except docker.errors.APIError as exc:
+            raise LaunchFailed(500, f"engine refused unpause: {exc}") from exc
+        if _reload_container(container) != "running":
+            raise LaunchFailed(500, "unpause did not reach running")
+        return {"state": "running"}
+    if status in {"exited", "created"}:
+        try:
+            _fix_dead_networks(get_docker_client(), container)
+            container.start()
+        except docker.errors.APIError as exc:
+            if "network" in str(exc).lower():
+                try:
+                    _fix_dead_networks(get_docker_client(), container)
+                    container.start()
+                except docker.errors.APIError as retry_exc:
+                    raise LaunchFailed(500, f"engine refused start: {retry_exc}") from retry_exc
+            else:
+                raise LaunchFailed(500, f"engine refused start: {exc}") from exc
+        if _reload_container(container) != "running":
+            raise LaunchFailed(500, "start did not reach running")
+        mark_sleeper_retired(chat_id, container)
+        return {"state": "running"}
+    if status == "restarting":
+        if not _wait_until_running(container):
+            raise LaunchFailed(504, "restart readiness timed out")
+        try:
+            retire_legacy_sleeper(chat_id, container)
+        except docker.errors.APIError as exc:
+            raise LaunchFailed(500, f"engine refused retirement: {exc}") from exc
+        return {"state": "running"}
+    if status == "dead":
+        raise LaunchFailed(500, "sandbox is dead")
+    raise LaunchFailed(500, f"unsupported sandbox state: {status}")
+
+
+def cli_badge() -> dict:
+    from cli_runtime import Cli, resolve_cli, resolve_subagent_model
+
+    cli = resolve_cli()
+    try:
+        model_id, _display = resolve_subagent_model("", cli)
+    except ValueError:
+        model_id = None
+    return {"cli": cli.value, "default_model": model_id, "supports_cost": cli == Cli.CLAUDE}
+
+
+def describe_sandbox(chat_id: str) -> dict:
+    """Read Docker state and metadata without creating or changing a sandbox."""
+    chat_id = canonical_lock_chat_id(chat_id)
+    with _combined_lock(chat_id):
+        container = _lookup_container(chat_id)
+        meta = load_container_meta(chat_id)
+        if container is not None and container.status == "running":
+            state = "running"
+            views = ["files", "browser", "terminal"]
+        elif container is None and meta is None:
+            state = "never_created"
+            views = ["files"]
+        else:
+            state = "stopped"
+            views = ["files"]
+        return {
+            "state": state,
+            "revision": 0,
+            "views": views,
+            "cli_badge": cli_badge(),
+        }
+
+
+def _idle_uncertain(state, container, now: float) -> bool:
+    timeout, poll = validate_idle_configuration()
+    identity = _container_identity(container)
+    if not isinstance(state, dict) or state.get("container_id") != identity:
+        return True
+    if state.get("sleeper_retired_for") != identity:
+        return True
+    try:
+        observed = float(state.get("observed_at"))
+        float(state.get("idle_expiry"))
+    except (TypeError, ValueError):
+        return True
+    return now - observed > max(poll, timeout)
+
+
+def reap_idle(chat_id: str, now=None) -> None:
+    """Stop one continuously observed running sandbox, or grant a fresh window."""
+    chat_id = canonical_lock_chat_id(chat_id)
+    current = time.time() if now is None else now
+    with _combined_lock(chat_id):
+        container = _lookup_container(chat_id)
+        if container is None:
+            return
+        if container.status == "paused":
+            state = read_idle_state(chat_id)
+            identity = _container_identity(container)
+            if not isinstance(state, dict) or state.get("container_id") != identity:
+                state = _fresh_idle(
+                    container,
+                    current,
+                    sleeper_retired_for=_preserved_retirement(state, identity),
+                    status="paused",
+                )
+            else:
+                state = dict(state)
+            state["status"] = "paused"
+            state["observed_at"] = current
+            write_idle_state(chat_id, state)
+            return
+        if container.status != "running":
+            return
+        state = read_idle_state(chat_id)
+        if not _ensure_retired_before_reaping(chat_id, container, state):
+            return
+        state = read_idle_state(chat_id)
+        if isinstance(state, dict) and state.get("status") == "paused":
+            note_running_activity(chat_id, container, now=current)
+            return
+        if _idle_uncertain(state, container, current):
+            note_running_activity(chat_id, container, now=current)
+            return
+        if current < float(state["idle_expiry"]):
+            state["observed_at"] = current
+            state["status"] = "running"
+            write_idle_state(chat_id, state)
+            return
+        reloaded = _lookup_container(chat_id)
+        latest = read_idle_state(chat_id)
+        if (
+            reloaded is None
+            or reloaded.status != "running"
+            or not isinstance(latest, dict)
+            or latest.get("container_id") != _container_identity(reloaded)
+            or latest.get("status") == "paused"
+            or _idle_uncertain(latest, reloaded, current)
+            or current < float(latest.get("idle_expiry") or 0)
+        ):
+            return
+        latest = read_idle_state(chat_id)
+        if latest is None or current < float(latest.get("idle_expiry") or 0):
+            return
+        reloaded.stop(timeout=10)
+        _reload_container(reloaded)
+
+
+def startup_idle_sweep(now=None) -> None:
+    """Grant every managed sandbox a fresh window before any worker may reap."""
+    validate_idle_configuration()
+    current = time.time() if now is None else now
+    if not BASE_DATA_DIR.exists():
+        return
+    for child in BASE_DATA_DIR.iterdir():
+        if not child.is_dir() or not (child / ".meta.json").exists() and not (child / ".idle.json").exists():
+            continue
+        try:
+            chat_id = canonical_lock_chat_id(child.name)
+        except Exception:
+            continue
+        try:
+            with _combined_lock(chat_id):
+                container = _lookup_container(chat_id)
+                if container is not None and container.status == "running":
+                    note_running_activity(chat_id, container, now=current)
+        except Exception as exc:
+            print(f"[IDLE] startup sweep failed for {child.name}: {exc}")
+
+
+def list_reap_candidates() -> list[str]:
+    if not BASE_DATA_DIR.exists():
+        return []
+    found = []
+    for child in BASE_DATA_DIR.iterdir():
+        if child.is_dir() and ((child / ".meta.json").exists() or (child / ".idle.json").exists()):
+            found.append(child.name)
+    return found
+
+
+def reap_known_sandboxes(now=None) -> None:
+    for chat_id in list_reap_candidates():
+        try:
+            reap_idle(chat_id, now=now)
+        except Exception as exc:
+            print(f"[IDLE] reap failed for {chat_id}: {exc}")
