@@ -35,8 +35,9 @@ HASH_CHUNK_SIZE = 1024 * 1024
 _NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _CLOSE_ON_EXEC = getattr(os, "O_CLOEXEC", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | _DIRECTORY | _NO_FOLLOW | _CLOSE_ON_EXEC
-_FILE_FLAGS = os.O_RDONLY | _NO_FOLLOW | _CLOSE_ON_EXEC
+_FILE_FLAGS = os.O_RDONLY | _NO_FOLLOW | _NONBLOCK | _CLOSE_ON_EXEC
 _WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NO_FOLLOW | _CLOSE_ON_EXEC
 _CURSOR = re.compile(r"(0|[1-9][0-9]*):(0|[1-9][0-9]*)\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -74,6 +75,10 @@ class CommitDurabilityError(OutputsBrokerError):
     """The atomic successor is visible but its containing directory was not synced."""
 
 
+class UnsupportedNameError(OutputsBrokerError):
+    """A live filesystem name cannot be persisted as a relative POSIX path."""
+
+
 @dataclass(frozen=True)
 class _Observation:
     path: str
@@ -102,8 +107,8 @@ class OutputsBroker:
         self.max_active_files = self._positive("max_active_files", max_active_files, MAX_ACTIVE_FILES)
         self.max_file_size = self._positive("max_file_size", max_file_size, MAX_FILE_SIZE)
         self.max_index_size = self._positive("max_index_size", max_index_size, MAX_INDEX_SIZE)
-        if not _NO_FOLLOW or not _DIRECTORY:
-            raise RuntimeError("outputs broker requires O_NOFOLLOW and O_DIRECTORY support")
+        if not _NO_FOLLOW or not _DIRECTORY or not _NONBLOCK:
+            raise RuntimeError("outputs broker requires O_NOFOLLOW, O_DIRECTORY and O_NONBLOCK support")
 
     @staticmethod
     def _positive(name: str, value: int, ceiling: int) -> int:
@@ -132,16 +137,13 @@ class OutputsBroker:
             if index is None:
                 index = self._empty_index()
 
-            observations = self._scan_metadata(chat)
+            observations = self._scan_metadata(chat, has_active=bool(index["active"]))
             successor, changed = self._reconcile_index(chat, index, observations)
             if index_missing or changed:
                 self._write_index(chat, successor)
 
-            entries = [
-                self._listing_entry(successor["active"][path], observations[path])
-                for path in sorted(successor["active"])
-            ]
-            return self._page(entries, successor["counter"], cursor, page_limit, unchanged=not changed)
+            paths = sorted(successor["active"])
+            return self._page(successor, observations, paths, successor["counter"], cursor, page_limit, unchanged=not changed)
 
     @staticmethod
     def _canonical_chat(chat_id: str) -> str:
@@ -231,13 +233,13 @@ class OutputsBroker:
             if index_stat.st_size > self.max_index_size:
                 raise LimitExceededError("persisted broker index exceeds configured size limit")
             try:
-                index_fd = os.open("index.json", _FILE_FLAGS, dir_fd=control_fd)
+                index_fd = self._open_regular("index.json", dir_fd=control_fd, label="broker index")
             except OSError as exc:
                 if self._is_nofollow_error(exc):
                     raise UnsafePathError("broker index became a symlink") from exc
                 if self._is_missing(exc):
                     raise UnstableReadError("broker index disappeared while opening") from exc
-                raise
+                raise UnstableReadError("cannot safely open broker index") from exc
             try:
                 opened = os.fstat(index_fd)
                 if not stat.S_ISREG(opened.st_mode):
@@ -344,20 +346,44 @@ class OutputsBroker:
 
     @staticmethod
     def _valid_relative_path(path: str) -> bool:
-        if not path or path.startswith("/") or "\\" in path:
+        if not path or path.startswith("/") or "\\" in path or "\x00" in path:
+            return False
+        try:
+            path.encode("utf-8")
+        except UnicodeEncodeError:
             return False
         pieces = path.split("/")
         return all(piece and piece not in (".", "..") and not piece.startswith(".") for piece in pieces)
+
+    @classmethod
+    def _require_representable_name(cls, name: str, relative_path: str) -> None:
+        if "\x00" in name or "\\" in name:
+            raise UnsupportedNameError(
+                f"unsupported output name {relative_path.encode('utf-8', 'backslashreplace')!r}"
+            )
+        try:
+            name.encode("utf-8")
+            relative_path.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise UnsupportedNameError(
+                f"unsupported output name {relative_path.encode('utf-8', 'backslashreplace')!r}"
+            ) from exc
+        if not cls._valid_relative_path(relative_path):
+            raise UnsupportedNameError(
+                f"unsupported output name {relative_path.encode('utf-8', 'backslashreplace')!r}"
+            )
 
     @staticmethod
     def _fingerprint(entry: dict[str, Any]) -> str:
         return f"{entry['size']}:{entry['hash']}"
 
-    def _scan_metadata(self, chat: str) -> dict[str, _Observation]:
+    def _scan_metadata(self, chat: str, *, has_active: bool) -> dict[str, _Observation]:
         output_root = self._chat_root(chat) / "outputs"
         try:
             output_stat = os.lstat(output_root)
         except FileNotFoundError:
+            if has_active:
+                raise UnstableReadError(f"outputs root disappeared while active entries exist: {output_root}")
             return {}
         if stat.S_ISLNK(output_stat.st_mode):
             raise UnsafePathError(f"outputs root is a symlink: {output_root}")
@@ -366,7 +392,7 @@ class OutputsBroker:
         root_fd = self._open_directory_path(output_root, "outputs root")
         observations: dict[str, _Observation] = {}
         try:
-            self._scan_directory(root_fd, (), observations)
+            self._scan_tree(root_fd, observations)
         finally:
             os.close(root_fd)
         return observations
@@ -397,50 +423,59 @@ class OutputsBroker:
             raise UnstableReadError(f"output directory changed while traversing: {name}")
         return child_fd
 
-    def _scan_directory(
-        self,
-        directory_fd: int,
-        prefix: tuple[str, ...],
-        observations: dict[str, _Observation],
-    ) -> None:
+    def _scan_tree(self, root_fd: int, observations: dict[str, _Observation]) -> None:
+        stack: list[tuple[int, tuple[str, ...], bool]] = [(root_fd, (), False)]
         try:
-            names = sorted(os.listdir(directory_fd))
-        except OSError as exc:
-            raise UnstableReadError("outputs directory changed while enumerating") from exc
-        for name in names:
-            if name.startswith("."):
-                continue
-            try:
-                item_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except OSError as exc:
-                if self._is_missing(exc):
-                    raise UnstableReadError(f"output disappeared while enumerating: {name}") from exc
-                raise UnstableReadError(f"cannot inspect output entry: {name}") from exc
-            mode = item_stat.st_mode
-            if stat.S_ISLNK(mode):
-                continue
-            parts = (*prefix, name)
-            if stat.S_ISDIR(mode):
-                child_fd = self._open_child_directory(directory_fd, name)
+            while stack:
+                directory_fd, prefix, owned = stack.pop()
                 try:
-                    self._scan_directory(child_fd, parts, observations)
+                    with os.scandir(directory_fd) as listing:
+                        children = []
+                        for entry in listing:
+                            name = entry.name
+                            if name.startswith("."):
+                                continue
+                            relative_path = "/".join((*prefix, name))
+                            self._require_representable_name(name, relative_path)
+                            try:
+                                item_stat = entry.stat(follow_symlinks=False)
+                            except OSError as exc:
+                                if self._is_missing(exc):
+                                    raise UnstableReadError(f"output disappeared while enumerating: {relative_path}") from exc
+                                raise UnstableReadError(f"cannot inspect output entry: {relative_path}") from exc
+                            mode = item_stat.st_mode
+                            if stat.S_ISLNK(mode):
+                                continue
+                            if stat.S_ISDIR(mode):
+                                children.append((name, relative_path, True, item_stat))
+                                continue
+                            if not stat.S_ISREG(mode):
+                                continue
+                            if item_stat.st_size > self.max_file_size:
+                                raise LimitExceededError(f"output file exceeds configured size limit: {relative_path}")
+                            observations[relative_path] = _Observation(
+                                path=relative_path,
+                                name=name,
+                                size=item_stat.st_size,
+                                mtime_ns=item_stat.st_mtime_ns,
+                                signature=self._signature(item_stat),
+                            )
+                            if len(observations) > self.max_active_files:
+                                raise LimitExceededError("output file count exceeds configured active-file limit")
+                        for name, relative_path, _is_dir, _stat in reversed(children):
+                            child_fd = self._open_child_directory(directory_fd, name)
+                            stack.append((child_fd, (*prefix, name), True))
+                except OSError as exc:
+                    raise UnstableReadError("outputs directory changed while enumerating") from exc
                 finally:
-                    os.close(child_fd)
-                continue
-            if not stat.S_ISREG(mode):
-                continue
-            if item_stat.st_size > self.max_file_size:
-                raise LimitExceededError(f"output file exceeds configured size limit: {'/'.join(parts)}")
-            relative_path = "/".join(parts)
-            observations[relative_path] = _Observation(
-                path=relative_path,
-                name=name,
-                size=item_stat.st_size,
-                mtime_ns=item_stat.st_mtime_ns,
-                signature=self._signature(item_stat),
-            )
-            if len(observations) > self.max_active_files:
-                raise LimitExceededError("output file count exceeds configured active-file limit")
+                    if owned:
+                        os.close(directory_fd)
+        except BaseException:
+            while stack:
+                directory_fd, _prefix, owned = stack.pop()
+                if owned:
+                    os.close(directory_fd)
+            raise
 
     def _hash_observation(self, chat: str, observation: _Observation) -> str:
         output_root = self._chat_root(chat) / "outputs"
@@ -454,9 +489,9 @@ class OutputsBroker:
                     os.close(parent_fd)
                 parent_fd = next_fd
             try:
-                file_fd = os.open(components[-1], _FILE_FLAGS, dir_fd=parent_fd)
+                file_fd = self._open_regular(components[-1], dir_fd=parent_fd, label=observation.path)
             except OSError as exc:
-                if self._is_nofollow_error(exc) or self._is_missing(exc):
+                if self._is_nofollow_error(exc) or self._is_missing(exc) or exc.errno in (errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK):
                     raise UnstableReadError(f"output changed before safe read: {observation.path}") from exc
                 raise UnstableReadError(f"cannot safely open output: {observation.path}") from exc
             try:
@@ -668,14 +703,16 @@ class OutputsBroker:
 
     def _page(
         self,
-        entries: list[dict[str, Any]],
+        index: dict[str, Any],
+        observations: dict[str, _Observation],
+        paths: list[str],
         revision: int,
         cursor: str | None,
         limit: int,
         *,
         unchanged: bool,
     ) -> dict[str, Any]:
-        total = len(entries)
+        total = len(paths)
         offset = 0
         if cursor is not None:
             if type(cursor) is not str:
@@ -692,7 +729,10 @@ class OutputsBroker:
         end = min(offset + limit, total)
         return {
             "revision": revision,
-            "entries": entries[offset:end],
+            "entries": [
+                self._listing_entry(index["active"][path], observations[path])
+                for path in paths[offset:end]
+            ],
             "total": total,
             "next_cursor": f"{revision}:{end}" if end < total else None,
             "unchanged": unchanged,
@@ -702,3 +742,19 @@ class OutputsBroker:
         if type(limit) is not int or limit <= 0 or limit > self.max_page_limit:
             raise LimitExceededError(f"limit must be a positive integer no greater than {self.max_page_limit}")
         return limit
+
+    def _open_regular(self, name: str, *, dir_fd: int, label: str) -> int:
+        try:
+            file_fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK):
+                raise UnstableReadError(f"{label} is not a stable regular file") from exc
+            raise
+        try:
+            opened = os.fstat(file_fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise UnstableReadError(f"{label} is not a stable regular file")
+            return file_fd
+        except BaseException:
+            os.close(file_fd)
+            raise

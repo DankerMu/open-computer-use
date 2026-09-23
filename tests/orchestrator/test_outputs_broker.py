@@ -102,6 +102,9 @@ def _child_environment(data: Path, shared: Path, *, disabled_lock: bool) -> dict
             "DOCKER_HOST": NO_DOCKER_SOCKET,
             "DOCKER_SOCKET": NO_DOCKER_SOCKET,
             "OCU_DISABLE_BROKER_LOCK": "1" if disabled_lock else "",
+            "OCU_SYNCHRONIZE_REPLACE": "1"
+            if disabled_lock or environment.get("OCU_SYNCHRONIZE_REPLACE") == "1"
+            else "",
             "PYTHONPATH": str(SERVER_DIR) + (os.pathsep + pythonpath if pythonpath else ""),
         }
     )
@@ -139,6 +142,8 @@ while len(list(shared.glob("ready-*"))) < 2:
 
 if os.environ.get("OCU_DISABLE_BROKER_LOCK") == "1":
     docker_manager._combined_lock = lambda _chat_id: contextlib.nullcontext()
+
+if os.environ.get("OCU_SYNCHRONIZE_REPLACE") == "1":
     original_replace = outputs_broker.os.replace
 
     def synchronized_replace(src, dst, *args, **kwargs):
@@ -326,7 +331,7 @@ def test_hidden_components_are_excluded_but_visible_nested_paths_are_sorted(worl
     assert [entry["path"] for entry in listing["entries"]] == ["a/visible.txt", "z.txt"]
 
 
-def test_unchanged_five_thousand_file_scan_reads_no_contents_and_rewrites_no_index(world):
+def test_unchanged_five_thousand_file_scan_reads_no_contents_and_rewrites_no_index(world, monkeypatch):
     broker_module, _docker_manager, data = world
     output_dir = _outputs(data)
     output_dir.mkdir(parents=True)
@@ -338,6 +343,21 @@ def test_unchanged_five_thousand_file_scan_reads_no_contents_and_rewrites_no_ind
     index_path = _index(data)
     before_bytes = index_path.read_bytes()
     before_mtime = index_path.stat().st_mtime_ns
+    output_identities = {
+        (item.stat().st_dev, item.stat().st_ino)
+        for item in output_dir.iterdir()
+        if item.is_file()
+    }
+    original_read = broker_module.os.read
+    content_reads = {"count": 0}
+
+    def count_output_reads(fd, count):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) in output_identities:
+            content_reads["count"] += 1
+        return original_read(fd, count)
+
+    monkeypatch.setattr(broker_module.os, "read", count_output_reads)
     for path in output_dir.iterdir():
         os.chmod(path, 0)
     try:
@@ -353,6 +373,7 @@ def test_unchanged_five_thousand_file_scan_reads_no_contents_and_rewrites_no_ind
     assert len(unchanged["entries"]) == 37
     assert index_path.read_bytes() == before_bytes
     assert index_path.stat().st_mtime_ns == before_mtime
+    assert content_reads["count"] == 0
 
 
 def test_pages_are_sorted_and_reject_stale_malformed_and_out_of_range_cursors(world):
@@ -444,11 +465,23 @@ def test_corrupt_or_wrong_schema_index_fails_closed_without_reset(world):
     broker.reconcile(CHAT)
     index_path = _index(data)
 
-    for bad in (b"{broken-json", b'{"schema_version": 999}'):
+    for bad in (b"{broken-json",):
         index_path.write_bytes(bad)
         with pytest.raises(broker_module.CorruptIndexError):
             broker.reconcile(CHAT)
         assert index_path.read_bytes() == bad
+    wrong_version = {
+        "schema_version": 999,
+        "counter": 0,
+        "active": {},
+        "fingerprints": {},
+        "tombstones": {},
+    }
+    encoded_wrong_version = json.dumps(wrong_version)
+    index_path.write_text(encoded_wrong_version, encoding="utf-8")
+    with pytest.raises(broker_module.CorruptIndexError, match="schema version"):
+        broker.current_revision(CHAT)
+    assert index_path.read_text(encoding="utf-8") == encoded_wrong_version
     malformed = {
         "schema_version": 1,
         "counter": 1,
@@ -460,6 +493,37 @@ def test_corrupt_or_wrong_schema_index_fails_closed_without_reset(world):
     with pytest.raises(broker_module.CorruptIndexError):
         broker.current_revision(CHAT)
     assert index_path.read_text(encoding="utf-8") == json.dumps(malformed)
+    index_path.unlink()
+    broker.reconcile(CHAT)
+    valid = json.loads(_index(data).read_text(encoding="utf-8"))
+    file_id = next(iter(valid["active"].values()))["file_id"]
+    digest = next(iter(valid["active"].values()))["hash"]
+    for bad_path, encoder in (
+        ("nul\x00name.txt", lambda payload: json.dumps(payload, ensure_ascii=False)),
+        ("bad\udcff.txt", lambda payload: json.dumps(payload, ensure_ascii=True)),
+    ):
+        poisoned = {
+            "schema_version": 1,
+            "counter": 1,
+            "active": {
+                bad_path: {
+                    "file_id": file_id,
+                    "path": bad_path,
+                    "name": bad_path.rsplit("/", 1)[-1],
+                    "size": 1,
+                    "mtime_ns": 1,
+                    "revision": 1,
+                    "hash": digest,
+                }
+            },
+            "fingerprints": {f"1:{digest}": [file_id]},
+            "tombstones": {},
+        }
+        encoded = encoder(poisoned)
+        index_path.write_text(encoded, encoding="utf-8")
+        with pytest.raises(broker_module.CorruptIndexError, match="path is invalid"):
+            broker.current_revision(CHAT)
+        assert index_path.read_text(encoding="utf-8") == encoded
 
 
 
@@ -655,3 +719,209 @@ def test_disabled_lifecycle_flock_negative_control_allows_conflicting_first_ids(
     final = broker_module.OutputsBroker().reconcile(CHAT)
     assert final["revision"] == 1
     assert final["entries"][0]["file_id"] in {child["file_id"] for child in children}
+
+
+_FIFO_WATCHDOG = r'''
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+os.environ["DOCKER_HOST"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
+os.environ["DOCKER_SOCKET"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
+
+import outputs_broker
+
+chat = os.environ["OCU_CHAT"]
+target = Path(os.environ["OCU_BASE"]) / chat / "outputs" / "watched.txt"
+target.parent.mkdir(parents=True)
+target.write_bytes(b"regular-before-fifo")
+original_scan = outputs_broker.OutputsBroker._scan_metadata
+
+def scan_then_replace(self, chat_id, *args, **kwargs):
+    observations = original_scan(self, chat_id, *args, **kwargs)
+    target.unlink()
+    os.mkfifo(target)
+    return observations
+
+outputs_broker.OutputsBroker._scan_metadata = scan_then_replace
+try:
+    outputs_broker.OutputsBroker().reconcile(chat)
+except outputs_broker.UnstableReadError as exc:
+    print("unstable:" + type(exc).__name__)
+    raise SystemExit(0)
+print("unexpected-success")
+raise SystemExit(2)
+'''
+
+
+def test_fifo_replacement_after_scan_fails_promptly_and_releases_lock(world):
+    broker_module, docker_manager, data = world
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "OCU_SERVER_DIR": str(SERVER_DIR),
+            "OCU_BASE": str(data),
+            "OCU_CHAT": CHAT,
+            "DOCKER_HOST": NO_DOCKER_SOCKET,
+            "DOCKER_SOCKET": NO_DOCKER_SOCKET,
+        }
+    )
+    started = time.monotonic()
+    completed = subprocess.run(
+        [sys.executable, "-c", _FIFO_WATCHDOG],
+        cwd=str(SERVER_DIR),
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=3,
+        check=False,
+        start_new_session=True,
+    )
+    elapsed = time.monotonic() - started
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert "unstable:UnstableReadError" in completed.stdout
+    assert elapsed < 2.5
+    with docker_manager._combined_lock(CHAT):
+        assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) >= 1
+    listing = broker_module.OutputsBroker().reconcile(CHAT)
+    assert listing["entries"] == []
+
+
+def test_backslash_name_is_rejected_and_removing_it_restores_reconciliation(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    _put(data, "ok.txt", b"ok")
+    broker.reconcile(CHAT)
+    before = _index(data).read_bytes()
+    bad = _outputs(data) / "report\\final.txt"
+    bad.write_bytes(b"bad-name")
+
+    with pytest.raises(broker_module.OutputsBrokerError) as raised:
+        broker.reconcile(CHAT)
+    assert type(raised.value).__name__ == "UnsupportedNameError"
+    assert "unsupported output name" in str(raised.value)
+    assert "final.txt" in str(raised.value)
+    assert not isinstance(raised.value, broker_module.CorruptIndexError)
+    assert _index(data).read_bytes() == before
+
+    bad.unlink()
+    restored = broker.reconcile(CHAT)
+    assert restored["unchanged"] is True
+    assert [entry["path"] for entry in restored["entries"]] == ["ok.txt"]
+
+
+def test_surrogate_names_are_rejected_at_the_scan_name_policy(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    _put(data, "ok.txt", b"ok")
+    broker.reconcile(CHAT)
+    before = _index(data).read_bytes()
+
+    class SurrogateDirEntry:
+        name = "bad\udcff.txt"
+
+        def stat(self, follow_symlinks=False):
+            return os.stat(_outputs(data) / "ok.txt", follow_symlinks=follow_symlinks)
+
+    class SurrogateListing:
+        def __iter__(self):
+            yield SurrogateDirEntry()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(broker_module.os, "scandir", lambda _fd: SurrogateListing())
+    monkeypatch.setattr(broker_module.os, "listdir", lambda _fd: ["bad\udcff.txt"])
+    with pytest.raises(broker_module.OutputsBrokerError) as raised:
+        broker.reconcile(CHAT)
+    assert type(raised.value).__name__ == "UnsupportedNameError"
+    assert "unsupported output name" in str(raised.value)
+    assert "bad" in str(raised.value)
+    assert not isinstance(raised.value, broker_module.CorruptIndexError)
+    monkeypatch.undo()
+
+    restored = broker.reconcile(CHAT)
+    assert restored["unchanged"] is True
+    assert [entry["path"] for entry in restored["entries"]] == ["ok.txt"]
+
+
+def test_mtime_only_change_keeps_identity_without_content_reads(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    path = _put(data, "same.txt", b"payload")
+    broker = broker_module.OutputsBroker()
+    before = broker.reconcile(CHAT)
+    entry = _entry_by_path(before, "same.txt")
+    before_bytes = _index(data).read_bytes()
+    identity = (path.stat().st_dev, path.stat().st_ino)
+    os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
+    original_read = broker_module.os.read
+    content_reads = {"count": 0}
+
+    def count_output_reads(fd, count):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == identity:
+            content_reads["count"] += 1
+        return original_read(fd, count)
+
+    monkeypatch.setattr(broker_module.os, "read", count_output_reads)
+    after = broker.reconcile(CHAT)
+    after_entry = _entry_by_path(after, "same.txt")
+
+    assert after["unchanged"] is True
+    assert after_entry["file_id"] == entry["file_id"]
+    assert after_entry["revision"] == entry["revision"]
+    assert after_entry["hash"] == entry["hash"]
+    assert after_entry["mtime_ns"] == path.stat().st_mtime_ns
+    assert _index(data).read_bytes() == before_bytes
+    assert content_reads["count"] == 0
+
+
+def test_missing_outputs_root_with_active_entries_is_retryable_and_restores_ids(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    empty = broker.reconcile(CHAT)
+    assert empty["revision"] == 0
+    assert empty["entries"] == []
+
+    _put(data, "keep.txt", b"keep")
+    indexed = broker.reconcile(CHAT)
+    keep_id = _entry_by_path(indexed, "keep.txt")["file_id"]
+    before = _index(data).read_bytes()
+    outputs = _outputs(data)
+    parked = outputs.with_name("outputs-parked")
+    outputs.rename(parked)
+    with pytest.raises(broker_module.UnstableReadError, match="outputs root"):
+        broker.reconcile(CHAT)
+    assert _index(data).read_bytes() == before
+
+    parked.rename(outputs)
+    restored = broker.reconcile(CHAT)
+    assert restored["unchanged"] is True
+    assert _entry_by_path(restored, "keep.txt")["file_id"] == keep_id
+
+
+def test_deep_directory_tree_is_traversed_without_recursion_error(world):
+    broker_module, _docker_manager, data = world
+    nested = _outputs(data)
+    nested.mkdir(parents=True)
+    for index in range(80):
+        nested = nested / f"d{index}"
+        os.mkdir(nested)
+    (nested / "leaf.txt").write_bytes(b"leaf")
+    original_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(50)
+    try:
+        listing = broker_module.OutputsBroker().reconcile(CHAT)
+    finally:
+        sys.setrecursionlimit(original_limit)
+
+    assert listing["total"] == 1
+    assert listing["entries"][0]["name"] == "leaf.txt"
+    assert listing["entries"][0]["path"].endswith("/leaf.txt")
+
+

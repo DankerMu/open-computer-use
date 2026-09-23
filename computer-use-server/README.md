@@ -33,7 +33,11 @@ separate integration slice. Its bounded defaults are 100 items per page
 
 Polling cannot detect a same-size in-place edit or a delete/recreate completed
 between reconciliations. A stale cached hash after the former can also prevent
-continuity from being recognised on a later rename.
+continuity from being recognised on a later rename. A missing outputs root is
+empty only on first use or with no active entries; if active identities already
+exist, reconciliation fails retryably and preserves the index. Live names that
+cannot be persisted as relative POSIX paths fail explicitly rather than being
+rewritten as a corrupt index.
 
 ## API Endpoints
 
