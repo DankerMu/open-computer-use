@@ -248,3 +248,11 @@ export function formulaCellDisplay(cell) {
   if (cell.v == null) return '';
   return String(cell.v);
 }
+
+export function disconnectPreviewObserver(node) {
+  const observer = node && node._pptxResizeObserver;
+  if (!observer || typeof observer.disconnect !== 'function') return false;
+  observer.disconnect();
+  node._pptxResizeObserver = null;
+  return true;
+}

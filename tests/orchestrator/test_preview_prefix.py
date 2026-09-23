@@ -648,6 +648,14 @@ async function run() {
     });
     return { loaded, hits };
   }
+  if (scenario === 'pptx-observer') {
+    let disconnected = 0;
+    const node = { _pptxResizeObserver: { disconnect() { disconnected += 1; } } };
+    const first = api.disconnectPreviewObserver(node);
+    const second = api.disconnectPreviewObserver(node);
+    const missing = api.disconnectPreviewObserver(null);
+    return { first, second, missing, disconnected, leftover: node._pptxResizeObserver };
+  }
   throw new Error('unknown scenario');
 }
 
@@ -746,6 +754,15 @@ def test_stale_cursor_restarts_once(tmp_path):
     recorded = _run_js_scenario(tmp_path, "stale-cursor")
     assert recorded["loaded"]["files"][0]["path"] == "b.txt"
     assert recorded["hits"] == 3
+
+
+def test_pptx_observer_disconnects_once_and_clears_handle(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "pptx-observer")
+    assert recorded["first"] is True
+    assert recorded["second"] is False
+    assert recorded["missing"] is False
+    assert recorded["disconnected"] == 1
+    assert recorded["leftover"] is None
 
 
 _XLSX_HARNESS = r"""

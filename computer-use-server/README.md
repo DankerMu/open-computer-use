@@ -48,10 +48,12 @@ rewritten as a corrupt index.
 
 ### Files
 - `GET /files/{chat_id}/{filename}` — Serves output files. Non-download HTML,
-  SVG, XHTML, and XML responses mirror generated-content isolation with
-  `Content-Security-Policy: sandbox allow-scripts allow-forms` and
-  `X-Content-Type-Options: nosniff`; disposition is unchanged (#62 tracks its
-  follow-up). The SPA HTML renderer uses the same sandbox tokens on `srcdoc`
+  SVG, XHTML, and XML responses are isolated with
+  `Content-Security-Policy: sandbox allow-scripts allow-forms`,
+  `X-Content-Type-Options: nosniff`, and Starlette
+  `FileResponse(..., content_disposition_type="inline", filename=...)`
+  (RFC 5987 `filename*` for non-Latin-1 names). `?download=1` still forces
+  `attachment`. The SPA HTML renderer uses the same sandbox tokens on `srcdoc`
   and `src` iframes and does not add `allow-same-origin`.
 - `GET /files/{chat_id}/archive` — Download all outputs as ZIP
 - `GET /api/outputs/{chat_id}` — Authenticated broker listing: `chat_id`, `files`, `total`, `timestamp`, `revision`, `next_cursor`. Query `cursor` and `limit` (1..1000, default 100). Malformed, out-of-range, or unparseable cursors (including oversized digit runs) return 400; stale cursors return 409. `If-None-Match` uses a weak ETag over the page representation excluding `timestamp`. Each file keeps SPA `modified` seconds for one release and emits `url` as `{OCU_PUBLIC_PREFIX}/files/{chat_id}/{percent-encoded path}`.

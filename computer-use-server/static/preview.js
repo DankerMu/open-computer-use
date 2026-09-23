@@ -21,6 +21,7 @@ import {
   applyListingSelection,
   formulaHasCachedValue,
   formulaCellDisplay,
+  disconnectPreviewObserver,
   workspaceHttpHeaders,
 } from './ocu-request.js';
 
@@ -499,7 +500,6 @@ async function renderPptxPreview(container, file) {
     const pptxResp = await fetchOutput(file.url);
     const pptxBuf = await pptxResp.arrayBuffer();
     const pptxContainer = container.querySelector('#pptxContainer');
-    const available = Math.max(container.clientWidth, container.parentElement?.clientWidth || 0, 320);
     let ratio = 9 / 16;
     let deckCx = 0;
     let deckCy = 0;
@@ -513,10 +513,24 @@ async function renderPptxPreview(container, file) {
     } catch (err) {
       console.warn('PPTX slide size:', err);
     }
-    const slideWidth = Math.min(available, 960);
+    const contentWidth = Math.max(container.clientWidth || container.parentElement?.clientWidth || 0, 1);
+    const slideWidth = Math.min(contentWidth, 960);
     const slideHeight = Math.max(1, Math.round(slideWidth * ratio));
     pptxContainer.style.setProperty('--pptx-slide-width', slideWidth + 'px');
     pptxContainer.style.setProperty('--pptx-slide-aspect', `${slideWidth} / ${slideHeight}`);
+    const applyDisplayedSize = () => {
+      const box = Math.max((pptxContainer.clientWidth || contentWidth) - 20, 1);
+      const cssWidth = Math.min(box, 960);
+      const cssHeight = Math.max(1, Math.round(cssWidth * ratio));
+      pptxContainer.querySelectorAll('canvas.pptx-slide').forEach((canvas) => {
+        canvas.style.removeProperty('width');
+        canvas.style.removeProperty('height');
+        canvas.style.width = cssWidth + 'px';
+        canvas.style.height = cssHeight + 'px';
+        canvas.style.maxWidth = '100%';
+        canvas.style.aspectRatio = `${canvas.width} / ${canvas.height}`;
+      });
+    };
     const viewer = new PptxViewJS.PPTXViewer();
     await viewer.loadFile(pptxBuf);
     const slideCount = viewer.getSlideCount();
@@ -532,9 +546,16 @@ async function renderPptxPreview(container, file) {
       viewer.setCanvas(canvas);
       await viewer.goToSlide(i);
       await viewer.render();
+      applyDisplayedSize();
     }
     container.querySelector('#pptxLoading')?.remove();
     pptxContainer.style.display = '';
+    applyDisplayedSize();
+    if (typeof ResizeObserver === 'function') {
+      const observer = new ResizeObserver(() => applyDisplayedSize());
+      observer.observe(pptxContainer);
+      container._pptxResizeObserver = observer;
+    }
   } catch (err) {
     console.error('PPTX render error:', err);
     renderDownloadFallback(container, file, 'filePresentation', t('pptx_fail'));
@@ -712,30 +733,45 @@ function FilesView({ files, selectedFile, onSelectFile }) {
   const generationRef = useRef(0);
 
   useEffect(() => {
-    if (!containerRef.current || !selectedFile) return;
+    if (!selectedFile) {
+      generationRef.current += 1;
+      prevKeyRef.current = null;
+      disconnectPreviewObserver(containerRef.current);
+      return;
+    }
+    if (!containerRef.current) return;
     const key = renderKey(selectedFile);
     if (key === prevKeyRef.current) return;
     prevKeyRef.current = key;
     const generation = ++generationRef.current;
     const host = containerRef.current;
+    disconnectPreviewObserver(host);
     const stage = document.createElement('div');
     stage.className = 'preview-stage';
     stage.style.cssText = 'display:flex;flex:1;flex-direction:column;min-height:0;width:100%;height:100%;overflow:auto';
     host.replaceChildren(stage);
     Promise.resolve(renderPreviewContent(stage, selectedFile, files, onSelectFile)).then(() => {
       if (generation !== generationRef.current) {
+        disconnectPreviewObserver(stage);
         stage.remove();
         return;
       }
       if (stage.parentNode !== host) host.replaceChildren(stage);
     }).catch(() => {
-      if (generation !== generationRef.current) stage.remove();
+      if (generation !== generationRef.current) {
+        disconnectPreviewObserver(stage);
+        stage.remove();
+      }
     });
+    return () => {
+      disconnectPreviewObserver(stage);
+      disconnectPreviewObserver(host);
+    };
   }, [selectedFile, files, onSelectFile]);
 
   if (!selectedFile) {
     return html`
-      <div class="preview">
+      <div class="preview" ref=${containerRef}>
         <div class="empty-state">
           <div class="empty-icon" dangerouslySetInnerHTML=${{ __html: icon('folder', 48) }}></div>
           <div class="empty-title">${t('no_files_yet')}</div>

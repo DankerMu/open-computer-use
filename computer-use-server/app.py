@@ -770,23 +770,25 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
         )
     else:
         mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        headers = None
-        if mime_type in {
+        isolated = mime_type in {
             "text/html",
             "image/svg+xml",
             "application/xhtml+xml",
             "text/xml",
             "application/xml",
-        }:
+        }
+        headers = None
+        if isolated:
             headers = {
                 "Content-Security-Policy": "sandbox allow-scripts allow-forms",
                 "X-Content-Type-Options": "nosniff",
             }
         return FileResponse(
             path=file_path,
-            filename=file_path.name,
+            filename=file_path.name if isolated else None,
+            content_disposition_type="inline",
             media_type=mime_type,
-            headers=headers
+            headers=headers,
         )
 
 

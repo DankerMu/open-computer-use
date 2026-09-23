@@ -14,9 +14,11 @@
   POST `restart-container` and start ttyd only after a successful launch.
   DOCX/XLSX/PPTX views show a visible `内容预览` disclaimer; XLSX formulas
   without a cached value are marked uncomputed. HTML previews keep
-  `sandbox="allow-scripts allow-forms"` without `allow-same-origin`; scripted
-  child execution and form/link behavior remain, while parent DOM and storage
-  stay unreachable from the iframe.
+  `sandbox="allow-scripts allow-forms"` without `allow-same-origin`. Generated
+  HTML/SVG/XML file responses use Starlette `content_disposition_type="inline"`
+  with RFC 5987 `filename*` encoding plus the same CSP sandbox so the SPA `src`
+  fallback can execute child scripts, buttons, and forms while parent DOM and
+  storage stay unreachable.
 - **Broker-backed outputs listing.** `GET /api/outputs/{chat_id}` now
   reconciles persisted identities instead of scanning independently. The
   current SPA envelope (`chat_id`, `files`, `total`, `timestamp`, and
