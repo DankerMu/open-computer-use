@@ -720,8 +720,11 @@ class OutputsBroker:
             parsed = _CURSOR.fullmatch(cursor)
             if parsed is None:
                 raise CursorError("cursor must be a revision:offset string")
-            cursor_revision = int(parsed.group(1))
-            offset = int(parsed.group(2))
+            try:
+                cursor_revision = int(parsed.group(1))
+                offset = int(parsed.group(2))
+            except ValueError as exc:
+                raise CursorError("cursor must be a revision:offset string") from exc
             if cursor_revision != revision:
                 raise StaleCursorError("cursor belongs to a stale listing revision")
             if offset >= total:

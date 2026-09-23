@@ -257,10 +257,33 @@ def test_pagination_is_path_ordered_and_cursor_errors_are_mapped(tmp_path):
         malformed = http.get(_list_url(cursor="not-a-cursor", limit=2), headers=_auth())
         assert malformed.status_code == 400
         current = http.get(_list_url(limit=2), headers=_auth()).json()
-        out_of_range = http.get(
+        assert current["total"] == 4
+        at_total = http.get(
+            _list_url(cursor=f"{current['revision']}:{current['total']}", limit=2),
+            headers=_auth(),
+        )
+        assert at_total.status_code == 400
+        assert GENERIC_FAILURE in str(at_total.json()["detail"])
+        beyond_total = http.get(
             _list_url(cursor=f"{current['revision']}:99", limit=2),
             headers=_auth(),
         )
+        assert beyond_total.status_code == 400
+        assert GENERIC_FAILURE in str(beyond_total.json()["detail"])
+        listed = http.get(_list_url(limit=2), headers=_auth())
+        etag = listed.headers["ETag"]
+        huge_offset = http.get(
+            _list_url(cursor=f"1:{'9' * 5000}", limit=2),
+            headers={**_auth(), "If-None-Match": etag},
+        )
+        assert huge_offset.status_code == 400
+        assert GENERIC_FAILURE in str(huge_offset.json()["detail"])
+        huge_revision = http.get(
+            _list_url(cursor=f"{'9' * 5000}:0", limit=2),
+            headers={**_auth(), "If-None-Match": "*"},
+        )
+        assert huge_revision.status_code == 400
+        assert GENERIC_FAILURE in str(huge_revision.json()["detail"])
         invalid_limit = http.get(_list_url(limit=0), headers=_auth())
         assert invalid_limit.status_code == 422
         over_limit = http.get(_list_url(limit=1001), headers=_auth())
