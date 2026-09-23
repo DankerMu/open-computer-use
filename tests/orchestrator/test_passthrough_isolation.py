@@ -113,7 +113,7 @@ def _clear_phase6_auth_env():
     ],
 )
 def test_passthrough_isolation(
-    cli, expected_keys, forbidden_keys, expected_opencode_config
+    cli, expected_keys, forbidden_keys, expected_opencode_config, tmp_path
 ):
     """With all three host auth env vars set, only the active CLI's allowlist
     crosses into extra_env. Closes Pitfall 1 (auth bleed across CLIs).
@@ -143,6 +143,7 @@ def test_passthrough_isolation(
         # _PASSTHROUGH_BY_CLI and SUBAGENT_CLI) pick up the new env.
         import docker_manager
         importlib.reload(docker_manager)
+        docker_manager.BASE_DATA_DIR = tmp_path / "data"
 
         client, fake_container = _build_mock_docker_client()
         with patch("docker_manager.get_docker_client", return_value=client):

@@ -9,6 +9,7 @@ spec, not from recomputing the implementation.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -68,6 +69,15 @@ class Clock:
         return self.now
 
 
+
+def _bind_outputs_broker(docker_manager):
+    """Keep outputs_broker.docker_manager on the live module after neighbor reloads."""
+    import outputs_broker
+
+    importlib.reload(outputs_broker)
+    assert outputs_broker.docker_manager is docker_manager
+
+
 def _apply_env(monkeypatch, tmp_path):
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL)
     monkeypatch.setenv("MCP_API_KEY", MCP_KEY)
@@ -80,6 +90,7 @@ def _apply_env(monkeypatch, tmp_path):
     monkeypatch.setenv("DOCKER_IMAGE", "python:3.12-slim")
     monkeypatch.delenv("OCU_SANDBOX_NO_AUTOSTART", raising=False)
     monkeypatch.delenv("OCU_SANDBOX_SUBNET", raising=False)
+    monkeypatch.delenv("SUBAGENT_CLI", raising=False)
 
 
 def _container(name, status="running", container_id="cid-1"):
@@ -174,10 +185,13 @@ def _docker(containers=None):
 def world(monkeypatch, tmp_path):
     _apply_env(monkeypatch, tmp_path)
     import docker_manager
+    import outputs_broker
 
+    _bind_outputs_broker(docker_manager)
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
     docker_manager.USER_DATA_BASE_PATH = str(tmp_path / "user-data")
     monkeypatch.setattr(docker_manager, "DOCKER_IMAGE", os.environ["DOCKER_IMAGE"])
+    monkeypatch.setattr(docker_manager, "SUBAGENT_CLI", "claude")
     docker_manager._docker_client = None
     docker_manager._chat_locks.clear()
     docker_manager._FLOCK_DEPTH.clear()
@@ -922,6 +936,8 @@ def test_describe_route_reports_real_sandbox_state(app_module, monkeypatch, tmp_
     _apply_env(monkeypatch, tmp_path)
     import docker_manager
 
+    _bind_outputs_broker(docker_manager)
+
     client = _docker()
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
     docker_manager._docker_client = None
@@ -1544,6 +1560,8 @@ def test_record_heartbeat_extends_running_idle_only(world):
 def test_heartbeat_route_requires_token_and_extends_idle(app_module, monkeypatch, tmp_path):
     _apply_env(monkeypatch, tmp_path)
     import docker_manager
+
+    _bind_outputs_broker(docker_manager)
 
     client = _docker()
     docker_manager.BASE_DATA_DIR = tmp_path / "data"

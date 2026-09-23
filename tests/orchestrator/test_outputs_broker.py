@@ -396,7 +396,8 @@ def test_pages_are_sorted_and_reject_stale_malformed_and_out_of_range_cursors(wo
         broker.reconcile(CHAT, cursor=first["next_cursor"], limit=2)
     assert broker.current_revision(CHAT) == first["revision"] + 1
 
-    for cursor in ("", "not-a-cursor", "1:-1", f"{broker.current_revision(CHAT)}:99"):
+    huge = "9" * 5000
+    for cursor in ("", "not-a-cursor", "1:-1", f"{broker.current_revision(CHAT)}:99", f"1:{huge}", f"{huge}:0"):
         with pytest.raises(broker_module.CursorError):
             broker.reconcile(CHAT, cursor=cursor, limit=2)
 

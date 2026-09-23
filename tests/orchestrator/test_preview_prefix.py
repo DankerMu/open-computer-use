@@ -38,6 +38,7 @@ _APP_MODULES = (
     "auth_guard",
     "mcp_tools",
     "docker_manager",
+    "outputs_broker",
     "context_vars",
     "security",
     "system_prompt",

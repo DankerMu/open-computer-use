@@ -100,6 +100,7 @@ def app_module(monkeypatch):
             "auth_guard",
             "mcp_tools",
             "docker_manager",
+            "outputs_broker",
             "context_vars",
             "security",
             "system_prompt",
@@ -123,6 +124,9 @@ def client(app_module, tmp_path, monkeypatch):
     (chat_outputs / "test.txt").write_text("hello-output")
     (chat_uploads / "uploaded.txt").write_text("hello-upload")
     monkeypatch.setattr(app_module, "BASE_DATA_DIR", data)
+    import docker_manager
+
+    monkeypatch.setattr(docker_manager, "BASE_DATA_DIR", data)
     with TestClient(app_module.app) as http:
         yield http
 
@@ -618,6 +622,9 @@ class TestHttpAuthorization:
         data = tmp_path / "outside"
         (data / CHAT / "outputs").mkdir(parents=True)
         monkeypatch.setattr(app_module, "BASE_DATA_DIR", data)
+        import docker_manager
+
+        monkeypatch.setattr(docker_manager, "BASE_DATA_DIR", data)
         with _peer_client(app_module.app, OUTSIDE_PEER, 40002) as http:
             response = http.get(f"/api/outputs/{CHAT}", headers=_bearer())
         assert response.status_code == 200

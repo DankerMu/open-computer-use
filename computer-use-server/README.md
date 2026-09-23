@@ -16,7 +16,7 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 | `auth_guard.py` | Fail-closed startup validation, service auth, peer denial and CORS policy |
 | `mcp_tools.py` | MCP tool definitions: `bash_tool`, `view`, `create_file`, `str_replace`, `sub_agent` |
 | `docker_manager.py` | Container lifecycle: create, stop, cleanup, health checks, volume mounts |
-| `outputs_broker.py` | Persisted, bounded output identities and per-chat reconciliation revisions; endpoint wiring follows separately |
+| `outputs_broker.py` | Persisted, bounded output identities and per-chat reconciliation revisions; `GET /api/outputs/{chat_id}` and `GET /internal/describe/{chat_id}` consume that authority |
 | `skill_manager.py` | Skill registry: fetch user skills, cache ZIPs, generate system prompt XML |
 | `system_prompt.py` | System prompt templates with skill injection |
 | `context_vars.py` | Per-request context (chat_id, user_email, etc.) via ContextVar |
@@ -27,9 +27,11 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 `outputs_broker.py` keeps a per-chat UUID/revision index under
 `BASE_DATA_DIR/{chat_id}/.ocu/index.json`, serialised with the lifecycle lock.
 It hashes first observations and detected size changes, but does not hash
-unchanged files. The broker currently has no endpoint wiring; that is a
-separate integration slice. Its bounded defaults are 100 items per page
-(maximum 1,000), 10,000 active files, 100 MiB per file, and a 64 MiB index.
+unchanged files. `GET /api/outputs/{chat_id}` reconciles that index off-thread
+and returns bounded pages with prefixed, percent-encoded cookie-path URLs.
+`GET /internal/describe/{chat_id}` reports the persisted counter without a
+scan or index create. Broker defaults remain 100 items per page (maximum
+1,000), 10,000 active files, 100 MiB per file, and a 64 MiB index.
 
 Polling cannot detect a same-size in-place edit or a delete/recreate completed
 between reconciliations. A stale cached hash after the former can also prevent
@@ -51,7 +53,7 @@ rewritten as a corrupt index.
   `X-Content-Type-Options: nosniff`; disposition is unchanged (#62 tracks its
   follow-up).
 - `GET /files/{chat_id}/archive` — Download all outputs as ZIP
-- `GET /api/outputs/{chat_id}` — List output files with metadata
+- `GET /api/outputs/{chat_id}` — Authenticated broker listing: `chat_id`, `files`, `total`, `timestamp`, `revision`, `next_cursor`. Query `cursor` and `limit` (1..1000, default 100). Malformed, out-of-range, or unparseable cursors (including oversized digit runs) return 400; stale cursors return 409. `If-None-Match` uses a weak ETag over the page representation excluding `timestamp`. Each file keeps SPA `modified` seconds for one release and emits `url` as `{OCU_PUBLIC_PREFIX}/files/{chat_id}/{percent-encoded path}`.
 - `POST /api/uploads/{chat_id}/{filename}` — Upload file to container
 
 ### Browser (CDP Proxy)

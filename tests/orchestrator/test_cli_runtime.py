@@ -38,7 +38,7 @@ def _drop_modules():
     """Drop docker_manager + cli_runtime from sys.modules so the next import
     re-runs module-load validation and re-binds SUBAGENT_CLI from the current
     os.environ (Pitfall B in 04-RESEARCH.md)."""
-    for mod in ("cli_runtime", "docker_manager"):
+    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
         sys.modules.pop(mod, None)
 
 
