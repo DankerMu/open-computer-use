@@ -3,6 +3,15 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Persisted output identity broker.** `outputs_broker.py` now packages
+  lifecycle-locked, bounded per-chat UUID identities, revision stamps, cached
+  hashes, deterministic rename matching, tombstones, and revision-bound pages
+  for the later outputs endpoint. It deliberately does not observe same-size
+  in-place edits or delete/recreate cycles completed between polls; a stale
+  hash from the former can also prevent later rename continuity. A vanished
+  outputs root with active predecessor identities is retryable and
+  index-preserving. Unsupported live names fail explicitly rather than as
+  index corruption.
 - **Preview shell public prefix.** `OCU_PUBLIC_PREFIX` (default empty) prefixes
   preview stylesheet/script URLs, `apiUrl`, `filesBase`, the inline heartbeat,
   and the static mount at `{prefix}/static` exactly once. `describeUrl` stays
