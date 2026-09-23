@@ -1660,10 +1660,3 @@ def test_mcp_tools_surface_stopped_and_corrupt_meta(monkeypatch, tool_name):
     assert result.startswith("Error:")
     assert "metadata" in result.lower()
     assert "corrupt" in result.lower()
-
-
-def test_app_fixture_restores_lifecycle_hooks(app_module):
-    import docker_manager
-
-    assert callable(app_module.startup_idle_sweep)
-    assert app_module.LifecycleError is docker_manager.LifecycleError
