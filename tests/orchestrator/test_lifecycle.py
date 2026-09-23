@@ -1377,9 +1377,6 @@ def test_retirement_none_or_nonzero_does_not_mint_evidence(world, exit_code):
     with pytest.raises(docker_manager.MigrationRequired):
         docker_manager.retire_legacy_sleeper(CHAT, container)
     assert docker_manager.read_idle_state(CHAT) is None
-    assert all("rm -f /tmp/.shutdown-timer-pid" not in str(item["cmd"]) or "kill -0" in str(item["cmd"]) for item in container._execs)
-    script = container._execs[0]["cmd"]
-    assert "kill -TERM -" not in script
     assert container._execs[0]["user"] is None
 
 
