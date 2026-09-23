@@ -22,6 +22,7 @@ import {
   formulaHasCachedValue,
   formulaCellDisplay,
   disconnectPreviewObserver,
+  attachPreviewObserver,
   workspaceHttpHeaders,
 } from './ocu-request.js';
 
@@ -554,7 +555,7 @@ async function renderPptxPreview(container, file) {
     if (typeof ResizeObserver === 'function') {
       const observer = new ResizeObserver(() => applyDisplayedSize());
       observer.observe(pptxContainer);
-      container._pptxResizeObserver = observer;
+      if (!attachPreviewObserver(container, observer)) return;
     }
   } catch (err) {
     console.error('PPTX render error:', err);
@@ -737,6 +738,10 @@ function FilesView({ files, selectedFile, onSelectFile }) {
       generationRef.current += 1;
       prevKeyRef.current = null;
       disconnectPreviewObserver(containerRef.current);
+      const host = containerRef.current;
+      if (host) {
+        host.querySelectorAll('.preview-stage').forEach((node) => disconnectPreviewObserver(node));
+      }
       return;
     }
     if (!containerRef.current) return;
@@ -745,9 +750,11 @@ function FilesView({ files, selectedFile, onSelectFile }) {
     prevKeyRef.current = key;
     const generation = ++generationRef.current;
     const host = containerRef.current;
+    host.querySelectorAll('.preview-stage').forEach((node) => disconnectPreviewObserver(node));
     disconnectPreviewObserver(host);
     const stage = document.createElement('div');
     stage.className = 'preview-stage';
+    stage.dataset.renderGeneration = String(generation);
     stage.style.cssText = 'display:flex;flex:1;flex-direction:column;min-height:0;width:100%;height:100%;overflow:auto';
     host.replaceChildren(stage);
     Promise.resolve(renderPreviewContent(stage, selectedFile, files, onSelectFile)).then(() => {
@@ -764,8 +771,9 @@ function FilesView({ files, selectedFile, onSelectFile }) {
       }
     });
     return () => {
-      disconnectPreviewObserver(stage);
-      disconnectPreviewObserver(host);
+      if (generationRef.current !== generation) {
+        disconnectPreviewObserver(stage);
+      }
     };
   }, [selectedFile, files, onSelectFile]);
 

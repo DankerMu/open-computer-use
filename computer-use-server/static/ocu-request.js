@@ -256,3 +256,14 @@ export function disconnectPreviewObserver(node) {
   node._pptxResizeObserver = null;
   return true;
 }
+
+export function attachPreviewObserver(node, observer) {
+  if (!node || !observer || typeof observer.disconnect !== 'function') return false;
+  if (node.isConnected === false) {
+    observer.disconnect();
+    return false;
+  }
+  disconnectPreviewObserver(node);
+  node._pptxResizeObserver = observer;
+  return true;
+}

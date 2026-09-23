@@ -650,11 +650,19 @@ async function run() {
   }
   if (scenario === 'pptx-observer') {
     let disconnected = 0;
-    const node = { _pptxResizeObserver: { disconnect() { disconnected += 1; } } };
-    const first = api.disconnectPreviewObserver(node);
-    const second = api.disconnectPreviewObserver(node);
+    const live = { isConnected: true, _pptxResizeObserver: null };
+    const dead = { isConnected: false, _pptxResizeObserver: null };
+    const liveObserver = { disconnect() { disconnected += 1; } };
+    const deadObserver = { disconnect() { disconnected += 1; } };
+    const attachedLive = api.attachPreviewObserver(live, liveObserver);
+    const attachedDead = api.attachPreviewObserver(dead, deadObserver);
+    const first = api.disconnectPreviewObserver(live);
+    const second = api.disconnectPreviewObserver(live);
     const missing = api.disconnectPreviewObserver(null);
-    return { first, second, missing, disconnected, leftover: node._pptxResizeObserver };
+    return {
+      attachedLive, attachedDead, first, second, missing, disconnected,
+      leftoverLive: live._pptxResizeObserver, leftoverDead: dead._pptxResizeObserver,
+    };
   }
   throw new Error('unknown scenario');
 }
@@ -758,11 +766,14 @@ def test_stale_cursor_restarts_once(tmp_path):
 
 def test_pptx_observer_disconnects_once_and_clears_handle(tmp_path):
     recorded = _run_js_scenario(tmp_path, "pptx-observer")
+    assert recorded["attachedLive"] is True
+    assert recorded["attachedDead"] is False
     assert recorded["first"] is True
     assert recorded["second"] is False
     assert recorded["missing"] is False
-    assert recorded["disconnected"] == 1
-    assert recorded["leftover"] is None
+    assert recorded["disconnected"] == 2
+    assert recorded["leftoverLive"] is None
+    assert recorded["leftoverDead"] is None
 
 
 _XLSX_HARNESS = r"""
