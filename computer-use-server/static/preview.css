@@ -551,6 +551,24 @@ body {
 .hljs-ln-code { padding-left: 12px; }
 
 /* --- Spreadsheet / XLSX --- */
+.office-preview-banner {
+  margin: 12px 16px 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+.xlsx-uncomputed {
+  font-style: italic;
+  color: var(--text-muted);
+  background: var(--warning-subtle, rgba(245, 158, 11, 0.12));
+}
+.listing-error {
+  font-size: 12px;
+  color: var(--danger-fg);
+}
 .sheet-tabs {
   display: flex;
   gap: 4px;

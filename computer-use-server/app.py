@@ -1321,8 +1321,6 @@ window.__CONFIG__ = {{
   chatId: {json.dumps(chat_id)},
   describeUrl: {json.dumps(describe_url)}
 }};
-// Heartbeat: keep container alive while page is open (every 2 min)
-setInterval(function() {{ fetch('{OCU_PUBLIC_PREFIX}/terminal/' + {json.dumps(chat_id)} + '/heartbeat').catch(function(){{}}); }}, 120000);
 </script>
 <script type="module" src="{asset}/preview.js"></script>
 </body>
