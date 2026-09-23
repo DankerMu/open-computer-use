@@ -59,6 +59,7 @@ All via environment variables:
 |----------|---------|-------------|
 | `OCU_INTERNAL_TOKEN` | _(required)_ | Service credential; REST/WS use `Authorization: Bearer`, MCP uses `X-OCU-Internal-Token` |
 | `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-facing base baked into prompt file links and emitted as `X-Public-Base-URL`. It accepts an absolute `http(s)` base or root-relative `/ocu`; a configured value must not end with `/`. |
+| `OCU_PUBLIC_PREFIX` | _(empty)_ | Same-origin path prefix for preview shell assets, `apiUrl`, `filesBase`, heartbeat, and the static mount (`{prefix}/static` only). Empty preserves baseline URLs. Noncanonical values fail import/startup. A prefix whose `{prefix}/static/` falls under a guarded chat namespace (`/files`, `/preview`, `/browser`, `/terminal`, `/internal`, `/api/outputs`, `/api/uploads`, and descendants) fails startup by the guard's path classification; `/api` and `/files-ui` remain valid. Prefixed SPA deployment is not complete until issue17 rewrites remaining module/script assets. |
 | `MCP_API_KEY` | _(empty)_ | Optional second MCP Bearer credential; required in addition to the internal token when set |
 | `OCU_SANDBOX_SUBNET` | _(empty)_ | Optional denied transport subnet, validated at startup |
 | `OCU_WEBUI_ORIGIN` | _(empty)_ | Optional sole CORS origin, validated at startup |

@@ -5,6 +5,8 @@
 
 import { t } from '/static/locale.js';
 
+const _browserBasePath = new URL('..', import.meta.url).pathname;
+
 export class BrowserViewer {
   constructor(canvas, chatId) {
     this.canvas = canvas;
@@ -83,7 +85,7 @@ export class BrowserViewer {
   connect() {
     return new Promise(async (resolve) => {
       try {
-        const resp = await fetch(`/browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
+        const resp = await fetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
         const pages = await resp.json();
         const page = pages.find(p => p.type === 'page');
         if (!page) { resolve(false); return; }
@@ -93,7 +95,7 @@ export class BrowserViewer {
       }
 
       const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${wsProto}//${location.host}/browser/${this.chatId}/devtools/page/${this.pageId}`;
+      const wsUrl = `${wsProto}//${location.host}${_browserBasePath}browser/${this.chatId}/devtools/page/${this.pageId}`;
       this.ws = new WebSocket(wsUrl);
 
       const timeout = setTimeout(() => {
@@ -174,7 +176,7 @@ export class BrowserViewer {
   async _checkTabSwitch() {
     if (!this.connected) return;
     try {
-      const resp = await fetch(`/browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
+      const resp = await fetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
       const pages = await resp.json();
       const realPages = pages.filter(p => p.type === 'page' && !p.url.startsWith('chrome://'));
       if (realPages.length === 0) return;
@@ -192,7 +194,7 @@ export class BrowserViewer {
     }
     this.pageId = newPageId;
     const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProto}//${location.host}/browser/${this.chatId}/devtools/page/${this.pageId}`;
+    const wsUrl = `${wsProto}//${location.host}${_browserBasePath}browser/${this.chatId}/devtools/page/${this.pageId}`;
     this.ws = new WebSocket(wsUrl);
     this.ws.onopen = () => {
       this.connected = true;

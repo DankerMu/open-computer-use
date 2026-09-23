@@ -16,6 +16,7 @@ import html as html_module
 import hashlib
 import json
 import mimetypes
+import re
 import time
 import zipfile
 from io import BytesIO
@@ -24,7 +25,7 @@ from typing import Optional, Dict, List, Any
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body
-from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight
+from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -56,6 +57,40 @@ import skill_manager
 # =============================================================================
 
 MCP_API_KEY = os.getenv("MCP_API_KEY")  # Required for /mcp endpoints
+
+_PUBLIC_PREFIX_SEGMENT = re.compile(r"^[A-Za-z0-9_.~-]+$")
+
+
+def _canonical_public_prefix(raw: str | None) -> str:
+    """Return the configured public prefix or raise before the app is created."""
+    if raw is None or raw == "":
+        return ""
+    if not raw.startswith("/") or raw.endswith("/") or "//" in raw:
+        raise RuntimeError(
+            f"OCU_PUBLIC_PREFIX is not a canonical path prefix: {raw!r}."
+        )
+    if any(ch in raw for ch in (" ", "\t", "\n", "\r", "%", "?", "#", ":")):
+        raise RuntimeError(
+            f"OCU_PUBLIC_PREFIX is not a canonical path prefix: {raw!r}."
+        )
+    segments = raw[1:].split("/")
+    if not segments or any(not segment for segment in segments):
+        raise RuntimeError(
+            f"OCU_PUBLIC_PREFIX is not a canonical path prefix: {raw!r}."
+        )
+    for segment in segments:
+        if segment in {".", ".."} or not _PUBLIC_PREFIX_SEGMENT.fullmatch(segment):
+            raise RuntimeError(
+                f"OCU_PUBLIC_PREFIX is not a canonical path prefix: {raw!r}."
+            )
+    if _guarded(f"{raw}/static/"):
+        raise RuntimeError(
+            f"OCU_PUBLIC_PREFIX places the static mount in a guarded chat namespace: {raw!r}."
+        )
+    return raw
+
+
+OCU_PUBLIC_PREFIX = _canonical_public_prefix(os.getenv("OCU_PUBLIC_PREFIX"))
 
 security = HTTPBearer(auto_error=False)
 
@@ -294,7 +329,7 @@ app.add_middleware(AuthGuardMiddleware)
 # Static files (bundled JS/CSS libraries)
 _static_dir = Path(__file__).parent / "static"
 if _static_dir.is_dir():
-    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+    app.mount(f"{OCU_PUBLIC_PREFIX}/static", StaticFiles(directory=str(_static_dir)), name="static")
 
 # Base directory where chat data is stored
 # Mounted from host: /tmp/computer-use-data/{chat_id}/outputs/
@@ -1138,31 +1173,33 @@ async def preview_page(chat_id: str, response: Response):
     chat_id = sanitize_chat_id(chat_id)
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     # Use relative URLs so it works behind HTTPS reverse proxy
-    api_url = f"/api/outputs/{chat_id}"
-    files_base = f"/files/{chat_id}"
+    api_url = f"{OCU_PUBLIC_PREFIX}/api/outputs/{chat_id}"
+    files_base = f"{OCU_PUBLIC_PREFIX}/files/{chat_id}"
 
     return _generate_preview_html(chat_id, api_url, files_base)
 
 
 def _generate_preview_html(chat_id: str, api_url: str, files_base: str) -> str:
     """Generate the preview SPA HTML page."""
+    asset = f"{OCU_PUBLIC_PREFIX}/static"
+    describe_url = f"/api/v1/ocu/workspaces/{chat_id}"
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>File Preview</title>
-<link rel="stylesheet" href="/static/preview.css">
-<link rel="stylesheet" href="/static/github.min.css" media="(prefers-color-scheme: light)">
-<link rel="stylesheet" href="/static/github-dark.min.css" media="(prefers-color-scheme: dark)">
-<link rel="stylesheet" href="/static/katex/katex.min.css">
-<link rel="stylesheet" href="/static/xterm.css">
-<script src="/static/highlight.min.js"></script>
-<script src="/static/highlightjs-line-numbers.min.js"></script>
-<script src="/static/marked.min.js"></script>
-<script src="/static/xterm.min.js"></script>
-<script src="/static/xterm-addon-fit.min.js"></script>
-<script src="/static/xterm-addon-web-links.min.js"></script>
+<link rel="stylesheet" href="{asset}/preview.css">
+<link rel="stylesheet" href="{asset}/github.min.css" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="{asset}/github-dark.min.css" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="{asset}/katex/katex.min.css">
+<link rel="stylesheet" href="{asset}/xterm.css">
+<script src="{asset}/highlight.min.js"></script>
+<script src="{asset}/highlightjs-line-numbers.min.js"></script>
+<script src="{asset}/marked.min.js"></script>
+<script src="{asset}/xterm.min.js"></script>
+<script src="{asset}/xterm-addon-fit.min.js"></script>
+<script src="{asset}/xterm-addon-web-links.min.js"></script>
 </head>
 <body>
 <div id="app"></div>
@@ -1170,12 +1207,13 @@ def _generate_preview_html(chat_id: str, api_url: str, files_base: str) -> str:
 window.__CONFIG__ = {{
   apiUrl: {json.dumps(api_url)},
   filesBase: {json.dumps(files_base)},
-  chatId: {json.dumps(chat_id)}
+  chatId: {json.dumps(chat_id)},
+  describeUrl: {json.dumps(describe_url)}
 }};
 // Heartbeat: keep container alive while page is open (every 2 min)
-setInterval(function() {{ fetch('/terminal/' + {json.dumps(chat_id)} + '/heartbeat').catch(function(){{}}); }}, 120000);
+setInterval(function() {{ fetch('{OCU_PUBLIC_PREFIX}/terminal/' + {json.dumps(chat_id)} + '/heartbeat').catch(function(){{}}); }}, 120000);
 </script>
-<script type="module" src="/static/preview.js"></script>
+<script type="module" src="{asset}/preview.js"></script>
 </body>
 </html>'''
 
