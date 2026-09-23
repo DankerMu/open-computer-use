@@ -22,6 +22,7 @@ import time
 import datetime
 import fcntl
 import threading
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -182,22 +183,25 @@ class _CombinedLock:
 
     def __enter__(self):
         self._thread_lock.acquire()
-        depth = _FLOCK_DEPTH.get(self.chat_id, 0)
-        if depth:
-            _FLOCK_DEPTH[self.chat_id] = depth + 1
-            return self
-        path = _control_dir(self.chat_id) / ".lifecycle.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle = path.open("a+")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            depth = _FLOCK_DEPTH.get(self.chat_id, 0)
+            if depth:
+                _FLOCK_DEPTH[self.chat_id] = depth + 1
+                return self
+            path = _control_dir(self.chat_id) / ".lifecycle.lock"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a+")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except BaseException:
+                handle.close()
+                raise
+            self._file = handle
+            _FLOCK_DEPTH[self.chat_id] = 1
+            return self
         except BaseException:
-            handle.close()
             self._thread_lock.release()
             raise
-        self._file = handle
-        _FLOCK_DEPTH[self.chat_id] = 1
-        return self
 
     def __exit__(self, exc_type, exc, tb):
         try:
@@ -470,6 +474,17 @@ async def _ensure_gitlab_token():
         token = await _fetch_gitlab_token(user_email, mcp_tokens_url, mcp_tokens_api_key)
         if token:
             current_gitlab_token.set(token)
+
+def _server_gitlab_token(email: str):
+    """Trusted server-side GitLab token lookup by metadata email. Never uses request credentials."""
+    if not email or not MCP_TOKENS_URL or not MCP_TOKENS_API_KEY:
+        return None
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_fetch_gitlab_token(email, MCP_TOKENS_URL, MCP_TOKENS_API_KEY))
+    return None
+
 
 
 
@@ -758,7 +773,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
     client = get_docker_client()
     credential_source = current_credential_source.get()
     if credential_source == "server":
-        gitlab_token = None
+        gitlab_token = _server_gitlab_token(_server_meta_value(chat_id, "user_email"))
         user_name = _server_meta_value(chat_id, "user_name")
         user_email = _server_meta_value(chat_id, "user_email")
         mcp_servers = _server_meta_value(chat_id, "mcp_servers")
@@ -876,7 +891,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
             uploads_path: {"bind": "/mnt/user-data/uploads", "mode": "ro"},
             outputs_path: {"bind": "/mnt/user-data/outputs", "mode": "rw"},
             **skill_manager.get_skill_mounts(
-                skill_manager.get_user_skills_sync(current_user_email.get())
+                skill_manager.get_user_skills_sync(user_email)
             ),
         },
         "labels": {
@@ -921,7 +936,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
         else:
             raise
     container.start()
-    container.labels = dict(config.get("labels") or {})
+
     _reload_container(container)
 
     # Connect to compose network so computer-use-orchestrator can proxy CDP (port 9222) to this container
@@ -1351,30 +1366,45 @@ def _container_identity(container) -> str:
     return str(getattr(container, "id", "") or "")
 
 
-def _fresh_idle(container, now: float) -> dict:
-    return {
-        "container_id": _container_identity(container),
-        "status": "running",
+def _fresh_idle(container, now: float, sleeper_retired_for=None, status="running") -> dict:
+    identity = _container_identity(container)
+    state = {
+        "container_id": identity,
+        "status": status,
         "observed_at": now,
         "idle_expiry": now + CONTAINER_IDLE_TIMEOUT,
-        "sleeper_retired_for": _container_identity(container),
     }
+    if sleeper_retired_for:
+        state["sleeper_retired_for"] = sleeper_retired_for
+    return state
+
+
+def _preserved_retirement(state, identity):
+    if isinstance(state, dict) and state.get("sleeper_retired_for") == identity:
+        return identity
+    return None
 
 
 def note_running_activity(chat_id: str, container, now=None) -> None:
-    write_idle_state(chat_id, _fresh_idle(container, time.time() if now is None else now))
+    current = time.time() if now is None else now
+    identity = _container_identity(container)
+    prior = read_idle_state(chat_id)
+    write_idle_state(
+        chat_id,
+        _fresh_idle(container, current, sleeper_retired_for=_preserved_retirement(prior, identity)),
+    )
 
 
 def extend_idle(chat_id: str, container, minimum_seconds: int, now=None) -> None:
     current = time.time() if now is None else now
     state = read_idle_state(chat_id)
     identity = _container_identity(container)
-    if (
-        not isinstance(state, dict)
-        or state.get("container_id") != identity
-        or state.get("sleeper_retired_for") != identity
-    ):
-        state = _fresh_idle(container, current)
+    if not isinstance(state, dict) or state.get("container_id") != identity:
+        state = _fresh_idle(container, current, sleeper_retired_for=_preserved_retirement(state, identity))
+    else:
+        state = dict(state)
+        if state.get("sleeper_retired_for") != identity:
+            state.pop("sleeper_retired_for", None)
     state["status"] = "running"
     state["observed_at"] = current
     state["idle_expiry"] = max(float(state.get("idle_expiry") or 0), current + minimum_seconds)
@@ -1382,7 +1412,15 @@ def extend_idle(chat_id: str, container, minimum_seconds: int, now=None) -> None
 
 
 def mark_sleeper_retired(chat_id: str, container, now=None) -> None:
-    note_running_activity(chat_id, container, now=now)
+    current = time.time() if now is None else now
+    identity = _container_identity(container)
+    state = read_idle_state(chat_id)
+    if not isinstance(state, dict) or state.get("container_id") != identity:
+        state = _fresh_idle(container, current, sleeper_retired_for=identity)
+    else:
+        state = dict(state)
+        state["sleeper_retired_for"] = identity
+    write_idle_state(chat_id, state)
 
 
 def record_heartbeat(chat_id: str, now=None) -> None:
@@ -1392,7 +1430,6 @@ def record_heartbeat(chat_id: str, now=None) -> None:
         if container is None or container.status != "running":
             return
         extend_idle(chat_id, container, CONTAINER_IDLE_TIMEOUT, now=now)
-
 
 def _migration_verified(state, container) -> bool:
     identity = _container_identity(container)
@@ -1408,23 +1445,26 @@ def retire_legacy_sleeper(chat_id: str, container) -> None:
         "exec 9>/tmp/.shutdown-timer-lock; "
         "flock -x 9; "
         "OLD=$(cat /tmp/.shutdown-timer-pid 2>/dev/null || true); "
-        "if [ -n \"$OLD\" ]; then "
-        "kill -TERM -$OLD 2>/dev/null || true; "
+        "if [ -z \"$OLD\" ]; then exit 0; fi; "
         "pkill -P \"$OLD\" 2>/dev/null || true; "
         "kill \"$OLD\" 2>/dev/null || true; "
-        "fi; "
-        "rm -f /tmp/.shutdown-timer-pid; "
-        "if [ -n \"$OLD\" ] && kill -0 \"$OLD\" 2>/dev/null; then exit 1; fi"
+        "i=0; "
+        "while [ \"$i\" -lt 20 ]; do "
+        "if ! kill -0 \"$OLD\" 2>/dev/null; then rm -f /tmp/.shutdown-timer-pid; exit 0; fi; "
+        "i=$((i + 1)); "
+        "sleep 0.05; "
+        "done; "
+        "if kill -0 \"$OLD\" 2>/dev/null; then exit 1; fi; "
+        "rm -f /tmp/.shutdown-timer-pid"
         "'"
     )
-    result = container.exec_run(script, user="assistant")
+    user, _workdir = _get_container_user_and_workdir()
+    try:
+        result = container.exec_run(script, user=user)
+    except docker.errors.APIError as exc:
+        raise MigrationRequired("legacy sleeper retirement failed") from exc
     exit_code = getattr(result, "exit_code", 1)
-    output = getattr(result, "output", b"")
-    if isinstance(output, tuple):
-        text = b"".join(part or b"" for part in output).decode("utf-8", errors="replace")
-    else:
-        text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
-    if exit_code not in (0, None) or "still-alive" in text:
+    if exit_code != 0:
         raise MigrationRequired("legacy sleeper retirement failed")
     mark_sleeper_retired(chat_id, container)
 
@@ -1440,13 +1480,15 @@ def _ensure_retired_before_reaping(chat_id: str, container, state) -> bool:
 
 
 def _wait_until_running(container) -> bool:
-    attempts = max(1, int(RESTART_WAIT_SECONDS / RESTART_POLL_SECONDS))
-    for _ in range(attempts):
+    deadline = time.monotonic() + RESTART_WAIT_SECONDS
+    remaining = max(1, int(RESTART_WAIT_SECONDS / max(RESTART_POLL_SECONDS, 0.001)))
+    while time.monotonic() < deadline and remaining > 0:
+        remaining -= 1
         if _reload_container(container) == "running":
             return True
         if container.status in {"dead", "exited"}:
             return False
-        time.sleep(RESTART_POLL_SECONDS)
+        time.sleep(min(RESTART_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     return _reload_container(container) == "running"
 
 def launch_sandbox(chat_id: str, credential_source: str = "server") -> dict:
@@ -1465,7 +1507,10 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
         meta = load_container_meta(chat_id)
     except MetadataCorrupt:
         raise
-    container = _lookup_container(chat_id)
+    try:
+        container = _lookup_container(chat_id)
+    except docker.errors.DockerException as exc:
+        raise LaunchFailed(500, f"engine lookup failed: {exc}") from exc
     if container is None and meta is None:
         raise NeverCreated()
     if container is None:
@@ -1480,21 +1525,35 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
         raise MigrationRequired()
     if status == "running":
         if not _migration_verified(state, container):
-            retire_legacy_sleeper(chat_id, container)
+            try:
+                retire_legacy_sleeper(chat_id, container)
+            except docker.errors.APIError as exc:
+                raise LaunchFailed(500, f"engine refused retirement: {exc}") from exc
         else:
             note_running_activity(chat_id, container)
         return {"state": "running"}
     if status == "paused":
         note_running_activity(chat_id, container)
-        container.unpause()
+        try:
+            container.unpause()
+        except docker.errors.APIError as exc:
+            raise LaunchFailed(500, f"engine refused unpause: {exc}") from exc
         if _reload_container(container) != "running":
             raise LaunchFailed(500, "unpause did not reach running")
         return {"state": "running"}
     if status in {"exited", "created"}:
         try:
+            _fix_dead_networks(get_docker_client(), container)
             container.start()
         except docker.errors.APIError as exc:
-            raise LaunchFailed(500, f"engine refused start: {exc}") from exc
+            if "network" in str(exc).lower():
+                try:
+                    _fix_dead_networks(get_docker_client(), container)
+                    container.start()
+                except docker.errors.APIError as retry_exc:
+                    raise LaunchFailed(500, f"engine refused start: {retry_exc}") from retry_exc
+            else:
+                raise LaunchFailed(500, f"engine refused start: {exc}") from exc
         if _reload_container(container) != "running":
             raise LaunchFailed(500, "start did not reach running")
         mark_sleeper_retired(chat_id, container)
@@ -1502,7 +1561,10 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
     if status == "restarting":
         if not _wait_until_running(container):
             raise LaunchFailed(504, "restart readiness timed out")
-        retire_legacy_sleeper(chat_id, container)
+        try:
+            retire_legacy_sleeper(chat_id, container)
+        except docker.errors.APIError as exc:
+            raise LaunchFailed(500, f"engine refused retirement: {exc}") from exc
         return {"state": "running"}
     if status == "dead":
         raise LaunchFailed(500, "sandbox is dead")
@@ -1564,12 +1626,33 @@ def reap_idle(chat_id: str, now=None) -> None:
     current = time.time() if now is None else now
     with _combined_lock(chat_id):
         container = _lookup_container(chat_id)
-        if container is None or container.status != "running":
+        if container is None:
+            return
+        if container.status == "paused":
+            state = read_idle_state(chat_id)
+            identity = _container_identity(container)
+            if not isinstance(state, dict) or state.get("container_id") != identity:
+                state = _fresh_idle(
+                    container,
+                    current,
+                    sleeper_retired_for=_preserved_retirement(state, identity),
+                    status="paused",
+                )
+            else:
+                state = dict(state)
+            state["status"] = "paused"
+            state["observed_at"] = current
+            write_idle_state(chat_id, state)
+            return
+        if container.status != "running":
             return
         state = read_idle_state(chat_id)
         if not _ensure_retired_before_reaping(chat_id, container, state):
             return
         state = read_idle_state(chat_id)
+        if isinstance(state, dict) and state.get("status") == "paused":
+            note_running_activity(chat_id, container, now=current)
+            return
         if _idle_uncertain(state, container, current):
             note_running_activity(chat_id, container, now=current)
             return
@@ -1585,6 +1668,7 @@ def reap_idle(chat_id: str, now=None) -> None:
             or reloaded.status != "running"
             or not isinstance(latest, dict)
             or latest.get("container_id") != _container_identity(reloaded)
+            or latest.get("status") == "paused"
             or _idle_uncertain(latest, reloaded, current)
             or current < float(latest.get("idle_expiry") or 0)
         ):
@@ -1609,10 +1693,13 @@ def startup_idle_sweep(now=None) -> None:
             chat_id = canonical_lock_chat_id(child.name)
         except Exception:
             continue
-        with _combined_lock(chat_id):
-            container = _lookup_container(chat_id)
-            if container is not None and container.status == "running":
-                note_running_activity(chat_id, container, now=current)
+        try:
+            with _combined_lock(chat_id):
+                container = _lookup_container(chat_id)
+                if container is not None and container.status == "running":
+                    note_running_activity(chat_id, container, now=current)
+        except Exception as exc:
+            print(f"[IDLE] startup sweep failed for {child.name}: {exc}")
 
 
 def list_reap_candidates() -> list[str]:
@@ -1627,4 +1714,7 @@ def list_reap_candidates() -> list[str]:
 
 def reap_known_sandboxes(now=None) -> None:
     for chat_id in list_reap_candidates():
-        reap_idle(chat_id, now=now)
+        try:
+            reap_idle(chat_id, now=now)
+        except Exception as exc:
+            print(f"[IDLE] reap failed for {chat_id}: {exc}")

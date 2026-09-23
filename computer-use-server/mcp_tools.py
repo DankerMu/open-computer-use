@@ -159,7 +159,7 @@ from docker_manager import (
     _reset_shutdown_timer, _get_compose_network_name,
     build_mcp_config, build_mcp_config_write_script,
     _fetch_gitlab_token, _ensure_gitlab_token,
-    SandboxStopped,
+    SandboxStopped, LifecycleError,
     DOCKER_SOCKET, DOCKER_IMAGE, CONTAINER_MEM_LIMIT, CONTAINER_CPU_LIMIT,
     COMMAND_TIMEOUT, ENABLE_NETWORK, USER_DATA_BASE_PATH, PUBLIC_BASE_URL,
     MCP_TOKENS_URL, MCP_TOKENS_API_KEY,
@@ -509,7 +509,7 @@ async def bash_tool(command: str, description: str, ctx: Context) -> str:
             )
         except asyncio.TimeoutError:
             return "Error: Container creation timed out (60s). Docker may be overloaded."
-        except SandboxStopped as stopped:
+        except LifecycleError as stopped:
             return f"Error: {stopped}"
         # Report progress during execution
         start_time = time.time()
@@ -582,7 +582,7 @@ async def str_replace(
             )
         except asyncio.TimeoutError:
             return "Error: Container creation timed out (60s)."
-        except SandboxStopped as stopped:
+        except LifecycleError as stopped:
             return f"Error: {stopped}"
 
         script = """
@@ -655,7 +655,7 @@ async def create_file(
             )
         except asyncio.TimeoutError:
             return "Error: Container creation timed out (60s)."
-        except SandboxStopped as stopped:
+        except LifecycleError as stopped:
             return f"Error: {stopped}"
         script = """
 import sys
@@ -725,7 +725,7 @@ async def view(
             )
         except asyncio.TimeoutError:
             return "Error: Container creation timed out (60s)."
-        except SandboxStopped as stopped:
+        except LifecycleError as stopped:
             return f"Error: {stopped}"
         quoted_path = shlex.quote(path)
 
@@ -981,7 +981,7 @@ async def sub_agent(
         await _ensure_gitlab_token()
         try:
             container = await asyncio.to_thread(_get_or_create_container, chat_id)
-        except SandboxStopped as stopped:
+        except LifecycleError as stopped:
             return f"Error: {stopped}"
         # Write ~/.mcp.json if MCP server names provided via header.
         mcp_servers_str = current_mcp_servers.get()

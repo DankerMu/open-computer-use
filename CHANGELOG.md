@@ -17,10 +17,12 @@
   `NO_AUTOSTART=1` is present exactly when `OCU_SANDBOX_NO_AUTOSTART=1`.
 - **Host-owned idle reclamation.** The detached in-container sleeper is removed.
   While OCU is online, workers share one idle-state file and exclude externally
-  paused time. Tracking gaps and process startup grant a fresh idle window.
-  Nothing reclaims idle sandboxes while OCU is down. See
-  `docs/TERMINAL-TAB.md` for the required operator cutover of existing
-  sleeper-equipped containers.
+  paused time, including pauses shorter than the idle timeout. Tracking gaps and
+  process startup grant a fresh idle window. Recreation from metadata restores
+  per-user skills and a trusted server-side GitLab token lookup by metadata
+  email, never launch-request credentials. Nothing reclaims idle sandboxes while
+  OCU is down. See `docs/TERMINAL-TAB.md` for the required operator cutover of
+  existing sleeper-equipped containers.
 - **OCU service authorization is fail-closed.** `OCU_INTERNAL_TOKEN` is required
   before startup and on every chat-bound REST/WebSocket and identity request.
   The Open WebUI tool reads it from its process environment on every call, never

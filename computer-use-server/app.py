@@ -196,6 +196,27 @@ curl -s -X POST "http://localhost:8081/mcp" \\
 
 from contextlib import asynccontextmanager
 
+async def _idle_reaper(stop_idle: asyncio.Event):
+    try:
+        await asyncio.to_thread(startup_idle_sweep)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[IDLE] startup sweep failed: {exc}")
+    _timeout, poll = validate_idle_configuration()
+    while not stop_idle.is_set():
+        try:
+            await asyncio.wait_for(stop_idle.wait(), timeout=poll)
+        except asyncio.TimeoutError:
+            try:
+                await asyncio.to_thread(reap_known_sandboxes)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[IDLE] reap tick failed: {exc}")
+
+
+
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: start MCP session manager for Streamable HTTP.
@@ -220,17 +241,7 @@ async def lifespan(app):
     if _mcp_server._session_manager is None:
         _mcp_server.streamable_http_app()
     stop_idle = asyncio.Event()
-
-    async def _idle_reaper():
-        await asyncio.to_thread(startup_idle_sweep)
-        _timeout, poll = validate_idle_configuration()
-        while not stop_idle.is_set():
-            try:
-                await asyncio.wait_for(stop_idle.wait(), timeout=poll)
-            except asyncio.TimeoutError:
-                await asyncio.to_thread(reap_known_sandboxes)
-
-    reaper = asyncio.create_task(_idle_reaper())
+    reaper = asyncio.create_task(_idle_reaper(stop_idle))
     async with _mcp_server.session_manager.run():
         print("[MCP] session_manager.run() entered — /mcp endpoint is live")
         try:

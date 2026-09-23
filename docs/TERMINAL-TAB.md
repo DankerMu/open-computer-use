@@ -46,7 +46,7 @@ A stopped, paused, created, restarting, dead, or removed-but-metadata sandbox is
 
 Containers created before this change may contain a detached `sleep && kill 1` timer. Quiesce the old orchestrator before deploying this one.
 
-1. Running sandboxes: the first explicit launch or host reap retires that sleeper under its in-container flock, verifies it is gone, and records the container id. A failed retirement is an explicit migration error; the sandbox is not adopted silently.
+1. Running sandboxes: the first explicit launch or host reap retires that sleeper under its in-container flock, verifies it is gone, and records the container id. Heartbeats, tool activity, and startup sweeps preserve existing evidence and never invent it. A failed retirement is an explicit migration error; the sandbox is not adopted silently.
 2. Exited or created sandboxes have no live sleeper. Explicit launch starts the same container and does not exec a retirement command first.
 3. Paused pre-upgrade sandboxes cannot run retirement code. Stop that container with Docker yourself, preserve the container and mounts, verify it is stopped, then deploy. Launch reports `migration-required` and does not unpause, delete, or recreate it until that operator stop is done. After the stop, explicit launch starts the same container.
 
