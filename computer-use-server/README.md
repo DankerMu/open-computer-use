@@ -16,10 +16,24 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 | `auth_guard.py` | Fail-closed startup validation, service auth, peer denial and CORS policy |
 | `mcp_tools.py` | MCP tool definitions: `bash_tool`, `view`, `create_file`, `str_replace`, `sub_agent` |
 | `docker_manager.py` | Container lifecycle: create, stop, cleanup, health checks, volume mounts |
+| `outputs_broker.py` | Persisted, bounded output identities and per-chat reconciliation revisions; endpoint wiring follows separately |
 | `skill_manager.py` | Skill registry: fetch user skills, cache ZIPs, generate system prompt XML |
 | `system_prompt.py` | System prompt templates with skill injection |
 | `context_vars.py` | Per-request context (chat_id, user_email, etc.) via ContextVar |
 | `docs_html.py` | HTML documentation page generator |
+
+### Output identity broker
+
+`outputs_broker.py` keeps a per-chat UUID/revision index under
+`BASE_DATA_DIR/{chat_id}/.ocu/index.json`, serialised with the lifecycle lock.
+It hashes first observations and detected size changes, but does not hash
+unchanged files. The broker currently has no endpoint wiring; that is a
+separate integration slice. Its bounded defaults are 100 items per page
+(maximum 1,000), 10,000 active files, 100 MiB per file, and a 64 MiB index.
+
+Polling cannot detect a same-size in-place edit or a delete/recreate completed
+between reconciliations. A stale cached hash after the former can also prevent
+continuity from being recognised on a later rename.
 
 ## API Endpoints
 
