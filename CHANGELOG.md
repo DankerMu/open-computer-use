@@ -5,12 +5,18 @@
 ### Changed
 - **Preview SPA revision window and Office content preview.** The Files view
   keys refresh on `path + revision`, keeps selected `file_id` across rename,
-  loads the first 100 entries with a visible More control, and commits only a
-  complete same-revision page chain from the latest request generation. The
-  CLI badge reads `cli_badge` from `describeUrl`. Both stopped recovery
-  branches POST `restart-container` and start ttyd only after a successful
-  launch. DOCX/XLSX/PPTX views show a visible `内容预览` disclaimer; XLSX
-  formulas without a cached value are marked uncomputed.
+  automatically displays a new or changed root output unless the user
+  explicitly selected another file, loads the first 100 entries with a visible
+  More control, and commits only a complete same-revision page chain from the
+  latest request generation. Listing body-read failures keep the prior window
+  and surface a visible error while browser/terminal polls continue. The CLI
+  badge reads `cli_badge` from `describeUrl`. Both stopped recovery branches
+  POST `restart-container` and start ttyd only after a successful launch.
+  DOCX/XLSX/PPTX views show a visible `内容预览` disclaimer; XLSX formulas
+  without a cached value are marked uncomputed. HTML previews keep
+  `sandbox="allow-scripts allow-forms"` without `allow-same-origin`; scripted
+  child execution and form/link behavior remain, while parent DOM and storage
+  stay unreachable from the iframe.
 - **Broker-backed outputs listing.** `GET /api/outputs/{chat_id}` now
   reconciles persisted identities instead of scanning independently. The
   current SPA envelope (`chat_id`, `files`, `total`, `timestamp`, and

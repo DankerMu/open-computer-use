@@ -223,6 +223,7 @@ function _showExternalLinkDialog(href) {
 // =============================================================================
 
 async function renderHtmlPreview(container, file) {
+  const sandbox = 'allow-scripts allow-forms';
   try {
     const resp = await fetchOutput(file.url);
     let text = await resp.text();
@@ -255,12 +256,12 @@ async function renderHtmlPreview(container, file) {
       text = injection + text;
     }
     const iframe = document.createElement('iframe');
-    iframe.setAttribute('sandbox', 'allow-scripts allow-forms');
+    iframe.setAttribute('sandbox', sandbox);
     iframe.srcdoc = text;
     container.replaceChildren(iframe);
   } catch {
     const iframe = document.createElement('iframe');
-    iframe.setAttribute('sandbox', 'allow-scripts allow-forms');
+    iframe.setAttribute('sandbox', sandbox);
     iframe.src = file.url;
     container.replaceChildren(iframe);
   }
@@ -498,7 +499,7 @@ async function renderPptxPreview(container, file) {
     const pptxResp = await fetchOutput(file.url);
     const pptxBuf = await pptxResp.arrayBuffer();
     const pptxContainer = container.querySelector('#pptxContainer');
-    const pptxWidth = Math.max(container.clientWidth, container.parentElement?.clientWidth || 0, 640);
+    const available = Math.max(container.clientWidth, container.parentElement?.clientWidth || 0, 320);
     let ratio = 9 / 16;
     let deckCx = 0;
     let deckCy = 0;
@@ -512,13 +513,17 @@ async function renderPptxPreview(container, file) {
     } catch (err) {
       console.warn('PPTX slide size:', err);
     }
+    const slideWidth = Math.min(available, 960);
+    const slideHeight = Math.max(1, Math.round(slideWidth * ratio));
+    pptxContainer.style.setProperty('--pptx-slide-width', slideWidth + 'px');
+    pptxContainer.style.setProperty('--pptx-slide-aspect', `${slideWidth} / ${slideHeight}`);
     const viewer = new PptxViewJS.PPTXViewer();
     await viewer.loadFile(pptxBuf);
     const slideCount = viewer.getSlideCount();
     for (let i = 0; i < slideCount; i++) {
       const canvas = document.createElement('canvas');
-      canvas.width = pptxWidth;
-      canvas.height = Math.round(pptxWidth * ratio);
+      canvas.width = slideWidth;
+      canvas.height = slideHeight;
       canvas.dataset.ratio = String(ratio);
       canvas.dataset.deckCx = String(deckCx);
       canvas.dataset.deckCy = String(deckCy);
@@ -574,19 +579,19 @@ function renderDownloadFallback(container, file, iconType, errorMsg) {
 
 function renderPreviewContent(container, file, files, onSelectFile) {
   switch (file.type) {
-    case 'html': renderHtmlPreview(container, file); break;
+    case 'html': return renderHtmlPreview(container, file);
     case 'image':
       container.innerHTML = `<img src="${escapeHtml(file.url)}" alt="${escapeHtml(file.name)}">`;
-      break;
-    case 'pdf': renderPdfPreview(container, file); break;
-    case 'markdown': renderMarkdownPreview(container, file, files, onSelectFile); break;
+      return;
+    case 'pdf': return renderPdfPreview(container, file);
+    case 'markdown': return renderMarkdownPreview(container, file, files, onSelectFile);
     case 'code':
-    case 'text': renderCodePreview(container, file); break;
-    case 'spreadsheet': renderSpreadsheetPreview(container, file); break;
-    case 'docx': renderDocxPreview(container, file); break;
-    case 'xlsx': renderXlsxPreview(container, file); break;
-    case 'pptx': renderPptxPreview(container, file); break;
-    case 'drawio': renderDrawioPreview(container, file); break;
+    case 'text': return renderCodePreview(container, file);
+    case 'spreadsheet': return renderSpreadsheetPreview(container, file);
+    case 'docx': return renderDocxPreview(container, file);
+    case 'xlsx': return renderXlsxPreview(container, file);
+    case 'pptx': return renderPptxPreview(container, file);
+    case 'drawio': return renderDrawioPreview(container, file);
     case 'audio':
       container.innerHTML = `<div class="media-container">
         <div class="media-icon">${icon('music', 48)}</div>
@@ -595,13 +600,13 @@ function renderPreviewContent(container, file, files, onSelectFile) {
         <audio controls preload="metadata" src="${escapeHtml(file.url)}">${t('audio_unsupported')}</audio>
         <a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>
       </div>`;
-      break;
+      return;
     case 'video':
       container.innerHTML = `<div class="media-container">
         <video controls preload="metadata" src="${escapeHtml(file.url)}">${t('video_unsupported')}</video>
         <a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>
       </div>`;
-      break;
+      return;
     default:
       renderDownloadFallback(container, file);
   }
@@ -715,7 +720,7 @@ function FilesView({ files, selectedFile, onSelectFile }) {
     const host = containerRef.current;
     const stage = document.createElement('div');
     stage.className = 'preview-stage';
-    stage.style.cssText = 'display:flex;flex:1;flex-direction:column;min-height:0;width:100%;height:100%';
+    stage.style.cssText = 'display:flex;flex:1;flex-direction:column;min-height:0;width:100%;height:100%;overflow:auto';
     host.replaceChildren(stage);
     Promise.resolve(renderPreviewContent(stage, selectedFile, files, onSelectFile)).then(() => {
       if (generation !== generationRef.current) {
@@ -1498,8 +1503,9 @@ function App() {
 
   useEffect(() => {
     const handler = (event) => {
-      if (!event.data || event.data.type !== 'iframe-link-click') return;
-      handleLinkClick(event.data.href, event.data.resolvedUrl, files, selectedFile, onSelectFile);
+      const data = event && event.data;
+      if (!data || data.type !== 'iframe-link-click') return;
+      handleLinkClick(data.href, data.resolvedUrl, files, selectedFile, onSelectFile);
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);

@@ -171,7 +171,12 @@ export async function loadOutputsWindow({
     }
     if (resp.status === 409) return { error: 'stale-cursor', files: null };
     if (!resp.ok) return { error: resp.status, files: null };
-    const body = await resp.json();
+    let body;
+    try {
+      body = await resp.json();
+    } catch {
+      return { error: 'body', files: null };
+    }
     if (pages.length && pages[0].revision !== body.revision) {
       return { error: 'revision-mismatch', files: null };
     }
@@ -217,10 +222,10 @@ function sameIdentity(previous, next) {
 
 export function applyListingSelection(files, previous, autoTarget, explicitSelection) {
   if (!files.length) return null;
+  if (autoTarget && !explicitSelection) return autoTarget;
   if (previous && previous.file_id) {
     const kept = files.find((file) => file.file_id === previous.file_id);
     if (kept) return sameIdentity(previous, kept) ? previous : kept;
-    if (explicitSelection) return files.find((file) => !file.path.includes('/')) || files[0] || null;
   }
   if (autoTarget) return autoTarget;
   if (!previous) return files.find((file) => !file.path.includes('/')) || files[0];

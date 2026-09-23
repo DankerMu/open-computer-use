@@ -51,7 +51,8 @@ rewritten as a corrupt index.
   SVG, XHTML, and XML responses mirror generated-content isolation with
   `Content-Security-Policy: sandbox allow-scripts allow-forms` and
   `X-Content-Type-Options: nosniff`; disposition is unchanged (#62 tracks its
-  follow-up).
+  follow-up). The SPA HTML renderer uses the same sandbox tokens on `srcdoc`
+  and `src` iframes and does not add `allow-same-origin`.
 - `GET /files/{chat_id}/archive` — Download all outputs as ZIP
 - `GET /api/outputs/{chat_id}` — Authenticated broker listing: `chat_id`, `files`, `total`, `timestamp`, `revision`, `next_cursor`. Query `cursor` and `limit` (1..1000, default 100). Malformed, out-of-range, or unparseable cursors (including oversized digit runs) return 400; stale cursors return 409. `If-None-Match` uses a weak ETag over the page representation excluding `timestamp`. Each file keeps SPA `modified` seconds for one release and emits `url` as `{OCU_PUBLIC_PREFIX}/files/{chat_id}/{percent-encoded path}`.
 - `POST /api/uploads/{chat_id}/{filename}` — Upload file to container
@@ -81,7 +82,7 @@ All via environment variables:
 |----------|---------|-------------|
 | `OCU_INTERNAL_TOKEN` | _(required)_ | Service credential; REST/WS use `Authorization: Bearer`, MCP uses `X-OCU-Internal-Token` |
 | `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-facing base baked into prompt file links and emitted as `X-Public-Base-URL`. It accepts an absolute `http(s)` base or root-relative `/ocu`; a configured value must not end with `/`. |
-| `OCU_PUBLIC_PREFIX` | _(empty)_ | Same-origin path prefix for preview shell assets, `apiUrl`, `filesBase`, SPA heartbeat, and the static mount (`{prefix}/static` only). Empty preserves baseline URLs. Noncanonical values fail import/startup. A prefix whose `{prefix}/static/` falls under a guarded chat namespace (`/files`, `/preview`, `/browser`, `/terminal`, `/internal`, `/api/outputs`, `/api/uploads`, and descendants) fails startup by the guard's path classification; `/api` and `/files-ui` remain valid. Authored SPA modules use relative imports and one `ocuFetch` wrapper (`X-Requested-With: ocu-workspace`; prefix once on client root paths; server-emitted URLs remain verbatim). |
+| `OCU_PUBLIC_PREFIX` | _(empty)_ | Same-origin path prefix for preview shell assets, `apiUrl`, `filesBase`, SPA heartbeat, and the static mount (`{prefix}/static` only). Empty preserves baseline URLs. Noncanonical values fail import/startup. A prefix whose `{prefix}/static/` falls under a guarded chat namespace (`/files`, `/preview`, `/browser`, `/terminal`, `/internal`, `/api/outputs`, `/api/uploads`, and descendants) fails startup by the guard's path classification; `/api` and `/files-ui` remain valid. Authored SPA modules use relative imports and one `ocuFetch` wrapper (`X-Requested-With: ocu-workspace`; prefix once on client root paths; server-emitted URLs remain verbatim). HTML previews keep `sandbox="allow-scripts allow-forms"` without `allow-same-origin`. |
 | `MCP_API_KEY` | _(empty)_ | Optional second MCP Bearer credential; required in addition to the internal token when set |
 | `OCU_SANDBOX_SUBNET` | _(empty)_ | Optional denied transport subnet, validated at startup |
 | `OCU_WEBUI_ORIGIN` | _(empty)_ | Optional sole CORS origin, validated at startup |

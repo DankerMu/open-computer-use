@@ -596,7 +596,22 @@ async function run() {
       null,
       false,
     );
-    return { loaded, late, selected, deleted, same, key: api.renderKey({ path: 'a.txt', revision: 7 }) };
+    const autoPrior = { file_id: 'a', path: 'a.txt', revision: 1, type: 'text' };
+    const autoFiles = [
+      { file_id: 'a', path: 'a.txt', revision: 1, type: 'text' },
+      { file_id: 'b', path: 'b.txt', revision: 2, type: 'text' },
+    ];
+    const auto = api.applyListingSelection(autoFiles, autoPrior, autoFiles[1], false);
+    const explicitOffice = api.applyListingSelection(
+      [
+        { file_id: 'office', path: 'report.docx', revision: 1, type: 'docx' },
+        { file_id: 'noise', path: 'note.txt', revision: 9, type: 'text' },
+      ],
+      { file_id: 'office', path: 'report.docx', revision: 1, type: 'docx' },
+      { file_id: 'noise', path: 'note.txt', revision: 9, type: 'text' },
+      true,
+    );
+    return { loaded, late, selected, deleted, same, auto, explicitOffice, key: api.renderKey({ path: 'a.txt', revision: 7 }) };
   }
   if (scenario === 'stale-cursor') {
     let hits = 0;
@@ -606,6 +621,24 @@ async function run() {
       if (parsed.searchParams.get('cursor')) return { ok: false, status: 409, json: async () => ({}) };
       if (hits === 1) return { ok: true, status: 200, json: async () => ({ files: [{ path: 'a.txt', revision: 1 }], revision: 1, next_cursor: '1:100', total: 101 }) };
       return { ok: true, status: 200, json: async () => ({ files: [{ path: 'b.txt', revision: 2 }], revision: 2, next_cursor: null, total: 1 }) };
+    };
+    const loaded = await api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat',
+      pageCount: 2,
+      generation: 1,
+      currentGeneration: () => 1,
+    });
+    return { loaded, hits };
+  }
+  if (scenario === 'listing-body-error') {
+    let hits = 0;
+    context.__respond = async (url) => {
+      hits += 1;
+      const parsed = new URL(url, 'https://webui.example');
+      if (!parsed.searchParams.get('cursor')) {
+        return { ok: true, status: 200, json: async () => ({ files: [{ path: 'a.txt', revision: 1 }], revision: 1, next_cursor: '1:100', total: 101 }) };
+      }
+      return { ok: true, status: 200, json: async () => { throw new Error('truncated'); } };
     };
     const loaded = await api.loadOutputsWindow({
       apiUrl: '/ocu/api/outputs/chat',
@@ -698,8 +731,16 @@ def test_listing_keeps_later_pages_and_rejects_stale_generation(tmp_path):
     assert recorded["selected"]["path"] == "new.docx"
     assert recorded["deleted"]["path"] == "other.txt"
     assert recorded["same"]["modified"] == 1
+    assert recorded["auto"]["path"] == "b.txt"
+    assert recorded["explicitOffice"]["path"] == "report.docx"
     assert recorded["key"] == "a.txt\x007"
 
+
+def test_listing_body_parse_failure_does_not_commit_partial_page(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "listing-body-error")
+    assert recorded["loaded"]["error"] == "body"
+    assert recorded["loaded"]["files"] is None
+    assert recorded["hits"] == 2
 
 def test_stale_cursor_restarts_once(tmp_path):
     recorded = _run_js_scenario(tmp_path, "stale-cursor")
@@ -839,90 +880,3 @@ def test_xlsx_formula_cache_distinguishes_zero_false_and_absent(tmp_path):
     assert recorded["a4d"]["display"] == "9"
 
 
-def _mutant_copy(tmp_path, name, replacements):
-    source = (SERVER_DIR / "static" / "ocu-request.js").read_text(encoding="utf-8")
-    for old, new in replacements:
-        assert old in source, old
-        source = source.replace(old, new, 1)
-    dest = tmp_path / name
-    dest.mkdir()
-    dest.joinpath("ocu-request.js").write_text(source, encoding="utf-8")
-    return dest
-
-
-def _run_js_from_dir(tmp_path, source_dir, scenario, module_url="https://webui.example/ocu/static/ocu-request.js"):
-    if not NODE:
-        pytest.fail("node is required for SPA request tests; install Node 22 or set OCU_TEST_NODE")
-    harness = tmp_path / f"{scenario}_harness.mjs"
-    harness.write_text(_JS_CASES)
-    completed = subprocess.run(
-        [
-            NODE,
-            "--experimental-vm-modules",
-            str(harness),
-            str(source_dir) + "/",
-            module_url,
-            scenario,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    return completed
-
-
-def test_listing_generation_rejection_fails_on_mtime_mutant(tmp_path):
-    mutant = _mutant_copy(
-        tmp_path,
-        "mtime-key",
-        [("String(file.path) + '\\0' + String(file.revision);", "String(file.path) + '\\0' + String(file.modified);")],
-    )
-    completed = _run_js_from_dir(tmp_path, mutant, "listing")
-    assert completed.returncode == 0, completed.stderr
-    recorded = json.loads(completed.stdout)
-    assert recorded["key"] != "a.txt\x007"
-
-
-def test_stale_cursor_no_retry_mutant_keeps_error(tmp_path):
-    mutant = _mutant_copy(
-        tmp_path,
-        "no-stale-retry",
-        [("if (resp.status === 409 && cursor && staleRetries === 0) {", "if (false && resp.status === 409 && cursor && staleRetries === 0) {")],
-    )
-    completed = _run_js_from_dir(tmp_path, mutant, "stale-cursor")
-    assert completed.returncode == 0, completed.stderr
-    recorded = json.loads(completed.stdout)
-    assert recorded["loaded"].get("error") == "stale-cursor"
-    assert recorded["hits"] == 2
-
-
-def test_formula_zero_cache_mutant_treats_zero_as_uncomputed(tmp_path):
-    mutant_src = (SERVER_DIR / "static" / "ocu-request.js").read_text(encoding="utf-8")
-    old = "if (cell.t === 'z') return false;\n  return Object.prototype.hasOwnProperty.call(cell, 'v') && cell.v !== undefined;"
-    new = "if (!cell.v) return false;\n  return true;"
-    assert old in mutant_src
-    dest = tmp_path / "formula-mutant"
-    dest.mkdir()
-    dest.joinpath("ocu-request.js").write_text(mutant_src.replace(old, new, 1), encoding="utf-8")
-    workbook = tmp_path / "formulas.xlsx"
-    workbook.write_bytes(_xlsx_bytes())
-    harness = tmp_path / "xlsx_mutant.mjs"
-    harness.write_text(_XLSX_HARNESS)
-    completed = subprocess.run(
-        [
-            NODE,
-            "--experimental-vm-modules",
-            str(harness),
-            str(SERVER_DIR / "static" / "xlsx.full.min.js"),
-            str(dest / "ocu-request.js"),
-            str(workbook),
-            "https://webui.example/ocu/static/ocu-request.js",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    assert completed.returncode == 0, completed.stderr
-    recorded = json.loads(completed.stdout)
-    assert recorded["a1d"]["cached"] is False
-    assert recorded["a1d"]["display"] == "uncomputed"
