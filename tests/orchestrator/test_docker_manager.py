@@ -96,7 +96,11 @@ class TestDockerManagerEnvInjection(unittest.TestCase):
             os.environ[k] = v
         os.environ.setdefault("BASE_DATA_DIR", os.path.join(os.environ.get("TMPDIR", "/tmp"), "ocu-docker-manager-tests"))
         import docker_manager
+        prior_base = docker_manager.BASE_DATA_DIR
         importlib.reload(docker_manager)
+        if "outputs_broker" in sys.modules:
+            importlib.reload(sys.modules["outputs_broker"])
+        docker_manager.BASE_DATA_DIR = prior_base
         return docker_manager
 
     def _run_isolated(self, body):
@@ -249,7 +253,11 @@ class TestBuildMcpConfigBaseUrlFallback(unittest.TestCase):
 
     def _reload_docker_manager(self):
         import docker_manager
+        prior_base = docker_manager.BASE_DATA_DIR
         importlib.reload(docker_manager)
+        if "outputs_broker" in sys.modules:
+            importlib.reload(sys.modules["outputs_broker"])
+        docker_manager.BASE_DATA_DIR = prior_base
         return docker_manager
 
     def test_none_base_url_falls_back_to_module_constant(self):
@@ -295,7 +303,11 @@ class TestAnthropicBaseUrlEmptyStringHandling(unittest.TestCase):
         the public Anthropic URL via `os.getenv(...) or "https://..."`."""
         with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": ""}, clear=False):
             import docker_manager
+            prior_base = docker_manager.BASE_DATA_DIR
             importlib.reload(docker_manager)
+            if "outputs_broker" in sys.modules:
+                importlib.reload(sys.modules["outputs_broker"])
+            docker_manager.BASE_DATA_DIR = prior_base
             self.assertEqual(docker_manager.ANTHROPIC_BASE_URL, "https://api.anthropic.com")
 
 

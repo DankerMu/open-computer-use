@@ -159,7 +159,7 @@ def test_claude_dispatch_byte_compat(fixture, monkeypatch):
     _scrub_dev_env(monkeypatch)
 
     # Drop modules so cli_runtime re-imports cleanly under the test env.
-    for mod in ("cli_runtime", "docker_manager"):
+    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
         sys.modules.pop(mod, None)
 
     # Import the freshly-loaded dispatch + Cli.
@@ -245,7 +245,7 @@ def test_claude_dispatch_resume_byte_compat(fixture, monkeypatch):
     assembled identically to v0.9.2.0."""
     _scrub_dev_env(monkeypatch)
 
-    for mod in ("cli_runtime", "docker_manager"):
+    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
         sys.modules.pop(mod, None)
 
     from cli_runtime import dispatch as cli_dispatch
@@ -304,7 +304,7 @@ def test_claude_dispatch_with_headers_env_byte_compat(fixture, monkeypatch):
     it BEFORE the argv - exactly the v0.9.2.0 shape."""
     _scrub_dev_env(monkeypatch)
 
-    for mod in ("cli_runtime", "docker_manager"):
+    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
         sys.modules.pop(mod, None)
     from cli_runtime import dispatch as cli_dispatch
 

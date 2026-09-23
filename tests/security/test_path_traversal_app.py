@@ -11,7 +11,6 @@ These tests verify that:
 """
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -41,15 +40,19 @@ def tmp_data(tmp_path):
 def client(tmp_data, monkeypatch):
     """TestClient with patched BASE_DATA_DIR and a valid service token."""
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    for name in ("app", "docker_manager", "outputs_broker"):
+        sys.modules.pop(name, None)
     import app as app_module
+    import docker_manager
 
-    with patch.object(app_module, "BASE_DATA_DIR", tmp_data):
-        http = TestClient(app_module.app)
-        http.headers.update({"Authorization": f"Bearer {INTERNAL_TOKEN}"})
-        try:
-            yield http
-        finally:
-            http.close()
+    monkeypatch.setattr(app_module, "BASE_DATA_DIR", tmp_data)
+    monkeypatch.setattr(docker_manager, "BASE_DATA_DIR", tmp_data)
+    http = TestClient(app_module.app)
+    http.headers.update({"Authorization": f"Bearer {INTERNAL_TOKEN}"})
+    try:
+        yield http
+    finally:
+        http.close()
 
 
 class TestChatIdValidation:

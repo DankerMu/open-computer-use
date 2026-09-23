@@ -37,7 +37,7 @@ _OPENCODE_ENV_VARS = (
 
 def _drop_modules():
     """Drop cli_runtime + docker_manager so the next import re-reads env."""
-    for mod in ("cli_runtime", "docker_manager"):
+    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
         sys.modules.pop(mod, None)
 
 

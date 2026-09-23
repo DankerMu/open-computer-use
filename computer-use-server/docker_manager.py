@@ -1597,9 +1597,11 @@ def describe_sandbox(chat_id: str) -> dict:
         else:
             state = "stopped"
             views = ["files"]
+        from outputs_broker import OutputsBroker
+        revision = OutputsBroker().current_revision(chat_id)
         return {
             "state": state,
-            "revision": 0,
+            "revision": revision,
             "views": views,
             "cli_badge": cli_badge(),
         }

@@ -3,6 +3,17 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Broker-backed outputs listing.** `GET /api/outputs/{chat_id}` now
+  reconciles persisted identities instead of scanning independently. The
+  current SPA envelope (`chat_id`, `files`, `total`, `timestamp`, and
+  per-file `modified` seconds) stays for one release; responses add
+  `revision`, `next_cursor`, broker metadata, and percent-encoded
+  `{OCU_PUBLIC_PREFIX}/files/...` cookie-path URLs. Pages are path-ordered
+  and bounded (default 100, maximum 1000). Matching `If-None-Match` after a
+  successful reconcile returns 304 with the weak page ETag; auth, cursor,
+  and broker failures never become empty 200/304. `GET /internal/describe/{chat_id}`
+  reports the persisted broker counter (0 when no index exists) instead of
+  the pre-broker zero placeholder.
 - **Persisted output identity broker.** `outputs_broker.py` now packages
   lifecycle-locked, bounded per-chat UUID identities, revision stamps, cached
   hashes, deterministic rename matching, tombstones, and revision-bound pages
@@ -31,8 +42,8 @@
   refusal, and corrupt metadata fail without deleting the sandbox. Missing
   sandbox and metadata return 409 `never_created`. Restart and resurrect are
   aliases of launch. `GET /internal/describe/{chat_id}` is non-mutating and
-  returns revision 0 until the broker exists. Credentials are read inside the
-  per-chat lock; recreation uses server-side fallbacks only.
+  returns the persisted broker revision, or 0 when no index exists. Credentials
+  are read inside the per-chat lock; recreation uses server-side fallbacks only.
   `OCU_INTERNAL_TOKEN` and `MCP_API_KEY` never enter sandbox environment, and
   `NO_AUTOSTART=1` is present exactly when `OCU_SANDBOX_NO_AUTOSTART=1`.
 - **Host-owned idle reclamation.** The detached in-container sleeper is removed.

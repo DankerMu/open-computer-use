@@ -15,6 +15,7 @@ import asyncio
 import html as html_module
 import hashlib
 import json
+import logging
 import mimetypes
 import re
 import time
@@ -22,9 +23,10 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Dict, List, Any
+from urllib.parse import quote
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, PlainTextResponse
@@ -49,7 +51,122 @@ from docker_manager import (
     LifecycleError,
 )
 from security import sanitize_chat_id, safe_path
+from outputs_broker import (
+    CursorError,
+    DEFAULT_PAGE_LIMIT,
+    LimitExceededError,
+    MAX_PAGE_LIMIT,
+    OutputsBroker,
+    OutputsBrokerError,
+    StaleCursorError,
+    UnstableReadError,
+)
 import skill_manager
+
+_OUTPUTS_BROKER = OutputsBroker()
+_OUTPUTS_LOG = logging.getLogger("ocu.outputs")
+_GENERIC_OUTPUTS_FAILURE = "outputs listing failed"
+
+
+def _outputs_http_error(exc: BaseException) -> HTTPException:
+    """Map broker failures to generic HTTP errors without leaking host paths."""
+    _OUTPUTS_LOG.warning("outputs broker failure: %s: %s", type(exc).__name__, exc)
+    if isinstance(exc, StaleCursorError):
+        status = 409
+    elif isinstance(exc, CursorError):
+        status = 400
+    elif isinstance(exc, UnstableReadError):
+        status = 503
+    elif isinstance(exc, LimitExceededError):
+        status = 413
+    else:
+        status = 500
+    headers = {"Retry-After": "1"} if status == 503 else None
+    return HTTPException(status_code=status, detail=_GENERIC_OUTPUTS_FAILURE, headers=headers)
+
+
+def _listing_etag(payload: dict) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return f'W/"{digest}"'
+
+
+_ENTITY_TAG = re.compile(r'(?:W/)?"[^"]*"')
+
+
+def _if_none_match_hits(header: str | None, etag: str) -> bool:
+    if header is None:
+        return False
+    raw = header.strip()
+    if not raw:
+        return False
+    if raw == "*":
+        return True
+    quoted = etag[3:-1] if etag.startswith("W/") else etag[1:-1]
+    candidates = {f'"{quoted}"', f'W/"{quoted}"'}
+    remaining = raw
+    while remaining:
+        remaining = remaining.lstrip(" \t")
+        match = _ENTITY_TAG.match(remaining)
+        if match is None:
+            return False
+        if match.group(0) in candidates:
+            return True
+        remaining = remaining[match.end():].lstrip(" \t")
+        if not remaining:
+            return False
+        if remaining[0] != ",":
+            return False
+        remaining = remaining[1:]
+        if not remaining.strip():
+            return False
+    return False
+
+
+def _output_file_url(chat_id: str, relative_path: str) -> str:
+    return f"{OCU_PUBLIC_PREFIX}/files/{chat_id}/{quote(relative_path, safe='/')}"
+
+
+def _listing_files(chat_id: str, entries: list[dict]) -> list[dict]:
+    files = []
+    for entry in entries:
+        file_type, mime = classify_file(entry["path"])
+        files.append({
+            "file_id": entry["file_id"],
+            "path": entry["path"],
+            "name": entry["name"],
+            "size": entry["size"],
+            "mtime_ns": entry["mtime_ns"],
+            "revision": entry["revision"],
+            "hash": entry["hash"],
+            "type": file_type,
+            "mime": mime,
+            "url": _output_file_url(chat_id, entry["path"]),
+            "modified": entry["mtime_ns"] / 1e9,
+        })
+    return files
+
+
+def _reconcile_outputs(chat_id: str, cursor: str | None, limit: int) -> dict:
+    page = _OUTPUTS_BROKER.reconcile(chat_id, cursor=cursor, limit=limit)
+    files = _listing_files(chat_id, page["entries"])
+    body = {
+        "chat_id": chat_id,
+        "files": files,
+        "total": page["total"],
+        "timestamp": time.time(),
+        "revision": page["revision"],
+        "next_cursor": page["next_cursor"],
+    }
+    etag = _listing_etag({
+        "chat_id": body["chat_id"],
+        "files": body["files"],
+        "total": body["total"],
+        "revision": body["revision"],
+        "next_cursor": body["next_cursor"],
+        "limit": limit,
+    })
+    return {"body": body, "etag": etag}
 
 
 # =============================================================================
@@ -678,38 +795,30 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
 # =============================================================================
 
 @app.get("/api/outputs/{chat_id}", tags=["Files"])
-async def list_outputs(chat_id: str, response: Response):
-    """List all files in the outputs directory with metadata."""
+async def list_outputs(
+    chat_id: str,
+    response: Response,
+    cursor: Optional[str] = Query(default=None),
+    limit: int = Query(default=DEFAULT_PAGE_LIMIT),
+    if_none_match: Optional[str] = Header(default=None, alias="If-None-Match"),
+):
+    """List output files from the persisted broker with prefixed URLs."""
     chat_id = sanitize_chat_id(chat_id)
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-
-    outputs_dir = safe_path(BASE_DATA_DIR, chat_id, "outputs")
-
-    if not outputs_dir.exists():
-        return {"chat_id": chat_id, "files": [], "total": 0, "timestamp": time.time()}
-
-    files = []
-
-    for file_path in outputs_dir.rglob("*"):
-        if not file_path.is_file():
-            continue
-        if file_path.name.startswith('.'):
-            continue
-        relative = file_path.relative_to(outputs_dir)
-        file_type, mime = classify_file(str(relative))
-        stat = file_path.stat()
-        files.append({
-            "name": file_path.name,
-            "path": str(relative),
-            "size": stat.st_size,
-            "modified": stat.st_mtime,
-            "type": file_type,
-            "mime": mime,
-            "url": f"/files/{chat_id}/{relative}",
-        })
-
-    files.sort(key=lambda f: f["modified"], reverse=True)
-    return {"chat_id": chat_id, "files": files, "total": len(files), "timestamp": time.time()}
+    cache_control = "no-cache, no-store, must-revalidate"
+    response.headers["Cache-Control"] = cache_control
+    if type(limit) is not int or limit < 1 or limit > MAX_PAGE_LIMIT:
+        raise HTTPException(status_code=422, detail=_GENERIC_OUTPUTS_FAILURE)
+    try:
+        listing = await asyncio.to_thread(_reconcile_outputs, chat_id, cursor, limit)
+    except (OutputsBrokerError, OSError) as exc:
+        raise _outputs_http_error(exc) from exc
+    response.headers["ETag"] = listing["etag"]
+    if _if_none_match_hits(if_none_match, listing["etag"]):
+        return Response(
+            status_code=304,
+            headers={"Cache-Control": cache_control, "ETag": listing["etag"]},
+        )
+    return listing["body"]
 
 
 # =============================================================================
@@ -991,6 +1100,8 @@ async def internal_describe(chat_id: str):
         return await asyncio.to_thread(describe_sandbox, canonical_chat_id(chat_id))
     except LifecycleError as exc:
         raise _lifecycle_http_error(exc) from exc
+    except (OutputsBrokerError, OSError) as exc:
+        raise _outputs_http_error(exc) from exc
 
 
 @app.get("/terminal/{chat_id}/sessions", tags=["Terminal"])

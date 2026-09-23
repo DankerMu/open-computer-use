@@ -39,7 +39,7 @@ def _scrub_all_model_envs(monkeypatch):
 
 def _fresh_cli_runtime(monkeypatch):
     """Drop + freshly import cli_runtime under current env."""
-    for mod in ("cli_runtime", "docker_manager"):
+    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
         sys.modules.pop(mod, None)
     return importlib.import_module("cli_runtime")
 
@@ -51,7 +51,7 @@ def _fresh_cli_runtime(monkeypatch):
 def test_docker_manager_has_no_sub_agent_default_model(monkeypatch):
     """D-03: docker_manager must NOT define SUB_AGENT_DEFAULT_MODEL attribute."""
     monkeypatch.delenv("SUB_AGENT_DEFAULT_MODEL", raising=False)
-    for mod in ("cli_runtime", "docker_manager"):
+    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
         sys.modules.pop(mod, None)
     dm = importlib.import_module("docker_manager")
     assert not hasattr(dm, "SUB_AGENT_DEFAULT_MODEL"), (
@@ -65,7 +65,7 @@ def test_docker_manager_has_no_per_cli_constants(monkeypatch):
     directly by cli_runtime resolver — docker_manager must NOT re-export them
     as module-level constants (dead code that drifts out of sync).
     """
-    for mod in ("cli_runtime", "docker_manager"):
+    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
         sys.modules.pop(mod, None)
     dm = importlib.import_module("docker_manager")
     for name in (

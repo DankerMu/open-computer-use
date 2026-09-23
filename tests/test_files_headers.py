@@ -37,6 +37,7 @@ def app_module(monkeypatch):
             "auth_guard",
             "mcp_tools",
             "docker_manager",
+            "outputs_broker",
             "context_vars",
             "security",
             "system_prompt",
@@ -61,6 +62,9 @@ def client(app_module, output_dir, monkeypatch):
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr(app_module, "BASE_DATA_DIR", output_dir.parents[1])
+    import docker_manager
+
+    monkeypatch.setattr(docker_manager, "BASE_DATA_DIR", output_dir.parents[1])
     with TestClient(app_module.app) as http:
         yield http
 
