@@ -8,9 +8,12 @@
   and the static mount at `{prefix}/static` exactly once. `describeUrl` stays
   the unprefixed WebUI route `/api/v1/ocu/workspaces/{chat_id}`. Browser-viewer
   discovery and CDP WebSockets derive their public path from the module URL.
-  Invalid prefixes fail import/startup. Empty prefix keeps the previous URLs.
-  A nonempty prefix is an intermediate server slice; issue17 must land before
-  prefixed SPA deployment.
+  Invalid prefixes fail import/startup. A prefix whose `{prefix}/static/` falls
+  under a guarded chat namespace (`/files`, `/preview`, `/browser`, `/terminal`,
+  `/internal`, `/api/outputs`, `/api/uploads`, and descendants) fails startup
+  by the guard's path classification; `/api` and `/files-ui` remain valid.
+  Empty prefix keeps the previous URLs. A nonempty prefix is an intermediate
+  server slice; issue17 must land before prefixed SPA deployment.
 - **Explicit sandbox lifecycle.** Tool and MCP calls return a running sandbox or
   create one only when neither a container nor valid metadata exists. Stopped
   and absent-with-metadata states return a workspace-stopped error without

@@ -182,6 +182,19 @@ def _subprocess_env():
     return env
 
 
+def _startup_import(prefix):
+    env = _subprocess_env()
+    env["OCU_PUBLIC_PREFIX"] = prefix
+    return subprocess.run(
+        [sys.executable, "-c", "import app"],
+        cwd=str(SERVER_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
 @contextmanager
 def _isolated_app(prefix=None):
     snapshot = sys.modules.copy()
@@ -292,21 +305,89 @@ def test_nested_prefix_shell_urls_and_static_mount(prefix):
 
 @pytest.mark.parametrize(
     "value",
-    ("ocu", "/ocu/", "//ocu", "/../ocu", "/ocu?x=1"),
+    (
+        "ocu",
+        "/ocu/",
+        "//ocu",
+        "/../ocu",
+        "/ocu?x=1",
+        " /ocu",
+        "/ocu ",
+        "/ocu%2f",
+        "/ocu#x",
+        "https://example.com/ocu",
+        "/./ocu",
+        "/ocu/..",
+    ),
 )
 def test_invalid_prefix_fails_import_naming_the_variable(value):
+    completed = _startup_import(value)
+    assert completed.returncode != 0
+    assert "OCU_PUBLIC_PREFIX" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    (
+        "/files",
+        "/preview",
+        "/browser",
+        "/terminal",
+        "/internal",
+        "/api/outputs",
+        "/api/uploads",
+        "/files/x",
+        "/terminal/a/b",
+        "/api/uploads/x",
+    ),
+)
+def test_guarded_namespace_prefix_fails_startup(prefix):
+    completed = _startup_import(prefix)
+    assert completed.returncode != 0
+    assert "OCU_PUBLIC_PREFIX" in completed.stderr
+
+
+def test_explicit_empty_string_prefix_is_accepted_at_startup():
     env = _subprocess_env()
-    env["OCU_PUBLIC_PREFIX"] = value
+    env["OCU_PUBLIC_PREFIX"] = ""
     completed = subprocess.run(
-        [sys.executable, "-c", "import app"],
+        [sys.executable, "-c", "import app; assert app.OCU_PUBLIC_PREFIX == ''"],
         cwd=str(SERVER_DIR),
         env=env,
         capture_output=True,
         text=True,
         timeout=60,
     )
-    assert completed.returncode != 0
-    assert "OCU_PUBLIC_PREFIX" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("prefix", ("/api", "/files-ui"))
+def test_nonconflicting_prefix_serves_static_without_changing_auth(prefix):
+    with _isolated_app(prefix) as loaded:
+        client = _client(loaded)
+        static = client.get(f"{prefix}/static/preview.css")
+        denied = client.get(f"/preview/{CHAT}")
+        authorized = _preview(client)
+
+    assert static.status_code == 200
+    assert "text/css" in static.headers["content-type"]
+    assert "Preview SPA" in static.text
+    assert denied.status_code == 401
+    assert authorized.status_code == 200
+    assert CHAT not in denied.text
+
+
+def test_invalid_token_on_preview_returns_401():
+    with _isolated_app(None) as loaded:
+        response = _client(loaded).get(
+            f"/preview/{CHAT}",
+            headers={"Authorization": f"Bearer not-{INTERNAL}"},
+        )
+
+    assert response.status_code == 401
+    assert CHAT not in response.text
+    assert INTERNAL not in response.text
+
 
 
 def test_browser_viewer_addresses_follow_module_url_and_protocol(tmp_path):

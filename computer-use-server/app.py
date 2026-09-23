@@ -25,7 +25,7 @@ from typing import Optional, Dict, List, Any
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body
-from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight
+from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -83,6 +83,10 @@ def _canonical_public_prefix(raw: str | None) -> str:
             raise RuntimeError(
                 f"OCU_PUBLIC_PREFIX is not a canonical path prefix: {raw!r}."
             )
+    if _guarded(f"{raw}/static/"):
+        raise RuntimeError(
+            f"OCU_PUBLIC_PREFIX places the static mount in a guarded chat namespace: {raw!r}."
+        )
     return raw
 
 
