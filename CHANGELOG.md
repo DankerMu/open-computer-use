@@ -3,6 +3,15 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Dedicated sandbox-bridge membership.** Network-enabled create and launch
+  attach a sandbox only to the deployment-provisioned `OCU_SANDBOX_NETWORK`
+  (default `ocu-sandbox`) and publish CDP/ttyd on that bridge's inspected IPv4
+  gateway. Compose-network discovery, attachment, address fallback, and the
+  unused CDP address alias are removed. Incompatible immutable bindings or live
+  membership fail without deleting or recreating the container; stopped
+  containers may have membership repaired, and a partial repair is not success.
+  `ENABLE_NETWORK=false` keeps disabled create/stop/launch with no network
+  lookup. `SANDBOX_HOST_BIND_IP`, when set, must equal the inspected gateway.
 - **Workspace WebSocket session re-check.** CDP and ttyd relays capture the
   handshake `token` cookie and canonical chat id, perform a bounded owner check
   against configured `OCU_WEBUI_AUTH_URL` before backend access, and recheck

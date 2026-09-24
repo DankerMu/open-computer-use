@@ -183,11 +183,20 @@ def test_extra_env_carries_subagent_cli_via_create_container(monkeypatch):
 
     class _FakeNetworks:
         def get(self, *a, **kw):
-            raise Exception("no such network")
+            net = type("N", (), {})()
+            net.name = "ocu-sandbox"
+            net.id = "netid-ocu-sandbox-current"
+            net.attrs = {
+                "Id": "netid-ocu-sandbox-current",
+                "Name": "ocu-sandbox",
+                "Driver": "bridge",
+                "Internal": False,
+                "IPAM": {"Config": [{"Gateway": "172.31.0.1"}]},
+            }
+            return net
 
         def list(self, *a, **kw):
             return []
-
     class _FakeImages:
         def get(self, *a, **kw):
             from unittest.mock import MagicMock

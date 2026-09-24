@@ -156,7 +156,7 @@ def _get_default_chat_warning() -> str:
 from docker_manager import (
     get_docker_client, get_container_service_address,
     _get_or_create_container, _execute_bash, execute_bash_streaming, _execute_python_with_stdin,
-    _reset_shutdown_timer, _get_compose_network_name,
+    _reset_shutdown_timer,
     build_mcp_config, build_mcp_config_write_script,
     _fetch_gitlab_token, _ensure_gitlab_token,
     SandboxStopped, LifecycleError,

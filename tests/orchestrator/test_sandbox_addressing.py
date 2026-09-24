@@ -1,18 +1,11 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Tests for resolving a sandbox service address across container engines.
+"""Tests for resolving a sandbox service address from published ports.
 
-The orchestrator proxies Chrome DevTools (9222) and the web terminal (7681) from the browser to a
-sandbox container. How it reaches that container differs by engine:
-
-- Docker-in-Docker: every sandbox shares one network namespace, so a bridge network with routable
-  per-container IPs exists and the container can be addressed directly.
-- Rootless Podman: no shared bridge, no routable per-container address. The only portable handle
-  is a published host port, which the engine assigns.
-
-Publishing ports works on both, so it is the primary path, with the IP lookup kept as a fallback
-for containers created before publishing was introduced — an upgrade must not strand a running
-sandbox.
+CDP (9222) and ttyd (7681) are reached through the engine-assigned published
+host address and port. Missing publication is unavailable. Host-network and
+wildcard HostIp still parse to loopback for the shared-namespace address
+contract; that parser is not a managed-launch isolation exception.
 
 Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_sandbox_addressing.py -v
 """
@@ -58,12 +51,18 @@ class PublishedAddressTests(unittest.TestCase):
         self.assertNotIn(":9222", _published_address(c, 9222))
 
     def test_wildcard_host_ip_is_narrowed_to_loopback(self):
-        """0.0.0.0 means "all interfaces"; the orchestrator only needs loopback."""
+        """0.0.0.0 means "all interfaces"; the shared-namespace parser uses loopback."""
         for wildcard in ("0.0.0.0", "::", ""):
             c = _container({"NetworkSettings": {"Ports": {
                 "7681/tcp": [{"HostIp": wildcard, "HostPort": "40000"}],
             }}})
             self.assertEqual(_published_address(c, 7681), "127.0.0.1:40000")
+
+    def test_concrete_gateway_binding_is_returned_verbatim(self):
+        c = _container({"NetworkSettings": {"Ports": {
+            "9222/tcp": [{"HostIp": "172.31.0.1", "HostPort": "49153"}],
+        }}})
+        self.assertEqual(_published_address(c, 9222), "172.31.0.1:49153")
 
     def test_ports_are_resolved_independently(self):
         """CDP and the terminal get different host ports and must not be confused."""
@@ -93,7 +92,7 @@ class PublishedAddressTests(unittest.TestCase):
 
 
 class ServiceAddressTests(unittest.TestCase):
-    """get_container_service_address prefers the published port, falls back to the IP."""
+    """get_container_service_address uses assigned published ports only."""
 
     def setUp(self):
         self.client = MagicMock()
@@ -101,39 +100,27 @@ class ServiceAddressTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_published_port_wins_over_the_network_ip(self):
-        """A container with both must use the port — the IP may be unroutable under Podman."""
+    def test_published_gateway_port_is_used_without_network_mutation(self):
         self.client.containers.get.return_value = _container({"NetworkSettings": {
-            "Ports": {"9222/tcp": [{"HostIp": "127.0.0.1", "HostPort": "49153"}]},
-            "Networks": {"compose_default": {"IPAddress": "172.18.0.5"}},
-            "IPAddress": "",
+            "Ports": {"9222/tcp": [{"HostIp": "172.31.0.1", "HostPort": "49153"}]},
+            "Networks": {"ocu-sandbox": {"IPAddress": "172.31.0.10"}},
+            "IPAddress": "172.31.0.10",
         }})
-        with patch.object(docker_manager, "_get_compose_network_name", return_value="compose_default"):
-            self.assertEqual(get_container_service_address("chat-1", CDP_PORT), "127.0.0.1:49153")
+        self.assertEqual(get_container_service_address("chat-1", CDP_PORT), "172.31.0.1:49153")
+        self.client.networks.get.assert_not_called()
 
-    def test_falls_back_to_network_ip_with_the_container_port(self):
-        """Pre-existing containers have no published port; the old path still has to work."""
+    def test_missing_publication_is_unavailable_even_with_container_ip(self):
         self.client.containers.get.return_value = _container({"NetworkSettings": {
             "Ports": {},
-            "Networks": {"compose_default": {"IPAddress": "172.18.0.5"}},
-            "IPAddress": "",
+            "Networks": {
+                "ocu-sandbox": {"IPAddress": "172.31.0.10"},
+                "compose_default": {"IPAddress": "172.18.0.5"},
+            },
+            "IPAddress": "172.18.0.5",
         }})
-        with patch.object(docker_manager, "_get_compose_network_name", return_value="compose_default"):
-            self.assertEqual(
-                get_container_service_address("chat-1", CDP_PORT), "172.18.0.5:9222"
-            )
-
-    def test_fallback_uses_the_requested_port_not_a_hardcoded_one(self):
-        """The terminal and CDP share this resolver; a hardcoded 9222 would break the terminal."""
-        self.client.containers.get.return_value = _container({"NetworkSettings": {
-            "Ports": {},
-            "Networks": {"compose_default": {"IPAddress": "172.18.0.5"}},
-            "IPAddress": "",
-        }})
-        with patch.object(docker_manager, "_get_compose_network_name", return_value="compose_default"):
-            self.assertEqual(
-                get_container_service_address("chat-1", TTYD_PORT), "172.18.0.5:7681"
-            )
+        self.assertIsNone(get_container_service_address("chat-1", CDP_PORT))
+        self.assertIsNone(get_container_service_address("chat-1", TTYD_PORT))
+        self.client.networks.get.assert_not_called()
 
     def test_returns_none_when_the_container_is_not_running(self):
         self.client.containers.get.return_value = _container(
@@ -152,14 +139,7 @@ class ServiceAddressTests(unittest.TestCase):
             "Networks": {},
             "IPAddress": "",
         }})
-        with patch.object(docker_manager, "_get_compose_network_name", return_value=None):
-            self.assertEqual(
-                get_container_service_address("chat-1", TTYD_PORT), "127.0.0.1:45000"
-            )
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(get_container_service_address("chat-1", TTYD_PORT), "127.0.0.1:45000")
 
 
 class UserDataDirectoryTests(unittest.TestCase):
@@ -198,3 +178,7 @@ class UserDataDirectoryTests(unittest.TestCase):
         for call in client.containers.run.call_args_list:
             self.assertNotEqual(call.kwargs.get("user"), "root",
                                 "must not spawn a root container to prepare directories")
+
+
+if __name__ == "__main__":
+    unittest.main()
