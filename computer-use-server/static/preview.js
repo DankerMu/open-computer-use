@@ -1610,15 +1610,13 @@ function App() {
       </div>
     </div>
 
-    ${currentView === 'files' && html`
-      <div style="display:flex;flex:1;flex-direction:column;overflow:hidden">
-        <${FilesView}
-          files=${files}
-          selectedFile=${selectedFile}
-          onSelectFile=${onSelectFile}
-        />
-      </div>
-    `}
+    <div style="display:${currentView === 'files' ? 'flex' : 'none'};flex:1;flex-direction:column;overflow:hidden">
+      <${FilesView}
+        files=${files}
+        selectedFile=${selectedFile}
+        onSelectFile=${onSelectFile}
+      />
+    </div>
 
     <div style="display:${currentView === 'browser' ? 'flex' : 'none'};flex:1;flex-direction:column;overflow:hidden">
       <${BrowserView}
