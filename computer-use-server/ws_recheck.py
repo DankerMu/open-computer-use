@@ -224,6 +224,17 @@ class RelaySession:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
+    async def _continue_after_cancel(self, awaitable) -> bool:
+        try:
+            await awaitable
+            return False
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None:
+                while task.cancelling():
+                    task.uncancel()
+            return True
+
     async def _aclose_session(self, session) -> None:
         if session is None:
             return
@@ -248,8 +259,13 @@ class RelaySession:
         await self._aclose_session(session)
 
     async def _cleanup_backend(self) -> None:
-        await self._close_backend()
-        await self._aclose_backend_session()
+        cancelled = False
+        if await self._continue_after_cancel(self._close_backend()):
+            cancelled = True
+        if await self._continue_after_cancel(self._aclose_backend_session()):
+            cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
 
 
     async def run(
@@ -361,16 +377,22 @@ class RelaySession:
             else:
                 await self._close_frontend(BACKEND_FAIL_CLOSE_CODE, "Backend connection failed")
         finally:
+            saw_cancel = cancelled
             task = asyncio.current_task()
-            if cancelled and task is not None:
+            if saw_cancel and task is not None:
                 while task.cancelling():
                     task.uncancel()
-            await self._cancel_tasks(
-                [lookup_task, self._connect_task, self._recheck_task, *self._pump_tasks]
-            )
-            await self._cleanup_backend()
-            await self._aclose_auth()
-            if cancelled:
+            if await self._continue_after_cancel(
+                self._cancel_tasks(
+                    [lookup_task, self._connect_task, self._recheck_task, *self._pump_tasks]
+                )
+            ):
+                saw_cancel = True
+            if await self._continue_after_cancel(self._cleanup_backend()):
+                saw_cancel = True
+            if await self._continue_after_cancel(self._aclose_auth()):
+                saw_cancel = True
+            if saw_cancel:
                 raise asyncio.CancelledError
 
 

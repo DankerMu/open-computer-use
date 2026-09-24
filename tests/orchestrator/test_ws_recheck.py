@@ -1476,6 +1476,89 @@ class TestHungAuthAndCancel:
         assert all(session.close_finished.is_set() for session in auth.sessions)
 
 
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    @pytest.mark.parametrize("path", ("normal", "revoked"))
+    def test_cancel_during_finally_backend_close_still_closes_sessions(
+        self, app_module, monkeypatch, kind, path
+    ):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200, 403] if path == "revoked" else [200, 200, 200])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        box = {}
+        messages = []
+        opened = threading.Event()
+        closed = threading.Event()
+
+        async def drive():
+            client_queue = asyncio.Queue()
+
+            async def receive():
+                if not opened.is_set():
+                    opened.set()
+                    return {"type": "websocket.connect"}
+                return await client_queue.get()
+
+            async def send(message):
+                messages.append(message)
+                if message.get("type") == "websocket.close":
+                    closed.set()
+
+            task = asyncio.create_task(app_module.app(_ws_scope(kind), receive, send))
+            deadline = time.monotonic() + 2
+            while not backend.connected.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert backend.connected.is_set()
+            assert backend.connections
+            conn = backend.connections[0]
+            conn.close_delay = 30.0
+            box["conn"] = conn
+            if path == "revoked":
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                clock.advance(RECHECK_INTERVAL)
+            else:
+                conn.eof()
+            await _await_thread_event(closed, name="frontend close before finally cancel")
+            await _await_thread_event(conn.close_started, name="finally entered blocked backend.close")
+            assert not backend.backend_sessions[0].close_entered.is_set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                box["cancelled"] = True
+            else:
+                box["cancelled"] = False
+            box["done"] = task.done()
+            box["close"] = next(
+                (item for item in messages if item.get("type") == "websocket.close"),
+                None,
+            )
+            box["pending"] = [
+                t
+                for t in asyncio.all_tasks()
+                if t is not asyncio.current_task() and not t.done()
+            ]
+
+        asyncio.run(drive())
+        close = box.get("close") or {}
+        expected = REVOKE_CODE if path == "revoked" else 1000
+        assert close.get("code") == expected, box
+        assert box.get("cancelled") is True
+        assert box.get("done") is True
+        assert not box["pending"], box["pending"]
+        conn = box["conn"]
+        assert conn.close_started.is_set()
+        assert conn.close_finished.is_set()
+        assert backend.backend_sessions, "backend session must exist"
+        assert backend.backend_sessions[0].close_entered.is_set()
+        assert backend.backend_sessions[0].close_finished.is_set()
+        assert auth.sessions, "auth session must exist after real GET"
+        assert all(session.close_entered.is_set() for session in auth.sessions)
+        assert all(session.close_finished.is_set() for session in auth.sessions)
+
+
 class TestDecisionBarriersAndConcurrentPairs:
     @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
     def test_predecision_frame_forwards_postdecision_does_not(
