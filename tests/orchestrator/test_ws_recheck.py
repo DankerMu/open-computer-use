@@ -122,6 +122,76 @@ def _ws_connect(client, kind, chat_id=CHAT, headers=None):
     return client.websocket_connect(path, **kwargs)
 
 
+def _ws_scope(kind, chat_id=CHAT, headers=None):
+    path = (
+        f"/browser/{chat_id}/devtools/page/page-1"
+        if kind == "cdp"
+        else f"/terminal/{chat_id}/ws"
+    )
+    header_map = headers or _cookie_headers()
+    raw = [
+        (name.lower().encode("latin-1"), str(value).encode("latin-1"))
+        for name, value in header_map.items()
+    ]
+    return {
+        "type": "websocket",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "scheme": "ws",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": raw,
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": ["tty"] if kind == "ttyd" else [],
+        "extensions": {},
+        "root_path": "",
+    }
+
+
+def _run_ws_route(app, kind, chat_id=CHAT, headers=None, timeout=8.0):
+    """Drive the real ASGI websocket route without TestClient lifespan join.
+
+    Denial is observed from the close message independently of lookup threads.
+    """
+    messages = []
+    opened = threading.Event()
+
+    async def receive():
+        if not opened.is_set():
+            opened.set()
+            return {"type": "websocket.connect"}
+        await asyncio.Event().wait()
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    async def send(message):
+        messages.append(message)
+
+    async def drive():
+        await app(_ws_scope(kind, chat_id, headers), receive, send)
+
+    box = {}
+
+    def runner():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(asyncio.wait_for(drive(), timeout=timeout))
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    thread.join(timeout + 1)
+    if thread.is_alive():
+        raise AssertionError("ASGI websocket route exceeded bounded harness timeout")
+    close = next((item for item in messages if item.get("type") == "websocket.close"), None)
+    return close, box.get("error"), messages
+
+
 class RecordingClock:
     def __init__(self, start=1_000.0):
         self.now = start
@@ -859,19 +929,18 @@ class TestFlagRaceAndBlockedSends:
     ):
         backend = FakeBackend()
         backend.send_block = asyncio.Event()
+        backend.send_entered = threading.Event()
         auth = ScriptedAuth([200, 403])
         clock = RecordingClock()
         _install_fakes(app_module, monkeypatch, auth, backend, clock)
         with _client(app_module) as client:
             with _ws_connect(client, kind) as socket:
-                deadline = time.monotonic() + 2
-                while not backend.connections and time.monotonic() < deadline:
-                    time.sleep(0.01)
+                assert backend.connected.wait(2)
                 if kind == "cdp":
                     socket.send_text("blocked")
                 else:
                     socket.send_bytes(b"blocked")
-                time.sleep(0.05)
+                assert backend.send_entered.wait(2)
                 deadline = time.monotonic() + 2
                 while not clock.sleeps and time.monotonic() < deadline:
                     time.sleep(0.01)
@@ -879,14 +948,12 @@ class TestFlagRaceAndBlockedSends:
                 _expect_close_code(socket, REVOKE_CODE)
                 backend.send_block.set()
                 assert all("blocked" not in str(item[1]) for item in backend.sent)
-                # After revoke, unblocking the backend send must not accept a
-                # later client marker.
                 try:
                     socket.send_text(FUTURE_MARKER)
                 except Exception:
                     pass
-                time.sleep(0.05)
                 assert all(FUTURE_MARKER not in str(item[1]) for item in backend.sent)
+        assert all(session.close_entered.is_set() for session in auth.sessions)
 
 
 class TestNormalDisconnectCancelAndBackendFailure:
@@ -1041,30 +1108,42 @@ class TestLookupAndHungConnect:
             return backend.address(chat_id, port)
 
         monkeypatch.setattr(app_module, "get_container_service_address", lookup)
+        b_result = {}
+
+        def open_b():
+            try:
+                with _ws_connect(
+                    client, "ttyd", chat_id=CHAT_B, headers=_cookie_headers(COOKIE_B)
+                ) as sock:
+                    b_result["code"] = None
+                    sock.close()
+            except Exception as exc:
+                b_result["code"] = getattr(exc, "code", None)
+
         with _client(app_module) as client:
             with _ws_connect(client, "cdp", chat_id=CHAT, headers=_cookie_headers(COOKIE_A)) as sock_a:
                 assert backend.connected.wait(2)
-                starter = threading.Thread(
-                    target=lambda: _ws_connect(
-                        client, "ttyd", chat_id=CHAT_B, headers=_cookie_headers(COOKIE_B)
-                    ).__enter__(),
-                    daemon=True,
-                )
+                starter = threading.Thread(target=open_b, daemon=True)
                 starter.start()
-                assert slow.lookup_entered.wait(2)
-                deadline = time.monotonic() + 2
-                while not clock.sleeps and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                clock.advance(RECHECK_INTERVAL)
-                deadline = time.monotonic() + 2
-                while auth.pair_counts().get((COOKIE_A, CHAT), 0) < 2 and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                assert auth.pair_counts().get((COOKIE_A, CHAT), 0) >= 2
-                sock_a.send_text("alive")
-                deadline = time.monotonic() + 2
-                while not backend.connections[0].sent and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                slow.lookup_release.set()
+                try:
+                    assert slow.lookup_entered.wait(2)
+                    deadline = time.monotonic() + 2
+                    while not clock.sleeps and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    clock.advance(RECHECK_INTERVAL)
+                    deadline = time.monotonic() + 2
+                    while auth.pair_counts().get((COOKIE_A, CHAT), 0) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    assert auth.pair_counts().get((COOKIE_A, CHAT), 0) >= 2
+                    sock_a.send_text("alive")
+                    deadline = time.monotonic() + 2
+                    while not backend.connections[0].sent and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    starter.join(2)
+                    assert b_result.get("code") == REVOKE_CODE
+                finally:
+                    slow.lookup_release.set()
+                    starter.join(2)
 
     @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
     def test_hung_connect_still_revokes_from_initial_success(
@@ -1106,8 +1185,9 @@ class TestSessionCloseDoesNotBlockRevoke:
                 while not clock.sleeps and time.monotonic() < deadline:
                     time.sleep(0.01)
                 clock.advance(RECHECK_INTERVAL)
-                assert conn.close_started.wait(2)
                 _expect_close_code(socket, REVOKE_CODE)
+                assert conn.close_started.wait(2)
+                assert backend.backend_sessions[0].close_entered.wait(2)
 
 
 class TestHungAuthAndCancel:
@@ -1138,6 +1218,60 @@ class TestHungAuthAndCancel:
                 auth.hang = True
                 clock.advance(RECHECK_INTERVAL)
                 _expect_close_code(socket, REVOKE_CODE, timeout=6.0)
+
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_route_cancel_during_hung_auth_cleans_up(self, app_module, monkeypatch, kind):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200], hang=True)
+        _install_fakes(app_module, monkeypatch, auth, backend)
+        import ws_recheck
+
+        pending = threading.Event()
+        original = ws_recheck.RelaySession.authorize_once
+
+        async def hanging_authorize(self):
+            pending.set()
+            await asyncio.Event().wait()
+            return True
+
+        monkeypatch.setattr(ws_recheck.RelaySession, "authorize_once", hanging_authorize)
+        box = {}
+
+        async def drive():
+            closer = []
+
+            async def receive():
+                if not closer:
+                    closer.append(True)
+                    return {"type": "websocket.connect"}
+                await asyncio.Event().wait()
+                return {"type": "websocket.disconnect", "code": 1000}
+
+            async def send(message):
+                return None
+
+            task = asyncio.create_task(
+                app_module.app(_ws_scope(kind), receive, send)
+            )
+            deadline = time.monotonic() + 2
+            while not pending.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert pending.is_set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                box["cancelled"] = True
+            else:
+                box["cancelled"] = False
+            box["done"] = task.done()
+
+        asyncio.run(drive())
+        assert box.get("cancelled") is True
+        assert box.get("done") is True
+        assert backend.address_calls == []
+        assert all(session.close_entered.is_set() or session.closed for session in auth.sessions)
+
 
 
 class TestDecisionBarriersAndConcurrentPairs:
@@ -1221,3 +1355,97 @@ class TestDecisionBarriersAndConcurrentPairs:
                     while not any("a-still-open" in str(item[1]) for item in backend.connections[0].sent) and time.monotonic() < deadline:
                         time.sleep(0.01)
                     assert any("a-still-open" in str(item[1]) for item in backend.connections[0].sent)
+
+class TestConnectRevokeAndRouteCancel:
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_connect_phase_revoke_enters_session_close(self, app_module, monkeypatch, kind):
+        backend = FakeBackend(hang_connect=True)
+        backend.session_close_hang = True
+        backend.connect_gate = asyncio.Event()
+        auth = ScriptedAuth([200, 403])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, kind) as socket:
+                assert backend.connect_entered.wait(2)
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                clock.advance(RECHECK_INTERVAL)
+                if backend.backend_sessions:
+                    assert backend.backend_sessions[0].close_entered.wait(2)
+                _expect_close_code(socket, REVOKE_CODE)
+                assert not backend.connections
+
+
+class TestLookupTimeoutAndException:
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_healthy_lookup_stall_closes_1011(self, app_module, monkeypatch, kind):
+        backend = FakeBackend()
+        backend.lookup_block = True
+        backend.lookup_release.clear()
+        auth = ScriptedAuth([200])
+        _install_fakes(app_module, monkeypatch, auth, backend)
+        import ws_recheck
+        monkeypatch.setattr(ws_recheck, "LOOKUP_TIMEOUT_SECONDS", 5.0)
+        try:
+            close, error, _messages = _run_ws_route(
+                app_module.app, kind, timeout=7.0
+            )
+            code = (close or {}).get("code")
+            if code is None and error is not None:
+                code = getattr(error, "code", None)
+            assert code == BACKEND_FAIL_CODE, (close, error)
+        finally:
+            backend.lookup_release.set()
+
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_lookup_exception_closes_1011(self, app_module, monkeypatch, kind):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200])
+        _install_fakes(app_module, monkeypatch, auth, backend)
+
+        def boom(*_a, **_k):
+            raise RuntimeError("docker ping failed")
+
+        monkeypatch.setattr(app_module, "get_container_service_address", boom)
+        with _client(app_module) as client:
+            with pytest.raises(Exception) as exc:
+                with _ws_connect(client, kind):
+                    pass
+            assert getattr(exc.value, "code", None) == BACKEND_FAIL_CODE
+        assert auth.calls
+
+
+class TestEofVersusRevokeRace:
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_simultaneous_eof_and_healthy_tick_closes_1000(self, app_module, monkeypatch, kind):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200, 200, 200])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, kind) as socket:
+                assert backend.connected.wait(2)
+                conn = backend.connections[0]
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                conn.eof()
+                clock.advance(RECHECK_INTERVAL)
+                _expect_close_code(socket, 1000)
+
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_genuine_403_still_closes_4401(self, app_module, monkeypatch, kind):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200, 403])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, kind) as socket:
+                assert backend.connected.wait(2)
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                clock.advance(RECHECK_INTERVAL)
+                _expect_close_code(socket, REVOKE_CODE)

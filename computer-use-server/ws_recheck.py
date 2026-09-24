@@ -28,6 +28,7 @@ RECHECK_INTERVAL_SECONDS = 30.0
 AUTH_TIMEOUT_SECONDS = 5.0
 BACKEND_CLOSE_TIMEOUT_SECONDS = 5.0
 FRONTEND_CLOSE_TIMEOUT_SECONDS = 5.0
+LOOKUP_TIMEOUT_SECONDS = 5.0  # handshake address lookup; to_thread worker is not killable
 REVOKE_CLOSE_CODE = 4401
 PREACCEPT_CLOSE_CODE = 1008
 BACKEND_FAIL_CLOSE_CODE = 1011
@@ -246,6 +247,13 @@ class RelaySession:
         self._backend_session = None
         await self._aclose_session(session)
 
+    async def _cleanup_backend(self) -> None:
+        await asyncio.gather(
+            self._close_backend(),
+            self._aclose_backend_session(),
+            return_exceptions=True,
+        )
+
     async def run(
         self,
         *,
@@ -270,17 +278,28 @@ class RelaySession:
             done, _pending = await asyncio.wait(
                 [lookup_task, self._recheck_task],
                 return_when=asyncio.FIRST_COMPLETED,
+                timeout=LOOKUP_TIMEOUT_SECONDS,
             )
-            if self.revoked or self._recheck_task in done:
-                await self._cancel_tasks([lookup_task, self._recheck_task])
+            if self.revoked:
                 await self._close_frontend(REVOKE_CLOSE_CODE)
+                await self._cancel_tasks([self._recheck_task])
+                return
+            if lookup_task not in done:
+                await self._close_frontend(
+                    BACKEND_FAIL_CLOSE_CODE, "Backend connection failed"
+                )
+                await self._cancel_tasks([self._recheck_task])
                 return
             try:
                 container_addr = lookup_task.result()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                container_addr = None
+                await self._cancel_tasks([self._recheck_task])
+                await self._close_frontend(
+                    BACKEND_FAIL_CLOSE_CODE, "Backend connection failed"
+                )
+                return
             if not container_addr:
                 self.request_stop("denied")
                 await self._cancel_tasks([self._recheck_task])
@@ -303,11 +322,10 @@ class RelaySession:
             self._connect_task = asyncio.create_task(connect())
             waiters = [self._connect_task, self._recheck_task]
             done, _pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-            if self.revoked or self._recheck_task in done:
+            if self.revoked:
                 await self._cancel_tasks([self._connect_task, self._recheck_task])
                 await self._close_frontend(REVOKE_CLOSE_CODE)
-                await self._close_backend()
-                await self._aclose_backend_session()
+                asyncio.create_task(self._cleanup_backend())
                 return
             try:
                 backend_ws = self._connect_task.result()
@@ -324,9 +342,8 @@ class RelaySession:
             self._pump_tasks = [client_task, backend_task]
             waiters = [client_task, backend_task, self._recheck_task]
             done, _pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-            if self.revoked or self._recheck_task in done:
+            if self.revoked:
                 outcome = "revoked"
-                self.revoked = True
             elif backend_task in done:
                 outcome = "normal"
             elif client_task in done:
@@ -337,8 +354,7 @@ class RelaySession:
                 await self._close_frontend(REVOKE_CLOSE_CODE)
             elif outcome == "normal":
                 await self._close_frontend(1000)
-            await self._close_backend()
-            await self._aclose_backend_session()
+            asyncio.create_task(self._cleanup_backend())
         except asyncio.CancelledError:
             cancelled = True
             self.request_stop("cancelled")
