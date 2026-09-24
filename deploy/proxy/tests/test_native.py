@@ -147,7 +147,12 @@ class NativeProxyTests(unittest.TestCase):
         status, _, _ = self.request("/ocu/api/uploads/" + CHAT + "/large.bin", "POST",
                                     self.owner(MUTATION), bytes((byte ^ 1) for byte in large[:64]) + large[64:])
         self.assertEqual(status, 200)
-        seen = self.since("ocu", before)[-1]
+        self.expect_auth(before)
+        ocu = self.since("ocu", before)
+        self.assertEqual(len(ocu), 1)
+        seen = ocu[0]
+        self.assertEqual((seen["method"], seen["target"]),
+                         ("POST", "/api/uploads/" + CHAT + "/large.bin"))
         self.assertNotEqual(seen.get("body_sha256"), hashlib.sha256(large).hexdigest())
         self.assertEqual(seen.get("body_length"), len(large))
 
