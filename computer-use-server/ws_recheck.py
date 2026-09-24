@@ -248,11 +248,9 @@ class RelaySession:
         await self._aclose_session(session)
 
     async def _cleanup_backend(self) -> None:
-        await asyncio.gather(
-            self._close_backend(),
-            self._aclose_backend_session(),
-            return_exceptions=True,
-        )
+        await self._close_backend()
+        await self._aclose_backend_session()
+
 
     async def run(
         self,
@@ -325,7 +323,6 @@ class RelaySession:
             if self.revoked:
                 await self._cancel_tasks([self._connect_task, self._recheck_task])
                 await self._close_frontend(REVOKE_CLOSE_CODE)
-                asyncio.create_task(self._cleanup_backend())
                 return
             try:
                 backend_ws = self._connect_task.result()
@@ -354,14 +351,9 @@ class RelaySession:
                 await self._close_frontend(REVOKE_CLOSE_CODE)
             elif outcome == "normal":
                 await self._close_frontend(1000)
-            asyncio.create_task(self._cleanup_backend())
         except asyncio.CancelledError:
             cancelled = True
             self.request_stop("cancelled")
-            await self._cancel_tasks(
-                [lookup_task, self._connect_task, self._recheck_task, *self._pump_tasks]
-            )
-            await self._close_backend()
             raise
         except Exception:
             if self.revoked:
@@ -369,10 +361,14 @@ class RelaySession:
             else:
                 await self._close_frontend(BACKEND_FAIL_CLOSE_CODE, "Backend connection failed")
         finally:
+            task = asyncio.current_task()
+            if cancelled and task is not None:
+                while task.cancelling():
+                    task.uncancel()
             await self._cancel_tasks(
                 [lookup_task, self._connect_task, self._recheck_task, *self._pump_tasks]
             )
-            await self._aclose_backend_session()
+            await self._cleanup_backend()
             await self._aclose_auth()
             if cancelled:
                 raise asyncio.CancelledError

@@ -192,6 +192,16 @@ def _run_ws_route(app, kind, chat_id=CHAT, headers=None, timeout=8.0):
     return close, box.get("error"), messages
 
 
+
+async def _await_thread_event(event, timeout=2.0, *, name="event"):
+    deadline = time.monotonic() + timeout
+    while not event.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    if not event.is_set():
+        raise AssertionError(f"timed out waiting for {name}")
+    return True
+
+
 class RecordingClock:
     def __init__(self, start=1_000.0):
         self.now = start
@@ -244,6 +254,7 @@ class ScriptedAuth:
         self.delay = delay
         self.error = error
         self.hang = hang
+        self.hang_forever = False
         self.calls = []
         self.sessions = []
         self._lock = threading.Lock()
@@ -251,6 +262,8 @@ class ScriptedAuth:
         self.loop = None
         self.periodic_entered = threading.Event()
         self.decision_made = threading.Event()
+        self.get_entered = threading.Event()
+        self.hang_entered = threading.Event()
 
     def bind(self, loop):
         self.loop = loop
@@ -331,11 +344,15 @@ class FakeAuthGet:
         loop = asyncio.get_running_loop()
         self._owner.bind(loop)
         self._owner.record(self._request)
+        self._owner.get_entered.set()
         if self._delay:
             await asyncio.sleep(self._delay)
         if self._owner.hold_decision is not None:
             await self._owner.hold_decision.wait()
-        if self._hang:
+        if self._hang or getattr(self._owner, "hang_forever", False):
+            self._owner.hang_entered.set()
+            if getattr(self._owner, "hang_forever", False):
+                await asyncio.Event().wait()
             timeout = self._request.get("session_kwargs", {}).get("timeout")
             total = getattr(timeout, "total", None)
             if total is None:
@@ -362,6 +379,7 @@ class FakeAuthSession:
         self.requests = []
         self.closed = False
         self.close_entered = threading.Event()
+        self.close_finished = threading.Event()
         script.sessions.append(self)
 
     async def __aenter__(self):
@@ -376,6 +394,7 @@ class FakeAuthSession:
         if getattr(self.script, "session_close_hang", False):
             await asyncio.Event().wait()
         self.closed = True
+        self.close_finished.set()
 
     def get(self, url, *, headers=None, allow_redirects=None, **_kwargs):
         request = {
@@ -410,6 +429,7 @@ class FakeBackendWs:
         self.sent = []
         self.closed = None
         self.close_started = threading.Event()
+        self.close_finished = threading.Event()
         self.close_delay = 0.0
         self.fail_enter = owner.fail_enter
         self._closed = asyncio.Event()
@@ -459,21 +479,33 @@ class FakeBackendWs:
         block = self.owner.send_block
         if self.owner.send_entered is not None:
             self.owner.send_entered.set()
-        if block is not None:
-            await block.wait()
-        self.sent.append(("text", data))
-        self.owner.sent.append(("text", data))
-        self.owner.sent_event.set()
+        try:
+            if block is not None:
+                await block.wait()
+            self.sent.append(("text", data))
+            self.owner.sent.append(("text", data))
+            self.owner.sent_event.set()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self.owner.send_finished is not None:
+                self.owner.send_finished.set()
 
     async def send_bytes(self, data):
         block = self.owner.send_block
         if self.owner.send_entered is not None:
             self.owner.send_entered.set()
-        if block is not None:
-            await block.wait()
-        self.sent.append(("bytes", data))
-        self.owner.sent.append(("bytes", data))
-        self.owner.sent_event.set()
+        try:
+            if block is not None:
+                await block.wait()
+            self.sent.append(("bytes", data))
+            self.owner.sent.append(("bytes", data))
+            self.owner.sent_event.set()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self.owner.send_finished is not None:
+                self.owner.send_finished.set()
 
     def __aiter__(self):
         return self
@@ -486,11 +518,16 @@ class FakeBackendWs:
 
     async def close(self, code=1000, message=b""):
         self.close_started.set()
-        if self.close_delay:
-            await asyncio.Event().wait()
-        self.closed = (code, message)
-        self._closed.set()
-        await self.incoming.put(None)
+        try:
+            if self.close_delay:
+                await asyncio.Event().wait()
+            self.closed = (code, message)
+            self._closed.set()
+            await self.incoming.put(None)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self.close_finished.set()
 
 
 class FakeBackendSession:
@@ -499,6 +536,7 @@ class FakeBackendSession:
         self.kwargs = kwargs
         self.closed = False
         self.close_entered = threading.Event()
+        self.close_finished = threading.Event()
         owner.backend_sessions.append(self)
 
     async def __aenter__(self):
@@ -510,9 +548,14 @@ class FakeBackendSession:
 
     async def close(self):
         self.close_entered.set()
-        if self.owner.session_close_hang:
-            await asyncio.Event().wait()
-        self.closed = True
+        try:
+            if self.owner.session_close_hang:
+                await asyncio.Event().wait()
+            self.closed = True
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self.close_finished.set()
 
     def ws_connect(self, url, **kwargs):
         self.owner.ws_connect_calls.append((url, dict(kwargs)))
@@ -533,6 +576,7 @@ class FakeBackend:
         self.connected = threading.Event()
         self.send_block = None
         self.send_entered = None
+        self.send_finished = None
         self.connect_entered = threading.Event()
         self.connect_gate = None
         self.lookup_entered = threading.Event()
@@ -930,30 +974,82 @@ class TestFlagRaceAndBlockedSends:
         backend = FakeBackend()
         backend.send_block = asyncio.Event()
         backend.send_entered = threading.Event()
+        backend.send_finished = threading.Event()
         auth = ScriptedAuth([200, 403])
         clock = RecordingClock()
         _install_fakes(app_module, monkeypatch, auth, backend, clock)
-        with _client(app_module) as client:
-            with _ws_connect(client, kind) as socket:
-                assert backend.connected.wait(2)
-                if kind == "cdp":
-                    socket.send_text("blocked")
-                else:
-                    socket.send_bytes(b"blocked")
-                assert backend.send_entered.wait(2)
-                deadline = time.monotonic() + 2
-                while not clock.sleeps and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                clock.advance(RECHECK_INTERVAL)
-                _expect_close_code(socket, REVOKE_CODE)
-                backend.send_block.set()
-                assert all("blocked" not in str(item[1]) for item in backend.sent)
-                try:
-                    socket.send_text(FUTURE_MARKER)
-                except Exception:
-                    pass
-                assert all(FUTURE_MARKER not in str(item[1]) for item in backend.sent)
-        assert all(session.close_entered.is_set() for session in auth.sessions)
+        box = {}
+        messages = []
+        opened = threading.Event()
+        closed = threading.Event()
+
+        async def drive():
+            client_queue = asyncio.Queue()
+
+            async def receive():
+                if not opened.is_set():
+                    opened.set()
+                    return {"type": "websocket.connect"}
+                return await client_queue.get()
+
+            async def send(message):
+                messages.append(message)
+                if message.get("type") == "websocket.close":
+                    closed.set()
+
+            task = asyncio.create_task(app_module.app(_ws_scope(kind), receive, send))
+            deadline = time.monotonic() + 2
+            while not backend.connected.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert backend.connected.is_set()
+            if kind == "cdp":
+                await client_queue.put({"type": "websocket.receive", "text": "blocked"})
+            else:
+                await client_queue.put({"type": "websocket.receive", "bytes": b"blocked"})
+            deadline = time.monotonic() + 2
+            while not backend.send_entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert backend.send_entered.is_set()
+            deadline = time.monotonic() + 2
+            while not clock.sleeps and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            clock.advance(RECHECK_INTERVAL)
+            deadline = time.monotonic() + 2
+            while not closed.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert closed.is_set()
+            backend.send_block.set()
+            deadline = time.monotonic() + 2
+            while not backend.send_finished.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert backend.send_finished.is_set()
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+            box["done"] = task.done()
+            box["close"] = next(
+                (item for item in messages if item.get("type") == "websocket.close"),
+                None,
+            )
+            box["sent"] = list(backend.sent)
+            box["pending"] = [
+                t
+                for t in asyncio.all_tasks()
+                if t is not asyncio.current_task() and not t.done()
+            ]
+
+        asyncio.run(drive())
+        close = box.get("close") or {}
+        assert close.get("code") == REVOKE_CODE, box
+        assert box.get("done") is True
+        assert all("blocked" not in str(item[1]) for item in box["sent"])
+        assert all(FUTURE_MARKER not in str(item[1]) for item in box["sent"])
+        assert not box["pending"], box["pending"]
+        assert auth.sessions, "auth session must exist after GET"
+        assert all(session.close_finished.wait(2) for session in auth.sessions)
+        assert backend.backend_sessions, "backend session must exist"
+        assert all(session.close_entered.is_set() for session in backend.backend_sessions)
+        assert all(session.close_finished.is_set() for session in backend.backend_sessions)
+        if backend.connections:
+            assert all(conn.close_finished.is_set() for conn in backend.connections)
 
 
 class TestNormalDisconnectCancelAndBackendFailure:
@@ -1175,19 +1271,69 @@ class TestSessionCloseDoesNotBlockRevoke:
         backend.session_close_hang = True
         auth = ScriptedAuth([200, 403])
         clock = RecordingClock()
-        _install_fakes(app_module, monkeypatch, auth, backend, clock)
-        with _client(app_module) as client:
-            with _ws_connect(client, kind) as socket:
-                assert backend.connected.wait(2)
-                conn = backend.connections[0]
-                conn.close_delay = 30.0
-                deadline = time.monotonic() + 2
-                while not clock.sleeps and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                clock.advance(RECHECK_INTERVAL)
-                _expect_close_code(socket, REVOKE_CODE)
-                assert conn.close_started.wait(2)
-                assert backend.backend_sessions[0].close_entered.wait(2)
+        ws_recheck = _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        monkeypatch.setattr(ws_recheck, "BACKEND_CLOSE_TIMEOUT_SECONDS", 0.2)
+        box = {}
+        messages = []
+        opened = threading.Event()
+        closed = threading.Event()
+
+        async def drive():
+            async def receive():
+                if not opened.is_set():
+                    opened.set()
+                    return {"type": "websocket.connect"}
+                await asyncio.Event().wait()
+                return {"type": "websocket.disconnect", "code": 1000}
+
+            async def send(message):
+                messages.append(message)
+                if message.get("type") == "websocket.close":
+                    closed.set()
+
+            task = asyncio.create_task(app_module.app(_ws_scope(kind), receive, send))
+            deadline = time.monotonic() + 2
+            while not backend.connected.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert backend.connected.is_set()
+            conn = backend.connections[0]
+            conn.close_delay = 30.0
+            deadline = time.monotonic() + 2
+            while not clock.sleeps and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            clock.advance(RECHECK_INTERVAL)
+            deadline = time.monotonic() + 2
+            while not closed.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert closed.is_set()
+            await _await_thread_event(conn.close_started, name="backend ws close_started")
+            await _await_thread_event(
+                backend.backend_sessions[0].close_entered, name="backend session close_entered"
+            )
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+            box["done"] = task.done()
+            box["close"] = next(
+                (item for item in messages if item.get("type") == "websocket.close"),
+                None,
+            )
+            box["pending"] = [
+                t
+                for t in asyncio.all_tasks()
+                if t is not asyncio.current_task() and not t.done()
+            ]
+
+        asyncio.run(drive())
+        close = box.get("close") or {}
+        assert close.get("code") == REVOKE_CODE, box
+        assert box.get("done") is True
+        assert not box["pending"], box["pending"]
+        conn = backend.connections[0]
+        assert conn.close_started.is_set()
+        assert conn.close_finished.is_set()
+        assert backend.backend_sessions[0].close_entered.is_set()
+        assert backend.backend_sessions[0].close_finished.is_set()
+        assert auth.sessions
+        assert all(session.close_finished.is_set() for session in auth.sessions)
 
 
 class TestHungAuthAndCancel:
@@ -1222,41 +1368,31 @@ class TestHungAuthAndCancel:
     @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
     def test_route_cancel_during_hung_auth_cleans_up(self, app_module, monkeypatch, kind):
         backend = FakeBackend()
-        auth = ScriptedAuth([200], hang=True)
+        auth = ScriptedAuth([200])
+        auth.hang_forever = True
         _install_fakes(app_module, monkeypatch, auth, backend)
-        import ws_recheck
-
-        pending = threading.Event()
-        original = ws_recheck.RelaySession.authorize_once
-
-        async def hanging_authorize(self):
-            pending.set()
-            await asyncio.Event().wait()
-            return True
-
-        monkeypatch.setattr(ws_recheck.RelaySession, "authorize_once", hanging_authorize)
         box = {}
+        messages = []
+        opened = threading.Event()
 
         async def drive():
-            closer = []
-
             async def receive():
-                if not closer:
-                    closer.append(True)
+                if not opened.is_set():
+                    opened.set()
                     return {"type": "websocket.connect"}
                 await asyncio.Event().wait()
                 return {"type": "websocket.disconnect", "code": 1000}
 
             async def send(message):
-                return None
+                messages.append(message)
 
-            task = asyncio.create_task(
-                app_module.app(_ws_scope(kind), receive, send)
-            )
+            task = asyncio.create_task(app_module.app(_ws_scope(kind), receive, send))
             deadline = time.monotonic() + 2
-            while not pending.is_set() and time.monotonic() < deadline:
+            while not auth.hang_entered.is_set() and time.monotonic() < deadline:
                 await asyncio.sleep(0.01)
-            assert pending.is_set()
+            assert auth.hang_entered.is_set()
+            assert auth.sessions, "auth session must exist before cancel"
+            assert auth.get_entered.is_set()
             task.cancel()
             try:
                 await task
@@ -1265,13 +1401,79 @@ class TestHungAuthAndCancel:
             else:
                 box["cancelled"] = False
             box["done"] = task.done()
+            box["pending"] = [
+                t
+                for t in asyncio.all_tasks()
+                if t is not asyncio.current_task() and not t.done()
+            ]
 
         asyncio.run(drive())
         assert box.get("cancelled") is True
         assert box.get("done") is True
+        assert not box["pending"], box["pending"]
         assert backend.address_calls == []
-        assert all(session.close_entered.is_set() or session.closed for session in auth.sessions)
+        assert auth.sessions, "auth session must exist after real GET"
+        assert all(session.close_entered.is_set() for session in auth.sessions)
+        assert all(session.close_finished.is_set() for session in auth.sessions)
 
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_route_cancel_during_connected_session_cleans_up(
+        self, app_module, monkeypatch, kind
+    ):
+        backend = FakeBackend()
+        backend.session_close_hang = True
+        auth = ScriptedAuth([200])
+        ws_recheck = _install_fakes(app_module, monkeypatch, auth, backend)
+        monkeypatch.setattr(ws_recheck, "BACKEND_CLOSE_TIMEOUT_SECONDS", 0.2)
+        box = {}
+        opened = threading.Event()
+
+        async def drive():
+            client_queue = asyncio.Queue()
+
+            async def receive():
+                if not opened.is_set():
+                    opened.set()
+                    return {"type": "websocket.connect"}
+                return await client_queue.get()
+
+            async def send(message):
+                return None
+
+            task = asyncio.create_task(app_module.app(_ws_scope(kind), receive, send))
+            deadline = time.monotonic() + 2
+            while not backend.connected.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert backend.connected.is_set()
+            assert backend.backend_sessions
+            conn = backend.connections[0]
+            conn.close_delay = 30.0
+            box["conn"] = conn
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                box["cancelled"] = True
+            else:
+                box["cancelled"] = False
+            box["done"] = task.done()
+            box["pending"] = [
+                t
+                for t in asyncio.all_tasks()
+                if t is not asyncio.current_task() and not t.done()
+            ]
+
+        asyncio.run(drive())
+        conn = box["conn"]
+        assert box.get("cancelled") is True
+        assert box.get("done") is True
+        assert not box["pending"], box["pending"]
+        assert backend.backend_sessions[0].close_entered.is_set()
+        assert backend.backend_sessions[0].close_finished.is_set()
+        assert conn.close_started.is_set()
+        assert conn.close_finished.is_set()
+        assert auth.sessions
+        assert all(session.close_finished.is_set() for session in auth.sessions)
 
 
 class TestDecisionBarriersAndConcurrentPairs:
@@ -1364,18 +1566,65 @@ class TestConnectRevokeAndRouteCancel:
         backend.connect_gate = asyncio.Event()
         auth = ScriptedAuth([200, 403])
         clock = RecordingClock()
-        _install_fakes(app_module, monkeypatch, auth, backend, clock)
-        with _client(app_module) as client:
-            with _ws_connect(client, kind) as socket:
-                assert backend.connect_entered.wait(2)
-                deadline = time.monotonic() + 2
-                while not clock.sleeps and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                clock.advance(RECHECK_INTERVAL)
-                if backend.backend_sessions:
-                    assert backend.backend_sessions[0].close_entered.wait(2)
-                _expect_close_code(socket, REVOKE_CODE)
-                assert not backend.connections
+        ws_recheck = _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        monkeypatch.setattr(ws_recheck, "BACKEND_CLOSE_TIMEOUT_SECONDS", 0.2)
+        box = {}
+        messages = []
+        opened = threading.Event()
+        closed = threading.Event()
+
+        async def drive():
+            async def receive():
+                if not opened.is_set():
+                    opened.set()
+                    return {"type": "websocket.connect"}
+                await asyncio.Event().wait()
+                return {"type": "websocket.disconnect", "code": 1000}
+
+            async def send(message):
+                messages.append(message)
+                if message.get("type") == "websocket.close":
+                    closed.set()
+
+            task = asyncio.create_task(app_module.app(_ws_scope(kind), receive, send))
+            deadline = time.monotonic() + 2
+            while not backend.connect_entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert backend.connect_entered.is_set()
+            deadline = time.monotonic() + 2
+            while not clock.sleeps and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            clock.advance(RECHECK_INTERVAL)
+            deadline = time.monotonic() + 2
+            while not closed.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert closed.is_set()
+            assert backend.backend_sessions, "connecting revoke must own a backend session"
+            await _await_thread_event(
+                backend.backend_sessions[0].close_entered, name="connecting session close_entered"
+            )
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+            box["done"] = task.done()
+            box["close"] = next(
+                (item for item in messages if item.get("type") == "websocket.close"),
+                None,
+            )
+            box["pending"] = [
+                t
+                for t in asyncio.all_tasks()
+                if t is not asyncio.current_task() and not t.done()
+            ]
+
+        asyncio.run(drive())
+        close = box.get("close") or {}
+        assert close.get("code") == REVOKE_CODE, box
+        assert box.get("done") is True
+        assert not box["pending"], box["pending"]
+        assert not backend.connections
+        assert backend.backend_sessions[0].close_entered.is_set()
+        assert backend.backend_sessions[0].close_finished.is_set()
+        assert auth.sessions
+        assert all(session.close_finished.is_set() for session in auth.sessions)
 
 
 class TestLookupTimeoutAndException:
