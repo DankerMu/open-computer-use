@@ -1,0 +1,5 @@
+# This file must exist before rendering a secret-bearing nginx.conf.
+nginx.conf
+runtime/
+*.tmp
+__pycache__/
