@@ -3,6 +3,16 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Workspace completion hint.** After an invoked MCP client attempt in
+  `openwebui/tools/computer_use_tools.py:_run_tool` returns success, an
+  error-valued result, or an ordinary caught exception — including returned
+  internal health/auth configuration errors — the shared hook emits one
+  best-effort `ocu:workspace_changed` event with `{chat_id, reason:
+  "tool_completed"}`. The hint is not revision authority and never carries
+  revision, paths, tool output, or credentials. Outer chat/config validation
+  and header construction failures emit none; cancellation still propagates
+  without a hint. A missing emitter is a no-op; an emitter exception is
+  swallowed once and cannot change the tool result or status.
 - **Preview SPA revision window and Office content preview.** The Files view
   keys refresh on `path + revision`, keeps selected `file_id` across rename,
   automatically displays a new or changed root output unless the user

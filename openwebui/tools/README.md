@@ -58,6 +58,7 @@ Each tool call authenticates the transport and carries only server-provided user
 - **File sync**: When a command references `/mnt/user-data/uploads`, uploaded files are synced with the internal REST Bearer credential before execution
 - **MCP server discovery**: `_get_user_mcp_server_names()` reads Open WebUI's `TOOL_SERVER_CONNECTIONS` and passes available MCP server names to the orchestrator via `X-Mcp-Servers` header — used for Claude Code sub-agent configuration
 - **SSE progress**: Tool calls stream progress updates via Server-Sent Events
+- **Workspace hint**: After an invoked MCP client attempt returns or raises an ordinary caught exception, `_run_tool` emits one best-effort `ocu:workspace_changed` event with `{chat_id, reason: "tool_completed"}`. The hint is not revision authority and does not include tool content. Internal client health/auth rejections still emit it; outer chat/config validation, header construction failure, cancellation, and a missing emitter do not. An emitter exception is swallowed once and cannot change the tool result.
 - **Timeouts**: Client-side timeouts (`CLIENT_HTTP_TIMEOUT=660s`, `SUB_AGENT_CLIENT_TIMEOUT=3660s`) are set higher than server-side to avoid premature disconnects
 
 ## Companion Filter
