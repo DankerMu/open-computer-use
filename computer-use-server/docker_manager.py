@@ -723,20 +723,26 @@ def _repair_stopped_membership(client, container, network) -> None:
             lookup = current_id or name
             try:
                 client.networks.get(lookup).disconnect(container, force=True)
-            except docker.errors.NotFound:
-                networks = (container.attrs.setdefault("NetworkSettings", {})).setdefault("Networks", {})
-                networks.pop(name, None)
+            except docker.errors.NotFound as exc:
+                raise LaunchFailed(
+                    500,
+                    "sandbox network repair failed: stale membership cannot be detached",
+                ) from exc
             except docker.errors.APIError as cop_exc:
                 raise LaunchFailed(500, f"sandbox network repair failed: {cop_exc}") from cop_exc
         container.reload()
-        network, _gateway = _inspect_sandbox_network(client)
+        network, gateway = _inspect_sandbox_network(client)
+        if not _bindings_match_gateway(container, gateway):
+            raise _incompatible_bindings_error()
         if not _membership_matches(container, network):
             try:
                 network.connect(container)
             except docker.errors.APIError as exc:
                 raise LaunchFailed(500, f"sandbox network repair failed: {exc}") from exc
             container.reload()
-            network, _gateway = _inspect_sandbox_network(client)
+            network, gateway = _inspect_sandbox_network(client)
+            if not _bindings_match_gateway(container, gateway):
+                raise _incompatible_bindings_error()
         if not _membership_matches(container, network):
             raise LaunchFailed(500, "sandbox network repair did not reach the desired membership")
     except LaunchFailed:
@@ -1015,15 +1021,21 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
     if user:
         config["user"] = user
 
+    pinned_network_id = None
     if not ENABLE_NETWORK:
         config["network_disabled"] = True
     else:
-        _network, gateway = _inspect_sandbox_network(client)
-        config["network"] = OCU_SANDBOX_NETWORK
+        network, gateway = _inspect_sandbox_network(client)
+        _, pinned_network_id = _network_identity(network)
+        config["network"] = pinned_network_id
         config["ports"] = {f"{port}/tcp": (gateway, None) for port in SANDBOX_PUBLISHED_PORTS}
 
     try:
         container = client.containers.create(**config)
+    except docker.errors.NotFound as e:
+        if pinned_network_id:
+            raise LaunchFailed(500, "inspected sandbox network is unavailable for create") from e
+        raise
     except docker.errors.APIError as e:
         if getattr(e, "status_code", None) == 409:
             winner = _lookup_container(chat_id)
@@ -1036,8 +1048,16 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
             print("[MCP] Engine refuses a per-container hostname; creating without one")
             config.pop("hostname", None)
             container = client.containers.create(**config)
+        elif pinned_network_id and getattr(e, "status_code", None) in {404, 400, 500}:
+            raise LaunchFailed(500, "inspected sandbox network is unavailable for create") from e
         else:
             raise
+    if pinned_network_id:
+        _reload_container(container)
+        membership = _current_membership(container)
+        attached_ids = {_membership_entry_id(data) for data in membership.values()}
+        if len(membership) != 1 or attached_ids != {pinned_network_id}:
+            raise LaunchFailed(500, "created sandbox is not on the inspected sandbox bridge")
     container.start()
 
     _reload_container(container)

@@ -60,24 +60,23 @@ class FakeNetwork:
         }
         self.fail_connect = False
         self.fail_disconnect = False
+        self.noop_disconnect = False
 
     def connect(self, container):
-        self.owner.ops.append((self.name, "connect", container.name))
+        self.owner.ops.append((self.id, "connect", container.id))
         if self.fail_connect:
             raise _api_error("failed to connect network")
-        networks = container.attrs.setdefault("NetworkSettings", {}).setdefault("Networks", {})
-        networks[self.name] = {"NetworkID": self.id, "IPAddress": "172.31.0.10"}
-        container.attrs.setdefault("HostConfig", {})["NetworkMode"] = self.name
+        membership = self.owner.engine_membership.setdefault(container.id, {})
+        membership[self.id] = {"name": self.name, "NetworkID": self.id, "IPAddress": "172.31.0.10"}
 
     def disconnect(self, container, force=False):
-        self.owner.ops.append((self.name, "disconnect", container.name))
+        self.owner.ops.append((self.id, "disconnect", container.id))
         if self.fail_disconnect:
             raise _api_error("failed to disconnect network")
-        networks = container.attrs.setdefault("NetworkSettings", {}).setdefault("Networks", {})
-        networks.pop(self.name, None)
-        for key, data in list(networks.items()):
-            if (data or {}).get("NetworkID") == self.id:
-                networks.pop(key, None)
+        if self.noop_disconnect:
+            return
+        membership = self.owner.engine_membership.setdefault(container.id, {})
+        membership.pop(self.id, None)
 
 
 class FakeNetworks:
@@ -86,10 +85,22 @@ class FakeNetworks:
 
     def get(self, key):
         self.owner.network_gets.append(key)
-        for net in self.owner._network_store.values():
+        unique = {id(net): net for net in self.owner._network_store.values()}
+        found = None
+        for net in unique.values():
             if net.name == key or net.id == key:
-                return net
-        raise NotFound(key)
+                found = net
+                break
+        if found is None:
+            raise NotFound(key)
+        if found.name == NETWORK_NAME:
+            self.owner._sandbox_lookups += 1
+            hook = self.owner.on_sandbox_lookup
+            if hook is not None:
+                replacement = hook(self.owner._sandbox_lookups)
+                if replacement is not None:
+                    return replacement
+        return found
 
 
 class FakeContainers:
@@ -106,6 +117,9 @@ class FakeContainers:
         if name in self.owner.store:
             response = MagicMock(status_code=409, url="http://docker.test", reason="Conflict")
             raise APIError("Conflict", response=response, explanation=b"conflict")
+        if self.owner.replace_named_network_on_create:
+            self.owner.replace_named_network_on_create()
+            self.owner.replace_named_network_on_create = None
         container = self.owner.make_container(
             name, status="created", container_id=f"cid-{len(self.owner.created) + 1}"
         )
@@ -121,17 +135,50 @@ class FakeClient:
         self.store = {}
         self.created = []
         self._network_store = {}
+        self.engine_membership = {}
         self.ops = []
         self.network_gets = []
         self._next_host_port = 49152
         self.containers = FakeContainers(self)
         self.networks = FakeNetworks(self)
+        self.replace_named_network_on_create = None
+        self.on_sandbox_lookup = None
+        self._sandbox_lookups = 0
 
     def add_network(self, name=NETWORK_NAME, network_id=NETWORK_ID, driver="bridge", internal=False, gateway=GATEWAY):
         net = FakeNetwork(self, name, network_id, driver=driver, internal=internal, gateway=gateway)
-        self._network_store[name] = net
+        if name not in self._network_store or self._network_store[name].id == network_id:
+            self._network_store[name] = net
         self._network_store[network_id] = net
         return net
+
+    def replace_named_network(self, name, network_id, driver="bridge", internal=False, gateway=GATEWAY):
+        previous = self._network_store.get(name)
+        if previous is not None:
+            self._network_store.pop(previous.id, None)
+            self._network_store.pop(name, None)
+        return self.add_network(name=name, network_id=network_id, driver=driver, internal=internal, gateway=gateway)
+
+    def inspect_membership(self, container):
+        snapshot = {}
+        for net_id, data in dict(self.engine_membership.get(container.id, {})).items():
+            snapshot[data["name"]] = {
+                "NetworkID": data["NetworkID"],
+                "IPAddress": data.get("IPAddress", "172.31.0.10"),
+            }
+        return snapshot
+
+    def seed_membership(self, container, networks):
+        membership = {}
+        for name, data in (networks or {}).items():
+            net_id = (data or {}).get("NetworkID") or (data or {}).get("NetworkId")
+            membership[net_id] = {
+                "name": name,
+                "NetworkID": net_id,
+                "IPAddress": (data or {}).get("IPAddress", "172.31.0.10"),
+            }
+        self.engine_membership[container.id] = membership
+        container.attrs.setdefault("NetworkSettings", {})["Networks"] = self.inspect_membership(container)
 
     def clear_networks(self):
         self._network_store.clear()
@@ -161,6 +208,7 @@ class FakeClient:
             container.attrs["State"]["Status"] = container.status
             container.attrs["State"]["Paused"] = container.status == "paused"
             container.attrs["Id"] = container.id
+            container.attrs.setdefault("NetworkSettings", {})["Networks"] = self.inspect_membership(container)
 
         def start():
             started["n"] += 1
@@ -202,6 +250,7 @@ class FakeClient:
             host["PortBindings"] = {}
             settings["Networks"] = {}
             settings["Ports"] = {}
+            self.engine_membership[container.id] = {}
             return
         cfg["NetworkDisabled"] = False
         bindings = {}
@@ -215,13 +264,14 @@ class FakeClient:
                     "HostPort": "" if host_port is None else str(host_port),
                 }]
         host["PortBindings"] = bindings
-        net_name = config.get("network")
-        if net_name:
-            net = self.networks.get(net_name)
-            host["NetworkMode"] = net_name
-            settings["Networks"] = {
-                net_name: {"NetworkID": net.id, "IPAddress": "172.31.0.10"},
+        net_key = config.get("network")
+        if net_key:
+            net = self.networks.get(net_key)
+            host["NetworkMode"] = net_key
+            self.engine_membership[container.id] = {
+                net.id: {"name": net.name, "NetworkID": net.id, "IPAddress": "172.31.0.10"},
             }
+            settings["Networks"] = self.inspect_membership(container)
 
     def put(
         self,
@@ -241,6 +291,7 @@ class FakeClient:
             container.attrs["HostConfig"]["PortBindings"] = {}
             container.attrs["NetworkSettings"]["Networks"] = {}
             container.attrs["NetworkSettings"]["Ports"] = {}
+            self.engine_membership[container.id] = {}
         else:
             if bindings is None:
                 bindings = {
@@ -250,7 +301,7 @@ class FakeClient:
             container.attrs["HostConfig"]["PortBindings"] = bindings
             if networks is None:
                 networks = {NETWORK_NAME: {"NetworkID": NETWORK_ID, "IPAddress": "172.31.0.10"}}
-            container.attrs["NetworkSettings"]["Networks"] = dict(networks)
+            self.seed_membership(container, networks)
             if published is None:
                 published = {
                     key: [dict(entry) for entry in entries]
@@ -353,16 +404,20 @@ def _membership(container):
     return dict((container.attrs.get("NetworkSettings") or {}).get("Networks") or {})
 
 
+def _engine_nets(client, container):
+    return client.inspect_membership(container)
+
+
 def test_create_selects_sandbox_bridge_and_gateway_publications(world):
     docker_manager, client, _tmp = world
     docker_manager._get_or_create_container(CHAT)
     created = client.created[0]
     config = created._create_config
-    assert config["network"] == NETWORK_NAME
+    assert config["network"] == NETWORK_ID
     assert config["ports"] == {CDP: (GATEWAY, None), TTYD: (GATEWAY, None)}
     assert "network_disabled" not in config
-    assert list(_membership(created)) == [NETWORK_NAME]
-    assert _membership(created)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
+    assert list(_engine_nets(client, created)) == [NETWORK_NAME]
+    assert _engine_nets(client, created)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
     assert client.ops == []
 
 
@@ -373,9 +428,9 @@ def test_absent_container_reconstruction_uses_create_path(world):
     created = client.created[0]
     assert created.status == "running"
     assert created.id == docker_manager._lookup_container(CHAT).id
-    assert created._create_config["network"] == NETWORK_NAME
+    assert created._create_config["network"] == NETWORK_ID
     assert created._create_config["ports"] == {CDP: (GATEWAY, None), TTYD: (GATEWAY, None)}
-    assert list(_membership(created)) == [NETWORK_NAME]
+    assert list(_engine_nets(client, created)) == [NETWORK_NAME]
     assert docker_manager.load_container_meta(CHAT)["user_email"] == "owner@example"
 
 
@@ -384,62 +439,62 @@ def test_stop_launch_and_restart_alias_keep_one_membership(world):
     container = client.put(_name(docker_manager), status="running", container_id="keep-me")
     container.stop()
     assert container.status == "exited"
-    before = dict(_membership(container))
+    before = dict(_engine_nets(client, container))
     assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
     assert container.status == "running"
     assert container.id == "keep-me"
-    assert _membership(container) == before
+    assert _engine_nets(client, container) == before
     assert container._removed["value"] is False
     container.stop()
     assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
-    assert list(_membership(container)) == [NETWORK_NAME]
-    assert _membership(container)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
+    assert list(_engine_nets(client, container)) == [NETWORK_NAME]
+    assert _engine_nets(client, container)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
     assert container._removed["value"] is False
+
+
+def test_missing_sandbox_network_fails_before_create(world):
+    docker_manager, client, _tmp = world
+    client.clear_networks()
+    with pytest.raises(docker_manager.LaunchFailed) as missing:
+        docker_manager._create_container(CHAT, _name(docker_manager))
+    assert missing.value.status_code == 500
+    assert client.created == []
+    assert _name(docker_manager) not in client.store
 
 
 def test_invalid_network_configuration_does_not_create_or_mutate(world):
     docker_manager, client, _tmp = world
     existing = client.put(_name(docker_manager), status="exited", container_id="stay")
 
-    client.clear_networks()
-    with pytest.raises(docker_manager.LaunchFailed) as missing:
-        docker_manager._create_container(CHAT, _name(docker_manager))
-    assert missing.value.status_code == 500
-    assert client.created == []
+    client.replace_named_network(NETWORK_NAME, NETWORK_ID, driver="overlay")
+    with pytest.raises(docker_manager.LaunchFailed):
+        docker_manager.launch_sandbox(CHAT)
     assert existing.status == "exited"
+    assert existing._started["n"] == 0
     assert existing._removed["value"] is False
 
-    client.add_network(driver="overlay")
-    with pytest.raises(docker_manager.LaunchFailed):
-        docker_manager.launch_sandbox(CHAT)
-    assert existing.status == "exited"
-    assert existing._started["n"] == 0
-
-    client.clear_networks()
-    client.add_network(internal=True)
+    client.replace_named_network(NETWORK_NAME, NETWORK_ID, internal=True)
     with pytest.raises(docker_manager.LaunchFailed):
         docker_manager.launch_sandbox(CHAT)
     assert existing._started["n"] == 0
 
-    client.clear_networks()
-    client.add_network(gateway=None)
+    client.replace_named_network(NETWORK_NAME, NETWORK_ID, gateway=None)
     with pytest.raises(docker_manager.LaunchFailed):
         docker_manager.launch_sandbox(CHAT)
     assert existing._started["n"] == 0
 
-    client.clear_networks()
-    client.add_network(gateway=["172.31.0.1", "172.31.0.2"])
+    client.replace_named_network(NETWORK_NAME, NETWORK_ID, gateway=["172.31.0.1", "172.31.0.2"])
     with pytest.raises(docker_manager.LaunchFailed):
         docker_manager.launch_sandbox(CHAT)
     assert existing._started["n"] == 0
 
-    client.clear_networks()
-    client.add_network()
+    client.replace_named_network(NETWORK_NAME, NETWORK_ID)
     docker_manager.SANDBOX_HOST_BIND_IP = "172.30.0.1"
     with pytest.raises(docker_manager.LaunchFailed):
-        docker_manager._create_container(CHAT, _name(docker_manager))
+        docker_manager._create_container("aaaaaaaa-bbbb-cccc-dddd-ffffffffffff", "owui-chat-fresh")
     assert client.created == []
     assert existing.status == "exited"
+    assert existing._started["n"] == 0
 
 
 def test_disabled_create_stop_launch_skips_network_lookup(world):
@@ -513,9 +568,7 @@ def test_create_conflict_adopts_only_compatible_running_winner(world):
     assert winner._removed["value"] is False
     assert client.ops == []
 
-    winner.attrs["NetworkSettings"]["Networks"] = {
-        COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.5"},
-    }
+    client.seed_membership(winner, {COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.5"}})
     with pytest.raises(docker_manager.LaunchFailed):
         docker_manager._create_container(CHAT, _name(docker_manager))
     assert winner.status == "running"
@@ -538,6 +591,7 @@ def test_create_conflict_adopts_only_compatible_running_winner(world):
 
 def test_same_gateway_stale_network_id_is_repaired_before_start(world):
     docker_manager, client, _tmp = world
+    client.add_network(NETWORK_NAME, STALE_ID, gateway=GATEWAY)
     container = client.put(
         _name(docker_manager),
         status="exited",
@@ -551,32 +605,33 @@ def test_same_gateway_stale_network_id_is_repaired_before_start(world):
     assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
     assert container.status == "running"
     assert container.id == "stale"
-    assert _membership(container) == {
+    assert _engine_nets(client, container) == {
         NETWORK_NAME: {"NetworkID": NETWORK_ID, "IPAddress": "172.31.0.10"}
     }
+    assert (STALE_ID, "disconnect", container.id) in client.ops
+    assert (NETWORK_ID, "connect", container.id) in client.ops
     assert container._removed["value"] is False
 
 
 def test_same_name_network_replacement_is_repaired_by_id(world):
     docker_manager, client, _tmp = world
+    client.add_network(NETWORK_NAME, STALE_ID, gateway=GATEWAY)
     container = client.put(
         _name(docker_manager),
         status="exited",
         container_id="replaced-id",
         networks={NETWORK_NAME: {"NetworkID": STALE_ID, "IPAddress": "172.31.0.10"}},
     )
-    client._network_store[STALE_ID] = FakeNetwork(client, NETWORK_NAME, STALE_ID)
     assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
-    assert list(_membership(container)) == [NETWORK_NAME]
-    assert _membership(container)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
-    assert any(op[1] == "disconnect" for op in client.ops)
-    assert (NETWORK_NAME, "connect", container.name) in client.ops
+    assert list(_engine_nets(client, container)) == [NETWORK_NAME]
+    assert _engine_nets(client, container)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
+    assert (STALE_ID, "disconnect", container.id) in client.ops
+    assert (NETWORK_ID, "connect", container.id) in client.ops
     assert container._removed["value"] is False
 
 
 def test_foreign_membership_repaired_on_stopped_launch(world):
     docker_manager, client, _tmp = world
-    client.add_network(COMPOSE_NAME, COMPOSE_ID, gateway="172.18.0.1")
     container = client.put(
         _name(docker_manager),
         status="exited",
@@ -585,9 +640,83 @@ def test_foreign_membership_repaired_on_stopped_launch(world):
     )
     assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
     assert container.id == "foreign"
-    assert list(_membership(container)) == [NETWORK_NAME]
-    assert _membership(container)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
+    assert list(_engine_nets(client, container)) == [NETWORK_NAME]
+    assert _engine_nets(client, container)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
+    assert (COMPOSE_ID, "disconnect", container.id) in client.ops
+    assert (NETWORK_ID, "connect", container.id) in client.ops
     assert container._removed["value"] is False
+
+
+def test_repair_revalidates_refreshed_gateway_before_start(world):
+    docker_manager, client, _tmp = world
+    container = client.put(
+        _name(docker_manager),
+        status="exited",
+        container_id="gw-race",
+        networks={COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"}},
+    )
+    _meta(docker_manager)
+    workspace = Path(docker_manager.USER_DATA_BASE_PATH) / CHAT
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "layer").write_text("keep")
+    replacement = FakeNetwork(client, NETWORK_NAME, "netid-ocu-sandbox-g2", gateway="172.31.9.1")
+
+    def after_first(count):
+        if count >= 2:
+            client.replace_named_network(NETWORK_NAME, "netid-ocu-sandbox-g2", gateway="172.31.9.1")
+            return replacement
+        return None
+
+    client.on_sandbox_lookup = after_first
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager.launch_sandbox(CHAT)
+    assert caught.value.status_code == 409
+    assert container.status == "exited"
+    assert container._started["n"] == 0
+    assert container.id == "gw-race"
+    assert container._removed["value"] is False
+    assert docker_manager.load_container_meta(CHAT)["user_email"] == "owner@example"
+    assert (workspace / "layer").read_text() == "keep"
+
+
+def test_same_gateway_id_replacement_still_repairs(world):
+    docker_manager, client, _tmp = world
+    container = client.put(
+        _name(docker_manager),
+        status="exited",
+        container_id="gw-same",
+        networks={COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"}},
+    )
+    replacement = FakeNetwork(client, NETWORK_NAME, "netid-ocu-sandbox-g1b", gateway=GATEWAY)
+
+    def after_first(count):
+        if count >= 2:
+            client.replace_named_network(NETWORK_NAME, "netid-ocu-sandbox-g1b", gateway=GATEWAY)
+            return replacement
+        return None
+
+    client.on_sandbox_lookup = after_first
+    assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    assert container.status == "running"
+    assert _engine_nets(client, container)[NETWORK_NAME]["NetworkID"] == "netid-ocu-sandbox-g1b"
+    assert container._removed["value"] is False
+
+
+def test_create_pins_inspected_network_id_against_same_name_swap(world):
+    docker_manager, client, _tmp = world
+    client.replace_named_network_on_create = lambda: client.replace_named_network(
+        NETWORK_NAME, "netid-ocu-sandbox-swapped", internal=True, gateway=GATEWAY
+    )
+    with pytest.raises(docker_manager.LaunchFailed):
+        docker_manager._create_container(CHAT, _name(docker_manager))
+    if client.created:
+        created = client.created[0]
+        assert created._started["n"] == 0
+        assert created._removed["value"] is False
+        nets = _engine_nets(client, created)
+        assert "netid-ocu-sandbox-swapped" not in {item["NetworkID"] for item in nets.values()}
+    else:
+        assert client.created == []
 
 
 def test_unassigned_dynamic_host_port_does_not_block_launch(world):
@@ -743,7 +872,7 @@ def test_live_foreign_membership_fails_without_mutation(world, status):
     assert container._unpaused["n"] == 0
     assert container._removed["value"] is False
     assert client.ops == ops_before
-    assert _membership(container) == {
+    assert _engine_nets(client, container) == {
         COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"}
     }
 
@@ -767,7 +896,7 @@ def test_membership_repair_failure_does_not_start_or_succeed(world):
     assert container._removed["value"] is False
     assert container.id == "repair-fail"
     assert docker_manager.load_container_meta(CHAT)["user_email"] == "owner@example"
-    assert NETWORK_NAME not in _membership(container)
+    assert NETWORK_NAME not in _engine_nets(client, container)
 
 
 def test_disconnect_failure_and_partial_repair_do_not_start(world):
@@ -785,18 +914,34 @@ def test_disconnect_failure_and_partial_repair_do_not_start(world):
     assert caught.value.status_code == 500
     assert container.status == "exited"
     assert container._started["n"] == 0
-    assert COMPOSE_NAME in _membership(container)
+    assert COMPOSE_NAME in _engine_nets(client, container)
 
     client.networks.get(COMPOSE_ID).fail_disconnect = False
     client.networks.get(NETWORK_NAME).fail_connect = True
-    container.attrs["NetworkSettings"]["Networks"] = {
-        COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"},
-    }
+    client.seed_membership(container, {COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"}})
     with pytest.raises(docker_manager.LaunchFailed):
         docker_manager.launch_sandbox(CHAT)
     assert container._started["n"] == 0
-    assert NETWORK_NAME not in _membership(container) or _membership(container).get(COMPOSE_NAME)
+    assert NETWORK_NAME not in _engine_nets(client, container) or _engine_nets(client, container).get(COMPOSE_NAME)
 
+
+def test_noop_or_wrong_id_detach_fails_without_start(world):
+    docker_manager, client, _tmp = world
+    compose = client.networks.get(COMPOSE_ID)
+    compose.noop_disconnect = True
+    container = client.put(
+        _name(docker_manager),
+        status="exited",
+        container_id="noop-detach",
+        networks={COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"}},
+    )
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager.launch_sandbox(CHAT)
+    assert caught.value.status_code == 500
+    assert container.status == "exited"
+    assert container._started["n"] == 0
+    assert COMPOSE_NAME in _engine_nets(client, container)
+    assert container._removed["value"] is False
 
 def test_address_uses_assigned_gateway_publication_only(world):
     docker_manager, client, _tmp = world

@@ -51,6 +51,12 @@ def _build_mock_docker_client():
     client.containers.run.return_value = None
     fake_container = MagicMock()
     fake_container.exec_run = MagicMock(return_value=(0, b""))
+    fake_container.attrs = {
+        "NetworkSettings": {
+            "Networks": {"ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}}
+        }
+    }
+    fake_container.status = "created"
     client.containers.create.return_value = fake_container
     network = MagicMock()
     network.name = "ocu-sandbox"

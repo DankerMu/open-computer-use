@@ -122,11 +122,17 @@ def _container(name, status="running", container_id="cid-1"):
     removed = {"value": False}
     stopped = {"value": False}
     execs = []
+    container._engine_membership = {
+        "ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}
+    }
 
     def reload():
         container.attrs["State"]["Status"] = container.status
         container.attrs["State"]["Paused"] = container.status == "paused"
         container.attrs["Id"] = container.id
+        membership = getattr(container, "_engine_membership", None)
+        if membership is not None:
+            container.attrs.setdefault("NetworkSettings", {})["Networks"] = dict(membership)
 
     def start():
         if container.status == "dead":
@@ -199,12 +205,16 @@ def _docker(containers=None):
             container.attrs["HostConfig"]["PortBindings"] = {}
             container.attrs["NetworkSettings"]["Networks"] = {}
             container.attrs["NetworkSettings"]["Ports"] = {}
+            container._engine_membership = {}
         elif config.get("network"):
-            net_name = config["network"]
-            container.attrs["HostConfig"]["NetworkMode"] = net_name
-            container.attrs["NetworkSettings"]["Networks"] = {
-                net_name: {"NetworkID": sandbox_net.id, "IPAddress": "172.31.0.10"},
-            }
+            net_key = config["network"]
+            net = sandbox_net if net_key in {sandbox_net.name, sandbox_net.id} else None
+            if net is None:
+                raise NotFound(net_key)
+            container.attrs["HostConfig"]["NetworkMode"] = net.id
+            membership = {net.name: {"NetworkID": net.id, "IPAddress": "172.31.0.10"}}
+            container._engine_membership = membership
+            container.attrs["NetworkSettings"]["Networks"] = dict(membership)
             bindings = {}
             for key, value in (config.get("ports") or {}).items():
                 if isinstance(value, tuple):
@@ -218,11 +228,22 @@ def _docker(containers=None):
         created.append(container)
         return container
 
-    def get_network(name):
-        if name != "ocu-sandbox":
-            raise NotFound(name)
-        return sandbox_net
+    def get_network(key):
+        if key in {sandbox_net.name, sandbox_net.id}:
+            return sandbox_net
+        raise NotFound(key)
 
+    def connect(target):
+        membership = {sandbox_net.name: {"NetworkID": sandbox_net.id, "IPAddress": "172.31.0.10"}}
+        target._engine_membership = membership
+
+    def disconnect(target, force=False):
+        membership = dict(getattr(target, "_engine_membership", {}) or {})
+        membership.pop(sandbox_net.name, None)
+        target._engine_membership = membership
+
+    sandbox_net.connect.side_effect = connect
+    sandbox_net.disconnect.side_effect = disconnect
     client.containers.get.side_effect = get
     client.containers.create.side_effect = create
     client.networks.get.side_effect = get_network
@@ -859,8 +880,17 @@ def get(name):
     container.name = name
     container.id = data[name]
     container.status = "running"
-    container.attrs = {"Id": container.id, "State": {"Status": "running"}}
-    container.reload.return_value = None
+    container.attrs = {
+        "Id": container.id,
+        "State": {"Status": "running"},
+        "Config": {"NetworkDisabled": False},
+        "HostConfig": {"NetworkMode": "netid-ocu-sandbox-current"},
+        "NetworkSettings": {"Networks": {"ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}}},
+    }
+    def reload():
+        container.attrs["State"]["Status"] = container.status
+        container.attrs["Id"] = container.id
+    container.reload.side_effect = reload
     return container
 def create(**config):
     if os.environ.get("OCU_BROKEN_FLOCK") == "1":
@@ -878,6 +908,12 @@ def create(**config):
     data[config["name"]] = "shared-cid"
     store.write_text(json.dumps(data))
     container = get(config["name"])
+    net_key = config.get("network")
+    if net_key:
+        container.attrs["HostConfig"]["NetworkMode"] = net_key
+        container.attrs["NetworkSettings"]["Networks"] = {
+            "ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}
+        }
     created.append(config["name"])
     return container
 client.containers.get.side_effect = get
@@ -887,7 +923,7 @@ sandbox.name = "ocu-sandbox"
 sandbox.id = "netid-ocu-sandbox-current"
 sandbox.attrs = {"Id": sandbox.id, "Name": "ocu-sandbox", "Driver": "bridge", "Internal": False, "IPAM": {"Config": [{"Gateway": "172.31.0.1"}]}}
 def get_network(name):
-    if name != "ocu-sandbox":
+    if name not in {"ocu-sandbox", "netid-ocu-sandbox-current"}:
         raise docker.errors.NotFound(name)
     return sandbox
 client.networks.get.side_effect = get_network
@@ -1406,20 +1442,54 @@ def test_idle_reaper_survives_startup_and_tick_errors(monkeypatch):
 def test_exited_stale_sandbox_network_is_repaired_without_deletion(world):
     docker_manager, client, _clock, _tmp = world
     container = _put(client, f"owui-chat-{CHAT}", "exited", container_id="dead-net")
-    container.attrs["NetworkSettings"]["Networks"] = {
+    container._engine_membership = {
         "ocu-sandbox": {"NetworkID": "stale-id", "IPAddress": "172.31.0.10"},
+    }
+    container.attrs["NetworkSettings"]["Networks"] = dict(container._engine_membership)
+    stale = MagicMock()
+    stale.name = "ocu-sandbox"
+    stale.id = "stale-id"
+
+    def disconnect(target, force=False):
+        target._engine_membership = {}
+
+    stale.disconnect.side_effect = disconnect
+
+    def get_network(key):
+        if key == "stale-id":
+            return stale
+        if key in {"ocu-sandbox", "netid-ocu-sandbox-current"}:
+            return client.networks.get.side_effect.__defaults__[0] if False else client.networks.get("ocu-sandbox") if key != "stale-id" else stale
+        raise NotFound(key)
+
+    sandbox = MagicMock()
+    sandbox.name = "ocu-sandbox"
+    sandbox.id = "netid-ocu-sandbox-current"
+    sandbox.attrs = {
+        "Id": "netid-ocu-sandbox-current",
+        "Name": "ocu-sandbox",
+        "Driver": "bridge",
+        "Internal": False,
+        "IPAM": {"Config": [{"Gateway": "172.31.0.1", "Subnet": "172.31.0.0/24"}]},
     }
 
     def connect(target):
-        target.attrs["NetworkSettings"]["Networks"] = {
+        target._engine_membership = {
             "ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"},
         }
 
-    sandbox = client.networks.get("ocu-sandbox")
+    def lookup(key):
+        if key == "stale-id":
+            return stale
+        if key in {"ocu-sandbox", "netid-ocu-sandbox-current"}:
+            return sandbox
+        raise NotFound(key)
+
     sandbox.connect.side_effect = connect
+    client.networks.get.side_effect = lookup
     assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
     assert container.status == "running"
-    assert container.attrs["NetworkSettings"]["Networks"]["ocu-sandbox"]["NetworkID"] == "netid-ocu-sandbox-current"
+    assert container._engine_membership["ocu-sandbox"]["NetworkID"] == "netid-ocu-sandbox-current"
     container.remove.assert_not_called()
     assert container._removed["value"] is False
 
