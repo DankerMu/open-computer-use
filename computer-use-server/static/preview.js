@@ -552,7 +552,7 @@ async function renderPptxPreview(container, file) {
     container.querySelector('#pptxLoading')?.remove();
     pptxContainer.style.display = '';
     applyDisplayedSize();
-    if (typeof ResizeObserver === 'function') {
+    if (typeof ResizeObserver === 'function' && container.isConnected !== false) {
       const observer = new ResizeObserver(() => applyDisplayedSize());
       observer.observe(pptxContainer);
       if (!attachPreviewObserver(container, observer)) return;
@@ -732,16 +732,33 @@ function FilesView({ files, selectedFile, onSelectFile }) {
   const containerRef = useRef(null);
   const prevKeyRef = useRef(null);
   const generationRef = useRef(0);
+  const ownedStageRef = useRef(null);
+  const mountedRef = useRef(true);
+
+  const dropOwnedStage = (stage) => {
+    disconnectPreviewObserver(stage);
+    if (stage && stage !== containerRef.current) stage.remove();
+    if (ownedStageRef.current === stage) ownedStageRef.current = null;
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+      dropOwnedStage(ownedStageRef.current);
+      disconnectPreviewObserver(containerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (!selectedFile) {
       generationRef.current += 1;
       prevKeyRef.current = null;
+      dropOwnedStage(ownedStageRef.current);
       disconnectPreviewObserver(containerRef.current);
       const host = containerRef.current;
-      if (host) {
-        host.querySelectorAll('.preview-stage').forEach((node) => disconnectPreviewObserver(node));
-      }
+      if (host) host.querySelectorAll('.preview-stage').forEach((node) => disconnectPreviewObserver(node));
       return;
     }
     if (!containerRef.current) return;
@@ -750,31 +767,26 @@ function FilesView({ files, selectedFile, onSelectFile }) {
     prevKeyRef.current = key;
     const generation = ++generationRef.current;
     const host = containerRef.current;
-    host.querySelectorAll('.preview-stage').forEach((node) => disconnectPreviewObserver(node));
+    host.querySelectorAll('.preview-stage').forEach((node) => {
+      disconnectPreviewObserver(node);
+      if (node !== host) node.remove();
+    });
     disconnectPreviewObserver(host);
     const stage = document.createElement('div');
     stage.className = 'preview-stage';
     stage.dataset.renderGeneration = String(generation);
     stage.style.cssText = 'display:flex;flex:1;flex-direction:column;min-height:0;width:100%;height:100%;overflow:auto';
+    ownedStageRef.current = stage;
     host.replaceChildren(stage);
     Promise.resolve(renderPreviewContent(stage, selectedFile, files, onSelectFile)).then(() => {
-      if (generation !== generationRef.current) {
-        disconnectPreviewObserver(stage);
-        stage.remove();
+      if (!mountedRef.current || generation !== generationRef.current) {
+        dropOwnedStage(stage);
         return;
       }
       if (stage.parentNode !== host) host.replaceChildren(stage);
     }).catch(() => {
-      if (generation !== generationRef.current) {
-        disconnectPreviewObserver(stage);
-        stage.remove();
-      }
+      if (!mountedRef.current || generation !== generationRef.current) dropOwnedStage(stage);
     });
-    return () => {
-      if (generationRef.current !== generation) {
-        disconnectPreviewObserver(stage);
-      }
-    };
   }, [selectedFile, files, onSelectFile]);
 
   if (!selectedFile) {
@@ -1598,13 +1610,15 @@ function App() {
       </div>
     </div>
 
-    <div style="display:${currentView === 'files' ? 'flex' : 'none'};flex:1;flex-direction:column;overflow:hidden">
-      <${FilesView}
-        files=${files}
-        selectedFile=${selectedFile}
-        onSelectFile=${onSelectFile}
-      />
-    </div>
+    ${currentView === 'files' && html`
+      <div style="display:flex;flex:1;flex-direction:column;overflow:hidden">
+        <${FilesView}
+          files=${files}
+          selectedFile=${selectedFile}
+          onSelectFile=${onSelectFile}
+        />
+      </div>
+    `}
 
     <div style="display:${currentView === 'browser' ? 'flex' : 'none'};flex:1;flex-direction:column;overflow:hidden">
       <${BrowserView}
