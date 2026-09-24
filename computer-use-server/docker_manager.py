@@ -14,6 +14,7 @@ Extracted from mcp_tools.py to reduce file size and separate concerns.
 """
 
 import os
+import ipaddress
 import sys
 import re
 import json
@@ -221,8 +222,10 @@ class _CombinedLock:
 
 def _combined_lock(chat_id: str) -> _CombinedLock:
     return _CombinedLock(chat_id)
-DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
-ORCHESTRATOR_CONTAINER_NAME = os.getenv("ORCHESTRATOR_CONTAINER_NAME", "computer-use-server")
+OCU_SANDBOX_NETWORK = os.getenv("OCU_SANDBOX_NETWORK", "ocu-sandbox").strip() or "ocu-sandbox"
+SANDBOX_HOST_BIND_IP = os.getenv("SANDBOX_HOST_BIND_IP", "").strip()
+_RESERVED_SANDBOX_NETWORKS = frozenset({"bridge", "host", "none"})
+_LIVE_SANDBOX_STATUSES = frozenset({"running", "paused", "restarting"})
 # Service ports INSIDE the sandbox. Fixed by the workspace image; only the host side of each
 # mapping varies, and the container engine assigns that.
 CDP_PORT = int(os.getenv("CDP_PORT", "9222"))    # Chrome DevTools
@@ -571,45 +574,238 @@ def _build_container_env(extra_env: Optional[dict] = None) -> dict:
     return env
 
 
-# Cached compose network name (detected once, reused)
-_compose_network_name: Optional[str] = None
+# Provisioned sandbox bridge is inspected on every use; never cached.
 
 
-def _get_compose_network_name(force_refresh: bool = False) -> Optional[str]:
-    """Find the Docker compose network that computer-use-orchestrator is on (for CDP proxy access)."""
-    global _compose_network_name
-    if _compose_network_name is not None and not force_refresh:
-        return _compose_network_name
-
-    client = get_docker_client()
+def _is_ipv4_address(value: str) -> bool:
     try:
-        fs = client.containers.get(ORCHESTRATOR_CONTAINER_NAME)
-        fs.reload()
-        for name in fs.attrs["NetworkSettings"]["Networks"]:
-            if name != "bridge":
-                _compose_network_name = name
-                print(f"[MCP] Detected compose network: {name}")
-                return name
-    except Exception as e:
-        print(f"[MCP] Could not detect compose network: {e}")
-    return None
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+def _network_disabled_on(container) -> bool:
+    attrs = getattr(container, "attrs", None) or {}
+    config = attrs.get("Config") or {}
+    if config.get("NetworkDisabled") is True:
+        return True
+    host = attrs.get("HostConfig") or {}
+    mode = (host.get("NetworkMode") or "").lower()
+    return mode in {"none", "disabled"}
+
+
+def _inspect_sandbox_network(client=None) -> tuple:
+    """Return (network, gateway) for the deployment-provisioned sandbox bridge."""
+    name = (OCU_SANDBOX_NETWORK or "").strip()
+    if not name or name.lower() in _RESERVED_SANDBOX_NETWORKS:
+        raise LaunchFailed(500, f"sandbox network {name!r} is not a dedicated bridge")
+    client = client or get_docker_client()
+    try:
+        network = client.networks.get(name)
+    except docker.errors.NotFound as exc:
+        raise LaunchFailed(500, f"sandbox network {name!r} is missing") from exc
+    except docker.errors.APIError as exc:
+        raise LaunchFailed(500, f"sandbox network {name!r} lookup failed: {exc}") from exc
+    attrs = getattr(network, "attrs", None) or {}
+    inspected_name = ((attrs.get("Name") or getattr(network, "name", "") or "")).strip()
+    inspected_id = (getattr(network, "id", None) or attrs.get("Id") or "").strip()
+    driver = (attrs.get("Driver") or "").lower()
+    if (
+        inspected_name.lower() in _RESERVED_SANDBOX_NETWORKS
+        or not inspected_id
+        or driver != "bridge"
+        or attrs.get("Internal") is True
+    ):
+        raise LaunchFailed(500, f"sandbox network {name!r} is not a dedicated non-internal bridge")
+    gateways = []
+    for item in ((attrs.get("IPAM") or {}).get("Config") or []):
+        gateway = (item or {}).get("Gateway")
+        if gateway and _is_ipv4_address(gateway):
+            gateways.append(gateway)
+    unique = list(dict.fromkeys(gateways))
+    if len(unique) != 1:
+        raise LaunchFailed(500, f"sandbox network {name!r} has no unambiguous IPv4 gateway")
+    gateway = unique[0]
+    configured = (SANDBOX_HOST_BIND_IP or "").strip()
+    if configured:
+        if not _is_ipv4_address(configured):
+            raise LaunchFailed(500, f"SANDBOX_HOST_BIND_IP {configured!r} is not a valid IPv4 address")
+        if configured != gateway:
+            raise LaunchFailed(
+                500,
+                f"SANDBOX_HOST_BIND_IP {configured} differs from inspected gateway {gateway}",
+            )
+        gateway = configured
+    return network, gateway
+
+
+def _network_identity(network) -> tuple[str, str]:
+    attrs = getattr(network, "attrs", None) or {}
+    name = (getattr(network, "name", None) or attrs.get("Name") or "").strip()
+    network_id = (getattr(network, "id", None) or attrs.get("Id") or "").strip()
+    return name, network_id
+
+
+def _membership_entry_id(data) -> str:
+    return str((data or {}).get("NetworkID") or (data or {}).get("NetworkId") or "").strip()
+
+
+def _current_membership(container) -> dict:
+    return dict(((container.attrs.get("NetworkSettings") or {}).get("Networks") or {}))
+
+
+def _membership_matches(container, network) -> bool:
+    membership = _current_membership(container)
+    if len(membership) != 1:
+        return False
+    name, data = next(iter(membership.items()))
+    desired_name, desired_id = _network_identity(network)
+    current_id = _membership_entry_id(data)
+    return bool(desired_name and desired_id and current_id) and name == desired_name and current_id == desired_id
+
+
+def _immutable_bindings(container) -> dict:
+    host = (container.attrs.get("HostConfig") or {})
+    bindings = host.get("PortBindings") or {}
+    return bindings if isinstance(bindings, dict) else {}
+
+
+def _binding_entries(bindings, port: int) -> list:
+    entries = bindings.get(f"{port}/tcp")
+    if not entries:
+        return []
+    if isinstance(entries, dict):
+        return [entries]
+    return list(entries)
+
+
+def _bindings_match_gateway(container, gateway: str) -> bool:
+    bindings = _immutable_bindings(container)
+    for port in SANDBOX_PUBLISHED_PORTS:
+        entries = _binding_entries(bindings, port)
+        if not entries:
+            return False
+        for entry in entries:
+            host_ip = (entry or {}).get("HostIp") or ""
+            if host_ip != gateway:
+                return False
+    return True
+
+
+def _incompatible_bindings_error() -> LaunchFailed:
+    return LaunchFailed(
+        409,
+        "sandbox port bindings are incompatible with the configured gateway; operator migration is required",
+    )
+
+
+def _require_enabled_compatibility(container, network, gateway: str, *, live: bool) -> None:
+    if not _bindings_match_gateway(container, gateway):
+        raise _incompatible_bindings_error()
+    if _membership_matches(container, network):
+        return
+    if live:
+        raise LaunchFailed(
+            409,
+            "live sandbox network membership is incompatible; stop the sandbox before migration",
+        )
+
+
+def _repair_stopped_membership(client, container, network) -> None:
+    desired_name, desired_id = _network_identity(network)
+    membership = _current_membership(container)
+    try:
+        for name, data in list(membership.items()):
+            current_id = _membership_entry_id(data)
+            keep = name == desired_name and current_id == desired_id
+            if keep:
+                continue
+            lookup = current_id or name
+            try:
+                client.networks.get(lookup).disconnect(container, force=True)
+            except docker.errors.NotFound as exc:
+                raise LaunchFailed(
+                    500,
+                    "sandbox network repair failed: stale membership cannot be detached",
+                ) from exc
+            except docker.errors.APIError as cop_exc:
+                raise LaunchFailed(500, f"sandbox network repair failed: {cop_exc}") from cop_exc
+        container.reload()
+        network, gateway = _inspect_sandbox_network(client)
+        if not _bindings_match_gateway(container, gateway):
+            raise _incompatible_bindings_error()
+        if not _membership_matches(container, network):
+            try:
+                network.connect(container)
+            except docker.errors.APIError as exc:
+                raise LaunchFailed(500, f"sandbox network repair failed: {exc}") from exc
+            container.reload()
+            network, gateway = _inspect_sandbox_network(client)
+            if not _bindings_match_gateway(container, gateway):
+                raise _incompatible_bindings_error()
+        if not _membership_matches(container, network):
+            raise LaunchFailed(500, "sandbox network repair did not reach the desired membership")
+    except LaunchFailed:
+        raise
+    except docker.errors.APIError as cop_exc:
+        raise LaunchFailed(500, f"sandbox network repair failed: {cop_exc}") from cop_exc
+
+
+def _require_disabled_compatibility(container) -> None:
+    if _immutable_bindings(container):
+        raise LaunchFailed(
+            409,
+            "configured networking differs from the existing sandbox network mode",
+        )
+    ports = (container.attrs.get("NetworkSettings") or {}).get("Ports") or {}
+    if any(ports.values()):
+        raise LaunchFailed(
+            409,
+            "configured networking differs from the existing sandbox network mode",
+        )
+    if _current_membership(container):
+        raise LaunchFailed(
+            409,
+            "configured networking differs from the existing sandbox network mode",
+        )
+
+
+def _prepare_existing_container(container, *, mutate: bool) -> None:
+    disabled = _network_disabled_on(container)
+    if not ENABLE_NETWORK:
+        if not disabled:
+            raise LaunchFailed(
+                409,
+                "configured networking differs from the existing sandbox network mode",
+            )
+        _require_disabled_compatibility(container)
+        return
+    if disabled:
+        raise LaunchFailed(
+            409,
+            "configured networking differs from the existing sandbox network mode",
+        )
+    client = get_docker_client()
+    network, gateway = _inspect_sandbox_network(client)
+    live = (container.status or "").lower() in _LIVE_SANDBOX_STATUSES
+    _require_enabled_compatibility(container, network, gateway, live=live)
+    if _membership_matches(container, network):
+        return
+    if live or not mutate:
+        raise LaunchFailed(
+            409,
+            "live sandbox network membership is incompatible; stop the sandbox before migration",
+        )
+    _repair_stopped_membership(client, container, network)
 
 
 def _published_address(container, container_port: int) -> Optional[str]:
-    """Host-side address of a published container port, if it has one.
+    """Host-side address of an assigned published container port, if it has one.
 
-    Works identically on Docker and Podman: both report the mapping under
-    NetworkSettings.Ports as {"9222/tcp": [{"HostIp": ..., "HostPort": ...}]}. Returns None when
-    the port is not published, which is the case for containers created before this was introduced.
-
-    An empty or 0.0.0.0 HostIp is normalised to 127.0.0.1 — the orchestrator shares a network
-    namespace with the engine, so loopback is both correct and the narrower target.
+    Host networking and empty/wildcard HostIp still resolve to loopback for the
+    existing shared-namespace address contract. Concrete gateway bindings are
+    returned as reported. Missing or unassigned publications return None.
     """
-    # Host networking: the container shares the caller's network namespace, so its port IS reachable
-    # on loopback and there is nothing to publish. Podman defaults sandboxes to this when the
-    # orchestrator itself runs with host networking, and in that case NetworkSettings.Ports is
-    # empty — which would otherwise look like "not published" and fall through to an IP lookup that
-    # cannot succeed either.
     if ((container.attrs.get("HostConfig") or {}).get("NetworkMode")) == "host":
         return f"127.0.0.1:{container_port}"
 
@@ -628,19 +824,9 @@ def _published_address(container, container_port: int) -> Optional[str]:
 def get_container_service_address(chat_id: str, container_port: int) -> Optional[str]:
     """Address to reach one of a chat container's services, as "host:port".
 
-    Two strategies, in order:
-
-    1. The published host port (NetworkSettings.Ports). This is the only one that works on rootless
-       Podman, where containers have no routable per-container IP, and it works on Docker too.
-       Note the host port is NOT the container port — the engine assigns it — so callers must use
-       the returned string whole rather than appending a port of their own.
-    2. The container's IP on the shared network, with `container_port` appended. Used for
-       containers created before ports were published, so an upgrade does not strand sandboxes
-       that are already running.
-
-    After deploy (docker-compose down/up), running containers may still be on the
-    old compose network with an unreachable IP. This function detects the mismatch
-    and reconnects the container to the current compose network.
+    Uses the engine-assigned published host address and port only. Missing
+    publication is unavailable; there is no compose-network or container-IP
+    fallback, and this function does not mutate membership.
     """
     chat_id = chat_id.lower()
     client = get_docker_client()
@@ -651,79 +837,9 @@ def get_container_service_address(chat_id: str, container_port: int) -> Optional
         c.reload()
         if c.status != "running":
             return None
-
-        published = _published_address(c, container_port)
-        if published:
-            return published
-
-        compose_net = _get_compose_network_name()
-        networks = c.attrs["NetworkSettings"]["Networks"]
-
-        # Legacy path: reach the container by IP on the shared network. Each branch appends the
-        # port itself, because this function's contract is "host:port" — a bare IP here would
-        # silently produce a URL with no port at the call sites.
-        # If container is on the current compose network, use that IP
-        if compose_net and compose_net in networks:
-            ip = networks[compose_net].get("IPAddress")
-            if ip:
-                return f"{ip}:{container_port}"
-
-        # Container running but NOT on compose network → fix and retry
-        if compose_net and compose_net not in networks:
-            print(f"[MCP] {container_name} not on compose network {compose_net}, reconnecting...")
-            _fix_dead_networks(client, c)
-            c.reload()
-            networks = c.attrs["NetworkSettings"]["Networks"]
-            if compose_net in networks:
-                ip = networks[compose_net].get("IPAddress")
-                if ip:
-                    return f"{ip}:{container_port}"
-
-        # Fallback: first non-bridge IP
-        for net_name, net_data in networks.items():
-            if net_name != "bridge" and net_data.get("IPAddress"):
-                return f"{net_data['IPAddress']}:{container_port}"
-        ip = c.attrs["NetworkSettings"]["IPAddress"]
-        return f"{ip}:{container_port}" if ip else None
+        return _published_address(c, container_port)
     except Exception:
         return None
-
-
-def get_container_cdp_address(chat_id: str) -> Optional[str]:
-    """Deprecated: use get_container_service_address(chat_id, CDP_PORT).
-
-    Kept because the old name was importable and the behaviour is unchanged for CDP. Note the
-    return value is now "host:port" rather than a bare host — callers that appended ":9222"
-    themselves must stop doing so.
-    """
-    return get_container_service_address(chat_id, CDP_PORT)
-
-
-def _fix_dead_networks(client, container):
-    """Disconnect from dead networks and reconnect to compose network.
-
-    After docker-compose down/up (deploy), networks are recreated with new IDs.
-    Stopped containers still reference old (dead) networks, causing start() to fail.
-    Same logic as restart-container endpoint in app.py.
-    """
-    try:
-        container.reload()
-        old_nets = list(container.attrs.get("NetworkSettings", {}).get("Networks", {}).keys())
-        for net_name in old_nets:
-            try:
-                net = client.networks.get(net_name)
-                net.disconnect(container, force=True)
-            except Exception:
-                pass  # Network already dead — ignore
-        compose_net = _get_compose_network_name(force_refresh=True)
-        if compose_net:
-            try:
-                net = client.networks.get(compose_net)
-                net.connect(container)
-            except Exception as e:
-                print(f"[MCP] Warning: could not connect to {compose_net}: {e}")
-    except Exception as e:
-        print(f"[MCP] Warning: network fix failed: {e}")
 
 
 def _container_name(chat_id: str) -> str:
@@ -905,27 +1021,26 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
     if user:
         config["user"] = user
 
+    pinned_network_id = None
     if not ENABLE_NETWORK:
         config["network_disabled"] = True
     else:
-        # Publish the sandbox's service ports on engine-assigned host ports.
-        #
-        # The orchestrator proxies Chrome DevTools and the web terminal to the browser. Historically
-        # it reached the container by IP on a shared bridge network, which only exists when every
-        # sandbox lives in one network namespace — true for Docker-in-Docker, not for rootless
-        # Podman, where containers get no routable per-container address.
-        #
-        # Publishing works on both engines and needs no bookkeeping here: passing None lets the
-        # engine pick a free host port, read back from NetworkSettings.Ports when an address is
-        # resolved. The engine is the ledger.
-        config["ports"] = {f"{port}/tcp": None for port in SANDBOX_PUBLISHED_PORTS}
+        network, gateway = _inspect_sandbox_network(client)
+        _, pinned_network_id = _network_identity(network)
+        config["network"] = pinned_network_id
+        config["ports"] = {f"{port}/tcp": (gateway, None) for port in SANDBOX_PUBLISHED_PORTS}
 
     try:
         container = client.containers.create(**config)
+    except docker.errors.NotFound as e:
+        if pinned_network_id:
+            raise LaunchFailed(500, "inspected sandbox network is unavailable for create") from e
+        raise
     except docker.errors.APIError as e:
         if getattr(e, "status_code", None) == 409:
             winner = _lookup_container(chat_id)
             if winner is not None and winner.status == "running":
+                _prepare_existing_container(winner, mutate=False)
                 print(f"[MCP] Adopting running container after name conflict: {container_name}")
                 return winner
             raise SandboxStopped()
@@ -933,21 +1048,19 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
             print("[MCP] Engine refuses a per-container hostname; creating without one")
             config.pop("hostname", None)
             container = client.containers.create(**config)
+        elif pinned_network_id and getattr(e, "status_code", None) in {404, 400, 500}:
+            raise LaunchFailed(500, "inspected sandbox network is unavailable for create") from e
         else:
             raise
+    if pinned_network_id:
+        _reload_container(container)
+        membership = _current_membership(container)
+        attached_ids = {_membership_entry_id(data) for data in membership.values()}
+        if len(membership) != 1 or attached_ids != {pinned_network_id}:
+            raise LaunchFailed(500, "created sandbox is not on the inspected sandbox bridge")
     container.start()
 
     _reload_container(container)
-
-    # Connect to compose network so computer-use-orchestrator can proxy CDP (port 9222) to this container
-    try:
-        compose_net = _get_compose_network_name()
-        if compose_net:
-            client.networks.get(compose_net).connect(container)
-            if DEBUG_LOGGING:
-                print(f"[MCP] Connected {container_name} to network {compose_net}")
-    except Exception as e:
-        print(f"[MCP] Warning: Could not connect to compose network: {e}")
 
     print(f"[MCP] Created and started new container: {container_name}")
 
@@ -1524,6 +1637,7 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
     if status == "paused" and not _migration_verified(state, container):
         raise MigrationRequired()
     if status == "running":
+        _prepare_existing_container(container, mutate=False)
         if not _migration_verified(state, container):
             try:
                 retire_legacy_sleeper(chat_id, container)
@@ -1533,6 +1647,7 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
             note_running_activity(chat_id, container)
         return {"state": "running"}
     if status == "paused":
+        _prepare_existing_container(container, mutate=False)
         note_running_activity(chat_id, container)
         try:
             container.unpause()
@@ -1542,23 +1657,17 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
             raise LaunchFailed(500, "unpause did not reach running")
         return {"state": "running"}
     if status in {"exited", "created"}:
+        _prepare_existing_container(container, mutate=True)
         try:
-            _fix_dead_networks(get_docker_client(), container)
             container.start()
         except docker.errors.APIError as exc:
-            if "network" in str(exc).lower():
-                try:
-                    _fix_dead_networks(get_docker_client(), container)
-                    container.start()
-                except docker.errors.APIError as retry_exc:
-                    raise LaunchFailed(500, f"engine refused start: {retry_exc}") from retry_exc
-            else:
-                raise LaunchFailed(500, f"engine refused start: {exc}") from exc
+            raise LaunchFailed(500, f"engine refused start: {exc}") from exc
         if _reload_container(container) != "running":
             raise LaunchFailed(500, "start did not reach running")
         mark_sleeper_retired(chat_id, container)
         return {"state": "running"}
     if status == "restarting":
+        _prepare_existing_container(container, mutate=False)
         if not _wait_until_running(container):
             raise LaunchFailed(504, "restart readiness timed out")
         try:

@@ -163,12 +163,18 @@ def test_extra_env_carries_subagent_cli_via_create_container(monkeypatch):
     class _FakeContainer:
         id = "fake-container-id"
         name = "fake-container"
+        status = "created"
+        attrs = {
+            "NetworkSettings": {
+                "Networks": {"ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}}
+            }
+        }
 
         def reload(self):
             pass
 
         def start(self):
-            pass
+            self.status = "running"
 
     class _FakeContainers:
         def run(self, *a, **kw):
@@ -180,14 +186,22 @@ def test_extra_env_carries_subagent_cli_via_create_container(monkeypatch):
 
         def get(self, *a, **kw):
             raise Exception("no such container")
-
     class _FakeNetworks:
         def get(self, *a, **kw):
-            raise Exception("no such network")
+            net = type("N", (), {})()
+            net.name = "ocu-sandbox"
+            net.id = "netid-ocu-sandbox-current"
+            net.attrs = {
+                "Id": "netid-ocu-sandbox-current",
+                "Name": "ocu-sandbox",
+                "Driver": "bridge",
+                "Internal": False,
+                "IPAM": {"Config": [{"Gateway": "172.31.0.1"}]},
+            }
+            return net
 
         def list(self, *a, **kw):
             return []
-
     class _FakeImages:
         def get(self, *a, **kw):
             from unittest.mock import MagicMock

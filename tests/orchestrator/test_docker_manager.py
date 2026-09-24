@@ -46,19 +46,38 @@ GATEWAY_VAR_NAMES = (
 ALL_GATEWAY_ENV_KEYS = GATEWAY_VAR_NAMES + ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
 
 
+def _sandbox_network():
+    network = MagicMock()
+    network.name = "ocu-sandbox"
+    network.id = "netid-ocu-sandbox-current"
+    network.attrs = {
+        "Id": "netid-ocu-sandbox-current",
+        "Name": "ocu-sandbox",
+        "Driver": "bridge",
+        "Internal": False,
+        "IPAM": {"Config": [{"Gateway": "172.31.0.1", "Subnet": "172.31.0.0/24"}]},
+    }
+    return network
+
+
 def _build_mock_docker_client():
     """Return a MagicMock wired to satisfy the _create_container call path.
 
     _create_container uses:
-      - client.containers.run(...)     — for the directory-setup ephemeral container
       - client.containers.create(...)  — for the actual sandbox container (the assertion target)
-      - client.networks.get(...)       — for the compose-network attach (guarded by try/except)
-      - client.containers.get(...)     — for the ORCHESTRATOR_CONTAINER_NAME lookup (compose net)
+      - client.networks.get(...)       — to inspect the provisioned sandbox bridge
     """
     client = MagicMock()
     client.containers.run.return_value = None
-    client.containers.create.return_value = MagicMock()
-    # networks.list / volumes.list are not called by _create_container but harmless as defaults
+    created = MagicMock()
+    created.attrs = {
+        "NetworkSettings": {
+            "Networks": {"ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}}
+        }
+    }
+    created.status = "created"
+    client.containers.create.return_value = created
+    client.networks.get.return_value = _sandbox_network()
     client.networks.list.return_value = []
     client.volumes.list.return_value = []
     client.images.get.return_value = MagicMock()

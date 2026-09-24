@@ -41,20 +41,34 @@ def _build_mock_docker_client():
     """Mock docker client wired for the _create_container call path.
 
     Mirrors tests/orchestrator/test_docker_manager.py::_build_mock_docker_client
-    so the SUT's exception-tolerant fallbacks (network attach, save_container_meta,
-    README write, MCP resource sync, defensive scrub) are all silently satisfied.
+    so the SUT's exception-tolerant fallbacks (save_container_meta, README write,
+    MCP resource sync, defensive scrub) are all silently satisfied.
 
     The actual sandbox is created via `client.containers.create(**config)` — that
-    is the call we inspect for the `environment` kwarg. `containers.run` is the
-    ephemeral mkdir shim and irrelevant to the assertion target.
+    is the call we inspect for the `environment` kwarg.
     """
     client = MagicMock()
     client.containers.run.return_value = None
     fake_container = MagicMock()
-    # Defensive scrub call (Plan 06-01 D4) — return a (exit_code, output) tuple
-    # so any unpacking in the SUT does not raise.
     fake_container.exec_run = MagicMock(return_value=(0, b""))
+    fake_container.attrs = {
+        "NetworkSettings": {
+            "Networks": {"ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}}
+        }
+    }
+    fake_container.status = "created"
     client.containers.create.return_value = fake_container
+    network = MagicMock()
+    network.name = "ocu-sandbox"
+    network.id = "netid-ocu-sandbox-current"
+    network.attrs = {
+        "Id": "netid-ocu-sandbox-current",
+        "Name": "ocu-sandbox",
+        "Driver": "bridge",
+        "Internal": False,
+        "IPAM": {"Config": [{"Gateway": "172.31.0.1", "Subnet": "172.31.0.0/24"}]},
+    }
+    client.networks.get.return_value = network
     client.networks.list.return_value = []
     client.volumes.list.return_value = []
     client.images.get.return_value = MagicMock()
