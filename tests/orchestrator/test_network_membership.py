@@ -943,6 +943,40 @@ def test_noop_or_wrong_id_detach_fails_without_start(world):
     assert COMPOSE_NAME in _engine_nets(client, container)
     assert container._removed["value"] is False
 
+
+def test_missing_stale_network_object_fails_without_start_or_forged_inspect(world):
+    docker_manager, client, _tmp = world
+    container = client.put(
+        _name(docker_manager),
+        status="exited",
+        container_id="missing-stale",
+        networks={NETWORK_NAME: {"NetworkID": STALE_ID, "IPAddress": "172.31.0.10"}},
+    )
+    _meta(docker_manager)
+    workspace = Path(docker_manager.USER_DATA_BASE_PATH) / CHAT
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "layer").write_text("keep")
+    meta = docker_manager._get_meta_path(CHAT)
+    meta_bytes = meta.read_text()
+    client._network_store.pop(STALE_ID, None)
+    assert STALE_ID not in {net.id for net in {id(n): n for n in client._network_store.values()}.values()}
+    container.attrs["NetworkSettings"]["Networks"] = {
+        NETWORK_NAME: {"NetworkID": NETWORK_ID, "IPAddress": "172.31.0.10"},
+    }
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager.launch_sandbox(CHAT)
+    assert caught.value.status_code == 500
+    assert container.status == "exited"
+    assert container._started["n"] == 0
+    assert container._unpaused["n"] == 0
+    assert container._removed["value"] is False
+    assert container.id == "missing-stale"
+    assert _engine_nets(client, container)[NETWORK_NAME]["NetworkID"] == STALE_ID
+    assert docker_manager.load_container_meta(CHAT)["user_email"] == "owner@example"
+    assert meta.read_text() == meta_bytes
+    assert (workspace / "layer").read_text() == "keep"
+    assert (NETWORK_ID, "connect", container.id) not in client.ops
+
 def test_address_uses_assigned_gateway_publication_only(world):
     docker_manager, client, _tmp = world
     client.put(
