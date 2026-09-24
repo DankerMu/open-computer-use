@@ -3,6 +3,22 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Preview SPA revision window and Office content preview.** The Files view
+  keys refresh on `path + revision`, keeps selected `file_id` across rename,
+  automatically displays a new or changed root output unless the user
+  explicitly selected another file, loads the first 100 entries with a visible
+  More control, and commits only a complete same-revision page chain from the
+  latest request generation. Listing body-read failures keep the prior window
+  and surface a visible error while browser/terminal polls continue. The CLI
+  badge reads `cli_badge` from `describeUrl`. Both stopped recovery branches
+  POST `restart-container` and start ttyd only after a successful launch.
+  DOCX/XLSX/PPTX views show a visible `内容预览` disclaimer; XLSX formulas
+  without a cached value are marked uncomputed. HTML previews keep
+  `sandbox="allow-scripts allow-forms"` without `allow-same-origin`. Generated
+  HTML/SVG/XML file responses use Starlette `content_disposition_type="inline"`
+  with RFC 5987 `filename*` encoding plus the same CSP sandbox so the SPA `src`
+  fallback can execute child scripts, buttons, and forms while parent DOM and
+  storage stay unreachable.
 - **Broker-backed outputs listing.** `GET /api/outputs/{chat_id}` now
   reconciles persisted identities instead of scanning independently. The
   current SPA envelope (`chat_id`, `files`, `total`, `timestamp`, and
@@ -23,17 +39,21 @@
   outputs root with active predecessor identities is retryable and
   index-preserving. Unsupported live names fail explicitly rather than as
   index corruption.
-- **Preview shell public prefix.** `OCU_PUBLIC_PREFIX` (default empty) prefixes
-  preview stylesheet/script URLs, `apiUrl`, `filesBase`, the inline heartbeat,
-  and the static mount at `{prefix}/static` exactly once. `describeUrl` stays
-  the unprefixed WebUI route `/api/v1/ocu/workspaces/{chat_id}`. Browser-viewer
-  discovery and CDP WebSockets derive their public path from the module URL.
-  Invalid prefixes fail import/startup. A prefix whose `{prefix}/static/` falls
-  under a guarded chat namespace (`/files`, `/preview`, `/browser`, `/terminal`,
+- **Preview SPA public prefix.** `OCU_PUBLIC_PREFIX` (default empty) prefixes
+  preview stylesheet/script URLs, `apiUrl`, `filesBase`, and the static mount
+  at `{prefix}/static` exactly once. `describeUrl` stays the unprefixed WebUI
+  route `/api/v1/ocu/workspaces/{chat_id}`. Authored SPA modules import
+  relatively; script/worker URLs derive from `import.meta.url`. One `ocuFetch`
+  wrapper adds `X-Requested-With: ocu-workspace` to scripted HTTP and prefixes
+  client root paths once with segment-boundary matching. Server-emitted
+  `apiUrl`/`filesBase`/entry `url`/`describeUrl` stay verbatim. Heartbeat moved
+  from the HTML shell into the SPA wrapper effect. Browser-viewer discovery and
+  CDP WebSockets still derive their public path from the module URL. Invalid
+  prefixes fail import/startup. A prefix whose `{prefix}/static/` falls under a
+  guarded chat namespace (`/files`, `/preview`, `/browser`, `/terminal`,
   `/internal`, `/api/outputs`, `/api/uploads`, and descendants) fails startup
   by the guard's path classification; `/api` and `/files-ui` remain valid.
-  Empty prefix keeps the previous URLs. A nonempty prefix is an intermediate
-  server slice; issue17 must land before prefixed SPA deployment.
+  Empty prefix keeps the previous URLs.
 - **Explicit sandbox lifecycle.** Tool and MCP calls return a running sandbox or
   create one only when neither a container nor valid metadata exists. Stopped
   and absent-with-metadata states return a workspace-stopped error without

@@ -5,7 +5,7 @@
 // =============================================================================
 //
 // Usage in browser:
-//   import { t } from '/static/locale.js';
+//   import { t } from './locale.js';
 //   t('files')          → 'Files'
 //   t('showing_rows', { n: 5000 }) → 'Showing 1000 of 5000 rows'
 //
@@ -39,7 +39,10 @@ export const TRANSLATIONS = {
     pptx_fail: 'Не удалось открыть PPTX',
     drawio_fail: 'Не удалось открыть Draw.io',
     showing_rows: 'Показано 1000 из {n} строк',
-
+    content_preview: '内容预览',
+    content_preview_disclaimer: 'Разбивка на страницы и вёрстка могут отличаться от Microsoft Office.',
+    more_files: 'Ещё',
+    listing_error: 'Не удалось обновить список файлов',
     // Dashboard
     beta: 'Бета',
     hero_desc: 'Автономный ИИ-агент в изолированном контейнере. Может самостоятельно писать и запускать код, создавать файлы, анализировать данные.',
@@ -139,7 +142,10 @@ export const TRANSLATIONS = {
     pptx_fail: 'Failed to open PPTX',
     drawio_fail: 'Failed to open Draw.io',
     showing_rows: 'Showing 1000 of {n} rows',
-
+    content_preview: '内容预览',
+    content_preview_disclaimer: 'Pagination and layout may differ from Microsoft Office.',
+    more_files: 'More',
+    listing_error: 'Failed to refresh the file list',
     // Dashboard
     beta: 'Beta',
     hero_desc: 'Autonomous AI agent in an isolated container. Can write and run code, create files, analyze data.',

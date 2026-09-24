@@ -4,12 +4,29 @@
 // Preview SPA — Preact + HTM
 // =============================================================================
 
-import { html, render, useState, useEffect, useRef, useCallback, useMemo } from '/static/preact-htm.min.js';
-import { icon, fileIcon, fileIconLarge } from '/static/icons.js';
-import { BrowserViewer } from '/static/browser-viewer.js';
-import { t, LANG } from '/static/locale.js';
+import { html, render, useState, useEffect, useRef, useCallback } from './preact-htm.min.js';
+import { icon, fileIcon, fileIconLarge } from './icons.js';
+import { BrowserViewer } from './browser-viewer.js';
+import { t, LANG } from './locale.js';
+import {
+  ocuFetch,
+  moduleAssetUrl,
+  terminalWsUrl,
+  startWorkspaceHeartbeat,
+  loadCliBadge,
+  recoverStoppedContainer,
+  loadOutputsWindow,
+  renderKey,
+  pickAutoSelect,
+  applyListingSelection,
+  formulaHasCachedValue,
+  formulaCellDisplay,
+  disconnectPreviewObserver,
+  attachPreviewObserver,
+  workspaceHttpHeaders,
+} from './ocu-request.js';
 
-const { apiUrl: API_URL, filesBase: FILES_BASE, chatId: CHAT_ID } = window.__CONFIG__;
+const { apiUrl: API_URL, filesBase: FILES_BASE, chatId: CHAT_ID, describeUrl: DESCRIBE_URL } = window.__CONFIG__;
 
 // =============================================================================
 // Utilities
@@ -37,6 +54,14 @@ function loadScript(url) {
     s.onerror = reject;
     document.head.appendChild(s);
   });
+}
+
+function fetchOutput(url) {
+  return ocuFetch(url, { serverUrl: true, cache: 'no-store' });
+}
+
+function officeBanner() {
+  return `<div class="office-preview-banner"><strong>${t('content_preview')}</strong> ${t('content_preview_disclaimer')}</div>`;
 }
 
 function normalizePath(path) {
@@ -200,8 +225,9 @@ function _showExternalLinkDialog(href) {
 // =============================================================================
 
 async function renderHtmlPreview(container, file) {
+  const sandbox = 'allow-scripts allow-forms';
   try {
-    const resp = await fetch(file.url);
+    const resp = await fetchOutput(file.url);
     let text = await resp.text();
     const fileDir = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/')) : '';
     const baseUrl = fileDir ? FILES_BASE + '/' + fileDir + '/' : FILES_BASE + '/';
@@ -232,25 +258,28 @@ async function renderHtmlPreview(container, file) {
       text = injection + text;
     }
     const iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', sandbox);
     iframe.srcdoc = text;
-    container.innerHTML = '';
-    container.appendChild(iframe);
+    container.replaceChildren(iframe);
   } catch {
     const iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', sandbox);
     iframe.src = file.url;
-    container.innerHTML = '';
-    container.appendChild(iframe);
+    container.replaceChildren(iframe);
   }
 }
 
 async function renderPdfPreview(container, file) {
   container.innerHTML = `<div class="pdf-container" id="pdfContainer"><div class="empty-state"><div class="spinner"></div><p class="loading-text">${t('loading_pdf')}</p></div></div>`;
   try {
-    await loadScript('/static/pdf.min.js');
+    await loadScript(moduleAssetUrl('pdf.min.js'));
     const pdfjsLib = window.pdfjsLib;
     if (!pdfjsLib) throw new Error('pdf.js not loaded');
-    pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/pdf.worker.min.js';
-    const pdf = await pdfjsLib.getDocument(file.url).promise;
+    pdfjsLib.GlobalWorkerOptions.workerSrc = moduleAssetUrl('pdf.worker.min.js');
+    const pdf = await pdfjsLib.getDocument({
+      url: file.url,
+      httpHeaders: workspaceHttpHeaders(),
+    }).promise;
     const pdfContainer = container.querySelector('#pdfContainer');
     pdfContainer.innerHTML = '';
     const maxPages = Math.min(pdf.numPages, 30);
@@ -277,7 +306,7 @@ async function renderPdfPreview(container, file) {
 
 async function renderMarkdownPreview(container, file, files, onSelectFile) {
   try {
-    const resp = await fetch(file.url);
+    const resp = await fetchOutput(file.url);
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000) + '\n\n... (truncated)';
     const renderer = new marked.Renderer();
@@ -323,7 +352,7 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
     const mermaidBlocks = mdBody.querySelectorAll('pre code.language-mermaid');
     if (mermaidBlocks.length > 0) {
       try {
-        await loadScript('/static/mermaid.min.js');
+        await loadScript(moduleAssetUrl('mermaid.min.js'));
         mermaid.initialize({ startOnLoad: false, theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default' });
         mermaidBlocks.forEach(codeEl => {
           const pre = codeEl.parentElement;
@@ -338,8 +367,8 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
 
     // KaTeX
     try {
-      await loadScript('/static/katex/katex.min.js');
-      await loadScript('/static/katex/auto-render.min.js');
+      await loadScript(moduleAssetUrl('katex/katex.min.js'));
+      await loadScript(moduleAssetUrl('katex/auto-render.min.js'));
       renderMathInElement(mdBody, {
         delimiters: [
           { left: '$$', right: '$$', display: true },
@@ -356,7 +385,7 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
 
 async function renderCodePreview(container, file) {
   try {
-    const resp = await fetch(file.url);
+    const resp = await fetchOutput(file.url);
     let text = await resp.text();
     if (text.length > 200000) text = text.substring(0, 200000) + '\n... (truncated)';
     const ext = file.name.split('.').pop() || '';
@@ -372,7 +401,7 @@ async function renderCodePreview(container, file) {
 
 async function renderSpreadsheetPreview(container, file) {
   try {
-    const resp = await fetch(file.url);
+    const resp = await fetchOutput(file.url);
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000);
     const ext = file.name.split('.').pop().toLowerCase();
@@ -399,26 +428,39 @@ async function renderSpreadsheetPreview(container, file) {
 }
 
 async function renderDocxPreview(container, file) {
-  container.innerHTML = '<div class="markdown-body" id="docxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
+  container.innerHTML = officeBanner() + '<div class="markdown-body" id="docxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
   try {
-    await loadScript('/static/mammoth.browser.min.js');
-    const resp = await fetch(file.url);
+    await loadScript(moduleAssetUrl('mammoth.browser.min.js'));
+    const resp = await fetchOutput(file.url);
     const arrayBuffer = await resp.arrayBuffer();
     const result = await mammoth.convertToHtml({ arrayBuffer });
-    container.querySelector('#docxContainer').innerHTML = result.value;
+    const body = container.querySelector('#docxContainer');
+    if (body) body.innerHTML = result.value;
   } catch (err) {
     console.error('DOCX render error:', err);
     renderDownloadFallback(container, file, 'fileText');
   }
 }
 
+function markUncomputedFormulaCells(root, sheet) {
+  root.querySelectorAll('td[id], th[id]').forEach((el) => {
+    const id = el.getAttribute('id') || '';
+    const addr = id.includes('-') ? id.slice(id.lastIndexOf('-') + 1) : '';
+    const cell = sheet[addr];
+    if (cell && cell.f != null && cell.f !== '' && !formulaHasCachedValue(cell)) {
+      el.classList.add('xlsx-uncomputed');
+      el.textContent = formulaCellDisplay(cell);
+    }
+  });
+}
+
 async function renderXlsxPreview(container, file) {
-  container.innerHTML = '<div class="data-table-wrap" id="xlsxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
+  container.innerHTML = officeBanner() + '<div class="data-table-wrap" id="xlsxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
   try {
-    await loadScript('/static/xlsx.full.min.js');
-    const resp = await fetch(file.url);
+    await loadScript(moduleAssetUrl('xlsx.full.min.js'));
+    const resp = await fetchOutput(file.url);
     const arrayBuffer = await resp.arrayBuffer();
-    const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+    const workbook = XLSX.read(arrayBuffer, { type: 'array', cellFormula: true, cellNF: true, sheetStubs: true, raw: false });
     let html = '';
     if (workbook.SheetNames.length > 1) {
       html += '<div class="sheet-tabs">';
@@ -432,7 +474,9 @@ async function renderXlsxPreview(container, file) {
     xlsxContainer.innerHTML = html;
     function renderSheet(index) {
       const sheet = workbook.Sheets[workbook.SheetNames[index]];
-      xlsxContainer.querySelector('#sheetContent').innerHTML = XLSX.utils.sheet_to_html(sheet, { editable: false });
+      const content = xlsxContainer.querySelector('#sheetContent');
+      content.innerHTML = XLSX.utils.sheet_to_html(sheet, { editable: false, id: 'xlsx' });
+      markUncomputedFormulaCells(content, sheet);
     }
     renderSheet(0);
     xlsxContainer.querySelectorAll('.sheet-tab').forEach(btn => {
@@ -449,30 +493,70 @@ async function renderXlsxPreview(container, file) {
 }
 
 async function renderPptxPreview(container, file) {
-  container.innerHTML = `<div class="empty-state" id="pptxLoading"><div class="spinner"></div><p class="loading-text">${t('loading')}</p></div><div class="pptx-container" id="pptxContainer" style="display:none"></div>`;
+  container.innerHTML = officeBanner() + `<div class="empty-state" id="pptxLoading"><div class="spinner"></div><p class="loading-text">${t('loading')}</p></div><div class="pptx-container" id="pptxContainer" style="display:none"></div>`;
   try {
-    await loadScript('/static/jszip.min.js');
-    await loadScript('/static/chart.umd.js');
-    await loadScript('/static/pptxviewjs.min.js');
-    const pptxResp = await fetch(file.url);
+    await loadScript(moduleAssetUrl('jszip.min.js'));
+    await loadScript(moduleAssetUrl('chart.umd.js'));
+    await loadScript(moduleAssetUrl('pptxviewjs.min.js'));
+    const pptxResp = await fetchOutput(file.url);
     const pptxBuf = await pptxResp.arrayBuffer();
     const pptxContainer = container.querySelector('#pptxContainer');
-    const pptxWidth = container.clientWidth;
+    let ratio = 9 / 16;
+    let deckCx = 0;
+    let deckCy = 0;
+    try {
+      const zip = await JSZip.loadAsync(pptxBuf.slice(0));
+      const presXml = await zip.file('ppt/presentation.xml').async('string');
+      const tag = (presXml.match(/<p:sldSz\b[^>]*>/) || [])[0] || '';
+      deckCx = Number((/cx="(\d+)"/.exec(tag) || [])[1]);
+      deckCy = Number((/cy="(\d+)"/.exec(tag) || [])[1]);
+      if (deckCx > 0 && deckCy > 0) ratio = deckCy / deckCx;
+    } catch (err) {
+      console.warn('PPTX slide size:', err);
+    }
+    const contentWidth = Math.max(container.clientWidth || container.parentElement?.clientWidth || 0, 1);
+    const slideWidth = Math.min(contentWidth, 960);
+    const slideHeight = Math.max(1, Math.round(slideWidth * ratio));
+    pptxContainer.style.setProperty('--pptx-slide-width', slideWidth + 'px');
+    pptxContainer.style.setProperty('--pptx-slide-aspect', `${slideWidth} / ${slideHeight}`);
+    const applyDisplayedSize = () => {
+      const box = Math.max((pptxContainer.clientWidth || contentWidth) - 20, 1);
+      const cssWidth = Math.min(box, 960);
+      const cssHeight = Math.max(1, Math.round(cssWidth * ratio));
+      pptxContainer.querySelectorAll('canvas.pptx-slide').forEach((canvas) => {
+        canvas.style.removeProperty('width');
+        canvas.style.removeProperty('height');
+        canvas.style.width = cssWidth + 'px';
+        canvas.style.height = cssHeight + 'px';
+        canvas.style.maxWidth = '100%';
+        canvas.style.aspectRatio = `${canvas.width} / ${canvas.height}`;
+      });
+    };
     const viewer = new PptxViewJS.PPTXViewer();
     await viewer.loadFile(pptxBuf);
     const slideCount = viewer.getSlideCount();
     for (let i = 0; i < slideCount; i++) {
       const canvas = document.createElement('canvas');
-      canvas.width = pptxWidth;
-      canvas.height = Math.round(pptxWidth * 9 / 16);
+      canvas.width = slideWidth;
+      canvas.height = slideHeight;
+      canvas.dataset.ratio = String(ratio);
+      canvas.dataset.deckCx = String(deckCx);
+      canvas.dataset.deckCy = String(deckCy);
       canvas.className = 'pptx-slide';
       pptxContainer.appendChild(canvas);
       viewer.setCanvas(canvas);
       await viewer.goToSlide(i);
       await viewer.render();
+      applyDisplayedSize();
     }
     container.querySelector('#pptxLoading')?.remove();
     pptxContainer.style.display = '';
+    applyDisplayedSize();
+    if (typeof ResizeObserver === 'function' && container.isConnected !== false) {
+      const observer = new ResizeObserver(() => applyDisplayedSize());
+      observer.observe(pptxContainer);
+      if (!attachPreviewObserver(container, observer)) return;
+    }
   } catch (err) {
     console.error('PPTX render error:', err);
     renderDownloadFallback(container, file, 'filePresentation', t('pptx_fail'));
@@ -482,7 +566,7 @@ async function renderPptxPreview(container, file) {
 async function renderDrawioPreview(container, file) {
   container.innerHTML = `<div class="empty-state"><div class="spinner"></div><p class="loading-text">${t('loading')}</p></div>`;
   try {
-    const drawioResp = await fetch(file.url);
+    const drawioResp = await fetchOutput(file.url);
     const drawioXml = await drawioResp.text();
     const mxDiv = document.createElement('div');
     mxDiv.className = 'mxgraph';
@@ -517,19 +601,19 @@ function renderDownloadFallback(container, file, iconType, errorMsg) {
 
 function renderPreviewContent(container, file, files, onSelectFile) {
   switch (file.type) {
-    case 'html': renderHtmlPreview(container, file); break;
+    case 'html': return renderHtmlPreview(container, file);
     case 'image':
       container.innerHTML = `<img src="${escapeHtml(file.url)}" alt="${escapeHtml(file.name)}">`;
-      break;
-    case 'pdf': renderPdfPreview(container, file); break;
-    case 'markdown': renderMarkdownPreview(container, file, files, onSelectFile); break;
+      return;
+    case 'pdf': return renderPdfPreview(container, file);
+    case 'markdown': return renderMarkdownPreview(container, file, files, onSelectFile);
     case 'code':
-    case 'text': renderCodePreview(container, file); break;
-    case 'spreadsheet': renderSpreadsheetPreview(container, file); break;
-    case 'docx': renderDocxPreview(container, file); break;
-    case 'xlsx': renderXlsxPreview(container, file); break;
-    case 'pptx': renderPptxPreview(container, file); break;
-    case 'drawio': renderDrawioPreview(container, file); break;
+    case 'text': return renderCodePreview(container, file);
+    case 'spreadsheet': return renderSpreadsheetPreview(container, file);
+    case 'docx': return renderDocxPreview(container, file);
+    case 'xlsx': return renderXlsxPreview(container, file);
+    case 'pptx': return renderPptxPreview(container, file);
+    case 'drawio': return renderDrawioPreview(container, file);
     case 'audio':
       container.innerHTML = `<div class="media-container">
         <div class="media-icon">${icon('music', 48)}</div>
@@ -538,13 +622,13 @@ function renderPreviewContent(container, file, files, onSelectFile) {
         <audio controls preload="metadata" src="${escapeHtml(file.url)}">${t('audio_unsupported')}</audio>
         <a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>
       </div>`;
-      break;
+      return;
     case 'video':
       container.innerHTML = `<div class="media-container">
         <video controls preload="metadata" src="${escapeHtml(file.url)}">${t('video_unsupported')}</video>
         <a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>
       </div>`;
-      break;
+      return;
     default:
       renderDownloadFallback(container, file);
   }
@@ -646,19 +730,68 @@ function FileSelector({ files, selectedFile, seenFiles, onSelect }) {
 
 function FilesView({ files, selectedFile, onSelectFile }) {
   const containerRef = useRef(null);
-  const prevFileRef = useRef(null);
+  const prevKeyRef = useRef(null);
+  const generationRef = useRef(0);
+  const ownedStageRef = useRef(null);
+  const mountedRef = useRef(true);
+
+  const dropOwnedStage = (stage) => {
+    disconnectPreviewObserver(stage);
+    if (stage && stage !== containerRef.current) stage.remove();
+    if (ownedStageRef.current === stage) ownedStageRef.current = null;
+  };
 
   useEffect(() => {
-    if (!containerRef.current) return;
-    if (selectedFile && selectedFile !== prevFileRef.current) {
-      prevFileRef.current = selectedFile;
-      renderPreviewContent(containerRef.current, selectedFile, files, onSelectFile);
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+      dropOwnedStage(ownedStageRef.current);
+      disconnectPreviewObserver(containerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedFile) {
+      generationRef.current += 1;
+      prevKeyRef.current = null;
+      dropOwnedStage(ownedStageRef.current);
+      disconnectPreviewObserver(containerRef.current);
+      const host = containerRef.current;
+      if (host) host.querySelectorAll('.preview-stage').forEach((node) => disconnectPreviewObserver(node));
+      return;
     }
-  }, [selectedFile, files]);
+    if (!containerRef.current) return;
+    const key = renderKey(selectedFile);
+    if (key === prevKeyRef.current) return;
+    prevKeyRef.current = key;
+    const generation = ++generationRef.current;
+    const host = containerRef.current;
+    host.querySelectorAll('.preview-stage').forEach((node) => {
+      disconnectPreviewObserver(node);
+      if (node !== host) node.remove();
+    });
+    disconnectPreviewObserver(host);
+    const stage = document.createElement('div');
+    stage.className = 'preview-stage';
+    stage.dataset.renderGeneration = String(generation);
+    stage.style.cssText = 'display:flex;flex:1;flex-direction:column;min-height:0;width:100%;height:100%;overflow:auto';
+    ownedStageRef.current = stage;
+    host.replaceChildren(stage);
+    Promise.resolve(renderPreviewContent(stage, selectedFile, files, onSelectFile)).then(() => {
+      if (!mountedRef.current || generation !== generationRef.current) {
+        dropOwnedStage(stage);
+        return;
+      }
+      if (stage.parentNode !== host) host.replaceChildren(stage);
+    }).catch(() => {
+      if (!mountedRef.current || generation !== generationRef.current) dropOwnedStage(stage);
+    });
+  }, [selectedFile, files, onSelectFile]);
 
   if (!selectedFile) {
     return html`
-      <div class="preview">
+      <div class="preview" ref=${containerRef}>
         <div class="empty-state">
           <div class="empty-icon" dangerouslySetInnerHTML=${{ __html: icon('folder', 48) }}></div>
           <div class="empty-title">${t('no_files_yet')}</div>
@@ -744,10 +877,10 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
     setLoading(true);
     try {
       const [sResp, sessResp, procResp, uplResp] = await Promise.all([
-        fetch(`/terminal/${chatId}/status?_t=${Date.now()}`),
-        fetch(`/terminal/${chatId}/sessions?_t=${Date.now()}`),
-        fetch(`/terminal/${chatId}/processes?_t=${Date.now()}`),
-        fetch(`/api/uploads/${chatId}/list?_t=${Date.now()}`),
+        ocuFetch(`/terminal/${chatId}/status?_t=${Date.now()}`),
+        ocuFetch(`/terminal/${chatId}/sessions?_t=${Date.now()}`),
+        ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`),
+        ocuFetch(`/api/uploads/${chatId}/list?_t=${Date.now()}`),
       ]);
       setData({
         status: await sResp.json(),
@@ -774,7 +907,7 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
       for (const file of input.files) {
         const formData = new FormData();
         formData.append('file', file);
-        await fetch(`/api/uploads/${chatId}/${encodeURIComponent(file.name)}`, { method: 'POST', body: formData });
+        await ocuFetch(`/api/uploads/${chatId}/${encodeURIComponent(file.name)}`, { method: 'POST', body: formData });
       }
       input.remove();
       fetchData();
@@ -783,7 +916,7 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
   }, [chatId]);
 
   const killProcess = useCallback(async (pid) => {
-    try { await fetch(`/terminal/${chatId}/processes/${pid}/kill`, { method: 'POST' }); } catch(e) {}
+    try { await ocuFetch(`/terminal/${chatId}/processes/${pid}/kill`, { method: 'POST' }); } catch(e) {}
     fetchData();
   }, [chatId]);
 
@@ -796,9 +929,9 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
   }
 
   const { status, sessions, processes, uploads } = data;
-  const hasProcesses = processes.processes.length > 0;
-  const hasSessions = sessions.sessions.length > 0;
-  const hasUploads = uploads.files && uploads.files.length > 0;
+  const hasProcesses = Boolean(processes && processes.processes && processes.processes.length);
+  const hasSessions = Boolean(sessions && sessions.sessions && sessions.sessions.length);
+  const hasUploads = Boolean(uploads && uploads.files && uploads.files.length);
 
   return html`
     <div class="dash-scroll">
@@ -904,10 +1037,10 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
   useEffect(() => { dangerousModeRef.current = dangerousMode; }, [dangerousMode]);
   const [startError, setStartError] = useState(null);
   const [selectMode, setSelectMode] = useState(false);
+  const [restarting, setRestarting] = useState(false);
 
   const connectWs = useCallback((rId) => {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${location.host}/terminal/${chatId}/ws`, ['tty']);
+    const ws = new WebSocket(terminalWsUrl(chatId), ['tty']);
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
@@ -921,7 +1054,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
           const dangerous = dangerousModeRef.current;
           const flagSuffix = dangerous ? ' --dangerously-skip-permissions' : '';
           try {
-            const resp = await fetch(`/terminal/${chatId}/processes?_t=${Date.now()}`);
+            const resp = await ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`);
             const data = await resp.json();
             const hasClaudeRunning = data.processes && data.processes.length > 0;
             if (hasClaudeRunning) {
@@ -948,7 +1081,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
         (async () => {
           await new Promise(r => setTimeout(r, 1500));
           try {
-            const resp = await fetch(`/terminal/${chatId}/processes?_t=${Date.now()}`);
+            const resp = await ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`);
             const data = await resp.json();
             const hasClaudeRunning = data.processes && data.processes.length > 0;
             if (!hasClaudeRunning && ws.readyState === WebSocket.OPEN) {
@@ -996,7 +1129,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     let cancelled = false;
     (async () => {
       try {
-        const resp = await fetch(`/terminal/${chatId}/start-ttyd`, {
+        const resp = await ocuFetch(`/terminal/${chatId}/start-ttyd`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ dangerous_mode: dangerousModeRef.current }),
@@ -1005,7 +1138,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
           if (!cancelled) {
             // Check if container is stopped (can be restarted) or removed with meta (can be resurrected)
             try {
-              const statusResp = await fetch(`/terminal/${chatId}/status?_t=${Date.now()}`);
+              const statusResp = await ocuFetch(`/terminal/${chatId}/status?_t=${Date.now()}`);
               const statusData = await statusResp.json();
               if (statusData.container_stopped) {
                 setStartError('__stopped__');
@@ -1140,15 +1273,15 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     }
     // Kill claude processes
     try {
-      const resp = await fetch(`/terminal/${chatId}/processes?_t=${Date.now()}`);
+      const resp = await ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`);
       const data = await resp.json();
       for (const p of (data.processes || [])) {
-        await fetch(`/terminal/${chatId}/processes/${p.pid}/kill`, { method: 'POST' });
+        await ocuFetch(`/terminal/${chatId}/processes/${p.pid}/kill`, { method: 'POST' });
       }
     } catch(e) {}
     // Kill ttyd + tmux so next "Open terminal" starts fresh (with .bashrc → Claude Code autostart)
     try {
-      await fetch(`/terminal/${chatId}/stop-ttyd`, { method: 'POST' });
+      await ocuFetch(`/terminal/${chatId}/stop-ttyd`, { method: 'POST' });
     } catch(e) {}
     if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
     if (xtermRef.current) { xtermRef.current.dispose(); xtermRef.current = null; }
@@ -1159,30 +1292,17 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     const isStopped = startError === '__stopped__';
     const isMetaExists = startError === '__meta_exists__';
     const canRecover = isStopped || isMetaExists;
-    const [restarting, setRestarting] = useState(false);
 
     const handleRestart = async () => {
       setRestarting(true);
       try {
-        const endpoint = isMetaExists
-          ? `/terminal/${chatId}/resurrect-container`
-          : `/terminal/${chatId}/restart-container`;
-        const resp = await fetch(endpoint, { method: 'POST' });
-        if (resp.ok) {
+        const recovered = await recoverStoppedContainer(chatId, dangerousModeRef.current);
+        if (recovered.ok) {
           setStartError(null);
           setReady(false);
-          // Re-trigger Phase 1: start ttyd
-          const ttydResp = await fetch(`/terminal/${chatId}/start-ttyd`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ dangerous_mode: dangerousModeRef.current }),
-          });
-          if (ttydResp.ok) {
-            const data = await ttydResp.json();
-            await new Promise(r => setTimeout(r, isMetaExists ? 2500 : (data.already_running ? 500 : 1500)));
-            setReady(true);
-            return;
-          }
+          await new Promise(r => setTimeout(r, isMetaExists ? 2500 : (recovered.already_running ? 500 : 1500)));
+          setReady(true);
+          return;
         }
         setStartError(t('restore_fail'));
       } catch { setStartError(t('restore_fail')); }
@@ -1290,19 +1410,13 @@ function renderCost(costUsd) {
   return `$${n.toFixed(4)}`;
 }
 
-// Phase 9.5 — small badge showing which sub-agent CLI the orchestrator
-// resolved at boot. Sourced from /api/runtime/cli (additive endpoint
-// added in app.py). When the endpoint 404s (older orchestrator) or the
-// fetch fails for any reason, the badge silently disappears — pure
-// progressive enhancement, no breakage of the existing layout.
 function ActiveCliBadge() {
   const [info, setInfo] = useState(null);
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/runtime/cli', { cache: 'no-store' })
-      .then(r => r.ok ? r.json() : null)
-      .then(data => { if (!cancelled && data) setInfo(data); })
-      .catch(() => {}); // older orchestrator without the endpoint — stay silent
+    loadCliBadge(DESCRIBE_URL).then((data) => {
+      if (!cancelled && data) setInfo(data);
+    });
     return () => { cancelled = true; };
   }, []);
   if (!info || !info.cli) return null;
@@ -1328,75 +1442,72 @@ function App() {
   const [browserActive, setBrowserActive] = useState(false);
   const [terminalActive, setTerminalActive] = useState(false);
   const [seenFiles, setSeenFiles] = useState(new Set());
-  const fileModTimesRef = useRef(new Map());
+  const [listingError, setListingError] = useState(null);
+  const [hasMore, setHasMore] = useState(false);
+  const pageCountRef = useRef(1);
+  const listingGenerationRef = useRef(0);
+  const fileRevisionsRef = useRef(new Map());
+  const explicitOfficeRef = useRef(false);
   const browserViewerRef = useRef(null);
   const lastSyncTimeRef = useRef(null);
   const syncDotRef = useRef(null);
 
-  // Fetch files
+  const applyLoadedFiles = useCallback((newFiles) => {
+    const autoSelectTarget = pickAutoSelect(newFiles, fileRevisionsRef.current);
+    const revisions = fileRevisionsRef.current;
+    revisions.clear();
+    for (const f of newFiles) revisions.set(f.path, f.revision);
+    setFiles(newFiles);
+    setSelectedFile((prev) => applyListingSelection(newFiles, prev, autoSelectTarget, explicitOfficeRef.current));
+    setSeenFiles((prev) => {
+      const next = new Set(prev);
+      newFiles.forEach((f) => next.add(f.path));
+      return next;
+    });
+  }, []);
+
   const fetchFiles = useCallback(async () => {
     const dot = syncDotRef.current;
     if (dot) { dot.classList.add('syncing'); dot.title = t('checking'); }
-    try {
-      const resp = await fetch(`${API_URL}?_t=${Date.now()}`, { cache: 'no-store' });
-      const data = await resp.json();
-      const newFiles = data.files;
-
-      let autoSelectTarget = null;
-      const modTimes = fileModTimesRef.current;
-      for (const f of newFiles) {
-        const prevMod = modTimes.get(f.path);
-        const isRoot = !f.path.includes('/');
-        if (prevMod === undefined && isRoot) { autoSelectTarget = f; break; }
-        else if (f.modified && f.modified !== prevMod && isRoot) { autoSelectTarget = f; break; }
-      }
-
-      modTimes.clear();
-      for (const f of newFiles) { modTimes.set(f.path, f.modified || null); }
-
-      setFiles(newFiles);
-
-      if (autoSelectTarget) {
-        setSelectedFile(autoSelectTarget);
-      } else if (newFiles.length > 0) {
-        setSelectedFile(prev => {
-          if (!prev) return newFiles.find(f => !f.path.includes('/')) || newFiles[0];
-          const updated = newFiles.find(f => f.path === prev.path);
-          // Return SAME reference if path+modified unchanged — prevents re-render and scroll reset
-          return updated && updated.path === prev.path && updated.modified === prev.modified ? prev : (updated || prev);
-        });
-      }
-
-      setSeenFiles(prev => {
-        const next = new Set(prev);
-        newFiles.forEach(f => next.add(f.path));
-        return next;
-      });
-
-      if (dot) { dot.classList.remove('syncing'); dot.title = t('synced'); }
-      lastSyncTimeRef.current = Date.now();
-    } catch (err) {
+    const generation = ++listingGenerationRef.current;
+    const loaded = await loadOutputsWindow({
+      apiUrl: API_URL,
+      pageCount: pageCountRef.current,
+      generation,
+      currentGeneration: () => listingGenerationRef.current,
+    });
+    if (loaded.stale || generation !== listingGenerationRef.current) return loaded;
+    if (loaded.error) {
+      setListingError(t('listing_error'));
       if (dot) { dot.classList.remove('syncing'); dot.title = t('error'); }
-      console.error('Poll error:', err);
+      return loaded;
     }
-  }, []);
+    setListingError(null);
+    applyLoadedFiles(loaded.files);
+    setHasMore(Boolean(loaded.next_cursor));
+    if (dot) { dot.classList.remove('syncing'); dot.title = t('synced'); }
+    lastSyncTimeRef.current = Date.now();
+    return loaded;
+  }, [applyLoadedFiles]);
 
-  // Check browser status
+  const loadMore = useCallback(async () => {
+    pageCountRef.current += 1;
+    await fetchFiles();
+  }, [fetchFiles]);
+
   const checkBrowserStatus = useCallback(async () => {
     try {
-      const resp = await fetch(`/browser/${CHAT_ID}/status?_t=${Date.now()}`, { cache: 'no-store' });
+      const resp = await ocuFetch(`/browser/${CHAT_ID}/status?_t=${Date.now()}`, { cache: 'no-store' });
       const data = await resp.json();
       setBrowserActive(prev => {
         if (data.active && !prev) {
-          // Auto-switch to browser when first active
           setCurrentView('browser');
         }
         if (!data.active && prev && browserViewerRef.current?.connected) {
-          return true; // Transient blip, keep active
+          return true;
         }
         return data.active;
       });
-      // Update URL bar
       if (data.active && data.pages && data.pages.length > 0) {
         const urlBar = document.getElementById('browserUrlBar');
         if (urlBar) urlBar.textContent = data.pages[0].url || '';
@@ -1404,10 +1515,9 @@ function App() {
     } catch (e) {}
   }, []);
 
-  // Check terminal status
   const checkTerminalStatus = useCallback(async () => {
     try {
-      const resp = await fetch(`/terminal/${CHAT_ID}/processes?_t=${Date.now()}`, { cache: 'no-store' });
+      const resp = await ocuFetch(`/terminal/${CHAT_ID}/processes?_t=${Date.now()}`, { cache: 'no-store' });
       const data = await resp.json();
       setTerminalActive(data.processes && data.processes.length > 0);
     } catch(e) {}
@@ -1440,19 +1550,22 @@ function App() {
     };
   }, [fetchFiles, checkBrowserStatus, checkTerminalStatus]);
 
-  // Listen for iframe link clicks
+  useEffect(() => startWorkspaceHeartbeat(CHAT_ID), []);
+
+  const onSelectFile = useCallback((file) => {
+    explicitOfficeRef.current = Boolean(file);
+    setSelectedFile(file);
+  }, []);
+
   useEffect(() => {
     const handler = (event) => {
-      if (!event.data || event.data.type !== 'iframe-link-click') return;
-      handleLinkClick(event.data.href, event.data.resolvedUrl, files, selectedFile, setSelectedFile);
+      const data = event && event.data;
+      if (!data || data.type !== 'iframe-link-click') return;
+      handleLinkClick(data.href, data.resolvedUrl, files, selectedFile, onSelectFile);
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
-  }, [files, selectedFile]);
-
-  const onSelectFile = useCallback((file) => {
-    setSelectedFile(file);
-  }, []);
+  }, [files, selectedFile, onSelectFile]);
 
   return html`
     <div class="toolbar">
@@ -1471,6 +1584,10 @@ function App() {
             onSelect=${onSelectFile}
           />
         `}
+        ${currentView === 'files' && hasMore && html`
+          <button class="btn" type="button" onClick=${loadMore}>${t('more_files')}</button>
+        `}
+        ${listingError && html`<span class="listing-error">${listingError}</span>`}
       </div>
       <div class="toolbar-right">
         <${ActiveCliBadge} />

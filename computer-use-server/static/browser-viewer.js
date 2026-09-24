@@ -3,7 +3,8 @@
 // BrowserViewer — CDP screencast + interactive input proxy
 // Extracted from inline app.py preview SPA
 
-import { t } from '/static/locale.js';
+import { t } from './locale.js';
+import { ocuFetch } from './ocu-request.js';
 
 const _browserBasePath = new URL('..', import.meta.url).pathname;
 
@@ -85,7 +86,7 @@ export class BrowserViewer {
   connect() {
     return new Promise(async (resolve) => {
       try {
-        const resp = await fetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
+        const resp = await ocuFetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
         const pages = await resp.json();
         const page = pages.find(p => p.type === 'page');
         if (!page) { resolve(false); return; }
@@ -176,7 +177,7 @@ export class BrowserViewer {
   async _checkTabSwitch() {
     if (!this.connected) return;
     try {
-      const resp = await fetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
+      const resp = await ocuFetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
       const pages = await resp.json();
       const realPages = pages.filter(p => p.type === 'page' && !p.url.startsWith('chrome://'));
       if (realPages.length === 0) return;

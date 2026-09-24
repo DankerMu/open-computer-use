@@ -770,23 +770,25 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
         )
     else:
         mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        headers = None
-        if mime_type in {
+        isolated = mime_type in {
             "text/html",
             "image/svg+xml",
             "application/xhtml+xml",
             "text/xml",
             "application/xml",
-        }:
+        }
+        headers = None
+        if isolated:
             headers = {
                 "Content-Security-Policy": "sandbox allow-scripts allow-forms",
                 "X-Content-Type-Options": "nosniff",
             }
         return FileResponse(
             path=file_path,
-            filename=file_path.name,
+            filename=file_path.name if isolated else None,
+            content_disposition_type="inline",
             media_type=mime_type,
-            headers=headers
+            headers=headers,
         )
 
 
@@ -1321,8 +1323,6 @@ window.__CONFIG__ = {{
   chatId: {json.dumps(chat_id)},
   describeUrl: {json.dumps(describe_url)}
 }};
-// Heartbeat: keep container alive while page is open (every 2 min)
-setInterval(function() {{ fetch('{OCU_PUBLIC_PREFIX}/terminal/' + {json.dumps(chat_id)} + '/heartbeat').catch(function(){{}}); }}, 120000);
 </script>
 <script type="module" src="{asset}/preview.js"></script>
 </body>

@@ -104,8 +104,13 @@ class FakeWebSocket {
 }
 
 const context = vm.createContext({
-  fetch: async (url) => {
-    fetches.push(String(url));
+  Headers,
+  fetch: async (url, init = {}) => {
+    const headers = {};
+    new Headers(init.headers || {}).forEach((value, key) => {
+      headers[key.toLowerCase()] = value;
+    });
+    fetches.push({ url: String(url), headers });
     const pages = fetches.length === 1
       ? [{ type: 'page', id: firstPageId, url: 'https://example.test' }]
       : [
@@ -135,15 +140,21 @@ const context = vm.createContext({
   queueMicrotask,
 });
 
-const linker = async (specifier) => {
-  const stub = new vm.SyntheticModule(['t'], function () {
-    this.setExport('t', (key) => key);
-  }, { context, identifier: specifier });
-  await stub.link(async () => {
-    throw new Error(`unexpected stub import ${specifier}`);
+const linker = async (specifier, referencingModule) => {
+  const resolved = new URL(specifier, referencingModule.identifier);
+  const filename = resolved.pathname.split('/').pop();
+  const directory = sourcePath.slice(0, sourcePath.lastIndexOf('/') + 1);
+  const fileSource = fs.readFileSync(directory + filename, 'utf8');
+  const child = new vm.SourceTextModule(fileSource, {
+    context,
+    identifier: resolved.href,
+    initializeImportMeta(meta) {
+      meta.url = resolved.href;
+    },
   });
-  await stub.evaluate();
-  return stub;
+  await child.link(linker);
+  await child.evaluate();
+  return child;
 };
 
 const module = new vm.SourceTextModule(source, {
@@ -250,7 +261,7 @@ def test_empty_prefix_keeps_baseline_shell_urls_and_adds_unprefixed_describe_url
     assert _field(html, "filesBase") == f"/files/{CHAT}"
     assert _field(html, "chatId") == CHAT
     assert _field(html, "describeUrl") == f"/api/v1/ocu/workspaces/{CHAT}"
-    assert "fetch('/terminal/' + " + json.dumps(CHAT) + " + '/heartbeat')" in html
+    assert "setInterval(function() { fetch(" not in html
     assert static.status_code == 200
     assert "text/css" in static.headers["content-type"]
     assert "Preview SPA" in static.text
@@ -276,7 +287,7 @@ def test_ocu_prefix_shell_urls_static_mount_auth_and_no_secret():
     assert _field(html, "apiUrl") == f"/ocu/api/outputs/{CHAT}"
     assert _field(html, "filesBase") == f"/ocu/files/{CHAT}"
     assert _field(html, "describeUrl") == f"/api/v1/ocu/workspaces/{CHAT}"
-    assert "fetch('/ocu/terminal/' + " + json.dumps(CHAT) + " + '/heartbeat')" in html
+    assert "setInterval(function() { fetch(" not in html
     assert prefixed.status_code == 200
     assert "text/css" in prefixed.headers["content-type"]
     assert "Preview SPA" in prefixed.text
@@ -298,7 +309,7 @@ def test_nested_prefix_shell_urls_and_static_mount(prefix):
     assert _field(html, "apiUrl") == f"{prefix}/api/outputs/{CHAT}"
     assert _field(html, "filesBase") == f"{prefix}/files/{CHAT}"
     assert _field(html, "describeUrl") == f"/api/v1/ocu/workspaces/{CHAT}"
-    assert f"fetch('{prefix}/terminal/' + " + json.dumps(CHAT) + " + '/heartbeat')" in html
+    assert "setInterval(function() { fetch(" not in html
     assert prefixed.status_code == 200
     assert "text/css" in prefixed.headers["content-type"]
     assert unprefixed.status_code == 404
@@ -453,6 +464,447 @@ def test_browser_viewer_addresses_follow_module_url_and_protocol(tmp_path):
         )
         assert completed.returncode == 0, completed.stderr
         recorded = json.loads(completed.stdout)
-        fetch_paths = [urlsplit(url).path for url in recorded["fetches"]]
+        fetch_paths = [urlsplit(row["url"]).path for row in recorded["fetches"]]
         assert fetch_paths == [json_path, json_path], recorded
         assert recorded["sockets"] == [connect_ws, reconnect_ws], recorded
+        for row in recorded["fetches"]:
+            assert row["headers"].get("x-requested-with") == "ocu-workspace", recorded
+
+
+_JS_CASES = r"""
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const [sourceDir, moduleUrl, scenario] = process.argv.slice(2);
+const context = vm.createContext({
+  Headers,
+  URL,
+  Date,
+  JSON,
+  Promise,
+  console,
+  setTimeout(fn, ms) { if (!ms) fn(); return 0; },
+  setInterval(fn) { context.__interval = fn; return 7; },
+  clearInterval(id) { context.__cleared = id; },
+  location: { protocol: 'https:', host: 'webui.example' },
+  fetch: async (url, init = {}) => {
+    const headers = {};
+    new Headers(init.headers || {}).forEach((value, key) => { headers[key.toLowerCase()] = value; });
+    context.__calls.push({ url: String(url), method: init.method || 'GET', headers, cache: init.cache || null, body: init.body || null });
+    const handler = context.__respond;
+    return handler(url, init, context.__calls.length);
+  },
+  __calls: [],
+  __interval: null,
+  __cleared: null,
+  __respond: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+});
+
+const linker = async (specifier, referencingModule) => {
+  const resolved = new URL(specifier, referencingModule.identifier);
+  const filename = resolved.pathname.split('/').pop();
+  const fileSource = fs.readFileSync(sourceDir + filename, 'utf8');
+  const child = new vm.SourceTextModule(fileSource, {
+    context,
+    identifier: resolved.href,
+    initializeImportMeta(meta) { meta.url = resolved.href; },
+  });
+  await child.link(linker);
+  await child.evaluate();
+  return child;
+};
+
+const module = new vm.SourceTextModule(
+  "export * from './ocu-request.js';",
+  { context, identifier: moduleUrl, initializeImportMeta(meta) { meta.url = moduleUrl; } },
+);
+await module.link(linker);
+await module.evaluate();
+const api = module.namespace;
+
+async function run() {
+  if (scenario === 'wrapper') {
+    await api.ocuFetch('/terminal/x/heartbeat', { headers: { Accept: 'application/json' }, header: { 'X-Extra': '1' } });
+    await api.ocuFetch('/ocu/files/c/a.html', { serverUrl: true, cache: 'no-store' });
+    await api.ocuFetch('/oculus/keep', {});
+    await api.ocuFetch('relative.json', {});
+    await api.ocuFetch('https://example.test/abs', {});
+    await api.ocuFetch('//cdn.example/x', {});
+    return { calls: context.__calls, ws: api.terminalWsUrl('chat-1') };
+  }
+  if (scenario === 'heartbeat') {
+    const stop = api.startWorkspaceHeartbeat('chat-1', context);
+    await context.__interval();
+    stop();
+    return { calls: context.__calls, cleared: context.__cleared };
+  }
+  if (scenario === 'badge') {
+    context.__respond = async (url) => {
+      if (String(url).includes('runtime/cli')) throw new Error('runtime-cli');
+      return { ok: true, status: 200, json: async () => ({ cli_badge: { cli: 'claude', supports_cost: true } }) };
+    };
+    const ok = await api.loadCliBadge('/api/v1/ocu/workspaces/chat-1');
+    context.__respond = async () => ({ ok: false, status: 500, json: async () => ({}) });
+    const hidden = await api.loadCliBadge('/api/v1/ocu/workspaces/chat-1');
+    return { ok, hidden, calls: context.__calls };
+  }
+  if (scenario === 'recover') {
+    context.__respond = async (url) => {
+      if (String(url).includes('resurrect')) throw new Error('resurrect');
+      if (String(url).includes('restart-container')) return { ok: true, status: 200, json: async () => ({ state: 'running' }) };
+      if (String(url).includes('start-ttyd')) return { ok: true, status: 200, json: async () => ({ already_running: false }) };
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    const ok = await api.recoverStoppedContainer('chat-1', false);
+    context.__respond = async (url) => {
+      if (String(url).includes('restart-container')) return { ok: false, status: 409, json: async () => ({}) };
+      throw new Error('start after failed launch');
+    };
+    const failed = await api.recoverStoppedContainer('chat-1', false);
+    return { ok, failed, calls: context.__calls };
+  }
+  if (scenario === 'listing') {
+    const pages = {
+      1: { files: [{ file_id: 'a', path: 'a.txt', revision: 7, type: 'text' }], revision: 7, next_cursor: '7:100', total: 101 },
+      2: { files: [{ file_id: 'z', path: 'z.txt', revision: 7, type: 'text' }], revision: 7, next_cursor: null, total: 101 },
+    };
+    context.__respond = async (url) => {
+      const parsed = new URL(url, 'https://webui.example');
+      const cursor = parsed.searchParams.get('cursor');
+      const body = cursor ? pages[2] : pages[1];
+      return { ok: true, status: 200, json: async () => body };
+    };
+    const loaded = await api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat',
+      pageCount: 2,
+      generation: 2,
+      currentGeneration: () => 2,
+    });
+    const late = await api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat',
+      pageCount: 1,
+      generation: 1,
+      currentGeneration: () => 2,
+    });
+    const previous = { file_id: 'keep', path: 'old.docx', revision: 3, type: 'docx' };
+    const renamed = [{ file_id: 'keep', path: 'new.docx', revision: 4, type: 'docx' }];
+    const selected = api.applyListingSelection(renamed, previous, { path: 'noise.txt', revision: 9 }, true);
+    const deleted = api.applyListingSelection([{ file_id: 'other', path: 'other.txt', revision: 1 }], previous, null, false);
+    const same = api.applyListingSelection(
+      [{ file_id: 'keep', path: 'same.txt', revision: 3, modified: 99 }],
+      { file_id: 'keep', path: 'same.txt', revision: 3, modified: 1 },
+      null,
+      false,
+    );
+    const autoPrior = { file_id: 'a', path: 'a.txt', revision: 1, type: 'text' };
+    const autoFiles = [
+      { file_id: 'a', path: 'a.txt', revision: 1, type: 'text' },
+      { file_id: 'b', path: 'b.txt', revision: 2, type: 'text' },
+    ];
+    const auto = api.applyListingSelection(autoFiles, autoPrior, autoFiles[1], false);
+    const explicitOffice = api.applyListingSelection(
+      [
+        { file_id: 'office', path: 'report.docx', revision: 1, type: 'docx' },
+        { file_id: 'noise', path: 'note.txt', revision: 9, type: 'text' },
+      ],
+      { file_id: 'office', path: 'report.docx', revision: 1, type: 'docx' },
+      { file_id: 'noise', path: 'note.txt', revision: 9, type: 'text' },
+      true,
+    );
+    return { loaded, late, selected, deleted, same, auto, explicitOffice, key: api.renderKey({ path: 'a.txt', revision: 7 }) };
+  }
+  if (scenario === 'stale-cursor') {
+    let hits = 0;
+    context.__respond = async (url) => {
+      hits += 1;
+      const parsed = new URL(url, 'https://webui.example');
+      if (parsed.searchParams.get('cursor')) return { ok: false, status: 409, json: async () => ({}) };
+      if (hits === 1) return { ok: true, status: 200, json: async () => ({ files: [{ path: 'a.txt', revision: 1 }], revision: 1, next_cursor: '1:100', total: 101 }) };
+      return { ok: true, status: 200, json: async () => ({ files: [{ path: 'b.txt', revision: 2 }], revision: 2, next_cursor: null, total: 1 }) };
+    };
+    const loaded = await api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat',
+      pageCount: 2,
+      generation: 1,
+      currentGeneration: () => 1,
+    });
+    return { loaded, hits };
+  }
+  if (scenario === 'listing-body-error') {
+    let hits = 0;
+    context.__respond = async (url) => {
+      hits += 1;
+      const parsed = new URL(url, 'https://webui.example');
+      if (!parsed.searchParams.get('cursor')) {
+        return { ok: true, status: 200, json: async () => ({ files: [{ path: 'a.txt', revision: 1 }], revision: 1, next_cursor: '1:100', total: 101 }) };
+      }
+      return { ok: true, status: 200, json: async () => { throw new Error('truncated'); } };
+    };
+    const loaded = await api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat',
+      pageCount: 2,
+      generation: 1,
+      currentGeneration: () => 1,
+    });
+    return { loaded, hits };
+  }
+  if (scenario === 'pptx-observer') {
+    let disconnected = 0;
+    const live = { isConnected: true, _pptxResizeObserver: null };
+    const dead = { isConnected: false, _pptxResizeObserver: null };
+    const liveObserver = { disconnect() { disconnected += 1; } };
+    const deadObserver = { disconnect() { disconnected += 1; } };
+    const attachedLive = api.attachPreviewObserver(live, liveObserver);
+    const attachedDead = api.attachPreviewObserver(dead, deadObserver);
+    const first = api.disconnectPreviewObserver(live);
+    const second = api.disconnectPreviewObserver(live);
+    const missing = api.disconnectPreviewObserver(null);
+    return {
+      attachedLive, attachedDead, first, second, missing, disconnected,
+      leftoverLive: live._pptxResizeObserver, leftoverDead: dead._pptxResizeObserver,
+    };
+  }
+  throw new Error('unknown scenario');
+}
+
+process.stdout.write(JSON.stringify(await run()));
+"""
+
+
+def _run_js_scenario(tmp_path, scenario, module_url="https://webui.example/ocu/static/ocu-request.js"):
+    if not NODE:
+        pytest.fail("node is required for SPA request tests; install Node 22 or set OCU_TEST_NODE")
+    harness = tmp_path / "ocu_request_harness.mjs"
+    harness.write_text(_JS_CASES)
+    completed = subprocess.run(
+        [
+            NODE,
+            "--experimental-vm-modules",
+            str(harness),
+            str(SERVER_DIR / "static") + "/",
+            module_url,
+            scenario,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_static_js_has_no_root_absolute_static_literal():
+    for path in (SERVER_DIR / "static").rglob("*.js"):
+        text = path.read_text(encoding="utf-8")
+        assert "/static/" not in text, path
+
+
+def test_wrapper_prefixes_client_paths_once_and_keeps_server_urls(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "wrapper")
+    calls = recorded["calls"]
+    assert calls[0]["url"] == "/ocu/terminal/x/heartbeat"
+    assert calls[0]["headers"]["x-requested-with"] == "ocu-workspace"
+    assert calls[0]["headers"]["accept"] == "application/json"
+    assert calls[0]["headers"]["x-extra"] == "1"
+    assert calls[1]["url"] == "/ocu/files/c/a.html"
+    assert "/ocu/ocu/" not in calls[1]["url"]
+    assert calls[2]["url"] == "/ocu/oculus/keep"
+    assert calls[3]["url"] == "relative.json"
+    assert calls[4]["url"] == "https://example.test/abs"
+    assert calls[5]["url"] == "//cdn.example/x"
+    assert recorded["ws"] == "wss://webui.example/ocu/terminal/chat-1/ws"
+
+
+def test_heartbeat_uses_wrapper_and_cleans_up(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "heartbeat")
+    assert recorded["calls"][0]["url"] == "/ocu/terminal/chat-1/heartbeat"
+    assert recorded["calls"][0]["headers"]["x-requested-with"] == "ocu-workspace"
+    assert recorded["cleared"] == 7
+
+
+def test_badge_uses_describe_url_and_hides_on_failure(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "badge")
+    assert recorded["ok"]["cli"] == "claude"
+    assert recorded["hidden"] is None
+    assert recorded["calls"][0]["url"] == "/api/v1/ocu/workspaces/chat-1"
+    assert not any("runtime/cli" in row["url"] for row in recorded["calls"])
+
+
+def test_both_stopped_branches_use_restart_alias_and_skip_ttyd_on_failure(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "recover")
+    urls = [row["url"] for row in recorded["calls"]]
+    assert urls.count("/ocu/terminal/chat-1/restart-container") == 2
+    assert "/ocu/terminal/chat-1/resurrect-container" not in urls
+    assert recorded["ok"]["ok"] is True
+    assert recorded["failed"]["ok"] is False
+    assert urls.count("/ocu/terminal/chat-1/start-ttyd") == 1
+
+
+def test_listing_keeps_later_pages_and_rejects_stale_generation(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "listing")
+    assert [row["path"] for row in recorded["loaded"]["files"]] == ["a.txt", "z.txt"]
+    assert recorded["late"]["stale"] is True
+    assert recorded["selected"]["path"] == "new.docx"
+    assert recorded["deleted"]["path"] == "other.txt"
+    assert recorded["same"]["modified"] == 1
+    assert recorded["auto"]["path"] == "b.txt"
+    assert recorded["explicitOffice"]["path"] == "report.docx"
+    assert recorded["key"] == "a.txt\x007"
+
+
+def test_listing_body_parse_failure_does_not_commit_partial_page(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "listing-body-error")
+    assert recorded["loaded"]["error"] == "body"
+    assert recorded["loaded"]["files"] is None
+    assert recorded["hits"] == 2
+
+def test_stale_cursor_restarts_once(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "stale-cursor")
+    assert recorded["loaded"]["files"][0]["path"] == "b.txt"
+    assert recorded["hits"] == 3
+
+
+def test_pptx_observer_disconnects_once_and_clears_handle(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "pptx-observer")
+    assert recorded["attachedLive"] is True
+    assert recorded["attachedDead"] is False
+    assert recorded["first"] is True
+    assert recorded["second"] is False
+    assert recorded["missing"] is False
+    assert recorded["disconnected"] == 2
+    assert recorded["leftoverLive"] is None
+    assert recorded["leftoverDead"] is None
+
+
+_XLSX_HARNESS = r"""
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const [xlsxPath, requestPath, workbookPath, moduleUrl] = process.argv.slice(2);
+const bytes = fs.readFileSync(workbookPath);
+const context = vm.createContext({
+  console,
+  Uint8Array,
+  ArrayBuffer,
+  DataView,
+  Buffer,
+  process,
+  setTimeout,
+  clearTimeout,
+});
+vm.runInContext(fs.readFileSync(xlsxPath, 'utf8'), context, { filename: xlsxPath });
+const linker = async (specifier, referencingModule) => {
+  const resolved = new URL(specifier, referencingModule.identifier);
+  const child = new vm.SourceTextModule(fs.readFileSync(requestPath, 'utf8'), {
+    context,
+    identifier: resolved.href,
+    initializeImportMeta(meta) { meta.url = resolved.href; },
+  });
+  await child.link(async () => { throw new Error('unexpected import'); });
+  await child.evaluate();
+  return child;
+};
+const module = new vm.SourceTextModule(
+  "export * from './ocu-request.js';",
+  { context, identifier: moduleUrl, initializeImportMeta(meta) { meta.url = moduleUrl; } },
+);
+await module.link(linker);
+await module.evaluate();
+const workbook = context.XLSX.read(bytes, { type: 'buffer', cellFormula: true, sheetStubs: true, raw: false });
+const sheet = workbook.Sheets[workbook.SheetNames[0]];
+const api = module.namespace;
+process.stdout.write(JSON.stringify({
+  names: workbook.SheetNames,
+  keys: Object.keys(sheet),
+  a1: sheet.A1 || null,
+  a2: sheet.A2 || null,
+  a3: sheet.A3 || null,
+  a4: sheet.A4 || null,
+  a1d: { f: sheet.A1 && sheet.A1.f, v: sheet.A1 && sheet.A1.v, cached: api.formulaHasCachedValue(sheet.A1), display: api.formulaCellDisplay(sheet.A1) },
+  a2d: { f: sheet.A2 && sheet.A2.f, v: sheet.A2 && sheet.A2.v, cached: api.formulaHasCachedValue(sheet.A2), display: api.formulaCellDisplay(sheet.A2) },
+  a3d: { f: sheet.A3 && sheet.A3.f, v: sheet.A3 && sheet.A3.v, cached: api.formulaHasCachedValue(sheet.A3), display: api.formulaCellDisplay(sheet.A3) },
+  a4d: { f: sheet.A4 && sheet.A4.f, v: sheet.A4 && sheet.A4.v, cached: api.formulaHasCachedValue(sheet.A4), display: api.formulaCellDisplay(sheet.A4) },
+}));
+"""
+
+
+def _xlsx_bytes():
+    import zipfile
+    from io import BytesIO
+
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sheet = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="{ns}">
+  <sheetData>
+    <row r="1"><c r="A1" t="n"><f>1+1</f><v>0</v></c></row>
+    <row r="2"><c r="A2" t="b"><f>FALSE()</f><v>0</v></c></row>
+    <row r="3"><c r="A3"><f>A1+A2</f></c></row>
+    <row r="4"><c r="A4" t="n"><v>9</v></c></row>
+  </sheetData>
+</worksheet>'''
+    workbook = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Cached" sheetId="1" r:id="rId1"/><sheet name="Formulas" sheetId="2" r:id="rId2"/></sheets>
+</workbook>'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+</Relationships>'''
+    content = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>'''
+    root_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>'''
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml", content)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", rels)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+        zf.writestr("xl/worksheets/sheet2.xml", sheet.replace("Cached", "Formulas"))
+    return buf.getvalue()
+
+
+def test_xlsx_formula_cache_distinguishes_zero_false_and_absent(tmp_path):
+    if not NODE:
+        pytest.fail("node is required for SheetJS formula tests; install Node 22 or set OCU_TEST_NODE")
+    workbook = tmp_path / "formulas.xlsx"
+    workbook.write_bytes(_xlsx_bytes())
+    harness = tmp_path / "xlsx_harness.mjs"
+    harness.write_text(_XLSX_HARNESS)
+    completed = subprocess.run(
+        [
+            NODE,
+            "--experimental-vm-modules",
+            str(harness),
+            str(SERVER_DIR / "static" / "xlsx.full.min.js"),
+            str(SERVER_DIR / "static" / "ocu-request.js"),
+            str(workbook),
+            "https://webui.example/ocu/static/ocu-request.js",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    recorded = json.loads(completed.stdout)
+    assert "A3" in recorded["keys"]
+    assert recorded["a1d"]["cached"] is True
+    assert recorded["a1d"]["display"] == "0"
+    assert recorded["a2d"]["cached"] is True
+    assert recorded["a2d"]["display"] == "FALSE"
+    assert recorded["a3d"]["cached"] is False
+    assert recorded["a3d"]["display"] == "uncomputed"
+    assert recorded["a4d"]["cached"] is True
+    assert recorded["a4d"]["display"] == "9"
+
+

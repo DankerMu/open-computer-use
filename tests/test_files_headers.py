@@ -99,6 +99,7 @@ def _assert_target_response(response, mime_type, contents, download):
         return
 
     assert response.headers["content-type"].split(";", 1)[0] == mime_type
+    assert response.headers["content-disposition"].startswith("inline;")
     _assert_mirror_headers(response)
 
 
@@ -207,3 +208,36 @@ def test_file_errors_remain_unheadered(client, output_dir):
     _assert_headers_absent(missing)
     assert denied.status_code == 401
     _assert_headers_absent(denied)
+
+def test_inline_html_uses_rfc5987_filename_encoding(client, output_dir):
+    chinese = "简报.html"
+    quoted = 'quote"name.html'
+    (output_dir / chinese).write_bytes(b"<p>chinese</p>")
+    (output_dir / quoted).write_bytes(b"<p>quoted</p>")
+
+    chinese_resp = client.get(_file_url(chinese), headers=_auth_headers())
+    quoted_resp = client.get(_file_url(quoted), headers=_auth_headers())
+
+    assert chinese_resp.status_code == 200
+    assert quoted_resp.status_code == 200
+    assert chinese_resp.content == b"<p>chinese</p>"
+    assert quoted_resp.content == b"<p>quoted</p>"
+    _assert_mirror_headers(chinese_resp)
+    _assert_mirror_headers(quoted_resp)
+    chinese_disp = chinese_resp.headers["content-disposition"]
+    quoted_disp = quoted_resp.headers["content-disposition"]
+    assert chinese_disp.startswith("inline;")
+    assert quoted_disp.startswith("inline;")
+    assert "filename*=utf-8''" in chinese_disp
+    assert "%E7%AE%80%E6%8A%A5.html" in chinese_disp
+    assert '"' not in chinese_disp.split("filename*=", 1)[0] or "filename*=utf-8''" in chinese_disp
+    assert "filename*=utf-8''" in quoted_disp
+    assert "%22" in quoted_disp
+    assert chinese_resp.headers["content-type"].startswith("text/html")
+    encoded = client.get(
+        "/files/%s/%s" % (CHAT, "%E7%AE%80%E6%8A%A5.html"),
+        headers=_auth_headers(),
+    )
+    assert encoded.status_code == 200
+    assert encoded.content == b"<p>chinese</p>"
+    _assert_mirror_headers(encoded)
