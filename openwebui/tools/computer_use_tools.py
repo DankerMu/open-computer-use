@@ -637,6 +637,17 @@ class Tools:
         except Exception:
             pass
 
+    async def _emit_workspace_hint(self, emitter, chat_id: str) -> None:
+        if not emitter:
+            return
+        try:
+            await emitter({
+                "type": "ocu:workspace_changed",
+                "data": {"chat_id": chat_id, "reason": "tool_completed"},
+            })
+        except Exception:
+            pass
+
     async def _prepare_tool_call(
         self, metadata: Optional[dict], emitter
     ) -> tuple[Optional[str], Optional[str]]:
@@ -739,18 +750,23 @@ class Tools:
                 pass
 
         await emit(in_progress_desc, "in_progress", False)
+        invoked = False
         try:
             headers = self._build_mcp_headers(chat_id, __user__, request=request)
-            result = await self.mcp_client.call_tool(
+            client = self.mcp_client
+            invoked = True
+            result = await client.call_tool(
                 tool_name, args, headers=headers, timeout=timeout,
                 event_emitter=emitter,
             )
             is_err = _looks_like_error(result)
             await emit(err_desc if is_err else ok_desc, "error" if is_err else "complete", True)
-            return result
         except Exception as e:
             await emit("Execution error", "error", True)
-            return f"[Error] {tool_name} wrapper crashed: {type(e).__name__}: {e}"
+            result = f"[Error] {tool_name} wrapper crashed: {type(e).__name__}: {e}"
+        if invoked:
+            await self._emit_workspace_hint(emitter, chat_id)
+        return result
 
     # =========================================================================
     # Tool methods — delegate to computer-use-orchestrator via MCP Streamable HTTP

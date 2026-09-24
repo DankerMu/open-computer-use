@@ -69,6 +69,53 @@ async def _collect(events, event):
     events.append(event)
 
 
+def _workspace_hints(events):
+    return [event for event in events if event.get("type") == "ocu:workspace_changed"]
+
+
+def _status_events(events):
+    return [event for event in events if event.get("type") == "status"]
+
+
+def _hint(chat_id):
+    return {
+        "type": "ocu:workspace_changed",
+        "data": {"chat_id": chat_id, "reason": "tool_completed"},
+    }
+
+
+class _RecordingEmitter:
+    def __init__(self, fail_hint=False):
+        self.events = []
+        self.fail_hint = fail_hint
+        self.hint_attempts = 0
+
+    async def __call__(self, event):
+        if event.get("type") == "ocu:workspace_changed":
+            self.hint_attempts += 1
+            if self.fail_hint:
+                raise RuntimeError("hint emitter failed")
+        self.events.append(event)
+
+
+def _stub_call_tool(monkeypatch, behavior, emitter=None):
+    async def call_tool(self, *args, **kwargs):
+        if emitter is not None:
+            emitter.events.append({"type": "client_completed"})
+        if isinstance(behavior, BaseException):
+            raise behavior
+        return behavior
+
+    monkeypatch.setattr(computer_use_tools._MCPClient, "call_tool", call_tool)
+
+
+def _tools_with_token(monkeypatch):
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    tools = computer_use_tools.Tools()
+    tools.valves.MCP_API_KEY = MCP_API_KEY
+    return tools
+
+
 def _call_with_empty_chat(tools, method, metadata, emitter):
     kwargs = {
         "__event_emitter__": emitter,
@@ -116,6 +163,7 @@ def test_empty_chat_rejects_every_public_tool_before_work(monkeypatch, method, m
     assert calls == []
     assert events[-1]["data"]["status"] == "error"
     assert events[-1]["data"]["done"] is True
+    assert _workspace_hints(events) == []
 
 
 @pytest.mark.parametrize(
@@ -161,6 +209,7 @@ def test_unusable_credentials_reject_before_upload_or_probe(
     assert calls == []
     assert events[-1]["data"]["status"] == "error"
     assert events[-1]["data"]["done"] is True
+    assert _workspace_hints(events) == []
 
 
 class _GuardedOCU:
@@ -642,8 +691,189 @@ def test_mcp_preflight_auth_rejection_is_a_configuration_error(monkeypatch, stat
     assert "traceback" not in result.lower()
     assert client_token not in result
     assert client_mcp_key not in result
-    assert events[-1]["data"]["status"] == "error"
-    assert events[-1]["data"]["done"] is True
+    status_events = _status_events(events)
+    assert status_events[-1]["data"]["status"] == "error"
+    assert status_events[-1]["data"]["done"] is True
+    assert _workspace_hints(events) == [_hint("chat-credential-rejection")]
+
+
+@pytest.mark.parametrize("status", (401, 403))
+def test_health_preflight_rejection_is_a_configuration_error_with_hint(
+    monkeypatch, status
+):
+    client_token = "well-formed-but-wrong-internal-token"
+    events = []
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", client_token)
+
+    def origin_response(request):
+        if request["path"] == "/health":
+            return status, {}, b"rejected"
+        raise AssertionError("MCP must not run after health rejection")
+
+    with _local_origin(origin_response) as origin:
+        tools = computer_use_tools.Tools()
+        tools.valves.ORCHESTRATOR_URL = origin.url
+        result = asyncio.run(
+            tools.bash_tool(
+                "echo rejected",
+                "check health",
+                __event_emitter__=lambda event: _collect(events, event),
+                __metadata__={"chat_id": "chat-health-rejection"},
+            )
+        )
+
+    assert [request["path"] for request in origin.requests] == ["/health"]
+    assert result.startswith("[CONFIG ERROR]")
+    assert f"HTTP {status}" in result
+    assert "traceback" not in result.lower()
+    assert client_token not in result
+    status_events = _status_events(events)
+    assert status_events[-1]["data"]["status"] == "error"
+    assert status_events[-1]["data"]["done"] is True
+    assert _workspace_hints(events) == [_hint("chat-health-rejection")]
+
+
+@pytest.mark.parametrize(
+    ("behavior", "expected", "status"),
+    (
+        ("sandbox output", "sandbox output", "complete"),
+        ("[CONFIG ERROR] remote failed", "[CONFIG ERROR] remote failed", "error"),
+        (RuntimeError("wrapper boom"), "[Error]", "error"),
+    ),
+    ids=("success", "error-valued", "caught-exception"),
+)
+def test_public_tool_emits_one_workspace_hint_after_client_completion(
+    monkeypatch, behavior, expected, status
+):
+    chat_id = "chat-hint"
+    emitter = _RecordingEmitter()
+    _stub_call_tool(monkeypatch, behavior, emitter)
+    tools = _tools_with_token(monkeypatch)
+    result = asyncio.run(
+        tools.bash_tool(
+            "echo hint",
+            "emit hint",
+            __event_emitter__=emitter,
+            __metadata__={"chat_id": chat_id},
+        )
+    )
+
+    if expected == "[Error]":
+        assert result.startswith("[Error]")
+        assert "RuntimeError" in result
+        assert "wrapper boom" in result
+    else:
+        assert result == expected
+    status_events = _status_events(emitter.events)
+    assert status_events[-1]["data"]["status"] == status
+    assert status_events[-1]["data"]["done"] is True
+    hints = _workspace_hints(emitter.events)
+    assert hints == [_hint(chat_id)]
+    assert "revision" not in hints[0]["data"]
+    client_completed = next(
+        event for event in emitter.events if event.get("type") == "client_completed"
+    )
+    assert emitter.events.index(client_completed) < emitter.events.index(status_events[-1])
+    assert emitter.events.index(status_events[-1]) < emitter.events.index(hints[0])
+
+
+def test_missing_emitter_is_a_noop_after_completion(monkeypatch):
+    _stub_call_tool(monkeypatch, "sandbox output")
+    tools = _tools_with_token(monkeypatch)
+    result = asyncio.run(
+        tools.bash_tool(
+            "echo hint",
+            "emit hint",
+            __event_emitter__=None,
+            __metadata__={"chat_id": "chat-no-emitter"},
+        )
+    )
+    assert result == "sandbox output"
+
+
+@pytest.mark.parametrize(
+    ("behavior", "expected", "status"),
+    (
+        ("sandbox output", "sandbox output", "complete"),
+        ("[CONFIG ERROR] remote failed", "[CONFIG ERROR] remote failed", "error"),
+        (RuntimeError("wrapper boom"), "[Error]", "error"),
+    ),
+    ids=("success", "error-valued", "caught-exception"),
+)
+def test_broken_hint_emitter_preserves_result_and_attempts_once(
+    monkeypatch, behavior, expected, status
+):
+    emitter = _RecordingEmitter(fail_hint=True)
+    _stub_call_tool(monkeypatch, behavior, emitter)
+    tools = _tools_with_token(monkeypatch)
+    result = asyncio.run(
+        tools.bash_tool(
+            "echo hint",
+            "emit hint",
+            __event_emitter__=emitter,
+            __metadata__={"chat_id": "chat-broken-emitter"},
+        )
+    )
+    if expected == "[Error]":
+        assert result.startswith("[Error]")
+        assert "RuntimeError" in result
+        assert "wrapper boom" in result
+    else:
+        assert result == expected
+    status_events = _status_events(emitter.events)
+    assert status_events[-1]["data"]["status"] == status
+    assert status_events[-1]["data"]["done"] is True
+    assert _workspace_hints(emitter.events) == []
+    assert emitter.hint_attempts == 1
+
+
+def test_header_construction_failure_does_not_emit_workspace_hint(monkeypatch):
+    calls = []
+
+    async def call_tool(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return "should not run"
+
+    def fail_headers(self, *args, **kwargs):
+        raise ValueError("cannot encode header")
+
+    monkeypatch.setattr(computer_use_tools._MCPClient, "call_tool", call_tool)
+    monkeypatch.setattr(computer_use_tools.Tools, "_build_mcp_headers", fail_headers)
+    emitter = _RecordingEmitter()
+    tools = _tools_with_token(monkeypatch)
+    result = asyncio.run(
+        tools.bash_tool(
+            "echo hint",
+            "emit hint",
+            __event_emitter__=emitter,
+            __metadata__={"chat_id": "chat-header-failure"},
+        )
+    )
+    assert result.startswith("[Error]")
+    assert "cannot encode header" in result
+    assert calls == []
+    assert _workspace_hints(emitter.events) == []
+    assert emitter.hint_attempts == 0
+
+
+def test_cancellation_propagates_without_workspace_hint(monkeypatch):
+    _stub_call_tool(monkeypatch, asyncio.CancelledError())
+    emitter = _RecordingEmitter()
+    tools = _tools_with_token(monkeypatch)
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await tools.bash_tool(
+                "echo hint",
+                "emit hint",
+                __event_emitter__=emitter,
+                __metadata__={"chat_id": "chat-cancelled"},
+            )
+
+    asyncio.run(run())
+    assert _workspace_hints(emitter.events) == []
+    assert emitter.hint_attempts == 0
 
 
 if __name__ == "__main__":
