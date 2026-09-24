@@ -28,6 +28,13 @@ from urllib.parse import quote
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
+from ws_recheck import (
+    admit,
+    forward_cdp_backend,
+    forward_cdp_client,
+    forward_ttyd_backend,
+    forward_ttyd_client,
+)
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -896,60 +903,16 @@ async def browser_cdp_json_version(chat_id: str):
 @app.websocket("/browser/{chat_id}/devtools/page/{page_id}")
 async def browser_ws_proxy(websocket: WebSocket, chat_id: str, page_id: str):
     """Bidirectional WebSocket proxy for CDP — connects browser viewer to container's Chromium."""
-    chat_id = sanitize_chat_id(chat_id)
-    container_addr = get_container_service_address(chat_id, CDP_PORT)
-    if not container_addr:
-        await websocket.close(code=1008, reason="Container not found")
+    session = await admit(websocket, chat_id)
+    if session is None:
         return
-
-    await websocket.accept()
-
-    backend_url = f"ws://{container_addr}/devtools/page/{page_id}"
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(backend_url) as backend_ws:
-                async def forward_client_to_backend():
-                    try:
-                        while True:
-                            data = await websocket.receive_text()
-                            await backend_ws.send_str(data)
-                    except WebSocketDisconnect:
-                        pass
-                    except Exception:
-                        pass
-                    finally:
-                        await backend_ws.close()
-
-                async def forward_backend_to_client():
-                    try:
-                        async for msg in backend_ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                await websocket.send_text(msg.data)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            await websocket.close()
-                        except Exception:
-                            pass
-
-                done, pending = await asyncio.wait(
-                    [
-                        asyncio.create_task(forward_client_to_backend()),
-                        asyncio.create_task(forward_backend_to_client()),
-                    ],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in pending:
-                    task.cancel()
-    except Exception:
-        try:
-            await websocket.close(code=1011, reason="Backend connection failed")
-        except Exception:
-            pass
+    chat_id = session.chat_id
+    await session.run(
+        backend_url=f"ws://{{addr}}/devtools/page/{page_id}",
+        lookup=lambda: get_container_service_address(chat_id, CDP_PORT),
+        client_to_backend=forward_cdp_client,
+        backend_to_client=forward_cdp_backend,
+    )
 
 
 
@@ -1213,67 +1176,18 @@ async def terminal_heartbeat(chat_id: str):
 @app.websocket("/terminal/{chat_id}/ws")
 async def terminal_ws_proxy(websocket: WebSocket, chat_id: str):
     """Bidirectional WebSocket proxy — connects xterm.js to container's ttyd."""
-    chat_id = sanitize_chat_id(chat_id)
-    container_addr = get_container_service_address(chat_id, TTYD_PORT)
-    if not container_addr:
-        await websocket.close(code=1008, reason="Container not found")
+    session = await admit(websocket, chat_id)
+    if session is None:
         return
-
-    await websocket.accept(subprotocol="tty")
-
-    backend_url = f"ws://{container_addr}/ws"
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(backend_url, protocols=["tty"]) as backend_ws:
-                async def forward_client_to_backend():
-                    try:
-                        while True:
-                            msg = await websocket.receive()
-                            if msg["type"] == "websocket.disconnect":
-                                break
-                            if msg.get("bytes"):
-                                await backend_ws.send_bytes(msg["bytes"])
-                            elif msg.get("text"):
-                                await backend_ws.send_str(msg["text"])
-                    except WebSocketDisconnect:
-                        pass
-                    except Exception:
-                        pass
-                    finally:
-                        await backend_ws.close()
-
-                async def forward_backend_to_client():
-                    try:
-                        async for msg in backend_ws:
-                            if msg.type == aiohttp.WSMsgType.BINARY:
-                                await websocket.send_bytes(msg.data)
-                            elif msg.type == aiohttp.WSMsgType.TEXT:
-                                await websocket.send_text(msg.data)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            await websocket.close()
-                        except Exception:
-                            pass
-
-                done, pending = await asyncio.wait(
-                    [
-                        asyncio.create_task(forward_client_to_backend()),
-                        asyncio.create_task(forward_backend_to_client()),
-                    ],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in pending:
-                    task.cancel()
-    except Exception:
-        try:
-            await websocket.close(code=1011, reason="Backend connection failed")
-        except Exception:
-            pass
+    chat_id = session.chat_id
+    await session.run(
+        backend_url="ws://{addr}/ws",
+        accept_kwargs={"subprotocol": "tty"},
+        connect_kwargs={"protocols": ["tty"]},
+        lookup=lambda: get_container_service_address(chat_id, TTYD_PORT),
+        client_to_backend=forward_ttyd_client,
+        backend_to_client=forward_ttyd_backend,
+    )
 
 
 @app.get("/preview/{chat_id}", response_class=HTMLResponse, tags=["Files"])

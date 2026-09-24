@@ -88,6 +88,7 @@ def _apply_env(monkeypatch):
     monkeypatch.setenv("SINGLE_USER_MODE", "true")
     monkeypatch.setenv("PUBLIC_BASE_URL", "http://ocu.example")
     monkeypatch.setenv("BASE_DATA_DIR", "/tmp/ocu-auth-guard-unused")
+    monkeypatch.setenv("OCU_WEBUI_AUTH_URL", "http://127.0.0.1:9/api/v1/ocu/auth")
 
 
 @pytest.fixture
@@ -98,6 +99,7 @@ def app_module(monkeypatch):
         if name in {
             "app",
             "auth_guard",
+            "ws_recheck",
             "mcp_tools",
             "docker_manager",
             "outputs_broker",
@@ -133,6 +135,10 @@ def client(app_module, tmp_path, monkeypatch):
 
 def _bearer(token=INTERNAL):
     return {"Authorization": f"Bearer {token}"}
+
+
+def _ws_session_headers(token=INTERNAL):
+    return {"Authorization": f"Bearer {token}", "Cookie": "token=ocu-test-session"}
 
 
 def _mcp_headers(internal=INTERNAL, mcp=MCP_KEY, chat=CHAT, extra=None):
@@ -805,12 +811,30 @@ class TestWebSockets:
             async def __aexit__(self, *_exc):
                 return False
 
-        class Session:
+        class AuthResponse:
+            status = 200
+
             async def __aenter__(self):
                 return self
 
             async def __aexit__(self, *_exc):
                 return False
+
+        class Session:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def close(self):
+                return None
+
+            def get(self, *_args, **_kwargs):
+                return AuthResponse()
 
             def ws_connect(self, *_args, **_kwargs):
                 calls.append("backend")
@@ -822,7 +846,12 @@ class TestWebSockets:
             lambda *_a, **_k: calls.append("address") or "sandbox.test:7681",
         )
         monkeypatch.setattr(app_module.aiohttp, "ClientSession", Session)
-        with client.websocket_connect(f"/terminal/{CHAT}/ws", headers=_bearer()) as socket:
+        import ws_recheck
+
+        monkeypatch.setattr(ws_recheck.aiohttp, "ClientSession", Session)
+        with client.websocket_connect(
+            f"/terminal/{CHAT}/ws", headers=_ws_session_headers()
+        ) as socket:
             with pytest.raises(WebSocketDisconnect) as exc:
                 socket.receive_text()
         assert calls == ["address", "backend"]
