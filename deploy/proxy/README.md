@@ -63,11 +63,14 @@ permanent proxy smoke.
 
 ## Trust and route behavior
 
-Chat routes authenticate through WebUI `/api/v1/ocu/auth` using the session
+Chat routes authenticate through WebUI `/api/v1/ocu/auth` using only the session
 Cookie and route-derived `X-Chat-Id`; static assets use session-only
-`/api/v1/auths/`. Browser Authorization and identity headers cannot authorize
-OCU. Every OCU-bound request gets the internal REST/WS Bearer token, while
-WebSocket requests also retain the Cookie for OCU's periodic revocation check.
+`/api/v1/auths/` with Cookie. Auth subrequests disable inherited client headers
+and do not forward Authorization, `x-api-key`, or any configured
+`CUSTOM_API_KEY_HEADER`. Browser Authorization and identity headers cannot
+authorize OCU. Every OCU-bound request gets the internal REST/WS Bearer token,
+while WebSocket requests also retain the Cookie for OCU's periodic revocation
+check.
 Auth 401 stays 401, auth 403 becomes 404; mutation denial is independently
 403 and OCU 403/409 are left intact. Only listed mutating rows require
 `X-Requested-With: ocu-workspace` and exact `Origin` or

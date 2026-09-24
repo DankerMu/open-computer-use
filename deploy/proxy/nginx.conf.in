@@ -62,29 +62,18 @@ http {
             internal;
             proxy_pass @@WEBUI@@/api/v1/ocu/auth;
             proxy_pass_request_body off;
-            proxy_set_header Content-Length "";
+            proxy_pass_request_headers off;
+            proxy_set_header Host $proxy_host;
             proxy_set_header Cookie $http_cookie;
-            proxy_set_header Authorization "";
             proxy_set_header X-Chat-Id $ocu_chat_id;
-            proxy_set_header X-User-Id "";
-            proxy_set_header X-User-Email "";
-            proxy_set_header X-OCU-Internal-Token "";
-            proxy_set_header X-Ocu-Grant "";
-            proxy_set_header X-Forwarded-User "";
         }
         location = /_ocu_session_auth {
             internal;
             proxy_pass @@WEBUI@@/api/v1/auths/;
             proxy_pass_request_body off;
-            proxy_set_header Content-Length "";
+            proxy_pass_request_headers off;
+            proxy_set_header Host $proxy_host;
             proxy_set_header Cookie $http_cookie;
-            proxy_set_header Authorization "";
-            proxy_set_header X-Chat-Id "";
-            proxy_set_header X-User-Id "";
-            proxy_set_header X-User-Email "";
-            proxy_set_header X-OCU-Internal-Token "";
-            proxy_set_header X-Ocu-Grant "";
-            proxy_set_header X-Forwarded-User "";
         }
         location @ocu_auth_not_found { internal; return 404; }
         location @ocu_mutation_denied { internal; return 403; }

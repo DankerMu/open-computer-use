@@ -26,9 +26,11 @@ class RecordingServer(ThreadingHTTPServer):
         self.record = record
         self.lock = threading.Lock()
 
-    def observe(self, kind, handler):
+    def observe(self, kind, handler, extra=None):
         entry = {"kind": kind, "method": handler.command, "target": handler.path,
                  "headers": {key.lower(): value for key, value in handler.headers.items()}}
+        if extra:
+            entry.update(extra)
         with self.lock:
             fd = os.open(self.record, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             with os.fdopen(fd, "a", encoding="utf-8") as stream:
@@ -64,16 +66,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve(self):
         kind = self.server.kind
-        self.server.observe(kind, self)
+        extra = {}
+        if kind == "ocu" and self.command == "POST":
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = self.rfile.read(length) if length else b""
+            extra["body_sha256"] = hashlib.sha256(payload).hexdigest()
+            extra["body_length"] = len(payload)
+        self.server.observe(kind, self, extra)
         if kind == "auth":
-            if self.path in {"/api/v1/ocu/auth", "/api/v1/auths/"}:
-                cookie = self.headers.get("Cookie", "")
-                if cookie == "session=owner":
-                    auth_headers = [("X-User-Id", "trusted-user"),
-                                    ("X-User-Email", "owner%2Bqa%40example.test")]
-                    self._reply(200, b"authenticated", auth_headers if self.path.endswith("/ocu/auth") else ())
-                elif cookie == "session=foreign":
+            cookie = self.headers.get("Cookie", "")
+            chat = self.headers.get("X-Chat-Id", "")
+            if self.path == "/api/v1/ocu/auth":
+                if cookie == "session=owner" and chat == "chat-ABC-123":
+                    self._reply(200, b"authenticated",
+                                [("X-User-Id", "trusted-user"),
+                                 ("X-User-Email", "owner%2Bqa%40example.test")])
+                elif cookie in {"session=owner", "session=foreign"}:
                     self._reply(403)
+                elif cookie == "session=error":
+                    self._reply(503)
+                else:
+                    self._reply(401)
+            elif self.path == "/api/v1/auths/":
+                if cookie in {"session=owner", "session=foreign"}:
+                    self._reply(200, b"authenticated")
                 elif cookie == "session=error":
                     self._reply(503)
                 else:
@@ -136,10 +152,6 @@ class Handler(BaseHTTPRequestHandler):
                        ("X-Content-Type-Options", "other")]
             self._reply(200, b"file", headers)
             return
-        if self.command == "POST":
-            length = int(self.headers.get("Content-Length", "0"))
-            if length:
-                self.rfile.read(length)
         self._reply(200, b"ocu")
 
 

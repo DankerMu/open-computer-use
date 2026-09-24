@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -21,16 +22,16 @@ PROXY_PORT = int(os.environ.get("OCU_TEST_PROXY_PORT", "18782"))
 
 
 class NativeProxyTests(unittest.TestCase):
-    def setUp(self):
-        self.before = len(self.observations())
-
     def observations(self):
         if not RECORD.exists():
             return []
         return [json.loads(row) for row in RECORD.read_text().splitlines() if row]
 
-    def since(self, kind):
-        return [row for row in self.observations()[self.before:] if row["kind"] == kind]
+    def snapshot(self):
+        return len(self.observations())
+
+    def since(self, kind, before):
+        return [row for row in self.observations()[before:] if row["kind"] == kind]
 
     def request(self, path, method="GET", headers=None, body=None):
         connection = http.client.HTTPConnection("127.0.0.1", PROXY_PORT, timeout=15)
@@ -43,13 +44,40 @@ class NativeProxyTests(unittest.TestCase):
     def owner(self, extra=None):
         return {"Cookie": "session=owner", **(extra or {})}
 
-    def check_forward(self, path, upstream, method="GET", extra=None, body=None):
+    def expect_auth(self, before, *, session=False, cookie="session=owner", chat=CHAT):
+        auth = self.since("auth", before)
+        self.assertEqual(len(auth), 1)
+        seen = auth[0]
+        if session:
+            self.assertEqual(seen["target"], "/api/v1/auths/")
+            self.assertNotIn("x-chat-id", seen["headers"])
+        else:
+            self.assertEqual(seen["target"], "/api/v1/ocu/auth")
+            self.assertEqual(seen["headers"].get("x-chat-id"), chat)
+        if cookie is None:
+            self.assertNotIn("cookie", seen["headers"])
+        else:
+            self.assertEqual(seen["headers"].get("cookie"), cookie)
+        self.assertNotIn("authorization", seen["headers"])
+        self.assertNotIn("x-api-key", seen["headers"])
+        self.assertNotIn("x-openwebui-key", seen["headers"])
+        return seen
+    def check_forward(self, path, upstream, method="GET", extra=None, body=None, *, session=False):
+        before = self.snapshot()
         status, _, _ = self.request(path, method, self.owner(extra), body)
         self.assertEqual(status, 200, path)
-        seen = self.since("ocu")[-1]
+        ocu = self.since("ocu", before)
+        self.assertEqual(len(ocu), 1, path)
+        seen = ocu[0]
         self.assertEqual((seen["method"], seen["target"]), (method, upstream), path)
-        self.assertEqual(self.since("auth")[-1]["headers"].get("x-chat-id"), CHAT)
-        self.assertEqual(seen["headers"].get("x-chat-id"), CHAT)
+        self.expect_auth(before, session=session)
+        if session:
+            self.assertNotIn("x-chat-id", seen["headers"])
+        else:
+            self.assertEqual(seen["headers"].get("x-chat-id"), CHAT)
+        if body is not None:
+            self.assertEqual(seen.get("body_sha256"), hashlib.sha256(body).hexdigest())
+            self.assertEqual(seen.get("body_length"), len(body))
         return seen
 
     def test_canonical_rows_forward_only_allowed_methods_and_preserve_prefix(self):
@@ -67,45 +95,61 @@ class NativeProxyTests(unittest.TestCase):
             ("/ocu/terminal/{c}/heartbeat", "/terminal/{c}/heartbeat", "GET"),
             ("/ocu/terminal/{c}/sessions", "/terminal/{c}/sessions", "GET"),
             ("/ocu/terminal/{c}/processes", "/terminal/{c}/processes", "GET"),
-            ("/ocu/api/uploads/{c}/folder/data.bin", "/api/uploads/{c}/folder/data.bin", "POST"),
+            ("/ocu/api/uploads/{c}/folder/data.bin", "/api/uploads/{c}/folder/data.bin", "POST", b"folder-payload"),
             ("/ocu/terminal/{c}/start-ttyd", "/terminal/{c}/start-ttyd", "POST"),
             ("/ocu/terminal/{c}/stop-ttyd", "/terminal/{c}/stop-ttyd", "POST"),
             ("/ocu/terminal/{c}/restart-container", "/terminal/{c}/restart-container", "POST"),
             ("/ocu/terminal/{c}/resurrect-container", "/terminal/{c}/resurrect-container", "POST"),
             ("/ocu/terminal/{c}/processes/123/kill", "/terminal/{c}/processes/123/kill", "POST"),
         )
-        for path, upstream, method in rows:
+        for path, upstream, method, *payload in rows:
             with self.subTest(path=path):
                 extra = MUTATION if path.split("/")[2] == "terminal" and path.endswith(("heartbeat", "sessions", "processes")) or method == "POST" else None
-                self.check_forward(path.format(c=CHAT), upstream.format(c=CHAT), method, extra)
-        status, _, _ = self.request("/ocu/static/deep/preview.js?rev=5", headers=self.owner())
-        self.assertEqual(status, 200)
-        self.assertEqual(self.since("ocu")[-1]["target"], "/ocu/static/deep/preview.js?rev=5")
-        self.assertEqual(self.since("auth")[-1]["target"], "/api/v1/auths/")
-        status, _, body = self.request("/ocu/static/deep/preview.js", "HEAD", self.owner())
-        self.assertEqual((status, body), (200, b""))
-        self.assertEqual(self.since("ocu")[-1]["method"], "HEAD")
+                self.check_forward(path.format(c=CHAT), upstream.format(c=CHAT), method, extra,
+                                   payload[0] if payload else None)
+        self.check_forward("/ocu/static/deep/preview.js?rev=5",
+                           "/ocu/static/deep/preview.js?rev=5", session=True)
+        self.check_forward("/ocu/static/deep/preview.js",
+                           "/ocu/static/deep/preview.js", "HEAD", session=True)
+        before = self.snapshot()
         status, _, body = self.request("/outside/ocu", headers=self.owner())
         self.assertEqual((status, body), (200, b"webui"))
+        self.assertEqual(self.since("ocu", before), [])
+        self.assertEqual(self.since("auth", before)[-1]["target"], "/outside/ocu")
 
     def test_literal_upload_filenames_dispatch_by_method(self):
-        for filename in ("manifest", "list", "%6danifest", "%6cist"):
+        payloads = {"manifest": b"manifest-bytes", "list": b"list-bytes",
+                    "%6danifest": b"enc-manifest", "%6cist": b"enc-list"}
+        for filename, payload in payloads.items():
             with self.subTest(filename=filename):
                 path = "/ocu/api/uploads/" + CHAT + "/" + filename
                 self.check_forward(path, "/api/uploads/" + CHAT + "/" + filename,
-                                   method="POST", extra=MUTATION, body=b"payload")
+                                   method="POST", extra=MUTATION, body=payload)
         self.check_forward("/ocu/api/uploads/" + CHAT + "/man%69fest",
-                           "/api/uploads/" + CHAT + "/man%69fest")
-        previous = len(self.since("ocu"))
+                           "/api/uploads/" + CHAT + "/man%69fest",
+                           method="GET")
         path = "/ocu/api/uploads/" + CHAT + "/manifest"
+        before = self.snapshot()
         status, _, _ = self.request(
             path, "POST", self.owner({**MUTATION, "Origin": "null"}), b"blocked")
         self.assertEqual(status, 403)
-        self.assertEqual(len(self.since("ocu")), previous)
+        self.assertEqual(self.since("ocu", before), [])
+        before = self.snapshot()
         status, _, _ = self.request(
             path, "POST", {"Cookie": "session=foreign", **MUTATION}, b"blocked")
         self.assertEqual(status, 404)
-        self.assertEqual(len(self.since("ocu")), previous)
+        self.assertEqual(self.since("ocu", before), [])
+        self.expect_auth(before, cookie="session=foreign")
+        large = b"x" * (1024 * 1024 + 1)
+        self.check_forward("/ocu/api/uploads/" + CHAT + "/large.bin",
+                           "/api/uploads/" + CHAT + "/large.bin", "POST", MUTATION, large)
+        before = self.snapshot()
+        status, _, _ = self.request("/ocu/api/uploads/" + CHAT + "/large.bin", "POST",
+                                    self.owner(MUTATION), bytes((byte ^ 1) for byte in large[:64]) + large[64:])
+        self.assertEqual(status, 200)
+        seen = self.since("ocu", before)[-1]
+        self.assertNotEqual(seen.get("body_sha256"), hashlib.sha256(large).hexdigest())
+        self.assertEqual(seen.get("body_length"), len(large))
 
     def test_unknown_paths_methods_and_ambiguous_targets_never_contact_ocu(self):
         targets = (
@@ -126,48 +170,53 @@ class NativeProxyTests(unittest.TestCase):
         )
         for path in targets:
             with self.subTest(path=path):
-                previous = len(self.since("ocu"))
+                before = self.snapshot()
                 status, _, _ = self.request(path, headers=self.owner())
                 self.assertEqual(status, 400 if path.endswith("/a%GG") else 404, path)
-                self.assertEqual(len(self.since("ocu")), previous, path)
+                self.assertEqual(self.since("ocu", before), [], path)
         for method, target in (("DELETE", "/ocu/api/outputs/" + CHAT),
                                ("OPTIONS", "/ocu/static/preview.js"),
                                ("POST", "/ocu/files/" + CHAT + "/report.html")):
             with self.subTest(method=method):
-                previous = len(self.since("ocu"))
+                before = self.snapshot()
                 status, _, _ = self.request(target, method, self.owner(MUTATION))
                 self.assertEqual(status, 404)
-                self.assertEqual(len(self.since("ocu")), previous)
+                self.assertEqual(self.since("ocu", before), [])
 
     def test_session_owner_identity_headers_and_status_provenance(self):
         target = "/ocu/api/outputs/" + CHAT
-        previous = len(self.since("ocu"))
+        before = self.snapshot()
         status, _, _ = self.request(target)
         self.assertEqual(status, 401)
-        self.assertEqual(len(self.since("ocu")), previous)
+        self.assertEqual(self.since("ocu", before), [])
+        before = self.snapshot()
         status, _, _ = self.request(target, headers={"Cookie": "session=foreign"})
         self.assertEqual(status, 404)
-        self.assertEqual(len(self.since("ocu")), previous)
+        self.assertEqual(self.since("ocu", before), [])
+        self.expect_auth(before, cookie="session=foreign")
+        before = self.snapshot()
         status, _, _ = self.request(target, headers={"Cookie": "session=error"})
         self.assertEqual(status, 500)
-        self.assertEqual(len(self.since("ocu")), previous)
+        self.assertEqual(self.since("ocu", before), [])
         static = "/ocu/static/deep/preview.js"
+        before = self.snapshot()
         status, _, _ = self.request(static)
         self.assertEqual(status, 401)
-        self.assertEqual(len(self.since("ocu")), previous)
+        self.assertEqual(self.since("ocu", before), [])
+        before = self.snapshot()
         status, _, _ = self.request(static, headers={"Cookie": "session=foreign"})
-        self.assertEqual(status, 404)
-        self.assertEqual(len(self.since("ocu")), previous)
+        self.assertEqual(status, 200)
+        self.expect_auth(before, session=True, cookie="session=foreign")
+        self.assertEqual(self.since("ocu", before)[-1]["target"], "/ocu/static/deep/preview.js")
         supplied = {"Authorization": "Bearer user-controlled", "X-User-Id": "forged-id",
                     "X-User-Email": "forged@example.test", "X-Chat-Id": "other-chat",
-                    "X-OCU-Internal-Token": "forged-token", "X-Ocu-Grant": "forged-grant"}
+                    "X-OCU-Internal-Token": "forged-token", "X-Ocu-Grant": "forged-grant",
+                    "X-Api-Key": "jwt-without-cookie", "X-OpenWebUI-Key": "custom-jwt"}
+        before = self.snapshot()
         status, headers, body = self.request(target, headers=self.owner(supplied))
         self.assertEqual(status, 200)
-        auth = self.since("auth")[-1]
-        ocu = self.since("ocu")[-1]
-        self.assertNotIn("authorization", auth["headers"])
-        self.assertEqual(auth["headers"].get("x-chat-id"), CHAT)
-        self.assertEqual(auth["headers"].get("cookie"), "session=owner")
+        auth = self.expect_auth(before)
+        ocu = self.since("ocu", before)[-1]
         self.assertEqual(ocu["headers"].get("authorization"), "Bearer " + TOKEN)
         self.assertEqual(ocu["headers"].get("x-user-id"), "trusted-user")
         self.assertEqual(ocu["headers"].get("x-user-email"), "owner%2Bqa%40example.test")
@@ -177,68 +226,89 @@ class NativeProxyTests(unittest.TestCase):
         self.assertNotIn("x-ocu-grant", ocu["headers"])
         self.assertNotIn(TOKEN.encode(), body)
         self.assertNotIn(TOKEN, str(headers))
-        status, _, _ = self.request("/ocu/static/deep/preview.js", headers=self.owner(supplied))
+        before = self.snapshot()
+        status, _, _ = self.request(static, headers=self.owner(supplied))
         self.assertEqual(status, 200)
-        static = self.since("ocu")[-1]["headers"]
-        self.assertNotIn("x-user-id", static)
-        self.assertNotIn("x-user-email", static)
-        self.assertNotIn("x-chat-id", static)
-        self.assertEqual(static.get("authorization"), "Bearer " + TOKEN)
+        self.expect_auth(before, session=True)
+        static_headers = self.since("ocu", before)[-1]["headers"]
+        self.assertNotIn("x-user-id", static_headers)
+        self.assertNotIn("x-user-email", static_headers)
+        self.assertNotIn("x-chat-id", static_headers)
+        self.assertEqual(static_headers.get("authorization"), "Bearer " + TOKEN)
         for filename, expected in (("backend403", 403), ("backend409", 409)):
+            before = self.snapshot()
             status, _, _ = self.request("/ocu/files/" + CHAT + "/" + filename, headers=self.owner())
             self.assertEqual(status, expected)
-            self.assertEqual(self.since("ocu")[-1]["target"], "/files/" + CHAT + "/" + filename)
+            self.expect_auth(before)
+            self.assertEqual(self.since("ocu", before)[-1]["target"], "/files/" + CHAT + "/" + filename)
+        for header in ("X-Api-Key", "X-OpenWebUI-Key"):
+            with self.subTest(header=header):
+                before = self.snapshot()
+                status, _, _ = self.request(target, headers={header: "owner-jwt"})
+                self.assertEqual(status, 401)
+                self.assertEqual(self.since("ocu", before), [])
+                self.expect_auth(before, cookie=None)
+                before = self.snapshot()
+                status, _, _ = self.request(static, headers={header: "owner-jwt"})
+                self.assertEqual(status, 401)
+                self.assertEqual(self.since("ocu", before), [])
+                self.expect_auth(before, session=True, cookie=None)
 
     def test_mutating_get_and_post_require_exact_header_and_origin_or_fetch_site(self):
         for action in ("heartbeat", "sessions", "processes"):
             path = "/ocu/terminal/" + CHAT + "/" + action
-            previous = len(self.since("ocu"))
             for extra in ({"Origin": "null", "X-Requested-With": "ocu-workspace", "Sec-Fetch-Site": "same-origin"},
                           {"Origin": ORIGIN},
                           {"Origin": "https://other.example", "X-Requested-With": "ocu-workspace"},
                           {"Origin": ORIGIN.upper(), "X-Requested-With": "ocu-workspace"}):
+                before = self.snapshot()
                 status, _, _ = self.request(path, headers=self.owner(extra))
                 self.assertEqual(status, 403, (action, extra))
-                self.assertEqual(len(self.since("ocu")), previous)
+                self.assertEqual(self.since("ocu", before), [])
             self.check_forward(path, "/terminal/" + CHAT + "/" + action, extra=MUTATION)
             self.check_forward(path, "/terminal/" + CHAT + "/" + action,
                                extra={"Sec-Fetch-Site": "same-origin", "X-Requested-With": "ocu-workspace"})
         upload = "/ocu/api/uploads/" + CHAT + "/large.bin"
-        before = len(self.since("ocu"))
+        before = self.snapshot()
         status, _, _ = self.request(upload, "POST", self.owner({**MUTATION, "Origin": "null"}), b"bad")
         self.assertEqual(status, 403)
-        self.assertEqual(len(self.since("ocu")), before)
-        body = b"x" * (1024 * 1024 + 1)
-        self.check_forward(upload, "/api/uploads/" + CHAT + "/large.bin", "POST", MUTATION, body)
-        self.assertEqual(self.since("ocu")[-1]["headers"].get("content-length"), str(len(body)))
+        self.assertEqual(self.since("ocu", before), [])
 
     def test_encoded_file_names_query_and_generated_file_headers(self):
         target = "/ocu/files/" + CHAT + "/sub/space%20hash%23plus%2Bpercent%25.html?revision=7"
+        before = self.snapshot()
         status, headers, body = self.request(target, headers=self.owner())
         self.assertEqual(status, 200)
-        self.assertEqual(self.since("ocu")[-1]["target"], target[4:])
+        self.expect_auth(before)
+        self.assertEqual(self.since("ocu", before)[-1]["target"], target[4:])
         self.assertEqual(body, b"file")
         self.assertEqual([value for name, value in headers if name.lower() == "content-security-policy"],
                          ["sandbox allow-scripts allow-forms"])
         self.assertEqual([value for name, value in headers if name.lower() == "x-content-type-options"], ["nosniff"])
         encoded_dot = "/ocu/files/" + CHAT + "/sub/report%2Ehtml?revision=8"
+        before = self.snapshot()
         status, headers, _ = self.request(encoded_dot, headers=self.owner())
         self.assertEqual(status, 200)
-        self.assertEqual(self.since("ocu")[-1]["target"], encoded_dot[4:])
+        self.expect_auth(before)
+        self.assertEqual(self.since("ocu", before)[-1]["target"], encoded_dot[4:])
         self.assertEqual([value for key, value in headers if key.lower() == "content-security-policy"],
                          ["sandbox allow-scripts allow-forms"])
         for extension in ("svg", "xhtml", "xml"):
             with self.subTest(extension=extension):
+                before = self.snapshot()
                 status, headers, _ = self.request("/ocu/files/" + CHAT + "/report." + extension, headers=self.owner())
                 self.assertEqual(status, 200)
+                self.expect_auth(before)
                 self.assertEqual([value for name, value in headers if name.lower() == "content-security-policy"],
                                  ["sandbox allow-scripts allow-forms"])
                 self.assertEqual([value for name, value in headers if name.lower() == "x-content-type-options"], ["nosniff"])
         for name, disposition in (("report.bin", "inline; filename=report.html"),
                                   ("report.html?download=1", "attachment; filename=report.html"),
                                   ("report.html?revision=7&download=1", "attachment; filename=report.html")):
+            before = self.snapshot()
             status, headers, _ = self.request("/ocu/files/" + CHAT + "/" + name, headers=self.owner())
             self.assertEqual(status, 200)
+            self.expect_auth(before)
             self.assertEqual([value for key, value in headers if key.lower() == "content-security-policy"],
                              ["default-src 'self'"])
             self.assertEqual([value for key, value in headers if key.lower() == "x-content-type-options"], ["other"])
@@ -249,32 +319,37 @@ class NativeProxyTests(unittest.TestCase):
                                    ("DOWNLOAD=1", "inline; filename=report.html"),
                                    ("download=1&%64ownload=0", "inline; filename=report.html"),
                                    ("download=1&download", "inline; filename=report.html")):
+            before = self.snapshot()
             status, headers, _ = self.request(
                 "/ocu/files/" + CHAT + "/report.html?" + query, headers=self.owner())
             self.assertEqual(status, 200)
-            self.assertEqual(self.since("ocu")[-1]["target"],
+            self.expect_auth(before)
+            self.assertEqual(self.since("ocu", before)[-1]["target"],
                              "/files/" + CHAT + "/report.html?" + query)
             self.assertEqual([value for key, value in headers if key.lower() == "content-disposition"],
                              [disposition])
             self.assertEqual([value for key, value in headers if key.lower() == "content-security-policy"],
                              ["sandbox allow-scripts allow-forms"])
-
+        before = self.snapshot()
         status, headers, body = self.request(
             "/ocu/files/" + CHAT + "/backend-html403.html", headers=self.owner())
         self.assertEqual((status, body), (403, b"upstream error"))
+        self.expect_auth(before)
         self.assertEqual([value for key, value in headers if key.lower() == "content-security-policy"],
                          ["sandbox allow-scripts allow-forms"])
         self.assertEqual([value for key, value in headers if key.lower() == "x-content-type-options"],
                          ["nosniff"])
 
     def test_websocket_auth_and_cookie_forwarding_without_custom_header(self):
-        for route in ("/ocu/terminal/" + CHAT + "/ws",
-                      "/ocu/browser/" + CHAT + "/devtools/page/PAGE-1"):
+        for route, upstream in (("/ocu/terminal/" + CHAT + "/ws", "/terminal/" + CHAT + "/ws"),
+                                ("/ocu/browser/" + CHAT + "/devtools/page/PAGE-1",
+                                 "/browser/" + CHAT + "/devtools/page/PAGE-1")):
             with self.subTest(route=route):
                 headers = self.owner({"Connection": "Upgrade", "Upgrade": "websocket",
                                       "Origin": ORIGIN,
                                       "Sec-WebSocket-Key": base64.b64encode(b"websocket-test-key").decode(),
                                       "Sec-WebSocket-Version": "13"})
+                before = self.snapshot()
                 connection = http.client.HTTPConnection("127.0.0.1", PROXY_PORT, timeout=15)
                 connection.request("GET", route, headers=headers)
                 response = connection.getresponse()
@@ -282,20 +357,19 @@ class NativeProxyTests(unittest.TestCase):
                 self.assertEqual(response.getheader("Upgrade"), "websocket")
                 self.assertEqual(response.fp.read(4), b"\x81\x02ok")
                 connection.close()
-                seen = self.since("ocu")[-1]
+                self.expect_auth(before)
+                seen = self.since("ocu", before)[-1]
+                self.assertEqual(seen["target"], upstream)
                 self.assertEqual(seen["headers"].get("cookie"), "session=owner")
                 self.assertEqual(seen["headers"].get("authorization"), "Bearer " + TOKEN)
                 self.assertEqual(seen["headers"].get("upgrade", "").lower(), "websocket")
-                self.assertEqual(self.since("auth")[-1]["headers"].get("x-chat-id"), CHAT)
-                previous = len(self.since("ocu"))
-                for denied, expected in (({"Origin": "null"}, 401),
-                                         ({"Origin": "https://foreign.test"}, 401),
-                                         ({"Cookie": "session=foreign"}, 404)):
-                    status, _, _ = self.request(
-                        route, headers={**{key: value for key, value in headers.items()
-                                           if key != "Cookie"}, **denied})
-                    self.assertEqual(status, expected)
-                    self.assertEqual(len(self.since("ocu")), previous)
+                before = self.snapshot()
+                status, _, _ = self.request(route, headers={**{key: value for key, value in headers.items()
+                                                               if key != "Cookie"},
+                                                            "Cookie": "session=foreign"})
+                self.assertEqual(status, 404)
+                self.assertEqual(self.since("ocu", before), [])
+                self.expect_auth(before, cookie="session=foreign")
 
 
 if __name__ == "__main__":
