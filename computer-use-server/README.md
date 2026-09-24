@@ -14,6 +14,7 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 |--------|---------|
 | `app.py` | FastAPI application: guarded MCP endpoint, file serving, browser/terminal proxy, system prompt API |
 | `auth_guard.py` | Fail-closed startup validation, service auth, peer denial and CORS policy |
+| `ws_recheck.py` | Captured-session CDP/ttyd authorization re-check and revocation shutdown |
 | `mcp_tools.py` | MCP tool definitions: `bash_tool`, `view`, `create_file`, `str_replace`, `sub_agent` |
 | `docker_manager.py` | Container lifecycle: create, stop, cleanup, health checks, volume mounts |
 | `outputs_broker.py` | Persisted, bounded output identities and per-chat reconciliation revisions; `GET /api/outputs/{chat_id}` and `GET /internal/describe/{chat_id}` consume that authority |
@@ -88,6 +89,7 @@ All via environment variables:
 | `MCP_API_KEY` | _(empty)_ | Optional second MCP Bearer credential; required in addition to the internal token when set |
 | `OCU_SANDBOX_SUBNET` | _(empty)_ | Optional denied transport subnet, validated at startup |
 | `OCU_WEBUI_ORIGIN` | _(empty)_ | Optional sole CORS origin, validated at startup |
+| `OCU_WEBUI_AUTH_URL` | _(empty)_ | Absolute `http(s)` URL of WebUI `GET /api/v1/ocu/auth` for CDP/ttyd session re-checks. Empty allows non-WS startup; both WS routes then deny before backend lookup. A nonempty invalid value fails startup. |
 | `DOCKER_IMAGE` | `open-computer-use:latest` | Sandbox container image |
 | `COMMAND_TIMEOUT` | `120` | Bash command timeout (seconds) |
 | `SUB_AGENT_TIMEOUT` | `3600` | Sub-agent timeout (seconds) |

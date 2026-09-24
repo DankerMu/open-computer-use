@@ -82,6 +82,10 @@ def startup_preflight() -> int:
             file=sys.stderr,
         )
         return 1
+    from ws_recheck import validate_webui_auth_url
+
+    if validate_webui_auth_url():
+        return 1
     return 0
 
 

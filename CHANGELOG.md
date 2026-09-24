@@ -3,6 +3,15 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Workspace WebSocket session re-check.** CDP and ttyd relays capture the
+  handshake `token` cookie and canonical chat id, perform a bounded owner check
+  against configured `OCU_WEBUI_AUTH_URL` before backend access, and recheck
+  the same pairing every 30s. Requests send Cookie, `X-Chat-Id`, and
+  `X-OCU-Internal-Token` (never `Authorization`), do not follow redirects, and
+  isolate credentials per connection. Any non-200, timeout, or transport
+  failure closes the frontend with 4401, cancels pending sends, and awaits
+  owned tasks. Missing config/cookie is pre-accept 1008 with no Docker lookup.
+  Logout without Redis token invalidation is not advertised as a signal.
 - **Workspace completion hint.** After an invoked MCP client attempt in
   `openwebui/tools/computer_use_tools.py:_run_tool` returns success, an
   error-valued result, or an ordinary caught exception — including returned

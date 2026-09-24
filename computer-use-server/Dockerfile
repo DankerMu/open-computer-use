@@ -27,6 +27,7 @@ COPY ./context_vars.py .
 COPY ./docs_html.py .
 COPY ./security.py .
 COPY ./auth_guard.py .
+COPY ./ws_recheck.py .
 COPY ./cli_runtime.py .
 COPY ./cli_adapters/ ./cli_adapters/
 COPY ./static/ ./static/
