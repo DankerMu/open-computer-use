@@ -168,25 +168,66 @@ class RecordingClock:
 
 
 class ScriptedAuth:
-    def __init__(self, statuses, *, delay=0.0, error=None, hang=False):
+    def __init__(self, statuses, *, delay=0.0, error=None, hang=False, by_chat=None):
         self.statuses = list(statuses)
+        self.by_chat = {key: list(value) for key, value in (by_chat or {}).items()}
         self.delay = delay
         self.error = error
         self.hang = hang
         self.calls = []
         self.sessions = []
         self._lock = threading.Lock()
+        self.hold_decision = None
+        self.loop = None
+        self.periodic_entered = threading.Event()
+        self.decision_made = threading.Event()
 
-    def next_status(self):
-        if not self.statuses:
-            return 200
-        if len(self.statuses) == 1:
-            return self.statuses[0]
-        return self.statuses.pop(0)
+    def bind(self, loop):
+        self.loop = loop
+        if self.hold_decision is None:
+            self.hold_decision = asyncio.Event()
+            self.hold_decision.set()
+
+    def pause_decisions(self):
+        if self.loop is None or self.hold_decision is None:
+            raise RuntimeError("auth loop not bound")
+        self.loop.call_soon_threadsafe(self.hold_decision.clear)
+
+    def resume_decisions(self):
+        if self.loop is None or self.hold_decision is None:
+            raise RuntimeError("auth loop not bound")
+        self.loop.call_soon_threadsafe(self.hold_decision.set)
+
+    def next_status(self, headers=None):
+        headers = {str(name).lower(): value for name, value in (headers or {}).items()}
+        chat = headers.get("x-chat-id")
+        with self._lock:
+            if chat in self.by_chat:
+                sequence = self.by_chat[chat]
+                if not sequence:
+                    return 200
+                if len(sequence) == 1:
+                    return sequence[0]
+                return sequence.pop(0)
+            if not self.statuses:
+                return 200
+            if len(self.statuses) == 1:
+                return self.statuses[0]
+            return self.statuses.pop(0)
 
     def record(self, request):
         with self._lock:
             self.calls.append(request)
+            if len(self.calls) > 1:
+                self.periodic_entered.set()
+
+    def pair_counts(self):
+        counts = {}
+        for call in self.calls:
+            headers = {str(name).lower(): value for name, value in call["headers"].items()}
+            pair = (headers.get("cookie"), headers.get("x-chat-id"))
+            counts[pair] = counts.get(pair, 0) + 1
+        return counts
 
 
 class FakeAuthResponse:
@@ -217,13 +258,26 @@ class FakeAuthGet:
         self._released = False
 
     async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        self._owner.bind(loop)
         self._owner.record(self._request)
         if self._delay:
             await asyncio.sleep(self._delay)
+        if self._owner.hold_decision is not None:
+            await self._owner.hold_decision.wait()
         if self._hang:
-            await asyncio.Event().wait()
+            timeout = self._request.get("session_kwargs", {}).get("timeout")
+            total = getattr(timeout, "total", None)
+            if total is None:
+                await asyncio.Event().wait()
+            else:
+                try:
+                    await asyncio.wait_for(asyncio.Event().wait(), timeout=total)
+                except TimeoutError as timeout_exc:
+                    raise TimeoutError("auth deadline") from timeout_exc
         if self._error is not None:
             raise self._error
+        self._owner.decision_made.set()
         return FakeAuthResponse(self._status)
 
     async def __aexit__(self, *_exc):
@@ -237,6 +291,7 @@ class FakeAuthSession:
         self.kwargs = kwargs
         self.requests = []
         self.closed = False
+        self.close_entered = threading.Event()
         script.sessions.append(self)
 
     async def __aenter__(self):
@@ -247,6 +302,9 @@ class FakeAuthSession:
         return False
 
     async def close(self):
+        self.close_entered.set()
+        if getattr(self.script, "session_close_hang", False):
+            await asyncio.Event().wait()
         self.closed = True
 
     def get(self, url, *, headers=None, allow_redirects=None, **_kwargs):
@@ -260,7 +318,7 @@ class FakeAuthSession:
         return FakeAuthGet(
             self.script,
             request,
-            self.script.next_status(),
+            self.script.next_status(headers),
             self.script.error,
             self.script.hang,
             self.script.delay,
@@ -286,20 +344,27 @@ class FakeBackendWs:
         self.fail_enter = owner.fail_enter
         self._closed = asyncio.Event()
         self.loop = None
+        self.connect_entered = threading.Event()
 
     def __await__(self):
         return self._connect().__await__()
 
     async def _connect(self):
         self.loop = asyncio.get_running_loop()
-        if self.owner.connect_delay:
-            await asyncio.sleep(self.owner.connect_delay)
+        self.connect_entered.set()
+        owner = self.owner
+        if owner.connect_entered is not None:
+            owner.connect_entered.set()
+        if owner.connect_gate is not None:
+            await owner.connect_gate.wait()
+        if owner.connect_delay:
+            await asyncio.sleep(owner.connect_delay)
         if self.fail_enter:
             raise RuntimeError("backend unavailable")
-        if self.owner.hang_connect:
+        if owner.hang_connect:
             await asyncio.Event().wait()
-        self.owner.connections.append(self)
-        self.owner.connected.set()
+        owner.connections.append(self)
+        owner.connected.set()
         return self
 
     async def __aenter__(self):
@@ -317,8 +382,13 @@ class FakeBackendWs:
             return
         loop.call_soon_threadsafe(self.incoming.put_nowait, message)
 
+    def eof(self):
+        self.push(None)
+
     async def send_str(self, data):
         block = self.owner.send_block
+        if self.owner.send_entered is not None:
+            self.owner.send_entered.set()
         if block is not None:
             await block.wait()
         self.sent.append(("text", data))
@@ -327,6 +397,8 @@ class FakeBackendWs:
 
     async def send_bytes(self, data):
         block = self.owner.send_block
+        if self.owner.send_entered is not None:
+            self.owner.send_entered.set()
         if block is not None:
             await block.wait()
         self.sent.append(("bytes", data))
@@ -355,16 +427,22 @@ class FakeBackendSession:
     def __init__(self, owner, **kwargs):
         self.owner = owner
         self.kwargs = kwargs
+        self.closed = False
+        self.close_entered = threading.Event()
         owner.backend_sessions.append(self)
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *_exc):
+        await self.close()
         return False
 
     async def close(self):
-        return None
+        self.close_entered.set()
+        if self.owner.session_close_hang:
+            await asyncio.Event().wait()
+        self.closed = True
 
     def ws_connect(self, url, **kwargs):
         self.owner.ws_connect_calls.append((url, dict(kwargs)))
@@ -381,12 +459,23 @@ class FakeBackend:
         self.ws_connect_calls = []
         self.backend_sessions = []
         self.sent = []
-        self.sent_event = asyncio.Event()
-        self.connected = asyncio.Event()
+        self.sent_event = threading.Event()
+        self.connected = threading.Event()
         self.send_block = None
+        self.send_entered = None
+        self.connect_entered = threading.Event()
+        self.connect_gate = None
+        self.lookup_entered = threading.Event()
+        self.lookup_release = threading.Event()
+        self.lookup_release.set()
+        self.lookup_block = False
+        self.session_close_hang = False
 
     def address(self, chat_id, port):
         self.address_calls.append((chat_id, port))
+        self.lookup_entered.set()
+        if self.lookup_block:
+            self.lookup_release.wait()
         return f"sandbox.{chat_id}:{port}"
 
     def session(self, **kwargs):
@@ -410,12 +499,30 @@ def _install_fakes(app_module, monkeypatch, auth, backend, clock=None):
     return ws_recheck
 
 
-def _expect_close_code(socket, code):
-    message = socket.receive()
-    assert message["type"] == "websocket.close"
-    assert message.get("code") == code
-    return message
+def _expect_close_code(socket, code, timeout=2.0):
+    box = {}
 
+    def _recv():
+        try:
+            box["message"] = socket.receive()
+        except Exception as exc:
+            box["error"] = exc
+
+    worker = threading.Thread(target=_recv, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise AssertionError(f"timed out waiting for websocket close {code}")
+    if "error" in box:
+        observed = getattr(box["error"], "code", None)
+        if observed == code:
+            return {"type": "websocket.close", "code": code}
+        raise box["error"]
+    message = box.get("message") or {}
+    if message.get("type") == "websocket.close":
+        assert message.get("code") == code, message
+        return message
+    raise AssertionError(f"expected close {code}, got {message!r}")
 
 # ---------------------------------------------------------------------------
 # Admission: missing config/cookie must not touch Docker/backend.
@@ -889,3 +996,228 @@ class TestAuthRequestShape:
         assert parsed.path == AUTH_PATH
         assert parsed.query == ""
         assert parsed.fragment == ""
+
+
+class TestBackendEofClosesFrontend:
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_backend_eof_closes_frontend_1000(self, app_module, monkeypatch, kind):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, kind) as socket:
+                assert backend.connected.wait(2)
+                conn = backend.connections[0]
+                if kind == "cdp":
+                    socket.send_text("pre")
+                else:
+                    socket.send_bytes(b"pre")
+                deadline = time.monotonic() + 2
+                while not conn.sent and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                conn.eof()
+                _expect_close_code(socket, 1000)
+
+
+class TestLookupAndHungConnect:
+    def test_blocking_lookup_does_not_stall_sibling_recheck(
+        self, app_module, monkeypatch
+    ):
+        backend = FakeBackend()
+        auth = ScriptedAuth(
+            [200],
+            by_chat={CHAT: [200, 200, 200], CHAT_B: [200, 403]},
+        )
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        slow = FakeBackend()
+        slow.lookup_block = True
+        slow.lookup_release.clear()
+
+        def lookup(chat_id, port):
+            if chat_id == CHAT_B:
+                return slow.address(chat_id, port)
+            return backend.address(chat_id, port)
+
+        monkeypatch.setattr(app_module, "get_container_service_address", lookup)
+        with _client(app_module) as client:
+            with _ws_connect(client, "cdp", chat_id=CHAT, headers=_cookie_headers(COOKIE_A)) as sock_a:
+                assert backend.connected.wait(2)
+                starter = threading.Thread(
+                    target=lambda: _ws_connect(
+                        client, "ttyd", chat_id=CHAT_B, headers=_cookie_headers(COOKIE_B)
+                    ).__enter__(),
+                    daemon=True,
+                )
+                starter.start()
+                assert slow.lookup_entered.wait(2)
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                clock.advance(RECHECK_INTERVAL)
+                deadline = time.monotonic() + 2
+                while auth.pair_counts().get((COOKIE_A, CHAT), 0) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert auth.pair_counts().get((COOKIE_A, CHAT), 0) >= 2
+                sock_a.send_text("alive")
+                deadline = time.monotonic() + 2
+                while not backend.connections[0].sent and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                slow.lookup_release.set()
+
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_hung_connect_still_revokes_from_initial_success(
+        self, app_module, monkeypatch, kind
+    ):
+        backend = FakeBackend(hang_connect=True)
+        backend.connect_gate = asyncio.Event()
+        auth = ScriptedAuth([200, 403])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, kind) as socket:
+                assert backend.connect_entered.wait(2)
+                assert not backend.connections
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                clock.advance(RECHECK_INTERVAL)
+                _expect_close_code(socket, REVOKE_CODE)
+                assert not backend.connections
+
+
+class TestSessionCloseDoesNotBlockRevoke:
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_stuck_session_close_still_delivers_4401(
+        self, app_module, monkeypatch, kind
+    ):
+        backend = FakeBackend()
+        backend.session_close_hang = True
+        auth = ScriptedAuth([200, 403])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, kind) as socket:
+                assert backend.connected.wait(2)
+                conn = backend.connections[0]
+                conn.close_delay = 30.0
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                clock.advance(RECHECK_INTERVAL)
+                assert conn.close_started.wait(2)
+                _expect_close_code(socket, REVOKE_CODE)
+
+
+class TestHungAuthAndCancel:
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_initial_hung_auth_closes_1008(self, app_module, monkeypatch, kind):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200], hang=True)
+        _install_fakes(app_module, monkeypatch, auth, backend)
+        with _client(app_module) as client:
+            with pytest.raises(Exception) as exc:
+                with _ws_connect(client, kind):
+                    pass
+            assert getattr(exc.value, "code", None) == PREACCEPT_CODE
+        assert backend.address_calls == []
+
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_periodic_hung_auth_closes_4401(self, app_module, monkeypatch, kind):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, kind) as socket:
+                assert backend.connected.wait(2)
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                auth.hang = True
+                clock.advance(RECHECK_INTERVAL)
+                _expect_close_code(socket, REVOKE_CODE, timeout=6.0)
+
+
+class TestDecisionBarriersAndConcurrentPairs:
+    @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
+    def test_predecision_frame_forwards_postdecision_does_not(
+        self, app_module, monkeypatch, kind
+    ):
+        backend = FakeBackend()
+        auth = ScriptedAuth([200, 403])
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, kind) as socket:
+                assert backend.connected.wait(2)
+                conn = backend.connections[0]
+                pre = "pre-decision"
+                if kind == "cdp":
+                    socket.send_text(pre)
+                else:
+                    socket.send_bytes(pre.encode())
+                deadline = time.monotonic() + 2
+                while not conn.sent and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                deadline = time.monotonic() + 2
+                while not clock.sleeps and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                auth.pause_decisions()
+                clock.advance(RECHECK_INTERVAL)
+                assert auth.periodic_entered.wait(2)
+                if kind == "cdp":
+                    socket.send_text("allowed-before-decision")
+                else:
+                    socket.send_bytes(b"allowed-before-decision")
+                deadline = time.monotonic() + 2
+                while not any("allowed-before-decision" in str(item[1]) for item in conn.sent) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert any("allowed-before-decision" in str(item[1]) for item in conn.sent)
+                auth.resume_decisions()
+                assert auth.decision_made.wait(2)
+                if kind == "cdp":
+                    socket.send_text(FUTURE_MARKER)
+                else:
+                    socket.send_bytes(FUTURE_MARKER.encode())
+                _expect_close_code(socket, REVOKE_CODE)
+                assert all(FUTURE_MARKER not in str(item[1]) for item in conn.sent)
+
+    def test_concurrent_pairs_each_recheck_and_b_revokes_alone(
+        self, app_module, monkeypatch
+    ):
+        backend = FakeBackend()
+        auth = ScriptedAuth(
+            [200],
+            by_chat={CHAT: [200, 200, 200], CHAT_B: [200, 403]},
+        )
+        clock = RecordingClock()
+        _install_fakes(app_module, monkeypatch, auth, backend, clock)
+        with _client(app_module) as client:
+            with _ws_connect(client, "cdp", chat_id=CHAT, headers=_cookie_headers(COOKIE_A)) as sock_a:
+                with _ws_connect(
+                    client, "ttyd", chat_id=CHAT_B, headers=_cookie_headers(COOKIE_B)
+                ) as sock_b:
+                    deadline = time.monotonic() + 2
+                    while len(backend.connections) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    deadline = time.monotonic() + 2
+                    while len(clock.sleeps) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    clock.advance(RECHECK_INTERVAL)
+                    deadline = time.monotonic() + 2
+                    while (
+                        auth.pair_counts().get((COOKIE_A, CHAT), 0) < 2
+                        or auth.pair_counts().get((COOKIE_B, CHAT_B), 0) < 2
+                    ) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    counts = auth.pair_counts()
+                    assert counts.get((COOKIE_A, CHAT), 0) >= 2
+                    assert counts.get((COOKIE_B, CHAT_B), 0) >= 2
+                    _expect_close_code(sock_b, REVOKE_CODE)
+                    sock_a.send_text("a-still-open")
+                    deadline = time.monotonic() + 2
+                    while not any("a-still-open" in str(item[1]) for item in backend.connections[0].sent) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    assert any("a-still-open" in str(item[1]) for item in backend.connections[0].sent)
