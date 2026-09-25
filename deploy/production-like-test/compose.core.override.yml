@@ -63,7 +63,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      CONTAINER_MAX_AGE_HOURS: ${CONTAINER_MAX_AGE_HOURS}
+      CONTAINER_MAX_AGE_HOURS: ${CONTAINER_MAX_AGE_HOURS-168}
       RETENTION_CHECK_INTERVAL_SECONDS: ${RETENTION_CHECK_INTERVAL_SECONDS}
     security_opt:
       - no-new-privileges:true

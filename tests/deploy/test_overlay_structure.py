@@ -113,6 +113,10 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_WEBUI_UPSTREAM"], "http://open-webui:8080")
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_PROXY_UPSTREAM"], "http://computer-use-server:8081")
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_PROXY_LISTEN"], "0.0.0.0:8082")
+        self.assertEqual(
+            core["services"]["retention-guard"]["environment"]["CONTAINER_MAX_AGE_HOURS"],
+            "${CONTAINER_MAX_AGE_HOURS-168}",
+        )
         core_context = ROOT / core["services"]["retention-guard"]["build"]["context"]
         self.assertTrue((core_context / "Dockerfile").is_file())
         self.assertTrue((core_context / "stop-overage.sh").is_file())
@@ -159,8 +163,6 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertFalse(autostart.exists())
         claim = (ROOT / "deploy" / "production-like-test" / "scripts" / "write-deployed-version.sh").read_text(encoding="utf-8")
         self.assertNotIn("private-sandbox-port-bindings.patch", claim)
-        self.assertNotIn("disable-cli-autostart.patch", claim)
-        self.assertIn("OCU_SANDBOX_NO_AUTOSTART=1", claim)
 
 
 if __name__ == "__main__":

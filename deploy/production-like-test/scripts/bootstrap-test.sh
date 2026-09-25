@@ -155,7 +155,13 @@ from urllib.parse import urlsplit
 value = sys.argv[1]
 if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
     raise SystemExit(1)
-parsed = urlsplit(value)
+if any(marker in value for marker in ("@", "?", "#")):
+    raise SystemExit(1)
+try:
+    parsed = urlsplit(value)
+    port = parsed.port
+except ValueError:
+    raise SystemExit(1)
 if (
     parsed.scheme not in {"http", "https"}
     or not parsed.hostname
@@ -167,6 +173,8 @@ if (
     or value.endswith("/")
     or parsed.netloc != parsed.netloc.lower()
 ):
+    raise SystemExit(1)
+if port is not None and not (1 <= port <= 65535):
     raise SystemExit(1)
 PY
 
@@ -222,6 +230,9 @@ internal_token=$(openssl rand -hex 32)
 
 runtime_tmp=$(mktemp "$runtime_dir/.runtime.env.XXXXXX")
 credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX")
+if [ "${OCU_BOOTSTRAP_FAIL_AFTER_TEMP:-}" = "1" ]; then
+    fail 'injected post-temp failure'
+fi
 
 {
     printf '%s\n' 'COMPOSE_PROJECT_NAME=ocu-test'

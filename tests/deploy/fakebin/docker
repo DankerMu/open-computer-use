@@ -69,19 +69,17 @@ def inspect_network(state: Path, name: str) -> int:
     sys.stderr.write(f"Error: No such network: {name}\n")
     return 1
 
-INTERPOLATION = re.compile(r"\$\$|\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+INTERPOLATION = re.compile(r"\$\{([^}]+)\}")
 
 
 def interpolate_value(value, env):
     if isinstance(value, str):
-        def replace(match):
-            token = match.group(0)
-            if token == "$$":
-                return "$"
-            name = match.group(1) or match.group(2)
-            return env.get(name, "")
+        unescaped = value.replace("$$", "$")
 
-        return INTERPOLATION.sub(replace, value)
+        def replace(match):
+            return env.get(match.group(1), "")
+
+        return INTERPOLATION.sub(replace, unescaped)
     if isinstance(value, list):
         return [interpolate_value(item, env) for item in value]
     if isinstance(value, dict):

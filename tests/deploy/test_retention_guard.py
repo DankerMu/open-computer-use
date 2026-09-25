@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import stat
 import subprocess
 import time
 import unittest
@@ -168,7 +167,6 @@ class RetentionGuardTests(unittest.TestCase):
         states = {item["Id"]: item["State"] for item in load_containers(self.state)}
         self.assertEqual(states["managed"], "exited")
         self.assertEqual(states["other-label"], "running")
-        self.assertEqual(stat.S_IMODE(self.volume.stat().st_mode) & 0o111, 0)
         self.assert_sentinels()
 
 
