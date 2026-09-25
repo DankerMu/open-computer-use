@@ -118,13 +118,17 @@ def create_network(state: Path, argv: list[str]) -> int:
             gateway = args.pop(0)
         elif token == "--label" and args:
             args.pop(0)
+    net_id = f"id-{name}"
     write_json(
         network_path(state, name),
         {
             "Name": name,
-            "Id": f"id-{name}",
+            "Id": net_id,
             "Driver": driver,
             "Internal": internal,
+            "Options": {
+                "com.docker.network.bridge.name": "br-" + net_id[:12],
+            },
             "IPAM": {"Config": [{"Subnet": subnet, "Gateway": gateway}]},
         },
     )
@@ -292,14 +296,45 @@ def compose_up(state: Path, argv: list[str]) -> int:
     return 0
 
 
+def docker_info(state: Path) -> int:
+    payload = {
+        "Driver": "overlay2",
+        "SecurityOptions": [],
+        "CgroupDriver": "systemd",
+        "FirewallBackend": "iptables",
+        "Rootless": False,
+    }
+    override = state / "docker-info.json"
+    if override.exists():
+        payload.update(json.loads(override.read_text(encoding="utf-8")))
+    if payload.get("error"):
+        sys.stderr.write(str(payload.get("message", "docker info failed")) + "\n")
+        return int(payload.get("code", 1))
+    sys.stdout.write(json.dumps(payload))
+    return 0
+
+
 def main(argv: list[str]) -> int:
     state = state_dir()
     log(argv, state)
     if len(argv) >= 2 and argv[0] == "network" and argv[1] == "inspect":
-        name = argv[2]
+        name = None
+        args = argv[2:]
+        while args:
+            token = args.pop(0)
+            if token in {"--format", "-f"} and args:
+                args.pop(0)
+                continue
+            if not token.startswith("-") and name is None:
+                name = token
+        if not name:
+            sys.stderr.write("docker network inspect requires a name\n")
+            return 1
         return inspect_network(state, name)
     if len(argv) >= 2 and argv[0] == "network" and argv[1] == "create":
         return create_network(state, argv[2:])
+    if argv and argv[0] == "info":
+        return docker_info(state)
     if argv and argv[0] == "compose":
         rest = argv[1:]
         if "config" in rest:

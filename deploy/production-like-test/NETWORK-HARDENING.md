@@ -2,19 +2,19 @@
 
 ## 部署入口与端口边界
 
-从源码 checkout 根目录配置运行环境后运行 `deploy/up.sh`。入口依次解析 core、WebUI、proxy 三套 Compose 配置为私有临时 JSON，运行 `deploy/check-ports.sh` 与 `deploy/provision-networks.sh`，然后用已检查的快照启动 core 和 WebUI，最后启动 proxy。core/WebUI 的项目目录是源码根；proxy 的项目目录是 overlay，以保持 `../proxy` 构建上下文。启动时覆盖 `COMPOSE_REMOVE_ORPHANS=false` 和 `COMPOSE_PROFILES=`，避免拆除共享项目中的兄弟栈或激活 cleanup。nginx 在配置校验时解析 `open-webui:8080` 和 `computer-use-server:8081`，因此两个应用必须先存在。入口监督配置解析、快照冻结、检查、建网和启动子进程；TERM/INT/HUP 会结束所属进程组并删除私有临时文件，但不会 `down`、删除卷、迁移网络或修改现存 sandbox。
+从源码 checkout 根目录配置运行环境后运行 `deploy/up.sh`。入口依次解析 core、WebUI、proxy 三套 Compose 配置为私有临时 JSON，运行 `deploy/check-ports.sh` 与 `deploy/provision-networks.sh`，再通过 `run_owned` 运行 `deploy/firewall/docker-user-rules.sh` 与 `deploy/firewall/check.sh`，然后用已检查的快照启动 core 和 WebUI，最后启动 proxy。core/WebUI 的项目目录是源码根；proxy 的项目目录是 overlay，以保持 `../proxy` 构建上下文。启动时覆盖 `COMPOSE_REMOVE_ORPHANS=false` 和 `COMPOSE_PROFILES=`，避免拆除共享项目中的兄弟栈或激活 cleanup。nginx 在配置校验时解析 `open-webui:8080` 和 `computer-use-server:8081`，因此两个应用必须先存在。入口监督配置解析、快照冻结、检查、建网、防火墙安装和启动子进程；TERM/INT/HUP 会结束所属进程组并删除私有临时文件，但不会 `down`、删除卷、迁移网络、刷新共享防火墙链或修改现存 sandbox。
 
 - 只有 proxy 将 `${OCU_PROXY_PORT}` 映射到容器的 TCP 8082。WebUI、Computer Use、PostgreSQL、initializer 和维护服务不得发布宿主机端口，即使只绑定 loopback 也不允许。
 - 应用服务仅连接由 `${OCU_PRIVATE_NETWORK}` 命名、`${OCU_PRIVATE_SUBNET}` 与 `${OCU_PRIVATE_GATEWAY}` 定址的 control-plane bridge；proxy 通过同一 bridge 的 Docker DNS 找到应用。显式 `network_mode`（包括 `bridge`）不得代替该命名网。
 - `${OCU_SANDBOX_NETWORK}` 是部署入口单独创建或校验的非 internal bridge，具有 `${OCU_SANDBOX_SUBNET}` 和 `${OCU_SANDBOX_GATEWAY}`。Compose 服务不加入此网络。OCU 将 CDP/ttyd 动态端口只绑定到该 gateway，且原生网络策略只允许 sandbox 连接这张 bridge。
 - Open WebUI 必须设置 `ENABLE_OCU_WORKSPACE=true` 和 `OCU_INTERNAL_URL=http://computer-use-server:8081`；`ORCHESTRATOR_URL` 不是客户端别名。
-- 运行环境必须显式提供 `OCU_PRIVATE_NETWORK`、`OCU_PRIVATE_SUBNET`、`OCU_PRIVATE_GATEWAY`、`OCU_SANDBOX_NETWORK`、`OCU_SANDBOX_SUBNET`、`OCU_SANDBOX_GATEWAY`、`OCU_PROXY_PORT`、`OCU_PROXY_IMAGE`、`OCU_INTERNAL_TOKEN`、`OCU_WEBUI_ORIGIN`、`OCU_WEBUI_AUTH_URL` 和 `PUBLIC_BASE_URL`，以及既有应用和 provider 的必要变量。不要将 token 写在命令行、日志或仓库文件中。现有 bootstrap 文件的变量清单与备份固定库存分别由 #26、#34 更新；在此前缺少新变量时部署入口拒绝启动。
+- 运行环境必须显式提供 `OCU_PRIVATE_NETWORK`、`OCU_PRIVATE_SUBNET`、`OCU_PRIVATE_GATEWAY`、`OCU_SANDBOX_NETWORK`、`OCU_SANDBOX_SUBNET`、`OCU_SANDBOX_GATEWAY`、`OCU_SANDBOX_EGRESS_ALLOW`、`OCU_PROXY_PORT`、`OCU_PROXY_IMAGE`、`OCU_INTERNAL_TOKEN`、`OCU_WEBUI_ORIGIN`、`OCU_WEBUI_AUTH_URL` 和 `PUBLIC_BASE_URL`，以及既有应用和 provider 的必要变量。`OCU_SANDBOX_EGRESS_ALLOW` 未设置是配置错误；显式空值表示拒绝全部新的 sandbox 出站。不要将 token 写在命令行、日志或仓库文件中。现有 bootstrap 文件的变量清单与备份固定库存分别由 #26、#34 更新；在此前缺少新变量时部署入口拒绝启动。
 
-`deploy/check-ports.sh` 的输入是 **完整的** `docker compose config --format json` 输出集合，不能用原始 YAML 代替；`expose` 不发布端口。bridge 已存在但 driver、internal 模式、subnet 或 gateway 不匹配时入口拒绝启动，不删除、替换、断开网络或现存 sandbox。DNS 解析、真实镜像构建、Compose 合并和引擎端口矩阵的实际验收留给 #36。
+`deploy/check-ports.sh` 的输入是 **完整的** `docker compose config --format json` 输出集合，不能用原始 YAML 代替；`expose` 不发布端口。bridge 已存在但 driver、internal 模式、subnet 或 gateway 不匹配时入口拒绝启动，不删除、替换、断开网络或现存 sandbox。防火墙安装绑定权威 sandbox 网桥入口接口，而不是源地址；同一宿主机只维护一份 owned 策略。安装器与检查器通过 `OCU_SANDBOX_EGRESS_LOCK`（默认 `$XDG_RUNTIME_DIR/ocu-sandbox-egress.lock`，否则 `/run/user/$UID/ocu-sandbox-egress.lock`）串行化合作进程。DNS 解析、真实镜像构建、Compose 合并、内核数据包路径和引擎端口矩阵的实际验收留给 #36。
 
 ## 已知边界
 
-当前拓扑并不宣称 sandbox 对 control plane 具备 L3 隔离。`DOCKER-USER` 防火墙规则和部署入口的对应检查由 #25 添加；在该检查交付前不能把 proxy-only 端口矩阵称为安全的 LAN 隔离。`computer-use-server` 仍挂载 Docker socket，是高权限可信组件。未经授权的直接 OCU 入口不得用作回滚方案。
+部署入口在建网之后、启动应用之前安装并核对 sandbox 出站策略：IPv4 经 `DOCKER-USER` 与 `INPUT` 的接口挂钩，IPv6 经 `INPUT` 与 `FORWARD` 默认 DROP。允许列表只豁免本守卫，不绕过后续宿主机策略；control-plane 子网与 metadata `169.254.169.254/32` 即使被宽网段覆盖也仍 DROP。控制面发起的 CDP/ttyd 应答走 conntrack `REPLY`，sandbox 发起的 ORIGINAL 已建立流仍受当前允许列表约束。该守卫不关闭 Docker 继承的宿主机 DNS 转发；完整 all-egress 关闭还需要 #79。真实 iptables/ip6tables、本机/转发数据包、CDP/ttyd 应答与 DNS 证据属于 #36。`computer-use-server` 仍挂载 Docker socket，是高权限可信组件。未经授权的直接 OCU 入口不得用作回滚方案。
 
 ## 正式离线生产建议
 

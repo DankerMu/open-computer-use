@@ -3,6 +3,7 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Sandbox egress destination guard.** Deployment requires `OCU_SANDBOX_EGRESS_ALLOW`, a comma-separated IPv4 address/CIDR allowlist. Unset fails configuration; an explicitly empty value denies all new sandbox-initiated IP traffic. After network provisioning and before any Compose start, `deploy/up.sh` runs `deploy/firewall/docker-user-rules.sh` and `deploy/firewall/check.sh` through `run_owned`. IPv4 policy is interface-scoped on the sandbox bridge via `DOCKER-USER` and `INPUT`: REPLY-only ESTABLISHED/RELATED RETURN, control-plane and metadata DROP, one RETURN per allowlisted destination, then unconditional DROP. IPv6 sandbox ingress is dropped on INPUT and FORWARD. The installer reconciles only owned chains and jumps, preserves foreign rules, and serializes cooperating processes with `OCU_SANDBOX_EGRESS_LOCK` (default `$XDG_RUNTIME_DIR/ocu-sandbox-egress.lock`). Docker inherited host-namespace DNS remains open until issue 79; real kernel and engine packet evidence remains issue 36.
 - **Proxy-only production-like deployment topology.** The core and WebUI
   overrides remove direct host publications; a standalone unprivileged proxy
   image renders the canonical nginx policy after both application stacks are
