@@ -139,6 +139,7 @@ echo "[init] Tool valves set: ORCHESTRATOR_URL=$ORCHESTRATOR_URL"
 # a failure here must block the marker file — otherwise the next restart skips init
 # and the tool stays admin-only forever.
 INIT_FAILED=0
+WORKSPACE_ID=""
 if curl -sf -X POST "$WEBUI_URL/api/v1/tools/id/ai_computer_use/access/update" \
     -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"access_grants":[
@@ -310,24 +311,54 @@ print(json.dumps({
     }
 }))
 ")
-    WORKSPACE_ID=$(printf '%s' "$MODEL_PAYLOAD" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
-    LOOKUP_FILE=$(mktemp "${TMPDIR:-/tmp}/ocu-init-model.XXXXXX")
-    LOOKUP_STATUS=$(curl -sS -o "$LOOKUP_FILE" -w '%{http_code}' \
-        "$WEBUI_URL/api/v1/models/model?id=$WORKSPACE_ID" -H "$AUTH" || true)
-    rm -f "$LOOKUP_FILE"
-    if [ "$LOOKUP_STATUS" = "200" ]; then
-        if curl -sf -X POST "$WEBUI_URL/api/v1/models/model/update?id=$WORKSPACE_ID" \
+    EXPECTED_WORKSPACE_ID=$(printf '%s' "$MODEL_PAYLOAD" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+    LOOKUP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+        "$WEBUI_URL/api/v1/models/model?id=$EXPECTED_WORKSPACE_ID" -H "$AUTH" || true)
+    persist_workspace_model() {
+        local method=$1
+        local url=$2
+        local raw
+        raw=$(curl -sf -X "$method" "$url" \
             -H "$AUTH" -H "Content-Type: application/json" \
-            -d "$MODEL_PAYLOAD" >/dev/null; then
+            -d "$MODEL_PAYLOAD") || return 1
+        printf '%s' "$raw" | EXPECTED_WORKSPACE_ID="$EXPECTED_WORKSPACE_ID" python3 -c "
+import json, os, sys
+raw = sys.stdin.read()
+if not raw.strip() or raw.strip() == 'null':
+    raise SystemExit('workspace model response is empty')
+model = json.loads(raw)
+if not isinstance(model, dict):
+    raise SystemExit('workspace model response is not an object')
+expected = os.environ['EXPECTED_WORKSPACE_ID']
+if model.get('id') != expected:
+    raise SystemExit(f'workspace model id mismatch: {model.get(\"id\")!r}')
+meta = model.get('meta')
+params = model.get('params')
+if not isinstance(meta, dict) or not isinstance(params, dict):
+    raise SystemExit('workspace model is missing persisted metadata or params')
+tool_ids = meta.get('toolIds') or []
+filter_ids = meta.get('filterIds') or []
+if 'ai_computer_use' not in tool_ids:
+    raise SystemExit('workspace model is missing Computer Use tool metadata')
+if 'computer_use_filter' not in filter_ids:
+    raise SystemExit('workspace model is missing Computer Use filter metadata')
+if params.get('function_calling') != 'native':
+    raise SystemExit('workspace model did not persist native function calling')
+if params.get('stream_response') is not True:
+    raise SystemExit('workspace model did not persist stream_response')
+" || return 1
+    }
+    if [ "$LOOKUP_STATUS" = "200" ]; then
+        if persist_workspace_model POST "$WEBUI_URL/api/v1/models/model/update?id=$EXPECTED_WORKSPACE_ID"; then
+            WORKSPACE_ID="$EXPECTED_WORKSPACE_ID"
             echo "[init] Workspace model updated: $FIRST_MODEL (Computer Use)"
         else
             echo "[init] ERROR: Could not update workspace model $FIRST_MODEL. Init will retry on next restart." >&2
             INIT_FAILED=1
         fi
     elif [ "$LOOKUP_STATUS" = "404" ]; then
-        if curl -sf -X POST "$WEBUI_URL/api/v1/models/create" \
-            -H "$AUTH" -H "Content-Type: application/json" \
-            -d "$MODEL_PAYLOAD" >/dev/null; then
+        if persist_workspace_model POST "$WEBUI_URL/api/v1/models/create"; then
+            WORKSPACE_ID="$EXPECTED_WORKSPACE_ID"
             echo "[init] Workspace model created: $FIRST_MODEL (Computer Use)"
         else
             echo "[init] ERROR: Could not create workspace model $FIRST_MODEL. Init will retry on next restart." >&2

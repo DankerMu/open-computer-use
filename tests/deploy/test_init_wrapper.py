@@ -97,6 +97,14 @@ def leftover_init(root: Path) -> list[Path]:
     ]
 
 
+def leftover_model_files(root: Path) -> list[Path]:
+    return [
+        path
+        for path in root.rglob("ocu-init-model.*")
+        if path.is_file() and path.name.startswith("ocu-init-model.")
+    ]
+
+
 class FakeWebUI:
     def __init__(self):
         self.mode = "unavailable"
@@ -104,6 +112,7 @@ class FakeWebUI:
         self.bodies: dict[str, object] = {}
         self.unexpected: list[str] = []
         self.hold_path = ""
+        self.hold_request = ""
         self.entered = threading.Event()
         self.lock = threading.Lock()
         self.existing_config = {
@@ -148,16 +157,20 @@ class FakeWebUI:
                     if payload is not None:
                         owner.bodies[key] = payload
 
-            def _hold_if_needed(self):
+            def _hold_if_needed(self, method):
                 if not owner.hold_path:
                     return
+                if owner.hold_request:
+                    parsed = urlparse(self.path)
+                    if f"{method} {parsed.path}" != owner.hold_request:
+                        return
                 marker = Path(owner.hold_path)
                 owner.entered.set()
                 while marker.exists():
                     time.sleep(0.05)
 
             def do_GET(self):
-                self._hold_if_needed()
+                self._hold_if_needed("GET")
                 parsed = urlparse(self.path)
                 path = parsed.path
                 self._record("GET")
@@ -213,7 +226,7 @@ class FakeWebUI:
                 self.send_error(404)
 
             def do_POST(self):
-                self._hold_if_needed()
+                self._hold_if_needed("POST")
                 payload = self._read_body()
                 parsed = urlparse(self.path)
                 path = parsed.path
@@ -290,6 +303,8 @@ class FakeWebUI:
                     owner.workspace_models[model_id] = payload or {}
                     return self._json(200, payload)
                 if path == "/api/v1/models/model/update":
+                    if owner.mode == "workspace-update-null":
+                        return self._json(200, None)
                     model_id = (payload or {}).get("id", PRIMARY_MODEL)
                     owner.workspace_models[model_id] = payload or {}
                     return self._json(200, payload)
@@ -297,8 +312,19 @@ class FakeWebUI:
                     if owner.mode == "workspace-access-failure":
                         self.send_error(503)
                         return
+                    model_id = (payload or {}).get("id") or PRIMARY_MODEL
+                    if model_id not in owner.workspace_models:
+                        owner.workspace_models[model_id] = {
+                            "id": model_id,
+                            "name": (payload or {}).get("name") or model_id,
+                            "meta": {},
+                            "params": {},
+                        }
                     owner.workspace_access = payload
-                    return self._json(200, payload)
+                    owner.workspace_models[model_id]["access_grants"] = (
+                        payload or {}
+                    ).get("access_grants")
+                    return self._json(200, owner.workspace_models[model_id])
                 self.send_error(404)
 
             def _json(self, status, payload):
@@ -321,6 +347,7 @@ class FakeWebUI:
 
     def stop(self):
         self.hold_path = ""
+        self.hold_request = ""
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
@@ -493,6 +520,7 @@ class InitWrapperTests(unittest.TestCase):
         self.assertFalse((self.data / MARKER_NAME).exists())
         self.assert_no_secret(result)
         self.assertIn("POST /api/v1/models/create", self.webui.calls)
+        self.assertNotIn("POST /api/v1/models/model/access/update", self.webui.calls)
         self.assertEqual(self.webui.workspace_models, {})
         self.assertIsNone(self.webui.workspace_access)
 
@@ -504,7 +532,11 @@ class InitWrapperTests(unittest.TestCase):
         self.assert_no_secret(result)
         self.assertTrue(any(call.startswith("GET /api/v1/models/model") for call in self.webui.calls))
         self.assertNotIn("POST /api/v1/models/create", self.webui.calls)
+        self.assertNotIn("POST /api/v1/models/model/update", self.webui.calls)
+        self.assertNotIn(f"POST /api/v1/models/model/update?id={PRIMARY_MODEL}", self.webui.calls)
+        self.assertNotIn("POST /api/v1/models/model/access/update", self.webui.calls)
         self.assertEqual(self.webui.workspace_models, {})
+        self.assertIsNone(self.webui.workspace_access)
 
     def test_workspace_access_failure_keeps_created_model_unmarked(self):
         self.webui.mode = "workspace-access-failure"
@@ -514,6 +546,66 @@ class InitWrapperTests(unittest.TestCase):
         self.assert_no_secret(result)
         self.assertIn(PRIMARY_MODEL, self.webui.workspace_models)
         self.assertIsNone(self.webui.workspace_access)
+
+    def test_workspace_update_null_does_not_grant_or_write_marker(self):
+        stale = {
+            "id": PRIMARY_MODEL,
+            "name": "stale-name",
+            "base_model_id": PRIMARY_MODEL,
+            "meta": {"description": "stale", "toolIds": [], "filterIds": []},
+            "params": {"function_calling": "off", "stream_response": False},
+        }
+        self.webui.workspace_models[PRIMARY_MODEL] = dict(stale)
+        self.webui.mode = "workspace-update-null"
+        result = self.run_wrapper()
+        self.assertNotEqual(result.returncode, 0, self.combined(result))
+        self.assertFalse((self.data / MARKER_NAME).exists())
+        self.assert_no_secret(result)
+        self.assertIn(f"POST /api/v1/models/model/update?id={PRIMARY_MODEL}", self.webui.calls)
+        self.assertNotIn("POST /api/v1/models/model/access/update", self.webui.calls)
+        self.assertEqual(self.webui.workspace_models[PRIMARY_MODEL], stale)
+        self.assertIsNone(self.webui.workspace_access)
+
+    def test_workspace_update_null_then_success_persists_model_and_grants(self):
+        stale = {
+            "id": PRIMARY_MODEL,
+            "name": "stale-name",
+            "base_model_id": PRIMARY_MODEL,
+            "meta": {"description": "stale", "toolIds": [], "filterIds": []},
+            "params": {"function_calling": "off", "stream_response": False},
+        }
+        self.webui.workspace_models[PRIMARY_MODEL] = dict(stale)
+        self.webui.mode = "workspace-update-null"
+        failed = self.run_wrapper()
+        self.assertNotEqual(failed.returncode, 0, self.combined(failed))
+        self.assertFalse((self.data / MARKER_NAME).exists())
+        self.assertEqual(self.webui.workspace_models[PRIMARY_MODEL], stale)
+        self.assertIsNone(self.webui.workspace_access)
+        self.webui.mode = "success"
+        succeeded = self.run_wrapper()
+        self.assertEqual(succeeded.returncode, 0, self.combined(succeeded))
+        self.assertTrue((self.data / MARKER_NAME).is_file())
+        self.assert_no_secret(succeeded)
+        self.assert_required_setup()
+        workspace = self.webui.workspace_models[PRIMARY_MODEL]
+        self.assertEqual(workspace["meta"]["toolIds"], ["ai_computer_use"])
+        self.assertEqual(workspace["meta"]["filterIds"], ["computer_use_filter"])
+        self.assertEqual(workspace["params"]["function_calling"], "native")
+        self.assertTrue(workspace["params"]["stream_response"])
+
+    def test_workspace_create_failure_then_success_persists_model_and_grants(self):
+        self.webui.mode = "workspace-create-failure"
+        failed = self.run_wrapper()
+        self.assertNotEqual(failed.returncode, 0, self.combined(failed))
+        self.assertFalse((self.data / MARKER_NAME).exists())
+        self.assertEqual(self.webui.workspace_models, {})
+        self.assertIsNone(self.webui.workspace_access)
+        self.webui.mode = "success"
+        succeeded = self.run_wrapper()
+        self.assertEqual(succeeded.returncode, 0, self.combined(succeeded))
+        self.assertTrue((self.data / MARKER_NAME).is_file())
+        self.assert_no_secret(succeeded)
+        self.assert_required_setup()
 
     def test_success_after_failure_writes_marker_without_secret(self):
         self.webui.mode = "auth-failure"
@@ -530,11 +622,12 @@ class InitWrapperTests(unittest.TestCase):
         self.assertEqual(skipped.returncode, 0, self.combined(skipped))
         self.assertIn("Already initialized", skipped.stdout)
 
-    def _signal_during_held_http(self, sig):
+    def _signal_during_held_http(self, sig, hold_request=""):
         self.webui.mode = "success"
         hold = self.root / "http-hold"
         hold.write_text("1", encoding="utf-8")
         self.webui.hold_path = str(hold)
+        self.webui.hold_request = hold_request
         env = os.environ.copy()
         env.update({
             "OCU_INIT_SOURCE_ROOT": str(self.source),
@@ -565,6 +658,7 @@ class InitWrapperTests(unittest.TestCase):
             owned = leftover_init(self.root)
             self.assertEqual(len(owned), 1)
             self.assertEqual(stat.S_IMODE(owned[0].stat().st_mode), 0o700)
+            self.assertEqual(leftover_model_files(self.root), [])
             children = descendant_pids(process.pid)
             self.assertTrue(children, "held initializer child was not recorded")
             process.send_signal(sig)
@@ -578,6 +672,7 @@ class InitWrapperTests(unittest.TestCase):
             )
             self.assertFalse((self.data / MARKER_NAME).exists())
             self.assertEqual(leftover_init(self.root), [])
+            self.assertEqual(leftover_model_files(self.root), [])
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGKILL)
@@ -586,6 +681,7 @@ class InitWrapperTests(unittest.TestCase):
                     os.kill(pid, signal.SIGKILL)
             hold.unlink(missing_ok=True)
             self.webui.hold_path = ""
+            self.webui.hold_request = ""
             process.communicate(timeout=10)
         self.assertNotEqual(process.returncode, 0)
 
@@ -594,6 +690,23 @@ class InitWrapperTests(unittest.TestCase):
 
     def test_hup_during_held_http_removes_owned_tmp_and_children(self):
         self._signal_during_held_http(signal.SIGHUP)
+
+    def test_term_during_held_model_lookup_leaves_no_lookup_tempfile(self):
+        self.webui.workspace_models[PRIMARY_MODEL] = {
+            "id": PRIMARY_MODEL,
+            "name": "existing (Computer Use)",
+            "base_model_id": PRIMARY_MODEL,
+            "meta": {
+                "description": "existing workspace model without secrets",
+                "toolIds": ["ai_computer_use"],
+                "filterIds": ["computer_use_filter"],
+            },
+            "params": {"function_calling": "native", "stream_response": True},
+        }
+        self._signal_during_held_http(
+            signal.SIGTERM,
+            hold_request="GET /api/v1/models/model",
+        )
 
 
     def test_term_during_generate_removes_owned_tmp_and_children(self):
