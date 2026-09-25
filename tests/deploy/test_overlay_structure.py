@@ -13,6 +13,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised by missing-dependency CI
     raise ImportError("PyYAML is required for parsed overlay checks") from exc
 
+from interpolation import UnsupportedInterpolation, interpolate_value
 from support import (
     CORE_OVERRIDE,
     PROXY_COMPOSE,
@@ -113,10 +114,15 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_WEBUI_UPSTREAM"], "http://open-webui:8080")
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_PROXY_UPSTREAM"], "http://computer-use-server:8081")
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_PROXY_LISTEN"], "0.0.0.0:8082")
-        self.assertEqual(
-            core["services"]["retention-guard"]["environment"]["CONTAINER_MAX_AGE_HOURS"],
-            "${CONTAINER_MAX_AGE_HOURS-168}",
-        )
+        age = core["services"]["retention-guard"]["environment"]["CONTAINER_MAX_AGE_HOURS"]
+        self.assertEqual(interpolate_value(age, {}), "168")
+        self.assertEqual(interpolate_value(age, {"CONTAINER_MAX_AGE_HOURS": ""}), "")
+        self.assertEqual(interpolate_value(age, {"CONTAINER_MAX_AGE_HOURS": "24"}), "24")
+        colon_default = "${CONTAINER_MAX_AGE_HOURS:-168}"
+        self.assertEqual(interpolate_value(colon_default, {"CONTAINER_MAX_AGE_HOURS": ""}), "168")
+        self.assertNotEqual(interpolate_value(age, {"CONTAINER_MAX_AGE_HOURS": ""}), "168")
+        with self.assertRaises(UnsupportedInterpolation):
+            interpolate_value("${CONTAINER_MAX_AGE_HOURS/foo/bar}", {})
         core_context = ROOT / core["services"]["retention-guard"]["build"]["context"]
         self.assertTrue((core_context / "Dockerfile").is_file())
         self.assertTrue((core_context / "stop-overage.sh").is_file())

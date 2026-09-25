@@ -230,9 +230,6 @@ internal_token=$(openssl rand -hex 32)
 
 runtime_tmp=$(mktemp "$runtime_dir/.runtime.env.XXXXXX")
 credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX")
-if [ "${OCU_BOOTSTRAP_FAIL_AFTER_TEMP:-}" = "1" ]; then
-    fail 'injected post-temp failure'
-fi
 
 {
     printf '%s\n' 'COMPOSE_PROJECT_NAME=ocu-test'

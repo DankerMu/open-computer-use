@@ -91,6 +91,9 @@ def leftover_hidden(directory: Path) -> list[Path]:
 
 def token_docs():
     docs = intended_docs()
+    docs["core.json"]["__unresolved__"] = True
+    docs["webui.json"]["__unresolved__"] = True
+    docs["proxy.json"]["__unresolved__"] = True
     docs["core.json"]["services"][OCU_SERVICE]["environment"] = {
         "OCU_INTERNAL_TOKEN": "${OCU_INTERNAL_TOKEN}",
     }
@@ -293,18 +296,15 @@ class BootstrapRuntimeTests(unittest.TestCase):
         ]
         self.assertEqual([row["stack"] for row in executed], ["core", "webui", "proxy"])
         by_stack = {row["stack"]: row for row in executed}
-        self.assertEqual(
-            by_stack["core"]["consumer_document"]["services"][OCU_SERVICE]["environment"]["OCU_INTERNAL_TOKEN"],
-            token,
-        )
-        self.assertEqual(
-            by_stack["webui"]["consumer_document"]["services"][WEBUI_SERVICE]["environment"]["OCU_INTERNAL_TOKEN"],
-            token,
-        )
-        self.assertEqual(
-            by_stack["proxy"]["consumer_document"]["services"][PROXY_SERVICE]["environment"]["OCU_INTERNAL_TOKEN"],
-            token,
-        )
+        for stack, service in (("core", OCU_SERVICE), ("webui", WEBUI_SERVICE), ("proxy", PROXY_SERVICE)):
+            self.assertEqual(
+                by_stack[stack]["document"]["services"][service]["environment"]["OCU_INTERNAL_TOKEN"],
+                token,
+            )
+            self.assertEqual(
+                by_stack[stack]["consumer_document"]["services"][service]["environment"]["OCU_INTERNAL_TOKEN"],
+                token,
+            )
 
     def test_generated_credentials_are_fresh_across_deployments(self):
         first = self.run_bootstrap()
@@ -376,8 +376,14 @@ class BootstrapRuntimeTests(unittest.TestCase):
                 self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 
     def test_post_temp_failure_removes_temporary_files(self):
-        result = self.run_bootstrap({"OCU_BOOTSTRAP_FAIL_AFTER_TEMP": "1"})
+        result = self.run_bootstrap(
+            {
+                "OCU_FAKE_INSTALL_FAIL_FIRST": "1",
+                "OCU_REAL_INSTALL": "/usr/bin/install",
+            }
+        )
         self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.state / "install-fail-reached").read_text(encoding="utf-8"), "1")
         self.assert_unpublished()
         self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 

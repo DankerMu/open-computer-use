@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import sys
 import time
-import re
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from interpolation import UnsupportedInterpolation, interpolate_value
 
 
 
@@ -69,22 +71,6 @@ def inspect_network(state: Path, name: str) -> int:
     sys.stderr.write(f"Error: No such network: {name}\n")
     return 1
 
-INTERPOLATION = re.compile(r"\$\{([^}]+)\}")
-
-
-def interpolate_value(value, env):
-    if isinstance(value, str):
-        unescaped = value.replace("$$", "$")
-
-        def replace(match):
-            return env.get(match.group(1), "")
-
-        return INTERPOLATION.sub(replace, unescaped)
-    if isinstance(value, list):
-        return [interpolate_value(item, env) for item in value]
-    if isinstance(value, dict):
-        return {key: interpolate_value(item, env) for key, item in value.items()}
-    return value
 
 
 
@@ -230,7 +216,19 @@ def compose_config(state: Path, argv: list[str]) -> int:
     if chosen is None or not chosen.exists():
         sys.stderr.write("resolved compose document is missing\n")
         return 1
-    sys.stdout.write(chosen.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(chosen.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        sys.stderr.write("resolved compose document is missing\n")
+        return 1
+    if payload.get("__unresolved__") is True:
+        body = {key: value for key, value in payload.items() if key != "__unresolved__"}
+        try:
+            payload = interpolate_value(body, os.environ, escaped=False)
+        except UnsupportedInterpolation as exc:
+            sys.stderr.write(f"unsupported interpolation: {exc}\n")
+            return 1
+    sys.stdout.write(json.dumps(payload))
     return 0
 
 
@@ -261,7 +259,13 @@ def compose_up(state: Path, argv: list[str]) -> int:
                 raw_document = None
             payload["document"] = raw_document
             if raw_document is not None:
-                payload["consumer_document"] = interpolate_value(raw_document, os.environ)
+                try:
+                    payload["consumer_document"] = interpolate_value(
+                        raw_document, os.environ, escaped=True
+                    )
+                except UnsupportedInterpolation as exc:
+                    sys.stderr.write(f"unsupported interpolation: {exc}\n")
+                    return 1
         payload["snapshot_path"] = str(first)
     else:
         live = state / "config" / f"{stack}.json"
