@@ -1,0 +1,93 @@
+# Token-free source. The rendered nginx.conf contains a service credential.
+worker_processes 1;
+pid @@RUNTIME@@/nginx.pid;
+error_log @@RUNTIME@@/error.log error;
+events { worker_connections 1024; }
+http {
+    upstream ocu_proxy_webui { server @@WEBUI_HOSTPORT@@; }
+    upstream ocu_proxy_ocu { server @@OCU_HOSTPORT@@; }
+    access_log off;
+    client_body_temp_path @@RUNTIME@@/client_body;
+    proxy_temp_path @@RUNTIME@@/proxy;
+    # nginx expands dollar-prefixed names even inside quoted directive arguments.
+    geo $ocu_dollar { default "$"; }
+    map $http_origin $ocu_allowed_origin {
+        default 0;
+        ~^@@ORIGIN_REGEX@@$ 1;
+    }
+    map $http_origin $ocu_null_origin {
+        default 0;
+        ~*^null$ 1;
+    }
+    map $http_sec_fetch_site $ocu_same_site {
+        default 0;
+        ~^same-origin$ 1;
+    }
+    map "$ocu_allowed_origin:$ocu_same_site:$ocu_null_origin:$http_x_requested_with" $ocu_mutation_denied {
+        default 1;
+        ~^1:[01]:0:ocu-workspace$ 0;
+        ~^0:1:0:ocu-workspace$ 0;
+    }
+    # Exempt only one literal lowercase download=1 with other unencoded,
+    # differently named query keys. Unknown/encoded/duplicate keys remain
+    # forwarded unchanged, but cannot disable active-document isolation.
+    map $args $ocu_download_exempt {
+        default 0;
+        "~^(?:(?!(?i:download)(?:=|&|$))[A-Za-z0-9_-]+(?:=[^&]*)?&)*download=1(?:&(?!(?i:download)(?:=|&|$))[A-Za-z0-9_-]+(?:=[^&]*)?)*$" 1;
+    }
+    map "$ocu_download_exempt:$upstream_http_content_type" $ocu_force_isolation {
+        default 0;
+        "~*^0:(text/html|image/svg\+xml|application/xhtml\+xml|text/xml|application/xml)\s*(;|$)" 1;
+    }
+    map $ocu_force_isolation $ocu_csp {
+        default $upstream_http_content_security_policy;
+        1 "sandbox allow-scripts allow-forms";
+    }
+    map $ocu_force_isolation $ocu_nosniff {
+        default $upstream_http_x_content_type_options;
+        1 nosniff;
+    }
+    server {
+        listen @@LISTEN@@;
+        server_name _;
+        server_tokens off;
+        client_max_body_size 0;
+        proxy_intercept_errors off;
+        # Reject ambiguous raw path forms before normalized location selection.
+        # Do not reject ordinary %25: it represents a literal percent in a filename.
+        if ($request_uri ~* "^/ocu/[^?]*(?:%2f|%5c|%25[0-9a-f]{2}|%(?![0-9a-f]{2})|\\\\|//)") { return 404; }
+        if ($request_uri ~* "^/ocu/(?:[^?]*/)?(?:[.]|%2e){1,2}(?:/|\?|$)") { return 404; }
+
+        location = /_ocu_chat_auth {
+            internal;
+            proxy_pass @@WEBUI@@/api/v1/ocu/auth;
+            proxy_pass_request_body off;
+            proxy_pass_request_headers off;
+            proxy_set_header Content-Length "";
+            proxy_set_header Host $proxy_host;
+            proxy_set_header Cookie $http_cookie;
+            proxy_set_header X-Chat-Id $ocu_chat_id;
+        }
+        location = /_ocu_session_auth {
+            internal;
+            proxy_pass @@WEBUI@@/api/v1/auths/;
+            proxy_pass_request_body off;
+            proxy_pass_request_headers off;
+            proxy_set_header Content-Length "";
+            proxy_set_header Host $proxy_host;
+            proxy_set_header Cookie $http_cookie;
+        }
+        location @ocu_auth_not_found { internal; return 404; }
+        location @ocu_mutation_denied { internal; return 403; }
+        location /ocu/ { return 404; }
+        location = /ocu { return 404; }
+        location / {
+            proxy_pass @@WEBUI@@;
+            proxy_set_header Authorization $http_authorization;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+@@LOCATIONS@@
+    }
+}

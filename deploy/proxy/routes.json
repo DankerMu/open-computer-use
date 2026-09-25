@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "rows": [
+    {"path": "api/outputs/{chat}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "api/uploads/{chat}/manifest", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "api/uploads/{chat}/list", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "files/{chat}/archive", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "files/{chat}/{path}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "file"},
+    {"path": "preview/{chat}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "browser/{chat}/status", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "browser/{chat}/json/version", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "browser/{chat}/json", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/status", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/heartbeat", "methods": ["GET"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/sessions", "methods": ["GET"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/processes", "methods": ["GET"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "api/uploads/{chat}/{path}", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "upload"},
+    {"path": "terminal/{chat}/start-ttyd", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/stop-ttyd", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/restart-container", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/resurrect-container", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/processes/{pid}/kill", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "terminal/{chat}/ws", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "ws"},
+    {"path": "browser/{chat}/devtools/page/{page}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "ws"},
+    {"path": "static/{path}", "methods": ["GET", "HEAD"], "auth": "session", "mutating": false, "prefix": "preserve", "kind": "http"}
+  ]
+}
