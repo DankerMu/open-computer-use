@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import sys
 import time
+import re
+
 
 
 CORE_SERVICES = ("workspace", "computer-use-server", "retention-guard")
@@ -43,7 +45,18 @@ def network_path(state: Path, name: str) -> Path:
     return state / "networks" / f"{name}.json"
 
 
+def hold_named(state: Path, env_name: str, entered_name: str) -> None:
+    hold = os.environ.get(env_name, "")
+    if not hold:
+        return
+    marker = Path(hold)
+    (state / entered_name).write_text(str(os.getpid()), encoding="utf-8")
+    while marker.exists():
+        time.sleep(0.05)
+
+
 def inspect_network(state: Path, name: str) -> int:
+    hold_named(state, "FAKE_DOCKER_HOLD_INSPECT", "entered-inspect")
     path = network_path(state, name)
     if path.exists():
         sys.stdout.write(path.read_text(encoding="utf-8"))
@@ -55,6 +68,26 @@ def inspect_network(state: Path, name: str) -> int:
         return int(payload.get("code", 1))
     sys.stderr.write(f"Error: No such network: {name}\n")
     return 1
+
+INTERPOLATION = re.compile(r"\$\$|\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def interpolate_value(value, env):
+    if isinstance(value, str):
+        def replace(match):
+            token = match.group(0)
+            if token == "$$":
+                return "$"
+            name = match.group(1) or match.group(2)
+            return env.get(name, "")
+
+        return INTERPOLATION.sub(replace, value)
+    if isinstance(value, list):
+        return [interpolate_value(item, env) for item in value]
+    if isinstance(value, dict):
+        return {key: interpolate_value(item, env) for key, item in value.items()}
+    return value
+
 
 
 def create_network(state: Path, argv: list[str]) -> int:
@@ -172,6 +205,7 @@ def services_for(stack: str, profiles: set[str]) -> list[str]:
 
 
 def compose_config(state: Path, argv: list[str]) -> int:
+    hold_named(state, "FAKE_DOCKER_HOLD_CONFIG", "entered-config")
     fail = state / "config-fail"
     if fail.exists():
         sys.stderr.write("compose config failed\n")
@@ -199,15 +233,7 @@ def compose_config(state: Path, argv: list[str]) -> int:
 
 
 def hold_up(state: Path) -> None:
-    hold = os.environ.get("FAKE_DOCKER_HOLD_UP", "")
-    if not hold:
-        return
-    marker = Path(hold)
-    entered = state / "entered-up"
-    entered.write_text("1", encoding="utf-8")
-    while marker.exists():
-        time.sleep(0.05)
-
+    hold_named(state, "FAKE_DOCKER_HOLD_UP", "entered-up")
 
 def compose_up(state: Path, argv: list[str]) -> int:
     files = compose_files(argv)
@@ -228,9 +254,12 @@ def compose_up(state: Path, argv: list[str]) -> int:
         first = Path(files[0])
         if first.exists():
             try:
-                payload["document"] = json.loads(first.read_text(encoding="utf-8"))
+                raw_document = json.loads(first.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError, UnicodeError):
-                payload["document"] = None
+                raw_document = None
+            payload["document"] = raw_document
+            if raw_document is not None:
+                payload["consumer_document"] = interpolate_value(raw_document, os.environ)
         payload["snapshot_path"] = str(first)
     else:
         live = state / "config" / f"{stack}.json"

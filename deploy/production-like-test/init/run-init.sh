@@ -4,19 +4,82 @@
 # It does not expose the upstream sub_agent capability until a fully internal
 # sub-agent runtime is available.
 set -euo pipefail
+set -m
 
 source_root="${OCU_INIT_SOURCE_ROOT:-/app/source}"
-work_root=$(mktemp -d "${TMPDIR:-/tmp}/ocu-init.XXXXXX")
+work_root=""
+OWNED_PID=""
+
+group_alive() {
+    local pid=$1
+    kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null
+}
+
+stop_owned() {
+    local pid="${OWNED_PID:-}"
+    OWNED_PID=""
+    if [[ -z "$pid" ]]; then
+        return 0
+    fi
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    local waited=0
+    while group_alive "$pid" && (( waited < 20 )); do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if group_alive "$pid"; then
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
 
 cleanup() {
-    rm -rf "$work_root"
+    local status=$?
+    trap '' INT TERM HUP
+    stop_owned || true
+    if [[ -n "${work_root:-}" && -d "$work_root" ]]; then
+        rm -rf "$work_root"
+    fi
+    return "$status"
 }
+
+interrupt() {
+    local status=$1
+    trap '' INT TERM HUP
+    trap - EXIT
+    cleanup || true
+    exit "$status"
+}
+
 trap cleanup EXIT
+trap 'interrupt 130' INT
+trap 'interrupt 143' TERM
+trap 'interrupt 129' HUP
 
+wait_owned() {
+    local pid=$1
+    local status=0
+    wait "$pid" || status=$?
+    if [[ "${OWNED_PID:-}" == "$pid" ]]; then
+        if group_alive "$pid"; then
+            stop_owned || true
+        else
+            OWNED_PID=""
+        fi
+    fi
+    return "$status"
+}
 
+run_owned() {
+    "$@" &
+    OWNED_PID=$!
+    wait_owned "$OWNED_PID"
+}
+
+work_root=$(mktemp -d "${TMPDIR:-/tmp}/ocu-init.XXXXXX")
 mkdir -p "$work_root/tools" "$work_root/functions"
 
-python3 - "$source_root" "$work_root" <<'PY'
+python3 - "$source_root" "$work_root" <<'PY' &
 from pathlib import Path
 import os
 import sys
@@ -52,7 +115,7 @@ safe_init = init_source.replace(
     f"cfg['DEFAULT_MODELS'] = {primary_model!r}",
 )
 selection_start = safe_init.find(
-    "# Also try setting via workspace model (fallback for v0.8.11–0.8.12)\n"
+    "# Create or update a workspace model with native function calling. The adopted\n"
 )
 selection_end = safe_init.find(
     '\n\nif [ -n "$FIRST_MODEL" ]; then',
@@ -84,10 +147,10 @@ if safe_init.count(marker_section) != 1:
     raise SystemExit("refusing to bootstrap: could not locate initialization marker section")
 workspace_model_access_block = '''
 # Make the approved Computer Use workspace model visible to all internal users.
-if [ -n "$FIRST_MODEL" ]; then
+if [ -n "$WORKSPACE_ID" ]; then
     if curl -sf -X POST "$WEBUI_URL/api/v1/models/model/access/update" \\
         -H "$AUTH" -H "Content-Type: application/json" \\
-        -d "{\\"id\\":\\"$FIRST_MODEL\\",\\"access_grants\\":[
+        -d "{\\"id\\":\\"$WORKSPACE_ID\\",\\"access_grants\\":[
                {\\"principal_type\\":\\"group\\",\\"principal_id\\":\\"*\\",\\"permission\\":\\"read\\"},
                {\\"principal_type\\":\\"user\\",\\"principal_id\\":\\"*\\",\\"permission\\":\\"read\\"}
              ]}" >/dev/null 2>&1; then
@@ -104,6 +167,7 @@ safe_init = safe_init.replace(marker_section, workspace_model_access_block + mar
     (source_root / "functions" / "computer_link_filter.py").read_bytes()
 )
 PY
+OWNED_PID=$!
+wait_owned "$OWNED_PID"
 
-
-/bin/bash "$work_root/init.sh"
+run_owned /bin/bash "$work_root/init.sh"

@@ -154,7 +154,7 @@ fi
 # Install function: computer_link_filter.py
 echo "[init] Installing Computer Use filter..."
 FUNC_PAYLOAD=$(python3 -c "
-import json
+import json, os
 code = open(os.environ['FILTER_SOURCE']).read()
 print(json.dumps({
     'id': 'computer_use_filter',
@@ -230,17 +230,27 @@ fi
 # endpoint does not exist in Open WebUI v0.8.12 (returns 405) — use POST /api/v1/configs/models
 # which takes the full ModelsConfigForm and merges DEFAULT_MODEL_PARAMS. We preserve
 # existing fields so we don't clobber DEFAULT_MODELS / DEFAULT_MODEL_METADATA.
+# A failed read, parse, or post must not write the marker or replace an unread
+# configuration with an empty object.
 echo "[init] Ensuring DEFAULT_MODEL_PARAMS has native function calling + streaming..."
 # Fetch current config; pipe its body into Python via stdin so arbitrary content
 # (quotes, newlines, triple-quote sequences) cannot break the interpolation.
 # Use direct assignment, not setdefault — any prior value for these two fields
 # must be overwritten so our "params enforced" log is truthful.
-MODELS_CFG=$(curl -sf "$WEBUI_URL/api/v1/configs/models" -H "$AUTH" 2>/dev/null || echo "{}")
-MERGED_CFG=$(printf '%s' "$MODELS_CFG" | python3 -c "
+if MODELS_CFG=$(curl -sf "$WEBUI_URL/api/v1/configs/models" -H "$AUTH"); then
+    if MERGED_CFG=$(printf '%s' "$MODELS_CFG" | python3 -c "
 import json, sys
-raw = sys.stdin.read() or '{}'
+raw = sys.stdin.read()
+if not raw.strip():
+    raise SystemExit('empty models configuration')
 cfg = json.loads(raw)
-params = cfg.get('DEFAULT_MODEL_PARAMS') or {}
+if not isinstance(cfg, dict):
+    raise SystemExit('models configuration is not an object')
+params = cfg.get('DEFAULT_MODEL_PARAMS')
+if not isinstance(params, dict):
+    params = {}
+else:
+    params = dict(params)
 params['function_calling'] = 'native'
 params['stream_response'] = True
 cfg['DEFAULT_MODEL_PARAMS'] = params
@@ -249,23 +259,27 @@ cfg.setdefault('DEFAULT_PINNED_MODELS', cfg.get('DEFAULT_PINNED_MODELS') or '')
 cfg.setdefault('MODEL_ORDER_LIST', cfg.get('MODEL_ORDER_LIST') or [])
 cfg.setdefault('DEFAULT_MODEL_METADATA', cfg.get('DEFAULT_MODEL_METADATA') or {})
 print(json.dumps(cfg))
-" 2>&1) || MERGED_CFG=""
-
-if [ -z "$MERGED_CFG" ] || printf '%s' "$MERGED_CFG" | grep -q '^Traceback'; then
-    echo "[init] WARNING: Could not merge DEFAULT_MODEL_PARAMS (Python parse failed)."
-    if [ -n "$MERGED_CFG" ]; then
-        printf '[init]   %s\n' "$MERGED_CFG" | head -5
+"); then
+        if curl -sf -X POST "$WEBUI_URL/api/v1/configs/models" \
+            -H "$AUTH" -H "Content-Type: application/json" \
+            -d "$MERGED_CFG" >/dev/null; then
+            echo "[init] DEFAULT_MODEL_PARAMS set (function_calling=native, stream_response=true)."
+        else
+            echo "[init] ERROR: Could not POST DEFAULT_MODEL_PARAMS. Init will retry on next restart." >&2
+            INIT_FAILED=1
+        fi
+    else
+        echo "[init] ERROR: Could not parse models configuration. Init will retry on next restart." >&2
+        INIT_FAILED=1
     fi
-elif curl -sf -X POST "$WEBUI_URL/api/v1/configs/models" \
-    -H "$AUTH" -H "Content-Type: application/json" \
-    -d "$MERGED_CFG" >/dev/null 2>&1; then
-    echo "[init] DEFAULT_MODEL_PARAMS set (function_calling=native, stream_response=true)."
 else
-    echo "[init] WARNING: Could not POST DEFAULT_MODEL_PARAMS (endpoint may differ on this Open WebUI version)."
+    echo "[init] ERROR: Could not read models configuration. Init will retry on next restart." >&2
+    INIT_FAILED=1
 fi
 
-# Also try setting via workspace model (fallback for v0.8.11–0.8.12)
-# Get first available model and create a workspace model with native FC
+# Create or update a workspace model with native function calling. The adopted
+# deployment later replaces first-available selection with PRIMARY_CHAT_MODEL;
+# a failed create/update here must not write the marker.
 FIRST_MODEL=$(curl -sf "$WEBUI_URL/api/models" -H "$AUTH" 2>/dev/null | python3 -c "
 import sys,json
 data = json.load(sys.stdin).get('data',[])
@@ -296,17 +310,40 @@ print(json.dumps({
     }
 }))
 ")
-    curl -sf -X POST "$WEBUI_URL/api/v1/models/create" \
-        -H "$AUTH" -H "Content-Type: application/json" \
-        -d "$MODEL_PAYLOAD" >/dev/null 2>&1 && \
-        echo "[init] Workspace model created: $FIRST_MODEL (Computer Use)" || \
-        echo "[init] Workspace model creation skipped (may already exist)"
+    WORKSPACE_ID=$(printf '%s' "$MODEL_PAYLOAD" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+    LOOKUP_FILE=$(mktemp "${TMPDIR:-/tmp}/ocu-init-model.XXXXXX")
+    LOOKUP_STATUS=$(curl -sS -o "$LOOKUP_FILE" -w '%{http_code}' \
+        "$WEBUI_URL/api/v1/models/model?id=$WORKSPACE_ID" -H "$AUTH" || true)
+    rm -f "$LOOKUP_FILE"
+    if [ "$LOOKUP_STATUS" = "200" ]; then
+        if curl -sf -X POST "$WEBUI_URL/api/v1/models/model/update?id=$WORKSPACE_ID" \
+            -H "$AUTH" -H "Content-Type: application/json" \
+            -d "$MODEL_PAYLOAD" >/dev/null; then
+            echo "[init] Workspace model updated: $FIRST_MODEL (Computer Use)"
+        else
+            echo "[init] ERROR: Could not update workspace model $FIRST_MODEL. Init will retry on next restart." >&2
+            INIT_FAILED=1
+        fi
+    elif [ "$LOOKUP_STATUS" = "404" ]; then
+        if curl -sf -X POST "$WEBUI_URL/api/v1/models/create" \
+            -H "$AUTH" -H "Content-Type: application/json" \
+            -d "$MODEL_PAYLOAD" >/dev/null; then
+            echo "[init] Workspace model created: $FIRST_MODEL (Computer Use)"
+        else
+            echo "[init] ERROR: Could not create workspace model $FIRST_MODEL. Init will retry on next restart." >&2
+            INIT_FAILED=1
+        fi
+    else
+        echo "[init] ERROR: Could not look up workspace model $FIRST_MODEL (HTTP ${LOOKUP_STATUS:-failed}). Init will retry on next restart." >&2
+        INIT_FAILED=1
+    fi
 fi
 
 # Mark as initialized — only if every required step succeeded. If INIT_FAILED=1,
 # leave the marker off so the next container start retries the failed steps
-# (public-access grant, filter toggle, filter global). Without this guard a
-# transient failure would be baked in forever.
+# (public-access grant, filter toggle, filter global, models configuration,
+# workspace model create/update). Without this guard a transient failure would
+# be baked in forever.
 if [ "$INIT_FAILED" = "0" ]; then
     touch "$MARKER_FILE"
     echo "[init] Done! Open WebUI is ready with Computer Use."

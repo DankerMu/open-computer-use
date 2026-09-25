@@ -9,23 +9,35 @@ umask 077
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OVERLAY="$ROOT/deploy/production-like-test"
 CONFIG_DIR=""
-COMPOSE_PID=""
+OWNED_PID=""
+
+group_alive() {
+    local pid=$1
+    kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null
+}
+
+stop_owned() {
+    local pid="${OWNED_PID:-}"
+    OWNED_PID=""
+    if [[ -z "$pid" ]]; then
+        return 0
+    fi
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    local waited=0
+    while group_alive "$pid" && (( waited < 20 )); do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if group_alive "$pid"; then
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
 
 cleanup() {
     local status=$?
-    if [[ -n "${COMPOSE_PID:-}" ]] && kill -0 "$COMPOSE_PID" 2>/dev/null; then
-        kill -TERM -- "-$COMPOSE_PID" 2>/dev/null || kill -TERM "$COMPOSE_PID" 2>/dev/null || true
-        local waited=0
-        while kill -0 "$COMPOSE_PID" 2>/dev/null && (( waited < 20 )); do
-            sleep 0.1
-            waited=$((waited + 1))
-        done
-        if kill -0 "$COMPOSE_PID" 2>/dev/null; then
-            kill -KILL -- "-$COMPOSE_PID" 2>/dev/null || kill -KILL "$COMPOSE_PID" 2>/dev/null || true
-        fi
-        wait "$COMPOSE_PID" 2>/dev/null || true
-        COMPOSE_PID=""
-    fi
+    trap '' INT TERM HUP
+    stop_owned || true
     if [[ -n "${CONFIG_DIR:-}" && -d "$CONFIG_DIR" ]]; then
         rm -rf "$CONFIG_DIR"
     fi
@@ -34,7 +46,8 @@ cleanup() {
 
 interrupt() {
     local status=$1
-    trap - EXIT INT TERM HUP
+    trap '' INT TERM HUP
+    trap - EXIT
     cleanup || true
     exit "$status"
 }
@@ -51,6 +64,26 @@ require() {
         exit 1
     fi
     export "$name"
+}
+
+wait_owned() {
+    local pid=$1
+    local status=0
+    wait "$pid" || status=$?
+    if [[ "${OWNED_PID:-}" == "$pid" ]]; then
+        if group_alive "$pid"; then
+            stop_owned || true
+        else
+            OWNED_PID=""
+        fi
+    fi
+    return "$status"
+}
+
+run_owned() {
+    "$@" &
+    OWNED_PID=$!
+    wait_owned "$OWNED_PID"
 }
 
 for name in COMPOSE_PROJECT_NAME OCU_PRIVATE_NETWORK OCU_PRIVATE_SUBNET OCU_PRIVATE_GATEWAY \
@@ -73,14 +106,14 @@ proxy_files=(-p "$PROJECT" --project-directory "$OVERLAY" -f "$OVERLAY/compose.p
 resolve() {
     local dest=$1
     shift
-    if ! docker compose "$@" config --format json >"$dest"; then
+    if ! run_owned docker compose "$@" config --format json >"$dest"; then
         printf '%s\n' 'deploy: compose config failed' >&2
-        exit 1
+        return 1
     fi
 }
 
 freeze() {
-    python3 - "$1" "$2" <<'PY'
+    python3 - "$1" "$2" <<'PY' &
 from __future__ import annotations
 
 import json
@@ -103,6 +136,11 @@ destination = Path(sys.argv[2])
 payload = json.loads(source.read_text(encoding="utf-8"))
 destination.write_text(json.dumps(escape_dollars(payload)), encoding="utf-8")
 PY
+    OWNED_PID=$!
+    if ! wait_owned "$OWNED_PID"; then
+        printf '%s\n' 'deploy: snapshot freeze failed' >&2
+        return 1
+    fi
 }
 
 resolve "$CONFIG_DIR/core.json" "${core_files[@]}"
@@ -112,12 +150,12 @@ freeze "$CONFIG_DIR/core.json" "$CONFIG_DIR/core.up.json"
 freeze "$CONFIG_DIR/webui.json" "$CONFIG_DIR/webui.up.json"
 freeze "$CONFIG_DIR/proxy.json" "$CONFIG_DIR/proxy.up.json"
 
-if ! bash "$ROOT/deploy/check-ports.sh" \
+if ! run_owned bash "$ROOT/deploy/check-ports.sh" \
     "$CONFIG_DIR/core.json" "$CONFIG_DIR/webui.json" "$CONFIG_DIR/proxy.json"; then
     printf '%s\n' 'deploy: publication check failed' >&2
     exit 1
 fi
-if ! bash "$ROOT/deploy/provision-networks.sh"; then
+if ! run_owned bash "$ROOT/deploy/provision-networks.sh"; then
     printf '%s\n' 'deploy: network provisioning failed' >&2
     exit 1
 fi
@@ -125,15 +163,10 @@ fi
 start_stack() {
     local project_dir=$1
     local snapshot=$2
-    docker compose -p "$PROJECT" --project-directory "$project_dir" \
-        --env-file "$CONFIG_DIR/empty.env" -f "$snapshot" up -d --build &
-    COMPOSE_PID=$!
-    local status=0
-    wait "$COMPOSE_PID" || status=$?
-    COMPOSE_PID=""
-    if [[ "$status" -ne 0 ]]; then
+    if ! run_owned docker compose -p "$PROJECT" --project-directory "$project_dir" \
+        --env-file "$CONFIG_DIR/empty.env" -f "$snapshot" up -d --build; then
         printf '%s\n' "deploy: compose up failed for ${snapshot}" >&2
-        exit "$status"
+        return 1
     fi
 }
 

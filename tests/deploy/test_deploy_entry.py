@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import signal
 import stat
@@ -83,6 +84,40 @@ def wait_for(predicate, timeout=5):
         time.sleep(0.05)
     return False
 
+
+def descendant_pids(root_pid: int) -> set[int]:
+    try:
+        listed = subprocess.check_output(["ps", "-ax", "-o", "pid=,ppid="], text=True)
+    except subprocess.CalledProcessError:
+        return set()
+    children: dict[int, list[int]] = {}
+    for line in listed.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        pid, ppid = int(parts[0]), int(parts[1])
+        children.setdefault(ppid, []).append(pid)
+    found: set[int] = set()
+    stack = [root_pid]
+    while stack:
+        current = stack.pop()
+        for child in children.get(current, []):
+            if child not in found:
+                found.add(child)
+                stack.append(child)
+    return found
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def recorded_child(state_dir: Path, name: str) -> int:
+    return int((state_dir / name).read_text(encoding="utf-8").strip())
 
 
 class DeployEntryTests(unittest.TestCase):
@@ -385,6 +420,7 @@ class DeployEntryTests(unittest.TestCase):
         marker.write_text("1", encoding="utf-8")
         env = dict(self.env)
         env["FAKE_DOCKER_HOLD_UP"] = str(marker)
+        env["TOKEN"] = "hostile-token-value"
         process = subprocess.Popen(
             ["bash", str(UP)],
             cwd=str(ROOT),
@@ -416,19 +452,21 @@ class DeployEntryTests(unittest.TestCase):
         webui = rows["webui"]["document"]["services"]["open-webui"]
         self.assertEqual(webui.get("ports", []), [])
         self.assertEqual(webui["environment"]["OCU_INTERNAL_TOKEN"], "synthetic$$TOKEN")
+        consumer = rows["webui"]["consumer_document"]["services"]["open-webui"]
+        self.assertEqual(consumer["environment"]["OCU_INTERNAL_TOKEN"], "synthetic$TOKEN")
         self.assertTrue(rows["webui"]["snapshot"])
 
-    def _signal_during_held_up(self, sig):
+    def _signal_during_hold(self, sig, *, hold_env, entered_name, require_resolved=False, require_snapshots=False):
         write_network(
             self.state,
             SANDBOX_NETWORK,
             subnet="172.31.0.0/24",
             gateway="172.31.0.1",
         )
-        marker = self.state / "up-hold"
+        marker = self.state / f"{entered_name}-hold"
         marker.write_text("1", encoding="utf-8")
         env = dict(self.env)
-        env["FAKE_DOCKER_HOLD_UP"] = str(marker)
+        env[hold_env] = str(marker)
         before = leftover_tmp(self.state)
         process = subprocess.Popen(
             ["bash", str(UP)],
@@ -439,35 +477,88 @@ class DeployEntryTests(unittest.TestCase):
             env=env,
             start_new_session=True,
         )
+        children: set[int] = set()
         try:
             self.assertTrue(
-                wait_for(lambda: (self.state / "entered-up").exists()),
-                "entry never reached compose up",
+                wait_for(lambda: (self.state / entered_name).exists()),
+                f"entry never reached {entered_name}",
             )
             private = leftover_tmp(self.state)
             self.assertEqual(len(private), 1)
             self.assertEqual(stat.S_IMODE(private[0].stat().st_mode), 0o700)
-            for name in ("core.json", "webui.json", "proxy.json", "core.up.json", "webui.up.json", "proxy.up.json"):
+            names = []
+            if require_resolved:
+                names.extend(["core.json", "webui.json", "proxy.json"])
+            if require_snapshots:
+                names.extend(["core.up.json", "webui.up.json", "proxy.up.json"])
+            for name in names:
+                self.assertTrue((private[0] / name).is_file(), name)
                 self.assertEqual(stat.S_IMODE((private[0] / name).stat().st_mode), 0o600)
+            held_pid = recorded_child(self.state, entered_name)
+            children = descendant_pids(process.pid)
+            children.add(held_pid)
+            self.assertTrue(pid_alive(held_pid), "held child died before the signal")
             process.send_signal(sig)
             self.assertTrue(
                 wait_for(lambda: process.poll() is not None, timeout=8),
                 "entry did not exit after signal",
             )
+            self.assertTrue(
+                wait_for(lambda: all(not pid_alive(pid) for pid in children), timeout=8),
+                "owned child survived parent exit",
+            )
+            self.assertEqual(leftover_tmp(self.state), before)
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGKILL)
+            for pid in children:
+                if pid_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
             marker.unlink(missing_ok=True)
             process.communicate(timeout=10)
         self.assertNotEqual(process.returncode, 0)
-        self.assertEqual(leftover_tmp(self.state), before)
         self.assert_no_destructive()
+
+    def _signal_during_held_up(self, sig):
+        self._signal_during_hold(
+            sig,
+            hold_env="FAKE_DOCKER_HOLD_UP",
+            entered_name="entered-up",
+            require_resolved=True,
+            require_snapshots=True,
+        )
 
     def test_signal_during_entry_removes_temporary_configs(self):
         self._signal_during_held_up(signal.SIGTERM)
 
     def test_hangup_during_entry_removes_temporary_configs(self):
         self._signal_during_held_up(signal.SIGHUP)
+
+    def test_int_during_entry_removes_temporary_configs(self):
+        self._signal_during_held_up(signal.SIGINT)
+
+    def test_int_during_config_removes_temporary_configs_and_children(self):
+        self._signal_during_hold(
+            signal.SIGINT,
+            hold_env="FAKE_DOCKER_HOLD_CONFIG",
+            entered_name="entered-config",
+        )
+
+    def test_term_during_config_removes_temporary_configs_and_children(self):
+        self._signal_during_hold(
+            signal.SIGTERM,
+            hold_env="FAKE_DOCKER_HOLD_CONFIG",
+            entered_name="entered-config",
+        )
+
+    def test_hup_during_inspect_removes_temporary_configs_and_children(self):
+        self._signal_during_hold(
+            signal.SIGHUP,
+            hold_env="FAKE_DOCKER_HOLD_INSPECT",
+            entered_name="entered-inspect",
+            require_resolved=True,
+            require_snapshots=True,
+        )
 
 
 
