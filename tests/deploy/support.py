@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECK_PORTS = ROOT / "deploy" / "check-ports.sh"
 PROVISION = ROOT / "deploy" / "provision-networks.sh"
 UP = ROOT / "deploy" / "up.sh"
+FIREWALL_INSTALL = ROOT / "deploy" / "firewall" / "docker-user-rules.sh"
+FIREWALL_CHECK = ROOT / "deploy" / "firewall" / "check.sh"
 FAKE_DOCKER = ROOT / "tests" / "deploy" / "fakebin" / "docker"
 CORE_OVERRIDE = ROOT / "deploy" / "production-like-test" / "compose.core.override.yml"
 WEBUI_OVERRIDE = ROOT / "deploy" / "production-like-test" / "compose.webui.override.yml"
@@ -31,6 +33,10 @@ WEBUI_SERVICE = "open-webui"
 OCU_SERVICE = "computer-use-server"
 PROXY_TARGET = 8082
 PROXY_PUBLISHED = "8082"
+DEFAULT_ALLOW = "8.8.8.8/32,1.1.1.1/32"
+METADATA_ADDR = "169.254.169.254"
+OWNED_IPV4 = "OCU-SANDBOX-EGRESS"
+OWNED_IPV6 = "OCU-SANDBOX-EGRESS6"
 
 
 def control_networks():
@@ -166,23 +172,76 @@ def fake_env(state_dir: Path, extra=None):
     env["OCU_WEBUI_AUTH_URL"] = "http://open-webui:8080/api/v1/ocu/auth"
     env["PUBLIC_BASE_URL"] = "http://localhost:8082/ocu"
     env["OCU_PROXY_IMAGE"] = "ocu-test-proxy:synthetic"
+    env["OCU_SANDBOX_EGRESS_ALLOW"] = DEFAULT_ALLOW
+    env["OCU_SANDBOX_EGRESS_LOCK"] = str(state_dir / "ocu-sandbox-egress.lock")
     if extra:
         env.update(extra)
     return env
 
 
-def write_network(state_dir: Path, name, *, subnet, gateway, driver="bridge", internal=False):
+def write_network(state_dir: Path, name, *, subnet, gateway, driver="bridge", internal=False, net_id=None, options=None):
     networks = state_dir / "networks"
     networks.mkdir(parents=True, exist_ok=True)
+    net_id = net_id or f"id-{name}"
     payload = {
         "Name": name,
-        "Id": f"id-{name}",
+        "Id": net_id,
         "Driver": driver,
         "Internal": internal,
+        "Options": options if options is not None else {"com.docker.network.bridge.name": "br-" + net_id[:12]},
         "IPAM": {"Config": [{"Subnet": subnet, "Gateway": gateway}]},
     }
     (networks / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
 
+
+def write_firewall(state_dir: Path, payload) -> Path:
+    path = state_dir / "firewall.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def load_firewall(state_dir: Path) -> dict:
+    path = state_dir / "firewall.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def seed_healthy_host(state_dir: Path) -> None:
+    # Permissive blankets stay last so a missing owned hook still lets
+    # traffic flow; foreign policy is seeded in front of those terminators.
+    write_firewall(
+        state_dir,
+        {
+            "ipv4": {
+                "DOCKER-USER": [["-j", "RETURN"]],
+                "INPUT": [["-j", "ACCEPT"]],
+                "FORWARD": [["-j", "DOCKER-USER"], ["-j", "ACCEPT"]],
+                "OUTPUT": [["-j", "ACCEPT"]],
+            },
+            "ipv6": {
+                "INPUT": [["-j", "ACCEPT"]],
+                "FORWARD": [["-j", "ACCEPT"]],
+                "OUTPUT": [["-j", "ACCEPT"]],
+            },
+            "policies": {
+                "ipv4": {"INPUT": "ACCEPT", "FORWARD": "ACCEPT", "OUTPUT": "ACCEPT", "DOCKER-USER": "-"},
+                "ipv6": {"INPUT": "ACCEPT", "FORWARD": "ACCEPT", "OUTPUT": "ACCEPT"},
+            },
+        },
+    )
+
+
+def run_script(script: Path, env, *, timeout=20):
+    return subprocess.run(
+        ["bash", str(script)],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=timeout,
+    )
 
 def write_fake_configs(state_dir: Path, docs=None):
     config_dir = state_dir / "config"

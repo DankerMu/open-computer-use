@@ -22,6 +22,7 @@ from support import (
     fake_env,
     intended_docs,
     ops,
+    seed_healthy_host,
     tmp_dir,
     write_fake_configs,
     write_network,
@@ -125,6 +126,7 @@ class DeployEntryTests(unittest.TestCase):
         self.context = tmp_dir()
         self.state = Path(self.context.name)
         write_fake_configs(self.state)
+        seed_healthy_host(self.state)
         write_network(
             self.state,
             CONTROL_NETWORK,
@@ -132,7 +134,6 @@ class DeployEntryTests(unittest.TestCase):
             gateway="172.30.0.1",
         )
         self.env = fake_env(self.state)
-
     def tearDown(self):
         self.context.cleanup()
 

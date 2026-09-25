@@ -91,6 +91,11 @@ for name in COMPOSE_PROJECT_NAME OCU_PRIVATE_NETWORK OCU_PRIVATE_SUBNET OCU_PRIV
     OCU_INTERNAL_TOKEN OCU_WEBUI_ORIGIN OCU_WEBUI_AUTH_URL PUBLIC_BASE_URL OCU_PROXY_IMAGE; do
     require "$name"
 done
+if ! declare -p OCU_SANDBOX_EGRESS_ALLOW >/dev/null 2>&1; then
+    printf '%s\n' 'deploy: OCU_SANDBOX_EGRESS_ALLOW is unset' >&2
+    exit 1
+fi
+export OCU_SANDBOX_EGRESS_ALLOW
 PROJECT="$COMPOSE_PROJECT_NAME"
 
 # Shared-project siblings must survive later ups; the cleanup profile must stay off.
@@ -157,6 +162,14 @@ if ! run_owned bash "$ROOT/deploy/check-ports.sh" \
 fi
 if ! run_owned bash "$ROOT/deploy/provision-networks.sh"; then
     printf '%s\n' 'deploy: network provisioning failed' >&2
+    exit 1
+fi
+if ! run_owned bash "$ROOT/deploy/firewall/docker-user-rules.sh"; then
+    printf '%s\n' 'deploy: sandbox egress policy installation failed' >&2
+    exit 1
+fi
+if ! run_owned bash "$ROOT/deploy/firewall/check.sh"; then
+    printf '%s\n' 'deploy: sandbox egress policy check failed' >&2
     exit 1
 fi
 

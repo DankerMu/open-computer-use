@@ -6,15 +6,17 @@
 # disconnect, or silently accept an incompatible network.
 
 set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONPATH="$ROOT/deploy${PYTHONPATH:+:$PYTHONPATH}"
+
 
 python3 - <<'PY'
 from __future__ import annotations
 
-import ipaddress
-import json
 import os
-import subprocess
 import sys
+
+from netinspect import NetworkInspectError, compatible, docker, inspect_network, parse_ipv4_address, parse_ipv4_network
 
 
 def fail(message: str) -> None:
@@ -29,95 +31,40 @@ def require(name: str) -> str:
     return value
 
 
-def parse_ipv4_network(name: str) -> ipaddress.IPv4Network:
-    raw = require(name)
+def parse_required_network(name: str):
     try:
-        network = ipaddress.ip_network(raw, strict=True)
-    except ValueError:
-        fail(f"{name} is not an IPv4 network")
-    if network.version != 4:
-        fail(f"{name} is not an IPv4 network")
-    return network
+        return parse_ipv4_network(name, require(name))
+    except NetworkInspectError as exc:
+        fail(str(exc))
 
 
-def parse_ipv4_address(name: str) -> ipaddress.IPv4Address:
-    raw = require(name)
+def parse_required_address(name: str):
     try:
-        address = ipaddress.ip_address(raw)
-    except ValueError:
-        fail(f"{name} is not an IPv4 address")
-    if address.version != 4:
-        fail(f"{name} is not an IPv4 address")
-    return address
-
-
-def docker(*args: str):
-    return subprocess.run(
-        ["docker", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        return parse_ipv4_address(name, require(name))
+    except NetworkInspectError as exc:
+        fail(str(exc))
 
 
 def inspect(name: str):
-    result = docker("network", "inspect", name, "--format", "{{json .}}")
-    if result.returncode == 0:
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            fail(f"{name}: inspect returned malformed JSON")
-        if isinstance(payload, list):
-            if len(payload) != 1 or not isinstance(payload[0], dict):
-                fail(f"{name}: inspect returned an unexpected document")
-            return payload[0]
-        if not isinstance(payload, dict):
-            fail(f"{name}: inspect returned an unexpected document")
-        return payload
-    combined = (result.stderr or "") + (result.stdout or "")
-    lowered = combined.lower()
-    if f"no such network: {name.lower()}" in lowered or f"network {name.lower()} not found" in lowered:
-        return None
-    fail(f"{name}: inspect failed")
-
-
-def ipam_config(payload: dict) -> dict:
-    ipam = payload.get("IPAM") or {}
-    configs = ipam.get("Config") or []
-    if not isinstance(configs, list) or len(configs) != 1 or not isinstance(configs[0], dict):
-        fail("existing network IPAM is incompatible")
-    return configs[0]
-
-
-def compatible(payload: dict, *, name: str, subnet: ipaddress.IPv4Network, gateway: ipaddress.IPv4Address) -> None:
-    inspected_name = str(payload.get("Name") or "")
-    driver = str(payload.get("Driver") or "").lower()
-    internal = payload.get("Internal")
-    if inspected_name != name:
-        fail(f"{name}: existing network name is incompatible")
-    if driver != "bridge":
-        fail(f"{name}: existing network driver is incompatible")
-    if internal is not False:
-        fail(f"{name}: existing network is not explicitly non-internal")
-    config = ipam_config(payload)
-    existing_subnet = str(config.get("Subnet") or "")
-    existing_gateway = str(config.get("Gateway") or "")
     try:
-        same_subnet = ipaddress.ip_network(existing_subnet, strict=False) == subnet
-    except ValueError:
-        same_subnet = False
-    if not same_subnet:
-        fail(f"{name}: existing network subnet is incompatible")
-    if existing_gateway != str(gateway):
-        fail(f"{name}: existing network gateway is incompatible")
+        return inspect_network(name)
+    except NetworkInspectError as exc:
+        fail(str(exc))
+
+
+def require_compatible(payload: dict, *, name: str, subnet, gateway) -> None:
+    try:
+        compatible(payload, name=name, subnet=subnet, gateway=gateway)
+    except NetworkInspectError as exc:
+        fail(str(exc))
 
 
 control_name = require("OCU_PRIVATE_NETWORK")
 sandbox_name = require("OCU_SANDBOX_NETWORK")
-control_subnet = parse_ipv4_network("OCU_PRIVATE_SUBNET")
-sandbox_subnet = parse_ipv4_network("OCU_SANDBOX_SUBNET")
-control_gateway = parse_ipv4_address("OCU_PRIVATE_GATEWAY")
-sandbox_gateway = parse_ipv4_address("OCU_SANDBOX_GATEWAY")
+control_subnet = parse_required_network("OCU_PRIVATE_SUBNET")
+sandbox_subnet = parse_required_network("OCU_SANDBOX_SUBNET")
+control_gateway = parse_required_address("OCU_PRIVATE_GATEWAY")
+sandbox_gateway = parse_required_address("OCU_SANDBOX_GATEWAY")
 
 if control_name == sandbox_name:
     fail("control-plane and sandbox network names must differ")
@@ -132,11 +79,11 @@ if sandbox_gateway not in sandbox_subnet:
 
 control = inspect(control_name)
 if control is not None:
-    compatible(control, name=control_name, subnet=control_subnet, gateway=control_gateway)
+    require_compatible(control, name=control_name, subnet=control_subnet, gateway=control_gateway)
 
 sandbox = inspect(sandbox_name)
 if sandbox is not None:
-    compatible(sandbox, name=sandbox_name, subnet=sandbox_subnet, gateway=sandbox_gateway)
+    require_compatible(sandbox, name=sandbox_name, subnet=sandbox_subnet, gateway=sandbox_gateway)
     raise SystemExit(0)
 
 created = docker(
@@ -158,6 +105,6 @@ if created.returncode != 0:
 sandbox = inspect(sandbox_name)
 if sandbox is None:
     fail(f"{sandbox_name}: inspect failed after create")
-compatible(sandbox, name=sandbox_name, subnet=sandbox_subnet, gateway=sandbox_gateway)
+require_compatible(sandbox, name=sandbox_name, subnet=sandbox_subnet, gateway=sandbox_gateway)
 raise SystemExit(0)
 PY
