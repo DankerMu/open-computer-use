@@ -242,6 +242,7 @@ jobs:
           pip install -r computer-use-server/requirements.txt
           pip install pytest pytest-asyncio
 
+          pip install PyYAML==6.0.2
       - name: Run orchestrator and auth-guard pytest
         env:
           OCU_INTERNAL_TOKEN: ci-internal-token
@@ -249,6 +250,7 @@ jobs:
         run: |
           pytest tests/orchestrator/ -v
           pytest tests/test_auth_guard.py -v
+          python -m unittest discover -s tests/deploy -v
 
   smoke-mcp-endpoint:
     name: Smoke — POST /mcp returns 200

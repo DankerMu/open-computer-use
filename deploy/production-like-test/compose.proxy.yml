@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2026 Open Computer Use Contributors
+#
+# Start after core and WebUI: nginx resolves service DNS names while validating
+# the rendered configuration. This stack has no application services.
+
+services:
+  proxy:
+    build:
+      context: ../proxy
+      dockerfile: Dockerfile
+    image: ${OCU_PROXY_IMAGE:?OCU_PROXY_IMAGE is required}
+    container_name: ocu-test-proxy
+    ports:
+      - "${OCU_PROXY_PORT:?OCU_PROXY_PORT is required}:8082"
+    environment:
+      OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
+      OCU_WEBUI_ORIGIN: ${OCU_WEBUI_ORIGIN:?OCU_WEBUI_ORIGIN is required}
+      OCU_WEBUI_UPSTREAM: http://open-webui:8080
+      OCU_PROXY_UPSTREAM: http://computer-use-server:8081
+      OCU_PROXY_LISTEN: 0.0.0.0:8082
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+networks:
+  default:
+    external: true
+    name: ${OCU_PRIVATE_NETWORK:?OCU_PRIVATE_NETWORK is required}

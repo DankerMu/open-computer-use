@@ -1,0 +1,77 @@
+# Production-like test overlay for the Computer Use services.
+# Invoke with the base compose file from the source checkout and the same
+# project name as the WebUI stack: docker compose -p ocu-test -f
+# docker-compose.yml -f deploy/production-like-test/compose.core.override.yml …
+# Host publications are removed; the proxy stack is the only publisher.
+
+services:
+  workspace:
+    image: ${DOCKER_IMAGE}
+
+  computer-use-server:
+    image: ${COMPUTER_USE_SERVER_IMAGE}
+    container_name: ocu-test-computer-use-server
+    ports: !override []
+    volumes: !override
+      - /var/run/docker.sock:/var/run/docker.sock
+      # These bind mounts use identical host/container paths. The Docker daemon
+      # must see them at the same absolute paths when it mounts chat data and
+      # custom skills into a sandbox.
+      - ${OCU_CHAT_DATA_DIR}:${OCU_CHAT_DATA_DIR}:rw
+      - ${OCU_SKILLS_CACHE_DIR}:${OCU_SKILLS_CACHE_DIR}:rw
+    environment: !override
+      MCP_API_KEY: ${MCP_API_KEY}
+      OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
+      OCU_WEBUI_ORIGIN: ${OCU_WEBUI_ORIGIN:?OCU_WEBUI_ORIGIN is required}
+      OCU_WEBUI_AUTH_URL: ${OCU_WEBUI_AUTH_URL:?OCU_WEBUI_AUTH_URL is required}
+      DOCKER_IMAGE: ${DOCKER_IMAGE}
+      USER_DATA_BASE_PATH: ${OCU_CHAT_DATA_DIR}
+      BASE_DATA_DIR: ${OCU_CHAT_DATA_DIR}
+      SKILLS_CACHE_DIR: ${OCU_SKILLS_CACHE_DIR}
+      SKILLS_CACHE_HOST_PATH: ${OCU_SKILLS_CACHE_DIR}
+      ORCHESTRATOR_CONTAINER_NAME: ocu-test-computer-use-server
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      SINGLE_USER_MODE: "false"
+      CONTAINER_MEM_LIMIT: ${CONTAINER_MEM_LIMIT}
+      CONTAINER_CPU_LIMIT: ${CONTAINER_CPU_LIMIT}
+      CONTAINER_IDLE_TIMEOUT: ${CONTAINER_IDLE_TIMEOUT}
+      OCU_SANDBOX_NETWORK: ${OCU_SANDBOX_NETWORK:?OCU_SANDBOX_NETWORK is required}
+      OCU_SANDBOX_SUBNET: ${OCU_SANDBOX_SUBNET:?OCU_SANDBOX_SUBNET is required}
+      SANDBOX_HOST_BIND_IP: ${OCU_SANDBOX_GATEWAY:?OCU_SANDBOX_GATEWAY is required}
+      COMMAND_TIMEOUT: ${COMMAND_TIMEOUT}
+      SUB_AGENT_TIMEOUT: ${SUB_AGENT_TIMEOUT}
+      ENABLE_NETWORK: "true"
+      # The injected Open WebUI Tool intentionally omits sub_agent. Do not pass
+      # credentials for Claude, Codex, OpenCode, or other external sub-agents.
+
+  # The upstream cleanup service stops sandboxes and deletes data/volumes.
+  # It must never start for this retention policy.
+  cleanup:
+    profiles: ["manual-maintenance"]
+    restart: "no"
+
+  # Stops only sandboxes that have exceeded their maximum continuous runtime.
+  # It never removes sandbox containers, chat data, volumes, images, or cache.
+  retention-guard:
+    build:
+      context: ./deploy/production-like-test/retention
+      dockerfile: Dockerfile
+    image: ${RETENTION_GUARD_IMAGE}
+    container_name: ocu-test-retention-guard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      CONTAINER_MAX_AGE_HOURS: ${CONTAINER_MAX_AGE_HOURS}
+      RETENTION_CHECK_INTERVAL_SECONDS: ${RETENTION_CHECK_INTERVAL_SECONDS}
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+networks:
+  default:
+    name: ${OCU_PRIVATE_NETWORK:?OCU_PRIVATE_NETWORK is required}
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${OCU_PRIVATE_SUBNET:?OCU_PRIVATE_SUBNET is required}
+          gateway: ${OCU_PRIVATE_GATEWAY:?OCU_PRIVATE_GATEWAY is required}

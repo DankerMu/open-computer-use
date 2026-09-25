@@ -3,6 +3,14 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Proxy-only production-like deployment topology.** The core and WebUI
+  overrides remove direct host publications; a standalone unprivileged proxy
+  image renders the canonical nginx policy after both application stacks are
+  started. The deploy entry checks the complete resolved publication matrix,
+  validates or creates the persistent non-internal sandbox bridge without
+  replacing existing networks, and binds sandbox services to its inspected
+  gateway. Real Docker topology acceptance and firewall isolation remain
+  separate gates.
 - **Dedicated sandbox-bridge membership.** Network-enabled create and launch
   attach a sandbox only to the deployment-provisioned `OCU_SANDBOX_NETWORK`
   (default `ocu-sandbox`) and publish CDP/ttyd on that bridge's inspected IPv4
