@@ -61,7 +61,11 @@ class NativeProxyTests(unittest.TestCase):
         self.assertNotIn("authorization", seen["headers"])
         self.assertNotIn("x-api-key", seen["headers"])
         self.assertNotIn("x-openwebui-key", seen["headers"])
+        self.assertEqual(seen.get("auth_frame"), "bodyless")
+        self.assertIn(seen.get("auth_content_length"), {None, "0"})
+        self.assertIsNone(seen.get("auth_transfer_encoding"))
         return seen
+
     def check_forward(self, path, upstream, method="GET", extra=None, body=None, *, session=False):
         before = self.snapshot()
         status, _, _ = self.request(path, method, self.owner(extra), body)
@@ -155,6 +159,13 @@ class NativeProxyTests(unittest.TestCase):
                          ("POST", "/api/uploads/" + CHAT + "/large.bin"))
         self.assertNotEqual(seen.get("body_sha256"), hashlib.sha256(large).hexdigest())
         self.assertEqual(seen.get("body_length"), len(large))
+        before = self.snapshot()
+        status, _, _ = self.request("/ocu/api/outputs/" + CHAT, headers=self.owner())
+        self.assertEqual(status, 200)
+        self.expect_auth(before)
+        ocu = self.since("ocu", before)
+        self.assertEqual(len(ocu), 1)
+        self.assertEqual(ocu[0]["target"], "/api/outputs/" + CHAT)
 
     def test_unknown_paths_methods_and_ambiguous_targets_never_contact_ocu(self):
         targets = (

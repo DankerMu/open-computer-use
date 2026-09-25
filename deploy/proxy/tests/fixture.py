@@ -72,10 +72,23 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.rfile.read(length) if length else b""
             extra["body_sha256"] = hashlib.sha256(payload).hexdigest()
             extra["body_length"] = len(payload)
+        if kind == "auth":
+            extra["auth_content_length"] = self.headers.get("Content-Length")
+            extra["auth_transfer_encoding"] = self.headers.get("Transfer-Encoding")
+            length_header = self.headers.get("Content-Length")
+            framed = bool(self.headers.get("Transfer-Encoding"))
+            if length_header not in {None, "0"}:
+                framed = True
+                leftover = self.rfile.read(int(length_header))
+                extra["auth_body_length"] = len(leftover)
+            extra["auth_frame"] = "body" if framed else "bodyless"
         self.server.observe(kind, self, extra)
         if kind == "auth":
             cookie = self.headers.get("Cookie", "")
             chat = self.headers.get("X-Chat-Id", "")
+            if extra.get("auth_frame") == "body":
+                self._reply(400, b"auth frame must be bodyless")
+                return
             if self.path == "/api/v1/ocu/auth":
                 if cookie == "session=owner" and chat == "chat-ABC-123":
                     self._reply(200, b"authenticated",

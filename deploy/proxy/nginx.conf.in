@@ -63,6 +63,7 @@ http {
             proxy_pass @@WEBUI@@/api/v1/ocu/auth;
             proxy_pass_request_body off;
             proxy_pass_request_headers off;
+            proxy_set_header Content-Length "";
             proxy_set_header Host $proxy_host;
             proxy_set_header Cookie $http_cookie;
             proxy_set_header X-Chat-Id $ocu_chat_id;
@@ -72,6 +73,7 @@ http {
             proxy_pass @@WEBUI@@/api/v1/auths/;
             proxy_pass_request_body off;
             proxy_pass_request_headers off;
+            proxy_set_header Content-Length "";
             proxy_set_header Host $proxy_host;
             proxy_set_header Cookie $http_cookie;
         }
