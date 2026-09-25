@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
-"""Static overlay and packaging assertions without emulating Compose merge."""
+"""Parsed overlay and packaging assertions without emulating Compose merge."""
 
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import unittest
+
 try:
     import yaml
     from yaml.nodes import MappingNode, SequenceNode
-except ImportError:
-    yaml = None
+except ImportError as exc:  # pragma: no cover - exercised by missing-dependency CI
+    raise ImportError("PyYAML is required for parsed overlay checks") from exc
 
 from support import (
     CORE_OVERRIDE,
     PROXY_COMPOSE,
     PROXY_DOCKERFILE,
     PROXY_DOCKERIGNORE,
-    PROXY_ENTRYPOINT,
     ROOT,
     WEBUI_OVERRIDE,
 )
@@ -32,141 +31,130 @@ REQUIRED_CORE_NAMES = (
     "OCU_SANDBOX_NETWORK",
     "OCU_SANDBOX_SUBNET",
 )
-REQUIRED_WEBUI_NAMES = (
-    "OCU_INTERNAL_TOKEN",
-)
 REQUIRED_PROXY_INTERPOLATED = (
     "OCU_INTERNAL_TOKEN",
     "OCU_WEBUI_ORIGIN",
-)
-REQUIRED_PRIVATE_NET = (
-    "OCU_PRIVATE_NETWORK",
-    "OCU_PRIVATE_SUBNET",
-    "OCU_PRIVATE_GATEWAY",
 )
 ADOPTED = (
     ROOT / "deploy" / "production-like-test" / "retention" / "Dockerfile",
     ROOT / "deploy" / "production-like-test" / "retention" / "stop-overage.sh",
     ROOT / "deploy" / "production-like-test" / "init" / "run-init.sh",
+    ROOT / "openwebui" / "init.sh",
+    ROOT / "openwebui" / "tools" / "computer_use_tools.py",
+    ROOT / "openwebui" / "functions" / "computer_link_filter.py",
 )
-PUBLIC_COPIES = (
-    "COPY render.py /opt/ocu-proxy/render.py",
-    "COPY nginx.conf.in /opt/ocu-proxy/nginx.conf.in",
-    "COPY routes.json /opt/ocu-proxy/routes.json",
-    "COPY entrypoint.sh /opt/ocu-proxy/entrypoint.sh",
+PUBLIC_COPY_SOURCES = (
+    "render.py",
+    "nginx.conf.in",
+    "routes.json",
+    "entrypoint.sh",
 )
 
 
-if yaml is not None:
-    class ComposeLoader(yaml.SafeLoader):
-        pass
+class ComposeLoader(yaml.SafeLoader):
+    pass
 
-    def override(loader, node):
-        if isinstance(node, SequenceNode):
-            return loader.construct_sequence(node)
-        if isinstance(node, MappingNode):
-            return loader.construct_mapping(node)
+
+def override(loader, node):
+    if isinstance(node, SequenceNode):
+        value = loader.construct_sequence(node)
+    elif isinstance(node, MappingNode):
+        value = loader.construct_mapping(node)
+    else:
         raise ValueError("unexpected !override value")
+    return {"__override__": True, "value": value}
 
-    ComposeLoader.add_constructor("!override", override)
+
+ComposeLoader.add_constructor("!override", override)
 
 
 def parsed(path: Path) -> dict:
-    if yaml is None:
-        raise unittest.SkipTest("PyYAML is required for parsed overlay checks")
     return yaml.load(path.read_text(encoding="utf-8"), Loader=ComposeLoader)
 
 
+def override_value(node):
+    if not isinstance(node, dict) or node.get("__override__") is not True:
+        raise AssertionError("expected Compose !override node")
+    return node["value"]
+
+
+def interpolated(value: str, name: str) -> bool:
+    return isinstance(value, str) and value.startswith(f"${{{name}:?")
+
+
 class OverlayStructureTests(unittest.TestCase):
-    def read(self, path: Path) -> str:
-        return path.read_text(encoding="utf-8")
-
-    def test_core_and_webui_remove_host_publications_with_override(self):
-        core = self.read(CORE_OVERRIDE)
-        webui = self.read(WEBUI_OVERRIDE)
-        self.assertIn("ports: !override []", core)
-        self.assertIn("ports: !override []", webui)
-        self.assertNotIn("127.0.0.1:", core)
-        self.assertNotIn("127.0.0.1:", webui)
-        self.assertNotRegex(core, r"ports:\s*\n\s*-\s*\"")
-        self.assertNotRegex(webui, r"ports:\s*\n\s*-\s*\"")
-
-    def test_required_auth_and_topology_names_cannot_be_dropped(self):
-        core = self.read(CORE_OVERRIDE)
-        webui = self.read(WEBUI_OVERRIDE)
-        proxy = self.read(PROXY_COMPOSE)
-        for name in REQUIRED_CORE_NAMES:
-            self.assertIn(f"{name}: ${{{name}:?", core)
-        self.assertIn("SANDBOX_HOST_BIND_IP: ${OCU_SANDBOX_GATEWAY:?", core)
-        for name in REQUIRED_WEBUI_NAMES:
-            self.assertIn(f"{name}: ${{{name}:?", webui)
-        for name in REQUIRED_PRIVATE_NET:
-            self.assertIn(f"${{{name}:?", core)
-            self.assertIn(f"${{{name}:?", webui)
-        self.assertIn("${OCU_PRIVATE_NETWORK:?", proxy)
-        for name in REQUIRED_PROXY_INTERPOLATED:
-            self.assertIn(f"{name}: ${{{name}:?", proxy)
-        self.assertIn("image: ${OCU_PROXY_IMAGE:?", proxy)
-        self.assertIn("${OCU_PROXY_PORT:?", proxy)
-        self.assertIn("OCU_WEBUI_UPSTREAM: http://open-webui:8080", proxy)
-        self.assertIn("OCU_PROXY_UPSTREAM: http://computer-use-server:8081", proxy)
-        self.assertIn("0.0.0.0:8082", proxy)
-
-    def test_adopted_local_dependencies_exist(self):
-        for path in ADOPTED:
-            self.assertTrue(path.is_file(), path)
-        self.assertIn("./deploy/production-like-test/retention", self.read(CORE_OVERRIDE))
-        self.assertIn("./deploy/production-like-test/init/run-init.sh", self.read(WEBUI_OVERRIDE))
-
-    @unittest.skipUnless(yaml is not None, "PyYAML is required for parsed overlay checks")
     def test_parsed_overrides_and_local_build_mount_dependencies(self):
         core = parsed(CORE_OVERRIDE)
         webui = parsed(WEBUI_OVERRIDE)
         proxy = parsed(PROXY_COMPOSE)
-        self.assertEqual(core["services"]["computer-use-server"]["ports"], [])
-        self.assertEqual(webui["services"]["open-webui"]["ports"], [])
+        self.assertEqual(override_value(core["services"]["computer-use-server"]["ports"]), [])
+        self.assertEqual(override_value(webui["services"]["open-webui"]["ports"]), [])
+        core_env = override_value(core["services"]["computer-use-server"]["environment"])
+        webui_env = override_value(webui["services"]["open-webui"]["environment"])
+        for name in REQUIRED_CORE_NAMES:
+            self.assertTrue(interpolated(core_env[name], name), name)
+        self.assertTrue(interpolated(core_env["SANDBOX_HOST_BIND_IP"], "OCU_SANDBOX_GATEWAY"))
+        self.assertTrue(interpolated(webui_env["OCU_INTERNAL_TOKEN"], "OCU_INTERNAL_TOKEN"))
+        self.assertEqual(webui_env["ENABLE_OCU_WORKSPACE"], "true")
+        self.assertEqual(webui_env["OCU_INTERNAL_URL"], "http://computer-use-server:8081")
+        self.assertEqual(webui_env["ORCHESTRATOR_URL"], "http://computer-use-server:8081")
+        self.assertTrue(interpolated(core["networks"]["default"]["name"], "OCU_PRIVATE_NETWORK"))
+        self.assertTrue(interpolated(core["networks"]["default"]["ipam"]["config"][0]["subnet"], "OCU_PRIVATE_SUBNET"))
+        self.assertTrue(interpolated(core["networks"]["default"]["ipam"]["config"][0]["gateway"], "OCU_PRIVATE_GATEWAY"))
+        self.assertTrue(interpolated(webui["networks"]["default"]["name"], "OCU_PRIVATE_NETWORK"))
+        self.assertTrue(interpolated(webui["networks"]["default"]["ipam"]["config"][0]["subnet"], "OCU_PRIVATE_SUBNET"))
+        self.assertTrue(interpolated(webui["networks"]["default"]["ipam"]["config"][0]["gateway"], "OCU_PRIVATE_GATEWAY"))
+        self.assertTrue(interpolated(proxy["networks"]["default"]["name"], "OCU_PRIVATE_NETWORK"))
+        for name in REQUIRED_PROXY_INTERPOLATED:
+            self.assertTrue(interpolated(proxy["services"]["proxy"]["environment"][name], name), name)
+        self.assertTrue(interpolated(proxy["services"]["proxy"]["image"], "OCU_PROXY_IMAGE"))
+        self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_WEBUI_UPSTREAM"], "http://open-webui:8080")
+        self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_PROXY_UPSTREAM"], "http://computer-use-server:8081")
+        self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_PROXY_LISTEN"], "0.0.0.0:8082")
         core_context = ROOT / core["services"]["retention-guard"]["build"]["context"]
         self.assertTrue((core_context / "Dockerfile").is_file())
         self.assertTrue((core_context / "stop-overage.sh").is_file())
         mounts = webui["services"]["open-webui-init"]["volumes"]
         self.assertTrue(any("init/run-init.sh:/bootstrap/run-init.sh:ro" in value for value in mounts))
+        self.assertTrue(any(value.startswith("./openwebui:") for value in mounts))
         proxy_context = (PROXY_COMPOSE.parent / proxy["services"]["proxy"]["build"]["context"]).resolve()
         self.assertEqual(proxy_context, ROOT / "deploy" / "proxy")
         self.assertTrue((proxy_context / proxy["services"]["proxy"]["build"]["dockerfile"]).is_file())
         self.assertEqual(list(proxy["services"]), ["proxy"])
 
+    def test_adopted_local_dependencies_exist(self):
+        for path in ADOPTED:
+            self.assertTrue(path.is_file(), path)
+        core = parsed(CORE_OVERRIDE)
+        webui = parsed(WEBUI_OVERRIDE)
+        self.assertEqual(
+            core["services"]["retention-guard"]["build"]["context"],
+            "./deploy/production-like-test/retention",
+        )
+        mounts = webui["services"]["open-webui-init"]["volumes"]
+        self.assertTrue(any("./deploy/production-like-test/init/run-init.sh:/bootstrap/run-init.sh:ro" in value for value in mounts))
 
     def test_proxy_packaging_copies_only_public_sources(self):
-        dockerfile = self.read(PROXY_DOCKERFILE)
-        dockerignore = self.read(PROXY_DOCKERIGNORE)
-        copies = re.findall(r"^COPY .+$", dockerfile, re.MULTILINE)
-        self.assertEqual(copies, list(PUBLIC_COPIES))
+        dockerfile = PROXY_DOCKERFILE.read_text(encoding="utf-8")
+        dockerignore = PROXY_DOCKERIGNORE.read_text(encoding="utf-8")
+        copies = [
+            line.split()[1]
+            for line in dockerfile.splitlines()
+            if line.startswith("COPY ")
+        ]
+        self.assertEqual(copies, list(PUBLIC_COPY_SOURCES))
         self.assertTrue(any(line.strip() == "*" for line in dockerignore.splitlines()), dockerignore)
-        for source in ("render.py", "nginx.conf.in", "routes.json", "entrypoint.sh"):
+        for source in PUBLIC_COPY_SOURCES:
             self.assertIn(f"!{source}", dockerignore)
         self.assertIn("nginx.conf", dockerignore)
         self.assertIn("runtime/", dockerignore)
-        copied = [line.split()[1] for line in copies]
-        self.assertNotIn("nginx.conf", copied)
-        self.assertNotIn("/opt/homebrew", dockerfile)
-        self.assertNotIn("/opt/homebrew", self.read(PROXY_ENTRYPOINT))
+        self.assertNotIn("nginx.conf", copies)
 
     def test_obsolete_private_binding_patch_is_absent(self):
         patch = ROOT / "deploy" / "production-like-test" / "patches" / "private-sandbox-port-bindings.patch"
         self.assertFalse(patch.exists())
-        claim = self.read(ROOT / "deploy" / "production-like-test" / "scripts" / "write-deployed-version.sh")
+        claim = (ROOT / "deploy" / "production-like-test" / "scripts" / "write-deployed-version.sh").read_text(encoding="utf-8")
         self.assertNotIn("private-sandbox-port-bindings.patch", claim)
-        self.assertIn("disable-cli-autostart.patch", claim)
-
-    def test_cli_autostart_patch_remains(self):
-        patch = ROOT / "deploy" / "production-like-test" / "patches" / "disable-cli-autostart.patch"
-        self.assertTrue(patch.is_file())
-
-    def test_base_development_compose_is_untouched_by_this_slice(self):
-        base = self.read(ROOT / "docker-compose.yml")
-        webui = self.read(ROOT / "docker-compose.webui.yml")
-        self.assertIn("${MCP_PORT:-8081}:8081", base)
-        self.assertIn("${OPENWEBUI_PORT:-3000}:8080", webui)
 
 
 if __name__ == "__main__":

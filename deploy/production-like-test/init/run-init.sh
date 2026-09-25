@@ -1,19 +1,18 @@
 #!/bin/bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # One-shot Open WebUI bootstrap wrapper for the production-like test deployment.
-# It deliberately does not log the generated admin password and does not expose
-# the upstream sub_agent capability until a fully internal sub-agent runtime is
-# available.
-
+# It does not expose the upstream sub_agent capability until a fully internal
+# sub-agent runtime is available.
 set -euo pipefail
 
-source_root=/app/source
-work_root=$(mktemp -d /tmp/ocu-init.XXXXXX)
+source_root="${OCU_INIT_SOURCE_ROOT:-/app/source}"
+work_root=$(mktemp -d "${TMPDIR:-/tmp}/ocu-init.XXXXXX")
 
 cleanup() {
     rm -rf "$work_root"
 }
 trap cleanup EXIT
+
 
 mkdir -p "$work_root/tools" "$work_root/functions"
 
@@ -41,21 +40,14 @@ if method_start < 0 or method_end < 0:
 )
 
 init_source = (source_root / "init.sh").read_text(encoding="utf-8")
-secret_log = 'echo "[init] Login: $ADMIN_EMAIL / $ADMIN_PASSWORD"'
-if init_source.count(secret_log) != 1:
-    raise SystemExit("refusing to bootstrap: expected credential log line changed upstream")
-safe_init = init_source.replace(
-    secret_log,
-    'echo "[init] Login credentials are stored in the protected host credential file."',
-)
 
 # Never let the upstream initializer select the first arbitrary model returned
 # by a provider. It must validate the explicitly approved deployment model and
 # use it both for the Computer Use workspace model and as WebUI's default.
 default_models_line = "cfg.setdefault('DEFAULT_MODELS', cfg.get('DEFAULT_MODELS') or '')"
-if safe_init.count(default_models_line) != 1:
+if init_source.count(default_models_line) != 1:
     raise SystemExit("refusing to bootstrap: expected DEFAULT_MODELS config line changed upstream")
-safe_init = safe_init.replace(
+safe_init = init_source.replace(
     default_models_line,
     f"cfg['DEFAULT_MODELS'] = {primary_model!r}",
 )
@@ -113,10 +105,5 @@ safe_init = safe_init.replace(marker_section, workspace_model_access_block + mar
 )
 PY
 
-if [ -e /app/init ]; then
-    printf '%s\n' '[init-wrapper] refusing to replace an existing /app/init path' >&2
-    exit 1
-fi
-ln -s "$work_root" /app/init
 
-exec /bin/bash "$work_root/init.sh"
+/bin/bash "$work_root/init.sh"

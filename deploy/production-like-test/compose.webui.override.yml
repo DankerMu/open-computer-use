@@ -46,6 +46,8 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       ORCHESTRATOR_URL: http://computer-use-server:8081
+      ENABLE_OCU_WORKSPACE: "true"
+      OCU_INTERNAL_URL: http://computer-use-server:8081
       MCP_API_KEY: ${MCP_API_KEY}
       OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
       CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "200"
@@ -63,8 +65,8 @@ services:
 
   # Current upstream compose no longer invokes openwebui/init.sh. This job
   # explicitly performs the one-time setup once the API is reachable. The
-  # wrapper removes sub_agent from the installed client tool and redacts the
-  # upstream script's final credential log line before it is executed.
+  # wrapper removes sub_agent from the installed client tool before executing
+  # the canonical initializer.
   open-webui-init:
     image: ${OPENWEBUI_IMAGE}
     container_name: ocu-test-open-webui-init

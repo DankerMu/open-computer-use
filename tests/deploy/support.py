@@ -70,24 +70,22 @@ def stack(services, networks=None):
 
 
 def intended_core():
-    attached = service(networks={"default": {}})
     return stack(
         {
-            "workspace": service(),
-            OCU_SERVICE: attached,
-            "cleanup": service(),
-            "retention-guard": attached,
+            "workspace": service(networks={"default": {}}),
+            OCU_SERVICE: service(networks={"default": {}}),
+            "cleanup": service(networks={"default": {}}),
+            "retention-guard": service(networks={"default": {}}),
         }
     )
 
 
 def intended_webui():
-    attached = service(networks={"default": {}})
     return stack(
         {
             WEBUI_SERVICE: service(networks={"default": {}}, expose=["8080"]),
-            "postgres": attached,
-            "open-webui-init": attached,
+            "postgres": service(networks={"default": {}}),
+            "open-webui-init": service(networks={"default": {}}),
         }
     )
 
@@ -133,12 +131,6 @@ def write_docs(directory: Path, docs=None) -> list[Path]:
 def run_checker(paths, *, env=None, extra_env=None):
     merged = os.environ.copy() if env is None else dict(env)
     if env is None:
-        for name in (
-            "OCU_CHECK_PROXY_SERVICE", "OCU_CHECK_WEBUI_SERVICE", "OCU_CHECK_OCU_SERVICE",
-            "OCU_CHECK_PROXY_TARGET", "OCU_CHECK_PROXY_PUBLISHED",
-            "OCU_CHECK_SANDBOX_NETWORK", "OCU_CHECK_CONTROL_NETWORK",
-        ):
-            merged.pop(name, None)
         merged.update({
             "OCU_PRIVATE_NETWORK": CONTROL_NETWORK,
             "OCU_SANDBOX_NETWORK": SANDBOX_NETWORK,

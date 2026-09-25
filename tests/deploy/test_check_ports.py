@@ -163,6 +163,15 @@ class CheckPortsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("retention-guard", result.stderr)
 
+    def test_bridge_network_mode_without_service_networks_is_rejected(self):
+        docs = intended_docs()
+        docs["webui.json"]["services"][WEBUI_SERVICE].pop("networks", None)
+        docs["webui.json"]["services"][WEBUI_SERVICE]["network_mode"] = "bridge"
+        result = self.check(docs)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(WEBUI_SERVICE, result.stderr)
+        self.assertIn("network mode", result.stderr)
+
 
     def test_sandbox_bridge_membership_is_rejected(self):
         docs = intended_docs()
@@ -208,6 +217,24 @@ class CheckPortsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(WEBUI_SERVICE, result.stderr)
 
+    def test_missing_services_key_is_rejected(self):
+        docs = intended_docs()
+        docs["core.json"] = {"networks": docs["core.json"]["networks"]}
+        result = self.check(docs)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_malformed_network_definition_is_rejected_without_environment_dump(self):
+        docs = intended_docs()
+        docs["core.json"]["networks"]["default"] = ["not-a-mapping"]
+        docs["webui.json"]["services"][WEBUI_SERVICE]["environment"] = {
+            "WEBUI_SECRET_KEY": "another-secret",
+        }
+        result = self.check(docs)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed network definition", result.stderr)
+        self.assertNotIn("another-secret", result.stderr)
+        self.assertNotIn("WEBUI_SECRET_KEY", result.stderr)
+
     def test_malformed_json_is_rejected(self):
         with tmp_dir() as raw:
             directory = Path(raw)
@@ -222,6 +249,7 @@ class CheckPortsTests(unittest.TestCase):
         docs["core.json"] = {"networks": docs["core.json"]["networks"]}
         result = self.check(docs)
         self.assertNotEqual(result.returncode, 0)
+
 
     def test_empty_argv_is_rejected(self):
         result = run_checker([])

@@ -23,6 +23,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEBUI_URL="${WEBUI_URL:-http://localhost:8080}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@open-computer-use.dev}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
@@ -34,12 +35,14 @@ ADMIN_NAME="${ADMIN_NAME:-Admin}"
 # OCU_INTERNAL_TOKEN remains an environment-only tool credential, read on every call.
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://computer-use-server:8081}"
 MCP_API_KEY="${MCP_API_KEY:-}"
-MARKER_FILE="/app/backend/data/.computer-use-initialized"
+MARKER_FILE="${MARKER_FILE:-/app/backend/data/.computer-use-initialized}"
+export TOOL_SOURCE="${SCRIPT_DIR}/tools/computer_use_tools.py"
+export FILTER_SOURCE="${SCRIPT_DIR}/functions/computer_link_filter.py"
 
 # Sanity checks — run EVERY start (before marker-gate), so stale-default
 # warnings resurface on each restart until the user fixes them.
 if [[ "$ADMIN_PASSWORD" == "admin" || "$ADMIN_PASSWORD" == "change-me" ]]; then
-    echo "[init] WARNING: ADMIN_PASSWORD is still the default (\"$ADMIN_PASSWORD\") — change it for anything beyond local dev."
+    echo "[init] WARNING: ADMIN_PASSWORD is still the default — change it for anything beyond local dev."
 fi
 if [[ -z "$MCP_API_KEY" ]]; then
     echo "[init] WARNING: MCP_API_KEY is empty — /mcp still requires OCU_INTERNAL_TOKEN, but has no second Bearer credential. Set it for defense in depth."
@@ -53,13 +56,21 @@ if [ -f "$MARKER_FILE" ]; then
 fi
 
 echo "[init] Waiting for Open WebUI to be ready..."
-for i in $(seq 1 60); do
+ready=0
+READY_ATTEMPTS="${OCU_INIT_READY_ATTEMPTS:-60}"
+READY_SLEEP="${OCU_INIT_READY_SLEEP:-2}"
+for i in $(seq 1 "$READY_ATTEMPTS"); do
     if curl -sf "$WEBUI_URL/api/version" >/dev/null 2>&1; then
         echo "[init] Open WebUI is ready."
+        ready=1
         break
     fi
-    sleep 2
+    sleep "$READY_SLEEP"
 done
+if [ "$ready" != "1" ]; then
+    echo "[init] ERROR: Open WebUI did not become ready." >&2
+    exit 1
+fi
 
 # Check if any users exist
 USERS=$(curl -sf "$WEBUI_URL/api/v1/auths/signin" \
@@ -77,12 +88,10 @@ else
 
     if echo "$SIGNUP" | python3 -c "import sys,json; json.load(sys.stdin)['token']" 2>/dev/null; then
         TOKEN=$(echo "$SIGNUP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
-        echo "[init] Created admin user: $ADMIN_EMAIL"
+        echo "[init] Created admin user."
     else
-        echo "[init] WARNING: Could not create or login as admin. Manual setup required."
-        echo "[init] Try: email=$ADMIN_EMAIL password=$ADMIN_PASSWORD"
-        touch "$MARKER_FILE"
-        exit 0
+        echo "[init] ERROR: Could not create or login as admin." >&2
+        exit 1
     fi
 fi
 
@@ -90,10 +99,9 @@ AUTH="Authorization: Bearer $TOKEN"
 
 # Install tool: computer_use_tools.py
 echo "[init] Installing Computer Use tool..."
-TOOL_CODE=$(cat /app/init/tools/computer_use_tools.py)
 TOOL_PAYLOAD=$(python3 -c "
-import json, sys
-code = open('/app/init/tools/computer_use_tools.py').read()
+import json, os
+code = open(os.environ['TOOL_SOURCE']).read()
 print(json.dumps({
     'id': 'ai_computer_use',
     'name': 'Computer Use Tools',
@@ -147,7 +155,7 @@ fi
 echo "[init] Installing Computer Use filter..."
 FUNC_PAYLOAD=$(python3 -c "
 import json
-code = open('/app/init/functions/computer_link_filter.py').read()
+code = open(os.environ['FILTER_SOURCE']).read()
 print(json.dumps({
     'id': 'computer_use_filter',
     'name': 'Computer Use Filter',
@@ -303,6 +311,6 @@ if [ "$INIT_FAILED" = "0" ]; then
     touch "$MARKER_FILE"
     echo "[init] Done! Open WebUI is ready with Computer Use."
 else
-    echo "[init] Done with errors — marker NOT written, init will re-run on next restart to retry the failed steps."
+    echo "[init] ERROR: required setup failed — marker not written." >&2
+    exit 1
 fi
-echo "[init] Login: $ADMIN_EMAIL / $ADMIN_PASSWORD"

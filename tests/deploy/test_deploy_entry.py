@@ -50,7 +50,39 @@ def starts(state_dir: Path) -> list[str]:
 
 
 def leftover_tmp(state_dir: Path) -> list[Path]:
-    return [path for path in state_dir.glob("ocu-deploy-config-*") if path.exists()]
+    return [
+        path
+        for path in state_dir.glob("ocu-deploy-config.*")
+        if path.is_dir() and path.name.startswith("ocu-deploy-config.")
+    ]
+
+
+def compose_up_ops(state_dir: Path) -> list[str]:
+    return [line for line in ops(state_dir) if " compose " in f" {line} " and line.split()[-1:] != ["config"] and " up " in f" {line} "]
+
+
+def executed_rows(state_dir: Path) -> list[dict]:
+    path = state_dir / "executed.json"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def running_services(state_dir: Path) -> dict:
+    path = state_dir / "running.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def wait_for(predicate, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
 
 
 class DeployEntryTests(unittest.TestCase):
@@ -242,7 +274,7 @@ class DeployEntryTests(unittest.TestCase):
         result = run_script(UP, self.env)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
-        self.assertFalse(any("compose up" in line for line in ops(self.state)))
+        self.assertEqual(compose_up_ops(self.state), [])
         self.assert_no_destructive()
 
     def test_checker_failure_starts_no_service_and_cleans_temp_files(self):
@@ -255,9 +287,19 @@ class DeployEntryTests(unittest.TestCase):
         result = run_script(UP, self.env)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
-        self.assertFalse(any("compose up" in line for line in ops(self.state)))
+        self.assertEqual(compose_up_ops(self.state), [])
         after = leftover_tmp(self.state)
         self.assertEqual(after, before)
+        self.assert_no_destructive()
+
+    def test_bridge_network_mode_prevents_starts(self):
+        docs = intended_docs()
+        docs["webui.json"]["services"]["open-webui"].pop("networks", None)
+        docs["webui.json"]["services"]["open-webui"]["network_mode"] = "bridge"
+        write_fake_configs(self.state, docs)
+        result = run_script(UP, self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(starts(self.state), [])
         self.assert_no_destructive()
 
     def test_incompatible_bridge_prevents_starts(self):
@@ -279,15 +321,104 @@ class DeployEntryTests(unittest.TestCase):
             subnet="172.31.0.0/24",
             gateway="172.31.0.1",
         )
-        result = run_script(UP, self.env)
+        env = dict(self.env)
+        env["COMPOSE_REMOVE_ORPHANS"] = "1"
+        env["COMPOSE_PROFILES"] = "manual-maintenance"
+        result = run_script(UP, env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(leftover_tmp(self.state), [])
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
         recorded = "\n".join(ops(self.state))
         self.assertNotIn("--remove-orphans", recorded)
+        rows = executed_rows(self.state)
+        self.assertEqual([row["stack"] for row in rows], ["core", "webui", "proxy"])
+        self.assertTrue(all(row["snapshot"] for row in rows))
+        self.assertTrue(all(row["env_remove_orphans"] == "false" for row in rows))
+        self.assertTrue(all(row["env_profiles"] == "" for row in rows))
+        self.assertNotIn("cleanup", running_services(self.state))
+        self.assertEqual(
+            set(running_services(self.state)),
+            {
+                "workspace",
+                "computer-use-server",
+                "retention-guard",
+                "open-webui",
+                "postgres",
+                "open-webui-init",
+                "proxy",
+            },
+        )
         self.assert_no_destructive()
 
-    def test_signal_during_entry_removes_temporary_configs(self):
+    def test_application_start_failure_preserves_earlier_stack(self):
+        write_network(
+            self.state,
+            SANDBOX_NETWORK,
+            subnet="172.31.0.0/24",
+            gateway="172.31.0.1",
+        )
+        (self.state / "up-fail-webui").write_text("1", encoding="utf-8")
+        result = run_script(UP, self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(starts(self.state), ["core", "webui:failed"])
+        self.assertEqual(
+            {name for name, owner in running_services(self.state).items() if owner == "core"},
+            {"workspace", "computer-use-server", "retention-guard"},
+        )
+        self.assertNotIn("proxy", starts(self.state))
+        self.assertEqual(leftover_tmp(self.state), [])
+        self.assert_no_destructive()
+
+    def test_checked_snapshot_is_started_after_source_mutation(self):
+        write_network(
+            self.state,
+            SANDBOX_NETWORK,
+            subnet="172.31.0.0/24",
+            gateway="172.31.0.1",
+        )
+        docs = intended_docs()
+        docs["webui.json"]["services"]["open-webui"]["environment"] = {
+            "OCU_INTERNAL_TOKEN": "synthetic$TOKEN",
+        }
+        write_fake_configs(self.state, docs)
+        marker = self.state / "up-hold"
+        marker.write_text("1", encoding="utf-8")
+        env = dict(self.env)
+        env["FAKE_DOCKER_HOLD_UP"] = str(marker)
+        process = subprocess.Popen(
+            ["bash", str(UP)],
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            self.assertTrue(
+                wait_for(lambda: (self.state / "entered-up").exists()),
+                "entry never reached compose up",
+            )
+            mutated = intended_docs()
+            mutated["webui.json"]["services"]["open-webui"]["ports"] = [
+                {"target": 8080, "published": "3000", "protocol": "tcp", "host_ip": "127.0.0.1"}
+            ]
+            write_fake_configs(self.state, mutated)
+            marker.unlink(missing_ok=True)
+            process.communicate(timeout=10)
+        finally:
+            marker.unlink(missing_ok=True)
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        rows = {row["stack"]: row for row in executed_rows(self.state)}
+        webui = rows["webui"]["document"]["services"]["open-webui"]
+        self.assertEqual(webui.get("ports", []), [])
+        self.assertEqual(webui["environment"]["OCU_INTERNAL_TOKEN"], "synthetic$$TOKEN")
+        self.assertTrue(rows["webui"]["snapshot"])
+
+    def _signal_during_held_up(self, sig):
         write_network(
             self.state,
             SANDBOX_NETWORK,
@@ -306,26 +437,38 @@ class DeployEntryTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            start_new_session=True,
         )
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            if any("compose up" in line for line in ops(self.state)):
-                break
-            time.sleep(0.05)
         try:
+            self.assertTrue(
+                wait_for(lambda: (self.state / "entered-up").exists()),
+                "entry never reached compose up",
+            )
             private = leftover_tmp(self.state)
             self.assertEqual(len(private), 1)
             self.assertEqual(stat.S_IMODE(private[0].stat().st_mode), 0o700)
-            for name in ("core.json", "webui.json", "proxy.json"):
+            for name in ("core.json", "webui.json", "proxy.json", "core.up.json", "webui.up.json", "proxy.up.json"):
                 self.assertEqual(stat.S_IMODE((private[0] / name).stat().st_mode), 0o600)
+            process.send_signal(sig)
+            self.assertTrue(
+                wait_for(lambda: process.poll() is not None, timeout=8),
+                "entry did not exit after signal",
+            )
         finally:
             if process.poll() is None:
-                process.send_signal(signal.SIGTERM)
+                process.send_signal(signal.SIGKILL)
             marker.unlink(missing_ok=True)
             process.communicate(timeout=10)
         self.assertNotEqual(process.returncode, 0)
         self.assertEqual(leftover_tmp(self.state), before)
         self.assert_no_destructive()
+
+    def test_signal_during_entry_removes_temporary_configs(self):
+        self._signal_during_held_up(signal.SIGTERM)
+
+    def test_hangup_during_entry_removes_temporary_configs(self):
+        self._signal_during_held_up(signal.SIGHUP)
+
 
 
 if __name__ == "__main__":

@@ -4,14 +4,6 @@
 # Validate complete resolved Compose JSON without printing environment data.
 set -euo pipefail
 
-export OCU_CHECK_PROXY_SERVICE="${OCU_CHECK_PROXY_SERVICE:-proxy}"
-export OCU_CHECK_WEBUI_SERVICE="${OCU_CHECK_WEBUI_SERVICE:-open-webui}"
-export OCU_CHECK_OCU_SERVICE="${OCU_CHECK_OCU_SERVICE:-computer-use-server}"
-export OCU_CHECK_PROXY_TARGET="${OCU_CHECK_PROXY_TARGET:-8082}"
-export OCU_CHECK_PROXY_PUBLISHED="${OCU_CHECK_PROXY_PUBLISHED:-${OCU_PROXY_PORT:-8082}}"
-export OCU_CHECK_SANDBOX_NETWORK="${OCU_CHECK_SANDBOX_NETWORK:-${OCU_SANDBOX_NETWORK:-ocu-sandbox}}"
-export OCU_CHECK_CONTROL_NETWORK="${OCU_CHECK_CONTROL_NETWORK:-${OCU_PRIVATE_NETWORK:-ocu-test-private}}"
-
 if [[ "$#" -lt 1 ]]; then
     printf '%s\n' 'check-ports: resolved Compose JSON documents are required' >&2
     exit 1
@@ -24,13 +16,13 @@ import json
 import os
 import sys
 
-PROXY = os.environ["OCU_CHECK_PROXY_SERVICE"]
-WEBUI = os.environ["OCU_CHECK_WEBUI_SERVICE"]
-OCU = os.environ["OCU_CHECK_OCU_SERVICE"]
-TARGET = os.environ["OCU_CHECK_PROXY_TARGET"]
-PUBLISHED = os.environ["OCU_CHECK_PROXY_PUBLISHED"]
-SANDBOX = os.environ["OCU_CHECK_SANDBOX_NETWORK"]
-CONTROL = os.environ["OCU_CHECK_CONTROL_NETWORK"]
+PROXY = "proxy"
+WEBUI = "open-webui"
+OCU = "computer-use-server"
+TARGET = "8082"
+PUBLISHED = os.environ.get("OCU_PROXY_PORT", "8082")
+SANDBOX = os.environ.get("OCU_SANDBOX_NETWORK", "ocu-sandbox")
+CONTROL = os.environ.get("OCU_PRIVATE_NETWORK", "ocu-test-private")
 
 
 def fail(message: str) -> None:
@@ -52,8 +44,12 @@ def load(path: str):
     return payload["services"], networks
 
 
-def networks_for(name: str, service: dict, networks: dict) -> set[str]:
+def networks_for(name: str, service: dict, networks: dict, mode) -> set[str]:
     declared = service.get("networks")
+    if mode:
+        if declared not in (None, {}, []):
+            fail(f"{name}: network mode cannot combine with service networks")
+        return set()
     if declared is None:
         aliases = ["default"] if "default" in networks else []
     elif isinstance(declared, dict):
@@ -88,10 +84,10 @@ for services, networks in docs:
         if not isinstance(service, dict):
             fail(f"{name}: malformed service")
         mode = service.get("network_mode")
-        if mode and (not isinstance(mode, str) or mode in {"host", "none"} or
-                     mode.startswith(("service:", "container:"))):
-            fail(f"{name}: forbidden host or shared network mode")
-        attached = networks_for(name, service, networks)
+        if mode:
+            if not isinstance(mode, str) or mode != "none":
+                fail(f"{name}: forbidden host or shared network mode")
+        attached = networks_for(name, service, networks, mode)
         if SANDBOX in attached:
             fail(f"{name}: joined sandbox network {SANDBOX}")
         if CONTROL not in attached:
