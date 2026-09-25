@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2026 Open Computer Use Contributors
+"""Independent fake Docker/Compose CLI driven by a state directory."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import re
+
+
+
+CORE_SERVICES = ("workspace", "computer-use-server", "retention-guard")
+WEBUI_SERVICES = ("open-webui", "postgres", "open-webui-init")
+PROXY_SERVICES = ("proxy",)
+CLEANUP_SERVICE = "cleanup"
+
+
+def state_dir() -> Path:
+    raw = os.environ.get("FAKE_DOCKER_STATE", "")
+    if not raw:
+        sys.stderr.write("FAKE_DOCKER_STATE is required\n")
+        sys.exit(2)
+    path = Path(raw)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "networks").mkdir(exist_ok=True)
+    return path
+
+
+def log(argv: list[str], state: Path) -> None:
+    line = " ".join(argv)
+    with (state / "ops.log").open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+
+
+def write_json(path: Path, payload) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def network_path(state: Path, name: str) -> Path:
+    return state / "networks" / f"{name}.json"
+
+
+def hold_named(state: Path, env_name: str, entered_name: str) -> None:
+    hold = os.environ.get(env_name, "")
+    if not hold:
+        return
+    marker = Path(hold)
+    (state / entered_name).write_text(str(os.getpid()), encoding="utf-8")
+    while marker.exists():
+        time.sleep(0.05)
+
+
+def inspect_network(state: Path, name: str) -> int:
+    hold_named(state, "FAKE_DOCKER_HOLD_INSPECT", "entered-inspect")
+    path = network_path(state, name)
+    if path.exists():
+        sys.stdout.write(path.read_text(encoding="utf-8"))
+        return 0
+    inspect_error = state / "inspect-error.json"
+    if inspect_error.exists():
+        payload = json.loads(inspect_error.read_text(encoding="utf-8"))
+        sys.stderr.write(str(payload.get("message", "inspect failed")) + "\n")
+        return int(payload.get("code", 1))
+    sys.stderr.write(f"Error: No such network: {name}\n")
+    return 1
+
+INTERPOLATION = re.compile(r"\$\$|\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def interpolate_value(value, env):
+    if isinstance(value, str):
+        def replace(match):
+            token = match.group(0)
+            if token == "$$":
+                return "$"
+            name = match.group(1) or match.group(2)
+            return env.get(name, "")
+
+        return INTERPOLATION.sub(replace, value)
+    if isinstance(value, list):
+        return [interpolate_value(item, env) for item in value]
+    if isinstance(value, dict):
+        return {key: interpolate_value(item, env) for key, item in value.items()}
+    return value
+
+
+
+def create_network(state: Path, argv: list[str]) -> int:
+    name = argv[-1]
+    script = state / "create-script.json"
+    if script.exists():
+        payload = json.loads(script.read_text(encoding="utf-8"))
+        if payload.get("once"):
+            script.unlink()
+        if payload.get("write"):
+            write_json(network_path(state, name), payload["write"])
+        sys.stderr.write(str(payload.get("message", "create failed")) + "\n")
+        return int(payload.get("code", 1))
+    driver = "bridge"
+    internal = False
+    subnet = ""
+    gateway = ""
+    args = argv[:]
+    while args:
+        token = args.pop(0)
+        if token == "--driver" and args:
+            driver = args.pop(0)
+        elif token == "--internal":
+            internal = True
+        elif token == "--subnet" and args:
+            subnet = args.pop(0)
+        elif token == "--gateway" and args:
+            gateway = args.pop(0)
+        elif token == "--label" and args:
+            args.pop(0)
+    write_json(
+        network_path(state, name),
+        {
+            "Name": name,
+            "Id": f"id-{name}",
+            "Driver": driver,
+            "Internal": internal,
+            "IPAM": {"Config": [{"Subnet": subnet, "Gateway": gateway}]},
+        },
+    )
+    return 0
+
+
+def compose_files(argv: list[str]) -> list[str]:
+    files = []
+    args = argv[:]
+    while args:
+        token = args.pop(0)
+        if token in {"-f", "--file"} and args:
+            files.append(args.pop(0))
+    return files
+
+
+def is_snapshot_file(path: str) -> bool:
+    return Path(path).name.endswith(".up.json")
+
+
+def stack_from_files(files: list[str]) -> str:
+    names = " ".join(Path(path).name for path in files)
+    joined = " ".join(files)
+    if "proxy.up.json" in names or "compose.proxy.yml" in joined:
+        return "proxy"
+    if "webui.up.json" in names or "compose.webui.override.yml" in joined or "docker-compose.webui.yml" in joined:
+        return "webui"
+    if "core.up.json" in names or "compose.core.override.yml" in joined or "docker-compose.yml" in joined:
+        return "core"
+    return "unknown"
+
+
+
+def running_path(state: Path) -> Path:
+    return state / "running.json"
+
+
+def load_running(state: Path) -> dict:
+    path = running_path(state)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_running(state: Path, payload: dict) -> None:
+    write_json(running_path(state), payload)
+
+
+def profiles_active(argv: list[str]) -> set[str]:
+    inherited = os.environ.get("COMPOSE_PROFILES", "")
+    names = {item for item in inherited.split(",") if item}
+    args = argv[:]
+    while args:
+        token = args.pop(0)
+        if token in {"--profile", "--profiles"} and args:
+            names.update(item for item in args.pop(0).split(",") if item)
+    return names
+
+
+def remove_orphans(argv: list[str]) -> bool:
+    if "--remove-orphans" in argv:
+        return True
+    value = os.environ.get("COMPOSE_REMOVE_ORPHANS", "")
+    return value.lower() in {"1", "true", "yes"}
+
+
+def services_for(stack: str, profiles: set[str]) -> list[str]:
+    if stack == "core":
+        names = list(CORE_SERVICES)
+        if "manual-maintenance" in profiles:
+            names.append(CLEANUP_SERVICE)
+        return names
+    if stack == "webui":
+        return list(WEBUI_SERVICES)
+    if stack == "proxy":
+        return list(PROXY_SERVICES)
+    return []
+
+
+def compose_config(state: Path, argv: list[str]) -> int:
+    hold_named(state, "FAKE_DOCKER_HOLD_CONFIG", "entered-config")
+    fail = state / "config-fail"
+    if fail.exists():
+        sys.stderr.write("compose config failed\n")
+        return 1
+    files = compose_files(argv)
+    config_dir = state / "config"
+    mapping = {
+        "compose.core.override.yml": "core.json",
+        "compose.webui.override.yml": "webui.json",
+        "compose.proxy.yml": "proxy.json",
+        "docker-compose.yml": "core.json",
+        "docker-compose.webui.yml": "webui.json",
+    }
+    chosen = None
+    for path in files:
+        for key, name in mapping.items():
+            if path.endswith(key):
+                chosen = config_dir / name
+                break
+    if chosen is None or not chosen.exists():
+        sys.stderr.write("resolved compose document is missing\n")
+        return 1
+    sys.stdout.write(chosen.read_text(encoding="utf-8"))
+    return 0
+
+
+def hold_up(state: Path) -> None:
+    hold_named(state, "FAKE_DOCKER_HOLD_UP", "entered-up")
+
+def compose_up(state: Path, argv: list[str]) -> int:
+    files = compose_files(argv)
+    hold_up(state)
+    stack = stack_from_files(files)
+    snapshot = any(is_snapshot_file(path) for path in files)
+    executed = state / "executed.json"
+    payload = {
+        "stack": stack,
+        "files": files,
+        "snapshot": snapshot,
+        "profiles": sorted(profiles_active(argv)),
+        "remove_orphans": remove_orphans(argv),
+        "env_remove_orphans": os.environ.get("COMPOSE_REMOVE_ORPHANS", ""),
+        "env_profiles": os.environ.get("COMPOSE_PROFILES", ""),
+    }
+    if snapshot and files:
+        first = Path(files[0])
+        if first.exists():
+            try:
+                raw_document = json.loads(first.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                raw_document = None
+            payload["document"] = raw_document
+            if raw_document is not None:
+                payload["consumer_document"] = interpolate_value(raw_document, os.environ)
+        payload["snapshot_path"] = str(first)
+    else:
+        live = state / "config" / f"{stack}.json"
+        if live.exists():
+            try:
+                payload["document"] = json.loads(live.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                payload["document"] = None
+        payload["source_path"] = str(live)
+
+    with executed.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload) + "\n")
+    fail = state / f"up-fail-{stack}"
+    running = load_running(state)
+    if remove_orphans(argv):
+        keep = set(services_for(stack, profiles_active(argv)))
+        running = {name: owner for name, owner in running.items() if name in keep or owner == stack}
+    for name in services_for(stack, profiles_active(argv)):
+        running[name] = stack
+    save_running(state, running)
+    starts = state / "starts.log"
+    with starts.open("a", encoding="utf-8") as stream:
+        if fail.exists():
+            stream.write(f"{stack}:failed\n")
+        else:
+            stream.write(stack + "\n")
+    if fail.exists():
+        sys.stderr.write(f"compose up failed for {stack}\n")
+        return 1
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    state = state_dir()
+    log(argv, state)
+    if len(argv) >= 2 and argv[0] == "network" and argv[1] == "inspect":
+        name = argv[2]
+        return inspect_network(state, name)
+    if len(argv) >= 2 and argv[0] == "network" and argv[1] == "create":
+        return create_network(state, argv[2:])
+    if argv and argv[0] == "compose":
+        rest = argv[1:]
+        if "config" in rest:
+            return compose_config(state, rest)
+        if "up" in rest:
+            return compose_up(state, rest)
+        sys.stderr.write("unsupported compose command\n")
+        return 1
+    sys.stderr.write("unsupported docker command\n")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

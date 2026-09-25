@@ -23,6 +23,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEBUI_URL="${WEBUI_URL:-http://localhost:8080}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@open-computer-use.dev}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
@@ -34,12 +35,14 @@ ADMIN_NAME="${ADMIN_NAME:-Admin}"
 # OCU_INTERNAL_TOKEN remains an environment-only tool credential, read on every call.
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://computer-use-server:8081}"
 MCP_API_KEY="${MCP_API_KEY:-}"
-MARKER_FILE="/app/backend/data/.computer-use-initialized"
+MARKER_FILE="${MARKER_FILE:-/app/backend/data/.computer-use-initialized}"
+export TOOL_SOURCE="${SCRIPT_DIR}/tools/computer_use_tools.py"
+export FILTER_SOURCE="${SCRIPT_DIR}/functions/computer_link_filter.py"
 
 # Sanity checks — run EVERY start (before marker-gate), so stale-default
 # warnings resurface on each restart until the user fixes them.
 if [[ "$ADMIN_PASSWORD" == "admin" || "$ADMIN_PASSWORD" == "change-me" ]]; then
-    echo "[init] WARNING: ADMIN_PASSWORD is still the default (\"$ADMIN_PASSWORD\") — change it for anything beyond local dev."
+    echo "[init] WARNING: ADMIN_PASSWORD is still the default — change it for anything beyond local dev."
 fi
 if [[ -z "$MCP_API_KEY" ]]; then
     echo "[init] WARNING: MCP_API_KEY is empty — /mcp still requires OCU_INTERNAL_TOKEN, but has no second Bearer credential. Set it for defense in depth."
@@ -53,13 +56,21 @@ if [ -f "$MARKER_FILE" ]; then
 fi
 
 echo "[init] Waiting for Open WebUI to be ready..."
-for i in $(seq 1 60); do
+ready=0
+READY_ATTEMPTS="${OCU_INIT_READY_ATTEMPTS:-60}"
+READY_SLEEP="${OCU_INIT_READY_SLEEP:-2}"
+for i in $(seq 1 "$READY_ATTEMPTS"); do
     if curl -sf "$WEBUI_URL/api/version" >/dev/null 2>&1; then
         echo "[init] Open WebUI is ready."
+        ready=1
         break
     fi
-    sleep 2
+    sleep "$READY_SLEEP"
 done
+if [ "$ready" != "1" ]; then
+    echo "[init] ERROR: Open WebUI did not become ready." >&2
+    exit 1
+fi
 
 # Check if any users exist
 USERS=$(curl -sf "$WEBUI_URL/api/v1/auths/signin" \
@@ -77,12 +88,10 @@ else
 
     if echo "$SIGNUP" | python3 -c "import sys,json; json.load(sys.stdin)['token']" 2>/dev/null; then
         TOKEN=$(echo "$SIGNUP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
-        echo "[init] Created admin user: $ADMIN_EMAIL"
+        echo "[init] Created admin user."
     else
-        echo "[init] WARNING: Could not create or login as admin. Manual setup required."
-        echo "[init] Try: email=$ADMIN_EMAIL password=$ADMIN_PASSWORD"
-        touch "$MARKER_FILE"
-        exit 0
+        echo "[init] ERROR: Could not create or login as admin." >&2
+        exit 1
     fi
 fi
 
@@ -90,10 +99,9 @@ AUTH="Authorization: Bearer $TOKEN"
 
 # Install tool: computer_use_tools.py
 echo "[init] Installing Computer Use tool..."
-TOOL_CODE=$(cat /app/init/tools/computer_use_tools.py)
 TOOL_PAYLOAD=$(python3 -c "
-import json, sys
-code = open('/app/init/tools/computer_use_tools.py').read()
+import json, os
+code = open(os.environ['TOOL_SOURCE']).read()
 print(json.dumps({
     'id': 'ai_computer_use',
     'name': 'Computer Use Tools',
@@ -131,6 +139,7 @@ echo "[init] Tool valves set: ORCHESTRATOR_URL=$ORCHESTRATOR_URL"
 # a failure here must block the marker file — otherwise the next restart skips init
 # and the tool stays admin-only forever.
 INIT_FAILED=0
+WORKSPACE_ID=""
 if curl -sf -X POST "$WEBUI_URL/api/v1/tools/id/ai_computer_use/access/update" \
     -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"access_grants":[
@@ -146,8 +155,8 @@ fi
 # Install function: computer_link_filter.py
 echo "[init] Installing Computer Use filter..."
 FUNC_PAYLOAD=$(python3 -c "
-import json
-code = open('/app/init/functions/computer_link_filter.py').read()
+import json, os
+code = open(os.environ['FILTER_SOURCE']).read()
 print(json.dumps({
     'id': 'computer_use_filter',
     'name': 'Computer Use Filter',
@@ -222,17 +231,27 @@ fi
 # endpoint does not exist in Open WebUI v0.8.12 (returns 405) — use POST /api/v1/configs/models
 # which takes the full ModelsConfigForm and merges DEFAULT_MODEL_PARAMS. We preserve
 # existing fields so we don't clobber DEFAULT_MODELS / DEFAULT_MODEL_METADATA.
+# A failed read, parse, or post must not write the marker or replace an unread
+# configuration with an empty object.
 echo "[init] Ensuring DEFAULT_MODEL_PARAMS has native function calling + streaming..."
 # Fetch current config; pipe its body into Python via stdin so arbitrary content
 # (quotes, newlines, triple-quote sequences) cannot break the interpolation.
 # Use direct assignment, not setdefault — any prior value for these two fields
 # must be overwritten so our "params enforced" log is truthful.
-MODELS_CFG=$(curl -sf "$WEBUI_URL/api/v1/configs/models" -H "$AUTH" 2>/dev/null || echo "{}")
-MERGED_CFG=$(printf '%s' "$MODELS_CFG" | python3 -c "
+if MODELS_CFG=$(curl -sf "$WEBUI_URL/api/v1/configs/models" -H "$AUTH"); then
+    if MERGED_CFG=$(printf '%s' "$MODELS_CFG" | python3 -c "
 import json, sys
-raw = sys.stdin.read() or '{}'
+raw = sys.stdin.read()
+if not raw.strip():
+    raise SystemExit('empty models configuration')
 cfg = json.loads(raw)
-params = cfg.get('DEFAULT_MODEL_PARAMS') or {}
+if not isinstance(cfg, dict):
+    raise SystemExit('models configuration is not an object')
+params = cfg.get('DEFAULT_MODEL_PARAMS')
+if not isinstance(params, dict):
+    params = {}
+else:
+    params = dict(params)
 params['function_calling'] = 'native'
 params['stream_response'] = True
 cfg['DEFAULT_MODEL_PARAMS'] = params
@@ -241,23 +260,27 @@ cfg.setdefault('DEFAULT_PINNED_MODELS', cfg.get('DEFAULT_PINNED_MODELS') or '')
 cfg.setdefault('MODEL_ORDER_LIST', cfg.get('MODEL_ORDER_LIST') or [])
 cfg.setdefault('DEFAULT_MODEL_METADATA', cfg.get('DEFAULT_MODEL_METADATA') or {})
 print(json.dumps(cfg))
-" 2>&1) || MERGED_CFG=""
-
-if [ -z "$MERGED_CFG" ] || printf '%s' "$MERGED_CFG" | grep -q '^Traceback'; then
-    echo "[init] WARNING: Could not merge DEFAULT_MODEL_PARAMS (Python parse failed)."
-    if [ -n "$MERGED_CFG" ]; then
-        printf '[init]   %s\n' "$MERGED_CFG" | head -5
+"); then
+        if curl -sf -X POST "$WEBUI_URL/api/v1/configs/models" \
+            -H "$AUTH" -H "Content-Type: application/json" \
+            -d "$MERGED_CFG" >/dev/null; then
+            echo "[init] DEFAULT_MODEL_PARAMS set (function_calling=native, stream_response=true)."
+        else
+            echo "[init] ERROR: Could not POST DEFAULT_MODEL_PARAMS. Init will retry on next restart." >&2
+            INIT_FAILED=1
+        fi
+    else
+        echo "[init] ERROR: Could not parse models configuration. Init will retry on next restart." >&2
+        INIT_FAILED=1
     fi
-elif curl -sf -X POST "$WEBUI_URL/api/v1/configs/models" \
-    -H "$AUTH" -H "Content-Type: application/json" \
-    -d "$MERGED_CFG" >/dev/null 2>&1; then
-    echo "[init] DEFAULT_MODEL_PARAMS set (function_calling=native, stream_response=true)."
 else
-    echo "[init] WARNING: Could not POST DEFAULT_MODEL_PARAMS (endpoint may differ on this Open WebUI version)."
+    echo "[init] ERROR: Could not read models configuration. Init will retry on next restart." >&2
+    INIT_FAILED=1
 fi
 
-# Also try setting via workspace model (fallback for v0.8.11–0.8.12)
-# Get first available model and create a workspace model with native FC
+# Create or update a workspace model with native function calling. The adopted
+# deployment later replaces first-available selection with PRIMARY_CHAT_MODEL;
+# a failed create/update here must not write the marker.
 FIRST_MODEL=$(curl -sf "$WEBUI_URL/api/models" -H "$AUTH" 2>/dev/null | python3 -c "
 import sys,json
 data = json.load(sys.stdin).get('data',[])
@@ -288,21 +311,74 @@ print(json.dumps({
     }
 }))
 ")
-    curl -sf -X POST "$WEBUI_URL/api/v1/models/create" \
-        -H "$AUTH" -H "Content-Type: application/json" \
-        -d "$MODEL_PAYLOAD" >/dev/null 2>&1 && \
-        echo "[init] Workspace model created: $FIRST_MODEL (Computer Use)" || \
-        echo "[init] Workspace model creation skipped (may already exist)"
+    EXPECTED_WORKSPACE_ID=$(printf '%s' "$MODEL_PAYLOAD" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+    LOOKUP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+        "$WEBUI_URL/api/v1/models/model?id=$EXPECTED_WORKSPACE_ID" -H "$AUTH" || true)
+    persist_workspace_model() {
+        local method=$1
+        local url=$2
+        local raw
+        raw=$(curl -sf -X "$method" "$url" \
+            -H "$AUTH" -H "Content-Type: application/json" \
+            -d "$MODEL_PAYLOAD") || return 1
+        printf '%s' "$raw" | EXPECTED_WORKSPACE_ID="$EXPECTED_WORKSPACE_ID" python3 -c "
+import json, os, sys
+raw = sys.stdin.read()
+if not raw.strip() or raw.strip() == 'null':
+    raise SystemExit('workspace model response is empty')
+model = json.loads(raw)
+if not isinstance(model, dict):
+    raise SystemExit('workspace model response is not an object')
+expected = os.environ['EXPECTED_WORKSPACE_ID']
+if model.get('id') != expected:
+    raise SystemExit(f'workspace model id mismatch: {model.get(\"id\")!r}')
+meta = model.get('meta')
+params = model.get('params')
+if not isinstance(meta, dict) or not isinstance(params, dict):
+    raise SystemExit('workspace model is missing persisted metadata or params')
+tool_ids = meta.get('toolIds') or []
+filter_ids = meta.get('filterIds') or []
+if 'ai_computer_use' not in tool_ids:
+    raise SystemExit('workspace model is missing Computer Use tool metadata')
+if 'computer_use_filter' not in filter_ids:
+    raise SystemExit('workspace model is missing Computer Use filter metadata')
+if params.get('function_calling') != 'native':
+    raise SystemExit('workspace model did not persist native function calling')
+if params.get('stream_response') is not True:
+    raise SystemExit('workspace model did not persist stream_response')
+" || return 1
+    }
+    if [ "$LOOKUP_STATUS" = "200" ]; then
+        if persist_workspace_model POST "$WEBUI_URL/api/v1/models/model/update?id=$EXPECTED_WORKSPACE_ID"; then
+            WORKSPACE_ID="$EXPECTED_WORKSPACE_ID"
+            echo "[init] Workspace model updated: $FIRST_MODEL (Computer Use)"
+        else
+            echo "[init] ERROR: Could not update workspace model $FIRST_MODEL. Init will retry on next restart." >&2
+            INIT_FAILED=1
+        fi
+    elif [ "$LOOKUP_STATUS" = "404" ]; then
+        if persist_workspace_model POST "$WEBUI_URL/api/v1/models/create"; then
+            WORKSPACE_ID="$EXPECTED_WORKSPACE_ID"
+            echo "[init] Workspace model created: $FIRST_MODEL (Computer Use)"
+        else
+            echo "[init] ERROR: Could not create workspace model $FIRST_MODEL. Init will retry on next restart." >&2
+            INIT_FAILED=1
+        fi
+    else
+        echo "[init] ERROR: Could not look up workspace model $FIRST_MODEL (HTTP ${LOOKUP_STATUS:-failed}). Init will retry on next restart." >&2
+        INIT_FAILED=1
+    fi
 fi
 
 # Mark as initialized — only if every required step succeeded. If INIT_FAILED=1,
 # leave the marker off so the next container start retries the failed steps
-# (public-access grant, filter toggle, filter global). Without this guard a
-# transient failure would be baked in forever.
+# (public-access grant, filter toggle, filter global, models configuration,
+# workspace model create/update). Without this guard a transient failure would
+# be baked in forever.
 if [ "$INIT_FAILED" = "0" ]; then
     touch "$MARKER_FILE"
     echo "[init] Done! Open WebUI is ready with Computer Use."
 else
-    echo "[init] Done with errors — marker NOT written, init will re-run on next restart to retry the failed steps."
+    echo "[init] ERROR: required setup failed — marker not written." >&2
+    exit 1
 fi
-echo "[init] Login: $ADMIN_EMAIL / $ADMIN_PASSWORD"

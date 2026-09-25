@@ -1,0 +1,103 @@
+# Production-like test overlay for Open WebUI, PostgreSQL, RAG and the explicit
+# one-shot Computer Use integration initializer. Only the proxy publishes ports.
+
+services:
+  open-webui:
+    image: ${OPENWEBUI_IMAGE}
+    ports: !override []
+    environment: !override
+      DATABASE_URL: postgresql://openwebui:${POSTGRES_PASSWORD}@postgres:5432/openwebui
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_AUTH: "true"
+      WEBUI_ADMIN_EMAIL: ${ADMIN_EMAIL}
+      WEBUI_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      WEBUI_ADMIN_NAME: AI Workbench Test Admin
+      ENABLE_SIGNUP: "false"
+      DEFAULT_USER_ROLE: pending
+      # This deployment uses only the configured OpenAI-compatible provider.
+      # Disable Open WebUI's default Ollama probe to avoid calls to a nonexistent
+      # host.docker.internal:11434 endpoint.
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_WEB_SEARCH: "false"
+      ENABLE_OPENAI_API_SSL_VERIFY: "true"
+      OPENAI_API_BASE_URL: ${DMXAPI_BASE_URL}
+      OPENAI_API_KEY: ${DMXAPI_API_KEY}
+      # Do not download local sentence-transformer models. RAG calls the
+      # verified external embedding endpoint during this test only.
+      BYPASS_EMBEDDING_AND_RETRIEVAL: "false"
+      BYPASS_RETRIEVAL_ACCESS_CONTROL: "false"
+      RAG_EMBEDDING_ENGINE: openai
+      RAG_OPENAI_API_BASE_URL: ${DMXAPI_BASE_URL}
+      RAG_OPENAI_API_KEY: ${DMXAPI_API_KEY}
+      RAG_EMBEDDING_MODEL: qwen3-embedding-8b
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      ENABLE_RAG_HYBRID_SEARCH: "true"
+      RAG_TOP_K: "8"
+      RAG_RERANKING_ENGINE: external
+      RAG_RERANKING_MODEL: qwen3-rerank
+      RAG_EXTERNAL_RERANKER_URL: ${DMXAPI_BASE_URL}/rerank
+      RAG_EXTERNAL_RERANKER_API_KEY: ${DMXAPI_API_KEY}
+      RAG_EXTERNAL_RERANKER_TIMEOUT: "30"
+      RAG_TOP_K_RERANKER: "3"
+      RAG_RERANKING_MODEL_AUTO_UPDATE: "false"
+      ENABLE_KB_EXEC: "false"
+      # Values consumed by the Computer Use initializer and persisted into its
+      # Tool/Filter valves on its first successful run.
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ORCHESTRATOR_URL: http://computer-use-server:8081
+      ENABLE_OCU_WORKSPACE: "true"
+      OCU_INTERNAL_URL: http://computer-use-server:8081
+      MCP_API_KEY: ${MCP_API_KEY}
+      OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
+      CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "200"
+      TOOL_RESULT_MAX_CHARS: "50000"
+      TOOL_RESULT_PREVIEW_CHARS: "2000"
+    restart: unless-stopped
+
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment: !override
+      POSTGRES_USER: openwebui
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: openwebui
+    restart: unless-stopped
+
+  # Current upstream compose no longer invokes openwebui/init.sh. This job
+  # explicitly performs the one-time setup once the API is reachable. The
+  # wrapper removes sub_agent from the installed client tool before executing
+  # the canonical initializer.
+  open-webui-init:
+    image: ${OPENWEBUI_IMAGE}
+    container_name: ocu-test-open-webui-init
+    user: "0:0"
+    entrypoint: ["/bin/bash", "/bootstrap/run-init.sh"]
+    depends_on:
+      open-webui:
+        condition: service_started
+    environment:
+      WEBUI_URL: http://open-webui:8080
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ADMIN_NAME: AI Workbench Test Admin
+      # The initializer validates this against /api/models and refuses to
+      # select an arbitrary first provider model.
+      PRIMARY_CHAT_MODEL: qwen3.8-27b
+      ORCHESTRATOR_URL: http://computer-use-server:8081
+      MCP_API_KEY: ${MCP_API_KEY}
+    volumes:
+      - ./openwebui:/app/source:ro
+      - ./deploy/production-like-test/init/run-init.sh:/bootstrap/run-init.sh:ro
+      - open-webui-data:/app/backend/data
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+networks:
+  default:
+    name: ${OCU_PRIVATE_NETWORK:?OCU_PRIVATE_NETWORK is required}
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${OCU_PRIVATE_SUBNET:?OCU_PRIVATE_SUBNET is required}
+          gateway: ${OCU_PRIVATE_GATEWAY:?OCU_PRIVATE_GATEWAY is required}
