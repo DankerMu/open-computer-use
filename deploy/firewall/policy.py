@@ -127,6 +127,7 @@ def parse_rule_tokens(tokens: list[str]) -> dict:
     dest = None
     comment = None
     target = None
+    goto = None
     matches: dict[str, str | None] = {}
     unknown: list[str] = []
     i = 0
@@ -152,8 +153,16 @@ def parse_rule_tokens(tokens: list[str]) -> dict:
             target = tokens[i + 1]
             i += 2
             continue
-        if token == "-m" and i + 1 < len(tokens):
+        if token == "-g" and i + 1 < len(tokens):
+            goto = tokens[i + 1]
+            unknown.extend(["-g", tokens[i + 1]])
             i += 2
+            continue
+        if token == "-m" and i + 1 < len(tokens):
+            module = tokens[i + 1]
+            i += 2
+            if module not in {"comment", "conntrack"}:
+                unknown.extend(["-m", module])
             continue
         if token == "--comment" and i + 1 < len(tokens):
             comment = tokens[i + 1]
@@ -180,6 +189,7 @@ def parse_rule_tokens(tokens: list[str]) -> dict:
         "dest": dest,
         "comment": comment,
         "target": target,
+        "goto": goto,
         "matches": matches,
         "unknown": tuple(unknown),
     }
@@ -300,9 +310,13 @@ def reject_unrecognized_owned_references(family: str, chains: dict[str, list[lis
             continue
         for rule in rules:
             parsed = parse_rule_tokens(rule)
-            if parsed["target"] in OWNED_CHAINS and parsed["comment"] != comment:
-                fail(f"{name} references reserved chain {parsed['target']} without owned comment")
-            if parsed["comment"] == comment and parsed["target"] not in OWNED_CHAINS:
+            jump = parsed["target"]
+            goto = parsed["goto"]
+            if jump in OWNED_CHAINS and parsed["comment"] != comment:
+                fail(f"{name} references reserved chain {jump} without owned comment")
+            if goto in OWNED_CHAINS:
+                fail(f"{name} references reserved chain {goto} without owned comment")
+            if parsed["comment"] == comment and jump not in OWNED_CHAINS:
                 fail(f"{name} has an unrecognized owned comment on {family}")
 
 
@@ -586,6 +600,8 @@ def check() -> None:
         ipv4 = save_rules("ipv4")
         ipv6 = save_rules("ipv6")
         require_docker_user_hook(ipv4)
+        reject_unrecognized_owned_references("ipv4", ipv4, OWNED_COMMENT)
+        reject_unrecognized_owned_references("ipv6", ipv6, OWNED_IPV6_COMMENT)
         expected = expected_ipv4(ctx)
         actual = ipv4.get(OWNED_IPV4)
         if actual is None:

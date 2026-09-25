@@ -207,6 +207,7 @@ def parse_rule(tokens: list[str]) -> dict:
     dest = None
     comment = None
     target = None
+    goto = None
     matches: dict[str, str | None] = {}
     unknown: list[str] = []
     i = 0
@@ -232,8 +233,16 @@ def parse_rule(tokens: list[str]) -> dict:
             target = tokens[i + 1]
             i += 2
             continue
-        if token == "-m" and i + 1 < len(tokens):
+        if token == "-g" and i + 1 < len(tokens):
+            goto = tokens[i + 1]
+            unknown.extend(["-g", tokens[i + 1]])
             i += 2
+            continue
+        if token == "-m" and i + 1 < len(tokens):
+            module = tokens[i + 1]
+            i += 2
+            if module not in {"comment", "conntrack"}:
+                unknown.extend(["-m", module])
             continue
         if token == "--comment" and i + 1 < len(tokens):
             comment = tokens[i + 1]
@@ -260,6 +269,7 @@ def parse_rule(tokens: list[str]) -> dict:
         "dest": dest,
         "comment": comment,
         "target": target,
+        "goto": goto,
         "matches": matches,
         "unknown": tuple(unknown),
     }

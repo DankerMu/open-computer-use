@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 import unittest
 
@@ -20,6 +22,7 @@ from support import (
     FIREWALL_INSTALL,
     METADATA_ADDR,
     OWNED_IPV4,
+    OWNED_IPV6,
     ROOT,
     SANDBOX_NETWORK,
     UP,
@@ -370,6 +373,88 @@ class EgressGuardTests(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_frag_match_is_not_equivalent_to_unconditional_drop(self):
+        env = dict(self.env)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(ROOT / "deploy" / "firewall"), str(ROOT / "deploy"), env.get("PYTHONPATH", "")]
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import policy; print(policy.rules_equivalent(['-m','frag','-j','DROP'],['-j','DROP']))",
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "False")
+
+    def test_seeded_ipv6_frag_only_drop_fails_check_naming_owned_chain(self):
+        self.assertEqual(self.install().returncode, 0)
+        firewall = load_firewall(self.state)
+        firewall["ipv6"][OWNED_IPV6] = [["-m", "frag", "-j", "DROP"]]
+        write_firewall(self.state, firewall)
+        result = self.check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(OWNED_IPV6, result.stderr)
+
+    def test_fake_save_retains_frag_module(self):
+        restore = (
+            "*filter\n"
+            f":{OWNED_IPV6} - [0:0]\n"
+            f"-A {OWNED_IPV6} -m frag -j DROP\n"
+            "COMMIT\n"
+        )
+        restored = subprocess.run(
+            ["ip6tables-restore", "-w", "5", "--noflush"],
+            cwd=str(ROOT),
+            input=restore,
+            capture_output=True,
+            text=True,
+            env=self.env,
+            check=False,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        result = subprocess.run(
+            ["ip6tables-save", "-t", "filter"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m frag", result.stdout)
+        self.assertRegex(result.stdout, rf"-A {OWNED_IPV6} .*?-m frag")
+
+    def test_check_rejects_uncommented_jump_to_reserved_chain_without_mutation(self):
+        self.assertEqual(self.install().returncode, 0)
+        firewall = load_firewall(self.state)
+        firewall["ipv4"]["INPUT"].append(["-i", "otherbridge", "-j", OWNED_IPV4])
+        write_firewall(self.state, firewall)
+        before = (self.state / "firewall.json").read_bytes()
+        result = self.check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("INPUT", result.stderr)
+        self.assertIn(OWNED_IPV4, result.stderr)
+        self.assertEqual((self.state / "firewall.json").read_bytes(), before)
+
+    def test_check_rejects_uncommented_goto_to_reserved_chain_without_mutation(self):
+        self.assertEqual(self.install().returncode, 0)
+        firewall = load_firewall(self.state)
+        firewall["ipv4"]["INPUT"].append(["-i", "otherbridge", "-g", OWNED_IPV4])
+        write_firewall(self.state, firewall)
+        before = (self.state / "firewall.json").read_bytes()
+        result = self.check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("INPUT", result.stderr)
+        self.assertIn(OWNED_IPV4, result.stderr)
+        self.assertEqual((self.state / "firewall.json").read_bytes(), before)
+
     def test_refuses_managed_hooks_for_a_different_bridge(self):
         self.assertEqual(self.install().returncode, 0)
         before = (self.state / "firewall.json").read_text(encoding="utf-8")
@@ -610,6 +695,7 @@ class EgressGuardTests(unittest.TestCase):
         hold.write_text("1", encoding="utf-8")
         env = dict(self.env)
         env["FAKE_FIREWALL_HOLD_RESTORE"] = str(hold)
+        lock = Path(self.env["OCU_SANDBOX_EGRESS_LOCK"])
         first = subprocess.Popen(
             ["bash", str(FIREWALL_INSTALL)],
             cwd=str(ROOT),
@@ -621,33 +707,85 @@ class EgressGuardTests(unittest.TestCase):
         second = None
         first_err = ""
         second_err = ""
+        probe_fd = None
+        barrier_error = None
         try:
-            self.assertTrue(_wait(lambda: (self.state / "entered-restore").exists()), "first installer never entered restore")
-            restores_while_held = len(_restore_lines(self.state))
-            second_env = dict(self.env)
-            second_env["XDG_RUNTIME_DIR"] = str(self.state / "xdg-other")
-            second = subprocess.Popen(
-                ["bash", str(FIREWALL_INSTALL)],
-                cwd=str(ROOT),
-                env=second_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            self.assertTrue(
-                _wait(lambda: second.poll() is None and len(_restore_lines(self.state)) == restores_while_held),
-                "second installer mutated firewall while the first held the lock",
-            )
-            self.assertIsNone(second.poll())
-            hold.unlink()
-            _first_out, first_err = first.communicate(timeout=10)
-            _second_out, second_err = second.communicate(timeout=10)
+            entered = _wait(lambda: (self.state / "entered-restore").exists())
+            if not (entered and hold.exists() and first.poll() is None):
+                barrier_error = "first installer never entered held restore"
+            else:
+                try:
+                    probe_fd = os.open(lock, os.O_RDWR)
+                    fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                except OSError as exc:
+                    barrier_error = f"could not open lock file {lock}: {exc}"
+                else:
+                    barrier_error = "native lock was not held exclusively by the first installer"
+            if barrier_error is None:
+                restores_while_held = len(_restore_lines(self.state))
+                firewall_while_held = (self.state / "firewall.json").read_bytes()
+                second_env = dict(self.env)
+                second_env["XDG_RUNTIME_DIR"] = str(self.state / "xdg-other")
+                second = subprocess.Popen(
+                    ["bash", str(FIREWALL_INSTALL)],
+                    cwd=str(ROOT),
+                    env=second_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    if not hold.exists():
+                        barrier_error = "hold file vanished during second-installer window"
+                        break
+                    if second.poll() is not None:
+                        barrier_error = "second installer exited while first still held restore"
+                        break
+                    if len(_restore_lines(self.state)) != restores_while_held or (
+                        self.state / "firewall.json"
+                    ).read_bytes() != firewall_while_held:
+                        barrier_error = "second installer mutated firewall while the first held the lock"
+                        break
+                    time.sleep(0.05)
+                else:
+                    hold.unlink()
         finally:
             hold.unlink(missing_ok=True)
-            for proc in (first, second):
-                if proc is not None and proc.poll() is None:
-                    proc.kill()
-                    proc.communicate(timeout=5)
+            if probe_fd is not None:
+                os.close(probe_fd)
+            collected = {}
+            for slot, proc in (("first", first), ("second", second)):
+                if proc is None:
+                    continue
+                running = proc.poll() is None
+                if barrier_error is not None and running:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    running = proc.poll() is None
+                try:
+                    _out, err = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    if running:
+                        proc.kill()
+                    _out, err = proc.communicate(timeout=5)
+                except ValueError:
+                    err = ""
+                collected[slot] = err or ""
+                for pipe in (proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+            first_err = collected.get("first", first_err)
+            second_err = collected.get("second", second_err)
+        if barrier_error:
+            self.fail(
+                f"{barrier_error}; first_stderr={first_err!r}; second_stderr={second_err!r}"
+            )
         self.assertEqual(first.returncode, 0, first_err)
         self.assertEqual(second.returncode, 0, second_err)
         firewall = load_firewall(self.state)
