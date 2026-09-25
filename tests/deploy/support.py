@@ -208,6 +208,8 @@ def load_firewall(state_dir: Path) -> dict:
 
 
 def seed_healthy_host(state_dir: Path) -> None:
+    # Permissive blankets stay last so a missing owned hook still lets
+    # traffic flow; foreign policy is seeded in front of those terminators.
     write_firewall(
         state_dir,
         {

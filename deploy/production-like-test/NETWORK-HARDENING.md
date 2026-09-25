@@ -10,11 +10,11 @@
 - Open WebUI 必须设置 `ENABLE_OCU_WORKSPACE=true` 和 `OCU_INTERNAL_URL=http://computer-use-server:8081`；`ORCHESTRATOR_URL` 不是客户端别名。
 - 运行环境必须显式提供 `OCU_PRIVATE_NETWORK`、`OCU_PRIVATE_SUBNET`、`OCU_PRIVATE_GATEWAY`、`OCU_SANDBOX_NETWORK`、`OCU_SANDBOX_SUBNET`、`OCU_SANDBOX_GATEWAY`、`OCU_SANDBOX_EGRESS_ALLOW`、`OCU_PROXY_PORT`、`OCU_PROXY_IMAGE`、`OCU_INTERNAL_TOKEN`、`OCU_WEBUI_ORIGIN`、`OCU_WEBUI_AUTH_URL` 和 `PUBLIC_BASE_URL`，以及既有应用和 provider 的必要变量。`OCU_SANDBOX_EGRESS_ALLOW` 未设置是配置错误；显式空值表示拒绝全部新的 sandbox 出站。不要将 token 写在命令行、日志或仓库文件中。现有 bootstrap 文件的变量清单与备份固定库存分别由 #26、#34 更新；在此前缺少新变量时部署入口拒绝启动。
 
-`deploy/check-ports.sh` 的输入是 **完整的** `docker compose config --format json` 输出集合，不能用原始 YAML 代替；`expose` 不发布端口。bridge 已存在但 driver、internal 模式、subnet 或 gateway 不匹配时入口拒绝启动，不删除、替换、断开网络或现存 sandbox。防火墙安装绑定权威 sandbox 网桥入口接口，而不是源地址；同一宿主机只维护一份 owned 策略。安装器与检查器通过 `OCU_SANDBOX_EGRESS_LOCK`（默认 `$XDG_RUNTIME_DIR/ocu-sandbox-egress.lock`，否则 `/run/user/$UID/ocu-sandbox-egress.lock`）串行化合作进程。DNS 解析、真实镜像构建、Compose 合并、内核数据包路径和引擎端口矩阵的实际验收留给 #36。
+`deploy/check-ports.sh` 的输入是 **完整的** `docker compose config --format json` 输出集合，不能用原始 YAML 代替；`expose` 不发布端口。bridge 已存在但 driver、internal 模式、subnet 或 gateway 不匹配时入口拒绝启动，不删除、替换、断开网络或现存 sandbox。防火墙安装绑定权威 sandbox 网桥入口接口，而不是源地址；同一宿主机只维护一份 owned 策略。安装器与检查器通过 `OCU_SANDBOX_EGRESS_LOCK`（默认 `/run/ocu-sandbox-egress/ocu-sandbox-egress.lock`）串行化合作进程；该路径必须位于当前 euid 拥有、非符号链接、非 group/world-writable 的目录中。DNS 解析、真实镜像构建、Compose 合并、内核数据包路径和引擎端口矩阵的实际验收留给 #36。
 
 ## 已知边界
 
-部署入口在建网之后、启动应用之前安装并核对 sandbox 出站策略：IPv4 经 `DOCKER-USER` 与 `INPUT` 的接口挂钩，IPv6 经 `INPUT` 与 `FORWARD` 默认 DROP。允许列表只豁免本守卫，不绕过后续宿主机策略；control-plane 子网与 metadata `169.254.169.254/32` 即使被宽网段覆盖也仍 DROP。控制面发起的 CDP/ttyd 应答走 conntrack `REPLY`，sandbox 发起的 ORIGINAL 已建立流仍受当前允许列表约束。该守卫不关闭 Docker 继承的宿主机 DNS 转发；完整 all-egress 关闭还需要 #79。真实 iptables/ip6tables、本机/转发数据包、CDP/ttyd 应答与 DNS 证据属于 #36。`computer-use-server` 仍挂载 Docker socket，是高权限可信组件。未经授权的直接 OCU 入口不得用作回滚方案。
+部署入口在建网之后、启动应用之前安装并核对 sandbox 出站策略：IPv4 经 `DOCKER-USER` 与 `INPUT` 的接口挂钩，且 `FORWARD` 的第一条规则必须是无条件 `-j DOCKER-USER`；IPv6 经 `INPUT` 与 `FORWARD` 默认 DROP。允许列表只豁免本守卫，不绕过后续宿主机策略；control-plane 子网与 metadata `169.254.169.254/32` 即使被宽网段覆盖也仍 DROP。控制面发起的 CDP/ttyd 应答走 conntrack `REPLY`，sandbox 发起的 ORIGINAL 已建立流仍受当前允许列表约束。control-plane 网桥在首次 Compose 启动前可以不存在，安装器此时使用已校验的配置 CIDR；已存在的 control-plane 网仍按 #24 校验。该守卫不关闭 Docker 继承的宿主机 DNS 转发；完整 all-egress 关闭还需要 #79。真实 iptables/ip6tables、本机/转发数据包、CDP/ttyd 应答与 DNS 证据属于 #36。`computer-use-server` 仍挂载 Docker socket，是高权限可信组件。未经授权的直接 OCU 入口不得用作回滚方案。
 
 ## 正式离线生产建议
 

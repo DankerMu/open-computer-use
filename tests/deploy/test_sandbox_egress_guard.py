@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import time
 import unittest
@@ -36,6 +38,7 @@ from support import (
 BRIDGE = "br-id-ocu-sandb"
 FOREIGN_RULE = ["-s", "10.9.9.9/32", "-j", "ACCEPT", "-m", "comment", "--comment", "foreign-keep"]
 FOREIGN_INPUT = ["-i", "eth0", "-j", "ACCEPT", "-m", "comment", "--comment", "foreign-input"]
+FOREIGN_V6 = ["-i", "eth0", "-j", "ACCEPT", "-m", "comment", "--comment", "foreign-v6"]
 
 
 def starts(state_dir: Path) -> list[str]:
@@ -51,6 +54,32 @@ def leftover_tmp(state_dir: Path) -> list[Path]:
         for path in state_dir.glob("ocu-deploy-config.*")
         if path.is_dir() and path.name.startswith("ocu-deploy-config.")
     ]
+
+
+def _owned_hooks(rules):
+    return [rule for rule in rules if OWNED_IPV4 in rule or "ocu-sandbox-egress" in rule]
+
+
+def _flag(rule: list[str], flag: str):
+    if flag not in rule:
+        return None
+    index = rule.index(flag)
+    if index + 1 >= len(rule):
+        return ""
+    return rule[index + 1]
+
+
+def _wait(predicate, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _restore_lines(state_dir: Path) -> list[str]:
+    return [line for line in ops(state_dir) if "iptables-restore" in line or "ip6tables-restore" in line]
 
 
 class EgressGuardTests(unittest.TestCase):
@@ -72,9 +101,9 @@ class EgressGuardTests(unittest.TestCase):
             gateway="172.31.0.1",
         )
         payload = load_firewall(self.state)
-        payload["ipv4"]["DOCKER-USER"].append(FOREIGN_RULE)
-        payload["ipv4"]["INPUT"].append(FOREIGN_INPUT)
-        payload["ipv6"]["FORWARD"].append(["-i", "eth0", "-j", "ACCEPT", "-m", "comment", "--comment", "foreign-v6"])
+        payload["ipv4"]["DOCKER-USER"].insert(0, FOREIGN_RULE)
+        payload["ipv4"]["INPUT"].insert(0, FOREIGN_INPUT)
+        payload["ipv6"]["FORWARD"].insert(0, FOREIGN_V6)
         write_firewall(self.state, payload)
         self.env = fake_env(self.state)
 
@@ -134,13 +163,33 @@ class EgressGuardTests(unittest.TestCase):
     def test_repeated_install_leaves_one_ordered_copy_and_keeps_foreign_rules(self):
         first = self.install()
         self.assertEqual(first.returncode, 0, first.stderr)
+        before_foreign = evaluate_packet(
+            load_firewall(self.state),
+            family="ipv4",
+            chain="FORWARD",
+            in_iface="eth0",
+            src="10.9.9.9",
+            dst="8.8.8.8",
+        )
         second = self.install()
         self.assertEqual(second.returncode, 0, second.stderr)
         firewall = load_firewall(self.state)
-        self.assertEqual(firewall["ipv4"]["DOCKER-USER"].count(["-i", BRIDGE, "-j", OWNED_IPV4, "-m", "comment", "--comment", "ocu-sandbox-egress"]), 1)
-        self.assertEqual(firewall["ipv4"]["DOCKER-USER"][0], ["-i", BRIDGE, "-j", OWNED_IPV4, "-m", "comment", "--comment", "ocu-sandbox-egress"])
+        owned = _owned_hooks(firewall["ipv4"]["DOCKER-USER"])
+        self.assertEqual(len(owned), 1)
+        self.assertEqual(firewall["ipv4"]["DOCKER-USER"][0], owned[0])
+        self.assertEqual(_flag(owned[0], "-i"), BRIDGE)
+        self.assertEqual(_flag(owned[0], "-j"), OWNED_IPV4)
         self.assertIn(FOREIGN_RULE, firewall["ipv4"]["DOCKER-USER"])
         self.assertIn(FOREIGN_INPUT, firewall["ipv4"]["INPUT"])
+        self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface="eth0", src="10.9.9.9", dst="8.8.8.8"),
+            "ACCEPT",
+        )
+        self.assertEqual(before_foreign, "ACCEPT")
+        self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="INPUT", in_iface="eth0", src="10.0.0.8", dst="172.31.0.1"),
+            "ACCEPT",
+        )
         check = self.check()
         self.assertEqual(check.returncode, 0, check.stderr)
 
@@ -148,21 +197,27 @@ class EgressGuardTests(unittest.TestCase):
         first = self.install({"OCU_SANDBOX_EGRESS_ALLOW": "9.9.9.9/32"})
         self.assertEqual(first.returncode, 0, first.stderr)
         firewall = load_firewall(self.state)
-        hook = ["-i", BRIDGE, "-j", OWNED_IPV4, "-m", "comment", "--comment", "ocu-sandbox-egress"]
-        firewall["ipv4"]["DOCKER-USER"].append(hook)
-        firewall["ipv4"]["DOCKER-USER"].append(hook)
+        hook = list(firewall["ipv4"]["DOCKER-USER"][0])
+        firewall["ipv4"]["DOCKER-USER"].append(list(hook))
+        firewall["ipv4"]["DOCKER-USER"].append(list(hook))
         firewall["ipv4"]["INPUT"].append(["-s", "172.31.0.0/24", "-j", OWNED_IPV4, "-m", "comment", "--comment", "ocu-sandbox-egress"])
         write_firewall(self.state, firewall)
         result = self.install({"OCU_SANDBOX_EGRESS_ALLOW": DEFAULT_ALLOW})
         self.assertEqual(result.returncode, 0, result.stderr)
         firewall = load_firewall(self.state)
-        self.assertEqual(firewall["ipv4"]["DOCKER-USER"].count(hook), 1)
-        self.assertEqual(firewall["ipv4"]["DOCKER-USER"][0], hook)
-        self.assertEqual(firewall["ipv4"]["INPUT"][0], hook)
+        owned = _owned_hooks(firewall["ipv4"]["DOCKER-USER"])
+        self.assertEqual(len(owned), 1)
+        self.assertEqual(firewall["ipv4"]["DOCKER-USER"][0], owned[0])
+        self.assertEqual(_flag(firewall["ipv4"]["INPUT"][0], "-i"), BRIDGE)
+        self.assertEqual(_flag(firewall["ipv4"]["INPUT"][0], "-j"), OWNED_IPV4)
         destinations = [_flag(rule, "-d") for rule in firewall["ipv4"][OWNED_IPV4] if _flag(rule, "-j") == "RETURN" and _flag(rule, "-d")]
         self.assertEqual(destinations, ["8.8.8.8/32", "1.1.1.1/32"])
         self.assertNotIn("9.9.9.9/32", destinations)
         self.assertIn(FOREIGN_RULE, firewall["ipv4"]["DOCKER-USER"])
+        self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface="eth0", src="10.9.9.9", dst="1.1.1.1"),
+            "ACCEPT",
+        )
 
     def test_missing_docker_user_is_an_error_not_a_placeholder(self):
         firewall = load_firewall(self.state)
@@ -181,6 +236,42 @@ class EgressGuardTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("DOCKER-USER", result.stderr)
         self.assertIn("FORWARD", result.stderr)
+
+    def test_interface_conditional_forward_accept_fails_preflight(self):
+        firewall = load_firewall(self.state)
+        firewall["ipv4"]["FORWARD"] = [["-i", BRIDGE, "-j", "ACCEPT"], ["-j", "DOCKER-USER"]]
+        write_firewall(self.state, firewall)
+        before = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DOCKER-USER", result.stderr)
+        self.assertIn("FORWARD", result.stderr)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
+        self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface=BRIDGE, src="172.31.0.20", dst="8.8.8.8"),
+            "ACCEPT",
+        )
+
+    def test_source_conditional_forward_accept_fails_preflight(self):
+        firewall = load_firewall(self.state)
+        firewall["ipv4"]["FORWARD"] = [["-s", "172.31.0.0/24", "-j", "ACCEPT"], ["-j", "DOCKER-USER"]]
+        write_firewall(self.state, firewall)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FORWARD", result.stderr)
+
+    def test_foreign_chain_jump_before_docker_user_fails_preflight(self):
+        firewall = load_firewall(self.state)
+        firewall["ipv4"]["ACCEPT-SANDBOX"] = [["-j", "ACCEPT"]]
+        firewall["ipv4"]["FORWARD"] = [["-j", "ACCEPT-SANDBOX"], ["-j", "DOCKER-USER"]]
+        write_firewall(self.state, firewall)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FORWARD", result.stderr)
+        self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface=BRIDGE, src="172.31.0.20", dst="8.8.8.8"),
+            "ACCEPT",
+        )
 
     def test_nftables_backend_and_rootless_fail_named(self):
         (self.state / "docker-info.json").write_text(json.dumps({"FirewallBackend": "nftables"}), encoding="utf-8")
@@ -229,7 +320,7 @@ class EgressGuardTests(unittest.TestCase):
     def test_check_names_duplicate_and_shadowed_hooks(self):
         self.assertEqual(self.install().returncode, 0)
         firewall = load_firewall(self.state)
-        hook = ["-i", BRIDGE, "-j", OWNED_IPV4, "-m", "comment", "--comment", "ocu-sandbox-egress"]
+        hook = list(_owned_hooks(firewall["ipv4"]["DOCKER-USER"])[0])
         firewall["ipv4"]["DOCKER-USER"].insert(0, ["-i", BRIDGE, "-j", "ACCEPT"])
         firewall["ipv4"]["DOCKER-USER"].append(hook)
         write_firewall(self.state, firewall)
@@ -240,12 +331,11 @@ class EgressGuardTests(unittest.TestCase):
     def test_check_is_read_only_on_healthy_policy(self):
         self.assertEqual(self.install().returncode, 0)
         before = (self.state / "firewall.json").read_text(encoding="utf-8")
-        before_restore = len([line for line in ops(self.state) if "iptables-restore" in line])
+        before_restore = len(_restore_lines(self.state))
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
-        after_restore = len([line for line in ops(self.state) if "iptables-restore" in line])
-        self.assertEqual(after_restore, before_restore)
+        self.assertEqual(len(_restore_lines(self.state)), before_restore)
 
     def test_unknown_fake_command_fails(self):
         result = subprocess.run(
@@ -259,12 +349,35 @@ class EgressGuardTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsupported", result.stderr)
 
+    def test_save_rejects_wait_flag(self):
+        result = subprocess.run(
+            ["iptables-save", "-w", "5", "-t", "filter"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized option", result.stderr)
+
+    def test_canonical_save_round_trip_passes_check(self):
+        self.assertEqual(self.install().returncode, 0)
+        firewall = load_firewall(self.state)
+        owned = firewall["ipv4"][OWNED_IPV4]
+        owned[0] = ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "REPLY", "-j", "RETURN"]
+        write_firewall(self.state, firewall)
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_refuses_managed_hooks_for_a_different_bridge(self):
         self.assertEqual(self.install().returncode, 0)
+        before = (self.state / "firewall.json").read_text(encoding="utf-8")
         other = dict(self.env)
         other["OCU_SANDBOX_NETWORK"] = "other-sandbox"
         other["OCU_SANDBOX_SUBNET"] = "172.32.0.0/24"
         other["OCU_SANDBOX_GATEWAY"] = "172.32.0.1"
+        other["OCU_SANDBOX_EGRESS_ALLOW"] = "9.9.9.9/32"
         write_network(
             self.state,
             "other-sandbox",
@@ -275,6 +388,7 @@ class EgressGuardTests(unittest.TestCase):
         result = run_script(FIREWALL_INSTALL, other)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("different bridge", result.stderr.lower())
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
 
     def test_packet_policy_allows_listed_and_drops_unlisted(self):
         self.assertEqual(self.install().returncode, 0)
@@ -351,16 +465,20 @@ class EgressGuardTests(unittest.TestCase):
         self.assertEqual(self.install().returncode, 0)
         firewall = load_firewall(self.state)
         self.assertEqual(
-            evaluate_packet(firewall, family="ipv4", chain="DOCKER-USER", in_iface=BRIDGE, src="8.8.8.8", dst="1.1.1.1"),
-            "RETURN",
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface=BRIDGE, src="8.8.8.8", dst="1.1.1.1"),
+            "ACCEPT",
         )
         self.assertEqual(
-            evaluate_packet(firewall, family="ipv4", chain="DOCKER-USER", in_iface=BRIDGE, src="8.8.8.8", dst="9.9.9.9"),
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface=BRIDGE, src="8.8.8.8", dst="9.9.9.9"),
             "DROP",
         )
         self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface="eth0", src="10.9.9.9", dst="9.9.9.9"),
+            "ACCEPT",
+        )
+        self.assertEqual(
             evaluate_packet(firewall, family="ipv4", chain="DOCKER-USER", in_iface="eth0", src="172.31.0.20", dst="9.9.9.9"),
-            "POLICY",
+            "RETURN",
         )
 
     def test_ipv6_sandbox_ingress_is_dropped(self):
@@ -390,6 +508,49 @@ class EgressGuardTests(unittest.TestCase):
         check = self.check()
         self.assertEqual(check.returncode, 0, check.stderr)
 
+    def test_fresh_host_up_uses_configured_control_cidr(self):
+        (self.state / "networks" / f"{CONTROL_NETWORK}.json").unlink()
+        result = run_script(UP, self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
+        firewall = load_firewall(self.state)
+        destinations = [_flag(rule, "-d") for rule in firewall["ipv4"][OWNED_IPV4]]
+        self.assertIn("172.30.0.0/24", destinations)
+        self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="DOCKER-USER", in_iface=BRIDGE, src="172.31.0.20", dst="172.30.0.10"),
+            "DROP",
+        )
+
+    def test_present_control_mismatch_fails_without_mutation(self):
+        write_network(self.state, CONTROL_NETWORK, subnet="172.33.0.0/24", gateway="172.33.0.1")
+        before = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("incompatible", result.stderr)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
+        self.assertEqual(starts(self.state), [])
+
+    def test_control_inspect_daemon_error_fails_closed(self):
+        (self.state / "networks" / f"{CONTROL_NETWORK}.json").unlink()
+        (self.state / "inspect-error.json").write_text(
+            json.dumps({"code": 1, "message": "permission denied"}),
+            encoding="utf-8",
+        )
+        before = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inspect failed", result.stderr)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
+
+    def test_malformed_gateway_is_named_config_error(self):
+        before = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = self.install({"OCU_SANDBOX_GATEWAY": "abc"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OCU_SANDBOX_GATEWAY", result.stderr)
+        self.assertIn("IPv4 address", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
+
     def test_unset_allowlist_in_up_starts_no_service(self):
         env = dict(self.env)
         del env["OCU_SANDBOX_EGRESS_ALLOW"]
@@ -418,6 +579,32 @@ class EgressGuardTests(unittest.TestCase):
         self.assertEqual(starts(self.state), [])
         self.assertEqual(leftover_tmp(self.state), [])
 
+    def test_check_failure_after_install_blocks_start(self):
+        (self.state / "check-fail-once").write_text("1", encoding="utf-8")
+        result = run_script(UP, self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sandbox egress policy check failed", result.stderr)
+        self.assertEqual(starts(self.state), [])
+        self.assertEqual(leftover_tmp(self.state), [])
+
+    def test_concurrent_foreign_insert_preserves_foreign_rule(self):
+        concurrent = ["-s", "10.8.8.8/32", "-j", "ACCEPT", "-m", "comment", "--comment", "foreign-concurrent"]
+        (self.state / "inject-foreign-once").write_text("1", encoding="utf-8")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        firewall = load_firewall(self.state)
+        self.assertIn(FOREIGN_RULE, firewall["ipv4"]["DOCKER-USER"])
+        self.assertIn(concurrent, firewall["ipv4"]["DOCKER-USER"])
+        owned = _owned_hooks(firewall["ipv4"]["DOCKER-USER"])
+        self.assertEqual(len(owned), 1)
+        self.assertEqual(firewall["ipv4"]["DOCKER-USER"][0], owned[0])
+        self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface="eth0", src="10.8.8.8", dst="8.8.8.8"),
+            "ACCEPT",
+        )
+        recorded = "\n".join(ops(self.state))
+        self.assertNotRegex(recorded, r"iptables .* -D DOCKER-USER [0-9]+")
+
     def test_native_lock_serializes_cooperating_installers(self):
         hold = self.state / "restore-hold"
         hold.write_text("1", encoding="utf-8")
@@ -431,29 +618,98 @@ class EgressGuardTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             text=True,
         )
-        self.assertTrue(_wait(lambda: (self.state / "entered-restore").exists()), "first installer never entered restore")
-        second_env = dict(self.env)
-        second = subprocess.Popen(
-            ["bash", str(FIREWALL_INSTALL)],
+        second = None
+        first_err = ""
+        second_err = ""
+        try:
+            self.assertTrue(_wait(lambda: (self.state / "entered-restore").exists()), "first installer never entered restore")
+            restores_while_held = len(_restore_lines(self.state))
+            second_env = dict(self.env)
+            second_env["XDG_RUNTIME_DIR"] = str(self.state / "xdg-other")
+            second = subprocess.Popen(
+                ["bash", str(FIREWALL_INSTALL)],
+                cwd=str(ROOT),
+                env=second_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertTrue(
+                _wait(lambda: second.poll() is None and len(_restore_lines(self.state)) == restores_while_held),
+                "second installer mutated firewall while the first held the lock",
+            )
+            self.assertIsNone(second.poll())
+            hold.unlink()
+            _first_out, first_err = first.communicate(timeout=10)
+            _second_out, second_err = second.communicate(timeout=10)
+        finally:
+            hold.unlink(missing_ok=True)
+            for proc in (first, second):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.communicate(timeout=5)
+        self.assertEqual(first.returncode, 0, first_err)
+        self.assertEqual(second.returncode, 0, second_err)
+        firewall = load_firewall(self.state)
+        owned = _owned_hooks(firewall["ipv4"]["DOCKER-USER"])
+        self.assertEqual(len(owned), 1)
+        self.assertEqual(firewall["ipv4"]["DOCKER-USER"][0], owned[0])
+
+    def test_term_during_held_restore_releases_lock(self):
+        hold = self.state / "restore-hold"
+        hold.write_text("1", encoding="utf-8")
+        env = dict(self.env)
+        env["FAKE_FIREWALL_HOLD_RESTORE"] = str(hold)
+        process = subprocess.Popen(
+            ["bash", str(UP)],
             cwd=str(ROOT),
-            env=second_env,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
-        time.sleep(0.2)
-        self.assertIsNone(second.poll(), "second installer finished while the first still held the lock")
-        hold.unlink()
-        first_status = first.wait(timeout=10)
-        second_status = second.wait(timeout=10)
-        first_err = first.stderr.read() if first.stderr else ""
-        second_err = second.stderr.read() if second.stderr else ""
-        self.assertEqual(first_status, 0, first_err)
-        self.assertEqual(second_status, 0, second_err)
-        firewall = load_firewall(self.state)
-        hook = ["-i", BRIDGE, "-j", OWNED_IPV4, "-m", "comment", "--comment", "ocu-sandbox-egress"]
-        self.assertEqual(firewall["ipv4"]["DOCKER-USER"].count(hook), 1)
-        self.assertEqual(firewall["ipv4"]["DOCKER-USER"][0], hook)
+        try:
+            self.assertTrue(_wait(lambda: (self.state / "entered-restore").exists()), "up never entered restore")
+            process.send_signal(signal.SIGTERM)
+            self.assertTrue(_wait(lambda: process.poll() is not None, timeout=8), "up did not exit after TERM")
+            self.assertNotEqual(process.returncode, 0)
+            self.assertEqual(starts(self.state), [])
+            self.assertEqual(leftover_tmp(self.state), [])
+        finally:
+            hold.unlink(missing_ok=True)
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+        follow = self.install()
+        self.assertEqual(follow.returncode, 0, follow.stderr)
+
+    def test_hup_during_held_check_releases_lock(self):
+        hold = self.state / "save-hold"
+        hold.write_text("1", encoding="utf-8")
+        env = dict(self.env)
+        env["FAKE_FIREWALL_HOLD_SAVE"] = str(hold)
+        process = subprocess.Popen(
+            ["bash", str(FIREWALL_CHECK)],
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            self.assertTrue(_wait(lambda: (self.state / "entered-save").exists()), "check never entered save")
+            process.send_signal(signal.SIGHUP)
+            self.assertTrue(_wait(lambda: process.poll() is not None, timeout=8), "check did not exit after HUP")
+            self.assertNotEqual(process.returncode, 0)
+        finally:
+            hold.unlink(missing_ok=True)
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+        follow = self.install()
+        self.assertEqual(follow.returncode, 0, follow.stderr)
 
     def test_lock_path_is_private_and_not_world_writable(self):
         result = self.install()
@@ -463,23 +719,43 @@ class EgressGuardTests(unittest.TestCase):
         mode = lock.stat().st_mode & 0o777
         self.assertEqual(mode & 0o022, 0)
 
+    def test_group_writable_lock_directory_is_refused(self):
+        parent = self.state / "lock-dir"
+        parent.mkdir()
+        os.chmod(parent, 0o775)
+        env = dict(self.env)
+        env["OCU_SANDBOX_EGRESS_LOCK"] = str(parent / "ocu-sandbox-egress.lock")
+        before = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = run_script(FIREWALL_INSTALL, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("world/group writable", result.stderr)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
 
-def _flag(rule: list[str], flag: str):
-    if flag not in rule:
-        return None
-    index = rule.index(flag)
-    if index + 1 >= len(rule):
-        return ""
-    return rule[index + 1]
+    def test_symlinked_lock_path_is_refused_without_touching_target(self):
+        target = self.state / "lock-target"
+        target.write_text("keep", encoding="utf-8")
+        os.chmod(target, 0o644)
+        link = self.state / "ocu-sandbox-egress.lock"
+        link.unlink(missing_ok=True)
+        os.symlink(target, link)
+        env = dict(self.env)
+        env["OCU_SANDBOX_EGRESS_LOCK"] = str(link)
+        before = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = run_script(FIREWALL_INSTALL, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink", result.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), "keep")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
 
-
-def _wait(predicate, timeout=5):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.05)
-    return False
+    def test_default_lock_path_is_host_stable(self):
+        env = dict(self.env)
+        del env["OCU_SANDBOX_EGRESS_LOCK"]
+        env["XDG_RUNTIME_DIR"] = str(self.state / "xdg-ignored")
+        result = run_script(FIREWALL_INSTALL, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("/run/ocu-sandbox-egress", result.stderr)
+        self.assertNotIn(str(self.state / "xdg-ignored"), result.stderr)
 
 
 if __name__ == "__main__":

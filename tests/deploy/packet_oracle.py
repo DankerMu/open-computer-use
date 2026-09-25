@@ -11,6 +11,10 @@ from __future__ import annotations
 from ipaddress import ip_address, ip_network
 
 
+BUILTIN_CHAINS = {"INPUT", "FORWARD", "OUTPUT", "PREROUTING", "POSTROUTING"}
+TERMINAL = {"ACCEPT", "DROP", "REJECT"}
+
+
 def _flag_value(rule: list[str], flag: str):
     if flag not in rule:
         return None
@@ -29,8 +33,10 @@ def _matches_iface(rule: list[str], iface: str | None) -> bool:
 
 def _matches_source(rule: list[str], src: str | None) -> bool:
     value = _flag_value(rule, "-s")
-    if value is None or src is None:
+    if value is None:
         return True
+    if src is None:
+        return False
     try:
         return ip_address(src) in ip_network(value, strict=False)
     except ValueError:
@@ -39,8 +45,10 @@ def _matches_source(rule: list[str], src: str | None) -> bool:
 
 def _matches_dest(rule: list[str], dst: str | None) -> bool:
     value = _flag_value(rule, "-d")
-    if value is None or dst is None:
+    if value is None:
         return True
+    if dst is None:
+        return False
     try:
         return ip_address(dst) in ip_network(value, strict=False)
     except ValueError:
@@ -68,7 +76,17 @@ def _target(rule: list[str]) -> str | None:
     return _flag_value(rule, "-j")
 
 
-def evaluate_chain(rules: list[list[str]], packet: dict, chains: dict, seen=None):
+def _policy(firewall: dict, family: str, chain: str) -> str:
+    policies = (firewall.get("policies") or {}).get(family) or {}
+    value = policies.get(chain)
+    if value in TERMINAL:
+        return value
+    if chain in BUILTIN_CHAINS:
+        return "DROP"
+    return "RETURN"
+
+
+def evaluate_chain(rules: list[list[str]], packet: dict, chains: dict, seen=None, *, family="ipv4", firewall=None, chain_name=""):
     seen = set() if seen is None else seen
     for rule in rules:
         if not _matches_iface(rule, packet.get("in_iface")):
@@ -84,20 +102,40 @@ def evaluate_chain(rules: list[list[str]], packet: dict, chains: dict, seen=None
         target = _target(rule)
         if target is None:
             continue
-        if target in {"ACCEPT", "DROP", "REJECT", "RETURN"}:
+        if target in TERMINAL:
             return target
+        if target == "RETURN":
+            return "RETURN"
         if target in chains:
             if target in seen:
                 return "LOOP"
-            nested = evaluate_chain(chains[target], packet, chains, seen | {target})
+            nested = evaluate_chain(
+                chains[target],
+                packet,
+                chains,
+                seen | {target},
+                family=family,
+                firewall=firewall,
+                chain_name=target,
+            )
             if nested != "RETURN":
                 return nested
             continue
-    return "POLICY"
+        return "UNKNOWN-TARGET"
+    if chain_name in BUILTIN_CHAINS:
+        return _policy(firewall or {}, family, chain_name)
+    return "RETURN"
 
 
 def evaluate_packet(firewall: dict, *, family: str, chain: str, **packet) -> str:
     chains = firewall.get(family) or {}
     if chain not in chains:
         return "MISSING-CHAIN"
-    return evaluate_chain(chains[chain], packet, chains)
+    return evaluate_chain(
+        chains[chain],
+        packet,
+        chains,
+        family=family,
+        firewall=firewall,
+        chain_name=chain,
+    )

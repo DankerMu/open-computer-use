@@ -51,8 +51,11 @@ class EgressFaultQualificationTests(unittest.TestCase):
     def tearDown(self):
         self.context.cleanup()
 
-    def install(self):
-        result = run_script(FIREWALL_INSTALL, self.env)
+    def install(self, extra=None):
+        env = dict(self.env)
+        if extra:
+            env.update(extra)
+        result = run_script(FIREWALL_INSTALL, env)
         self.assertEqual(result.returncode, 0, result.stderr)
         return load_firewall(self.state)
 
@@ -70,7 +73,13 @@ class EgressFaultQualificationTests(unittest.TestCase):
         )
 
     def test_reversed_deny_allow_order_is_rejected(self):
-        firewall = self.install()
+        firewall = self.install({"OCU_SANDBOX_EGRESS_ALLOW": "0.0.0.0/0"})
+        env = dict(self.env)
+        env["OCU_SANDBOX_EGRESS_ALLOW"] = "0.0.0.0/0"
+        self.assertEqual(
+            evaluate_packet(firewall, family="ipv4", chain="DOCKER-USER", in_iface=BRIDGE, src="172.31.0.20", dst=METADATA_ADDR),
+            "DROP",
+        )
         owned = firewall["ipv4"][OWNED_IPV4]
         drops = [rule for rule in owned if rule[-1] == "DROP" and rule != ["-j", "DROP"]]
         reply = [rule for rule in owned if "--ctdir" in rule]
@@ -78,7 +87,7 @@ class EgressFaultQualificationTests(unittest.TestCase):
         final = [rule for rule in owned if rule == ["-j", "DROP"]]
         firewall["ipv4"][OWNED_IPV4] = reply + allows + drops + final
         write_firewall(self.state, firewall)
-        result = run_script(FIREWALL_CHECK, self.env)
+        result = run_script(FIREWALL_CHECK, env)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(OWNED_IPV4, result.stderr)
         self.assertEqual(
@@ -116,7 +125,7 @@ class EgressFaultQualificationTests(unittest.TestCase):
         self.assertIn("INPUT", result.stderr)
         self.assertEqual(
             evaluate_packet(firewall, family="ipv4", chain="INPUT", in_iface=BRIDGE, src="172.31.0.20", dst="172.31.0.1"),
-            "POLICY",
+            "ACCEPT",
         )
 
     def test_missing_ipv6_hook_is_rejected(self):
@@ -129,7 +138,7 @@ class EgressFaultQualificationTests(unittest.TestCase):
         self.assertIn(OWNED_IPV6, result.stderr)
         self.assertEqual(
             evaluate_packet(firewall, family="ipv6", chain="FORWARD", in_iface=BRIDGE, src="fe80::1", dst="fe80::2"),
-            "POLICY",
+            "ACCEPT",
         )
 
     def test_source_subnet_only_hook_is_rejected(self):
@@ -145,15 +154,15 @@ class EgressFaultQualificationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("-i", result.stderr)
         self.assertEqual(
-            evaluate_packet(firewall, family="ipv4", chain="DOCKER-USER", in_iface=BRIDGE, src="8.8.8.8", dst="9.9.9.9"),
-            "POLICY",
+            evaluate_packet(firewall, family="ipv4", chain="FORWARD", in_iface=BRIDGE, src="8.8.8.8", dst="9.9.9.9"),
+            "ACCEPT",
         )
 
     def test_duplicate_or_bypassed_jump_is_rejected(self):
         firewall = self.install()
-        hook = ["-i", BRIDGE, "-j", OWNED_IPV4, "-m", "comment", "--comment", "ocu-sandbox-egress"]
+        hook = [rule for rule in firewall["ipv4"]["DOCKER-USER"] if OWNED_IPV4 in rule][0]
         firewall["ipv4"]["DOCKER-USER"].insert(0, ["-i", BRIDGE, "-j", "ACCEPT"])
-        firewall["ipv4"]["DOCKER-USER"].append(hook)
+        firewall["ipv4"]["DOCKER-USER"].append(list(hook))
         write_firewall(self.state, firewall)
         result = run_script(FIREWALL_CHECK, self.env)
         self.assertNotEqual(result.returncode, 0)

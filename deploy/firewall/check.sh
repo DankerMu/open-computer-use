@@ -4,4 +4,5 @@
 # Read-only ordered-policy check. Does not mutate firewall state.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export PYTHONPATH="$ROOT/deploy${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 "$ROOT/deploy/firewall/policy.py" check

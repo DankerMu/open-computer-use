@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -14,9 +15,8 @@ import time
 
 
 OWNED_IPV4 = "OCU-SANDBOX-EGRESS"
-OWNED_IPV6 = "OCU-SANDBOX-EGRESS6"
-OWNED_COMMENT = "ocu-sandbox-egress"
-OWNED_IPV6_COMMENT = "ocu-sandbox-egress6"
+SAVE_OPTSTRING = "bcdt:M:f:V"
+CTSTATE_ORDER = ("INVALID", "NEW", "RELATED", "ESTABLISHED", "UNTRACKED", "SNAT", "DNAT")
 
 
 def state_dir() -> Path:
@@ -97,18 +97,64 @@ def fail_if_missing_backend(state: Path, tool: str) -> bool:
     return False
 
 
-def strip_wait(argv: list[str]) -> tuple[list[str], str | None]:
-    wait = None
+def reject_save_wait(argv: list[str]) -> None:
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in {"-w", "--wait"} or token.startswith("-w") and token[2:].isdigit() or token.startswith("--wait"):
+            sys.stderr.write(f"unrecognized option '{token}'\n")
+            sys.stderr.write(f"Look at manual page `iptables-save.8' for more information.\n")
+            raise SystemExit(1)
+        i += 1
+
+
+def parse_save_argv(argv: list[str]) -> None:
+    reject_save_wait(argv)
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "-t" and i + 1 < len(argv):
+            table = argv[i + 1]
+            if table != "filter":
+                sys.stderr.write(f"unsupported table {table}\n")
+                raise SystemExit(1)
+            i += 2
+            continue
+        if token.startswith("-t") and len(token) > 2:
+            table = token[2:]
+            if table != "filter":
+                sys.stderr.write(f"unsupported table {table}\n")
+                raise SystemExit(1)
+            i += 1
+            continue
+        if token in {"-c", "-d", "-b", "-V"}:
+            i += 1
+            continue
+        if token in {"-M", "-f"} and i + 1 < len(argv):
+            i += 2
+            continue
+        if token.startswith("-") and len(token) == 2 and token[1] in SAVE_OPTSTRING.replace(":", ""):
+            sys.stderr.write(f"unrecognized option '{token}'\n")
+            raise SystemExit(1)
+        if token.startswith("-"):
+            sys.stderr.write(f"unrecognized option '{token}'\n")
+            raise SystemExit(1)
+        sys.stderr.write("Unknown arguments found on commandline\n")
+        raise SystemExit(1)
+
+
+def strip_mutate_flags(argv: list[str]) -> list[str]:
     out: list[str] = []
     i = 0
     while i < len(argv):
         token = argv[i]
-        if token == "-w" and i + 1 < len(argv):
-            wait = argv[i + 1]
+        if token in {"-w", "--wait", "-W", "--wait-interval"} and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
             i += 2
             continue
         if token.startswith("-w") and token[2:].isdigit():
-            wait = token[2:]
+            i += 1
+            continue
+        if token.startswith("--wait=") or token.startswith("--wait-interval="):
             i += 1
             continue
         if token == "-t" and i + 1 < len(argv):
@@ -127,7 +173,7 @@ def strip_wait(argv: list[str]) -> tuple[list[str], str | None]:
             continue
         out.append(token)
         i += 1
-    return out, wait
+    return out
 
 
 def chain_map(payload: dict, family: str) -> dict:
@@ -136,6 +182,117 @@ def chain_map(payload: dict, family: str) -> dict:
 
 def policies(payload: dict, family: str) -> dict:
     return payload.setdefault("policies", {}).setdefault(family, {})
+
+
+def canonical_ctstate(value: str) -> str:
+    wanted = {item.strip().upper() for item in value.split(",") if item.strip()}
+    ordered = [name for name in CTSTATE_ORDER if name in wanted]
+    leftover = wanted.difference(CTSTATE_ORDER)
+    if leftover:
+        ordered.extend(sorted(leftover))
+    return ",".join(ordered)
+
+
+def canonical_cidr(value: str) -> str:
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        return value
+
+
+def parse_rule(tokens: list[str]) -> dict:
+    interface = None
+    out_iface = None
+    source = None
+    dest = None
+    comment = None
+    target = None
+    matches: dict[str, str | None] = {}
+    unknown: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "-i" and i + 1 < len(tokens):
+            interface = tokens[i + 1]
+            i += 2
+            continue
+        if token == "-o" and i + 1 < len(tokens):
+            out_iface = tokens[i + 1]
+            i += 2
+            continue
+        if token == "-s" and i + 1 < len(tokens):
+            source = canonical_cidr(tokens[i + 1])
+            i += 2
+            continue
+        if token == "-d" and i + 1 < len(tokens):
+            dest = canonical_cidr(tokens[i + 1])
+            i += 2
+            continue
+        if token == "-j" and i + 1 < len(tokens):
+            target = tokens[i + 1]
+            i += 2
+            continue
+        if token == "-m" and i + 1 < len(tokens):
+            i += 2
+            continue
+        if token == "--comment" and i + 1 < len(tokens):
+            comment = tokens[i + 1]
+            i += 2
+            continue
+        if token == "--ctstate" and i + 1 < len(tokens):
+            matches["--ctstate"] = canonical_ctstate(tokens[i + 1])
+            i += 2
+            continue
+        if token == "--ctdir" and i + 1 < len(tokens):
+            matches["--ctdir"] = tokens[i + 1]
+            i += 2
+            continue
+        if token.startswith("-"):
+            unknown.append(token)
+            i += 1
+            continue
+        unknown.append(token)
+        i += 1
+    return {
+        "interface": interface,
+        "out": out_iface,
+        "source": source,
+        "dest": dest,
+        "comment": comment,
+        "target": target,
+        "matches": matches,
+        "unknown": tuple(unknown),
+    }
+
+
+def rules_match(left: list[str], right: list[str]) -> bool:
+    return parse_rule(left) == parse_rule(right)
+
+
+def serialize_rule(tokens: list[str]) -> str:
+    parsed = parse_rule(tokens)
+    parts: list[str] = []
+    if parsed["interface"] is not None:
+        parts.extend(["-i", parsed["interface"]])
+    if parsed["out"] is not None:
+        parts.extend(["-o", parsed["out"]])
+    if parsed["source"] is not None:
+        parts.extend(["-s", parsed["source"]])
+    if parsed["dest"] is not None:
+        parts.extend(["-d", parsed["dest"]])
+    if parsed["matches"].get("--ctstate") is not None or parsed["matches"].get("--ctdir") is not None:
+        parts.extend(["-m", "conntrack"])
+        if parsed["matches"].get("--ctstate") is not None:
+            parts.extend(["--ctstate", parsed["matches"]["--ctstate"]])
+        if parsed["matches"].get("--ctdir") is not None:
+            parts.extend(["--ctdir", parsed["matches"]["--ctdir"]])
+    if parsed["comment"] is not None:
+        parts.extend(["-m", "comment", "--comment", shlex.quote(parsed["comment"])])
+    for token in parsed["unknown"]:
+        parts.append(token)
+    if parsed["target"] is not None:
+        parts.extend(["-j", parsed["target"]])
+    return " ".join(parts)
 
 
 def render_save(payload: dict, family: str) -> str:
@@ -147,7 +304,7 @@ def render_save(payload: dict, family: str) -> str:
         lines.append(f":{name} {policy} [0:0]")
     for name, rules in chains.items():
         for rule in rules:
-            lines.append("-A " + name + " " + " ".join(rule))
+            lines.append("-A " + name + " " + serialize_rule(rule))
     lines.append("COMMIT")
     lines.append("")
     return "\n".join(lines)
@@ -203,6 +360,23 @@ def apply_restore(payload: dict, family: str, text: str) -> None:
             name = args[0]
             chains.setdefault(name, [])
             chains[name].append(args[1:])
+        elif op == "-I":
+            name = args[0]
+            if len(args) > 1 and args[1].isdigit():
+                index = int(args[1])
+                rule = args[2:]
+            else:
+                index = 1
+                rule = args[1:]
+            insert_rule(payload, family, name, index, rule)
+        elif op == "-D":
+            name = args[0]
+            spec: object
+            if len(args) == 2 and args[1].isdigit():
+                spec = int(args[1])
+            else:
+                spec = args[1:]
+            delete_rule(payload, family, name, spec)
         elif op == "-X":
             name = args[0]
             chains.pop(name, None)
@@ -242,7 +416,7 @@ def delete_rule(payload: dict, family: str, chain: str, spec) -> None:
         del rules[spec - 1]
         return
     for i, rule in enumerate(rules):
-        if rule == spec:
+        if rules_match(rule, spec):
             del rules[i]
             return
     raise KeyError("rule")
@@ -258,6 +432,33 @@ def new_chain(payload: dict, family: str, chain: str) -> None:
 
 def iptables_family(tool: str) -> str:
     return "ipv6" if tool in {"ip6tables", "ip6tables-restore", "ip6tables-save"} else "ipv4"
+
+
+def maybe_corrupt_owned(state: Path, payload: dict, family: str, text: str) -> None:
+    marker = state / "check-fail-once"
+    if not marker.exists() or family != "ipv4":
+        return
+    if f"-F {OWNED_IPV4}" not in text:
+        return
+    owned = chain_map(payload, "ipv4").get(OWNED_IPV4) or []
+    chain_map(payload, "ipv4")[OWNED_IPV4] = [
+        rule for rule in owned if parse_rule(rule) != parse_rule(["-j", "DROP"])
+    ]
+    marker.unlink()
+
+
+
+def maybe_inject_foreign(state: Path, payload: dict, family: str) -> None:
+    marker = state / "inject-foreign-once"
+    if not marker.exists() or family != "ipv4":
+        return
+    if OWNED_IPV4 not in chain_map(payload, "ipv4"):
+        return
+    extra = ["-s", "10.8.8.8/32", "-j", "ACCEPT", "-m", "comment", "--comment", "foreign-concurrent"]
+    docker_user = chain_map(payload, "ipv4").setdefault("DOCKER-USER", [])
+    if extra not in docker_user:
+        docker_user.insert(0, extra)
+    marker.unlink()
 
 
 def handle_iptables(state: Path, tool: str, argv: list[str]) -> int:
@@ -278,15 +479,27 @@ def handle_iptables(state: Path, tool: str, argv: list[str]) -> int:
         if not noflush:
             sys.stderr.write("iptables-restore requires --noflush\n")
             return 1
+        stripped = strip_mutate_flags(argv)
+        if any(token.startswith("-") and token not in {"--noflush"} for token in stripped):
+            sys.stderr.write(f"unsupported {tool} command: {' '.join(stripped)}\n")
+            return 1
         try:
             apply_restore(payload, family, text)
         except Exception as exc:
             sys.stderr.write(f"iptables-restore failed: {exc}\n")
             return 1
+        maybe_corrupt_owned(state, payload, family, text)
         save_firewall(state, payload)
         return 0
-    args, _wait = strip_wait(argv)
-    if tool.endswith("-save") or args[:1] == ["-S"]:
+    if tool.endswith("-save"):
+        parse_save_argv(argv)
+        hold(state, "FAKE_FIREWALL_HOLD_SAVE", "entered-save")
+        maybe_inject_foreign(state, payload, family)
+        save_firewall(state, payload)
+        sys.stdout.write(render_save(payload, family))
+        return 0
+    args = strip_mutate_flags(argv)
+    if args[:1] == ["-S"]:
         hold(state, "FAKE_FIREWALL_HOLD_SAVE", "entered-save")
         sys.stdout.write(render_save(payload, family))
         return 0
@@ -294,13 +507,13 @@ def handle_iptables(state: Path, tool: str, argv: list[str]) -> int:
         sys.stderr.write("missing iptables command\n")
         return 1
     if args[0] == "-V":
-        sys.stdout.write("iptables v1.8.10 (nf_tables)\n")
+        sys.stdout.write("iptables v1.8.11 (legacy)\n")
         return 0
     if args[0] == "-L":
         chain = args[1] if len(args) > 1 else ""
         chains = chain_map(payload, family)
         if chain and chain not in chains:
-            sys.stderr.write(f"iptables: No chain/target/match by that name.\n")
+            sys.stderr.write("iptables: No chain/target/match by that name.\n")
             return 1
         return 0
     if args[0] == "-N":
@@ -382,8 +595,6 @@ def sysctl_cmd(state: Path, argv: list[str]) -> int:
         sys.stderr.write("unsupported sysctl command\n")
         return 1
     names = argv[1:]
-    if argv[0] == "-e":
-        names = argv[1:]
     for name in names:
         if name not in values:
             sys.stderr.write(f"sysctl: cannot stat {name}: No such file or directory\n")
@@ -415,8 +626,6 @@ def ip_cmd(state: Path, argv: list[str]) -> int:
     if name in aliases:
         name = aliases[name]
     if name not in names:
-        # Accept any interface the tests created as a known device, including
-        # the default Docker br-<id[:12]> convention derived from network files.
         networks = state / "networks"
         if networks.is_dir():
             for path in networks.glob("*.json"):
@@ -443,7 +652,6 @@ def main(argv: list[str]) -> int:
     state = state_dir()
     tool = command_name(argv[0] if argv else sys.argv[0])
     args = argv[1:] if argv and command_name(argv[0]) == tool and Path(argv[0]).name == tool else argv
-    # When invoked as `python3 host.py iptables ...` the first arg is the tool.
     if tool == "host.py":
         if not args:
             sys.stderr.write("missing host command\n")
