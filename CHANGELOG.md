@@ -3,6 +3,20 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Retention-safe overlay runtime provisioning.** Bootstrap no longer pins a
+  historical source SHA, upstream WebUI image, or direct OCU/WebUI host
+  publications. Operators must supply a full `SOURCE_SHA` matching the selected
+  checkout, explicit fork image references, a valid HTTP(S) `OCU_WEBUI_ORIGIN`,
+  and an explicit `OCU_SANDBOX_EGRESS_ALLOW` (empty remains deny-all). Generated
+  `runtime.env` now includes distinct control/sandbox topology, proxy image/port,
+  `PUBLIC_BASE_URL=${OCU_WEBUI_ORIGIN}/ocu`, internal
+  `OCU_WEBUI_AUTH_URL=http://open-webui:8080/api/v1/ocu/auth`, one shared
+  internal token, `OCU_PUBLIC_PREFIX=/ocu`, and `OCU_SANDBOX_NO_AUTOSTART=1`.
+  The core override delivers prefix and no-autostart through the replacement
+  environment. Retention remains stop-only; stopped sandboxes require explicit
+  launch. The historical `disable-cli-autostart.patch` is removed. Real engine
+  startup and 168h data preservation remain issue36 evidence; DNS issue79
+  remains required for full all-egress readiness.
 - **Sandbox egress destination guard.** Deployment requires `OCU_SANDBOX_EGRESS_ALLOW`, a comma-separated IPv4 address/CIDR allowlist. Unset fails configuration; an explicitly empty value denies all new sandbox-initiated IP traffic. After network provisioning and before any Compose start, `deploy/up.sh` runs `deploy/firewall/docker-user-rules.sh` and `deploy/firewall/check.sh` through `run_owned`. IPv4 policy is interface-scoped on the sandbox bridge via `DOCKER-USER` and `INPUT`: REPLY-only ESTABLISHED/RELATED RETURN, control-plane and metadata DROP, one RETURN per allowlisted destination, then unconditional DROP. IPv6 sandbox ingress is dropped on INPUT and FORWARD. The installer reconciles only owned chains and jumps, preserves foreign rules, and serializes cooperating processes with `OCU_SANDBOX_EGRESS_LOCK` (default `/run/ocu-sandbox-egress/ocu-sandbox-egress.lock`). Docker inherited host-namespace DNS remains open until issue 79; real kernel and engine packet evidence remains issue 36.
 - **Proxy-only production-like deployment topology.** The core and WebUI
   overrides remove direct host publications; a standalone unprivileged proxy

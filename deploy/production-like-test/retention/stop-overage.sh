@@ -1,11 +1,15 @@
 #!/bin/sh
 # Stop only sandbox containers that exceed the permitted continuous runtime.
 # Deliberately never removes containers, named volumes, chat data, images, or
-# build cache. A later MCP request restarts the stopped sandbox using its
-# existing chat workspace volume.
+# build cache. Stopped workspaces require the existing explicit launch
+# operation; this guard never restarts a sandbox.
 
 set -eu
 
+if [ "${CONTAINER_MAX_AGE_HOURS+x}" = x ] && [ -z "$CONTAINER_MAX_AGE_HOURS" ]; then
+    printf '%s\n' '[retention-guard] CONTAINER_MAX_AGE_HOURS must be a non-negative integer' >&2
+    exit 2
+fi
 max_age_hours=${CONTAINER_MAX_AGE_HOURS:-168}
 case "$max_age_hours" in
     ''|*[!0-9]*)

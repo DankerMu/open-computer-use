@@ -94,6 +94,8 @@ class OverlayStructureTests(unittest.TestCase):
         for name in REQUIRED_CORE_NAMES:
             self.assertTrue(interpolated(core_env[name], name), name)
         self.assertTrue(interpolated(core_env["SANDBOX_HOST_BIND_IP"], "OCU_SANDBOX_GATEWAY"))
+        self.assertEqual(core_env["OCU_PUBLIC_PREFIX"], "/ocu")
+        self.assertEqual(core_env["OCU_SANDBOX_NO_AUTOSTART"], "1")
         self.assertTrue(interpolated(webui_env["OCU_INTERNAL_TOKEN"], "OCU_INTERNAL_TOKEN"))
         self.assertEqual(webui_env["ENABLE_OCU_WORKSPACE"], "true")
         self.assertEqual(webui_env["OCU_INTERNAL_URL"], "http://computer-use-server:8081")
@@ -153,8 +155,12 @@ class OverlayStructureTests(unittest.TestCase):
     def test_obsolete_private_binding_patch_is_absent(self):
         patch = ROOT / "deploy" / "production-like-test" / "patches" / "private-sandbox-port-bindings.patch"
         self.assertFalse(patch.exists())
+        autostart = ROOT / "deploy" / "production-like-test" / "patches" / "disable-cli-autostart.patch"
+        self.assertFalse(autostart.exists())
         claim = (ROOT / "deploy" / "production-like-test" / "scripts" / "write-deployed-version.sh").read_text(encoding="utf-8")
         self.assertNotIn("private-sandbox-port-bindings.patch", claim)
+        self.assertNotIn("disable-cli-autostart.patch", claim)
+        self.assertIn("OCU_SANDBOX_NO_AUTOSTART=1", claim)
 
 
 if __name__ == "__main__":
