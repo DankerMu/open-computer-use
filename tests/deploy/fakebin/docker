@@ -558,10 +558,6 @@ def load_exec_rules(state: Path) -> list[dict]:
     return rows
 
 
-def save_exec_rules(state: Path, rows: list[dict]) -> None:
-    path = state / "exec.jsonl"
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-
 
 
 def match_exec_rule(rule: dict, container: str, command: list[str]) -> bool:
@@ -591,14 +587,8 @@ def load_sandbox_terminal(state: Path) -> dict:
             "sessions": [],
             "no_autostart_marker": False,
             "subagent_autostarted": "",
-            "pane": {
-                "session": "main",
-                "pane_id": "%1",
-                "pid": "9001",
-                "command": "bash",
-                "comm": "bash",
-                "tree": "9001 9000 9001 bash bash",
-            },
+            "pane": {"session": "main", "pane_id": "%1", "pid": "9001", "tty": "/dev/pts/0", "command": "bash"},
+            "processes": ["9001 9000 9001 9001 9001 pts/0 bash"],
         }
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -617,6 +607,8 @@ def curl_writeout(code: int, *, connects=0, remote="", connect_time="0.000", htt
 def handle_sandbox_command(state: Path, container: str, command: list[str]) -> tuple[int, str, str]:
     terminal = load_sandbox_terminal(state)
     joined = " ".join(command)
+    if terminal.get("probe_error") and terminal["probe_error"] in joined:
+        return 2, "", "synthetic exec unavailable"
     if command[:1] == ["curl"] or (len(command) >= 3 and command[0] == "bash" and "curl" in joined):
         path = state / "curl.jsonl"
         url = command[-1] if command else ""
@@ -641,33 +633,36 @@ def handle_sandbox_command(state: Path, container: str, command: list[str]) -> t
                 return int(row.get("code", 0)), stdout, str(row.get("stderr", ""))
         return 7, curl_writeout(7), ""
     if "pgrep -x ttyd" in joined:
-        return 0, "RUNNING\n" if terminal.get("ttyd") else "STOPPED\n", ""
+        return (0, "9900\n", "") if terminal.get("ttyd") else (1, "", "")
     if "tmux list-sessions" in joined:
         sessions = terminal.get("sessions") or []
+        if not sessions:
+            return 1, "", "no server running on /tmp/tmux-1000/default\n"
         return 0, "".join(f"{name}\n" for name in sessions), ""
     if "test -f /tmp/.no_autostart" in joined:
-        return 0, "MARKER\n" if terminal.get("no_autostart_marker") else "ABSENT\n", ""
+        return (0, "", "") if terminal.get("no_autostart_marker") else (1, "", "")
     if "printenv SUBAGENT_AUTOSTARTED" in joined:
-        return 0, str(terminal.get("subagent_autostarted") or ""), ""
+        value = str(terminal.get("subagent_autostarted") or "")
+        return (0, value + "\n", "") if value else (1, "", "")
     if "tmux display-message" in joined:
-        if not terminal.get("ttyd") and "main" not in (terminal.get("sessions") or []):
+        if "main" not in (terminal.get("sessions") or []):
             return 1, "", "no current window"
         pane = terminal.get("pane") or {}
-        line = " ".join(
-            [
-                str(pane.get("session", "main")),
-                str(pane.get("pane_id", "%1")),
-                str(pane.get("pid", "9001")),
-                str(pane.get("command", "bash")),
-            ]
+        line = "|".join(
+            str(pane.get(key, fallback))
+            for key, fallback in (
+                ("session", "main"), ("pane_id", "%1"), ("pid", "9001"),
+                ("tty", "/dev/pts/0"), ("command", "bash"),
+            )
         )
         return 0, line + "\n", ""
-    if "ps -o comm=" in joined:
-        pane = terminal.get("pane") or {}
-        return 0, str(pane.get("comm", "bash")) + "\n", ""
-    if "ps -o pid=,pgrp=,comm=,args=" in joined or "ps -eo pid=,ppid=,pgrp=,comm=,args=" in joined:
-        pane = terminal.get("pane") or {}
-        return 0, str(pane.get("tree", "9001 9000 9001 bash bash")) + "\n", ""
+    if "ps -eo pid=,ppid=,pgid=,tpgid=,sess=,tty=,comm=" in joined:
+        if "transition_after_reads" in terminal:
+            terminal["process_reads"] = terminal.get("process_reads", 0) + 1
+            if terminal["process_reads"] >= terminal["transition_after_reads"]:
+                terminal["processes"] = terminal["next_processes"]
+            save_sandbox_terminal(state, terminal)
+        return 0, "".join(row + "\n" for row in terminal.get("processes", [])), ""
     return 1, "", "unsupported exec command"
 
 

@@ -37,41 +37,30 @@ POSTGRES = "postgres"
 RETENTION = "retention-guard"
 CLEANUP = "cleanup"
 REQUIRED_RUNNING = (OCU, WEBUI, PROXY, POSTGRES, RETENTION)
-ONESHOTS = ("workspace", "open-webui-init")
 PROXY_TARGET = "8082"
 OCU_TARGET = 8081
 WEBUI_TARGET = 8080
-FORMER_OCU_PORT = 8081
 MANAGED_LABEL = "mcp-computer-use-orchestrator"
 NO_AUTOSTART = "NO_AUTOSTART=1"
 CURL_WRITE_OUT = (
     "exitcode=%{exitcode} num_connects=%{num_connects} "
     "remote_ip=%{remote_ip} time_connect=%{time_connect} http_code=%{http_code}"
 )
-CLI_NAMES = {
-    "claude",
-    "codex",
-    "opencode",
-    "node",
-    "bun",
-    "cat",
-    "cli.js",
-    "claude-code",
-}
 BASH_NAMES = {"bash", "-bash"}
 CONNECT_TIMEOUT = 3.0
 HTTP_TIMEOUT = 5.0
 SANDBOX_CONNECT = "5"
 SANDBOX_MAX = "15"
 TERMINAL_DEADLINE = 10.0
-STABLE_SAMPLES = 3
-STABLE_INTERVAL = 0.4
+STABLE_WINDOW = 2.0
+STABLE_INTERVAL = 0.25
 SIGNAL_EXITS = {signal.SIGINT: 130, signal.SIGTERM: 143, signal.SIGHUP: 129}
 
 _OWNED_SESSION: TtydSession | None = None
 _OWNED_CLEANUP: dict | None = None
 _CLEANUP_DONE = False
 _OWNED_PGIDS: set[int] = set()
+_PENDING_START: dict | None = None
 
 
 class SmokeError(Exception):
@@ -186,14 +175,23 @@ def run_cmd(argv: list[str], *, timeout: float, env=None) -> subprocess.Complete
     pgid = process.pid
     _OWNED_PGIDS.add(pgid)
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _stop_pgid(pgid)
-        stdout, stderr = process.communicate(timeout=2)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            fail(f"{argv[0]} timed out")
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    finally:
+        if process.poll() is None:
+            _stop_pgid(pgid)
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            _stop_pgid(pgid)
+            try:
+                process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                fail(f"{argv[0]} could not be reaped")
         _OWNED_PGIDS.discard(pgid)
-        fail(f"{argv[0]} timed out")
-    _OWNED_PGIDS.discard(pgid)
-    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 def docker(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess:
@@ -280,7 +278,7 @@ def service_running(state: str) -> bool:
     return state in {"running", "up"} or state.startswith("running")
 
 
-def publisher_ok(mapping: dict, published: str) -> bool:
+def publisher_ok(mapping: dict, published: str, bound: str) -> bool:
     if not isinstance(mapping, dict):
         return False
     target = str(mapping.get("TargetPort") or mapping.get("Target") or "")
@@ -288,10 +286,9 @@ def publisher_ok(mapping: dict, published: str) -> bool:
     protocol = str(mapping.get("Protocol") or "tcp").lower()
     url = str(mapping.get("URL") or mapping.get("url") or "")
     host_ip = str(mapping.get("HostIP") or mapping.get("HostIp") or "")
-    bound = host_ip or url
     if target != PROXY_TARGET or published_port != published or protocol != "tcp":
         return False
-    return bound in {"", "0.0.0.0"}
+    return (host_ip or url) == bound
 
 
 def judge_publications(inventory: dict[str, dict], published: str) -> None:
@@ -315,8 +312,19 @@ def judge_publications(inventory: dict[str, dict], published: str) -> None:
     publications = []
     for row in proxy_rows:
         publications.extend(row["Publishers"])
-    if len(publications) != 1 or not publisher_ok(publications[0], published):
+    if not 1 <= len(publications) <= 2 or not any(
+        publisher_ok(mapping, published, "0.0.0.0") or publisher_ok(mapping, published, "")
+        for mapping in publications
+    ):
         fail(f"{PROXY}: incorrect TCP listen/publication mapping")
+    if len(publications) == 2 and not any(
+        publisher_ok(mapping, published, "::") for mapping in publications
+    ):
+        fail(f"{PROXY}: incorrect IPv6 TCP publication")
+    if len(publications) == 2 and sum(
+        publisher_ok(mapping, published, "::") for mapping in publications
+    ) != 1:
+        fail(f"{PROXY}: unexpected proxy publication")
     for service, rows in by_service.items():
         if service == PROXY:
             continue
@@ -525,6 +533,8 @@ def sandbox_curl(container: str, url: str, *, connect: str = SANDBOX_CONNECT, ma
         if result.returncode not in {0, 28, 7, 6, 5, 52, 56}:
             fail(f"sandbox curl failed ({result.returncode})")
         raise
+    if fields["exitcode"] != str(result.returncode):
+        fail("sandbox curl process exit disagrees with write-out")
     fields["process_exit"] = str(result.returncode)
     return fields
 
@@ -537,7 +547,7 @@ def connected(fields: dict[str, str]) -> bool:
     if remote and remote not in {"0.0.0.0"}:
         return True
     try:
-        return int(fields.get("num_connects") or "0") > 0
+        return int(fields.get("num_connects") or "0") > 0 or float(fields.get("time_connect") or "0") > 0
     except ValueError:
         return True
 
@@ -722,20 +732,49 @@ def resolve_sandbox(chat_id: str, sandbox_id: str, sandbox_name: str) -> dict:
     return {"id": sandbox_id, "name": name, "payload": payload}
 
 
-def precheck_terminal(container: str) -> None:
-    ttyd = exec_text(container, "pgrep -x ttyd >/dev/null && echo RUNNING || echo STOPPED")
-    if "RUNNING" in (ttyd.stdout or ""):
-        fail("pre-existing ttyd process; refusing terminal mutation", 2)
-    tmux = exec_text(container, "tmux list-sessions -F '#{session_name}' 2>/dev/null || true")
-    sessions = [line.strip() for line in (tmux.stdout or "").splitlines() if line.strip()]
+def _terminal_state(container: str, *, code: int = 2) -> tuple[bool, bool]:
+    ttyd = exec_text(container, "pgrep -x ttyd")
+    if ttyd.returncode not in {0, 1} or ttyd.stderr or (ttyd.returncode == 1 and ttyd.stdout):
+        fail("ttyd presence probe failed", code)
+    if ttyd.returncode == 0 and not (ttyd.stdout or "").strip().isdigit():
+        fail("ttyd presence probe is malformed", code)
+    tmux = exec_text(container, "tmux list-sessions -F '#{session_name}'")
+    sessions = (tmux.stdout or "").strip().splitlines()
+    if tmux.returncode == 0:
+        if tmux.stderr or not sessions or any(not item.strip() for item in sessions):
+            fail("tmux session inventory is malformed", code)
+    elif tmux.returncode == 1:
+        detail = (tmux.stderr or "").strip()
+        if sessions or not (
+            detail.startswith("no server running on ")
+            or (detail.startswith("error connecting to ") and "No such file or directory" in detail)
+        ):
+            fail("tmux session inventory failed", code)
+    else:
+        fail("tmux session inventory failed", code)
+    return ttyd.returncode == 0, bool(sessions)
+
+
+def assert_terminal_absent(container: str, *, code: int = 2) -> None:
+    ttyd, sessions = _terminal_state(container, code=code)
+    if ttyd:
+        fail("pre-existing ttyd process" if code == 2 else "owned ttyd survived cleanup", code)
     if sessions:
-        fail("pre-existing assistant tmux session; refusing terminal mutation", 2)
-    marker = exec_text(container, "test -f /tmp/.no_autostart && echo MARKER || echo ABSENT")
-    if "MARKER" in (marker.stdout or ""):
+        fail("pre-existing assistant tmux session" if code == 2 else "owned tmux survived cleanup", code)
+
+
+def precheck_terminal(container: str) -> None:
+    assert_terminal_absent(container)
+    marker = exec_text(container, "test -f /tmp/.no_autostart")
+    if marker.returncode == 0 and not marker.stdout and not marker.stderr:
         fail("global no-autostart marker present; use a fresh smoke sandbox", 2)
-    started = exec_text(container, 'printenv SUBAGENT_AUTOSTARTED || true')
-    if (started.stdout or "").strip():
+    if marker.returncode != 1 or marker.stdout or marker.stderr:
+        fail("global no-autostart marker probe failed", 2)
+    started = exec_text(container, "printenv SUBAGENT_AUTOSTARTED")
+    if started.returncode == 0:
         fail("stale SUBAGENT_AUTOSTARTED would make the negative vacuous", 2)
+    if started.returncode != 1 or started.stdout or started.stderr:
+        fail("autostart environment probe failed", 2)
 
 
 def proxy_headers(origin: str, token: str) -> dict[str, str]:
@@ -748,6 +787,7 @@ def proxy_headers(origin: str, token: str) -> dict[str, str]:
 
 
 def start_product_terminal(origin: str, chat_id: str, token: str) -> None:
+    global _PENDING_START
     url = f"{origin}/ocu/terminal/{chat_id}/start-ttyd"
     body = json.dumps({"dangerous_mode": False}).encode("utf-8")
     status, _headers, payload = http_request(
@@ -763,6 +803,7 @@ def start_product_terminal(origin: str, chat_id: str, token: str) -> None:
     except (UnicodeError, json.JSONDecodeError):
         fail("start-ttyd returned malformed JSON", 2)
     if document.get("already_running") is True:
+        _PENDING_START = None
         fail("start-ttyd reported already_running; refusing shared terminal", 2)
     if document.get("started") is not True:
         fail("start-ttyd did not start a new terminal", 2)
@@ -780,77 +821,105 @@ def stop_product_terminal(origin: str, chat_id: str, token: str) -> None:
         fail("owned stop-ttyd cleanup failed")
 
 
-def pane_snapshot(container: str) -> dict:
-    tmux = exec_text(
+def collect_processes(container: str, exec_fn=exec_text) -> dict[int, tuple[int, int, int, int, str, str]]:
+    """Read the sandbox's actual process and terminal foreground groups."""
+    result = exec_fn(container, "ps -eo pid=,ppid=,pgid=,tpgid=,sess=,tty=,comm=")
+    if result.returncode != 0 or not result.stdout or len(result.stdout) > 1_048_576:
+        fail("terminal process inventory failed")
+    records = {}
+    for line in result.stdout.splitlines():
+        columns = line.split(maxsplit=6)
+        if len(columns) != 7 or not all(item.lstrip("-").isdigit() for item in columns[:5]):
+            fail("terminal process inventory is malformed")
+        pid, ppid, pgid, tpgid, sid = map(int, columns[:5])
+        if pid < 0 or pid in records:
+            fail("terminal process inventory has invalid identities")
+        records[pid] = (ppid, pgid, tpgid, sid, columns[5], columns[6])
+    return records
+
+
+def pane_snapshot(container: str, exec_fn=exec_text) -> dict | None:
+    tmux = exec_fn(
         container,
-        "tmux display-message -p -t main '#{session_name} #{pane_id} #{pane_pid} #{pane_current_command}'",
+        "tmux display-message -p -t main '#{session_name}|#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_current_command}'",
     )
     if tmux.returncode != 0:
-        fail("product tmux pane is not ready")
-    parts = (tmux.stdout or "").split()
-    if len(parts) < 4:
+        if tmux.returncode == 1 and any(
+            marker in (tmux.stderr or "") for marker in ("no current window", "can't find session", "no server running on ")
+        ):
+            return None
+        fail("product tmux pane inspection failed")
+    parts = (tmux.stdout or "").strip().split("|")
+    if (
+        len(parts) != 5
+        or parts[0] != "main"
+        or not parts[1].startswith("%")
+        or not parts[2].isdigit()
+        or int(parts[2]) <= 0
+        or not parts[3].startswith("/dev/")
+    ):
         fail("product tmux pane observation is malformed")
-    pid = parts[2]
-    command = parts[3]
-    comm = exec_text(container, f"ps -o comm= -p {pid}")
-    pgrp = exec_text(container, f"ps -o pid=,pgrp=,comm=,args= -p {pid}")
-    tree = exec_text(
-        container,
-        (
-            "PGRP=$(ps -o pgrp= -p "
-            + pid
-            + " | tr -d ' '); ps -eo pid=,ppid=,pgrp=,comm=,args= | awk -v pane="
-            + pid
-            + ' -v pgrp="$PGRP" \'$1==pane || $2==pane || $3==pgrp {print}\''
-        ),
-    )
     return {
         "session": parts[0],
         "pane": parts[1],
-        "pid": pid,
-        "pane_command": command,
-        "comm": (comm.stdout or "").strip(),
-        "pgrp": pgrp.stdout or "",
-        "tree": tree.stdout or "",
+        "pid": int(parts[2]),
+        "tty": parts[3],
+        "pane_command": parts[4],
+        "processes": collect_processes(container, exec_fn),
     }
 
 
-def _tokens(text: str) -> set[str]:
-    return {item.lower() for item in text.replace("/", " ").split() if item}
-
-
 def foreground_is_bash(snapshot: dict) -> bool:
-    pane = snapshot["pane_command"].lower()
-    comm = snapshot["comm"].split("/")[-1].lower()
-    if pane not in BASH_NAMES or comm not in BASH_NAMES:
+    pane_pid = snapshot["pid"]
+    processes = snapshot["processes"]
+    pane = processes.get(pane_pid)
+    if pane is None or snapshot["pane_command"] not in BASH_NAMES:
         return False
-    combined = f"{snapshot['pgrp']}\n{snapshot['tree']}"
-    names = {item for item in _tokens(combined) if item not in {"sleep", "ps", "awk", "tr", "tmux"}}
-    if names & CLI_NAMES:
+    _, pgid, tpgid, sid, tty, comm = pane
+    expected_tty = snapshot["tty"].removeprefix("/dev/")
+    if tty != expected_tty or comm.split("/")[-1] not in BASH_NAMES:
         return False
-    return True
+    if tpgid <= 0 or tpgid != pgid or sid <= 0:
+        return False
+    foreground = [
+        row for row in processes.values()
+        if row[2] == tpgid and row[3] == sid and row[4] == tty
+    ]
+    if not foreground or any(row[1] == tpgid and row[5].split("/")[-1] not in BASH_NAMES for row in foreground):
+        return False
+    children = {pane_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, row in processes.items():
+            if pid not in children and row[0] in children:
+                children.add(pid)
+                changed = True
+    return all(processes[pid][5].split("/")[-1] in BASH_NAMES for pid in children)
 
 
-def observe_foreground(container: str) -> None:
-    deadline = time.monotonic() + TERMINAL_DEADLINE
-    seen: list[dict] = []
-    while time.monotonic() < deadline:
-        try:
-            snapshot = pane_snapshot(container)
-        except SmokeError:
-            time.sleep(STABLE_INTERVAL)
-            continue
-        if snapshot["session"] != "main":
-            fail("product terminal did not create session main")
-        if not foreground_is_bash(snapshot):
-            fail(
-                f"product terminal foreground is {snapshot['pane_command']}/{snapshot['comm']}, not bash"
-            )
-        seen.append(snapshot)
-        if len(seen) >= STABLE_SAMPLES:
-            return
+def observe_foreground(container: str, session: TtydSession) -> None:
+    readiness_deadline = time.monotonic() + TERMINAL_DEADLINE
+    while True:
+        session.check_alive()
+        snapshot = pane_snapshot(container)
+        if snapshot is not None:
+            if not foreground_is_bash(snapshot):
+                fail("product terminal foreground is not plain bash")
+            break
+        if time.monotonic() >= readiness_deadline:
+            fail("product terminal pane did not become ready")
         time.sleep(STABLE_INTERVAL)
-    fail("product terminal did not stabilize on bash")
+    # Two seconds of pane PID, tpgid and descendant evidence, not universal
+    # attribution of detached processes reparented outside this window.
+    stable_until = time.monotonic() + STABLE_WINDOW
+    while time.monotonic() < stable_until:
+        time.sleep(min(STABLE_INTERVAL, stable_until - time.monotonic()))
+        session.check_alive()
+        snapshot = pane_snapshot(container)
+        if snapshot is None or not foreground_is_bash(snapshot):
+            fail("product terminal foreground changed during stable window")
+    session.check_alive()
 
 
 def open_terminal_session(origin: str, chat_id: str, token: str) -> TtydSession:
@@ -863,29 +932,61 @@ def open_terminal_session(origin: str, chat_id: str, token: str) -> TtydSession:
             headers,
             timeout=TERMINAL_DEADLINE,
         )
-    except TtydProtocolError as exc:
-        fail(str(exc))
+    except (TtydProtocolError, OSError) as exc:
+        fail(f"ttyd websocket failed ({type(exc).__name__})")
 
 
 def cleanup_owned(status: int) -> int:
-    global _OWNED_SESSION, _OWNED_CLEANUP, _CLEANUP_DONE
+    global _OWNED_SESSION, _OWNED_CLEANUP, _CLEANUP_DONE, _PENDING_START
     if _CLEANUP_DONE:
         return status
     _CLEANUP_DONE = True
-    session = _OWNED_SESSION
-    owned = _OWNED_CLEANUP
+    for signum in SIGNAL_EXITS:
+        signal.signal(signum, signal.SIG_IGN)
+    session, owned, pending = _OWNED_SESSION, _OWNED_CLEANUP, _PENDING_START
     _OWNED_SESSION = None
     _OWNED_CLEANUP = None
+    _PENDING_START = None
+    failed = False
     if session is not None:
-        session.close()
-    stop_owned_children()
-    if owned:
         try:
+            session.close()
+        except Exception as exc:
+            print(f"{PREFIX}: websocket cleanup failed ({type(exc).__name__})", file=sys.stderr)
+            failed = True
+    try:
+        stop_owned_children()
+    except Exception as exc:
+        print(f"{PREFIX}: owned child cleanup failed ({type(exc).__name__})", file=sys.stderr)
+        failed = True
+    try:
+        if owned is None and pending is not None:
+            # The POST may have started ttyd before its response was observed.
+            deadline = time.monotonic() + 5.0
+            while True:
+                ttyd, sessions = _terminal_state(pending["container"], code=1)
+                if ttyd or sessions:
+                    owned = pending
+                    break
+                if time.monotonic() >= deadline:
+                    print(f"{PREFIX}: start-ttyd response unknown; no terminal observed", file=sys.stderr)
+                    failed = True
+                    break
+                time.sleep(0.2)
+        if owned:
             stop_product_terminal(owned["origin"], owned["chat_id"], owned["token"])
-        except SmokeError:
-            print(f"{PREFIX}: owned stop-ttyd cleanup failed", file=sys.stderr)
-            return status if status not in {0, None} else 1
-    return status
+            deadline = time.monotonic() + 5.0
+            while True:
+                ttyd, sessions = _terminal_state(owned["container"], code=1)
+                if not ttyd and not sessions:
+                    break
+                if time.monotonic() >= deadline:
+                    fail("owned ttyd survived cleanup" if ttyd else "owned tmux survived cleanup")
+                time.sleep(0.2)
+    except Exception as exc:
+        print(f"{PREFIX}: owned terminal cleanup failed ({type(exc).__name__})", file=sys.stderr)
+        failed = True
+    return 1 if failed else status
 
 
 def handle_signal(signum, _frame) -> None:  # noqa: ANN001
@@ -894,12 +995,13 @@ def handle_signal(signum, _frame) -> None:  # noqa: ANN001
 
 
 def run(argv: list[str]) -> int:
-    global _OWNED_SESSION, _OWNED_CLEANUP, _CLEANUP_DONE
+    global _OWNED_SESSION, _OWNED_CLEANUP, _CLEANUP_DONE, _PENDING_START
     if len(argv) != 1:
         fail("unexpected arguments; configure the deployment shell and run deploy/smoke.sh", 2)
     _OWNED_SESSION = None
     _OWNED_CLEANUP = None
     _CLEANUP_DONE = False
+    _PENDING_START = None
     _OWNED_PGIDS.clear()
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, handle_signal)
@@ -910,35 +1012,29 @@ def run(argv: list[str]) -> int:
     sandbox = resolve_sandbox(inputs["chat_id"], inputs["sandbox_id"], inputs["sandbox_name"])
     endpoints = resolve_control_endpoints(inventory, inputs["private_name"])
     probe_tcp_refused(inputs["former_host"], inputs["former_port"])
-    host_urls = {
+    control_urls = {
         OCU: f"http://{endpoints[OCU][0]}:{endpoints[OCU][1]}/",
         WEBUI: f"http://{endpoints[WEBUI][0]}:{endpoints[WEBUI][1]}/",
         PROXY: f"http://{endpoints[PROXY][0]}:{endpoints[PROXY][1]}/",
         "lan-proxy": f"http://{inputs['lan']}:{inputs['published']}/",
     }
-    for name, url in host_urls.items():
+    for url in control_urls.values():
         require_http_status(url, allow_any=True)
-        del name
-    allowed = sandbox_curl(sandbox["id"], inputs["egress_url"])
-    require_allowed(allowed)
-    negatives = {
-        OCU: f"http://{endpoints[OCU][0]}:{endpoints[OCU][1]}/",
-        WEBUI: f"http://{endpoints[WEBUI][0]}:{endpoints[WEBUI][1]}/",
-        PROXY: f"http://{endpoints[PROXY][0]}:{endpoints[PROXY][1]}/",
-        "lan-proxy": f"http://{inputs['lan']}:{inputs['published']}/",
-    }
-    for name, url in negatives.items():
+    require_allowed(sandbox_curl(sandbox["id"], inputs["egress_url"]))
+    for name, url in control_urls.items():
         require_blocked(sandbox_curl(sandbox["id"], url), name)
     precheck_terminal(sandbox["id"])
-    start_product_terminal(inputs["origin"], inputs["chat_id"], inputs["token"])
-    _OWNED_CLEANUP = {
+    _PENDING_START = {
         "origin": inputs["origin"],
         "chat_id": inputs["chat_id"],
         "token": inputs["token"],
+        "container": sandbox["id"],
     }
-    session = open_terminal_session(inputs["origin"], inputs["chat_id"], inputs["token"])
-    _OWNED_SESSION = session
-    observe_foreground(sandbox["id"])
+    start_product_terminal(inputs["origin"], inputs["chat_id"], inputs["token"])
+    _OWNED_CLEANUP = _PENDING_START
+    _PENDING_START = None
+    _OWNED_SESSION = open_terminal_session(inputs["origin"], inputs["chat_id"], inputs["token"])
+    observe_foreground(sandbox["id"], _OWNED_SESSION)
     return cleanup_owned(0)
 
 
@@ -950,6 +1046,15 @@ def main(argv: list[str]) -> int:
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
         return cleanup_owned(code)
+    except KeyboardInterrupt:
+        print(f"{PREFIX}: interrupted", file=sys.stderr)
+        return cleanup_owned(130)
+    except TtydProtocolError as exc:
+        print(f"{PREFIX}: {exc}", file=sys.stderr)
+        return cleanup_owned(1)
+    except Exception as exc:
+        print(f"{PREFIX}: runtime failure ({type(exc).__name__})", file=sys.stderr)
+        return cleanup_owned(1)
 
 
 if __name__ == "__main__":
