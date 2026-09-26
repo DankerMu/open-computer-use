@@ -3,6 +3,17 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Sandbox DNS pinning.** Production requires `OCU_SANDBOX_DNS` presence.
+  Empty becomes a nonempty container-local `127.0.0.11` override so Docker
+  does not inherit host nameservers. Nonempty values are 1-3 unique ordered
+  IPv4 resolvers, checked against the existing egress allowlist and
+  control/metadata hard denies. Network-enabled create/recreate set current
+  DNS; existing containers with missing, empty, reordered, or otherwise
+  incompatible `HostConfig.Dns` are refused before start, unpause, running
+  reuse, or membership repair, without deletion. Deployment inspects all
+  protected-bridge containers after provisioning and before firewall
+  installation. Real-engine routing acceptance remains issue36.
+
 - **Retention-safe overlay runtime provisioning.** Bootstrap no longer pins a
   historical source SHA, upstream WebUI image, or direct OCU/WebUI host
   publications. Operators must supply a full `SOURCE_SHA` matching the selected
@@ -15,9 +26,8 @@
   The core override delivers prefix and no-autostart through the replacement
   environment. Retention remains stop-only; stopped sandboxes require explicit
   launch. The historical `disable-cli-autostart.patch` is removed. Real engine
-  startup and 168h data preservation remain issue36 evidence; DNS issue79
-  remains required for full all-egress readiness.
-- **Sandbox egress destination guard.** Deployment requires `OCU_SANDBOX_EGRESS_ALLOW`, a comma-separated IPv4 address/CIDR allowlist. Unset fails configuration; an explicitly empty value denies all new sandbox-initiated IP traffic. After network provisioning and before any Compose start, `deploy/up.sh` runs `deploy/firewall/docker-user-rules.sh` and `deploy/firewall/check.sh` through `run_owned`. IPv4 policy is interface-scoped on the sandbox bridge via `DOCKER-USER` and `INPUT`: REPLY-only ESTABLISHED/RELATED RETURN, control-plane and metadata DROP, one RETURN per allowlisted destination, then unconditional DROP. IPv6 sandbox ingress is dropped on INPUT and FORWARD. The installer reconciles only owned chains and jumps, preserves foreign rules, and serializes cooperating processes with `OCU_SANDBOX_EGRESS_LOCK` (default `/run/ocu-sandbox-egress/ocu-sandbox-egress.lock`). Docker inherited host-namespace DNS remains open until issue 79; real kernel and engine packet evidence remains issue 36.
+  startup and 168h data preservation remain issue36 evidence.
+- **Sandbox egress destination guard.** Deployment requires `OCU_SANDBOX_EGRESS_ALLOW`, a comma-separated IPv4 address/CIDR allowlist. Unset fails configuration; an explicitly empty value denies all new sandbox-initiated IP traffic. After network provisioning and before any Compose start, `deploy/up.sh` runs `deploy/firewall/docker-user-rules.sh` and `deploy/firewall/check.sh` through `run_owned`. IPv4 policy is interface-scoped on the sandbox bridge via `DOCKER-USER` and `INPUT`: REPLY-only ESTABLISHED/RELATED RETURN, control-plane and metadata DROP, one RETURN per allowlisted destination, then unconditional DROP. IPv6 sandbox ingress is dropped on INPUT and FORWARD. The installer reconciles only owned chains and jumps, preserves foreign rules, and serializes cooperating processes with `OCU_SANDBOX_EGRESS_LOCK` (default `/run/ocu-sandbox-egress/ocu-sandbox-egress.lock`). Docker inherited host-namespace DNS is closed by the `OCU_SANDBOX_DNS` policy in this unreleased slice; real kernel and engine packet evidence remains issue 36.
 - **Proxy-only production-like deployment topology.** The core and WebUI
   overrides remove direct host publications; a standalone unprivileged proxy
   image renders the canonical nginx policy after both application stacks are

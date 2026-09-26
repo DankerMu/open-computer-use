@@ -41,6 +41,7 @@ from context_vars import (
     current_credential_source,
 )
 from system_prompt import render_system_prompt_sync
+import sandbox_dns
 
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "unix:///var/run/docker.sock")
 DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", "open-computer-use:latest")
@@ -131,6 +132,11 @@ class MigrationRequired(LifecycleError):
 class LifecycleConfigError(LifecycleError):
     def __init__(self, message):
         super().__init__(message, status_code=500, reason="invalid_idle_configuration")
+
+
+class SandboxDnsConfigError(LifecycleError):
+    def __init__(self, message):
+        super().__init__(message, status_code=500, reason="invalid_dns_configuration")
 
 
 _CHAT_LOCKS_GUARD = threading.Lock()
@@ -226,6 +232,38 @@ OCU_SANDBOX_NETWORK = os.getenv("OCU_SANDBOX_NETWORK", "ocu-sandbox").strip() or
 SANDBOX_HOST_BIND_IP = os.getenv("SANDBOX_HOST_BIND_IP", "").strip()
 _RESERVED_SANDBOX_NETWORKS = frozenset({"bridge", "host", "none"})
 _LIVE_SANDBOX_STATUSES = frozenset({"running", "paused", "restarting"})
+
+
+def configured_sandbox_dns():
+    """Parse OCU_SANDBOX_DNS at call time. Absent env preserves development mode."""
+    if "OCU_SANDBOX_DNS" not in os.environ:
+        return None
+    try:
+        return sandbox_dns.parse_sandbox_dns(os.environ["OCU_SANDBOX_DNS"])
+    except sandbox_dns.SandboxDnsError as exc:
+        raise SandboxDnsConfigError(str(exc)) from exc
+
+
+def validate_sandbox_dns_configuration() -> None:
+    """Docker-free startup check for configured DNS syntax."""
+    configured_sandbox_dns()
+
+
+def _incompatible_dns_error() -> LaunchFailed:
+    return LaunchFailed(
+        409,
+        "sandbox DNS is incompatible with the configured policy; operator migration is required",
+    )
+
+
+def _require_dns_compatibility(container) -> None:
+    expected = configured_sandbox_dns()
+    if expected is None or not ENABLE_NETWORK:
+        return
+    host = (getattr(container, "attrs", None) or {}).get("HostConfig")
+    if not sandbox_dns.dns_compatible(sandbox_dns.inspected_dns(host), expected):
+        raise _incompatible_dns_error()
+
 # Service ports INSIDE the sandbox. Fixed by the workspace image; only the host side of each
 # mapping varies, and the container engine assigns that.
 CDP_PORT = int(os.getenv("CDP_PORT", "9222"))    # Chrome DevTools
@@ -771,6 +809,7 @@ def _require_disabled_compatibility(container) -> None:
 
 
 def _prepare_existing_container(container, *, mutate: bool) -> None:
+    expected_dns = configured_sandbox_dns()
     disabled = _network_disabled_on(container)
     if not ENABLE_NETWORK:
         if not disabled:
@@ -785,6 +824,10 @@ def _prepare_existing_container(container, *, mutate: bool) -> None:
             409,
             "configured networking differs from the existing sandbox network mode",
         )
+    if expected_dns is not None:
+        host = (getattr(container, "attrs", None) or {}).get("HostConfig")
+        if not sandbox_dns.dns_compatible(sandbox_dns.inspected_dns(host), expected_dns):
+            raise _incompatible_dns_error()
     client = get_docker_client()
     network, gateway = _inspect_sandbox_network(client)
     live = (container.status or "").lower() in _LIVE_SANDBOX_STATUSES
@@ -874,6 +917,7 @@ def _get_or_create_container(chat_id: str) -> docker.models.containers.Container
         if container is not None:
             if container.status != "running":
                 raise SandboxStopped()
+            _require_dns_compatibility(container)
             note_running_activity(chat_id, container)
             return container
         if meta is not None:
@@ -1021,6 +1065,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
     if user:
         config["user"] = user
 
+    expected_dns = configured_sandbox_dns()
     pinned_network_id = None
     if not ENABLE_NETWORK:
         config["network_disabled"] = True
@@ -1029,6 +1074,8 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
         _, pinned_network_id = _network_identity(network)
         config["network"] = pinned_network_id
         config["ports"] = {f"{port}/tcp": (gateway, None) for port in SANDBOX_PUBLISHED_PORTS}
+        if expected_dns is not None:
+            config["dns"] = list(expected_dns)
 
     try:
         container = client.containers.create(**config)
@@ -1058,6 +1105,10 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
         attached_ids = {_membership_entry_id(data) for data in membership.values()}
         if len(membership) != 1 or attached_ids != {pinned_network_id}:
             raise LaunchFailed(500, "created sandbox is not on the inspected sandbox bridge")
+        if expected_dns is not None:
+            host = (getattr(container, "attrs", None) or {}).get("HostConfig")
+            if not sandbox_dns.dns_compatible(sandbox_dns.inspected_dns(host), expected_dns):
+                raise LaunchFailed(500, "created sandbox DNS does not match the configured policy")
     container.start()
 
     _reload_container(container)

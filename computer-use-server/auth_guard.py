@@ -53,7 +53,11 @@ def _is_http_safe_credential(value: str) -> bool:
 
 def startup_preflight() -> int:
     """Return 0 when startup config is usable, else 1. Never serves traffic."""
-    from docker_manager import validate_public_base_url
+    from docker_manager import (
+        SandboxDnsConfigError,
+        validate_public_base_url,
+        validate_sandbox_dns_configuration,
+    )
 
     if validate_public_base_url():
         return 1
@@ -85,6 +89,11 @@ def startup_preflight() -> int:
     from ws_recheck import validate_webui_auth_url
 
     if validate_webui_auth_url():
+        return 1
+    try:
+        validate_sandbox_dns_configuration()
+    except SandboxDnsConfigError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
     return 0
 

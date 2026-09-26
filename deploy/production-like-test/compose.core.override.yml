@@ -43,6 +43,7 @@ services:
       COMMAND_TIMEOUT: ${COMMAND_TIMEOUT}
       SUB_AGENT_TIMEOUT: ${SUB_AGENT_TIMEOUT}
       ENABLE_NETWORK: "true"
+      OCU_SANDBOX_DNS: ${OCU_SANDBOX_DNS?OCU_SANDBOX_DNS is required}
       # The injected Open WebUI Tool intentionally omits sub_agent. Do not pass
       # credentials for Claude, Codex, OpenCode, or other external sub-agents.
 

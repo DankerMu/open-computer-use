@@ -83,6 +83,10 @@ def interpolated(value: str, name: str) -> bool:
     return isinstance(value, str) and value.startswith(f"${{{name}:?")
 
 
+def interpolated_present(value: str, name: str) -> bool:
+    return isinstance(value, str) and value.startswith(f"${{{name}?")
+
+
 class OverlayStructureTests(unittest.TestCase):
     def test_parsed_overrides_and_local_build_mount_dependencies(self):
         core = parsed(CORE_OVERRIDE)
@@ -97,6 +101,10 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertTrue(interpolated(core_env["SANDBOX_HOST_BIND_IP"], "OCU_SANDBOX_GATEWAY"))
         self.assertEqual(core_env["OCU_PUBLIC_PREFIX"], "/ocu")
         self.assertEqual(core_env["OCU_SANDBOX_NO_AUTOSTART"], "1")
+        self.assertTrue(interpolated_present(core_env["OCU_SANDBOX_DNS"], "OCU_SANDBOX_DNS"))
+        self.assertEqual(interpolate_value(core_env["OCU_SANDBOX_DNS"], {"OCU_SANDBOX_DNS": ""}), "")
+        with self.assertRaises(UnsupportedInterpolation):
+            interpolate_value(core_env["OCU_SANDBOX_DNS"], {})
         self.assertTrue(interpolated(webui_env["OCU_INTERNAL_TOKEN"], "OCU_INTERNAL_TOKEN"))
         self.assertEqual(webui_env["ENABLE_OCU_WORKSPACE"], "true")
         self.assertEqual(webui_env["OCU_INTERNAL_URL"], "http://computer-use-server:8081")

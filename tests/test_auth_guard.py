@@ -404,6 +404,54 @@ class TestStartupFailClosed:
         )
         assert completed.returncode == 0, completed.stderr[-500:]
 
+    def test_invalid_sandbox_dns_prevents_packaged_startup_without_docker(self):
+        env = _subprocess_env()
+        env["OCU_INTERNAL_TOKEN"] = INTERNAL
+        env["OCU_SANDBOX_SUBNET"] = SUBNET
+        env["OCU_WEBUI_ORIGIN"] = ORIGIN
+        env["OCU_SANDBOX_DNS"] = "not-an-ip"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import docker, sys; "
+                    "docker.DockerClient = lambda *a, **k: (_ for _ in ()).throw("
+                    "AssertionError('docker client constructed')); "
+                    "import auth_guard; "
+                    "raise SystemExit(auth_guard.startup_preflight())"
+                ),
+            ],
+            cwd=SERVER_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert completed.returncode != 0
+        assert "OCU_SANDBOX_DNS" in completed.stderr
+        assert "docker client constructed" not in completed.stderr
+
+    def test_absent_sandbox_dns_preflight_still_succeeds(self):
+        env = _subprocess_env()
+        env["OCU_INTERNAL_TOKEN"] = INTERNAL
+        env["OCU_SANDBOX_SUBNET"] = SUBNET
+        env["OCU_WEBUI_ORIGIN"] = ORIGIN
+        env.pop("OCU_SANDBOX_DNS", None)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import auth_guard; raise SystemExit(auth_guard.startup_preflight())",
+            ],
+            cwd=SERVER_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert completed.returncode == 0, completed.stderr[-500:]
+
     def test_packaged_command_with_valid_public_base_serves_guarded_prompt_and_mcp(self):
         env = _subprocess_env()
         env["OCU_INTERNAL_TOKEN"] = INTERNAL

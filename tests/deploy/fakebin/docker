@@ -365,12 +365,15 @@ def match_filters(container: dict, filters: list[str]) -> bool:
 
 def docker_ps(state: Path, argv: list[str]) -> int:
     quiet = False
+    include_all = False
     filters: list[str] = []
     args = argv[:]
     while args:
         token = args.pop(0)
         if token == "-q":
             quiet = True
+        elif token in {"-a", "--all"}:
+            include_all = True
         elif token == "--filter" and args:
             filters.append(args.pop(0))
         else:
@@ -379,11 +382,13 @@ def docker_ps(state: Path, argv: list[str]) -> int:
     if not quiet:
         sys.stderr.write("unsupported docker command\n")
         return 1
-    selected = [
-        container
-        for container in load_containers(state)
-        if container.get("State") == "running" and match_filters(container, filters)
-    ]
+    selected = []
+    for container in load_containers(state):
+        if not include_all and container.get("State") != "running":
+            continue
+        if not match_filters(container, filters):
+            continue
+        selected.append(container)
     for container in selected:
         sys.stdout.write(container["Id"] + "\n")
     return 0
@@ -404,6 +409,10 @@ def docker_inspect(state: Path, argv: list[str]) -> int:
             return 1
     if not target:
         sys.stderr.write("docker inspect requires a container\n")
+        return 1
+    fail_marker = state / f"inspect-fail-{target}"
+    if fail_marker.exists():
+        sys.stderr.write(f"Error: permission denied: {target}\n")
         return 1
     for container in load_containers(state):
         if container["Id"] != target and container.get("Name") != target:

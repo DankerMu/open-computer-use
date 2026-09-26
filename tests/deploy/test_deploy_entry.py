@@ -15,6 +15,9 @@ import unittest
 
 from support import (
     CONTROL_NETWORK,
+    DEFAULT_DNS,
+    METADATA_ADDR,
+    OCU_SERVICE,
     PROVISION,
     ROOT,
     SANDBOX_NETWORK,
@@ -22,12 +25,14 @@ from support import (
     fake_env,
     intended_docs,
     ops,
+    sandbox_container,
     seed_healthy_host,
     tmp_dir,
+    with_core_dns,
+    write_containers,
     write_fake_configs,
     write_network,
 )
-
 
 DESTRUCTIVE = ("network rm", "network disconnect", "compose down", " rm -f", " container rm")
 
@@ -351,12 +356,6 @@ class DeployEntryTests(unittest.TestCase):
         self.assert_no_destructive()
 
     def test_successful_entry_starts_applications_before_proxy(self):
-        write_network(
-            self.state,
-            SANDBOX_NETWORK,
-            subnet="172.31.0.0/24",
-            gateway="172.31.0.1",
-        )
         env = dict(self.env)
         env["COMPOSE_REMOVE_ORPHANS"] = "1"
         env["COMPOSE_PROFILES"] = "manual-maintenance"
@@ -366,6 +365,7 @@ class DeployEntryTests(unittest.TestCase):
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
         recorded = "\n".join(ops(self.state))
         self.assertNotIn("--remove-orphans", recorded)
+        self.assertTrue(any("network create" in line and SANDBOX_NETWORK in line for line in ops(self.state)))
         rows = executed_rows(self.state)
         self.assertEqual([row["stack"] for row in rows], ["core", "webui", "proxy"])
         self.assertTrue(all(row["snapshot"] for row in rows))
@@ -562,6 +562,174 @@ class DeployEntryTests(unittest.TestCase):
             require_resolved=True,
             require_snapshots=True,
         )
+
+    def _seed_bridge(self):
+        write_network(
+            self.state,
+            SANDBOX_NETWORK,
+            subnet="172.31.0.0/24",
+            gateway="172.31.0.1",
+        )
+
+    def test_unset_dns_starts_no_service(self):
+        env = dict(self.env)
+        del env["OCU_SANDBOX_DNS"]
+        result = run_script(UP, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OCU_SANDBOX_DNS", result.stderr)
+        self.assertEqual(starts(self.state), [])
+        self.assert_no_destructive()
+
+    def test_empty_dns_starts_with_matching_resolved_env(self):
+        self._seed_bridge()
+        env = dict(self.env)
+        env["OCU_SANDBOX_DNS"] = ""
+        write_fake_configs(self.state, with_core_dns(intended_docs(), ""))
+        result = run_script(UP, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
+        self.assert_no_destructive()
+
+    def test_unlisted_or_protected_resolver_starts_no_service(self):
+        self._seed_bridge()
+        cases = (
+            "9.9.9.9",
+            METADATA_ADDR,
+            "172.30.0.9",
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                before_firewall = (self.state / "firewall.json").read_text(encoding="utf-8")
+                env = dict(self.env)
+                env["OCU_SANDBOX_DNS"] = value
+                write_fake_configs(self.state, with_core_dns(intended_docs(), value))
+                result = run_script(UP, env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before_firewall)
+                self.assertFalse(any("iptables" in line or "ip6tables" in line for line in ops(self.state)))
+                self.assert_no_destructive()
+
+    def test_omitted_or_mismatched_resolved_dns_starts_no_service(self):
+        self._seed_bridge()
+        docs = intended_docs()
+        docs["core.json"]["services"][OCU_SERVICE].pop("environment", None)
+        write_fake_configs(self.state, docs)
+        result = run_script(UP, self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(starts(self.state), [])
+        self.assert_no_destructive()
+
+        write_fake_configs(self.state, with_core_dns(intended_docs(), "1.1.1.1"))
+        result = run_script(UP, self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(starts(self.state), [])
+        self.assert_no_destructive()
+
+    def test_incompatible_protected_containers_are_named_and_preserved(self):
+        self._seed_bridge()
+        write_containers(
+            self.state,
+            [
+                sandbox_container(cid="cid-running", name="running-sandbox", state="running"),
+                sandbox_container(cid="cid-stopped", name="stopped-sandbox", state="exited"),
+                sandbox_container(
+                    cid="cid-unlabelled",
+                    name="foreign-sandbox",
+                    state="paused",
+                    labels={},
+                ),
+                sandbox_container(
+                    cid="cid-other",
+                    name="other-net",
+                    state="running",
+                    network_mode="bridge",
+                    networks={"bridge": {"NetworkID": "id-bridge", "IPAddress": "172.17.0.2"}},
+                ),
+            ],
+        )
+        before = (self.state / "containers.json").read_text(encoding="utf-8")
+        before_firewall = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = run_script(UP, self.env)
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("running-sandbox", combined)
+        self.assertIn("stopped-sandbox", combined)
+        self.assertIn("foreign-sandbox", combined)
+        self.assertNotIn("other-net", combined)
+        self.assertEqual(starts(self.state), [])
+        self.assertEqual((self.state / "containers.json").read_text(encoding="utf-8"), before)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before_firewall)
+        self.assertFalse(any("iptables" in line or "ip6tables" in line for line in ops(self.state)))
+        self.assert_no_destructive()
+
+    def test_inspect_failure_starts_no_service(self):
+        self._seed_bridge()
+        write_containers(
+            self.state,
+            [
+                sandbox_container(
+                    cid="cid-fail",
+                    name="inspect-fail",
+                    state="exited",
+                    dns=[DEFAULT_DNS],
+                )
+            ],
+        )
+        (self.state / "inspect-fail-cid-fail").write_text("1", encoding="utf-8")
+        before = (self.state / "containers.json").read_text(encoding="utf-8")
+        before_firewall = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = run_script(UP, self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cid-fail", result.stderr)
+        self.assertEqual(starts(self.state), [])
+        self.assertEqual((self.state / "containers.json").read_text(encoding="utf-8"), before)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before_firewall)
+        self.assert_no_destructive()
+
+    def test_compatible_protected_container_allows_start(self):
+        self._seed_bridge()
+        write_containers(
+            self.state,
+            [
+                sandbox_container(
+                    cid="cid-ok",
+                    name="ok-sandbox",
+                    state="exited",
+                    dns=[DEFAULT_DNS],
+                )
+            ],
+        )
+        result = run_script(UP, self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
+        self.assert_no_destructive()
+
+    def test_unclassifiable_membership_refuses_without_mutation(self):
+        self._seed_bridge()
+        write_containers(
+            self.state,
+            [
+                sandbox_container(
+                    cid="cid-unknown",
+                    name="unknown-shape",
+                    state="exited",
+                    omit_host_config=True,
+                    omit_network_settings=True,
+                )
+            ],
+        )
+        before = (self.state / "containers.json").read_text(encoding="utf-8")
+        before_firewall = (self.state / "firewall.json").read_text(encoding="utf-8")
+        result = run_script(UP, self.env)
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("unknown-shape", combined)
+        self.assertIn("cid-unknown", combined)
+        self.assertEqual(starts(self.state), [])
+        self.assertEqual((self.state / "containers.json").read_text(encoding="utf-8"), before)
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before_firewall)
+        self.assert_no_destructive()
 
 
 

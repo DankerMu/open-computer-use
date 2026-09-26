@@ -55,6 +55,7 @@ from docker_manager import (
     startup_idle_sweep,
     reap_known_sandboxes,
     validate_idle_configuration,
+    validate_sandbox_dns_configuration,
     LifecycleError,
 )
 from security import sanitize_chat_id, safe_path
@@ -392,6 +393,7 @@ async def lifespan(app):
     if startup_preflight():
         raise RuntimeError("OCU authorization startup preflight failed")
     validate_idle_configuration()
+    validate_sandbox_dns_configuration()
     warn_if_public_base_url_is_default()
     warn_if_mcp_api_key_missing()
     warn_subagent_cli()

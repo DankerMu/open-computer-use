@@ -64,6 +64,71 @@ def inspect_network(name: str) -> dict | None:
     raise NetworkInspectError(f"{name}: inspect failed: {detail}")
 
 
+def list_container_ids() -> list[str]:
+    result = docker("ps", "-a", "-q")
+    if result.returncode != 0:
+        detail = ((result.stderr or "") + (result.stdout or "")).strip() or "nonzero status"
+        raise NetworkInspectError(f"container listing failed: {detail}")
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def inspect_container(container_id: str) -> dict:
+    result = docker("inspect", container_id)
+    if result.returncode != 0:
+        detail = ((result.stderr or "") + (result.stdout or "")).strip() or "nonzero status"
+        raise NetworkInspectError(f"{container_id}: inspect failed: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise NetworkInspectError(f"{container_id}: inspect returned malformed JSON") from exc
+    if isinstance(payload, list):
+        if len(payload) != 1 or not isinstance(payload[0], dict):
+            raise NetworkInspectError(f"{container_id}: inspect returned an unexpected document")
+        return payload[0]
+    if not isinstance(payload, dict):
+        raise NetworkInspectError(f"{container_id}: inspect returned an unexpected document")
+    return payload
+
+
+def container_identity(payload: dict, fallback: str) -> str:
+    name = str(payload.get("Name") or "").lstrip("/")
+    container_id = str(payload.get("Id") or fallback)
+    if name and container_id:
+        return f"{name} ({container_id})"
+    return name or container_id or fallback
+
+
+def protected_membership(payload: dict, *, network_name: str, network_id: str) -> bool | None:
+    """True when attached to the protected bridge, False when elsewhere, None if unknown."""
+    if not isinstance(payload, dict):
+        return None
+    host = payload.get("HostConfig")
+    settings = payload.get("NetworkSettings")
+    if not isinstance(host, dict) and not isinstance(settings, dict):
+        return None
+    wanted = {item for item in (network_name, network_id) if item}
+    if not wanted:
+        return None
+    mode = ""
+    if isinstance(host, dict):
+        mode = str(host.get("NetworkMode") or "").strip()
+    if mode in wanted:
+        return True
+    membership = settings.get("Networks") if isinstance(settings, dict) else None
+    if membership is None:
+        return False if mode else None
+    if not isinstance(membership, dict):
+        return None
+    for name, data in membership.items():
+        if str(name) in wanted:
+            return True
+        if isinstance(data, dict):
+            current_id = str(data.get("NetworkID") or data.get("NetworkId") or "").strip()
+            if current_id in wanted:
+                return True
+    return False
+
+
 def ipam_config(payload: dict) -> dict:
     ipam = payload.get("IPAM") or {}
     configs = ipam.get("Config") or []
