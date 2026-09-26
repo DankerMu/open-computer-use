@@ -528,6 +528,197 @@ def docker_compose_version(state: Path, argv: list[str]) -> int:
     return 0
 
 
+def compose_ps(state: Path, argv: list[str]) -> int:
+    hold_named(state, "FAKE_DOCKER_HOLD_PS", "entered-ps")
+    files = compose_files(argv)
+    stack = stack_from_files(files)
+    fail = state / f"ps-fail-{stack}"
+    if fail.exists():
+        sys.stderr.write(f"compose ps failed for {stack}\n")
+        return 1
+    path = state / "ps" / f"{stack}.jsonl"
+    if not path.exists():
+        sys.stderr.write(f"compose ps inventory missing for {stack}\n")
+        return 1
+    text = path.read_text(encoding="utf-8")
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def load_exec_rules(state: Path) -> list[dict]:
+    path = state / "exec.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+
+
+def match_exec_rule(rule: dict, container: str, command: list[str]) -> bool:
+    wanted = str(rule.get("container") or "")
+    if wanted and wanted not in {container, container[:12]}:
+        return False
+    match = rule.get("match")
+    if match is None:
+        return True
+    if isinstance(match, str):
+        return match in " ".join(command)
+    if isinstance(match, list):
+        text = " ".join(command)
+        return all(str(item) in text for item in match)
+    return False
+
+
+def sandbox_state_path(state: Path) -> Path:
+    return state / "sandbox-terminal.json"
+
+
+def load_sandbox_terminal(state: Path) -> dict:
+    path = sandbox_state_path(state)
+    if not path.exists():
+        return {
+            "ttyd": False,
+            "sessions": [],
+            "no_autostart_marker": False,
+            "subagent_autostarted": "",
+            "pane": {"session": "main", "pane_id": "%1", "pid": "9001", "tty": "/dev/pts/0", "command": "bash"},
+            "processes": ["9200 1 9200 -1 9200 ? harmless-idle"],
+        }
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_sandbox_terminal(state: Path, payload: dict) -> None:
+    sandbox_state_path(state).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def curl_writeout(code: int, *, connects=0, remote="", connect_time="0.000", http="000") -> str:
+    return (
+        f"exitcode={code} num_connects={connects} remote_ip={remote} "
+        f"time_connect={connect_time} http_code={http}"
+    )
+
+
+def handle_sandbox_command(state: Path, container: str, command: list[str]) -> tuple[int, str, str]:
+    terminal = load_sandbox_terminal(state)
+    joined = " ".join(command)
+    if terminal.get("probe_error") and terminal["probe_error"] in joined:
+        return 2, "", "synthetic exec unavailable"
+    if command[:1] == ["curl"] or (len(command) >= 3 and command[0] == "bash" and "curl" in joined):
+        path = state / "curl.jsonl"
+        url = command[-1] if command else ""
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("url") and row["url"] not in url:
+                    continue
+                if row.get("match") and row["match"] not in joined:
+                    continue
+                stdout = row.get("stdout")
+                if stdout is None:
+                    stdout = curl_writeout(
+                        int(row.get("code", 0)),
+                        connects=int(row.get("num_connects", 0)),
+                        remote=str(row.get("remote_ip", "")),
+                        connect_time=str(row.get("time_connect", "0.000")),
+                        http=str(row.get("http_code", "000")),
+                    )
+                return int(row.get("code", 0)), stdout, str(row.get("stderr", ""))
+        return 7, curl_writeout(7), ""
+    if "pgrep -x ttyd" in joined:
+        return (0, "9900\n", "") if terminal.get("ttyd") else (1, "", "")
+    if "tmux list-sessions" in joined:
+        sessions = terminal.get("sessions") or []
+        if not sessions:
+            return 1, "", "no server running on /tmp/tmux-1000/default\n"
+        return 0, "".join(f"{name}\n" for name in sessions), ""
+    if "test -f /tmp/.no_autostart" in joined:
+        return (0, "", "") if terminal.get("no_autostart_marker") else (1, "", "")
+    if "printenv SUBAGENT_AUTOSTARTED" in joined:
+        value = str(terminal.get("subagent_autostarted") or "")
+        return (0, value + "\n", "") if value else (1, "", "")
+    if "tmux display-message" in joined:
+        if "main" not in (terminal.get("sessions") or []):
+            return 1, "", "no current window"
+        pane = terminal.get("pane") or {}
+        line = "|".join(
+            str(pane.get(key, fallback))
+            for key, fallback in (
+                ("session", "main"), ("pane_id", "%1"), ("pid", "9001"),
+                ("tty", "/dev/pts/0"), ("command", "bash"),
+            )
+        )
+        return 0, line + "\n", ""
+    if "ps -eo pid=,ppid=,pgid=,tpgid=,sess=,tty=,comm=" in joined:
+        if "transition_after_reads" in terminal:
+            terminal["process_reads"] = terminal.get("process_reads", 0) + 1
+            if terminal["process_reads"] >= terminal["transition_after_reads"]:
+                terminal["processes"] = terminal["next_processes"]
+            save_sandbox_terminal(state, terminal)
+        rows = terminal.get("processes", [])
+        return 0, (
+            "OCU_SMOKE_OBSERVER=9800\n"
+            + "".join(row + "\n" for row in rows)
+            + "9800 1 9800 -1 9001 ? ps\n"
+        ), ""
+    return 1, "", "unsupported exec command"
+
+
+def docker_exec(state: Path, argv: list[str]) -> int:
+    user = ""
+    args = argv[:]
+    while args:
+        token = args[0]
+        if token in {"-u", "--user"} and len(args) > 1:
+            user = args[1]
+            args = args[2:]
+            continue
+        if token in {"-i", "-t", "-it", "-d"}:
+            args = args[1:]
+            continue
+        break
+    if "tmux display-message" in " ".join(args):
+        hold_named(state, "FAKE_DOCKER_HOLD_EXEC", "entered-exec")
+    if not args:
+        sys.stderr.write("docker exec requires a container\n")
+        return 1
+    container = args[0]
+    command = args[1:]
+    running = False
+    for item in load_containers(state):
+        if item["Id"] == container or item.get("Name") == container:
+            state_value = item.get("State")
+            if isinstance(state_value, dict):
+                running = bool(state_value.get("Running"))
+            else:
+                running = str(state_value).lower() == "running"
+            break
+    if not running:
+        sys.stderr.write(f"Error: No such container: {container}\n")
+        return 1
+    fail_marker = state / "exec-fail"
+    if fail_marker.exists():
+        sys.stderr.write("exec failed\n")
+        return 1
+    for rule in load_exec_rules(state):
+        if match_exec_rule(rule, container, command):
+            sys.stdout.write(str(rule.get("stdout") or ""))
+            sys.stderr.write(str(rule.get("stderr") or ""))
+            return int(rule.get("code", 0))
+    code, stdout, stderr = handle_sandbox_command(state, container, command)
+    sys.stdout.write(stdout)
+    sys.stderr.write(stderr)
+    del user
+    return code
+
+
 
 def main(argv: list[str]) -> int:
     state = state_dir()
@@ -566,10 +757,14 @@ def main(argv: list[str]) -> int:
             return compose_config(state, rest)
         if "up" in rest:
             return compose_up(state, rest)
+        if "ps" in rest:
+            return compose_ps(state, rest)
         if rest[:1] == ["version"]:
             return docker_compose_version(state, rest[1:])
         sys.stderr.write("unsupported compose command\n")
         return 1
+    if argv and argv[0] == "exec":
+        return docker_exec(state, argv[1:])
     if argv and argv[0] in DESTRUCTIVE_VERBS:
         sys.stderr.write("unsupported docker command\n")
         return 1
