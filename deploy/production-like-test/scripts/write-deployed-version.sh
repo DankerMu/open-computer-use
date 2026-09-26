@@ -57,7 +57,7 @@ image_id() {
     printf -- '- Sandbox CDP/ttyd published ports: dedicated sandbox bridge gateway (`%s`)\n' "$(env_value OCU_SANDBOX_GATEWAY)"
     printf -- '- Chat/workspace data retention: no automatic deletion\n'
     printf '\n## Deployment-local modifications\n\n'
-    printf -- '- `%s`\n' 'disable-cli-autostart.patch'
+    printf -- '- `%s`\n' 'Sandbox terminals use the OCU_SANDBOX_NO_AUTOSTART=1 environment policy; no historical source patch is applied'
     printf -- '- `%s`\n' 'Open WebUI bootstrap wrapper: explicit Qwen model selection, public internal-model access, direct tools only, no credential log'
     printf -- '- `%s`\n' 'Ollama disabled; only the configured OpenAI-compatible provider is enabled'
     printf '\n## Upgrade and offline-production notes\n\n'

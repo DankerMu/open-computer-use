@@ -31,6 +31,8 @@ services:
       SKILLS_CACHE_HOST_PATH: ${OCU_SKILLS_CACHE_DIR}
       ORCHESTRATOR_CONTAINER_NAME: ocu-test-computer-use-server
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      OCU_PUBLIC_PREFIX: /ocu
+      OCU_SANDBOX_NO_AUTOSTART: "1"
       SINGLE_USER_MODE: "false"
       CONTAINER_MEM_LIMIT: ${CONTAINER_MEM_LIMIT}
       CONTAINER_CPU_LIMIT: ${CONTAINER_CPU_LIMIT}
@@ -61,7 +63,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      CONTAINER_MAX_AGE_HOURS: ${CONTAINER_MAX_AGE_HOURS}
+      CONTAINER_MAX_AGE_HOURS: ${CONTAINER_MAX_AGE_HOURS-168}
       RETENTION_CHECK_INTERVAL_SECONDS: ${RETENTION_CHECK_INTERVAL_SECONDS}
     security_opt:
       - no-new-privileges:true

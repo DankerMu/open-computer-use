@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2026 Open Computer Use Contributors
+"""Fail only the first final runtime install after both temps are populated."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def state_dir() -> Path:
+    raw = os.environ.get("FAKE_DOCKER_STATE", "")
+    if not raw:
+        sys.stderr.write("FAKE_DOCKER_STATE is required\n")
+        sys.exit(2)
+    path = Path(raw)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def real_install() -> str:
+    return os.environ.get("OCU_REAL_INSTALL", "/usr/bin/install")
+
+def is_runtime_install(argv: list[str]) -> bool:
+    if len(argv) < 2 or argv[:2] != ["-m", "0600"]:
+        return False
+    if len(argv) != 4:
+        return False
+    source = Path(argv[2])
+    dest = Path(argv[3])
+    return source.name.startswith(".runtime.env.") and dest.name == "runtime.env"
+
+
+def temps_populated(source: Path) -> bool:
+    parent = source.parent
+    cred_parent = Path(os.environ.get("OCU_ADMIN_CREDENTIALS_FILE", "")).parent
+    runtime_temps = [path for path in parent.glob(".runtime.env.*") if path.is_file()]
+    cred_temps = []
+    if cred_parent.exists():
+        cred_temps = [
+            path
+            for path in cred_parent.glob(".ocu-test-admin-credentials.*")
+            if path.is_file()
+        ]
+    if not runtime_temps or not cred_temps:
+        return False
+    return all(path.stat().st_size > 0 for path in runtime_temps + cred_temps)
+
+
+def main(argv: list[str]) -> int:
+    state = state_dir()
+    fail_first = os.environ.get("OCU_FAKE_INSTALL_FAIL_FIRST") == "1"
+    if fail_first and is_runtime_install(argv) and temps_populated(Path(argv[2])):
+        marker = state / "install-fail-reached"
+        if not marker.exists():
+            marker.write_text("1", encoding="utf-8")
+            sys.stderr.write("install: injected first runtime install failure\n")
+            return 1
+    return subprocess.call([real_install(), *argv])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

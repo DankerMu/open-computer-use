@@ -455,6 +455,8 @@ class DeployEntryTests(unittest.TestCase):
         self.assertEqual(webui["environment"]["OCU_INTERNAL_TOKEN"], "synthetic$$TOKEN")
         consumer = rows["webui"]["consumer_document"]["services"]["open-webui"]
         self.assertEqual(consumer["environment"]["OCU_INTERNAL_TOKEN"], "synthetic$TOKEN")
+        self.assertNotEqual(consumer["environment"]["OCU_INTERNAL_TOKEN"], "synthetic" + env["TOKEN"])
+        self.assertNotIn(env["TOKEN"], consumer["environment"]["OCU_INTERNAL_TOKEN"])
         self.assertTrue(rows["webui"]["snapshot"])
 
     def _signal_during_hold(self, sig, *, hold_env, entered_name, require_resolved=False, require_snapshots=False):

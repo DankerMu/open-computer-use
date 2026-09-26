@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import sys
 import time
-import re
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from interpolation import UnsupportedInterpolation, interpolate_value
 
 
 
@@ -69,24 +71,6 @@ def inspect_network(state: Path, name: str) -> int:
     sys.stderr.write(f"Error: No such network: {name}\n")
     return 1
 
-INTERPOLATION = re.compile(r"\$\$|\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-
-
-def interpolate_value(value, env):
-    if isinstance(value, str):
-        def replace(match):
-            token = match.group(0)
-            if token == "$$":
-                return "$"
-            name = match.group(1) or match.group(2)
-            return env.get(name, "")
-
-        return INTERPOLATION.sub(replace, value)
-    if isinstance(value, list):
-        return [interpolate_value(item, env) for item in value]
-    if isinstance(value, dict):
-        return {key: interpolate_value(item, env) for key, item in value.items()}
-    return value
 
 
 
@@ -232,7 +216,19 @@ def compose_config(state: Path, argv: list[str]) -> int:
     if chosen is None or not chosen.exists():
         sys.stderr.write("resolved compose document is missing\n")
         return 1
-    sys.stdout.write(chosen.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(chosen.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        sys.stderr.write("resolved compose document is missing\n")
+        return 1
+    if payload.get("__unresolved__") is True:
+        body = {key: value for key, value in payload.items() if key != "__unresolved__"}
+        try:
+            payload = interpolate_value(body, os.environ)
+        except UnsupportedInterpolation as exc:
+            sys.stderr.write(f"unsupported interpolation: {exc}\n")
+            return 1
+    sys.stdout.write(json.dumps(payload))
     return 0
 
 
@@ -263,7 +259,13 @@ def compose_up(state: Path, argv: list[str]) -> int:
                 raw_document = None
             payload["document"] = raw_document
             if raw_document is not None:
-                payload["consumer_document"] = interpolate_value(raw_document, os.environ)
+                try:
+                    payload["consumer_document"] = interpolate_value(
+                        raw_document, os.environ
+                    )
+                except UnsupportedInterpolation as exc:
+                    sys.stderr.write(f"unsupported interpolation: {exc}\n")
+                    return 1
         payload["snapshot_path"] = str(first)
     else:
         live = state / "config" / f"{stack}.json"
@@ -314,9 +316,213 @@ def docker_info(state: Path) -> int:
     return 0
 
 
+DESTRUCTIVE_VERBS = {
+    "rm",
+    "rmi",
+    "kill",
+    "prune",
+    "volume",
+    "system",
+    "container",
+}
+
+
+def containers_path(state: Path) -> Path:
+    return state / "containers.json"
+
+
+def load_containers(state: Path) -> list[dict]:
+    path = containers_path(state)
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_containers(state: Path, payload: list[dict]) -> None:
+    write_json(containers_path(state), payload)
+
+
+def match_filters(container: dict, filters: list[str]) -> bool:
+    for item in filters:
+        if "=" not in item:
+            return False
+        key, value = item.split("=", 1)
+        if key == "label":
+            labels = container.get("Labels") or {}
+            if "=" in value:
+                name, expected = value.split("=", 1)
+                if labels.get(name) != expected:
+                    return False
+            elif value not in labels:
+                return False
+        elif key == "status":
+            if container.get("State") != value:
+                return False
+        else:
+            return False
+    return True
+
+
+def docker_ps(state: Path, argv: list[str]) -> int:
+    quiet = False
+    filters: list[str] = []
+    args = argv[:]
+    while args:
+        token = args.pop(0)
+        if token == "-q":
+            quiet = True
+        elif token == "--filter" and args:
+            filters.append(args.pop(0))
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not quiet:
+        sys.stderr.write("unsupported docker command\n")
+        return 1
+    selected = [
+        container
+        for container in load_containers(state)
+        if container.get("State") == "running" and match_filters(container, filters)
+    ]
+    for container in selected:
+        sys.stdout.write(container["Id"] + "\n")
+    return 0
+
+
+def docker_inspect(state: Path, argv: list[str]) -> int:
+    fmt = ""
+    args = argv[:]
+    target = None
+    while args:
+        token = args.pop(0)
+        if token in {"--format", "-f"} and args:
+            fmt = args.pop(0)
+        elif not token.startswith("-") and target is None:
+            target = token
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not target:
+        sys.stderr.write("docker inspect requires a container\n")
+        return 1
+    for container in load_containers(state):
+        if container["Id"] != target and container.get("Name") != target:
+            continue
+        if fmt == "{{.State.StartedAt}}":
+            sys.stdout.write(container.get("StartedAt", "") + "\n")
+            return 0
+        if fmt == "{{.Name}}":
+            sys.stdout.write("/" + container.get("Name", target) + "\n")
+            return 0
+        sys.stdout.write(json.dumps(container))
+        return 0
+    sys.stderr.write(f"Error: No such container: {target}\n")
+    return 1
+
+
+def docker_stop(state: Path, argv: list[str]) -> int:
+    time_limit = None
+    args = argv[:]
+    target = None
+    while args:
+        token = args.pop(0)
+        if token in {"--time", "-t"} and args:
+            time_limit = args.pop(0)
+        elif not token.startswith("-") and target is None:
+            target = token
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not target:
+        sys.stderr.write("docker stop requires a container\n")
+        return 1
+    if time_limit != "30":
+        sys.stderr.write("unsupported docker command\n")
+        return 1
+    containers = load_containers(state)
+    for container in containers:
+        if container["Id"] != target and container.get("Name") != target:
+            continue
+        container["State"] = "exited"
+        save_containers(state, containers)
+        (state / "stopped.log").write_text(
+            container["Id"] + "\n",
+            encoding="utf-8",
+        )
+        sys.stdout.write(container["Id"] + "\n")
+        return 0
+    sys.stderr.write(f"Error: No such container: {target}\n")
+    return 1
+
+
+def docker_image_inspect(state: Path, argv: list[str]) -> int:
+    fmt = ""
+    args = argv[:]
+    target = None
+    while args:
+        token = args.pop(0)
+        if token in {"--format", "-f"} and args:
+            fmt = args.pop(0)
+        elif not token.startswith("-") and target is None:
+            target = token
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not target:
+        sys.stderr.write("docker image inspect requires an image\n")
+        return 1
+    images = state / "images.json"
+    payload = {}
+    if images.exists():
+        payload = json.loads(images.read_text(encoding="utf-8"))
+    record = payload.get(target)
+    if not record:
+        sys.stderr.write(f"Error: No such image: {target}\n")
+        return 1
+    if fmt == "{{.Id}}":
+        sys.stdout.write(record["Id"] + "\n")
+        return 0
+    sys.stdout.write(json.dumps(record))
+    return 0
+
+
+def docker_version(state: Path, argv: list[str]) -> int:
+    fmt = ""
+    args = argv[:]
+    while args:
+        token = args.pop(0)
+        if token in {"--format", "-f"} and args:
+            fmt = args.pop(0)
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    payload = {"Server": {"Version": "29.1.3-fake"}}
+    override = state / "docker-version.json"
+    if override.exists():
+        payload.update(json.loads(override.read_text(encoding="utf-8")))
+    if fmt == "{{.Server.Version}}":
+        sys.stdout.write(payload["Server"]["Version"] + "\n")
+        return 0
+    sys.stdout.write(json.dumps(payload))
+    return 0
+
+
+def docker_compose_version(state: Path, argv: list[str]) -> int:
+    if argv != ["--short"]:
+        sys.stderr.write("unsupported compose command\n")
+        return 1
+    payload = "2.40.3-fake"
+    override = state / "compose-version.txt"
+    if override.exists():
+        payload = override.read_text(encoding="utf-8").strip()
+    sys.stdout.write(payload + "\n")
+    return 0
+
+
+
 def main(argv: list[str]) -> int:
     state = state_dir()
-    log(argv, state)
+    log(["docker", *argv], state)
     if len(argv) >= 2 and argv[0] == "network" and argv[1] == "inspect":
         name = None
         args = argv[2:]
@@ -335,13 +541,28 @@ def main(argv: list[str]) -> int:
         return create_network(state, argv[2:])
     if argv and argv[0] == "info":
         return docker_info(state)
+    if argv and argv[0] == "ps":
+        return docker_ps(state, argv[1:])
+    if argv and argv[0] == "inspect":
+        return docker_inspect(state, argv[1:])
+    if argv and argv[0] == "stop":
+        return docker_stop(state, argv[1:])
+    if argv and argv[0] == "version":
+        return docker_version(state, argv[1:])
+    if len(argv) >= 2 and argv[0] == "image" and argv[1] == "inspect":
+        return docker_image_inspect(state, argv[2:])
     if argv and argv[0] == "compose":
         rest = argv[1:]
         if "config" in rest:
             return compose_config(state, rest)
         if "up" in rest:
             return compose_up(state, rest)
+        if rest[:1] == ["version"]:
+            return docker_compose_version(state, rest[1:])
         sys.stderr.write("unsupported compose command\n")
+        return 1
+    if argv and argv[0] in DESTRUCTIVE_VERBS:
+        sys.stderr.write("unsupported docker command\n")
         return 1
     sys.stderr.write("unsupported docker command\n")
     return 1

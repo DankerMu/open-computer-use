@@ -13,6 +13,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised by missing-dependency CI
     raise ImportError("PyYAML is required for parsed overlay checks") from exc
 
+from interpolation import UnsupportedInterpolation, interpolate_value
 from support import (
     CORE_OVERRIDE,
     PROXY_COMPOSE,
@@ -94,6 +95,8 @@ class OverlayStructureTests(unittest.TestCase):
         for name in REQUIRED_CORE_NAMES:
             self.assertTrue(interpolated(core_env[name], name), name)
         self.assertTrue(interpolated(core_env["SANDBOX_HOST_BIND_IP"], "OCU_SANDBOX_GATEWAY"))
+        self.assertEqual(core_env["OCU_PUBLIC_PREFIX"], "/ocu")
+        self.assertEqual(core_env["OCU_SANDBOX_NO_AUTOSTART"], "1")
         self.assertTrue(interpolated(webui_env["OCU_INTERNAL_TOKEN"], "OCU_INTERNAL_TOKEN"))
         self.assertEqual(webui_env["ENABLE_OCU_WORKSPACE"], "true")
         self.assertEqual(webui_env["OCU_INTERNAL_URL"], "http://computer-use-server:8081")
@@ -111,6 +114,15 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_WEBUI_UPSTREAM"], "http://open-webui:8080")
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_PROXY_UPSTREAM"], "http://computer-use-server:8081")
         self.assertEqual(proxy["services"]["proxy"]["environment"]["OCU_PROXY_LISTEN"], "0.0.0.0:8082")
+        age = core["services"]["retention-guard"]["environment"]["CONTAINER_MAX_AGE_HOURS"]
+        self.assertEqual(interpolate_value(age, {}), "168")
+        self.assertEqual(interpolate_value(age, {"CONTAINER_MAX_AGE_HOURS": ""}), "")
+        self.assertEqual(interpolate_value(age, {"CONTAINER_MAX_AGE_HOURS": "24"}), "24")
+        colon_default = "${CONTAINER_MAX_AGE_HOURS:-168}"
+        self.assertEqual(interpolate_value(colon_default, {"CONTAINER_MAX_AGE_HOURS": ""}), "168")
+        self.assertNotEqual(interpolate_value(age, {"CONTAINER_MAX_AGE_HOURS": ""}), "168")
+        with self.assertRaises(UnsupportedInterpolation):
+            interpolate_value("${CONTAINER_MAX_AGE_HOURS/foo/bar}", {})
         core_context = ROOT / core["services"]["retention-guard"]["build"]["context"]
         self.assertTrue((core_context / "Dockerfile").is_file())
         self.assertTrue((core_context / "stop-overage.sh").is_file())
@@ -153,8 +165,17 @@ class OverlayStructureTests(unittest.TestCase):
     def test_obsolete_private_binding_patch_is_absent(self):
         patch = ROOT / "deploy" / "production-like-test" / "patches" / "private-sandbox-port-bindings.patch"
         self.assertFalse(patch.exists())
+        autostart = ROOT / "deploy" / "production-like-test" / "patches" / "disable-cli-autostart.patch"
+        self.assertFalse(autostart.exists())
         claim = (ROOT / "deploy" / "production-like-test" / "scripts" / "write-deployed-version.sh").read_text(encoding="utf-8")
         self.assertNotIn("private-sandbox-port-bindings.patch", claim)
+
+    def test_single_pass_dollar_interpolation(self):
+        env = {"TOKEN": "HOST_VALUE"}
+        self.assertEqual(interpolate_value("$${TOKEN}", env), "${TOKEN}")
+        self.assertEqual(interpolate_value("$$TOKEN", env), "$TOKEN")
+        self.assertEqual(interpolate_value("${TOKEN}", env), "HOST_VALUE")
+        self.assertEqual(interpolate_value("$TOKEN", env), "HOST_VALUE")
 
 
 if __name__ == "__main__":
