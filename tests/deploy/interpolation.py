@@ -16,23 +16,22 @@ class UnsupportedInterpolation(ValueError):
     """Compose placeholder uses syntax this fake does not implement."""
 
 
-def interpolate_value(value, env, *, escaped=False):
+def interpolate_value(value, env):
     if isinstance(value, str):
-        if not escaped:
-            for token in re.findall(r"\$\{[^}]*\}", value):
-                inner = token[2:-1]
-                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner):
-                    continue
-                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(:?[-?]).*", inner):
-                    continue
-                raise UnsupportedInterpolation(token)
+        for token in re.findall(r"\$\$|\$\{[^}]*\}", value):
+            if token == "$$":
+                continue
+            inner = token[2:-1]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner):
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(:?[-?]).*", inner):
+                continue
+            raise UnsupportedInterpolation(token)
 
         def replace(match):
             token = match.group(0)
             if token == "$$":
                 return "$"
-            if escaped:
-                return token
             name = match.group(1) or match.group(4) or match.group(5)
             if name is None:
                 raise UnsupportedInterpolation(token)
@@ -58,7 +57,7 @@ def interpolate_value(value, env, *, escaped=False):
 
         return INTERPOLATION.sub(replace, value)
     if isinstance(value, list):
-        return [interpolate_value(item, env, escaped=escaped) for item in value]
+        return [interpolate_value(item, env) for item in value]
     if isinstance(value, dict):
-        return {key: interpolate_value(item, env, escaped=escaped) for key, item in value.items()}
+        return {key: interpolate_value(item, env) for key, item in value.items()}
     return value

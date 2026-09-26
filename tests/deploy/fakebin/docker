@@ -224,7 +224,7 @@ def compose_config(state: Path, argv: list[str]) -> int:
     if payload.get("__unresolved__") is True:
         body = {key: value for key, value in payload.items() if key != "__unresolved__"}
         try:
-            payload = interpolate_value(body, os.environ, escaped=False)
+            payload = interpolate_value(body, os.environ)
         except UnsupportedInterpolation as exc:
             sys.stderr.write(f"unsupported interpolation: {exc}\n")
             return 1
@@ -261,7 +261,7 @@ def compose_up(state: Path, argv: list[str]) -> int:
             if raw_document is not None:
                 try:
                     payload["consumer_document"] = interpolate_value(
-                        raw_document, os.environ, escaped=True
+                        raw_document, os.environ
                     )
                 except UnsupportedInterpolation as exc:
                     sys.stderr.write(f"unsupported interpolation: {exc}\n")

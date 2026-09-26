@@ -170,6 +170,13 @@ class OverlayStructureTests(unittest.TestCase):
         claim = (ROOT / "deploy" / "production-like-test" / "scripts" / "write-deployed-version.sh").read_text(encoding="utf-8")
         self.assertNotIn("private-sandbox-port-bindings.patch", claim)
 
+    def test_single_pass_dollar_interpolation(self):
+        env = {"TOKEN": "HOST_VALUE"}
+        self.assertEqual(interpolate_value("$${TOKEN}", env), "${TOKEN}")
+        self.assertEqual(interpolate_value("$$TOKEN", env), "$TOKEN")
+        self.assertEqual(interpolate_value("${TOKEN}", env), "HOST_VALUE")
+        self.assertEqual(interpolate_value("$TOKEN", env), "HOST_VALUE")
+
 
 if __name__ == "__main__":
     unittest.main()
