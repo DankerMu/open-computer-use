@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import select
 import signal
 import socket
 import subprocess
@@ -174,10 +175,31 @@ def owned_pid_exists(pid):
 
 @contextmanager
 def owned_bash_pty():
-    """Real controlling PTY; never fork Python's threaded unittest process."""
+    """Keep the real controlling PTY drained while judging its foreground."""
     master, slave = pty.openpty()
     process = None
     groups: dict[int, int] = {}
+    drain_fd = None
+    reader = None
+    reader_started = False
+    stop = threading.Event()
+    errors = []
+
+    def consume_output():
+        try:
+            while not stop.is_set():
+                if select.select([drain_fd], [], [], 0.05)[0]:
+                    if not os.read(drain_fd, 65536):
+                        break
+        except (OSError, ValueError):
+            # EIO is normal after the last PTY slave closes.
+            pass
+        finally:
+            try:
+                os.close(drain_fd)
+            except OSError as exc:
+                errors.append(f"PTY drain descriptor close: {type(exc).__name__}")
+
     try:
         try:
             process = subprocess.Popen(
@@ -187,97 +209,112 @@ def owned_bash_pty():
             groups[process.pid] = process.pid
         finally:
             os.close(slave)
+        drain_fd = os.dup(master)
+        reader = threading.Thread(target=consume_output, daemon=True)
+        reader.start()
+        reader_started = True
         yield process, master, groups
     finally:
         prior = sys.exc_info()[1]
-        errors = []
         try:
-            os.write(master, b"\x03")
-        except OSError:
-            pass
-        # Reap the foreground child while Bash still owns and can wait for it.
-        try:
-            if process is not None:
-                for group, child_pid in groups.items():
-                    if group == process.pid:
-                        continue
-                    if group <= 0 or group == os.getpgrp():
-                        errors.append("unsafe owned PTY process group")
-                        continue
-                    try:
-                        os.killpg(group, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    deadline = time.monotonic() + 1
-                    while owned_pid_exists(child_pid) and time.monotonic() < deadline:
-                        time.sleep(0.05)
-                    if owned_pid_exists(child_pid):
+            try:
+                os.write(master, b"\x03")
+            except OSError:
+                pass
+            # Reap the foreground child while Bash still owns and can wait for it.
+            try:
+                if process is not None:
+                    for group, child_pid in groups.items():
+                        if group == process.pid:
+                            continue
+                        if group <= 0 or group == os.getpgrp():
+                            errors.append("unsafe owned PTY process group")
+                            continue
                         try:
-                            os.killpg(group, signal.SIGKILL)
+                            os.killpg(group, signal.SIGTERM)
                         except ProcessLookupError:
                             pass
                         deadline = time.monotonic() + 1
                         while owned_pid_exists(child_pid) and time.monotonic() < deadline:
                             time.sleep(0.05)
                         if owned_pid_exists(child_pid):
-                            errors.append(f"PTY child {child_pid} not reaped")
-        except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
-            errors.append(f"PTY child cleanup: {type(exc).__name__}")
-        finally:
-            try:
-                os.write(master, b"exit\n")
-            except OSError:
-                pass
-            try:
-                os.close(master)
-            except OSError as exc:
-                errors.append(f"master descriptor close: {type(exc).__name__}")
-        if process is not None:
-            if process.pid > 0 and process.pid != os.getpgrp():
+                            try:
+                                os.killpg(group, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            deadline = time.monotonic() + 1
+                            while owned_pid_exists(child_pid) and time.monotonic() < deadline:
+                                time.sleep(0.05)
+                            if owned_pid_exists(child_pid):
+                                errors.append(f"PTY child {child_pid} not reaped")
+            except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
+                errors.append(f"PTY child cleanup: {type(exc).__name__}")
+            finally:
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
+                    os.write(master, b"exit\n")
+                except OSError:
                     pass
-                except OSError as exc:
-                    errors.append(f"PTY TERM: {type(exc).__name__}")
-        if process is not None:
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                for group in groups:
-                    if group > 0 and group != os.getpgrp():
-                        try:
-                            os.killpg(group, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        except OSError as exc:
-                            errors.append(f"PTY KILL: {type(exc).__name__}")
+            if process is not None:
+                if process.pid > 0 and process.pid != os.getpgrp():
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    except OSError as exc:
+                        errors.append(f"PTY TERM: {type(exc).__name__}")
                 try:
-                    process.wait(timeout=1)
+                    process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    errors.append("PTY child could not be reaped within 3 seconds")
-            for group in groups:
-                if group <= 0 or group == os.getpgrp():
-                    continue
-                try:
-                    deadline = time.monotonic() + 1
-                    while live_group(group) and time.monotonic() < deadline:
-                        time.sleep(0.05)
-                    if live_group(group):
-                        os.killpg(group, signal.SIGKILL)
+                    for group in groups:
+                        if group > 0 and group != os.getpgrp():
+                            try:
+                                os.killpg(group, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            except OSError as exc:
+                                errors.append(f"PTY KILL: {type(exc).__name__}")
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        errors.append("PTY child could not be reaped within 3 seconds")
+                for group in groups:
+                    if group <= 0 or group == os.getpgrp():
+                        continue
+                    try:
                         deadline = time.monotonic() + 1
                         while live_group(group) and time.monotonic() < deadline:
                             time.sleep(0.05)
                         if live_group(group):
-                            errors.append(f"PTY process group {group} still running")
-                except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
-                    errors.append(f"PTY group inspection: {type(exc).__name__}")
-        if errors:
-            message = "; ".join(errors)
-            if prior is not None:
-                prior.add_note(f"PTY cleanup failure: {message}")
-            else:
-                raise AssertionError(f"PTY cleanup failure: {message}")
+                            os.killpg(group, signal.SIGKILL)
+                            deadline = time.monotonic() + 1
+                            while live_group(group) and time.monotonic() < deadline:
+                                time.sleep(0.05)
+                            if live_group(group):
+                                errors.append(f"PTY process group {group} still running")
+                    except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
+                        errors.append(f"PTY group inspection: {type(exc).__name__}")
+        finally:
+            stop.set()
+            if reader_started:
+                reader.join(timeout=1)
+                if reader.is_alive():
+                    errors.append("PTY drainer did not stop within one second")
+            elif drain_fd is not None:
+                try:
+                    os.close(drain_fd)
+                except OSError as exc:
+                    errors.append(f"PTY drain descriptor close: {type(exc).__name__}")
+            if not reader_started or not reader.is_alive():
+                try:
+                    os.close(master)
+                except OSError as exc:
+                    errors.append(f"master descriptor close: {type(exc).__name__}")
+            if errors:
+                message = "; ".join(errors)
+                if prior is not None:
+                    prior.add_note(f"PTY cleanup failure: {message}")
+                else:
+                    raise AssertionError(f"PTY cleanup failure: {message}")
 
 
 class NativeSmokeTests(unittest.TestCase):
