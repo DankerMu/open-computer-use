@@ -19,6 +19,8 @@ UP = ROOT / "deploy" / "up.sh"
 FIREWALL_INSTALL = ROOT / "deploy" / "firewall" / "docker-user-rules.sh"
 FIREWALL_CHECK = ROOT / "deploy" / "firewall" / "check.sh"
 CHECK_SANDBOX_DNS = ROOT / "deploy" / "check-sandbox-dns.sh"
+SMOKE = ROOT / "deploy" / "smoke.sh"
+SMOKE_PY = ROOT / "deploy" / "smoke_deployment.py"
 FAKE_DOCKER = ROOT / "tests" / "deploy" / "fakebin" / "docker"
 CORE_OVERRIDE = ROOT / "deploy" / "production-like-test" / "compose.core.override.yml"
 WEBUI_OVERRIDE = ROOT / "deploy" / "production-like-test" / "compose.webui.override.yml"
@@ -198,6 +200,49 @@ def fake_env(state_dir: Path, extra=None):
     return env
 
 
+def smoke_env(state_dir: Path, extra=None):
+    env = fake_env(state_dir)
+    env["OCU_SMOKE_CHAT_ID"] = "smoke-chat"
+    env["OCU_SMOKE_SANDBOX_ID"] = "sandbox-smoke"
+    env["OCU_SMOKE_EXCLUSIVE"] = "1"
+    env["OCU_SMOKE_OWNER_TOKEN"] = "synthetic-owner-token"
+    env["OCU_SMOKE_FORMER_URL"] = "127.0.0.1:18081"
+    env["OCU_SMOKE_EGRESS_URL"] = "http://8.8.8.8:80/"
+    env["OCU_SMOKE_HOST_LAN_IPV4"] = "127.0.0.1"
+    if extra:
+        env.update(extra)
+    return env
+
+
+def write_ps(state_dir: Path, stack: str, rows) -> Path:
+    directory = state_dir / "ps"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{stack}.jsonl"
+    if isinstance(rows, str):
+        path.write_text(rows if rows.endswith("\n") else rows + "\n", encoding="utf-8")
+        return path
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def write_exec(state_dir: Path, rows) -> Path:
+    path = state_dir / "exec.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def write_curl(state_dir: Path, rows) -> Path:
+    path = state_dir / "curl.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def write_sandbox_terminal(state_dir: Path, payload) -> Path:
+    path = state_dir / "sandbox-terminal.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def write_network(state_dir: Path, name, *, subnet, gateway, driver="bridge", internal=False, net_id=None, options=None):
     networks = state_dir / "networks"
     networks.mkdir(parents=True, exist_ok=True)
@@ -233,6 +278,7 @@ def sandbox_container(
     network_settings=None,
     omit_host_config=False,
     omit_network_settings=False,
+    config_env=None,
 ):
     mode = SANDBOX_NETWORK if network_mode is None else network_mode
     membership = {SANDBOX_NETWORK: {"NetworkID": f"id-{SANDBOX_NETWORK}", "IPAddress": "172.31.0.10"}}
@@ -249,6 +295,8 @@ def sandbox_container(
         "State": state,
         "Labels": dict(labels or {}),
     }
+    if config_env is not None:
+        body["Config"] = {"Env": list(config_env), "Labels": dict(labels or {})}
     if not omit_host_config:
         body["HostConfig"] = host
     if not omit_network_settings:
