@@ -822,19 +822,29 @@ def stop_product_terminal(origin: str, chat_id: str, token: str) -> None:
 
 
 def collect_processes(container: str, exec_fn=exec_text) -> dict[int, tuple[int, int, int, int, str, str]]:
-    """Read the sandbox's actual process and terminal foreground groups."""
-    result = exec_fn(container, "ps -eo pid=,ppid=,pgid=,tpgid=,sess=,tty=,comm=")
+    """Read real process groups; exclude only this collector's exec'd ps PID."""
+    result = exec_fn(
+        container,
+        "printf 'OCU_SMOKE_OBSERVER=%s\\n' \"$$\"; "
+        "exec ps -eo pid=,ppid=,pgid=,tpgid=,sess=,tty=,comm=",
+    )
     if result.returncode != 0 or not result.stdout or len(result.stdout) > 1_048_576:
         fail("terminal process inventory failed")
+    lines = result.stdout.splitlines()
+    marker = "OCU_SMOKE_OBSERVER="
+    if not lines or not lines[0].startswith(marker) or not lines[0][len(marker):].isdigit():
+        fail("terminal process observer identity is malformed")
+    observer = int(lines[0][len(marker):])
     records = {}
-    for line in result.stdout.splitlines():
+    for line in lines[1:]:
         columns = line.split(maxsplit=6)
         if len(columns) != 7 or not all(item.lstrip("-").isdigit() for item in columns[:5]):
             fail("terminal process inventory is malformed")
         pid, ppid, pgid, tpgid, sid = map(int, columns[:5])
         if pid < 0 or pid in records:
             fail("terminal process inventory has invalid identities")
-        records[pid] = (ppid, pgid, tpgid, sid, columns[5], columns[6])
+        if pid != observer:
+            records[pid] = (ppid, pgid, tpgid, sid, columns[5], columns[6])
     return records
 
 
@@ -897,15 +907,46 @@ def foreground_is_bash(snapshot: dict) -> bool:
                 changed = True
     return all(processes[pid][5].split("/")[-1] in BASH_NAMES for pid in children)
 
+def terminal_delta_clean(snapshot: dict, baseline: dict[int, tuple[int, int, int, int, str, str]]) -> bool:
+    """Judge only newly observable processes in the fresh pane's session or ancestry."""
+    processes = snapshot["processes"]
+    pane_pid = snapshot["pid"]
+    pane = processes.get(pane_pid)
+    if pane is None:
+        return False
+    pane_sid, pane_tty = pane[3], pane[4]
+    ancestors = set()
+    ancestor = pane_pid
+    while ancestor in processes and ancestor not in ancestors:
+        ancestors.add(ancestor)
+        ancestor = processes[ancestor][0]
+    for pid, row in processes.items():
+        if baseline.get(pid) == row:
+            continue
+        if row[3] != pane_sid and row[4] != pane_tty and pid not in ancestors:
+            continue
+        name = row[5].split("/")[-1]
+        if name in BASH_NAMES:
+            continue
+        # ttyd/tmux may be new product ancestors, never a blanket name exemption.
+        if pid != pane_pid and pid in ancestors and name in {"ttyd", "tmux"}:
+            continue
+        return False
+    return True
 
-def observe_foreground(container: str, session: TtydSession) -> None:
+
+def observe_foreground(
+    container: str,
+    session: TtydSession,
+    baseline: dict[int, tuple[int, int, int, int, str, str]],
+) -> None:
     readiness_deadline = time.monotonic() + TERMINAL_DEADLINE
     while True:
         session.check_alive()
         snapshot = pane_snapshot(container)
         if snapshot is not None:
-            if not foreground_is_bash(snapshot):
-                fail("product terminal foreground is not plain bash")
+            if not foreground_is_bash(snapshot) or not terminal_delta_clean(snapshot, baseline):
+                fail("product terminal foreground or newly launched process is not plain bash")
             break
         if time.monotonic() >= readiness_deadline:
             fail("product terminal pane did not become ready")
@@ -917,8 +958,8 @@ def observe_foreground(container: str, session: TtydSession) -> None:
         time.sleep(min(STABLE_INTERVAL, stable_until - time.monotonic()))
         session.check_alive()
         snapshot = pane_snapshot(container)
-        if snapshot is None or not foreground_is_bash(snapshot):
-            fail("product terminal foreground changed during stable window")
+        if snapshot is None or not foreground_is_bash(snapshot) or not terminal_delta_clean(snapshot, baseline):
+            fail("product terminal foreground or process changed during stable window")
     session.check_alive()
 
 
@@ -1024,6 +1065,9 @@ def run(argv: list[str]) -> int:
     for name, url in control_urls.items():
         require_blocked(sandbox_curl(sandbox["id"], url), name)
     precheck_terminal(sandbox["id"])
+    # Session inventory is proven empty by precheck; snapshot the remaining
+    # processes before the product is permitted to create terminal state.
+    baseline = collect_processes(sandbox["id"])
     _PENDING_START = {
         "origin": inputs["origin"],
         "chat_id": inputs["chat_id"],
@@ -1034,7 +1078,7 @@ def run(argv: list[str]) -> int:
     _OWNED_CLEANUP = _PENDING_START
     _PENDING_START = None
     _OWNED_SESSION = open_terminal_session(inputs["origin"], inputs["chat_id"], inputs["token"])
-    observe_foreground(sandbox["id"], _OWNED_SESSION)
+    observe_foreground(sandbox["id"], _OWNED_SESSION, baseline)
     return cleanup_owned(0)
 
 

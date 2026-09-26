@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import pty
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -18,8 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
-if str(DEPLOY) not in __import__("sys").path:
-    __import__("sys").path.insert(0, str(DEPLOY))
+if str(DEPLOY) not in sys.path:
+    sys.path.insert(0, str(DEPLOY))
 
 from smoke_deployment import (
     SmokeError,
@@ -88,6 +90,194 @@ class TtyHandler(BaseHTTPRequestHandler):
             self.server.hold.wait(timeout=5)
         except OSError:
             return
+
+
+def native_exec(_container, command):
+    """Only adapt Darwin SID representation; every other ps field stays native."""
+    needs_sid = sys.platform == "darwin" and "exec ps -eo pid=,ppid=,pgid=,tpgid=,sess=,tty=,comm=" in command
+    native_command = command.replace("tpgid=,sess=,tty=", "tpgid=,tty=") if needs_sid else command
+    result = subprocess.run(["sh", "-c", native_command], capture_output=True, text=True, timeout=3)
+    if not needs_sid or result.returncode:
+        return result
+    lines = result.stdout.splitlines()
+    if not lines or not lines[0].startswith("OCU_SMOKE_OBSERVER="):
+        return subprocess.CompletedProcess(result.args, 1, "", "native observer header missing")
+    output = [lines[0]]
+    for line in lines[1:]:
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6 or not fields[0].isdigit():
+            return subprocess.CompletedProcess(result.args, 1, "", "native process row malformed")
+        pid = int(fields[0])
+        if pid == 0:
+            continue
+        try:
+            sid = os.getsid(pid)
+        except (ProcessLookupError, PermissionError):
+            # A vanished/inaccessible host process is not evidence about the pane.
+            continue
+        output.append(" ".join([*fields[:4], str(sid), *fields[4:]]))
+    return subprocess.CompletedProcess(result.args, 0, "\n".join(output) + "\n", result.stderr)
+
+
+def pane_exec(pane_pid):
+    def execute(container, command):
+        if command.startswith("tmux display-message"):
+            row = collect_processes(container, native_exec).get(pane_pid)
+            tty = row[4] if row else "?"
+            return SimpleNamespace(
+                returncode=0, stdout=f"main|%1|{pane_pid}|/dev/{tty}|bash\n", stderr="",
+            )
+        return native_exec(container, command)
+    return execute
+
+
+def start_real_foreground_cat(pane_pid, master, exec_fn):
+    os.write(master, b"cat\n")
+    deadline = time.monotonic() + 5
+    while True:
+        snapshot = pane_snapshot("native", exec_fn)
+        pane = snapshot["processes"][pane_pid]
+        for pid, row in snapshot["processes"].items():
+            if (
+                pane[2] != pane[1]
+                and row[5].split("/")[-1] == "cat"
+                and row[1] == pane[2]
+                and row[3] == pane[3]
+                and row[4] == pane[4]
+            ):
+                return snapshot, pid, row[1]
+        if time.monotonic() >= deadline:
+            raise AssertionError("foreground cat was not observed")
+        time.sleep(0.05)
+
+
+def live_group(group):
+    result = subprocess.run(
+        ["ps", "-eo", "pgid=,stat="], capture_output=True, text=True, timeout=1,
+    )
+    if result.returncode:
+        raise AssertionError("cannot inspect owned PTY process groups")
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == str(group) and not fields[1].startswith("Z"):
+            return True
+    return False
+
+def owned_pid_exists(pid):
+    result = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=1,
+    )
+    if result.returncode not in {0, 1}:
+        raise AssertionError("cannot inspect owned PTY child")
+    return bool(result.stdout.strip())
+
+
+@contextmanager
+def owned_bash_pty():
+    """Real controlling PTY; never fork Python's threaded unittest process."""
+    master, slave = pty.openpty()
+    process = None
+    groups: dict[int, int] = {}
+    try:
+        try:
+            process = subprocess.Popen(
+                [sys.executable, str(Path(__file__).with_name("pty_bash.py"))],
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+            )
+            groups[process.pid] = process.pid
+        finally:
+            os.close(slave)
+        yield process, master, groups
+    finally:
+        prior = sys.exc_info()[1]
+        errors = []
+        try:
+            os.write(master, b"\x03")
+        except OSError:
+            pass
+        # Reap the foreground child while Bash still owns and can wait for it.
+        try:
+            if process is not None:
+                for group, child_pid in groups.items():
+                    if group == process.pid:
+                        continue
+                    if group <= 0 or group == os.getpgrp():
+                        errors.append("unsafe owned PTY process group")
+                        continue
+                    try:
+                        os.killpg(group, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 1
+                    while owned_pid_exists(child_pid) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if owned_pid_exists(child_pid):
+                        try:
+                            os.killpg(group, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        deadline = time.monotonic() + 1
+                        while owned_pid_exists(child_pid) and time.monotonic() < deadline:
+                            time.sleep(0.05)
+                        if owned_pid_exists(child_pid):
+                            errors.append(f"PTY child {child_pid} not reaped")
+        except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"PTY child cleanup: {type(exc).__name__}")
+        finally:
+            try:
+                os.write(master, b"exit\n")
+            except OSError:
+                pass
+            try:
+                os.close(master)
+            except OSError as exc:
+                errors.append(f"master descriptor close: {type(exc).__name__}")
+        if process is not None:
+            if process.pid > 0 and process.pid != os.getpgrp():
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    errors.append(f"PTY TERM: {type(exc).__name__}")
+        if process is not None:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                for group in groups:
+                    if group > 0 and group != os.getpgrp():
+                        try:
+                            os.killpg(group, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        except OSError as exc:
+                            errors.append(f"PTY KILL: {type(exc).__name__}")
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    errors.append("PTY child could not be reaped within 3 seconds")
+            for group in groups:
+                if group <= 0 or group == os.getpgrp():
+                    continue
+                try:
+                    deadline = time.monotonic() + 1
+                    while live_group(group) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if live_group(group):
+                        os.killpg(group, signal.SIGKILL)
+                        deadline = time.monotonic() + 1
+                        while live_group(group) and time.monotonic() < deadline:
+                            time.sleep(0.05)
+                        if live_group(group):
+                            errors.append(f"PTY process group {group} still running")
+                except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
+                    errors.append(f"PTY group inspection: {type(exc).__name__}")
+        if errors:
+            message = "; ".join(errors)
+            if prior is not None:
+                prior.add_note(f"PTY cleanup failure: {message}")
+            else:
+                raise AssertionError(f"PTY cleanup failure: {message}")
 
 
 class NativeSmokeTests(unittest.TestCase):
@@ -264,42 +454,25 @@ class NativeSmokeTests(unittest.TestCase):
             thread.join(timeout=2)
 
     def test_native_pty_foreground_judge_rejects_harmless_cat(self):
-        pane_pid, master = pty.fork()
-        if pane_pid == 0:
-            os.execvp("bash", ["bash", "--noprofile", "--norc", "-i"])
-        try:
-            def local_exec(_container, command):
-                if command.startswith("tmux display-message"):
-                    row = collect_processes("native", local_exec).get(pane_pid)
-                    tty = row[4] if row else "?"
-                    return SimpleNamespace(
-                        returncode=0,
-                        stdout=f"main|%1|{pane_pid}|/dev/{tty}|bash\n",
-                        stderr="",
-                    )
-                return subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=3)
+        with owned_bash_pty() as (process, master, groups):
+            pane_pid = process.pid
+
+            local_exec = pane_exec(pane_pid)
 
             deadline = time.monotonic() + 5
             while True:
                 records = collect_processes("native", local_exec)
                 row = records.get(pane_pid)
-                if row and row[2] == row[1] and row[4] not in {"?", "??"}:
+                if (
+                    row and row[2] == row[1] and row[4] not in {"?", "??"}
+                    and row[5].split("/")[-1] == "bash"
+                ):
                     break
                 self.assertLess(time.monotonic(), deadline, "plain Bash never acquired the PTY")
                 time.sleep(0.05)
             self.assertTrue(foreground_is_bash(pane_snapshot("native", local_exec)))
-            os.write(master, b"cat\n")
-            deadline = time.monotonic() + 5
-            while True:
-                snapshot = pane_snapshot("native", local_exec)
-                pane = snapshot["processes"][pane_pid]
-                if pane[2] != pane[1] and any(
-                    row[5].split("/")[-1] == "cat" and row[1] == pane[2]
-                    for row in snapshot["processes"].values()
-                ):
-                    break
-                self.assertLess(time.monotonic(), deadline, "foreground cat was not observed")
-                time.sleep(0.05)
+            snapshot, cat_pid, cat_group = start_real_foreground_cat(pane_pid, master, local_exec)
+            groups[cat_group] = cat_pid
             self.assertFalse(foreground_is_bash(snapshot))
             os.write(master, b"\x03")
             deadline = time.monotonic() + 5
@@ -310,22 +483,42 @@ class NativeSmokeTests(unittest.TestCase):
                 self.assertLess(time.monotonic(), deadline, "Bash did not regain foreground after Ctrl-C")
                 time.sleep(0.05)
             self.assertTrue(foreground_is_bash(snapshot))
-        finally:
-            try:
-                os.write(master, b"\x03exit\n")
-            except OSError:
-                pass
-            deadline = time.monotonic() + 2
-            while True:
-                finished, _ = os.waitpid(pane_pid, os.WNOHANG)
-                if finished:
-                    break
-                if time.monotonic() >= deadline:
-                    os.killpg(pane_pid, signal.SIGKILL)
-                    os.waitpid(pane_pid, 0)
-                    break
-                time.sleep(0.05)
-            os.close(master)
+
+    def test_failed_pty_assertion_still_closes_and_reaps(self):
+        observed = {}
+        started_cleanup = None
+        with self.assertRaisesRegex(AssertionError, "forced PTY assertion") as caught:
+            with owned_bash_pty() as (process, master, groups):
+                observed["process"] = process
+                observed["master"] = master
+                local_exec = pane_exec(process.pid)
+                deadline = time.monotonic() + 5
+                while True:
+                    records = collect_processes("native", local_exec)
+                    row = records.get(process.pid)
+                    if (
+                        row and row[2] == row[1] and row[4] not in {"?", "??"}
+                        and row[5].split("/")[-1] == "bash"
+                    ):
+                        break
+                    self.assertLess(time.monotonic(), deadline, "PTY Bash never acquired the terminal")
+                    time.sleep(0.05)
+                _snapshot, cat_pid, cat_group = start_real_foreground_cat(process.pid, master, local_exec)
+                groups[cat_group] = cat_pid
+                observed["cat_pid"] = cat_pid
+                observed["cat_group"] = cat_group
+                started_cleanup = time.monotonic()
+                raise AssertionError("forced PTY assertion")
+        self.assertLess(time.monotonic() - started_cleanup, 12)
+        self.assertFalse(any(
+            note.startswith("PTY cleanup failure")
+            for note in getattr(caught.exception, "__notes__", ())
+        ))
+        self.assertIsNotNone(observed["process"].poll())
+        with self.assertRaises(OSError):
+            os.fstat(observed["master"])
+        self.assertFalse(live_group(observed["cat_group"]))
+        self.assertFalse(owned_pid_exists(observed["cat_pid"]))
 
 
 if __name__ == "__main__":

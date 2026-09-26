@@ -588,7 +588,7 @@ def load_sandbox_terminal(state: Path) -> dict:
             "no_autostart_marker": False,
             "subagent_autostarted": "",
             "pane": {"session": "main", "pane_id": "%1", "pid": "9001", "tty": "/dev/pts/0", "command": "bash"},
-            "processes": ["9001 9000 9001 9001 9001 pts/0 bash"],
+            "processes": ["9200 1 9200 -1 9200 ? harmless-idle"],
         }
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -662,7 +662,12 @@ def handle_sandbox_command(state: Path, container: str, command: list[str]) -> t
             if terminal["process_reads"] >= terminal["transition_after_reads"]:
                 terminal["processes"] = terminal["next_processes"]
             save_sandbox_terminal(state, terminal)
-        return 0, "".join(row + "\n" for row in terminal.get("processes", [])), ""
+        rows = terminal.get("processes", [])
+        return 0, (
+            "OCU_SMOKE_OBSERVER=9800\n"
+            + "".join(row + "\n" for row in rows)
+            + "9800 1 9800 -1 9001 ? ps\n"
+        ), ""
     return 1, "", "unsupported exec command"
 
 

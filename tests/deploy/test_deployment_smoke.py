@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -176,8 +177,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self.server.ws_init.set()
                 if self.server.ws_mode != "ignore-init":
                     terminal = json.loads(self.server.terminal_path.read_text(encoding="utf-8"))
-                    terminal["sessions"] = ["main"]
-                    self.server.terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
+                    if terminal["ttyd"]:
+                        terminal["sessions"] = ["main"]
+                        terminal["processes"] = terminal["terminal_processes"]
+                        self.server.terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
                 if self.server.ws_mode == "drop":
                     return
                 self.server.ws_hold.wait(timeout=15)
@@ -224,6 +227,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 terminal = json.loads(self.server.terminal_path.read_text(encoding="utf-8"))
                 terminal["ttyd"] = False
                 terminal["sessions"] = []
+                terminal["processes"] = terminal["baseline_processes"]
                 if self.server.stop_mode == "probe-error":
                     terminal["probe_error"] = "pgrep -x ttyd"
                 self.server.terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
@@ -242,7 +246,7 @@ class OverlaySmokeCliTests(unittest.TestCase):
         self.former_reservation = socket.socket()
         self.former_reservation.bind(("127.0.0.1", 0))
         self.env["OCU_SMOKE_FORMER_URL"] = f"127.0.0.1:{self.former_reservation.getsockname()[1]}"
-        self.env["OCU_SMOKE_HOST_LAN_IPV4"] = "127.0.0.12"
+        self.env["OCU_SMOKE_HOST_LAN_IPV4"] = "127.0.0.1"
         self.http = None
         self.thread = None
         self.control = []
@@ -265,11 +269,13 @@ class OverlaySmokeCliTests(unittest.TestCase):
         self.context.cleanup()
 
     def start_control_listeners(self):
-        for address, port in (("127.0.0.10", 8081), ("127.0.0.11", 8080), ("127.0.0.12", 8082)):
+        for port in (8081, 8080, 8082):
+            address = "127.0.0.1"
             try:
                 server = ThreadingHTTPServer((address, port), OkHandler)
             except OSError as exc:
-                self.fail(f"{address}:{port} is occupied; CLI smoke requires this listener ({exc})")
+                reason = "is occupied" if exc.errno == errno.EADDRINUSE else "cannot be bound"
+                self.fail(f"{address}:{port} {reason}; CLI smoke requires this listener ({exc})")
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             self.control.append((server, thread))
@@ -339,11 +345,11 @@ class OverlaySmokeCliTests(unittest.TestCase):
         write_containers(
             self.state,
             [
-                control_container("cid-ocu", "ocu-test-computer-use-server", "computer-use-server", "127.0.0.10"),
-                control_container("cid-webui", "ocu-test-open-webui", "open-webui", "127.0.0.11"),
-                control_container("cid-proxy", "ocu-test-proxy", "proxy", "127.0.0.12"),
-                control_container("cid-pg", "ocu-test-postgres", "postgres", "127.0.0.13"),
-                control_container("cid-ret", "ocu-test-retention-guard", "retention-guard", "127.0.0.14"),
+                control_container("cid-ocu", "ocu-test-computer-use-server", "computer-use-server", "127.0.0.1"),
+                control_container("cid-webui", "ocu-test-open-webui", "open-webui", "127.0.0.1"),
+                control_container("cid-proxy", "ocu-test-proxy", "proxy", "127.0.0.1"),
+                control_container("cid-pg", "ocu-test-postgres", "postgres", "127.0.0.1"),
+                control_container("cid-ret", "ocu-test-retention-guard", "retention-guard", "127.0.0.1"),
                 sandbox,
             ],
         )
@@ -361,7 +367,12 @@ class OverlaySmokeCliTests(unittest.TestCase):
                     "tty": "/dev/pts/0",
                     "command": "bash",
                 },
-                "processes": processes or ["9001 9000 9001 9001 9001 pts/0 bash"],
+                "baseline_processes": ["9200 1 9200 -1 9200 ? harmless-idle"],
+                "processes": ["9200 1 9200 -1 9200 ? harmless-idle"],
+                "terminal_processes": [
+                    "9200 1 9200 -1 9200 ? harmless-idle",
+                    *(processes or ["9001 9000 9001 9001 9001 pts/0 bash"]),
+                ],
             },
         )
 
@@ -658,6 +669,46 @@ class OverlaySmokeCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("foreground", result.stderr)
 
+    def test_reparented_new_terminal_session_process_is_rejected(self):
+        self.start_http()
+        self.seed_inventory(processes=[
+            "9001 9000 9001 9001 9001 pts/0 bash",
+            "9300 1 9300 -1 9001 ? harmless-daemon",
+        ])
+        self.seed_probes()
+        result = self.run_smoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newly launched process", result.stderr)
+        self.assertTrue(self.http.stopped.is_set())
+
+    def test_observer_identity_does_not_exempt_unrelated_ps_name(self):
+        self.start_http()
+        self.seed_inventory(processes=[
+            "9001 9000 9001 9001 9001 pts/0 bash",
+            "9901 1 9901 -1 9001 ? ps",
+        ])
+        self.seed_probes()
+        result = self.run_smoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newly launched process", result.stderr)
+
+    def test_product_tmux_ancestor_is_allowed_but_name_only_is_not(self):
+        self.start_http()
+        self.seed_inventory(processes=[
+            "9000 1 9000 -1 9001 ? tmux",
+            "9001 9000 9001 9001 9001 pts/0 bash",
+        ])
+        self.seed_probes()
+        self.assertEqual(self.run_smoke().returncode, 0)
+        self.seed_inventory(processes=[
+            "9001 9000 9001 9001 9001 pts/0 bash",
+            "9400 1 9400 -1 9001 ? tmux",
+        ])
+        self.seed_probes()
+        result = self.run_smoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newly launched process", result.stderr)
+
     def test_observation_rejects_midwindow_foreground_transition(self):
         self.start_http()
         self.seed_inventory()
@@ -698,7 +749,7 @@ class OverlaySmokeCliTests(unittest.TestCase):
         result = self.run_smoke()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("terminal process inventory failed", result.stderr)
-        self.assertTrue(self.http.stopped.is_set())
+        self.assertFalse(any(item[0] == "POST" for item in self.http.record))
 
     def test_healthy_fake_deployment_exits_zero_without_secrets_or_destruction(self):
         self.start_http()
@@ -725,6 +776,10 @@ class OverlaySmokeCliTests(unittest.TestCase):
         self.assertEqual(ws[2]["Cookie"], f"token={TOKEN}")
         self.assertTrue(self.http.stopped.is_set())
         self.assertFalse(json.loads((self.state / "sandbox-terminal.json").read_text())["ttyd"])
+        self.assertEqual(
+            json.loads((self.state / "sandbox-terminal.json").read_text())["processes"],
+            ["9200 1 9200 -1 9200 ? harmless-idle"],
+        )
 
     def test_terminal_cannot_pass_without_product_ws_initialization(self):
         self.start_http(ws_mode="ignore-init")
