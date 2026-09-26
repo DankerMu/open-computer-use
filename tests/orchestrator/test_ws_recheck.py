@@ -91,6 +91,7 @@ def app_module(monkeypatch, tmp_path):
     monkeypatch.setattr(loaded, "startup_idle_sweep", lambda now=None: None)
     monkeypatch.setattr(loaded, "reap_known_sandboxes", lambda now=None: None)
     monkeypatch.setattr(loaded, "validate_idle_configuration", lambda *a, **k: (600, 30))
+    monkeypatch.setattr(loaded, "validate_sandbox_dns_configuration", lambda: None)
     return loaded
 
 

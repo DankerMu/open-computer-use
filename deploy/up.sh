@@ -96,6 +96,11 @@ if ! declare -p OCU_SANDBOX_EGRESS_ALLOW >/dev/null 2>&1; then
     exit 1
 fi
 export OCU_SANDBOX_EGRESS_ALLOW
+if ! declare -p OCU_SANDBOX_DNS >/dev/null 2>&1; then
+    printf '%s\n' 'deploy: OCU_SANDBOX_DNS is unset' >&2
+    exit 1
+fi
+export OCU_SANDBOX_DNS
 PROJECT="$COMPOSE_PROJECT_NAME"
 
 # Shared-project siblings must survive later ups; the cleanup profile must stay off.
@@ -162,6 +167,10 @@ if ! run_owned bash "$ROOT/deploy/check-ports.sh" \
 fi
 if ! run_owned bash "$ROOT/deploy/provision-networks.sh"; then
     printf '%s\n' 'deploy: network provisioning failed' >&2
+    exit 1
+fi
+if ! run_owned bash "$ROOT/deploy/check-sandbox-dns.sh" "$CONFIG_DIR/core.json"; then
+    printf '%s\n' 'deploy: sandbox DNS policy check failed' >&2
     exit 1
 fi
 if ! run_owned bash "$ROOT/deploy/firewall/docker-user-rules.sh"; then

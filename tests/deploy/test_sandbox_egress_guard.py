@@ -21,12 +21,14 @@ from support import (
     FIREWALL_CHECK,
     FIREWALL_INSTALL,
     METADATA_ADDR,
+    OCU_SERVICE,
     OWNED_IPV4,
     OWNED_IPV6,
     ROOT,
     SANDBOX_NETWORK,
     UP,
     fake_env,
+    intended_docs,
     load_firewall,
     ops,
     run_script,
@@ -648,6 +650,10 @@ class EgressGuardTests(unittest.TestCase):
     def test_blank_allowlist_in_up_is_deny_all_not_unset(self):
         env = dict(self.env)
         env["OCU_SANDBOX_EGRESS_ALLOW"] = ""
+        env["OCU_SANDBOX_DNS"] = ""
+        docs = intended_docs()
+        docs["core.json"]["services"][OCU_SERVICE]["environment"] = {"OCU_SANDBOX_DNS": ""}
+        write_fake_configs(self.state, docs)
         result = run_script(UP, env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])

@@ -63,6 +63,7 @@ REQUIRED_RUNTIME = (
     "OCU_SANDBOX_SUBNET",
     "OCU_SANDBOX_GATEWAY",
     "OCU_SANDBOX_EGRESS_ALLOW",
+    "OCU_SANDBOX_DNS",
     "OCU_PROXY_PORT",
     "OCU_WEBUI_ORIGIN",
     "PUBLIC_BASE_URL",
@@ -96,6 +97,7 @@ def token_docs():
     docs["proxy.json"]["__unresolved__"] = True
     docs["core.json"]["services"][OCU_SERVICE]["environment"] = {
         "OCU_INTERNAL_TOKEN": "${OCU_INTERNAL_TOKEN}",
+        "OCU_SANDBOX_DNS": "${OCU_SANDBOX_DNS}",
     }
     docs["webui.json"]["services"][WEBUI_SERVICE]["environment"] = {
         "OCU_INTERNAL_TOKEN": "${OCU_INTERNAL_TOKEN}",
@@ -157,6 +159,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.env["SOURCE_SHA"] = self.sha
         self.env["OCU_WEBUI_ORIGIN"] = ORIGIN
         self.env["OCU_SANDBOX_EGRESS_ALLOW"] = "8.8.8.8/32"
+        self.env["OCU_SANDBOX_DNS"] = ""
         self.env.update(IMAGES)
 
     def tearDown(self):
@@ -331,6 +334,14 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertIn("OCU_SANDBOX_EGRESS_ALLOW=", self.runtime_path().read_text(encoding="utf-8"))
         self.assert_no_temp_residue()
 
+    def test_explicit_empty_dns_is_preserved(self):
+        result = self.run_bootstrap({"OCU_SANDBOX_DNS": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        self.assertEqual(runtime["OCU_SANDBOX_DNS"], "")
+        self.assertIn("OCU_SANDBOX_DNS=", self.runtime_path().read_text(encoding="utf-8"))
+        self.assert_no_temp_residue()
+
     def test_origin_with_explicit_port_composes_public_base(self):
         origin = "https://workbench.example.test:8443"
         result = self.run_bootstrap({"OCU_WEBUI_ORIGIN": origin})
@@ -362,6 +373,9 @@ class BootstrapRuntimeTests(unittest.TestCase):
             ({"OCU_WEBUI_ORIGIN": "https://workbench.example.test:99999"}, None),
             ({}, ["OCU_SANDBOX_EGRESS_ALLOW"]),
             ({"OCU_SANDBOX_EGRESS_ALLOW": "not-an-ip"}, None),
+            ({}, ["OCU_SANDBOX_DNS"]),
+            ({"OCU_SANDBOX_DNS": "not-an-ip"}, None),
+            ({"OCU_SANDBOX_DNS": "169.254.169.254"}, None),
             ({"OCU_WEBUI_ORIGIN": "https://workbench.example.test\nOCU_INTERNAL_TOKEN=injected"}, None),
         )
         for extra, unset in cases:

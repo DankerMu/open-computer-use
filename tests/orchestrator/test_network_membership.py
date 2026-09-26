@@ -120,11 +120,16 @@ class FakeContainers:
         if self.owner.replace_named_network_on_create:
             self.owner.replace_named_network_on_create()
             self.owner.replace_named_network_on_create = None
+        if self.owner.refuse_hostname and "hostname" in config:
+            self.owner.refuse_hostname = False
+            raise _api_error("cannot set hostname in host UTS namespace", status_code=500)
         container = self.owner.make_container(
             name, status="created", container_id=f"cid-{len(self.owner.created) + 1}"
         )
         container._create_config = config
         self.owner.apply_create_config(container, config)
+        if self.owner.inspect_dns_mismatch:
+            container.attrs.setdefault("HostConfig", {})["Dns"] = list(self.owner.inspect_dns_mismatch)
         self.owner.store[name] = container
         self.owner.created.append(container)
         return container
@@ -144,6 +149,8 @@ class FakeClient:
         self.replace_named_network_on_create = None
         self.on_sandbox_lookup = None
         self._sandbox_lookups = 0
+        self.refuse_hostname = False
+        self.inspect_dns_mismatch = None
 
     def add_network(self, name=NETWORK_NAME, network_id=NETWORK_ID, driver="bridge", internal=False, gateway=GATEWAY):
         net = FakeNetwork(self, name, network_id, driver=driver, internal=internal, gateway=gateway)
@@ -251,6 +258,8 @@ class FakeClient:
             settings["Networks"] = {}
             settings["Ports"] = {}
             self.engine_membership[container.id] = {}
+            if "dns" in config:
+                host["Dns"] = list(config["dns"]) if config["dns"] is not None else None
             return
         cfg["NetworkDisabled"] = False
         bindings = {}
@@ -272,6 +281,9 @@ class FakeClient:
                 net.id: {"name": net.name, "NetworkID": net.id, "IPAddress": "172.31.0.10"},
             }
             settings["Networks"] = self.inspect_membership(container)
+        if "dns" in config:
+            host["Dns"] = list(config["dns"]) if config["dns"] is not None else None
+
 
     def put(
         self,
@@ -283,6 +295,7 @@ class FakeClient:
         networks=None,
         bindings=None,
         published=None,
+        dns=None,
     ):
         container = self.make_container(name, status=status, container_id=container_id, disabled=disabled)
         if disabled:
@@ -311,6 +324,8 @@ class FakeClient:
             container.attrs["NetworkSettings"]["Ports"] = published
             if networks:
                 container.attrs["HostConfig"]["NetworkMode"] = next(iter(networks))
+        if dns is not None:
+            container.attrs["HostConfig"]["Dns"] = list(dns)
         self.store[name] = container
         return container
 
@@ -340,6 +355,7 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setenv("DOCKER_IMAGE", "python:3.12-slim")
     monkeypatch.delenv("OCU_SANDBOX_NO_AUTOSTART", raising=False)
     monkeypatch.delenv("SUBAGENT_CLI", raising=False)
+    monkeypatch.delenv("OCU_SANDBOX_DNS", raising=False)
     import docker_manager
 
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
@@ -1029,3 +1045,178 @@ def test_rejected_default_network_names_fail_before_create(world):
         assert client.created == []
         assert client.network_gets == []
         client.network_gets.clear()
+
+
+def _policy(monkeypatch, docker_manager, raw):
+    monkeypatch.setenv("OCU_SANDBOX_DNS", raw)
+
+
+def test_policy_create_pins_ordered_dns_and_empty_override(world, monkeypatch):
+    docker_manager, client, _tmp = world
+    _policy(monkeypatch, docker_manager, "8.8.8.8,1.1.1.1")
+    docker_manager._get_or_create_container(CHAT)
+    created = client.created[0]
+    assert created._create_config["dns"] == ["8.8.8.8", "1.1.1.1"]
+    assert created.attrs["HostConfig"]["Dns"] == ["8.8.8.8", "1.1.1.1"]
+    assert created.status == "running"
+
+    monkeypatch.setenv("OCU_SANDBOX_DNS", "")
+    docker_manager._get_or_create_container("aaaaaaaa-bbbb-cccc-dddd-ffffffffffff")
+    empty = client.created[1]
+    assert empty._create_config["dns"] == ["127.0.0.11"]
+    assert empty.attrs["HostConfig"]["Dns"] == ["127.0.0.11"]
+
+
+def test_absent_policy_create_does_not_send_dns(world):
+    docker_manager, client, _tmp = world
+    docker_manager._get_or_create_container(CHAT)
+    created = client.created[0]
+    assert "dns" not in created._create_config
+    assert "Dns" not in created.attrs["HostConfig"]
+
+
+def test_disabled_create_skips_dns_args_with_valid_or_invalid_policy(world, monkeypatch):
+    docker_manager, client, _tmp = world
+    docker_manager.ENABLE_NETWORK = False
+    _policy(monkeypatch, docker_manager, "8.8.8.8")
+    docker_manager._get_or_create_container(CHAT)
+    created = client.created[0]
+    assert created._create_config.get("network_disabled") is True
+    assert "dns" not in created._create_config
+    assert "Dns" not in created.attrs["HostConfig"]
+    assert client.network_gets == []
+
+    monkeypatch.setenv("OCU_SANDBOX_DNS", "not-an-ip")
+    with pytest.raises(docker_manager.SandboxDnsConfigError):
+        docker_manager._create_container("aaaaaaaa-bbbb-cccc-dddd-ffffffffffff", "owui-chat-invalid-dns")
+    assert len(client.created) == 1
+
+
+def test_metadata_recreate_uses_current_dns_policy(world, monkeypatch):
+    docker_manager, client, _tmp = world
+    _meta(docker_manager)
+    _policy(monkeypatch, docker_manager, "1.1.1.1")
+    assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    created = client.created[0]
+    assert created._create_config["dns"] == ["1.1.1.1"]
+    assert created.attrs["HostConfig"]["Dns"] == ["1.1.1.1"]
+    assert docker_manager.load_container_meta(CHAT)["user_email"] == "owner@example"
+
+
+def test_hostname_retry_keeps_current_dns(world, monkeypatch):
+    docker_manager, client, _tmp = world
+    _policy(monkeypatch, docker_manager, "8.8.8.8")
+    client.refuse_hostname = True
+    docker_manager._create_container(CHAT, _name(docker_manager))
+    created = client.created[0]
+    assert "hostname" not in created._create_config
+    assert created._create_config["dns"] == ["8.8.8.8"]
+    assert created.attrs["HostConfig"]["Dns"] == ["8.8.8.8"]
+
+
+def test_created_dns_mismatch_refuses_before_start(world, monkeypatch):
+    docker_manager, client, _tmp = world
+    _policy(monkeypatch, docker_manager, "8.8.8.8")
+    client.inspect_dns_mismatch = ["1.1.1.1"]
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager._create_container(CHAT, _name(docker_manager))
+    assert caught.value.status_code == 500
+    created = client.created[0]
+    assert created._started["n"] == 0
+    assert created._removed["value"] is False
+
+
+def test_running_reuse_refuses_inherited_or_reordered_dns(world, monkeypatch):
+    docker_manager, client, tmp = world
+    _policy(monkeypatch, docker_manager, "8.8.8.8,1.1.1.1")
+    inherited = client.put(_name(docker_manager), status="running", container_id="run-inherit")
+    ops_before = list(client.ops)
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager._get_or_create_container(CHAT)
+    assert caught.value.status_code == 409
+    assert inherited.status == "running"
+    assert inherited._started["n"] == 0
+    assert inherited._unpaused["n"] == 0
+    assert inherited._removed["value"] is False
+    assert client.ops == ops_before
+
+    reordered = client.put(
+        _name(docker_manager),
+        status="running",
+        container_id="run-reorder",
+        dns=["1.1.1.1", "8.8.8.8"],
+    )
+    with pytest.raises(docker_manager.LaunchFailed):
+        docker_manager._get_or_create_container(CHAT)
+    assert reordered.status == "running"
+    assert reordered._removed["value"] is False
+
+    compatible = client.put(
+        _name(docker_manager),
+        status="running",
+        container_id="run-ok",
+        dns=["8.8.8.8", "1.1.1.1"],
+    )
+    assert docker_manager._get_or_create_container(CHAT) is compatible
+    assert compatible._started["n"] == 0
+
+
+@pytest.mark.parametrize("status", ["running", "paused", "exited"])
+def test_launch_refuses_incompatible_dns_before_mutation(world, monkeypatch, status):
+    docker_manager, client, tmp = world
+    _policy(monkeypatch, docker_manager, "8.8.8.8")
+    _meta(docker_manager)
+    workspace = Path(docker_manager.USER_DATA_BASE_PATH) / CHAT
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "layer").write_text("keep")
+    meta_bytes = docker_manager._get_meta_path(CHAT).read_bytes()
+    container = client.put(
+        _name(docker_manager),
+        status=status,
+        container_id=f"dns-{status}",
+        networks={COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"}},
+        dns=["1.1.1.1"],
+    )
+    if status == "paused":
+        docker_manager.mark_sleeper_retired(CHAT, container)
+    ops_before = list(client.ops)
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager.launch_sandbox(CHAT)
+    assert caught.value.status_code == 409
+    assert container.status == status
+    assert container._started["n"] == 0
+    assert container._unpaused["n"] == 0
+    assert container._removed["value"] is False
+    assert client.ops == ops_before
+    assert docker_manager._get_meta_path(CHAT).read_bytes() == meta_bytes
+    assert (workspace / "layer").read_text() == "keep"
+
+
+def test_create_conflict_adopts_only_compatible_dns_winner(world, monkeypatch):
+    docker_manager, client, _tmp = world
+    _policy(monkeypatch, docker_manager, "8.8.8.8")
+    winner = client.put(_name(docker_manager), status="running", container_id="dns-win", dns=["8.8.8.8"])
+
+    def conflict(**config):
+        response = MagicMock(status_code=409, url="http://docker.test", reason="Conflict")
+        raise APIError("Conflict", response=response, explanation=b"conflict")
+
+    client.containers.create = conflict
+    adopted = docker_manager._create_container(CHAT, _name(docker_manager))
+    assert adopted is winner
+
+    client.seed_membership(winner, {NETWORK_NAME: {"NetworkID": NETWORK_ID, "IPAddress": "172.31.0.10"}})
+    winner.attrs["HostConfig"]["Dns"] = ["1.1.1.1"]
+    with pytest.raises(docker_manager.LaunchFailed):
+        docker_manager._create_container(CHAT, _name(docker_manager))
+    assert winner.status == "running"
+    assert winner._removed["value"] is False
+
+
+def test_invalid_dns_configuration_fails_without_docker(world, monkeypatch):
+    docker_manager, client, _tmp = world
+    monkeypatch.setenv("OCU_SANDBOX_DNS", "8.8.8.8,8.8.8.8")
+    with pytest.raises(docker_manager.SandboxDnsConfigError):
+        docker_manager.validate_sandbox_dns_configuration()
+    assert client.created == []
+    assert client.network_gets == []

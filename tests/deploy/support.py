@@ -18,6 +18,7 @@ PROVISION = ROOT / "deploy" / "provision-networks.sh"
 UP = ROOT / "deploy" / "up.sh"
 FIREWALL_INSTALL = ROOT / "deploy" / "firewall" / "docker-user-rules.sh"
 FIREWALL_CHECK = ROOT / "deploy" / "firewall" / "check.sh"
+CHECK_SANDBOX_DNS = ROOT / "deploy" / "check-sandbox-dns.sh"
 FAKE_DOCKER = ROOT / "tests" / "deploy" / "fakebin" / "docker"
 CORE_OVERRIDE = ROOT / "deploy" / "production-like-test" / "compose.core.override.yml"
 WEBUI_OVERRIDE = ROOT / "deploy" / "production-like-test" / "compose.webui.override.yml"
@@ -34,6 +35,7 @@ OCU_SERVICE = "computer-use-server"
 PROXY_TARGET = 8082
 PROXY_PUBLISHED = "8082"
 DEFAULT_ALLOW = "8.8.8.8/32,1.1.1.1/32"
+DEFAULT_DNS = "8.8.8.8"
 METADATA_ADDR = "169.254.169.254"
 OWNED_IPV4 = "OCU-SANDBOX-EGRESS"
 OWNED_IPV6 = "OCU-SANDBOX-EGRESS6"
@@ -79,11 +81,27 @@ def intended_core():
     return stack(
         {
             "workspace": service(networks={"default": {}}),
-            OCU_SERVICE: service(networks={"default": {}}),
+            OCU_SERVICE: service(
+                networks={"default": {}},
+                environment={"OCU_SANDBOX_DNS": DEFAULT_DNS},
+            ),
             "cleanup": service(networks={"default": {}}),
             "retention-guard": service(networks={"default": {}}),
         }
     )
+
+def with_core_dns(docs, value):
+    payload = dict(docs)
+    core = dict(payload["core.json"])
+    services = dict(core["services"])
+    service_body = dict(services[OCU_SERVICE])
+    environment = dict(service_body.get("environment") or {})
+    environment["OCU_SANDBOX_DNS"] = value
+    service_body["environment"] = environment
+    services[OCU_SERVICE] = service_body
+    core["services"] = services
+    payload["core.json"] = core
+    return payload
 
 
 def intended_webui():
@@ -173,6 +191,7 @@ def fake_env(state_dir: Path, extra=None):
     env["PUBLIC_BASE_URL"] = "http://localhost:8082/ocu"
     env["OCU_PROXY_IMAGE"] = "ocu-test-proxy:synthetic"
     env["OCU_SANDBOX_EGRESS_ALLOW"] = DEFAULT_ALLOW
+    env["OCU_SANDBOX_DNS"] = DEFAULT_DNS
     env["OCU_SANDBOX_EGRESS_LOCK"] = str(state_dir / "ocu-sandbox-egress.lock")
     if extra:
         env.update(extra)
@@ -193,6 +212,42 @@ def write_network(state_dir: Path, name, *, subnet, gateway, driver="bridge", in
     }
     (networks / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
 
+
+
+def write_containers(state_dir: Path, containers) -> Path:
+    path = state_dir / "containers.json"
+    path.write_text(json.dumps(containers), encoding="utf-8")
+    return path
+
+
+def sandbox_container(
+    *,
+    cid,
+    name,
+    state="running",
+    network_mode=None,
+    networks=None,
+    dns=None,
+    labels=None,
+    host_config=None,
+):
+    mode = SANDBOX_NETWORK if network_mode is None else network_mode
+    membership = {SANDBOX_NETWORK: {"NetworkID": f"id-{SANDBOX_NETWORK}", "IPAddress": "172.31.0.10"}}
+    if networks is not None:
+        membership = networks
+    host = {"NetworkMode": mode}
+    if dns is not None:
+        host["Dns"] = dns
+    if host_config:
+        host.update(host_config)
+    return {
+        "Id": cid,
+        "Name": name,
+        "State": state,
+        "Labels": dict(labels or {}),
+        "HostConfig": host,
+        "NetworkSettings": {"Networks": membership},
+    }
 
 def write_firewall(state_dir: Path, payload) -> Path:
     path = state_dir / "firewall.json"

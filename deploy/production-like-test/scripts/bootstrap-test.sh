@@ -9,6 +9,7 @@
 #   RETENTION_GUARD_IMAGE OCU_PROXY_IMAGE
 #   OCU_WEBUI_ORIGIN — absolute HTTP(S) origin, no path/credentials/query/fragment/slash
 #   OCU_SANDBOX_EGRESS_ALLOW — must be present; empty is deny-all
+#   OCU_SANDBOX_DNS — must be present; empty disables external sandbox DNS
 # Optional:
 #   OCU_ADMIN_CREDENTIALS_FILE — isolated-test output path; default unchanged
 #   POSTGRES_IMAGE OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
@@ -135,15 +136,26 @@ esac
 require_present OCU_SANDBOX_EGRESS_ALLOW
 safe_dotenv_value OCU_SANDBOX_EGRESS_ALLOW "$OCU_SANDBOX_EGRESS_ALLOW"
 export OCU_SANDBOX_EGRESS_ALLOW
-export PYTHONPATH="$source_root/deploy${PYTHONPATH:+:$PYTHONPATH}"
-python3 - "$source_root" <<'PY' || fail 'OCU_SANDBOX_EGRESS_ALLOW is invalid'
+require_present OCU_SANDBOX_DNS
+safe_dotenv_value OCU_SANDBOX_DNS "$OCU_SANDBOX_DNS"
+export OCU_SANDBOX_DNS
+export PYTHONPATH="$source_root/computer-use-server:$source_root/deploy${PYTHONPATH:+:$PYTHONPATH}"
+python3 - "$source_root" <<'PY' || fail 'OCU_SANDBOX_EGRESS_ALLOW or OCU_SANDBOX_DNS is invalid'
 import os
 import sys
 
+sys.path.insert(0, os.path.join(sys.argv[1], "computer-use-server"))
 sys.path.insert(0, os.path.join(sys.argv[1], "deploy"))
-from firewall.policy import parse_allowlist
+from firewall.policy import METADATA, parse_allowlist
+from netinspect import parse_ipv4_network
+import sandbox_dns
 
-parse_allowlist(os.environ["OCU_SANDBOX_EGRESS_ALLOW"])
+allow = parse_allowlist(os.environ["OCU_SANDBOX_EGRESS_ALLOW"])
+expected = sandbox_dns.parse_sandbox_dns(os.environ["OCU_SANDBOX_DNS"])
+control = parse_ipv4_network("OCU_PRIVATE_SUBNET", os.environ.get("OCU_PRIVATE_SUBNET", "172.30.0.0/24"))
+offenders = sandbox_dns.resolver_violations(expected, allow, control, METADATA)
+if offenders:
+    raise SystemExit(1)
 PY
 
 require_nonempty OCU_WEBUI_ORIGIN
@@ -251,6 +263,7 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' "OCU_SANDBOX_SUBNET=$sandbox_subnet"
     printf '%s\n' "OCU_SANDBOX_GATEWAY=$sandbox_gateway"
     printf '%s\n' "OCU_SANDBOX_EGRESS_ALLOW=$OCU_SANDBOX_EGRESS_ALLOW"
+    printf '%s\n' "OCU_SANDBOX_DNS=$OCU_SANDBOX_DNS"
     printf '%s\n' "OCU_PROXY_PORT=$proxy_port"
     printf '%s\n' "OCU_WEBUI_ORIGIN=$OCU_WEBUI_ORIGIN"
     printf '%s\n' "PUBLIC_BASE_URL=$public_base_url"

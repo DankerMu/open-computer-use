@@ -91,9 +91,10 @@ def _apply_env(monkeypatch, tmp_path):
     monkeypatch.delenv("OCU_SANDBOX_NO_AUTOSTART", raising=False)
     monkeypatch.delenv("OCU_SANDBOX_SUBNET", raising=False)
     monkeypatch.delenv("SUBAGENT_CLI", raising=False)
+    monkeypatch.delenv("OCU_SANDBOX_DNS", raising=False)
 
 
-def _container(name, status="running", container_id="cid-1"):
+def _container(name, status="running", container_id="cid-1", dns=None):
     container = MagicMock(name=name)
     container.name = name
     container.id = container_id
@@ -119,6 +120,8 @@ def _container(name, status="running", container_id="cid-1"):
             },
         },
     }
+    if dns is not None:
+        container.attrs["HostConfig"]["Dns"] = list(dns)
     removed = {"value": False}
     stopped = {"value": False}
     execs = []
@@ -224,6 +227,10 @@ def _docker(containers=None):
                         "HostPort": "" if host_port is None else str(host_port),
                     }]
             container.attrs["HostConfig"]["PortBindings"] = bindings
+        if "dns" in config:
+            container.attrs["HostConfig"]["Dns"] = (
+                list(config["dns"]) if config["dns"] is not None else None
+            )
         store[name] = container
         created.append(container)
         return container
@@ -291,8 +298,8 @@ def world(monkeypatch, tmp_path):
         docker_manager.ANTHROPIC_AUTH_TOKEN = saved_anthropic
         docker_manager._FLOCK_DEPTH.clear()
         docker_manager._chat_locks.clear()
-        docker_manager._docker_client = None
 
+        docker_manager._docker_client = None
 
 @pytest.fixture(scope="module")
 def app_module():
@@ -315,12 +322,14 @@ def app_module():
         "startup_idle_sweep": loaded.startup_idle_sweep,
         "reap_known_sandboxes": loaded.reap_known_sandboxes,
         "validate_idle_configuration": loaded.validate_idle_configuration,
+        "validate_sandbox_dns_configuration": loaded.validate_sandbox_dns_configuration,
     }
     saved_client = getattr(loaded, "_lifecycle_client", None)
     loaded.LifecycleError = docker_manager.LifecycleError
     loaded.startup_idle_sweep = lambda now=None: None
     loaded.reap_known_sandboxes = lambda now=None: None
     loaded.validate_idle_configuration = lambda *args, **kwargs: (600, 30)
+    loaded.validate_sandbox_dns_configuration = lambda: None
     with TestClient(loaded.app) as client:
         loaded._lifecycle_client = client
         try:
@@ -337,6 +346,7 @@ def app_module():
             assert loaded.startup_idle_sweep is saved["startup_idle_sweep"]
             assert loaded.reap_known_sandboxes is saved["reap_known_sandboxes"]
             assert loaded.validate_idle_configuration is saved["validate_idle_configuration"]
+            assert loaded.validate_sandbox_dns_configuration is saved["validate_sandbox_dns_configuration"]
             assert loaded.LifecycleError is saved["LifecycleError"]
 
 
@@ -357,8 +367,8 @@ def _meta(docker_manager, chat_id, **extra):
     return path
 
 
-def _put(client, name, status, container_id="cid-existing"):
-    container = _container(name, status=status, container_id=container_id)
+def _put(client, name, status, container_id="cid-existing", dns=None):
+    container = _container(name, status=status, container_id=container_id, dns=dns)
     client._store[name] = container
     return container
 
@@ -1826,3 +1836,34 @@ def test_mcp_tools_surface_stopped_and_corrupt_meta(monkeypatch, tool_name):
     assert result.startswith("Error:")
     assert "metadata" in result.lower()
     assert "corrupt" in result.lower()
+
+
+def test_stopped_tool_path_stays_sandbox_stopped_with_incompatible_dns(world, monkeypatch):
+    docker_manager, client, _clock, _tmp = world
+    monkeypatch.setenv("OCU_SANDBOX_DNS", "8.8.8.8")
+    container = _put(client, f"owui-chat-{CHAT}", "exited", dns=["1.1.1.1"])
+    with pytest.raises(docker_manager.SandboxStopped, match=STOPPED_MESSAGE):
+        docker_manager._get_or_create_container(CHAT)
+    assert container.status == "exited"
+    container.start.assert_not_called()
+    assert client._created == []
+
+
+def test_running_tool_reuse_refuses_incompatible_dns(world, monkeypatch):
+    docker_manager, client, _clock, _tmp = world
+    monkeypatch.setenv("OCU_SANDBOX_DNS", "8.8.8.8")
+    container = _put(client, f"owui-chat-{CHAT}", "running")
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager._get_or_create_container(CHAT)
+    assert caught.value.status_code == 409
+    container.start.assert_not_called()
+    container.remove.assert_not_called()
+
+
+def test_launch_compatible_dns_preserves_existing_success(world, monkeypatch):
+    docker_manager, client, _clock, _tmp = world
+    monkeypatch.setenv("OCU_SANDBOX_DNS", "8.8.8.8")
+    container = _put(client, f"owui-chat-{CHAT}", "exited", dns=["8.8.8.8"])
+    assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    assert container.status == "running"
+    container.remove.assert_not_called()
