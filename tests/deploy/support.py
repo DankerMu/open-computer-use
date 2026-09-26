@@ -230,6 +230,9 @@ def sandbox_container(
     dns=None,
     labels=None,
     host_config=None,
+    network_settings=None,
+    omit_host_config=False,
+    omit_network_settings=False,
 ):
     mode = SANDBOX_NETWORK if network_mode is None else network_mode
     membership = {SANDBOX_NETWORK: {"NetworkID": f"id-{SANDBOX_NETWORK}", "IPAddress": "172.31.0.10"}}
@@ -240,14 +243,19 @@ def sandbox_container(
         host["Dns"] = dns
     if host_config:
         host.update(host_config)
-    return {
+    body = {
         "Id": cid,
         "Name": name,
         "State": state,
         "Labels": dict(labels or {}),
-        "HostConfig": host,
-        "NetworkSettings": {"Networks": membership},
     }
+    if not omit_host_config:
+        body["HostConfig"] = host
+    if not omit_network_settings:
+        body["NetworkSettings"] = (
+            network_settings if network_settings is not None else {"Networks": membership}
+        )
+    return body
 
 def write_firewall(state_dir: Path, payload) -> Path:
     path = state_dir / "firewall.json"

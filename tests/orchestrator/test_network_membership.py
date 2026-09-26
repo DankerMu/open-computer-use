@@ -1161,7 +1161,7 @@ def test_running_reuse_refuses_inherited_or_reordered_dns(world, monkeypatch):
     assert compatible._started["n"] == 0
 
 
-@pytest.mark.parametrize("status", ["running", "paused", "exited"])
+@pytest.mark.parametrize("status", ["running", "paused", "exited", "created", "restarting"])
 def test_launch_refuses_incompatible_dns_before_mutation(world, monkeypatch, status):
     docker_manager, client, tmp = world
     _policy(monkeypatch, docker_manager, "8.8.8.8")
@@ -1177,7 +1177,7 @@ def test_launch_refuses_incompatible_dns_before_mutation(world, monkeypatch, sta
         networks={COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"}},
         dns=["1.1.1.1"],
     )
-    if status == "paused":
+    if status in {"paused", "restarting"}:
         docker_manager.mark_sleeper_retired(CHAT, container)
     ops_before = list(client.ops)
     with pytest.raises(docker_manager.LaunchFailed) as caught:
@@ -1187,6 +1187,8 @@ def test_launch_refuses_incompatible_dns_before_mutation(world, monkeypatch, sta
     assert container._started["n"] == 0
     assert container._unpaused["n"] == 0
     assert container._removed["value"] is False
+    if hasattr(container, "exec_run"):
+        assert container.exec_run.call_count == 0
     assert client.ops == ops_before
     assert docker_manager._get_meta_path(CHAT).read_bytes() == meta_bytes
     assert (workspace / "layer").read_text() == "keep"

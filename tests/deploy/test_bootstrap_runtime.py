@@ -342,6 +342,13 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertIn("OCU_SANDBOX_DNS=", self.runtime_path().read_text(encoding="utf-8"))
         self.assert_no_temp_residue()
 
+    def test_listed_nonempty_dns_is_published(self):
+        result = self.run_bootstrap({"OCU_SANDBOX_DNS": "8.8.8.8"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        self.assertEqual(runtime["OCU_SANDBOX_DNS"], "8.8.8.8")
+        self.assert_no_temp_residue()
+
     def test_origin_with_explicit_port_composes_public_base(self):
         origin = "https://workbench.example.test:8443"
         result = self.run_bootstrap({"OCU_WEBUI_ORIGIN": origin})
@@ -376,6 +383,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
             ({}, ["OCU_SANDBOX_DNS"]),
             ({"OCU_SANDBOX_DNS": "not-an-ip"}, None),
             ({"OCU_SANDBOX_DNS": "169.254.169.254"}, None),
+            ({"OCU_SANDBOX_DNS": "9.9.9.9"}, None),
             ({"OCU_WEBUI_ORIGIN": "https://workbench.example.test\nOCU_INTERNAL_TOKEN=injected"}, None),
         )
         for extra, unset in cases:

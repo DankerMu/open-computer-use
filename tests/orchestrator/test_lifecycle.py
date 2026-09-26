@@ -1177,6 +1177,60 @@ def test_lifespan_does_not_open_docker(app_module, monkeypatch, tmp_path):
     assert response.json()["status"] == "healthy"
 
 
+def test_lifespan_refuses_invalid_sandbox_dns_without_docker(tmp_path):
+    script = textwrap.dedent(
+        """
+        import os
+        import sys
+        import docker as docker_mod
+        from fastapi.testclient import TestClient
+
+        def fail(*_args, **_kwargs):
+            raise AssertionError("real docker client constructed")
+
+        docker_mod.DockerClient = fail
+        sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+        import docker_manager
+        import app
+
+        app.startup_preflight = lambda: 0
+        app.validate_idle_configuration = lambda *a, **k: (600, 30)
+        app.startup_idle_sweep = lambda now=None: None
+        app.reap_known_sandboxes = lambda now=None: None
+        try:
+            with TestClient(app.app):
+                raise SystemExit("lifespan accepted invalid DNS")
+        except docker_manager.SandboxDnsConfigError:
+            raise SystemExit(0)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(SERVER_DIR),
+        env={
+            **os.environ,
+            "OCU_SERVER_DIR": str(SERVER_DIR),
+            "OCU_INTERNAL_TOKEN": INTERNAL,
+            "MCP_API_KEY": MCP_KEY,
+            "OCU_WEBUI_ORIGIN": "https://webui.example",
+            "PUBLIC_BASE_URL": "/ocu",
+            "BASE_DATA_DIR": str(tmp_path / "data"),
+            "USER_DATA_BASE_PATH": str(tmp_path / "user-data"),
+            "CONTAINER_IDLE_TIMEOUT": "600",
+            "OCU_IDLE_POLL_SECONDS": "30",
+            "DOCKER_IMAGE": "python:3.12-slim",
+            "OCU_SANDBOX_DNS": "not-an-ip",
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr[-800:]
+    assert "real docker client constructed" not in completed.stderr
+    assert "lifespan accepted invalid DNS" not in completed.stderr
+    assert "lifespan accepted invalid DNS" not in completed.stdout
+
+
 def _mcp_tool(mcp_tools, tool_name):
     if tool_name == "view":
         return mcp_tools.view("inspect", "/tmp/file", None, None)

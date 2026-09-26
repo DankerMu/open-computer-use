@@ -69,7 +69,6 @@ def _reload_server():
             "mcp_tools",
             "docker_manager",
             "outputs_broker",
-            "context_vars",
             "security",
             "system_prompt",
             "skill_manager",
