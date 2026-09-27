@@ -100,6 +100,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._reply(503)
                 else:
                     self._reply(401)
+                return
             elif self.path == "/api/v1/auths/":
                 if cookie in {"session=owner", "session=foreign"}:
                     self._reply(200, b"authenticated")
@@ -107,9 +108,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._reply(503)
                 else:
                     self._reply(401)
+                return
             else:
-                self._reply(200, b"webui")
-            return
+                if not (self.path == "/ws/socket.io/?EIO=4&transport=websocket"
+                        and self.headers.get("Upgrade", "").lower() == "websocket"):
+                    self._reply(200, b"webui")
+                    return
         if self.headers.get("Upgrade", "").lower() == "websocket":
             key = self.headers.get("Sec-WebSocket-Key", "")
             digest = base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
@@ -118,8 +122,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "Upgrade")
             self.send_header("Sec-WebSocket-Accept", digest)
             self.end_headers()
-            self.wfile.write(b"\x81\x02ok")
-            self.wfile.flush()
+            if kind == "ocu":
+                self.wfile.write(b"\x81\x02ok")
+                self.wfile.flush()
             while True:
                 frame = self.rfile.read(2)
                 if len(frame) != 2:
@@ -133,6 +138,11 @@ class Handler(BaseHTTPRequestHandler):
                 if opcode & 0x0F == 9:
                     self.wfile.write(bytes((0x8A, len(decoded))) + decoded)
                     self.wfile.flush()
+                elif kind == "auth" and opcode & 0x0F == 1:
+                    self.wfile.write(bytes((0x81, len(decoded))) + decoded)
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
                 else:
                     return
         path = unquote(urlsplit(self.path).path)

@@ -9,6 +9,10 @@ http {
     access_log off;
     client_body_temp_path @@RUNTIME@@/client_body;
     proxy_temp_path @@RUNTIME@@/proxy;
+    map $http_upgrade $ocu_webui_connection_upgrade {
+        default upgrade;
+        '' close;
+    }
     # nginx expands dollar-prefixed names even inside quoted directive arguments.
     geo $ocu_dollar { default "$"; }
     map $http_origin $ocu_allowed_origin {
@@ -82,8 +86,11 @@ http {
         location /ocu/ { return 404; }
         location = /ocu { return 404; }
         location / {
+            proxy_http_version 1.1;
             proxy_pass @@WEBUI@@;
             proxy_set_header Authorization $http_authorization;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $ocu_webui_connection_upgrade;
             proxy_set_header Host $host;
             proxy_set_header X-Forwarded-For $remote_addr;
             proxy_set_header X-Forwarded-Proto $scheme;
