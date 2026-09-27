@@ -95,6 +95,22 @@ generated-content link selection, or mount Browser/Terminal/CLI clients. A
 newer request clears the old render and supersedes its result; tearing down
 the iframe releases owned effects.
 
+DOCX and SheetJS-converted HTML pass through locally pinned DOMPurify before
+insertion into the trusted DOM in both embedded and standalone previews.
+Approved elements are text headings/paragraphs, basic inline formatting,
+lists, code, tables, anchors and raster images. Only text, table layout,
+anchor and inline-image attributes survive: document styles, classes, scripts,
+event handlers, SVG/MathML, forms and embedded frames do not. Images must be
+inline base64 PNG/JPEG/GIF/WebP; remote document images are removed before
+attaching the sanitized fragment and cannot initiate a network fetch. Links
+are either surviving same-document bookmarks (rewritten to namespaced IDs)
+or explicit HTTP(S) URLs opened in a new tab with `noopener noreferrer`;
+unsafe links retain text without navigation.
+Embedded Mammoth style maps are disabled. Broker `.xls` files are the same
+`xlsx` type as `.xlsx`; CFB-contained BIFF8 and OOXML ZIP workbooks are both
+eligible, while arbitrary text disguised as a workbook is not. Raw legacy
+BIFF streams outside CFB are not admitted in Files-only embedding.
+
 The local real-SPA browser harness is
 `node tests/orchestrator/preview_embedding_browser.cjs` (Playwright 1.62.1
 and its Chromium required); its assets and Office fixtures are local.

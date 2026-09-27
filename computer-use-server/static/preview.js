@@ -69,6 +69,71 @@ function fetchOutput(url) {
 function officeBanner() {
   return `<div class="office-preview-banner"><strong>${t('content_preview')}</strong> ${t('content_preview_disclaimer')}</div>`;
 }
+// Office converters produce HTML from document-controlled bytes. Only this
+// detached, sanitized fragment may cross into the trusted preview DOM.
+function safeOfficeHtml(markup) {
+  if (!window.DOMPurify?.isSupported) throw new Error('Office sanitizer unavailable');
+  const inlineImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+  const blockRemoteImage = (node, data) => {
+    if (data.attrName === 'src' && node.nodeName.toLowerCase() === 'img'
+        && !inlineImage.test(data.attrValue)) data.keepAttr = false;
+  };
+  window.DOMPurify.addHook('uponSanitizeAttribute', blockRemoteImage);
+  let fragment;
+  try {
+    fragment = window.DOMPurify.sanitize(markup, {
+      RETURN_DOM_FRAGMENT: true,
+      ALLOWED_TAGS: ['p', 'div', 'span', 'br', 'strong', 'em', 'b', 'i', 'u', 's',
+        'sub', 'sup', 'blockquote', 'pre', 'code', 'ul', 'ol', 'li', 'h1', 'h2',
+        'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tfoot', 'tr',
+        'th', 'td', 'caption', 'a', 'img', 'hr'],
+      ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'colspan', 'rowspan', 'id', 'scope'],
+      FORBID_TAGS: ['script', 'style', 'svg', 'math', 'iframe', 'object', 'embed',
+        'form', 'link', 'meta', 'base', 'audio', 'video'],
+      FORBID_ATTR: ['style', 'srcset'],
+      ALLOW_DATA_ATTR: false,
+      ALLOW_ARIA_ATTR: false,
+      SANITIZE_NAMED_PROPS: true,
+    });
+  } finally {
+    window.DOMPurify.removeHook('uponSanitizeAttribute', blockRemoteImage);
+  }
+  for (const image of fragment.querySelectorAll('img')) {
+    const src = image.getAttribute('src') || '';
+    if (!inlineImage.test(src)) {
+      image.remove();
+    }
+  }
+  let ids = null;
+  for (const link of fragment.querySelectorAll('a[href]')) {
+    const href = link.getAttribute('href');
+    if (href.startsWith('#')) {
+      try {
+        ids ??= new Set(Array.from(fragment.querySelectorAll('[id]'), node => node.id));
+        const target = 'user-content-' + decodeURIComponent(href.slice(1));
+        if (ids.has(target)) link.setAttribute('href', '#' + encodeURIComponent(target));
+        else link.removeAttribute('href');
+      } catch {
+        link.removeAttribute('href');
+      }
+      continue;
+    }
+    let safe = false;
+    try {
+      const url = new URL(href, location.href);
+      safe = /^(https?:)$/.test(url.protocol) && !url.username && !url.password
+        && /^(https?:)?\/\//i.test(href);
+    } catch {
+      safe = false;
+    }
+    if (!safe) link.removeAttribute('href');
+    else {
+      link.setAttribute('target', '_blank');
+      link.setAttribute('rel', 'noopener noreferrer');
+    }
+  }
+  return fragment;
+}
 
 function normalizePath(path) {
   const parts = path.split('/');
@@ -437,12 +502,14 @@ async function renderDocxPreview(container, file, embedded = false) {
   container.innerHTML = officeBanner() + '<div class="markdown-body" id="docxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
   try {
     await loadScript(moduleAssetUrl('mammoth.browser.min.js'));
+    await loadScript(moduleAssetUrl('purify.min.js'));
     const resp = await fetchOutput(file.url);
     if (embedded && !resp.ok) throw new Error('Office response failed');
     const arrayBuffer = await resp.arrayBuffer();
-    const result = await mammoth.convertToHtml({ arrayBuffer });
+    const result = await mammoth.convertToHtml({ arrayBuffer }, { includeEmbeddedStyleMap: false });
+    const safe = safeOfficeHtml(result.value);
     const body = container.querySelector('#docxContainer');
-    if (body) body.innerHTML = result.value;
+    if (body) body.replaceChildren(safe);
   } catch (err) {
     if (embedded) {
       container.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
@@ -470,13 +537,22 @@ async function renderXlsxPreview(container, file, embedded = false) {
   container.innerHTML = officeBanner() + '<div class="data-table-wrap" id="xlsxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
   try {
     await loadScript(moduleAssetUrl('xlsx.full.min.js'));
+    await loadScript(moduleAssetUrl('purify.min.js'));
     const resp = await fetchOutput(file.url);
     if (embedded && !resp.ok) throw new Error('Office response failed');
     const arrayBuffer = await resp.arrayBuffer();
     if (embedded) {
-      await loadScript(moduleAssetUrl('jszip.min.js'));
-      const zip = await JSZip.loadAsync(arrayBuffer.slice(0));
-      if (!zip.file('xl/workbook.xml')) throw new Error('Invalid Office workbook');
+      const signature = new Uint8Array(arrayBuffer, 0, Math.min(arrayBuffer.byteLength, 8));
+      const zip = signature.length >= 4 && signature[0] === 0x50 && signature[1] === 0x4b
+        && signature[2] === 0x03 && signature[3] === 0x04;
+      const biff = signature.length === 8
+        && [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1].every((byte, i) => signature[i] === byte);
+      if (!zip && !biff) throw new Error('Invalid Office workbook');
+      if (zip) {
+        await loadScript(moduleAssetUrl('jszip.min.js'));
+        const contents = await JSZip.loadAsync(arrayBuffer.slice(0));
+        if (!contents.file('xl/workbook.xml')) throw new Error('Invalid Office workbook');
+      }
     }
     const workbook = XLSX.read(arrayBuffer, { type: 'array', cellFormula: true, cellNF: true, sheetStubs: true, raw: false });
     if (embedded && !workbook.SheetNames.length) throw new Error('Empty Office workbook');
@@ -494,7 +570,7 @@ async function renderXlsxPreview(container, file, embedded = false) {
     function renderSheet(index) {
       const sheet = workbook.Sheets[workbook.SheetNames[index]];
       const content = xlsxContainer.querySelector('#sheetContent');
-      content.innerHTML = XLSX.utils.sheet_to_html(sheet, { editable: false, id: 'xlsx' });
+      content.replaceChildren(safeOfficeHtml(XLSX.utils.sheet_to_html(sheet, { editable: false, id: 'xlsx' })));
       markUncomputedFormulaCells(content, sheet);
     }
     renderSheet(0);
@@ -1495,7 +1571,8 @@ function embeddedFileDisposition(file) {
     if (parts.some((part) => !part || part === '.' || part === '..' || part.includes('\\'))) return 'error';
     const base = new URL(FILES_BASE + '/', location.origin);
     if (base.origin !== location.origin || base.search || base.hash) return 'error';
-    const expected = new URL(base.href + parts.map(encodeURIComponent).join('/'));
+    const expected = new URL(base.href + parts.map((part) => encodeURIComponent(part)
+      .replace(/[!'()*]/g, (char) => '%' + char.charCodeAt(0).toString(16).toUpperCase())).join('/'));
     const actual = new URL(file.url, location.origin);
     if (actual.origin !== location.origin || actual.href !== expected.href) return 'error';
   } catch {

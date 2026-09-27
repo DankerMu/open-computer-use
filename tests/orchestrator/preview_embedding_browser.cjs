@@ -25,6 +25,14 @@ const files = [
   { file_id: 'sheet', path: 'valid.xlsx', type: 'xlsx', mime: OFFICE_MIME.xlsx },
   { file_id: 'broken', path: 'broken.xlsx', type: 'xlsx', mime: OFFICE_MIME.xlsx },
   { file_id: 'deck', path: 'broken.pptx', type: 'pptx', mime: OFFICE_MIME.pptx },
+  { file_id: 'deck-valid', path: 'valid.pptx', type: 'pptx', mime: OFFICE_MIME.pptx },
+  { file_id: 'biff', path: 'valid.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'punct', path: "report (1)!'.docx", type: 'docx', mime: OFFICE_MIME.docx,
+    url: `/ocu/files/${CHAT}/report%20%281%29%21%27.docx` },
+  { file_id: 'hostile', path: 'hostile.docx', type: 'docx', mime: OFFICE_MIME.docx },
+  { file_id: 'corrupt-doc', path: 'corrupt.docx', type: 'docx', mime: OFFICE_MIME.docx },
+  { file_id: 'slow-sheet', path: 'slow.xlsx', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'hostile-sheet', path: 'hostile.xlsx', type: 'xlsx', mime: OFFICE_MIME.xlsx },
   { file_id: 'svg', path: 'vector.svg', type: 'image', mime: 'image/svg+xml' },
   { file_id: 'xhtml', path: 'page.xhtml', type: 'other', mime: 'application/xhtml+xml' },
   { file_id: 'xml', path: 'data.xml', type: 'code', mime: 'application/xml' },
@@ -39,12 +47,16 @@ const requests = [];
 let slowRequested;
 const slowArrival = new Promise(resolve => { slowRequested = resolve; });
 const held = [];
+let sheetRequested;
+const sheetArrival = new Promise(resolve => { sheetRequested = resolve; });
+const heldSheets = [];
 const heldListings = [];
 const within = (promise, name) => Promise.race([
   promise,
   new Promise((_, reject) => setTimeout(() => reject(new Error(`${name} timed out`)), 10000).unref()),
 ]);
 let listMode = 'normal';
+let injectedListingFailure = false;
 const bytes = {};
 const contentTypes = { '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2' };
 const respond = (res, status, body, type = 'application/json') => {
@@ -83,8 +95,19 @@ const server = http.createServer(async (req, res) => {
       return respond(res, 200, html, 'text/html');
     }
     if (url.pathname === '/ocu/api/outputs/' + CHAT) {
-      if (listMode === 'failure') return respond(res, 503, '{}');
+      if (listMode === 'failure') {
+        injectedListingFailure = true;
+        return respond(res, 503, '{}');
+      }
       if (listMode === 'timeout') { heldListings.push(res); return; }
+      if (listMode === 'standalone') {
+        const file = { file_id: 'hostile', path: 'hostile.docx', name: 'hostile.docx',
+          type: 'docx', mime: OFFICE_MIME.docx, size: 128, revision: 1,
+          url: `/ocu/files/${CHAT}/hostile.docx` };
+        return respond(res, 200, JSON.stringify({
+          chat_id: CHAT, files: [file], total: 1, revision: 1, next_cursor: null,
+        }));
+      }
       const entries = files.filter(f => listMode !== 'deleted' || f.file_id !== 'doc');
       const all = [...Array.from({ length: 100 }, (_, i) => ({
         file_id: `filler-${i}`, path: `filler-${i}.txt`, type: 'text', mime: 'text/plain',
@@ -98,21 +121,45 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname.startsWith(`/ocu/files/${CHAT}/`)) {
       if (url.pathname.endsWith('/slow.docx')) { held.push(res); slowRequested(); return; }
+      if (url.pathname.endsWith('/slow.xlsx')) { heldSheets.push(res); sheetRequested(); return; }
       const name = decodeURIComponent(url.pathname.slice(`/ocu/files/${CHAT}/`.length));
       if (!(name in bytes)) return respond(res, 404, 'Not found', 'text/plain');
       return respond(res, 200, bytes[name], 'application/octet-stream');
     }
+    if (url.pathname === `/ocu/browser/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false, pages: [] }));
+    if (url.pathname === `/ocu/terminal/${CHAT}/processes`) return respond(res, 200, JSON.stringify({ processes: [] }));
+    if (url.pathname === `/ocu/terminal/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false }));
+    if (url.pathname === `/ocu/terminal/${CHAT}/sessions`) return respond(res, 200, JSON.stringify({ sessions: [] }));
+    if (url.pathname === `/ocu/api/uploads/${CHAT}/list`) return respond(res, 200, JSON.stringify({ files: [], total: 0 }));
+    if (url.pathname === `/api/v1/ocu/workspaces/${CHAT}`) return respond(res, 200, JSON.stringify({ cli_badge: null }));
     if (url.pathname === '/favicon.ico') return respond(res, 204, '', 'text/plain');
     if (url.pathname === '/parent') return respond(res, 200, `<!doctype html><html><body>
       <script src="/ocu/static/jszip.min.js"></script><script src="/ocu/static/xlsx.full.min.js"></script>
+      <script src="/ocu/static/mammoth.browser.min.js"></script>
       <script>
         window.states=[];
-        window.addEventListener('message', e => { if(e.origin===location.origin) window.states.push(e.data); if(e.data?.type==='opaque-done') window.opaqueDone=true; });
+        window.beacons={};
+        window.retiredFrames=new Set();
+        window.postRetirement=[];
+        window.addEventListener('message', e => {
+          if(e.data?.type==='sibling-done' || e.data?.type==='opaque-done') {
+            window.beacons[e.data.type]={origin:e.origin, source:e.source};
+          }
+          const current=document.querySelector('#preview')?.contentWindow;
+          if(e.source===current && e.origin===location.origin && e.data
+              && typeof e.data==='object' && typeof e.data.type==='string'
+              && e.data.type.startsWith('ocu:preview-')) window.states.push(e.data);
+          if(e.origin===location.origin && window.retiredFrames.has(e.source) && e.data
+              && typeof e.data==='object' && typeof e.data.type==='string'
+              && e.data.type.startsWith('ocu:preview-')) window.postRetirement.push(e.data);
+        });
         window.select=(file_id,generation,extra={})=>document.querySelector('#preview').contentWindow.postMessage(
           {type:'ocu:preview-select',chat_id:'${CHAT}',file_id,generation,...extra},location.origin);
         window.mount=(query='?embed=files')=>{const frame=document.createElement('iframe');frame.id='preview';
           frame.setAttribute('sandbox','allow-scripts allow-same-origin allow-forms');
           frame.src='/ocu/preview/${CHAT}'+query;document.body.appendChild(frame);};
+        window.retire=()=>{const frame=document.querySelector('#preview');
+          window.retiredFrames.add(frame.contentWindow);frame.remove();};
       </script></body></html>`, 'text/html');
     return respond(res, 404, 'Not found', 'text/plain');
   } catch (error) { respond(res, 500, String(error), 'text/plain'); }
@@ -124,39 +171,161 @@ async function main() {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
   const browser = await playwright.chromium.launch({ headless: true });
-  const page = await browser.newPage();
-  page.setDefaultTimeout(10000);
-  const consoleErrors = [];
-  page.on('pageerror', error => consoleErrors.push(String(error)));
-  page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()); });
-  const frame = () => page.frameLocator('#preview');
-  const waitState = async (generation, state, timeout = 10000) => {
-    await page.waitForFunction(({ generation, state }) => window.states.some(row =>
-      row.type === 'ocu:preview-state' && row.generation === generation && row.state === state),
-    { generation, state }, { timeout });
-    const result = (await page.evaluate(g => window.states.filter(row => row.generation === g), generation)).at(-1);
-    assert.deepEqual(Object.keys(result).sort(), ['chat_id', 'file_id', 'generation', 'state', 'type']);
-    assert.equal(result.chat_id, CHAT);
-    return result;
-  };
   try {
+    const context = await browser.newContext();
+    context.setDefaultTimeout(10000);
+    const page = await context.newPage();
+    page.setDefaultTimeout(10000);
+    const consoleErrors = [];
+    page.on('pageerror', error => consoleErrors.push({ text: String(error), url: '' }));
+    const expectedAbortUrls = [];
+    const unexpectedNetworkFailures = [];
+    page.on('requestfailed', request => {
+      const failure = request.failure()?.errorText || '';
+      if (failure.includes('ERR_ABORTED') && (request.url().includes(`/ocu/api/outputs/${CHAT}`)
+          || request.url().endsWith('/slow.docx'))) expectedAbortUrls.push(request.url());
+      else unexpectedNetworkFailures.push(`${request.url()}: ${failure}`);
+    });
+    const externalRequests = [];
+    await context.route('**/*', route => {
+      const url = route.request().url();
+      if (/^https?:/.test(url) && !url.startsWith(origin + '/')) {
+        externalRequests.push(url);
+        return route.abort();
+      }
+      return route.continue();
+    });
+    let accepted503 = 0;
+    page.on('console', message => {
+      if (message.type() !== 'error') return;
+      const text = message.text();
+      const url = message.location().url;
+      const expectedBrokerUrl = `${origin}/ocu/api/outputs/${CHAT}`;
+      if (injectedListingFailure && accepted503 === 0 && text.includes('503')
+          && (url.startsWith(expectedBrokerUrl) || text.includes(expectedBrokerUrl))) {
+        accepted503++;
+        return;
+      }
+      consoleErrors.push({ text, url });
+    });
+    const frame = () => page.frameLocator('#preview');
+    const waitState = async (generation, state, timeout = 10000) => {
+      await page.waitForFunction(({ generation, state }) => window.states.some(row =>
+        row.type === 'ocu:preview-state' && row.generation === generation && row.state === state),
+      { generation, state }, { timeout });
+      const result = (await page.evaluate(g => window.states.filter(row => row.generation === g), generation)).at(-1);
+      assert.deepEqual(Object.keys(result).sort(), ['chat_id', 'file_id', 'generation', 'state', 'type']);
+      assert.equal(result.chat_id, CHAT);
+      return result;
+    };
     await page.goto(origin + '/parent');
     const fixture = await page.evaluate(async () => {
-      const zip = new JSZip();
-      zip.file('[Content_Types].xml', `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`);
-      zip.file('_rels/.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`);
-      zip.file('word/document.xml', `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello Office</w:t></w:r></w:p></w:body></w:document>`);
-      zip.file('word/_rels/document.xml.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>');
-      const doc = Array.from(await zip.generateAsync({ type: 'uint8array' }));
+      const relNS = 'http://schemas.openxmlformats.org/package/2006/relationships';
+      const officeNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+      const typesNS = 'http://schemas.openxmlformats.org/package/2006/content-types';
+      const makeDoc = async (text, hostile = false) => {
+        const zip = new JSZip();
+        zip.file('[Content_Types].xml', `<Types xmlns="${typesNS}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`);
+        zip.file('_rels/.rels', `<Relationships xmlns="${relNS}"><Relationship Id="rId1" Type="${officeNS}/officeDocument" Target="word/document.xml"/></Relationships>`);
+        const links = hostile ? `<w:hyperlink r:id="evil"><w:r><w:t>Unsafe link</w:t></w:r></w:hyperlink>
+          <w:hyperlink r:id="safe"><w:r><w:t>Safe link</w:t></w:r></w:hyperlink>
+          <w:hyperlink w:anchor="section"><w:r><w:t>Go to section</w:t></w:r></w:hyperlink>` : '';
+        const blocks = hostile ? `<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Table cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+          <w:p><w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/><wp:docPr id="1" name="pixel"/>
+            <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+              <pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="pixel.png"/><pic:cNvPicPr/></pic:nvPicPr>
+                <pic:blipFill><a:blip r:embed="image"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+                <pic:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+              </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>` : '';
+        zip.file('word/document.xml', `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="${officeNS}"
+          xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+          <w:body><w:p>${hostile ? '<w:bookmarkStart w:id="7" w:name="section"/>' : ''}<w:r><w:rPr><w:b/></w:rPr><w:t>${text}</w:t></w:r>${links}${hostile ? '<w:bookmarkEnd w:id="7"/>' : ''}</w:p>${blocks}</w:body></w:document>`);
+        zip.file('word/_rels/document.xml.rels', hostile
+          ? `<Relationships xmlns="${relNS}"><Relationship Id="evil" Type="${officeNS}/hyperlink" Target="javascript:parent.__docxExecuted=1;void(0)" TargetMode="External"/>
+            <Relationship Id="safe" Type="${officeNS}/hyperlink" Target="https://example.invalid/safe" TargetMode="External"/>
+            <Relationship Id="image" Type="${officeNS}/image" Target="media/pixel.png"/></Relationships>`
+          : `<Relationships xmlns="${relNS}"/>`);
+        if (hostile) {
+          zip.file('mammoth/style-map', 'p => iframe');
+          zip.file('word/media/pixel.png', Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XwN8AAAAASUVORK5CYII='), c => c.charCodeAt(0)));
+        }
+        return Array.from(await zip.generateAsync({ type: 'uint8array' }));
+      };
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['Report'], ['Visible cell']]), 'Evidence');
-      const sheet = Array.from(new Uint8Array(XLSX.write(wb, { bookType: 'xlsx', type: 'array' })));
-      return { doc, sheet };
+      const formulaSheet = XLSX.utils.aoa_to_sheet([['Report'], ['Visible cell'], ['']]);
+      formulaSheet.A3 = { t: 'n', f: '1+1' };
+      XLSX.utils.book_append_sheet(wb, formulaSheet, 'Evidence');
+      const biffBook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(biffBook, XLSX.utils.aoa_to_sheet([['Report'], ['Visible cell']]), 'Evidence');
+      const linkedBook = XLSX.utils.book_new();
+      const linkedSheet = XLSX.utils.aoa_to_sheet([['Report'], ['Unsafe cell link']]);
+      linkedSheet.A2.l = { Target: 'javascript:parent.__sheetExecuted=1;void(0)' };
+      XLSX.utils.book_append_sheet(linkedBook, linkedSheet, 'Evidence');
+      const oldBook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(oldBook, XLSX.utils.aoa_to_sheet([['Report'], ['Older sheet']]), 'Evidence');
+      const ppt = new JSZip();
+      ppt.file('[Content_Types].xml', `<Types xmlns="${typesNS}">
+        <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+        <Default Extension="xml" ContentType="application/xml"/>
+        <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+        <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+        <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
+        <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+        <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/></Types>`);
+      ppt.file('_rels/.rels', `<Relationships xmlns="${relNS}"><Relationship Id="rId1" Type="${officeNS}/officeDocument" Target="ppt/presentation.xml"/></Relationships>`);
+      ppt.file('ppt/presentation.xml', `<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="${officeNS}"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId2"/></p:sldMasterIdLst><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="5143500"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>`);
+      ppt.file('ppt/_rels/presentation.xml.rels', `<Relationships xmlns="${relNS}"><Relationship Id="rId1" Type="${officeNS}/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="${officeNS}/slideMaster" Target="slideMasters/slideMaster1.xml"/></Relationships>`);
+      ppt.file('ppt/slides/slide1.xml', `<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>
+        <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+        <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+        <p:sp><p:nvSpPr><p:cNvPr id="2" name="Office text"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr><a:xfrm><a:off x="600000" y="600000"/><a:ext cx="8000000" cy="1000000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></p:spPr>
+          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" sz="2400"/><a:t>Hello Deck</a:t></a:r></a:p></p:txBody>
+        </p:sp></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`);
+      ppt.file('ppt/slides/_rels/slide1.xml.rels', `<Relationships xmlns="${relNS}"><Relationship Id="rId1" Type="${officeNS}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>`);
+      const group = `<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree>`;
+      ppt.file('ppt/slideLayouts/slideLayout1.xml', `<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" type="blank" preserve="1"><p:cSld>${group}</p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>`);
+      ppt.file('ppt/slideLayouts/_rels/slideLayout1.xml.rels', `<Relationships xmlns="${relNS}"><Relationship Id="rId1" Type="${officeNS}/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>`);
+      ppt.file('ppt/slideMasters/slideMaster1.xml', `<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${officeNS}"><p:cSld>${group}</p:cSld><p:clrMap accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" bg1="lt1" bg2="lt2" folHlink="folHlink" hlink="hlink" tx1="dk1" tx2="dk2"/><p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst></p:sldMaster>`);
+      ppt.file('ppt/slideMasters/_rels/slideMaster1.xml.rels', `<Relationships xmlns="${relNS}"><Relationship Id="rId1" Type="${officeNS}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="${officeNS}/theme" Target="../theme/theme1.xml"/></Relationships>`);
+      ppt.file('ppt/theme/theme1.xml', `<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office"><a:themeElements>
+        <a:clrScheme name="Office"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="222222"/></a:dk2><a:lt2><a:srgbClr val="EEEEEE"/></a:lt2><a:accent1><a:srgbClr val="FF0000"/></a:accent1><a:accent2><a:srgbClr val="008000"/></a:accent2><a:accent3><a:srgbClr val="0000FF"/></a:accent3><a:accent4><a:srgbClr val="FFFF00"/></a:accent4><a:accent5><a:srgbClr val="00FFFF"/></a:accent5><a:accent6><a:srgbClr val="FF00FF"/></a:accent6><a:hlink><a:srgbClr val="0000FF"/></a:hlink><a:folHlink><a:srgbClr val="800080"/></a:folHlink></a:clrScheme>
+        <a:fontScheme name="Office"><a:majorFont><a:latin typeface="Arial"/></a:majorFont><a:minorFont><a:latin typeface="Arial"/></a:minorFont></a:fontScheme>
+        <a:fmtScheme name="Office"><a:fillStyleLst><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln w="9525"><a:solidFill><a:schemeClr val="dk1"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme>
+      </a:themeElements></a:theme>`);
+      return {
+        doc: await makeDoc('Hello Office'), oldDoc: await makeDoc('Older Office'),
+        hostile: await makeDoc('Safe content', true),
+        sheet: Array.from(new Uint8Array(XLSX.write(wb, { bookType: 'xlsx', type: 'array' }))),
+        biff: Array.from(new Uint8Array(XLSX.write(biffBook, { bookType: 'biff8', type: 'array' }))),
+        hostileSheet: Array.from(new Uint8Array(XLSX.write(linkedBook, { bookType: 'xlsx', type: 'array' }))),
+        oldSheet: Array.from(new Uint8Array(XLSX.write(oldBook, { bookType: 'xlsx', type: 'array' }))),
+        deck: Array.from(await ppt.generateAsync({ type: 'uint8array' })),
+      };
     });
+    const styleMapEvidence = await page.evaluate(async (raw) => {
+      const arrayBuffer = Uint8Array.from(raw).buffer;
+      const enabled = await mammoth.convertToHtml({ arrayBuffer: arrayBuffer.slice(0) }, { includeEmbeddedStyleMap: true });
+      const disabled = await mammoth.convertToHtml({ arrayBuffer: arrayBuffer.slice(0) }, { includeEmbeddedStyleMap: false });
+      return { enabled: enabled.value, disabled: disabled.value };
+    }, fixture.hostile);
+    assert(styleMapEvidence.enabled.includes('<iframe'), 'embedded hostile style-map fixture was not consumed');
+    assert(!styleMapEvidence.disabled.includes('<iframe'), 'embedded style-map remained active');
+    assert(styleMapEvidence.disabled.includes('javascript:parent.__docxExecuted'),
+      'DOCX fixture did not expose the unsafe link when style maps were disabled');
     bytes['valid.docx'] = Buffer.from(fixture.doc);
-    bytes['slow.docx'] = bytes['valid.docx'];
+    bytes['slow.docx'] = Buffer.from(fixture.oldDoc);
+    bytes["report (1)!'.docx"] = Buffer.from(fixture.doc);
+    bytes['hostile.docx'] = Buffer.from(fixture.hostile);
+    bytes['corrupt.docx'] = Buffer.from('not an Office ZIP');
     bytes['valid.xlsx'] = Buffer.from(fixture.sheet);
+    bytes['hostile.xlsx'] = Buffer.from(fixture.hostileSheet);
+    bytes['valid.xls'] = Buffer.from(fixture.biff);
+    bytes['slow.xlsx'] = Buffer.from(fixture.oldSheet);
     bytes['broken.xlsx'] = Buffer.from('not an Office ZIP');
+    bytes['valid.pptx'] = Buffer.from(fixture.deck);
     bytes['broken.pptx'] = Buffer.from('not an Office ZIP');
 
     await page.evaluate(() => window.mount());
@@ -167,17 +336,17 @@ async function main() {
     assert.equal(before, 0, 'embedded page polls before selection');
     const bad = { type:'ocu:preview-select', chat_id:CHAT, file_id:'broken', generation:0 };
     await frame().locator('#app').waitFor();
-    await page.evaluate(payload => {
+    await page.evaluate(({ payload, target }) => {
       const iframe = document.createElement('iframe');
-      iframe.srcdoc = `<script>parent.frames[0].postMessage(${JSON.stringify(payload)}, location.origin);parent.postMessage({type:'sibling-done'}, location.origin)<\/script>`;
+      iframe.srcdoc = `<script>parent.frames[0].postMessage(${JSON.stringify(payload)}, ${JSON.stringify(target)});parent.postMessage({type:'sibling-done'}, ${JSON.stringify(target)})<\/script>`;
       document.body.appendChild(iframe);
-    }, bad);
-    await page.evaluate(payload => {
+    }, { payload: bad, target: origin });
+    await page.evaluate(({ payload, target }) => {
       const iframe = document.createElement('iframe');
       iframe.setAttribute('sandbox', 'allow-scripts');
-      iframe.srcdoc = `<script>parent.frames[0].postMessage(${JSON.stringify(payload)}, '*');parent.postMessage({type:'opaque-done'}, '*')<\/script>`;
+      iframe.srcdoc = `<script>parent.frames[0].postMessage(${JSON.stringify(payload)}, ${JSON.stringify(target)});parent.postMessage({type:'opaque-done'}, ${JSON.stringify(target)})<\/script>`;
       document.body.appendChild(iframe);
-    }, bad);
+    }, { payload: bad, target: origin });
     await frame().locator('#app').evaluate((element, payload) => {
       window.dispatchEvent(new MessageEvent('message', { data: payload, source: window.parent, origin: 'https://wrong.example' }));
       window.dispatchEvent(new MessageEvent('message', { data: payload, source: window, origin: location.origin }));
@@ -189,8 +358,10 @@ async function main() {
       window.select('', 0);
       window.select('doc', 0, { chat_id: 'wrong-chat' });
     });
-    await page.waitForFunction(() => window.states.some(row => row.type === 'sibling-done'));
-    await page.waitForFunction(() => window.opaqueDone === true);
+    await page.waitForFunction(() => window.beacons['sibling-done']);
+    await page.waitForFunction(() => window.beacons['opaque-done']);
+    assert.equal((await page.evaluate(() => window.beacons['opaque-done'].origin)), 'null');
+    assert.equal(await page.evaluate(() => window.beacons['sibling-done'].source === document.querySelector('#preview').contentWindow), false);
     await frame().locator('#app').evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
     assert.equal(requests.filter(row => row.path.includes('/api/outputs/')).length, before);
     assert.equal((await page.evaluate(() => window.states.filter(row => row.type === 'ocu:preview-state'))).length, 0);
@@ -207,6 +378,7 @@ async function main() {
       source: window, origin: location.origin,
     })));
     await frame().locator('.preview-stage').getByText('Visible cell').waitFor();
+    assert.equal(await frame().locator('.preview-stage .xlsx-uncomputed').textContent(), 'uncomputed');
     await page.evaluate(() => window.select('broken', 2));
     await waitState(2, 'error');
     await frame().locator('.preview-stage .empty-state').waitFor();
@@ -270,15 +442,101 @@ async function main() {
       () => window.__officeCompleted === 2, null, { timeout: 10000 });
     assert.equal((await page.evaluate(() => window.states.filter(row => row.generation === 17))).length, 1);
     assert.equal(await frame().locator('.preview-stage').getByText('Hello Office').count(), 1);
+    assert.equal(await frame().locator('.preview-stage').getByText('Older Office').count(), 0);
+    await page.evaluate(() => window.select('deck-valid', 19));
+    await waitState(19, 'ready');
+    const visibleSlide = await frame().locator('canvas.pptx-slide').evaluate(canvas => {
+      const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      let red = 0;
+      for (let i = 0; i < pixels.length; i += 4) {
+        if (pixels[i + 3] && pixels[i] > 200 && pixels[i + 1] < 80 && pixels[i + 2] < 80) red++;
+      }
+      return red;
+    });
+    assert(visibleSlide > 100, 'real PPTX slide did not paint its red text panel');
+    await page.screenshot({ path: path.join(artifacts, 'valid-presentation.png') });
+    await page.evaluate(() => window.select('biff', 20));
+    await waitState(20, 'ready');
+    await frame().locator('.preview-stage').getByText('Visible cell').waitFor();
+    await page.evaluate(() => window.select('punct', 21));
+    await waitState(21, 'ready');
+    assert(requests.some(row => row.path === `/ocu/files/${CHAT}/report%20%281%29%21%27.docx`));
+    await page.evaluate(() => window.select('hostile', 22));
+    await waitState(22, 'ready');
+    await frame().locator('.preview-stage').getByText('Safe content').waitFor();
+    assert.equal(await frame().locator('.preview-stage strong').filter({ hasText: 'Safe content' }).count(), 1);
+    await frame().locator('.preview-stage').getByText('Table cell').waitFor();
+    const inlineImages = await frame().locator('.preview-stage img[src^="data:image/png;base64,"]').count();
+    assert.equal(inlineImages, 1, 'supported DOCX inline raster image lost');
+    const decodedImageWidth = await frame().locator('.preview-stage img').evaluate(async image => {
+      await image.decode();
+      return image.naturalWidth;
+    });
+    assert.equal(decodedImageWidth, 1);
+    const unsafe = frame().locator('.preview-stage a').filter({ hasText: 'Unsafe link' });
+    assert.equal(await unsafe.getAttribute('href'), null);
+    await unsafe.click();
+    assert.equal(await page.evaluate(() => window.__docxExecuted), undefined);
+    assert.equal(await frame().locator('#app').evaluate(() => window.__docxExecuted), undefined);
+    const safeLink = frame().locator('.preview-stage a').filter({ hasText: 'Safe link' });
+    assert.equal(await safeLink.getAttribute('href'), 'https://example.invalid/safe');
+    assert.equal(await safeLink.getAttribute('target'), '_blank');
+    assert.equal(await safeLink.getAttribute('rel'), 'noopener noreferrer');
+    const bookmark = frame().locator('.preview-stage a').filter({ hasText: 'Go to section' });
+    assert.equal(await bookmark.getAttribute('href'), '#user-content-section');
+    assert.equal(await frame().locator('.preview-stage [id="user-content-section"]').count(), 1);
+    assert.equal(await frame().locator('.preview-stage .markdown-body').locator('script, style, svg, iframe, [onclick], [onerror], [style]').count(), 0);
+    assert.deepEqual(externalRequests, [], 'document content caused an external request');
+    await page.screenshot({ path: path.join(artifacts, 'sanitized-office.png') });
+    await page.evaluate(() => window.select('corrupt-doc', 23));
+    await waitState(23, 'error');
+    await frame().locator('.preview-stage .empty-state').waitFor();
+    const rawSheetMarkup = await page.evaluate(data => {
+      const workbook = XLSX.read(Uint8Array.from(data), { type: 'array' });
+      return XLSX.utils.sheet_to_html(workbook.Sheets[workbook.SheetNames[0]]);
+    }, fixture.hostileSheet);
+    assert(rawSheetMarkup.includes('javascript:'), 'SheetJS fixture did not emit its hostile link');
+    await page.evaluate(() => window.select('hostile-sheet', 24));
+    await waitState(24, 'ready');
+    const unsafeCell = frame().locator('.preview-stage a').filter({ hasText: 'Unsafe cell link' });
+    assert.equal(await unsafeCell.getAttribute('href'), null);
+    await unsafeCell.click();
+    assert.equal(await page.evaluate(() => window.__sheetExecuted), undefined);
+    await frame().locator('#app').evaluate(() => {
+      window.__sheetCompleted = 0;
+      const renderSheet = window.XLSX.utils.sheet_to_html;
+      window.XLSX.utils.sheet_to_html = (...args) => {
+        const output = renderSheet(...args);
+        window.__sheetCompleted++;
+        return output;
+      };
+    });
+    await page.evaluate(() => window.select('slow-sheet', 25));
+    await waitState(25, 'loading');
+    await within(sheetArrival, 'delayed spreadsheet fetch');
+    await page.evaluate(() => window.select('sheet', 26));
+    await waitState(26, 'ready');
+    for (const response of heldSheets.splice(0)) respond(response, 200, bytes['slow.xlsx'], 'application/octet-stream');
+    await page.frames().find(child => child.url().includes('/ocu/preview/')).waitForFunction(
+      () => window.__sheetCompleted === 2, null, { timeout: 10000 });
+    assert.equal((await page.evaluate(() => window.states.filter(row => row.generation === 25))).length, 1);
+    await frame().locator('.preview-stage').getByText('Visible cell').waitFor();
+    assert.equal(await frame().locator('.preview-stage').getByText('Older sheet').count(), 0);
     const secondSlow = new Promise(resolve => { slowRequested = resolve; });
-    await page.evaluate(() => window.select('slow', 19));
-    await waitState(19, 'loading');
+    await page.evaluate(() => window.select('slow', 27));
+    await waitState(27, 'loading');
     await within(secondSlow, 'unmounted Office fetch');
     const beforeUnmount = await page.evaluate(() => window.states.length);
-    await page.locator('#preview').evaluate(element => element.remove());
+    const abortedFetch = page.waitForEvent('requestfailed', {
+      predicate: request => request.url().endsWith('/slow.docx'), timeout: 10000,
+    });
+    await page.evaluate(() => window.retire());
+    await abortedFetch;
     for (const response of held.splice(0)) respond(response, 200, bytes['slow.docx'], 'application/octet-stream');
-    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     assert.equal(await page.evaluate(() => window.states.length), beforeUnmount);
+    assert.deepEqual(await page.evaluate(() => window.postRetirement), [],
+      'retired iframe emitted a product protocol message');
     await page.evaluate(() => window.mount('?embed=files&embed=files'));
     await frame().locator('[role="alert"]').getByText('Invalid preview embedding').waitFor();
     assert.equal((await page.evaluate(() => window.states.filter(row => row.type === 'ocu:preview-ready'))).length, 1);
@@ -294,8 +552,32 @@ async function main() {
     assert(requests.filter(row => row.path.includes('/api/outputs/')).every(row => row.header === 'ocu-workspace'));
     assert(requests.filter(row => row.path.endsWith('.docx') || row.path.endsWith('.xlsx') || row.path.endsWith('.pptx'))
       .every(row => row.header === 'ocu-workspace'));
-    // Navigation teardown and the timed-out listing intentionally abort pending fetches.
-    assert.deepEqual(consoleErrors.filter(error => !error.includes('net::ERR_ABORTED')),
+    listMode = 'standalone';
+    const standalone = await context.newPage();
+    standalone.on('pageerror', error => consoleErrors.push({ text: String(error), url: '' }));
+    standalone.on('console', message => {
+      if (message.type() === 'error') consoleErrors.push({ text: message.text(), url: message.location().url });
+    });
+    try {
+      await standalone.goto(`${origin}/ocu/preview/${CHAT}`);
+      const standaloneUnsafe = standalone.locator('.preview-stage a').filter({ hasText: 'Unsafe link' });
+      await standaloneUnsafe.waitFor();
+      assert.equal(await standaloneUnsafe.getAttribute('href'), null);
+      await standaloneUnsafe.click();
+      assert.equal(await standalone.evaluate(() => window.__docxExecuted), undefined);
+      await standalone.locator('.preview-stage').getByText('Table cell').waitFor();
+      await standalone.screenshot({ path: path.join(artifacts, 'standalone-sanitized-office.png') });
+    } finally {
+      await standalone.close();
+      listMode = 'normal';
+    }
+    assert.deepEqual(externalRequests, [], 'Office content requested an external resource');
+    const abortLogs = consoleErrors.filter(error => error.text.includes('net::ERR_ABORTED'));
+    assert(abortLogs.length <= expectedAbortUrls.length, 'unaccounted aborted-resource console errors');
+    assert.deepEqual(abortLogs.filter(error => !expectedAbortUrls.includes(error.url)),
+      [], 'unexpected aborted-resource URL');
+    assert.deepEqual(unexpectedNetworkFailures, [], 'unexpected network failure');
+    assert.deepEqual(consoleErrors.filter(error => !error.text.includes('net::ERR_ABORTED')),
       [], 'unexpected browser console errors');
     console.log(JSON.stringify({ result: 'ok', screenshots: artifacts, listingRequests: requests.filter(r => r.path.includes('/api/outputs/')).length }));
   } finally {
@@ -305,5 +587,6 @@ async function main() {
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   for (const response of held.splice(0)) response.destroy();
   for (const response of heldListings.splice(0)) response.destroy();
+  for (const response of heldSheets.splice(0)) response.destroy();
   await new Promise(resolve => server.close(resolve));
 });

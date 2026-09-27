@@ -13,6 +13,13 @@
   suppresses standalone polling, runtime clients, chrome and download links;
   WebUI owns list reconciliation and download controls.
 
+- **Office HTML trust boundary and workbook compatibility.** Locally pinned
+  DOMPurify sanitizes Mammoth and SheetJS HTML at their shared standalone and
+  embedded insertion seams; hostile links/styles and remote document images
+  are refused while ordinary text, tables and inline raster images remain.
+  Canonical broker file URLs now accept Python-encoded punctuation, and
+  embedded broker `.xls` BIFF workbooks render alongside `.xlsx` OOXML files.
+
 - **Overlay post-deploy smoke.** `deploy/smoke.sh` is an operator command,
   not an `up.sh` hook. It judges the running Compose publication matrix,
   former-OCU `ECONNREFUSED`, live host listeners, allowlisted sandbox HTTP
