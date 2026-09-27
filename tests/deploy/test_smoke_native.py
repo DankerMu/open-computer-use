@@ -172,6 +172,48 @@ def owned_pid_exists(pid):
         raise AssertionError("cannot inspect owned PTY child")
     return bool(result.stdout.strip())
 
+def group_absent(group, child_pid):
+    return not live_group(group) and not owned_pid_exists(child_pid)
+
+
+def owned_pid_in_group(group, child_pid):
+    result = subprocess.run(
+        ["ps", "-o", "pgid=", "-p", str(child_pid)],
+        capture_output=True, text=True, timeout=1,
+    )
+    if result.returncode not in {0, 1}:
+        raise AssertionError("cannot confirm owned PTY process group")
+    return result.stdout.strip() == str(group)
+
+
+def stop_owned_group(group, child_pid, errors):
+    if group <= 0 or group == os.getpgrp():
+        errors.append("unsafe owned PTY process group")
+        return
+    try:
+        if group_absent(group, child_pid):
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if not owned_pid_in_group(group, child_pid):
+                if not group_absent(group, child_pid):
+                    errors.append(f"PTY group {group} persists without confirmed ownership")
+                return
+            try:
+                os.killpg(group, sig)
+            except OSError as exc:
+                if not group_absent(group, child_pid):
+                    errors.append(f"PTY group {group} signal failed and group persists ({type(exc).__name__})")
+                return
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                if group_absent(group, child_pid):
+                    return
+                time.sleep(0.05)
+        if not group_absent(group, child_pid):
+            errors.append(f"PTY child {child_pid} not reaped")
+    except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"PTY group {group} inspection failed ({type(exc).__name__})")
+
 
 @contextmanager
 def owned_bash_pty():
@@ -227,28 +269,10 @@ def owned_bash_pty():
                     for group, child_pid in groups.items():
                         if group == process.pid:
                             continue
-                        if group <= 0 or group == os.getpgrp():
-                            errors.append("unsafe owned PTY process group")
-                            continue
                         try:
-                            os.killpg(group, signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
-                        deadline = time.monotonic() + 1
-                        while owned_pid_exists(child_pid) and time.monotonic() < deadline:
-                            time.sleep(0.05)
-                        if owned_pid_exists(child_pid):
-                            try:
-                                os.killpg(group, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
-                            deadline = time.monotonic() + 1
-                            while owned_pid_exists(child_pid) and time.monotonic() < deadline:
-                                time.sleep(0.05)
-                            if owned_pid_exists(child_pid):
-                                errors.append(f"PTY child {child_pid} not reaped")
-            except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
-                errors.append(f"PTY child cleanup: {type(exc).__name__}")
+                            stop_owned_group(group, child_pid, errors)
+                        except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
+                            errors.append(f"PTY group {group} cleanup failed ({type(exc).__name__})")
             finally:
                 try:
                     os.write(master, b"exit\n")
@@ -257,42 +281,51 @@ def owned_bash_pty():
             if process is not None:
                 if process.pid > 0 and process.pid != os.getpgrp():
                     try:
-                        os.killpg(process.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    except OSError as exc:
-                        errors.append(f"PTY TERM: {type(exc).__name__}")
+                        if process.poll() is None:
+                            if not owned_pid_in_group(process.pid, process.pid):
+                                errors.append("PTY Bash group ownership cannot be confirmed")
+                            else:
+                                try:
+                                    os.killpg(process.pid, signal.SIGTERM)
+                                except OSError as exc:
+                                    if process.poll() is None and not group_absent(process.pid, process.pid):
+                                        errors.append(f"PTY Bash TERM failed and group persists ({type(exc).__name__})")
+                    except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
+                        errors.append(f"PTY Bash inspection failed ({type(exc).__name__})")
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    for group in groups:
-                        if group > 0 and group != os.getpgrp():
+                    for group, child_pid in groups.items():
+                        if group <= 0 or group == os.getpgrp():
+                            continue
+                        try:
+                            if group_absent(group, child_pid):
+                                continue
+                            if not owned_pid_in_group(group, child_pid):
+                                errors.append(f"PTY group {group} ownership cannot be confirmed")
+                                continue
                             try:
                                 os.killpg(group, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
                             except OSError as exc:
-                                errors.append(f"PTY KILL: {type(exc).__name__}")
+                                if not group_absent(group, child_pid):
+                                    errors.append(f"PTY KILL failed and group persists ({type(exc).__name__})")
+                        except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
+                            errors.append(f"PTY KILL inspection failed ({type(exc).__name__})")
                     try:
                         process.wait(timeout=1)
                     except subprocess.TimeoutExpired:
                         errors.append("PTY child could not be reaped within 3 seconds")
-                for group in groups:
+                for group, child_pid in groups.items():
                     if group <= 0 or group == os.getpgrp():
                         continue
                     try:
                         deadline = time.monotonic() + 1
-                        while live_group(group) and time.monotonic() < deadline:
+                        while not group_absent(group, child_pid) and time.monotonic() < deadline:
                             time.sleep(0.05)
-                        if live_group(group):
-                            os.killpg(group, signal.SIGKILL)
-                            deadline = time.monotonic() + 1
-                            while live_group(group) and time.monotonic() < deadline:
-                                time.sleep(0.05)
-                            if live_group(group):
-                                errors.append(f"PTY process group {group} still running")
+                        if not group_absent(group, child_pid):
+                            errors.append(f"PTY process group {group} or child {child_pid} still present")
                     except (OSError, AssertionError, subprocess.TimeoutExpired) as exc:
-                        errors.append(f"PTY group inspection: {type(exc).__name__}")
+                        errors.append(f"PTY group inspection failed ({type(exc).__name__})")
         finally:
             stop.set()
             if reader_started:
@@ -489,6 +522,46 @@ class NativeSmokeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_stale_owned_group_requires_observed_absence(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        process.wait(timeout=2)
+        errors = []
+        stop_owned_group(process.pid, process.pid, errors)
+        self.assertEqual(errors, [])
+        self.assertTrue(group_absent(process.pid, process.pid))
+
+    def test_term_ignoring_owned_group_is_killed_not_waved_through(self):
+        process = subprocess.Popen(
+            [
+                sys.executable, "-c",
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('READY', flush=True); time.sleep(20)",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, start_new_session=True,
+        )
+        try:
+            self.assertTrue(select.select([process.stdout], [], [], 2)[0], "child did not arm TERM ignore")
+            self.assertEqual(process.stdout.readline(), "READY\n")
+            errors = []
+            worker = threading.Thread(
+                target=stop_owned_group, args=(process.pid, process.pid, errors), daemon=True,
+            )
+            worker.start()
+            process.wait(timeout=5)
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive(), "owned-group cleanup did not finish")
+            self.assertEqual(errors, [])
+            self.assertTrue(group_absent(process.pid, process.pid))
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=2)
+            process.stdout.close()
 
     def test_native_pty_foreground_judge_rejects_harmless_cat(self):
         with owned_bash_pty() as (process, master, groups):
