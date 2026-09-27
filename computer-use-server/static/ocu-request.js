@@ -136,8 +136,8 @@ function listingUrl(apiUrl, cursor, limit) {
   return apiUrl + sep + params.join('&');
 }
 
-export async function fetchOutputsPage(apiUrl, { cursor, limit = PAGE_LIMIT } = {}) {
-  return ocuFetch(listingUrl(apiUrl, cursor, limit), { serverUrl: true, cache: 'no-store' });
+export async function fetchOutputsPage(apiUrl, { cursor, limit = PAGE_LIMIT, signal } = {}) {
+  return ocuFetch(listingUrl(apiUrl, cursor, limit), { serverUrl: true, cache: 'no-store', signal });
 }
 
 export async function loadOutputsWindow({
@@ -146,58 +146,101 @@ export async function loadOutputsWindow({
   generation,
   currentGeneration,
   fetchPage = fetchOutputsPage,
+  matchFileId = null,
+  chatId = null,
+  deadlineMs = null,
+  signal = null,
 }) {
   const depth = Math.max(1, pageCount | 0);
   const pages = [];
+  const seenCursors = new Set();
   let cursor = null;
   let staleRetries = 0;
   let loaded = 0;
-  const seenCursors = new Set();
-  while (loaded < depth) {
+  let requests = 0;
+  let expectedTotal = null;
+  let enumerated = 0;
+  const controller = matchFileId === null ? null : new AbortController();
+  const cancel = () => controller.abort();
+  if (signal && controller) signal.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) controller?.abort();
+  const timer = controller && deadlineMs != null ? setTimeout(cancel, deadlineMs) : null;
+  try {
+    while (loaded < depth) {
+      if (generation !== currentGeneration()) return { stale: true, files: null };
+      if (controller?.signal.aborted || (controller && requests >= depth)) return { error: 'limit', files: null };
+      let resp;
+      requests += 1;
+      try {
+        resp = await fetchPage(apiUrl, { cursor, limit: PAGE_LIMIT, signal: controller?.signal });
+      } catch {
+        return { error: controller?.signal.aborted ? 'limit' : 'network', files: null };
+      }
+      if (resp.status === 409 && cursor && staleRetries === 0) {
+        staleRetries += 1;
+        cursor = null;
+        pages.length = 0;
+        loaded = 0;
+        expectedTotal = null;
+        enumerated = 0;
+        seenCursors.clear();
+        continue;
+      }
+      if (resp.status === 409) return { error: 'stale-cursor', files: null };
+      if (!resp.ok) return { error: resp.status, files: null };
+      let body;
+      try {
+        body = await resp.json();
+      } catch {
+        return { error: controller?.signal.aborted ? 'limit' : 'body', files: null };
+      }
+      if (controller) {
+        if (controller.signal.aborted) return { error: 'limit', files: null };
+        if (!body || body.chat_id !== chatId
+            || !Number.isSafeInteger(body.revision) || !Number.isSafeInteger(body.total)
+            || body.total < 0 || !Array.isArray(body.files) || body.files.length > PAGE_LIMIT
+            || !body.files.every((file) => file && typeof file === 'object' && typeof file.file_id === 'string')
+            || (body.next_cursor !== null && (typeof body.next_cursor !== 'string' || !body.next_cursor))
+            || (expectedTotal !== null && expectedTotal !== body.total)
+            || (body.next_cursor && (body.files.length !== PAGE_LIMIT || body.next_cursor === cursor
+              || seenCursors.has(body.next_cursor)))
+            || enumerated + body.files.length > body.total) {
+          return { error: 'incomplete', files: null };
+        }
+        expectedTotal = body.total;
+      }
+      if (pages.length && pages[0].revision !== body.revision) {
+        return { error: 'revision-mismatch', files: null };
+      }
+      if (cursor) {
+        if (seenCursors.has(cursor)) return { error: 'repeated-cursor', files: null };
+        seenCursors.add(cursor);
+      }
+      const match = controller && body.files.find((file) => file.file_id === matchFileId);
+      if (match) return { file: match, files: null };
+      if (controller) enumerated += body.files.length;
+      pages.push(body);
+      loaded += 1;
+      if (!body.next_cursor) break;
+      cursor = body.next_cursor;
+    }
     if (generation !== currentGeneration()) return { stale: true, files: null };
-    let resp;
-    try {
-      resp = await fetchPage(apiUrl, { cursor, limit: PAGE_LIMIT });
-    } catch (err) {
-      return { error: 'network', files: null };
+    const last = pages[pages.length - 1];
+    if (controller && (last.next_cursor || enumerated !== expectedTotal)) {
+      return { error: 'incomplete', files: null };
     }
-    if (resp.status === 409 && cursor && staleRetries === 0) {
-      staleRetries += 1;
-      cursor = null;
-      pages.length = 0;
-      loaded = 0;
-      seenCursors.clear();
-      continue;
-    }
-    if (resp.status === 409) return { error: 'stale-cursor', files: null };
-    if (!resp.ok) return { error: resp.status, files: null };
-    let body;
-    try {
-      body = await resp.json();
-    } catch {
-      return { error: 'body', files: null };
-    }
-    if (pages.length && pages[0].revision !== body.revision) {
-      return { error: 'revision-mismatch', files: null };
-    }
-    if (cursor) {
-      if (seenCursors.has(cursor)) return { error: 'repeated-cursor', files: null };
-      seenCursors.add(cursor);
-    }
-    pages.push(body);
-    loaded += 1;
-    if (!body.next_cursor) break;
-    cursor = body.next_cursor;
+    return {
+      files: pages.flatMap((page) => page.files || []),
+      revision: last.revision,
+      next_cursor: last.next_cursor,
+      total: last.total,
+      pages: pages.length,
+    };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', cancel);
+    controller?.abort();
   }
-  if (generation !== currentGeneration()) return { stale: true, files: null };
-  const last = pages[pages.length - 1];
-  return {
-    files: pages.flatMap((page) => page.files || []),
-    revision: last.revision,
-    next_cursor: last.next_cursor,
-    total: last.total,
-    pages: pages.length,
-  };
 }
 
 export function renderKey(file) {

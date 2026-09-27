@@ -60,6 +60,46 @@ rewritten as a corrupt index.
 - `GET /api/outputs/{chat_id}` — Authenticated broker listing: `chat_id`, `files`, `total`, `timestamp`, `revision`, `next_cursor`. Query `cursor` and `limit` (1..1000, default 100). Malformed, out-of-range, or unparseable cursors (including oversized digit runs) return 400; stale cursors return 409. `If-None-Match` uses a weak ETag over the page representation excluding `timestamp`. Each file keeps SPA `modified` seconds for one release and emits `url` as `{OCU_PUBLIC_PREFIX}/files/{chat_id}/{percent-encoded path}`.
 - `POST /api/uploads/{chat_id}/{filename}` — Upload file to container
 
+#### Files-only preview embedding
+
+Embed the authenticated same-origin `/preview/{chat_id}?embed=files` page in an
+iframe with exactly `sandbox="allow-scripts allow-same-origin allow-forms"`.
+The parent must remain the authenticated owner of the file list, revision hints
+and download button; do not add `allow-downloads`. Without `embed`, the preview
+keeps its standalone Files/Browser/Terminal behavior. Unsupported or repeated
+`embed` parameters fail visibly without starting runtime clients.
+
+After its listener is installed, the child sends
+`{type:"ocu:preview-ready", chat_id}` to `window.parent` at `location.origin`.
+The parent may then send exactly
+`{type:"ocu:preview-select", chat_id, file_id, generation}` to the iframe
+window at that origin. `file_id` is a nonempty string of at most 128 characters;
+`generation` is a nonnegative safe integer strictly increasing for that iframe,
+including re-requests for a deleted or revised identity. Unknown fields are
+rejected. The child accepts only `event.source === window.parent` and
+`event.origin === location.origin` with the configured chat id. It sends
+`{type:"ocu:preview-state", chat_id, file_id, generation, state}` where
+`state` is `loading`, `ready`, `error`, `missing` or `unsupported`. The parent
+must check the reply's source, origin, chat id and current generation as well.
+No URL, file bytes, credentials or raw error text travel over this channel.
+
+Selection resolves the id against the authorized broker's coherent listing,
+up to 100 pages/10 seconds (including a stale-cursor retry). Only a completed
+same-revision enumeration can prove `missing`; failures or limits are `error`.
+Resolved URLs must be canonical same-origin URLs under this chat's files path.
+Only broker types DOCX/XLSX/PPTX are eligible, and HTML, SVG, XHTML, XML and
+`+xml` MIME essences are refused regardless of type. `ready` follows successful
+Office rendering; corrupt Office reports `error` visibly, so the parent can
+offer its own authorized download. The child does not poll, autoselect, handle
+generated-content link selection, or mount Browser/Terminal/CLI clients. A
+newer request clears the old render and supersedes its result; tearing down
+the iframe releases owned effects.
+
+The local real-SPA browser harness is
+`node tests/orchestrator/preview_embedding_browser.cjs` (Playwright 1.62.1
+and its Chromium required); its assets and Office fixtures are local.
+
+
 ### Browser (CDP Proxy)
 - `GET /browser/{chat_id}/status` — Browser status
 - `GET /browser/{chat_id}/json` — CDP targets

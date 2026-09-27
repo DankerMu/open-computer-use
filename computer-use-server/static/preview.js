@@ -27,6 +27,12 @@ import {
 } from './ocu-request.js';
 
 const { apiUrl: API_URL, filesBase: FILES_BASE, chatId: CHAT_ID, describeUrl: DESCRIBE_URL } = window.__CONFIG__;
+const embedParams = new URLSearchParams(location.search).getAll('embed');
+const EMBED_MODE = embedParams.length === 0 ? 'standalone'
+  : embedParams.length === 1 && embedParams[0] === 'files' && window.parent !== window
+    ? 'files' : 'invalid';
+const EMBED_PAGES = 100;
+const EMBED_DEADLINE_MS = 10000;
 
 // =============================================================================
 // Utilities
@@ -427,19 +433,25 @@ async function renderSpreadsheetPreview(container, file) {
   }
 }
 
-async function renderDocxPreview(container, file) {
+async function renderDocxPreview(container, file, embedded = false) {
   container.innerHTML = officeBanner() + '<div class="markdown-body" id="docxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
   try {
     await loadScript(moduleAssetUrl('mammoth.browser.min.js'));
     const resp = await fetchOutput(file.url);
+    if (embedded && !resp.ok) throw new Error('Office response failed');
     const arrayBuffer = await resp.arrayBuffer();
     const result = await mammoth.convertToHtml({ arrayBuffer });
     const body = container.querySelector('#docxContainer');
     if (body) body.innerHTML = result.value;
   } catch (err) {
+    if (embedded) {
+      container.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
+      return false;
+    }
     console.error('DOCX render error:', err);
     renderDownloadFallback(container, file, 'fileText');
   }
+  return true;
 }
 
 function markUncomputedFormulaCells(root, sheet) {
@@ -454,13 +466,20 @@ function markUncomputedFormulaCells(root, sheet) {
   });
 }
 
-async function renderXlsxPreview(container, file) {
+async function renderXlsxPreview(container, file, embedded = false) {
   container.innerHTML = officeBanner() + '<div class="data-table-wrap" id="xlsxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
   try {
     await loadScript(moduleAssetUrl('xlsx.full.min.js'));
     const resp = await fetchOutput(file.url);
+    if (embedded && !resp.ok) throw new Error('Office response failed');
     const arrayBuffer = await resp.arrayBuffer();
+    if (embedded) {
+      await loadScript(moduleAssetUrl('jszip.min.js'));
+      const zip = await JSZip.loadAsync(arrayBuffer.slice(0));
+      if (!zip.file('xl/workbook.xml')) throw new Error('Invalid Office workbook');
+    }
     const workbook = XLSX.read(arrayBuffer, { type: 'array', cellFormula: true, cellNF: true, sheetStubs: true, raw: false });
+    if (embedded && !workbook.SheetNames.length) throw new Error('Empty Office workbook');
     let html = '';
     if (workbook.SheetNames.length > 1) {
       html += '<div class="sheet-tabs">';
@@ -487,18 +506,24 @@ async function renderXlsxPreview(container, file) {
       });
     });
   } catch (err) {
+    if (embedded) {
+      container.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
+      return false;
+    }
     console.error('XLSX render error:', err);
     renderDownloadFallback(container, file, 'fileSpreadsheet');
   }
+  return true;
 }
 
-async function renderPptxPreview(container, file) {
+async function renderPptxPreview(container, file, embedded = false) {
   container.innerHTML = officeBanner() + `<div class="empty-state" id="pptxLoading"><div class="spinner"></div><p class="loading-text">${t('loading')}</p></div><div class="pptx-container" id="pptxContainer" style="display:none"></div>`;
   try {
     await loadScript(moduleAssetUrl('jszip.min.js'));
     await loadScript(moduleAssetUrl('chart.umd.js'));
     await loadScript(moduleAssetUrl('pptxviewjs.min.js'));
     const pptxResp = await fetchOutput(file.url);
+    if (embedded && !pptxResp.ok) throw new Error('Office response failed');
     const pptxBuf = await pptxResp.arrayBuffer();
     const pptxContainer = container.querySelector('#pptxContainer');
     let ratio = 9 / 16;
@@ -512,6 +537,7 @@ async function renderPptxPreview(container, file) {
       deckCy = Number((/cy="(\d+)"/.exec(tag) || [])[1]);
       if (deckCx > 0 && deckCy > 0) ratio = deckCy / deckCx;
     } catch (err) {
+      if (embedded) throw err;
       console.warn('PPTX slide size:', err);
     }
     const contentWidth = Math.max(container.clientWidth || container.parentElement?.clientWidth || 0, 1);
@@ -535,6 +561,7 @@ async function renderPptxPreview(container, file) {
     const viewer = new PptxViewJS.PPTXViewer();
     await viewer.loadFile(pptxBuf);
     const slideCount = viewer.getSlideCount();
+    if (embedded && !slideCount) throw new Error('Empty Office presentation');
     for (let i = 0; i < slideCount; i++) {
       const canvas = document.createElement('canvas');
       canvas.width = slideWidth;
@@ -555,12 +582,17 @@ async function renderPptxPreview(container, file) {
     if (typeof ResizeObserver === 'function' && container.isConnected !== false) {
       const observer = new ResizeObserver(() => applyDisplayedSize());
       observer.observe(pptxContainer);
-      if (!attachPreviewObserver(container, observer)) return;
+      if (!attachPreviewObserver(container, observer)) return false;
     }
   } catch (err) {
+    if (embedded) {
+      container.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
+      return false;
+    }
     console.error('PPTX render error:', err);
     renderDownloadFallback(container, file, 'filePresentation', t('pptx_fail'));
   }
+  return true;
 }
 
 async function renderDrawioPreview(container, file) {
@@ -599,7 +631,7 @@ function renderDownloadFallback(container, file, iconType, errorMsg) {
   </div>`;
 }
 
-function renderPreviewContent(container, file, files, onSelectFile) {
+function renderPreviewContent(container, file, files, onSelectFile, embedded = false) {
   switch (file.type) {
     case 'html': return renderHtmlPreview(container, file);
     case 'image':
@@ -610,9 +642,9 @@ function renderPreviewContent(container, file, files, onSelectFile) {
     case 'code':
     case 'text': return renderCodePreview(container, file);
     case 'spreadsheet': return renderSpreadsheetPreview(container, file);
-    case 'docx': return renderDocxPreview(container, file);
-    case 'xlsx': return renderXlsxPreview(container, file);
-    case 'pptx': return renderPptxPreview(container, file);
+    case 'docx': return renderDocxPreview(container, file, embedded);
+    case 'xlsx': return renderXlsxPreview(container, file, embedded);
+    case 'pptx': return renderPptxPreview(container, file, embedded);
     case 'drawio': return renderDrawioPreview(container, file);
     case 'audio':
       container.innerHTML = `<div class="media-container">
@@ -728,7 +760,7 @@ function FileSelector({ files, selectedFile, seenFiles, onSelect }) {
   `;
 }
 
-function FilesView({ files, selectedFile, onSelectFile }) {
+function FilesView({ files, selectedFile, onSelectFile, selectionKey, onRenderState, embedded = false }) {
   const containerRef = useRef(null);
   const prevKeyRef = useRef(null);
   const generationRef = useRef(0);
@@ -762,7 +794,7 @@ function FilesView({ files, selectedFile, onSelectFile }) {
       return;
     }
     if (!containerRef.current) return;
-    const key = renderKey(selectedFile);
+    const key = embedded ? renderKey(selectedFile) + '\0' + selectionKey : renderKey(selectedFile);
     if (key === prevKeyRef.current) return;
     prevKeyRef.current = key;
     const generation = ++generationRef.current;
@@ -778,16 +810,22 @@ function FilesView({ files, selectedFile, onSelectFile }) {
     stage.style.cssText = 'display:flex;flex:1;flex-direction:column;min-height:0;width:100%;height:100%;overflow:auto';
     ownedStageRef.current = stage;
     host.replaceChildren(stage);
-    Promise.resolve(renderPreviewContent(stage, selectedFile, files, onSelectFile)).then(() => {
+    Promise.resolve(renderPreviewContent(stage, selectedFile, files, onSelectFile, embedded)).then((success) => {
       if (!mountedRef.current || generation !== generationRef.current) {
         dropOwnedStage(stage);
         return;
       }
       if (stage.parentNode !== host) host.replaceChildren(stage);
+      if (onRenderState) onRenderState(success === false ? 'error' : 'ready');
     }).catch(() => {
-      if (!mountedRef.current || generation !== generationRef.current) dropOwnedStage(stage);
+      if (!mountedRef.current || generation !== generationRef.current) {
+        dropOwnedStage(stage);
+        return;
+      }
+      if (embedded) stage.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
+      if (onRenderState) onRenderState('error');
     });
-  }, [selectedFile, files, onSelectFile]);
+  }, [selectedFile, files, onSelectFile, selectionKey, onRenderState, embedded]);
 
   if (!selectedFile) {
     return html`
@@ -1435,6 +1473,99 @@ function ActiveCliBadge() {
   `;
 }
 
+function validEmbedSelection(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+  const keys = Object.keys(data).sort();
+  return keys.length === 4 && keys.join(',') === 'chat_id,file_id,generation,type'
+    && data.type === 'ocu:preview-select' && data.chat_id === CHAT_ID
+    && typeof data.file_id === 'string' && data.file_id.length > 0
+    && data.file_id.length <= 128 && data.file_id.trim().length > 0
+    && Number.isSafeInteger(data.generation) && data.generation >= 0;
+}
+
+function embeddedFileDisposition(file) {
+  if (!file || !['docx', 'xlsx', 'pptx'].includes(file.type)
+      || typeof file.mime !== 'string') return 'unsupported';
+  const mime = file.mime.split(';', 1)[0].trim().toLowerCase();
+  if (!mime || ['text/html', 'image/svg+xml', 'application/xhtml+xml',
+    'application/xml', 'text/xml'].includes(mime) || mime.endsWith('+xml')) return 'unsupported';
+  try {
+    if (typeof file.path !== 'string' || typeof file.url !== 'string') return 'error';
+    const parts = file.path.split('/');
+    if (parts.some((part) => !part || part === '.' || part === '..' || part.includes('\\'))) return 'error';
+    const base = new URL(FILES_BASE + '/', location.origin);
+    if (base.origin !== location.origin || base.search || base.hash) return 'error';
+    const expected = new URL(base.href + parts.map(encodeURIComponent).join('/'));
+    const actual = new URL(file.url, location.origin);
+    if (actual.origin !== location.origin || actual.href !== expected.href) return 'error';
+  } catch {
+    return 'error';
+  }
+  return 'ready';
+}
+
+function EmbeddedFilesApp() {
+  const [selection, setSelection] = useState(null);
+  const [status, setStatus] = useState('waiting');
+  const currentRef = useRef(null);
+  const requestRef = useRef(null);
+  const mountedRef = useRef(false);
+
+  const announce = (request, state) => {
+    if (!mountedRef.current || currentRef.current !== request) return;
+    setStatus(state);
+    window.parent.postMessage({
+      type: 'ocu:preview-state', chat_id: CHAT_ID,
+      file_id: request.file_id, generation: request.generation, state,
+    }, location.origin);
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const handleMessage = async (event) => {
+      if (event.source !== window.parent || event.origin !== location.origin
+          || !validEmbedSelection(event.data)
+          || event.data.generation <= (currentRef.current?.generation ?? -1)) return;
+      const request = event.data;
+      requestRef.current?.abort();
+      const controller = new AbortController();
+      requestRef.current = controller;
+      currentRef.current = request;
+      setSelection(null);
+      announce(request, 'loading');
+      const result = await loadOutputsWindow({
+        apiUrl: API_URL, pageCount: EMBED_PAGES, chatId: CHAT_ID,
+        matchFileId: request.file_id, deadlineMs: EMBED_DEADLINE_MS,
+        generation: request.generation,
+        currentGeneration: () => currentRef.current?.generation,
+        signal: controller.signal,
+      });
+      if (!mountedRef.current || currentRef.current !== request) return;
+      if (result.error !== undefined) { announce(request, 'error'); return; }
+      if (result.stale) return;
+      if (!result.file) { announce(request, 'missing'); return; }
+      const disposition = embeddedFileDisposition(result.file);
+      if (disposition !== 'ready') { announce(request, disposition); return; }
+      setSelection({ file: result.file, request });
+    };
+    window.addEventListener('message', handleMessage);
+    window.parent.postMessage({ type: 'ocu:preview-ready', chat_id: CHAT_ID }, location.origin);
+    return () => {
+      mountedRef.current = false;
+      currentRef.current = null;
+      requestRef.current?.abort();
+      window.removeEventListener('message', handleMessage);
+    };
+  }, []);
+
+  return html`<div style="display:flex;flex:1;flex-direction:column;min-height:0">
+    ${selection ? html`<${FilesView} files=${[selection.file]} selectedFile=${selection.file}
+      onSelectFile=${() => {}} selectionKey=${selection.request.generation}
+      onRenderState=${(state) => announce(selection.request, state)} embedded=${true} />`
+      : html`<div class="empty-state" role="status">${status}</div>`}
+  </div>`;
+}
+
 function App() {
   const [files, setFiles] = useState([]);
   const [selectedFile, setSelectedFile] = useState(null);
@@ -1636,4 +1767,6 @@ function App() {
 // Mount
 // =============================================================================
 
-render(html`<${App} />`, document.getElementById('app'));
+render(EMBED_MODE === 'files' ? html`<${EmbeddedFilesApp} />`
+  : EMBED_MODE === 'invalid' ? html`<div class="empty-state" role="alert">Invalid preview embedding</div>`
+    : html`<${App} />`, document.getElementById('app'));

@@ -3,6 +3,16 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Files-only preview embedding.** An explicit `?embed=files` iframe accepts
+  strict same-origin, same-parent, same-chat, increasing-generation `file_id`
+  selection and reports loading/ready/error/missing/unsupported. Bounded
+  coherent broker pagination resolves only canonical same-chat Office URLs;
+  forbidden generated-content MIME types remain outside the embed. The
+  existing Office renderers now distinguish successful content from corrupt
+  fallback in embedded mode, with stale results isolated. Embedded mode
+  suppresses standalone polling, runtime clients, chrome and download links;
+  WebUI owns list reconciliation and download controls.
+
 - **Overlay post-deploy smoke.** `deploy/smoke.sh` is an operator command,
   not an `up.sh` hook. It judges the running Compose publication matrix,
   former-OCU `ECONNREFUSED`, live host listeners, allowlisted sandbox HTTP
