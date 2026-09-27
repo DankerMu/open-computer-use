@@ -10,5 +10,6 @@ This project's source code is FSL-1.1-Apache-2.0 (see [`LICENSE`](LICENSE)). The
 | GSD bundle ([`gsd-build/get-shit-done`](https://github.com/gsd-build/get-shit-done)) | Apache 2.0 (upstream) | Cloned at build time from upstream tag. |
 | Superpowers bundle ([`obra/superpowers`](https://github.com/obra/superpowers)) | Apache 2.0 (upstream) | Cloned at build time from upstream tag. |
 | Open WebUI base | BSD-3-Clause-with-additional-license-condition | Upstream; see [Open WebUI](https://github.com/open-webui/open-webui). |
+| DOMPurify 3.4.16 (local `computer-use-server/static/purify.min.js`) | Apache-2.0 OR MPL-2.0 | Pinned npm package `dompurify@3.4.16` (`https://registry.npmjs.org/dompurify/-/dompurify-3.4.16.tgz`); unmodified approved `dist/purify.min.js`, parent-verified SHA-256 `2c90a9b46d6463f26038a29b686e82bc91de01fdac9d5229e7cfe3b360134ea2`. Upstream Apache-2.0 license copy: [`computer-use-server/static/purify.LICENSE`](computer-use-server/static/purify.LICENSE). npm tarball SHA-512 was verified by the parent gate. |
 
 **No warranties.** Source is provided "as is". Compliance with downstream licenses (AGPL conveyance, Anthropic Skill License, etc.) when you build, host, or redistribute the image is **your responsibility**. The repository maintainers do not act as a license clearinghouse and do not grant sublicenses to third-party components.

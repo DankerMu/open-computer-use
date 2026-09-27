@@ -479,11 +479,14 @@ const [sourceDir, moduleUrl, scenario] = process.argv.slice(2);
 const context = vm.createContext({
   Headers,
   URL,
+  AbortController,
   Date,
   JSON,
   Promise,
   console,
-  setTimeout(fn, ms) { if (!ms) fn(); return 0; },
+  setTimeout(fn, ms) { if (!ms) fn(); else context.__timer = fn; return 0; },
+  clearTimeout() {},
+  __timer: null,
   setInterval(fn) { context.__interval = fn; return 7; },
   clearInterval(id) { context.__cleared = id; },
   location: { protocol: 'https:', host: 'webui.example' },
@@ -664,6 +667,78 @@ async function run() {
       leftoverLive: live._pptxResizeObserver, leftoverDead: dead._pptxResizeObserver,
     };
   }
+  if (scenario === 'embedded-listing') {
+    const file = { file_id: 'wanted', type: 'docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      path: 'report.docx', url: '/ocu/files/chat/report.docx', revision: 2 };
+    let mode = 'later';
+    let hits = 0;
+    context.__respond = async (url) => {
+      hits += 1;
+      const cursor = new URL(url, 'https://webui.example').searchParams.get('cursor');
+      if (mode === 'http-error') return { ok: false, status: 503 };
+      if (mode === 'body-error') return { ok: true, status: 200, json: async () => { throw Error('broken page'); } };
+      if (mode === 'stale' || (mode === 'churn' && cursor)) return { ok: false, status: 409 };
+      const first = { chat_id: 'chat', files: Array.from({ length: 100 }, (_, i) => ({ file_id: `other-${i}` })),
+        revision: 2, total: 101, next_cursor: '2:100' };
+      const last = { chat_id: 'chat', files: mode === 'missing' || mode === 'incomplete' ? [{ file_id: 'another' }] : [file],
+        revision: 2, total: 101, next_cursor: null };
+      const body = cursor ? last : first;
+      if (mode === 'incomplete' && cursor) body.next_cursor = '2:2';
+      if (mode === 'revision' && cursor) body.revision = 3;
+      if (mode === 'wrong-chat') body.chat_id = 'other-chat';
+      return { ok: true, status: 200, json: async () => body };
+    };
+    const resolve = () => api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat', pageCount: 100, chatId: 'chat', matchFileId: 'wanted',
+      deadlineMs: 10000, generation: 1, currentGeneration: () => 1,
+    });
+    const later = await resolve();
+    mode = 'missing';
+    const missing = await resolve();
+    mode = 'incomplete';
+    const incomplete = await resolve();
+    mode = 'wrong-chat';
+    const wrongChat = await resolve();
+    mode = 'body-error';
+    const bodyError = await resolve();
+    mode = 'http-error';
+    const httpError = await resolve();
+    mode = 'revision';
+    const revision = await resolve();
+    mode = 'stale';
+    const stale = await resolve();
+    mode = 'churn';
+    const churn = await resolve();
+    return { later, missing, incomplete, wrongChat, bodyError, httpError, stale, churn, revision, hits };
+  }
+  if (scenario === 'embedded-limits') {
+    let hits = 0;
+    const endless = async () => {
+      hits++;
+      return { ok: true, status: 200, json: async () => ({
+        chat_id: 'chat', files: Array.from({ length: 100 }, (_, i) => ({ file_id: `${hits}-${i}` })), revision: 1,
+        total: 10001, next_cursor: `1:${hits * 100}`,
+      }) };
+    };
+    const limited = await api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat', pageCount: 100, chatId: 'chat', matchFileId: 'absent',
+      deadlineMs: 10000, generation: 1, currentGeneration: () => 1, fetchPage: endless,
+    });
+    const timeout = await api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat', pageCount: 100, chatId: 'chat', matchFileId: 'absent',
+      deadlineMs: 0, generation: 1, currentGeneration: () => 1, fetchPage: endless,
+    });
+    const pending = api.loadOutputsWindow({
+      apiUrl: '/ocu/api/outputs/chat', pageCount: 100, chatId: 'chat', matchFileId: 'absent',
+      deadlineMs: 10000, generation: 1, currentGeneration: () => 1,
+      fetchPage: async (_, { signal }) => new Promise((_, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('deadline')));
+      }),
+    });
+    context.__timer();
+    const inflight = await pending;
+    return { limited, timeout, inflight, hits };
+  }
   throw new Error('unknown scenario');
 }
 
@@ -774,6 +849,28 @@ def test_pptx_observer_disconnects_once_and_clears_handle(tmp_path):
     assert recorded["disconnected"] == 2
     assert recorded["leftoverLive"] is None
     assert recorded["leftoverDead"] is None
+
+
+def test_embedded_resolution_requires_complete_coherent_listing(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "embedded-listing")
+    assert recorded["later"]["file"]["file_id"] == "wanted"
+    assert recorded["missing"]["files"] is not None
+    assert recorded["missing"]["next_cursor"] is None
+    assert recorded["incomplete"]["error"] == "incomplete"
+    assert recorded["wrongChat"]["error"] == "incomplete"
+    assert recorded["bodyError"]["error"] == "body"
+    assert recorded["httpError"]["error"] == 503
+    assert recorded["stale"]["error"] == "stale-cursor"
+    assert recorded["churn"]["error"] == "stale-cursor"
+    assert recorded["revision"]["error"] == "revision-mismatch"
+
+
+def test_embedded_resolution_rejects_page_and_deadline_exhaustion(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "embedded-limits")
+    assert recorded["limited"]["error"] == "incomplete"
+    assert recorded["timeout"]["error"] == "limit"
+    assert recorded["hits"] == 100
+    assert recorded["inflight"]["error"] == "limit"
 
 
 _XLSX_HARNESS = r"""
