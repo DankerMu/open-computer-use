@@ -9,6 +9,7 @@ import hashlib
 import http.client
 import json
 import os
+import socket
 from pathlib import Path
 import unittest
 
@@ -355,6 +356,61 @@ class NativeProxyTests(unittest.TestCase):
                          ["sandbox allow-scripts allow-forms"])
         self.assertEqual([value for key, value in headers if key.lower() == "x-content-type-options"],
                          ["nosniff"])
+
+    def test_webui_default_location_preserves_http_and_bidirectional_websocket(self):
+        before = self.snapshot()
+        status, _, body = self.request("/", headers=self.owner())
+        self.assertEqual((status, body), (200, b"webui"))
+        self.assertEqual([row["target"] for row in self.since("auth", before)], ["/"])
+        self.assertEqual(self.since("ocu", before), [])
+
+        path = "/ws/socket.io/?EIO=4&transport=websocket"
+        key = base64.b64encode(b"webui-test-key12").decode("ascii")
+        before = self.snapshot()
+        request = "\r\n".join((
+            f"GET {path} HTTP/1.1",
+            f"Host: 127.0.0.1:{PROXY_PORT}",
+            "Connection: Upgrade",
+            "Upgrade: websocket",
+            f"Origin: {ORIGIN}",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+            "Cookie: session=owner",
+            "Authorization: Bearer browser-user-token",
+            "",
+            "",
+        )).encode("ascii")
+        with socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=15) as connection:
+            connection.sendall(request)
+            stream = connection.makefile("rb")
+            status_line = stream.readline()
+            self.assertEqual(status_line.split()[1], b"101", status_line)
+            headers = {}
+            while True:
+                line = stream.readline()
+                if line == b"\r\n":
+                    break
+                name, value = line.split(b":", 1)
+                headers[name.lower()] = value.strip()
+            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+            self.assertEqual(headers.get(b"upgrade", b"").lower(), b"websocket")
+            self.assertEqual(headers.get(b"sec-websocket-accept"), accept)
+            payload = b"upstream-ok"
+            mask = b"\x11\x22\x33\x44"
+            frame = b"\x81" + bytes((0x80 | len(payload),)) + mask
+            frame += bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+            connection.sendall(frame)
+            self.assertEqual(stream.read(2 + len(payload)), b"\x81" + bytes((len(payload),)) + payload)
+            stream.close()
+
+        seen = self.since("auth", before)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["target"], path)
+        self.assertEqual(seen[0]["headers"].get("cookie"), "session=owner")
+        self.assertEqual(seen[0]["headers"].get("authorization"), "Bearer browser-user-token")
+        self.assertEqual(seen[0]["headers"].get("upgrade", "").lower(), "websocket")
+        self.assertEqual(seen[0]["headers"].get("connection", "").lower(), "upgrade")
+        self.assertEqual(self.since("ocu", before), [])
 
     def test_websocket_auth_and_cookie_forwarding_without_custom_header(self):
         for route, upstream in (("/ocu/terminal/" + CHAT + "/ws", "/terminal/" + CHAT + "/ws"),
