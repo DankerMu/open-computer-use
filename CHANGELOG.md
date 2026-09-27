@@ -3,6 +3,14 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Overlay post-deploy smoke.** `deploy/smoke.sh` is an operator command,
+  not an `up.sh` hook. It judges the running Compose publication matrix,
+  former-OCU `ECONNREFUSED`, live host listeners, allowlisted sandbox HTTP
+  egress, then sandbox-to-control connection-phase timeouts, and the product
+  terminal default on an exclusive smoke sandbox. Deny-all allowlists and
+  missing positives are unsuitable prerequisites. Real Docker/engine evidence
+  remains issue36.
+
 - **Sandbox DNS pinning.** Production requires `OCU_SANDBOX_DNS` presence.
   Empty becomes a nonempty container-local `127.0.0.11` override so Docker
   does not inherit host nameservers. Nonempty values are 1-3 unique ordered
