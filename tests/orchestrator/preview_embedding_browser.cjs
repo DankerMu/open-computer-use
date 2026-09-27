@@ -27,6 +27,15 @@ const files = [
   { file_id: 'deck', path: 'broken.pptx', type: 'pptx', mime: OFFICE_MIME.pptx },
   { file_id: 'deck-valid', path: 'valid.pptx', type: 'pptx', mime: OFFICE_MIME.pptx },
   { file_id: 'biff', path: 'valid.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw2', path: 'raw2.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw3', path: 'raw3.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw4', path: 'raw4.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw-truncated', path: 'truncated.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw-no-eof', path: 'missing-eof.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw-payload', path: 'truncated-payload.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw-historical', path: 'historical.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw-short-header', path: 'short-header.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
+  { file_id: 'raw-text', path: 'not-a-workbook.xls', type: 'xlsx', mime: OFFICE_MIME.xlsx },
   { file_id: 'punct', path: "report (1)!'.docx", type: 'docx', mime: OFFICE_MIME.docx,
     url: `/ocu/files/${CHAT}/report%20%281%29%21%27.docx` },
   { file_id: 'hostile', path: 'hostile.docx', type: 'docx', mime: OFFICE_MIME.docx },
@@ -138,6 +147,7 @@ const server = http.createServer(async (req, res) => {
       <script src="/ocu/static/mammoth.browser.min.js"></script>
       <script>
         window.states=[];
+        window.expectedSelections={};
         window.beacons={};
         window.retiredFrames=new Set();
         window.postRetirement=[];
@@ -153,8 +163,14 @@ const server = http.createServer(async (req, res) => {
               && typeof e.data==='object' && typeof e.data.type==='string'
               && e.data.type.startsWith('ocu:preview-')) window.postRetirement.push(e.data);
         });
-        window.select=(file_id,generation,extra={})=>document.querySelector('#preview').contentWindow.postMessage(
-          {type:'ocu:preview-select',chat_id:'${CHAT}',file_id,generation,...extra},location.origin);
+        window.select=(file_id,generation,extra={})=>{
+          const request={type:'ocu:preview-select',chat_id:'${CHAT}',file_id,generation,...extra};
+          if(typeof generation==='number' && Number.isSafeInteger(generation)
+              && generation>=0 && request.chat_id==='${CHAT}' && !('url' in request)
+              && file_id && !(generation in window.expectedSelections))
+            window.expectedSelections[generation]=file_id;
+          document.querySelector('#preview').contentWindow.postMessage(request,location.origin);
+        };
         window.mount=(query='?embed=files')=>{const frame=document.createElement('iframe');frame.id='preview';
           frame.setAttribute('sandbox','allow-scripts allow-same-origin allow-forms');
           frame.src='/ocu/preview/${CHAT}'+query;document.body.appendChild(frame);};
@@ -213,9 +229,12 @@ async function main() {
       await page.waitForFunction(({ generation, state }) => window.states.some(row =>
         row.type === 'ocu:preview-state' && row.generation === generation && row.state === state),
       { generation, state }, { timeout });
-      const result = (await page.evaluate(g => window.states.filter(row => row.generation === g), generation)).at(-1);
+      const result = await page.evaluate(({ generation, state }) => window.states.find(row =>
+        row.type === 'ocu:preview-state' && row.generation === generation && row.state === state),
+      { generation, state });
       assert.deepEqual(Object.keys(result).sort(), ['chat_id', 'file_id', 'generation', 'state', 'type']);
       assert.equal(result.chat_id, CHAT);
+      assert.equal(result.file_id, await page.evaluate(g => window.expectedSelections[g], generation));
       return result;
     };
     await page.goto(origin + '/parent');
@@ -300,7 +319,14 @@ async function main() {
         hostile: await makeDoc('Safe content', true),
         sheet: Array.from(new Uint8Array(XLSX.write(wb, { bookType: 'xlsx', type: 'array' }))),
         biff: Array.from(new Uint8Array(XLSX.write(biffBook, { bookType: 'biff8', type: 'array' }))),
+        raw2: Array.from(new Uint8Array(XLSX.write(biffBook, { bookType: 'biff2', type: 'array' }))),
+        raw3: Array.from(new Uint8Array(XLSX.write(biffBook, { bookType: 'biff3', type: 'array' }))),
+        raw4: Array.from(new Uint8Array(XLSX.write(biffBook, { bookType: 'biff4', type: 'array' }))),
         hostileSheet: Array.from(new Uint8Array(XLSX.write(linkedBook, { bookType: 'xlsx', type: 'array' }))),
+        remoteMarkup: `<p>Converted Office image</p>
+          <img src="https://example.invalid/document-image.png" alt="remote">
+          <img src="/remote-document-image.png" alt="same-origin remote">
+          <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XwN8AAAAASUVORK5CYII=" alt="inline">`,
         oldSheet: Array.from(new Uint8Array(XLSX.write(oldBook, { bookType: 'xlsx', type: 'array' }))),
         deck: Array.from(await ppt.generateAsync({ type: 'uint8array' })),
       };
@@ -326,6 +352,24 @@ async function main() {
     bytes['slow.xlsx'] = Buffer.from(fixture.oldSheet);
     bytes['broken.xlsx'] = Buffer.from('not an Office ZIP');
     bytes['valid.pptx'] = Buffer.from(fixture.deck);
+    for (const [version, name] of [[2, 'raw2'], [3, 'raw3'], [4, 'raw4']]) {
+      const raw = Buffer.from(fixture[name]);
+      assert.equal(raw.readUInt16LE(0), { 2: 9, 3: 521, 4: 1033 }[version]);
+      assert.equal(raw.readUInt16LE(4), version);
+      bytes[`${name}.xls`] = raw;
+    }
+    const raw3 = Buffer.from(fixture.raw3);
+    const firstRecordEnd = 4 + raw3.readUInt16LE(2);
+    const nextLength = raw3.readUInt16LE(firstRecordEnd + 2);
+    assert(nextLength > 0, 'raw BIFF fixture has no nonempty record after BOF');
+    bytes['truncated.xls'] = raw3.subarray(0, raw3.length - 1);
+    bytes['truncated-payload.xls'] = raw3.subarray(0, firstRecordEnd + 4 + nextLength - 1);
+    bytes['missing-eof.xls'] = Buffer.from(fixture.raw4.slice(0, -4));
+    const historical = Buffer.from(fixture.raw3);
+    historical.writeUInt16LE(0x0300, 4);
+    bytes['historical.xls'] = historical;
+    bytes['short-header.xls'] = raw3.subarray(0, firstRecordEnd + 2);
+    bytes['not-a-workbook.xls'] = Buffer.from('name,value\\nfalse,positive');
     bytes['broken.pptx'] = Buffer.from('not an Office ZIP');
 
     await page.evaluate(() => window.mount());
@@ -478,7 +522,7 @@ async function main() {
     await unsafe.click();
     assert.equal(await page.evaluate(() => window.__docxExecuted), undefined);
     assert.equal(await frame().locator('#app').evaluate(() => window.__docxExecuted), undefined);
-    const safeLink = frame().locator('.preview-stage a').filter({ hasText: 'Safe link' });
+    const safeLink = frame().getByRole('link', { name: 'Safe link', exact: true });
     assert.equal(await safeLink.getAttribute('href'), 'https://example.invalid/safe');
     assert.equal(await safeLink.getAttribute('target'), '_blank');
     assert.equal(await safeLink.getAttribute('rel'), 'noopener noreferrer');
@@ -487,6 +531,27 @@ async function main() {
     assert.equal(await frame().locator('.preview-stage [id="user-content-section"]').count(), 1);
     assert.equal(await frame().locator('.preview-stage .markdown-body').locator('script, style, svg, iframe, [onclick], [onerror], [style]').count(), 0);
     assert.deepEqual(externalRequests, [], 'document content caused an external request');
+    // Synthetic converted-markup boundary proof of the real sanitizer seam,
+    // not an end-to-end DOCX fixture or a substituted Office renderer.
+    const remotePolicy = await frame().locator('#app').evaluate(async (root, markup) => {
+      const { safeOfficeHtml } = await import(new URL('../static/preview.js', document.baseURI).href);
+      const fragment = safeOfficeHtml(markup);
+      const detached = document.createElement('div');
+      detached.appendChild(fragment);
+      root.appendChild(detached);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const images = Array.from(detached.querySelectorAll('img'), image => image.getAttribute('src'));
+      const image = detached.querySelector('img');
+      if (image) await image.decode();
+      const width = image?.naturalWidth ?? 0;
+      detached.remove();
+      return { images, width };
+    }, fixture.remoteMarkup);
+    assert.equal(remotePolicy.images.length, 1, 'inline raster lost at sanitizer boundary');
+    assert(remotePolicy.images[0].startsWith('data:image/png;base64,'));
+    assert.equal(remotePolicy.width, 1);
+    assert.equal(requests.filter(row => row.path === '/remote-document-image.png').length, 0);
+    assert.deepEqual(externalRequests, [], 'remote converted image initiated a request');
     await page.screenshot({ path: path.join(artifacts, 'sanitized-office.png') });
     await page.evaluate(() => window.select('corrupt-doc', 23));
     await waitState(23, 'error');
@@ -522,9 +587,21 @@ async function main() {
     assert.equal((await page.evaluate(() => window.states.filter(row => row.generation === 25))).length, 1);
     await frame().locator('.preview-stage').getByText('Visible cell').waitFor();
     assert.equal(await frame().locator('.preview-stage').getByText('Older sheet').count(), 0);
+    for (const [index, file] of ['raw2', 'raw3', 'raw4', 'raw-historical'].entries()) {
+      const generation = 28 + index;
+      await page.evaluate(([id, value]) => window.select(id, value), [file, generation]);
+      await waitState(generation, 'ready');
+      await frame().locator('.preview-stage').getByText('Visible cell').waitFor();
+    }
+    for (const [index, file] of ['raw-truncated', 'raw-no-eof', 'raw-text', 'raw-payload', 'raw-short-header'].entries()) {
+      const generation = 32 + index;
+      await page.evaluate(([id, value]) => window.select(id, value), [file, generation]);
+      await waitState(generation, 'error');
+      await frame().locator('.preview-stage .empty-state').waitFor();
+    }
     const secondSlow = new Promise(resolve => { slowRequested = resolve; });
-    await page.evaluate(() => window.select('slow', 27));
-    await waitState(27, 'loading');
+    await page.evaluate(() => window.select('slow', 37));
+    await waitState(37, 'loading');
     await within(secondSlow, 'unmounted Office fetch');
     const beforeUnmount = await page.evaluate(() => window.states.length);
     const abortedFetch = page.waitForEvent('requestfailed', {
@@ -547,6 +624,24 @@ async function main() {
     await page.locator('#preview').evaluate(element => element.remove());
     await page.evaluate(() => window.mount());
     await page.waitForFunction(() => window.states.filter(row => row.type === 'ocu:preview-ready').length === 2);
+    const transcript = await page.evaluate(() => ({
+      states: window.states, expected: window.expectedSelections,
+    }));
+    for (const message of transcript.states) {
+      if (message.type === 'ocu:preview-ready') {
+        assert.deepEqual(message, { type: 'ocu:preview-ready', chat_id: CHAT });
+        continue;
+      }
+      assert.equal(message.type, 'ocu:preview-state', 'unexpected preview protocol message');
+      assert.deepEqual(Object.keys(message).sort(), ['chat_id', 'file_id', 'generation', 'state', 'type']);
+      assert.equal(message.chat_id, CHAT);
+      assert(Number.isSafeInteger(message.generation) && message.generation >= 0);
+      assert(Object.hasOwn(transcript.expected, message.generation),
+        `unexpected generation ${message.generation}`);
+      assert.equal(message.file_id, transcript.expected[message.generation],
+        `wrong file_id in generation ${message.generation}`);
+      assert(['loading', 'ready', 'error', 'missing', 'unsupported'].includes(message.state));
+    }
     assert.equal(requests.filter(row => /\/(browser|terminal)\//.test(row.path)
       || /\/api\/runtime\//.test(row.path) || /\/api\/v1\//.test(row.path)).length, 0);
     assert(requests.filter(row => row.path.includes('/api/outputs/')).every(row => row.header === 'ocu-workspace'));

@@ -107,9 +107,10 @@ are either surviving same-document bookmarks (rewritten to namespaced IDs)
 or explicit HTTP(S) URLs opened in a new tab with `noopener noreferrer`;
 unsafe links retain text without navigation.
 Embedded Mammoth style maps are disabled. Broker `.xls` files are the same
-`xlsx` type as `.xlsx`; CFB-contained BIFF8 and OOXML ZIP workbooks are both
-eligible, while arbitrary text disguised as a workbook is not. Raw legacy
-BIFF streams outside CFB are not admitted in Files-only embedding.
+`xlsx` type as `.xlsx`; OOXML ZIP, CFB-contained BIFF and complete SheetJS-
+readable raw BIFF2/3/4 streams are eligible. Raw BIFF is checked for versioned
+BOF, complete record framing and terminating EOF before SheetJS parsing;
+arbitrary text and truncated records cannot masquerade as an Office workbook.
 
 The local real-SPA browser harness is
 `node tests/orchestrator/preview_embedding_browser.cjs` (Playwright 1.62.1

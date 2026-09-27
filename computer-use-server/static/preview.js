@@ -71,7 +71,7 @@ function officeBanner() {
 }
 // Office converters produce HTML from document-controlled bytes. Only this
 // detached, sanitized fragment may cross into the trusted preview DOM.
-function safeOfficeHtml(markup) {
+export function safeOfficeHtml(markup) {
   if (!window.DOMPurify?.isSupported) throw new Error('Office sanitizer unavailable');
   const inlineImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
   const blockRemoteImage = (node, data) => {
@@ -542,16 +542,54 @@ async function renderXlsxPreview(container, file, embedded = false) {
     if (embedded && !resp.ok) throw new Error('Office response failed');
     const arrayBuffer = await resp.arrayBuffer();
     if (embedded) {
-      const signature = new Uint8Array(arrayBuffer, 0, Math.min(arrayBuffer.byteLength, 8));
-      const zip = signature.length >= 4 && signature[0] === 0x50 && signature[1] === 0x4b
-        && signature[2] === 0x03 && signature[3] === 0x04;
-      const biff = signature.length === 8
-        && [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1].every((byte, i) => signature[i] === byte);
-      if (!zip && !biff) throw new Error('Invalid Office workbook');
+      const bytes = new Uint8Array(arrayBuffer);
+      const zip = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b
+        && bytes[2] === 0x03 && bytes[3] === 0x04;
+      const cfb = bytes.length >= 8
+        && [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1].every((byte, i) => bytes[i] === byte);
       if (zip) {
         await loadScript(moduleAssetUrl('jszip.min.js'));
         const contents = await JSZip.loadAsync(arrayBuffer.slice(0));
         if (!contents.file('xl/workbook.xml')) throw new Error('Invalid Office workbook');
+      } else if (!cfb) {
+        // SheetJS writes and reads raw BIFF2/3/4 with these versioned BOF
+        // records. Validate framing through EOF before its permissive parser.
+        const view = new DataView(arrayBuffer);
+        const bof = bytes.length >= 8 && view.getUint16(0, true);
+        const version = bof === 9 ? 2 : bof === 521 ? 3 : bof === 1033 ? 4 : null;
+        const minimum = version === 2 ? 4 : 6;
+        if (!version || bytes.length < 4 + minimum
+            || view.getUint16(2, true) < minimum
+            || 4 + view.getUint16(2, true) > bytes.length
+            || !(view.getUint16(4, true) === version || view.getUint16(4, true) === (version << 8)
+              || (version === 2 && view.getUint16(4, true) === 7))) {
+          throw new Error('Invalid raw BIFF workbook');
+        }
+        let offset = 0;
+        let depth = 0;
+        let closed = false;
+        while (offset + 4 <= bytes.length) {
+          const id = view.getUint16(offset, true);
+          const length = view.getUint16(offset + 2, true);
+          const end = offset + 4 + length;
+          if (end > bytes.length) break;
+          if (id === 9 || id === 521 || id === 1033) {
+            const nestedVersion = id === 9 ? 2 : id === 521 ? 3 : 4;
+            if (length < (nestedVersion === 2 ? 4 : 6)) break;
+            const word = view.getUint16(offset + 4, true);
+            if (word !== nestedVersion && word !== (nestedVersion << 8)
+                && !(nestedVersion === 2 && word === 7)) break;
+            depth++;
+          } else if (id === 10) {
+            if (length !== 0 || --depth < 0) break;
+            if (depth === 0 && end === bytes.length) {
+              closed = true;
+              break;
+            }
+          } else if (depth === 0) break;
+          offset = end;
+        }
+        if (!closed) throw new Error('Truncated raw BIFF workbook');
       }
     }
     const workbook = XLSX.read(arrayBuffer, { type: 'array', cellFormula: true, cellNF: true, sheetStubs: true, raw: false });

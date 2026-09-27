@@ -18,7 +18,8 @@
   embedded insertion seams; hostile links/styles and remote document images
   are refused while ordinary text, tables and inline raster images remain.
   Canonical broker file URLs now accept Python-encoded punctuation, and
-  embedded broker `.xls` BIFF workbooks render alongside `.xlsx` OOXML files.
+  embedded broker `.xls` CFB BIFF and complete raw BIFF2/3/4 workbooks
+  render alongside `.xlsx` OOXML files; truncated raw records remain errors.
 
 - **Overlay post-deploy smoke.** `deploy/smoke.sh` is an operator command,
   not an `up.sh` hook. It judges the running Compose publication matrix,
