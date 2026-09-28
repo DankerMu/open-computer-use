@@ -104,6 +104,7 @@ class FakeWebSocket {
 }
 
 const context = vm.createContext({
+  AbortController,
   Headers,
   fetch: async (url, init = {}) => {
     const headers = {};
@@ -117,7 +118,7 @@ const context = vm.createContext({
           { type: 'page', id: firstPageId, url: 'chrome://newtab' },
           { type: 'page', id: nextPageId, url: 'https://other.test' },
         ];
-    return { json: async () => pages };
+    return { ok: true, json: async () => pages };
   },
   WebSocket: FakeWebSocket,
   location: { protocol, host },
@@ -292,6 +293,64 @@ def test_ocu_prefix_shell_urls_static_mount_auth_and_no_secret():
     assert "text/css" in prefixed.headers["content-type"]
     assert "Preview SPA" in prefixed.text
     assert unprefixed.status_code == 404
+
+
+@pytest.mark.parametrize("mode", ("browser", "terminal"))
+@pytest.mark.parametrize("prefix", ("/ocu", "/tools/ocu"))
+def test_runtime_embed_response_has_scoped_nonce_bound_csp(mode, prefix):
+    with _isolated_app(prefix) as loaded:
+        client = _client(loaded)
+        authorization = {"Authorization": f"Bearer {INTERNAL}"}
+        runtime = client.get(
+            f"/preview/{CHAT}", params={"embed": mode}, headers=authorization
+        )
+        another_runtime = client.get(
+            f"/preview/{CHAT}", params={"embed": mode}, headers=authorization
+        )
+        repeated = client.get(
+            f"/preview/{CHAT}",
+            params=[("embed", mode), ("embed", mode)],
+            headers=authorization,
+        )
+        standalone = client.get(f"/preview/{CHAT}", headers=authorization)
+        files = client.get(
+            f"/preview/{CHAT}", params={"embed": "files"}, headers=authorization
+        )
+        unknown = client.get(
+            f"/preview/{CHAT}", params={"embed": "unknown"}, headers=authorization
+        )
+
+    assert runtime.status_code == standalone.status_code == files.status_code == 200
+    assert f'href="{prefix}/static/preview.css"' in runtime.text
+    assert f'src="{prefix}/static/preview.js"' in runtime.text
+    assert "content-security-policy" not in standalone.headers
+    assert "content-security-policy" not in files.headers
+    assert "content-security-policy" not in repeated.headers
+    assert "content-security-policy" not in unknown.headers
+    policy = runtime.headers.get("content-security-policy")
+    assert policy, f"{mode} embedding has no response content policy"
+    directives = {part.strip() for part in policy.split(";")}
+    assert "default-src 'none'" in directives
+    assert "style-src 'self' 'unsafe-inline'" in directives
+    assert "img-src 'self' data: blob:" in directives
+    assert "font-src 'self' data:" in directives
+    assert "connect-src 'self'" in directives
+    assert "frame-src 'none'" in directives
+    assert "base-uri 'none'" in directives
+    assert "object-src 'none'" in directives
+    assert "form-action 'none'" in directives
+    assert "frame-ancestors 'self'" in directives
+    assert "'unsafe-eval'" not in policy
+    script_policy = next(
+        (part for part in policy.split(";") if part.strip().startswith("script-src ")), ""
+    )
+    nonce = re.search(r"'nonce-([A-Za-z0-9+/_=-]+)'", script_policy)
+    assert nonce, f"{mode} embedding has no nonce-bound scripts"
+    assert re.search(
+        rf'<script\b[^>]*\bnonce="{re.escape(nonce.group(1))}"[^>]*>\s*window\.__CONFIG__',
+        runtime.text,
+    ), f"{mode} configuration script did not use its response nonce"
+    assert f"'nonce-{nonce.group(1)}'" not in another_runtime.headers["content-security-policy"]
 
 
 @pytest.mark.parametrize("prefix", ("/tools/ocu", "/.ocu"))

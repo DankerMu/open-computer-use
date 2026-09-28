@@ -29,8 +29,8 @@ import {
 const { apiUrl: API_URL, filesBase: FILES_BASE, chatId: CHAT_ID, describeUrl: DESCRIBE_URL } = window.__CONFIG__;
 const embedParams = new URLSearchParams(location.search).getAll('embed');
 const EMBED_MODE = embedParams.length === 0 ? 'standalone'
-  : embedParams.length === 1 && embedParams[0] === 'files' && window.parent !== window
-    ? 'files' : 'invalid';
+  : embedParams.length === 1 && ['files', 'browser', 'terminal'].includes(embedParams[0])
+    && window.parent !== window ? embedParams[0] : 'invalid';
 const EMBED_PAGES = 100;
 const EMBED_DEADLINE_MS = 10000;
 
@@ -982,7 +982,9 @@ function BrowserView({ chatId, browserActive, onBrowserViewerRef }) {
     const viewer = new BrowserViewer(canvas, chatId);
     viewerRef.current = viewer;
     if (onBrowserViewerRef) onBrowserViewerRef(viewer);
+    let retired = false;
     viewer.connect().then(ok => {
+      if (retired) return;
       setConnecting(false);
       if (ok) {
         setConnected(true);
@@ -991,10 +993,14 @@ function BrowserView({ chatId, browserActive, onBrowserViewerRef }) {
         setError(true);
         viewerRef.current = null;
       }
+    }).catch(() => {
+      if (!retired) { setConnecting(false); setError(true); viewerRef.current = null; }
     });
 
     return () => {
-      if (viewerRef.current) { viewerRef.current.disconnect(); viewerRef.current = null; }
+      retired = true;
+      viewer.disconnect();
+      if (viewerRef.current === viewer) viewerRef.current = null;
     };
   }, [browserActive]);
 
@@ -1024,29 +1030,44 @@ function BrowserView({ chatId, browserActive, onBrowserViewerRef }) {
 function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSession, onResumeSession }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const mountedRef = useRef(false);
+  const requestRef = useRef(null);
 
   const fetchData = useCallback(async () => {
+    if (!mountedRef.current) return;
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
     setLoading(true);
     try {
       const [sResp, sessResp, procResp, uplResp] = await Promise.all([
-        ocuFetch(`/terminal/${chatId}/status?_t=${Date.now()}`),
-        ocuFetch(`/terminal/${chatId}/sessions?_t=${Date.now()}`),
-        ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`),
-        ocuFetch(`/api/uploads/${chatId}/list?_t=${Date.now()}`),
+        ocuFetch(`/terminal/${chatId}/status?_t=${Date.now()}`, { signal: controller.signal }),
+        ocuFetch(`/terminal/${chatId}/sessions?_t=${Date.now()}`, { signal: controller.signal }),
+        ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`, { signal: controller.signal }),
+        ocuFetch(`/api/uploads/${chatId}/list?_t=${Date.now()}`, { signal: controller.signal }),
       ]);
-      setData({
-        status: await sResp.json(),
-        sessions: await sessResp.json(),
-        processes: await procResp.json(),
-        uploads: await uplResp.json(),
-      });
+      const [status, sessions, processes, uploads] = await Promise.all([
+        sResp.json(), sessResp.json(), procResp.json(), uplResp.json()
+      ]);
+      if (mountedRef.current && !controller.signal.aborted)
+        setData({ status, sessions, processes, uploads });
     } catch(e) {
-      setData({ status: { active: false }, sessions: { sessions: [] }, processes: { processes: [] }, uploads: { files: [], total: 0 } });
+      if (mountedRef.current && !controller.signal.aborted)
+        setData({ status: { active: false }, sessions: { sessions: [] },
+          processes: { processes: [] }, uploads: { files: [], total: 0 } });
+    } finally {
+      if (requestRef.current === controller) {
+        requestRef.current = null;
+        if (mountedRef.current) setLoading(false);
+      }
     }
-    setLoading(false);
   }, [chatId]);
 
-  useEffect(() => { fetchData(); }, []);
+  useEffect(() => {
+    mountedRef.current = true;
+    fetchData();
+    return () => { mountedRef.current = false; requestRef.current?.abort(); };
+  }, [fetchData]);
 
   const uploadFile = useCallback((evt) => {
     if (evt) evt.stopPropagation();
@@ -1190,64 +1211,85 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
   const [startError, setStartError] = useState(null);
   const [selectMode, setSelectMode] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const mountedRef = useRef(true);
+  const timersRef = useRef(new Map());
+  const reconnectTimerRef = useRef(null);
+  const backTimerRef = useRef(null);
+  const schedule = useCallback((callback, delay) => {
+    if (!mountedRef.current) return null;
+    const timer = setTimeout(() => {
+      timersRef.current.delete(timer);
+      if (mountedRef.current) callback();
+    }, delay);
+    timersRef.current.set(timer, null);
+    return timer;
+  }, []);
+  const pause = useCallback(delay => new Promise(resolve => {
+    if (!mountedRef.current) { resolve(false); return; }
+    const timer = schedule(() => resolve(true), delay);
+    timersRef.current.set(timer, () => resolve(false));
+  }), [schedule]);
+  const cancelTimer = useCallback(timer => {
+    if (timer === null) return;
+    const resolve = timersRef.current.get(timer);
+    clearTimeout(timer);
+    timersRef.current.delete(timer);
+    if (resolve) resolve();
+  }, []);
+  useEffect(() => () => {
+    mountedRef.current = false;
+    for (const timer of timersRef.current.keys()) cancelTimer(timer);
+  }, [cancelTimer]);
 
   const connectWs = useCallback((rId) => {
+    if (!mountedRef.current || !xtermRef.current) return;
     const ws = new WebSocket(terminalWsUrl(chatId), ['tty']);
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
+    const current = () => mountedRef.current && wsRef.current === ws && ws.readyState === WebSocket.OPEN;
 
     let receivedData = false;
     ws.onopen = () => {
+      if (!current()) { ws.close(); return; }
       const dims = fitAddonRef.current ? fitAddonRef.current.proposeDimensions() : { cols: 80, rows: 24 };
       ws.send(JSON.stringify({ authToken: '', columns: dims.cols || 80, rows: dims.rows || 24 }));
       if (rId) {
-        // Check if Claude Code is running, then send appropriate resume sequence
         (async () => {
-          const dangerous = dangerousModeRef.current;
-          const flagSuffix = dangerous ? ' --dangerously-skip-permissions' : '';
+          const flagSuffix = dangerousModeRef.current ? ' --dangerously-skip-permissions' : '';
           try {
             const resp = await ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`);
             const data = await resp.json();
-            const hasClaudeRunning = data.processes && data.processes.length > 0;
-            if (hasClaudeRunning) {
-              // Claude Code active — double Ctrl+C to exit, then resume
-              ws.send(new TextEncoder().encode('\x30\x03')); // Ctrl+C #1
-              await new Promise(r => setTimeout(r, 500));
-              ws.send(new TextEncoder().encode('\x30\x03')); // Ctrl+C #2
-              await new Promise(r => setTimeout(r, 1500));
-            } else {
-              // No Claude Code — just wait for bash prompt
-              await new Promise(r => setTimeout(r, 1000));
-            }
+            if (!current()) return;
+            if (data.processes && data.processes.length > 0) {
+              ws.send(new TextEncoder().encode('\x30\x03'));
+              if (!(await pause(500)) || !current()) return;
+              ws.send(new TextEncoder().encode('\x30\x03'));
+              if (!(await pause(1500)) || !current()) return;
+            } else if (!(await pause(1000)) || !current()) return;
             ws.send(new TextEncoder().encode('\x30claude --resume ' + rId + flagSuffix + '\r'));
-          } catch(e) {
-            // Fallback: just send resume after delay
-            await new Promise(r => setTimeout(r, 2000));
-            ws.send(new TextEncoder().encode('\x30claude --resume ' + rId + (dangerousModeRef.current ? ' --dangerously-skip-permissions' : '') + '\r'));
+          } catch {
+            if (!(await pause(2000)) || !current()) return;
+            ws.send(new TextEncoder().encode('\x30claude --resume ' + rId +
+              (dangerousModeRef.current ? ' --dangerously-skip-permissions' : '') + '\r'));
           }
         })();
       } else if (dangerousModeRef.current) {
-        // New session in dangerous mode — NO_AUTOSTART=1 prevented .bashrc autostart,
-        // so we wait for the bash prompt and inject the command with the flag.
-        // For reconnects where claude is already running — leave it undisturbed.
         (async () => {
-          await new Promise(r => setTimeout(r, 1500));
+          if (!(await pause(1500)) || !current()) return;
           try {
             const resp = await ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`);
             const data = await resp.json();
-            const hasClaudeRunning = data.processes && data.processes.length > 0;
-            if (!hasClaudeRunning && ws.readyState === WebSocket.OPEN) {
+            if (current() && !(data.processes && data.processes.length > 0))
               ws.send(new TextEncoder().encode('\x30claude --dangerously-skip-permissions\r'));
-            }
-          } catch(e) {
-            if (ws.readyState === WebSocket.OPEN)
-              ws.send(new TextEncoder().encode('\x30claude --dangerously-skip-permissions\r'));
+          } catch {
+            if (current()) ws.send(new TextEncoder().encode('\x30claude --dangerously-skip-permissions\r'));
           }
         })();
       }
     };
 
     ws.onmessage = (ev) => {
+      if (!current()) return;
       if (!receivedData) { receivedData = true; reconnectAttemptsRef.current = 0; }
       if (ev.data instanceof ArrayBuffer && xtermRef.current) {
         const data = new Uint8Array(ev.data);
@@ -1261,37 +1303,48 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     };
 
     ws.onclose = () => {
-      if (xtermRef.current) {
-        if (reconnectAttemptsRef.current < 3) {
-          const delay = 1000 * Math.pow(2, reconnectAttemptsRef.current);
-          reconnectAttemptsRef.current++;
-          setTimeout(() => connectWs(), delay);
-        } else {
-          xtermRef.current.write('\r\n\x1b[90m' + t('session_ended') + '\x1b[0m\r\n');
-          setTimeout(() => onBack(), 2000);
-        }
+      if (wsRef.current !== ws || !mountedRef.current || !xtermRef.current) return;
+      wsRef.current = null;
+      if (reconnectAttemptsRef.current < 3) {
+        const delay = 1000 * Math.pow(2, reconnectAttemptsRef.current);
+        reconnectAttemptsRef.current++;
+        reconnectTimerRef.current = schedule(() => {
+          reconnectTimerRef.current = null;
+          if (!wsRef.current && xtermRef.current) connectWs();
+        }, delay);
+      } else {
+        xtermRef.current.write('\r\n\x1b[90m' + t('session_ended') + '\x1b[0m\r\n');
+        backTimerRef.current = schedule(() => {
+          backTimerRef.current = null;
+          onBack();
+        }, 2000);
       }
     };
-  }, [chatId, onBack]);
+  }, [chatId, onBack, pause, schedule]);
 
   const [ready, setReady] = useState(false);
 
   // Phase 1: start ttyd (if not already running)
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     (async () => {
       try {
         const resp = await ocuFetch(`/terminal/${chatId}/start-ttyd`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
           body: JSON.stringify({ dangerous_mode: dangerousModeRef.current }),
         });
+        if (cancelled || !mountedRef.current) return;
         if (!resp.ok) {
           if (!cancelled) {
             // Check if container is stopped (can be restarted) or removed with meta (can be resurrected)
             try {
-              const statusResp = await ocuFetch(`/terminal/${chatId}/status?_t=${Date.now()}`);
+              const statusResp = await ocuFetch(`/terminal/${chatId}/status?_t=${Date.now()}`,
+                { signal: controller.signal });
               const statusData = await statusResp.json();
+              if (cancelled || !mountedRef.current) return;
               if (statusData.container_stopped) {
                 setStartError('__stopped__');
               } else if (statusData.meta_exists) {
@@ -1299,19 +1352,19 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
               } else {
                 setStartError(t('terminal_fail'));
               }
-            } catch { setStartError(t('terminal_fail')); }
+            } catch { if (!cancelled && mountedRef.current) setStartError(t('terminal_fail')); }
           }
           return;
         }
         const data = await resp.json();
         // If already running, shorter wait (just need WS connection)
         const wait = data.already_running ? 500 : 1500;
-        await new Promise(r => setTimeout(r, wait));
-      } catch(e) { if (!cancelled) setStartError(t('server_fail')); return; }
-      if (!cancelled) setReady(true);
+        if (!(await pause(wait))) return;
+      } catch(e) { if (!cancelled && mountedRef.current) setStartError(t('server_fail')); return; }
+      if (!cancelled && mountedRef.current) setReady(true);
     })();
-    return () => { cancelled = true; };
-  }, [chatId]);
+    return () => { cancelled = true; controller.abort(); };
+  }, [chatId, pause]);
 
   // Phase 2: init xterm + connect WS (only after ttyd is ready)
   useEffect(() => {
@@ -1391,10 +1444,18 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
 
     return () => {
       ro.disconnect();
-      if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+      cancelTimer(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+      cancelTimer(backTimerRef.current);
+      backTimerRef.current = null;
+      if (wsRef.current) {
+        const ws = wsRef.current;
+        wsRef.current = null;
+        ws.close();
+      }
       if (xtermRef.current) { xtermRef.current.dispose(); xtermRef.current = null; }
     };
-  }, [ready]);
+  }, [ready, connectWs, cancelTimer]);
 
   const handleToggleSelectMode = useCallback(() => {
     if (!xtermRef.current) return;
@@ -1437,7 +1498,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     } catch(e) {}
     if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
     if (xtermRef.current) { xtermRef.current.dispose(); xtermRef.current = null; }
-    onBack();
+    if (mountedRef.current) onBack();
   }, [chatId, onBack]);
 
   if (startError) {
@@ -1446,19 +1507,21 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     const canRecover = isStopped || isMetaExists;
 
     const handleRestart = async () => {
+      if (!mountedRef.current) return;
       setRestarting(true);
       try {
         const recovered = await recoverStoppedContainer(chatId, dangerousModeRef.current);
+        if (!mountedRef.current) return;
         if (recovered.ok) {
           setStartError(null);
           setReady(false);
-          await new Promise(r => setTimeout(r, isMetaExists ? 2500 : (recovered.already_running ? 500 : 1500)));
+          if (!(await pause(isMetaExists ? 2500 : (recovered.already_running ? 500 : 1500)))) return;
           setReady(true);
           return;
         }
         setStartError(t('restore_fail'));
-      } catch { setStartError(t('restore_fail')); }
-      setRestarting(false);
+      } catch { if (mountedRef.current) setStartError(t('restore_fail')); }
+      if (mountedRef.current) setRestarting(false);
     };
 
     return html`
@@ -1528,13 +1591,17 @@ function TerminalView({ chatId }) {
     setDangerousMode(val);
     try { localStorage.setItem('claudeDangerousMode', val ? '1' : '0'); } catch(e) {}
   }, []);
+  const backToDashboard = useCallback(() => {
+    setMode('dashboard');
+    setResumeId(null);
+  }, []);
 
   if (mode === 'terminal') {
     return html`<${TerminalSession}
       chatId=${chatId}
       resumeId=${resumeId}
       dangerousMode=${dangerousMode}
-      onBack=${() => { setMode('dashboard'); setResumeId(null); }}
+      onBack=${backToDashboard}
     />`;
   }
 
@@ -1678,6 +1745,52 @@ function EmbeddedFilesApp() {
       onSelectFile=${() => {}} selectionKey=${selection.request.generation}
       onRenderState=${(state) => announce(selection.request, state)} embedded=${true} />`
       : html`<div class="empty-state" role="status">${status}</div>`}
+  </div>`;
+}
+
+function EmbeddedRuntimeApp({ mode }) {
+  const [browserStatus, setBrowserStatus] = useState('loading');
+
+  useEffect(() => {
+    const stopHeartbeat = startWorkspaceHeartbeat(CHAT_ID);
+    if (mode === 'terminal') return stopHeartbeat;
+
+    let retired = false;
+    let timer;
+    let controller;
+    const checkStatus = async () => {
+      controller = new AbortController();
+      try {
+        const response = await ocuFetch(`/browser/${CHAT_ID}/status?_t=${Date.now()}`,
+          { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw new Error('browser status unavailable');
+        const status = await response.json();
+        if (!status || typeof status.active !== 'boolean' || !Array.isArray(status.pages))
+          throw new Error('invalid browser status');
+        if (!retired) setBrowserStatus(status.active ? 'active' : 'inactive');
+      } catch {
+        if (!retired) setBrowserStatus('unavailable');
+      } finally {
+        if (!retired) timer = setTimeout(checkStatus, 3000);
+      }
+    };
+    checkStatus();
+    return () => {
+      retired = true;
+      clearTimeout(timer);
+      controller?.abort();
+      stopHeartbeat();
+    };
+  }, [mode]);
+
+  return html`<div style="display:flex;flex:1;flex-direction:column;min-height:0">
+    ${mode === 'browser'
+      ? html`
+        ${browserStatus === 'loading' && html`<div role="status">Checking browser status</div>`}
+        ${browserStatus === 'unavailable' && html`<div role="alert">Browser unavailable</div>`}
+        <${BrowserView} chatId=${CHAT_ID} browserActive=${browserStatus === 'active'} />
+      `
+      : html`<div class="terminal-panel"><${TerminalView} chatId=${CHAT_ID} /></div>`}
   </div>`;
 }
 
@@ -1883,5 +1996,7 @@ function App() {
 // =============================================================================
 
 render(EMBED_MODE === 'files' ? html`<${EmbeddedFilesApp} />`
-  : EMBED_MODE === 'invalid' ? html`<div class="empty-state" role="alert">Invalid preview embedding</div>`
-    : html`<${App} />`, document.getElementById('app'));
+  : EMBED_MODE === 'browser' || EMBED_MODE === 'terminal'
+    ? html`<${EmbeddedRuntimeApp} mode=${EMBED_MODE} />`
+    : EMBED_MODE === 'invalid' ? html`<div class="empty-state" role="alert">Invalid preview embedding</div>`
+      : html`<${App} />`, document.getElementById('app'));
