@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
-// Run from repository root: node tests/orchestrator/preview_embedding_browser.cjs
-// Requires the declared playwright 1.62.1 package and its Chromium browser.
+// Run from repository root with OCU_PREVIEW_PYTHON pointing to Python 3.12
+// with the server requirements and pytest; requires Playwright 1.62.1 + Chromium.
 const assert = require('node:assert/strict');
-const { createHash, randomBytes } = require('node:crypto');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
+const { spawnSync } = require('node:child_process');
 let playwright;
 try { playwright = require('playwright'); }
 catch { playwright = require('@playwright/test'); }
@@ -15,6 +16,50 @@ catch { playwright = require('@playwright/test'); }
 const ROOT = path.resolve(__dirname, '../..');
 const STATIC = path.join(ROOT, 'computer-use-server/static');
 const CHAT = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+let previewCaptures;
+
+async function captureProductionPreviews() {
+  const python = process.env.OCU_PREVIEW_PYTHON ||
+    (process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python') : null);
+  if (!python || !path.isAbsolute(python))
+    throw new Error('OCU_PREVIEW_PYTHON must name Python 3.12 with server requirements and pytest');
+  try { await fs.access(python); }
+  catch { throw new Error(`OCU_PREVIEW_PYTHON is not an available executable: ${python}`); }
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'ocu-preview-capture-'));
+  const output = path.join(directory, 'responses.json');
+  try {
+    const result = spawnSync(python,
+      [path.join(__dirname, '_preview_capture.py'), CHAT, output],
+      {
+        cwd: ROOT,
+        env: {
+          PATH: process.env.PATH || '',
+          HOME: process.env.HOME || '',
+          TMPDIR: process.env.TMPDIR || os.tmpdir(),
+          PYTHONUNBUFFERED: '1',
+        },
+        timeout: 180000,
+        maxBuffer: 1024 * 1024,
+      });
+    if (result.error || result.status !== 0)
+      throw new Error(`production preview capture failed (${result.error?.code || result.status}); ` +
+        'OCU_PREVIEW_PYTHON must provide Python 3.12, server requirements and pytest');
+    const captures = JSON.parse(await fs.readFile(output, 'utf8'));
+    if (!Array.isArray(captures) || captures.length !== 14)
+      throw new Error('production preview capture omitted required prefix/mode responses');
+    const byRoute = new Map();
+    for (const response of captures) {
+      const key = response.prefix + response.query;
+      if (byRoute.has(key) || response.status !== 200 || typeof response.body !== 'string' ||
+          !response.headers?.['content-type'])
+        throw new Error(`invalid production preview capture: ${key}`);
+      byRoute.set(key, response);
+    }
+    return byRoute;
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
 const OFFICE_MIME = {
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -103,33 +148,11 @@ const server = http.createServer(async (req, res) => {
       return respond(res, 200, await fs.readFile(filename), contentTypes[path.extname(filename)] || 'application/octet-stream');
     }
     if (url.pathname === `${prefix}/preview/${CHAT}`) {
-      const origin = `http://${req.headers.host}`;
-      const embed = url.searchParams.getAll('embed');
-      const runtime = embed.length === 1 && ['browser', 'terminal'].includes(embed[0]);
-      const nonce = runtime ? randomBytes(18).toString('base64url') : '';
-      const policy = runtime
-        ? `default-src 'none'; script-src 'self' 'nonce-${nonce}'; ` +
-          "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; " +
-          "connect-src 'self'; frame-src 'none'; base-uri 'none'; object-src 'none'; " +
-          "form-action 'none'; frame-ancestors 'self'"
-        : null;
-      const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
-        <link rel="stylesheet" href="${prefix}/static/preview.css">
-        <link rel="stylesheet" href="${prefix}/static/github.min.css">
-        <link rel="stylesheet" href="${prefix}/static/katex/katex.min.css">
-        <link rel="stylesheet" href="${prefix}/static/xterm.css">
-        <script src="${prefix}/static/highlight.min.js"></script>
-        <script src="${prefix}/static/highlightjs-line-numbers.min.js"></script>
-        <script src="${prefix}/static/marked.min.js"></script>
-        <script src="${prefix}/static/xterm.min.js"></script>
-        <script src="${prefix}/static/xterm-addon-fit.min.js"></script>
-        <script src="${prefix}/static/xterm-addon-web-links.min.js"></script>
-        </head><body><div id="app"></div><script${runtime ? ` nonce="${nonce}"` : ''}>window.__CONFIG__ = {
-          apiUrl:'${prefix}/api/outputs/${CHAT}', filesBase:'${prefix}/files/${CHAT}', chatId:'${CHAT}',
-          describeUrl:'/api/v1/ocu/workspaces/${CHAT}' };</script>
-          <script type="module" src="${prefix}/static/preview.js"></script></body></html>`;
-      assert.equal(new URL(origin).hostname, '127.0.0.1');
-      return respond(res, 200, html, 'text/html', policy ? { 'Content-Security-Policy': policy } : {});
+      const captured = previewCaptures?.get(prefix + url.search);
+      if (!captured) throw new Error(`uncaptured production preview response: ${prefix}${url.search}`);
+      res.writeHead(captured.status, captured.headers);
+      res.end(captured.body);
+      return;
     }
     if (url.pathname === `${prefix}/api/outputs/${CHAT}`) {
       if (listMode === 'failure') {
@@ -311,6 +334,7 @@ server.on('upgrade', (req, socket, head) => {
 async function main() {
   const artifacts = process.env.OCU_PREVIEW_ARTIFACTS || await fs.mkdtemp(path.join(os.tmpdir(), 'ocu-preview-browser-'));
   await fs.mkdir(artifacts, { recursive: true });
+  previewCaptures = await captureProductionPreviews();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
   const browser = await playwright.chromium.launch({ headless: true });
