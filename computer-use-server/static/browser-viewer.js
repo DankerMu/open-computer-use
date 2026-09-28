@@ -25,10 +25,17 @@ export class BrowserViewer {
     this._navigating = false;
     this._loadingShownAt = 0;
     this._loadingHideTimer = null;
+    this._viewportFixTimer = null;
     this._viewportFixPending = false;
     this._lastMouseMove = 0;
     this._tabPollTimer = null;
+    this._tabController = null;
     this._resizeObserver = null;
+    this._disposed = false;
+    this._connectController = null;
+    this._connectTimer = null;
+    this._connectResolve = null;
+    this._inputTimers = new Set();
 
     this._bindInputHandlers();
   }
@@ -47,12 +54,14 @@ export class BrowserViewer {
       });
       // Press after microtask delay — lets Chromium process hover before click
       // (fixes JS widgets like SearchBooster that require hover state)
-      setTimeout(() => {
-        this._send('Input.dispatchMouseEvent', {
+      const timer = setTimeout(() => {
+        this._inputTimers.delete(timer);
+        if (!this._disposed) this._send('Input.dispatchMouseEvent', {
           type: 'mousePressed', x: coords.x, y: coords.y,
           button: 'left', clickCount: 1, modifiers: mods
         });
       }, 0);
+      this._inputTimers.add(timer);
       window.focus();
       c.focus();
     });
@@ -83,65 +92,106 @@ export class BrowserViewer {
     }, { passive: false });
   }
 
-  connect() {
-    return new Promise(async (resolve) => {
-      try {
-        const resp = await ocuFetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
-        const pages = await resp.json();
-        const page = pages.find(p => p.type === 'page');
-        if (!page) { resolve(false); return; }
-        this.pageId = page.id;
-      } catch (e) {
-        resolve(false); return;
-      }
+  async connect() {
+    if (this._disposed) return false;
+    const controller = new AbortController();
+    this._connectController = controller;
+    try {
+      const resp = await ocuFetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`,
+        { cache: 'no-store', signal: controller.signal });
+      if (!resp.ok) return false;
+      const pages = await resp.json();
+      if (this._disposed || !Array.isArray(pages)) return false;
+      const page = pages.find(p => p.type === 'page' && typeof p.id === 'string' && p.id);
+      if (!page) return false;
+      this.pageId = page.id;
 
       const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${wsProto}//${location.host}${_browserBasePath}browser/${this.chatId}/devtools/page/${this.pageId}`;
-      this.ws = new WebSocket(wsUrl);
-
-      const timeout = setTimeout(() => {
-        this.ws.close();
-        this.connected = false;
-        resolve(false);
-      }, 10000);
-
-      this.ws.onopen = () => {
-        clearTimeout(timeout);
-        this.connected = true;
-        this._send('Page.enable', {});
-        this._send('Fetch.enable', { handleAuthRequests: true });
-        this._send('Browser.setDownloadBehavior', {
-          behavior: 'allow',
-          downloadPath: '/mnt/user-data/outputs'
-        });
-        this._startScreencast();
-        this._resizeObserver = new ResizeObserver(() => {
-          if (this.connected) this._startScreencast();
-        });
-        this._resizeObserver.observe(this.canvas);
-        this._tabPollTimer = setInterval(() => this._checkTabSwitch(), 2000);
-        resolve(true);
-      };
-
-      this.ws.onmessage = (event) => this._onWsMessage(event);
-      this.ws.onclose = () => { this.connected = false; };
-      this.ws.onerror = () => {
-        clearTimeout(timeout);
-        this.connected = false;
-        resolve(false);
-      };
-    });
+      const ws = new WebSocket(wsUrl);
+      this.ws = ws;
+      return await new Promise(resolve => {
+        let settled = false;
+        const finish = ok => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(this._connectTimer);
+          this._connectTimer = null;
+          this._connectResolve = null;
+          if (!ok) {
+            this.connected = false;
+            if (this._resizeObserver) { this._resizeObserver.disconnect(); this._resizeObserver = null; }
+            if (this._tabPollTimer) { clearInterval(this._tabPollTimer); this._tabPollTimer = null; }
+            if (this.ws === ws) {
+              this.ws = null;
+              ws.close();
+            }
+          }
+          resolve(ok);
+        };
+        this._connectResolve = finish;
+        this._connectTimer = setTimeout(() => finish(false), 10000);
+        ws.onopen = () => {
+          if (this._disposed || this.ws !== ws) { finish(false); return; }
+          this.connected = true;
+          try {
+            this._send('Page.enable', {});
+            this._send('Fetch.enable', { handleAuthRequests: true });
+            this._send('Browser.setDownloadBehavior', {
+              behavior: 'allow', downloadPath: '/mnt/user-data/outputs'
+            });
+            this._startScreencast();
+            this._resizeObserver = new ResizeObserver(() => {
+              if (this.connected && !this._disposed) this._startScreencast();
+            });
+            this._resizeObserver.observe(this.canvas);
+            this._tabPollTimer = setInterval(() => this._checkTabSwitch(), 2000);
+            finish(true);
+          } catch {
+            finish(false);
+          }
+        };
+        ws.onmessage = event => {
+          if (!this._disposed && this.ws === ws) this._onWsMessage(event);
+        };
+        ws.onclose = () => {
+          if (this.ws === ws) this.connected = false;
+          finish(false);
+        };
+        ws.onerror = () => {
+          if (this.ws === ws) this.connected = false;
+          finish(false);
+        };
+      });
+    } catch {
+      return false;
+    } finally {
+      if (this._connectController === controller) this._connectController = null;
+    }
   }
 
   disconnect() {
+    this._disposed = true;
+    this._connectController?.abort();
+    this._connectResolve?.(false);
+    if (this._connectTimer) { clearTimeout(this._connectTimer); this._connectTimer = null; }
     if (this._tabPollTimer) { clearInterval(this._tabPollTimer); this._tabPollTimer = null; }
+    this._tabController?.abort();
+    this._tabController = null;
     if (this._resizeObserver) { this._resizeObserver.disconnect(); this._resizeObserver = null; }
+    if (this._viewportFixTimer) { clearTimeout(this._viewportFixTimer); this._viewportFixTimer = null; }
+    this._viewportFixPending = false;
+    if (this._loadingHideTimer) { clearTimeout(this._loadingHideTimer); this._loadingHideTimer = null; }
+    for (const timer of this._inputTimers) clearTimeout(timer);
+    this._inputTimers.clear();
+    this._img.onload = null;
     if (this.ws) {
       if (this.connected) {
         try { this._send('Page.stopScreencast', {}); } catch(e) {}
       }
-      this.ws.close();
+      const ws = this.ws;
       this.ws = null;
+      ws.close();
     }
     this.connected = false;
   }
@@ -175,36 +225,50 @@ export class BrowserViewer {
   }
 
   async _checkTabSwitch() {
-    if (!this.connected) return;
+    if (this._disposed || !this.connected || this._tabController) return;
+    const controller = new AbortController();
+    this._tabController = controller;
     try {
-      const resp = await ocuFetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`, { cache: 'no-store' });
+      const resp = await ocuFetch(`${_browserBasePath}browser/${this.chatId}/json?_t=${Date.now()}`,
+        { cache: 'no-store', signal: controller.signal });
+      if (!resp.ok) return;
       const pages = await resp.json();
+      if (this._disposed || !this.connected || !Array.isArray(pages)) return;
       const realPages = pages.filter(p => p.type === 'page' && !p.url.startsWith('chrome://'));
       if (realPages.length === 0) return;
       const target = realPages[realPages.length - 1];
-      if (target.id !== this.pageId) {
-        this._reconnectToPage(target.id);
-      }
-    } catch(e) {}
+      if (target.id !== this.pageId) this._reconnectToPage(target.id);
+    } catch(e) {
+    } finally {
+      if (this._tabController === controller) this._tabController = null;
+    }
   }
 
   _reconnectToPage(newPageId) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      try { this._send('Page.stopScreencast', {}); } catch(e) {}
+    if (this._disposed) return;
+    if (this.ws) {
+      if (this.ws.readyState === WebSocket.OPEN) {
+        try { this._send('Page.stopScreencast', {}); } catch(e) {}
+      }
       this.ws.close();
     }
+    this.connected = false;
     this.pageId = newPageId;
     const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsProto}//${location.host}${_browserBasePath}browser/${this.chatId}/devtools/page/${this.pageId}`;
-    this.ws = new WebSocket(wsUrl);
-    this.ws.onopen = () => {
+    const ws = new WebSocket(wsUrl);
+    this.ws = ws;
+    ws.onopen = () => {
+      if (this._disposed || this.ws !== ws) { ws.close(); return; }
       this.connected = true;
       this._send('Page.enable', {});
       this._send('Fetch.enable', { handleAuthRequests: true });
       this._startScreencast();
     };
-    this.ws.onmessage = (event) => this._onWsMessage(event);
-    this.ws.onclose = () => { this.connected = false; };
+    ws.onmessage = event => {
+      if (!this._disposed && this.ws === ws) this._onWsMessage(event);
+    };
+    ws.onclose = () => { if (this.ws === ws) this.connected = false; };
   }
 
   _applyViewport() {
@@ -254,9 +318,10 @@ export class BrowserViewer {
       if (this._targetWidth && !this._viewportFixPending &&
           (devW !== this._targetWidth || devH !== this._targetHeight)) {
         this._viewportFixPending = true;
-        setTimeout(() => {
+        this._viewportFixTimer = setTimeout(() => {
+          this._viewportFixTimer = null;
           this._viewportFixPending = false;
-          if (this.connected) this._startScreencast();
+          if (this.connected && !this._disposed) this._startScreencast();
         }, 200);
       }
       if (!this._navigating && this._targetWidth &&
@@ -266,6 +331,7 @@ export class BrowserViewer {
     }
     const img = this._img;
     img.onload = () => {
+      if (this._disposed) return;
       this.canvas.width = img.width;
       this.canvas.height = img.height;
       this.ctx.drawImage(img, 0, 0);

@@ -18,6 +18,7 @@ import json
 import logging
 import mimetypes
 import re
+import secrets
 import time
 import zipfile
 from io import BytesIO
@@ -1193,7 +1194,7 @@ async def terminal_ws_proxy(websocket: WebSocket, chat_id: str):
 
 
 @app.get("/preview/{chat_id}", response_class=HTMLResponse, tags=["Files"])
-async def preview_page(chat_id: str, response: Response):
+async def preview_page(chat_id: str, request: Request, response: Response):
     """
     Self-contained file preview SPA.
     Shows output files with auto-refresh, file navigation, and type-specific preview.
@@ -1204,14 +1205,30 @@ async def preview_page(chat_id: str, response: Response):
     # Use relative URLs so it works behind HTTPS reverse proxy
     api_url = f"{OCU_PUBLIC_PREFIX}/api/outputs/{chat_id}"
     files_base = f"{OCU_PUBLIC_PREFIX}/files/{chat_id}"
+    embed = request.query_params.getlist("embed")
+    nonce = secrets.token_urlsafe(24) if len(embed) == 1 and embed[0] in ("browser", "terminal") else None
+    if nonce:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            f"script-src 'self' 'nonce-{nonce}'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "font-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-src 'none'; "
+            "base-uri 'none'; "
+            "object-src 'none'; "
+            "form-action 'none'; "
+            "frame-ancestors 'self'"
+        )
+    return _generate_preview_html(chat_id, api_url, files_base, nonce)
 
-    return _generate_preview_html(chat_id, api_url, files_base)
 
-
-def _generate_preview_html(chat_id: str, api_url: str, files_base: str) -> str:
+def _generate_preview_html(chat_id: str, api_url: str, files_base: str, nonce: Optional[str] = None) -> str:
     """Generate the preview SPA HTML page."""
     asset = f"{OCU_PUBLIC_PREFIX}/static"
     describe_url = f"/api/v1/ocu/workspaces/{chat_id}"
+    config_nonce = f' nonce="{nonce}"' if nonce else ""
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1232,7 +1249,7 @@ def _generate_preview_html(chat_id: str, api_url: str, files_base: str) -> str:
 </head>
 <body>
 <div id="app"></div>
-<script>
+<script{config_nonce}>
 window.__CONFIG__ = {{
   apiUrl: {json.dumps(api_url)},
   filesBase: {json.dumps(files_base)},

@@ -3,6 +3,7 @@
 // Run from repository root: node tests/orchestrator/preview_embedding_browser.cjs
 // Requires the declared playwright 1.62.1 package and its Chromium browser.
 const assert = require('node:assert/strict');
+const { createHash, randomBytes } = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -60,50 +61,77 @@ let sheetRequested;
 const sheetArrival = new Promise(resolve => { sheetRequested = resolve; });
 const heldSheets = [];
 const heldListings = [];
+const heldBrowserStatuses = [];
+const heldBrowserPages = [];
+const heldUpgrades = [];
+const activeSockets = new Set();
+const socketMessages = [];
+const upgradeAttempts = [];
+let browserFixture = 'inactive';
+let browserPagesHeld = false;
+let upgradesHeld = false;
+let ttydSendsData = true;
 const within = (promise, name) => Promise.race([
   promise,
   new Promise((_, reject) => setTimeout(() => reject(new Error(`${name} timed out`)), 10000).unref()),
 ]);
+const waitUntil = async (condition, label) => {
+  const deadline = Date.now() + 10000;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`${label} timed out`);
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+};
 let listMode = 'normal';
 let injectedListingFailure = false;
 const bytes = {};
 const contentTypes = { '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2' };
-const respond = (res, status, body, type = 'application/json') => {
+const respond = (res, status, body, type = 'application/json', headers = {}) => {
   if (res.destroyed) return;
-  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store' });
+  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', ...headers });
   res.end(body);
 };
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
+  const prefix = url.pathname.startsWith('/tools/ocu/') ? '/tools/ocu' : '/ocu';
   requests.push({ path: url.pathname, cursor: url.searchParams.get('cursor'), header: req.headers['x-requested-with'] });
   try {
-    if (url.pathname.startsWith('/ocu/static/')) {
-      const name = decodeURIComponent(url.pathname.slice('/ocu/static/'.length));
+    if (url.pathname.startsWith(`${prefix}/static/`)) {
+      const name = decodeURIComponent(url.pathname.slice(`${prefix}/static/`.length));
       const filename = path.resolve(STATIC, name);
       if (!filename.startsWith(STATIC + path.sep)) return respond(res, 404, 'Not found', 'text/plain');
       return respond(res, 200, await fs.readFile(filename), contentTypes[path.extname(filename)] || 'application/octet-stream');
     }
-    if (url.pathname === '/ocu/preview/' + CHAT) {
+    if (url.pathname === `${prefix}/preview/${CHAT}`) {
       const origin = `http://${req.headers.host}`;
+      const embed = url.searchParams.getAll('embed');
+      const runtime = embed.length === 1 && ['browser', 'terminal'].includes(embed[0]);
+      const nonce = runtime ? randomBytes(18).toString('base64url') : '';
+      const policy = runtime
+        ? `default-src 'none'; script-src 'self' 'nonce-${nonce}'; ` +
+          "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; " +
+          "connect-src 'self'; frame-src 'none'; base-uri 'none'; object-src 'none'; " +
+          "form-action 'none'; frame-ancestors 'self'"
+        : null;
       const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
-        <link rel="stylesheet" href="/ocu/static/preview.css">
-        <link rel="stylesheet" href="/ocu/static/github.min.css">
-        <link rel="stylesheet" href="/ocu/static/katex/katex.min.css">
-        <link rel="stylesheet" href="/ocu/static/xterm.css">
-        <script src="/ocu/static/highlight.min.js"></script>
-        <script src="/ocu/static/highlightjs-line-numbers.min.js"></script>
-        <script src="/ocu/static/marked.min.js"></script>
-        <script src="/ocu/static/xterm.min.js"></script>
-        <script src="/ocu/static/xterm-addon-fit.min.js"></script>
-        <script src="/ocu/static/xterm-addon-web-links.min.js"></script>
-        </head><body><div id="app"></div><script>window.__CONFIG__ = {
-          apiUrl:'/ocu/api/outputs/${CHAT}', filesBase:'/ocu/files/${CHAT}', chatId:'${CHAT}',
+        <link rel="stylesheet" href="${prefix}/static/preview.css">
+        <link rel="stylesheet" href="${prefix}/static/github.min.css">
+        <link rel="stylesheet" href="${prefix}/static/katex/katex.min.css">
+        <link rel="stylesheet" href="${prefix}/static/xterm.css">
+        <script src="${prefix}/static/highlight.min.js"></script>
+        <script src="${prefix}/static/highlightjs-line-numbers.min.js"></script>
+        <script src="${prefix}/static/marked.min.js"></script>
+        <script src="${prefix}/static/xterm.min.js"></script>
+        <script src="${prefix}/static/xterm-addon-fit.min.js"></script>
+        <script src="${prefix}/static/xterm-addon-web-links.min.js"></script>
+        </head><body><div id="app"></div><script${runtime ? ` nonce="${nonce}"` : ''}>window.__CONFIG__ = {
+          apiUrl:'${prefix}/api/outputs/${CHAT}', filesBase:'${prefix}/files/${CHAT}', chatId:'${CHAT}',
           describeUrl:'/api/v1/ocu/workspaces/${CHAT}' };</script>
-          <script type="module" src="/ocu/static/preview.js"></script></body></html>`;
+          <script type="module" src="${prefix}/static/preview.js"></script></body></html>`;
       assert.equal(new URL(origin).hostname, '127.0.0.1');
-      return respond(res, 200, html, 'text/html');
+      return respond(res, 200, html, 'text/html', policy ? { 'Content-Security-Policy': policy } : {});
     }
-    if (url.pathname === '/ocu/api/outputs/' + CHAT) {
+    if (url.pathname === `${prefix}/api/outputs/${CHAT}`) {
       if (listMode === 'failure') {
         injectedListingFailure = true;
         return respond(res, 503, '{}');
@@ -128,18 +156,34 @@ const server = http.createServer(async (req, res) => {
         files: page.map(f => ({ name: f.path, size: 128, revision: 1,
           url: `/ocu/files/${CHAT}/${encodeURIComponent(f.path)}`, ...f })) }));
     }
-    if (url.pathname.startsWith(`/ocu/files/${CHAT}/`)) {
+    if (url.pathname.startsWith(`${prefix}/files/${CHAT}/`)) {
       if (url.pathname.endsWith('/slow.docx')) { held.push(res); slowRequested(); return; }
       if (url.pathname.endsWith('/slow.xlsx')) { heldSheets.push(res); sheetRequested(); return; }
-      const name = decodeURIComponent(url.pathname.slice(`/ocu/files/${CHAT}/`.length));
+      const name = decodeURIComponent(url.pathname.slice(`${prefix}/files/${CHAT}/`.length));
       if (!(name in bytes)) return respond(res, 404, 'Not found', 'text/plain');
       return respond(res, 200, bytes[name], 'application/octet-stream');
     }
-    if (url.pathname === `/ocu/browser/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false, pages: [] }));
-    if (url.pathname === `/ocu/terminal/${CHAT}/processes`) return respond(res, 200, JSON.stringify({ processes: [] }));
-    if (url.pathname === `/ocu/terminal/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false }));
-    if (url.pathname === `/ocu/terminal/${CHAT}/sessions`) return respond(res, 200, JSON.stringify({ sessions: [] }));
-    if (url.pathname === `/ocu/api/uploads/${CHAT}/list`) return respond(res, 200, JSON.stringify({ files: [], total: 0 }));
+    if (url.pathname === `${prefix}/browser/${CHAT}/status`) {
+      if (browserFixture === 'held') { heldBrowserStatuses.push(res); return; }
+      if (browserFixture === 'failure') return respond(res, 503, '{}');
+      if (browserFixture === 'malformed') return respond(res, 200, '{"active":"yes"}');
+      return respond(res, 200, JSON.stringify({
+        active: browserFixture === 'active', pages: browserFixture === 'active'
+          ? [{ id: 'fixture-page', type: 'page', url: 'about:blank' }] : []
+      }));
+    }
+    if (url.pathname === `${prefix}/browser/${CHAT}/json`) {
+      if (browserPagesHeld) { heldBrowserPages.push(res); return; }
+      return respond(res, 200, JSON.stringify([{ id: 'fixture-page', type: 'page', url: 'about:blank' }]));
+    }
+    if (url.pathname === `${prefix}/terminal/${CHAT}/heartbeat`)
+      return respond(res, 200, '{"ok":true}');
+    if (url.pathname === `${prefix}/terminal/${CHAT}/start-ttyd` && req.method === 'POST')
+      return respond(res, 200, '{"already_running":true}');
+    if (url.pathname === `${prefix}/terminal/${CHAT}/processes`) return respond(res, 200, JSON.stringify({ processes: [] }));
+    if (url.pathname === `${prefix}/terminal/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false }));
+    if (url.pathname === `${prefix}/terminal/${CHAT}/sessions`) return respond(res, 200, JSON.stringify({ sessions: [] }));
+    if (url.pathname === `${prefix}/api/uploads/${CHAT}/list`) return respond(res, 200, JSON.stringify({ files: [], total: 0 }));
     if (url.pathname === `/api/v1/ocu/workspaces/${CHAT}`) return respond(res, 200, JSON.stringify({ cli_badge: null }));
     if (url.pathname === '/favicon.ico') return respond(res, 204, '', 'text/plain');
     if (url.pathname === '/parent') return respond(res, 200, `<!doctype html><html><body>
@@ -171,14 +215,97 @@ const server = http.createServer(async (req, res) => {
             window.expectedSelections[generation]=file_id;
           document.querySelector('#preview').contentWindow.postMessage(request,location.origin);
         };
-        window.mount=(query='?embed=files')=>{const frame=document.createElement('iframe');frame.id='preview';
+        window.mount=(query='?embed=files',prefix='/ocu')=>{const frame=document.createElement('iframe');frame.id='preview';
           frame.setAttribute('sandbox','allow-scripts allow-same-origin allow-forms');
-          frame.src='/ocu/preview/${CHAT}'+query;document.body.appendChild(frame);};
+          frame.src=prefix+'/preview/${CHAT}'+query;document.body.appendChild(frame);};
         window.retire=()=>{const frame=document.querySelector('#preview');
           window.retiredFrames.add(frame.contentWindow);frame.remove();};
       </script></body></html>`, 'text/html');
     return respond(res, 404, 'Not found', 'text/plain');
   } catch (error) { respond(res, 500, String(error), 'text/plain'); }
+});
+
+const closeSent = new WeakSet();
+const sendWsFrame = (socket, opcode, payload) => {
+  if (opcode === 8) {
+    if (closeSent.has(socket)) throw new Error('fixture sent duplicate WebSocket close');
+    closeSent.add(socket);
+  }
+  const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+  const header = body.length < 126
+    ? Buffer.from([0x80 | opcode, body.length])
+    : Buffer.from([0x80 | opcode, 126, body.length >> 8, body.length & 255]);
+  socket.write(Buffer.concat([header, body]));
+};
+const acceptUpgrade = ({ req, socket, head }) => {
+  if (socket.destroyed || socket.readableEnded || socket.writableEnded) {
+    if (!socket.destroyed) socket.end();
+    return;
+  }
+  const path = new URL(req.url, 'http://127.0.0.1').pathname;
+  const terminal = path.endsWith(`/terminal/${CHAT}/ws`);
+  const accept = createHash('sha1')
+    .update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+    .digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+    `Sec-WebSocket-Accept: ${accept}\r\n` +
+    (terminal ? 'Sec-WebSocket-Protocol: tty\r\n' : '') + '\r\n');
+  activeSockets.add(socket);
+  socket.on('close', () => activeSockets.delete(socket));
+  let buffered = head;
+  const receive = chunk => {
+    buffered = Buffer.concat([buffered, chunk]);
+    while (buffered.length >= 2) {
+      const opcode = buffered[0] & 15;
+      const masked = Boolean(buffered[1] & 0x80);
+      const wireLength = buffered[1] & 127;
+      let length = wireLength;
+      let offset = 2;
+      if (wireLength === 126) {
+        if (buffered.length < 4) return;
+        length = buffered.readUInt16BE(2);
+        offset = 4;
+      }
+      if (wireLength === 127 || !masked || (opcode >= 8 && length > 125)) {
+        socket.destroy();
+        return;
+      }
+      if (buffered.length < offset + 4 + length) return;
+      const mask = buffered.subarray(offset, offset + 4);
+      const body = Buffer.from(buffered.subarray(offset + 4, offset + 4 + length));
+      for (let i = 0; i < body.length; i++) body[i] ^= mask[i % 4];
+      buffered = buffered.subarray(offset + 4 + length);
+      if (opcode === 8) {
+        if (!closeSent.has(socket)) sendWsFrame(socket, 8, body);
+        socket.end();
+        return;
+      }
+      if (opcode !== 1) continue;
+      try {
+        const message = JSON.parse(body.toString('utf8'));
+        socketMessages.push({ path, method: message.method || (terminal ? 'ttyd-init' : 'unknown') });
+        if (terminal && ttydSendsData)
+          sendWsFrame(socket, 2, Buffer.from([0x30, 0x6f, 0x6b, 0x0d, 0x0a]));
+        else if (Number.isInteger(message.id)) sendWsFrame(socket, 1,
+          JSON.stringify({ id: message.id, result: {} }));
+      } catch { socket.destroy(); return; }
+    }
+  };
+  socket.on('data', receive);
+  if (head.length) receive(Buffer.alloc(0));
+};
+server.on('upgrade', (req, socket, head) => {
+  socket.on('error', () => socket.destroy());
+  const path = new URL(req.url, 'http://127.0.0.1').pathname;
+  if (!path.endsWith(`/terminal/${CHAT}/ws`) &&
+      !path.endsWith(`/browser/${CHAT}/devtools/page/fixture-page`)) {
+    socket.destroy();
+    return;
+  }
+  socket.on('end', () => socket.end());
+  upgradeAttempts.push(path);
+  if (upgradesHeld) heldUpgrades.push({ req, socket, head });
+  else acceptUpgrade({ req, socket, head });
 });
 
 async function main() {
@@ -190,17 +317,94 @@ async function main() {
   try {
     const context = await browser.newContext();
     context.setDefaultTimeout(10000);
+    await context.addInitScript(() => {
+      const start = window.setInterval.bind(window);
+      const stop = window.clearInterval.bind(window);
+      const startTimeout = window.setTimeout.bind(window);
+      const stopTimeout = window.clearTimeout.bind(window);
+      window.__runtimeTimeouts = new Map();
+      window.setTimeout = (callback, delay, ...args) => {
+        if (typeof callback !== 'function' || ![1000, 2000, 4000].includes(delay))
+          return startTimeout(callback, delay, ...args);
+        const timer = startTimeout((...values) => {
+          window.__runtimeTimeouts.delete(timer);
+          callback.apply(window, values);
+        }, delay, ...args);
+        window.__runtimeTimeouts.set(timer, delay);
+        return timer;
+      };
+      window.clearTimeout = timer => {
+        window.__runtimeTimeouts.delete(timer);
+        return stopTimeout(timer);
+      };
+      window.__heartbeatTimers = new Set();
+      window.setInterval = (callback, delay, ...args) => {
+        const timer = start(callback, delay, ...args);
+        if (delay === 120000) window.__heartbeatTimers.add(timer);
+        return timer;
+      };
+      window.clearInterval = timer => {
+        window.__heartbeatTimers.delete(timer);
+        return stop(timer);
+      };
+    });
     const page = await context.newPage();
     page.setDefaultTimeout(10000);
     const consoleErrors = [];
+    const observedBrowserSockets = [];
+    page.on('websocket', socket => {
+      const path = new URL(socket.url()).pathname;
+      if (!path.endsWith(`/browser/${CHAT}/devtools/page/fixture-page`)) return;
+      const observation = { closed: false, socket };
+      observedBrowserSockets.push(observation);
+      socket.on('close', () => { observation.closed = true; });
+    });
     page.on('pageerror', error => consoleErrors.push({ text: String(error), url: '' }));
     const expectedAbortUrls = [];
+    const expectedCspErrors = [];
+    const deniedScriptUrl = 'https://example.invalid/runtime-denied.js';
+    const deniedConnectionUrl = 'https://example.invalid/runtime-denied-api';
+    let cspProbeArmed = false;
+    let frameCspArmed = false;
+    const cspProbeTargets = new Set();
+    const cspProbeFailures = new Set();
+    const pendingRuntimeRequests = new Set();
+    const expectedRetiredRuntimeRequests = new Set();
+    let retiringFrame = null;
+    const expectedRuntimeFailures = [];
     const unexpectedNetworkFailures = [];
+    page.on('request', request => {
+      const address = new URL(request.url());
+      if (address.origin !== origin ||
+          !(address.pathname.endsWith(`/browser/${CHAT}/status`) ||
+            address.pathname.endsWith(`/browser/${CHAT}/json`))) return;
+      pendingRuntimeRequests.add(request);
+      try {
+        if (retiringFrame && request.frame() === retiringFrame)
+          expectedRetiredRuntimeRequests.add(request);
+      } catch {}
+    });
+    page.on('requestfinished', request => {
+      pendingRuntimeRequests.delete(request);
+      expectedRetiredRuntimeRequests.delete(request);
+    });
     page.on('requestfailed', request => {
       const failure = request.failure()?.errorText || '';
-      if (failure.includes('ERR_ABORTED') && (request.url().includes(`/ocu/api/outputs/${CHAT}`)
-          || request.url().endsWith('/slow.docx'))) expectedAbortUrls.push(request.url());
-      else unexpectedNetworkFailures.push(`${request.url()}: ${failure}`);
+      const url = request.url();
+      if (cspProbeTargets.has(url) &&
+          (failure === 'csp' || failure.includes('ERR_BLOCKED_BY_CSP'))) {
+        cspProbeTargets.delete(url);
+        cspProbeFailures.add(url);
+        return;
+      }
+      const expectedRetirement = expectedRetiredRuntimeRequests.delete(request);
+      pendingRuntimeRequests.delete(request);
+      if (failure.includes('ERR_ABORTED') && (
+          url.includes(`/ocu/api/outputs/${CHAT}`) ||
+          url.endsWith('/slow.docx') ||
+          expectedRetirement)) {
+        expectedAbortUrls.push(url);
+      } else unexpectedNetworkFailures.push(`${url}: ${failure}`);
     });
     const externalRequests = [];
     await context.route('**/*', route => {
@@ -222,9 +426,44 @@ async function main() {
         accepted503++;
         return;
       }
+      if (text.includes('Content Security Policy') &&
+          ((cspProbeArmed &&
+            (text.includes(deniedScriptUrl) || text.includes(deniedConnectionUrl))) ||
+           (frameCspArmed && text.includes("frame-src 'none'")))) {
+        expectedCspErrors.push(text);
+        return;
+      }
+      if (browserFixture === 'failure' && text.includes('503') &&
+          (url.includes(`/browser/${CHAT}/status`) || text.includes(`/browser/${CHAT}/status`))) {
+        expectedRuntimeFailures.push(text);
+        return;
+      }
       consoleErrors.push({ text, url });
     });
     const frame = () => page.frameLocator('#preview');
+    const retireFrame = async () => {
+      const iframe = await page.locator('#preview').elementHandle();
+      assert(iframe, 'missing preview iframe before retirement');
+      const owner = await iframe.contentFrame();
+      await iframe.dispose();
+      assert(owner, 'preview iframe has no attached frame');
+      retiringFrame = owner;
+      for (const request of pendingRuntimeRequests) {
+        try {
+          for (let requestFrame = request.frame(); requestFrame; requestFrame = requestFrame.parentFrame()) {
+            if (requestFrame === owner) {
+              expectedRetiredRuntimeRequests.add(request);
+              break;
+            }
+          }
+        } catch {}
+      }
+      try {
+        await page.evaluate(() => window.retire());
+      } finally {
+        retiringFrame = null;
+      }
+    };
     const waitState = async (generation, state, timeout = 10000) => {
       await page.waitForFunction(({ generation, state }) => window.states.some(row =>
         row.type === 'ocu:preview-state' && row.generation === generation && row.state === state),
@@ -238,6 +477,44 @@ async function main() {
       return result;
     };
     await page.goto(origin + '/parent');
+    const extendedFrame = await within(page.evaluate(async socketUrl => {
+      const socket = new WebSocket(socketUrl);
+      const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
+      try {
+        await new Promise((resolve, reject) => {
+          socket.addEventListener('open', resolve, { once: true });
+          socket.addEventListener('error', () => reject(new Error('fixture WebSocket upgrade failed')),
+            { once: true });
+        });
+        const message = { id: 77, method: 'Fixture.length127', padding: '' };
+        const baseLength = new TextEncoder().encode(JSON.stringify(message)).length;
+        if (baseLength > 127) throw new Error('127-byte fixture method exceeds frame boundary');
+        message.padding = 'x'.repeat(127 - baseLength);
+        const payload = JSON.stringify(message);
+        const length = new TextEncoder().encode(payload).length;
+        if (length !== 127) throw new Error('fixture did not build a 127-byte payload');
+        const reply = new Promise((resolve, reject) => {
+          socket.addEventListener('message', event => {
+            const result = JSON.parse(event.data);
+            if (result.id === message.id) resolve(result);
+          });
+          socket.addEventListener('close', () => reject(new Error('127-byte frame was rejected')),
+            { once: true });
+        });
+        socket.send(payload);
+        const result = await reply;
+        socket.close();
+        await closed;
+        return { length, replyId: result.id };
+      } finally {
+        if (socket.readyState < WebSocket.CLOSING) socket.close();
+      }
+    }, `${origin.replace(/^http/, 'ws')}/ocu/browser/${CHAT}/devtools/page/fixture-page`),
+    '127-byte masked WebSocket frame');
+    assert.deepEqual(extendedFrame, { length: 127, replyId: 77 });
+    assert(socketMessages.some(row => row.method === 'Fixture.length127'),
+      'fixture decoder did not consume the extended 127-byte frame');
+    await waitUntil(() => activeSockets.size === 0, '127-byte fixture WebSocket close');
     const fixture = await page.evaluate(async () => {
       const relNS = 'http://schemas.openxmlformats.org/package/2006/relationships';
       const officeNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
@@ -380,6 +657,8 @@ async function main() {
     assert.equal(before, 0, 'embedded page polls before selection');
     const bad = { type:'ocu:preview-select', chat_id:CHAT, file_id:'broken', generation:0 };
     await frame().locator('#app').waitFor();
+    assert.equal(await frame().locator('#app').evaluate(() => window.__heartbeatTimers.size), 0,
+      'Files embedding started a runtime heartbeat');
     await page.evaluate(({ payload, target }) => {
       const iframe = document.createElement('iframe');
       iframe.srcdoc = `<script>parent.frames[0].postMessage(${JSON.stringify(payload)}, ${JSON.stringify(target)});parent.postMessage({type:'sibling-done'}, ${JSON.stringify(target)})<\/script>`;
@@ -607,7 +886,7 @@ async function main() {
     const abortedFetch = page.waitForEvent('requestfailed', {
       predicate: request => request.url().endsWith('/slow.docx'), timeout: 10000,
     });
-    await page.evaluate(() => window.retire());
+    await retireFrame();
     await abortedFetch;
     for (const response of held.splice(0)) respond(response, 200, bytes['slow.docx'], 'application/octet-stream');
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -618,7 +897,7 @@ async function main() {
     await frame().locator('[role="alert"]').getByText('Invalid preview embedding').waitFor();
     assert.equal((await page.evaluate(() => window.states.filter(row => row.type === 'ocu:preview-ready'))).length, 1);
     await page.locator('#preview').evaluate(element => element.remove());
-    await page.evaluate(() => window.mount('?embed=browser'));
+    await page.evaluate(() => window.mount('?embed=unknown'));
     await frame().locator('[role="alert"]').getByText('Invalid preview embedding').waitFor();
     assert.equal((await page.evaluate(() => window.states.filter(row => row.type === 'ocu:preview-ready'))).length, 1);
     await page.locator('#preview').evaluate(element => element.remove());
@@ -647,6 +926,272 @@ async function main() {
     assert(requests.filter(row => row.path.includes('/api/outputs/')).every(row => row.header === 'ocu-workspace'));
     assert(requests.filter(row => row.path.endsWith('.docx') || row.path.endsWith('.xlsx') || row.path.endsWith('.pptx'))
       .every(row => row.header === 'ocu-workspace'));
+    await retireFrame();
+    const listingBeforeRuntime = requests.filter(row => row.path === `/ocu/api/outputs/${CHAT}`).length;
+    const terminalBeforeBrowser = requests.filter(row =>
+      row.path.startsWith(`/ocu/terminal/${CHAT}/`) && !row.path.endsWith('/heartbeat')).length;
+    const launchBeforeRuntime = requests.filter(row => /\/(restart-container|start-ttyd)$/.test(row.path)).length;
+    const browserStatus = page.waitForResponse(response =>
+      new URL(response.url()).pathname === `/ocu/browser/${CHAT}/status`);
+    browserStatus.catch(() => {});
+    const runtimeShell = page.waitForResponse(response =>
+      new URL(response.url()).pathname === `/ocu/preview/${CHAT}` &&
+      new URL(response.url()).searchParams.get('embed') === 'browser');
+    runtimeShell.catch(() => {});
+    await page.evaluate(() => window.mount('?embed=browser'));
+    await frame().locator('.browser-panel .empty-title').waitFor();
+    const policy = (await runtimeShell).headers()['content-security-policy'];
+    assert(policy.includes("default-src 'none'") && policy.includes("frame-ancestors 'self'"));
+    const nonce = policy.match(/'nonce-([^']+)'/)?.[1];
+    assert(nonce, 'runtime response omitted its script nonce');
+    assert.equal(await frame().locator('script[nonce]').evaluate(element => element.nonce), nonce);
+    assert.equal(await frame().locator('#app').evaluate(async () => {
+      const font = new FontFace('OCUFixture', 'url(/ocu/static/katex/fonts/KaTeX_Main-Regular.woff2)');
+      await font.load();
+      return font.status;
+    }), 'loaded');
+    cspProbeArmed = true;
+    cspProbeTargets.add(deniedScriptUrl);
+    cspProbeTargets.add(deniedConnectionUrl);
+    const blocked = await frame().locator('#app').evaluate(async (_element, { scriptUrl, connectionUrl }) => {
+      if (new URL(scriptUrl).origin === location.origin ||
+          new URL(connectionUrl).origin === location.origin)
+        throw new Error('runtime CSP negative controls must be external');
+      const script = new Promise(resolve => {
+        const element = document.createElement('script');
+        element.src = scriptUrl;
+        element.onload = () => resolve(false);
+        element.onerror = () => resolve(true);
+        document.head.appendChild(element);
+      });
+      const connection = fetch(connectionUrl).then(() => false, () => true);
+      return Promise.all([script, connection]);
+    }, { scriptUrl: deniedScriptUrl, connectionUrl: deniedConnectionUrl });
+    assert.deepEqual(blocked, [true, true], 'runtime CSP allowed external content');
+    assert.equal(externalRequests.length, 0, 'external runtime request reached the network');
+    await waitUntil(() => expectedCspErrors.length >= 2, 'runtime CSP violations');
+    await waitUntil(() => cspProbeFailures.has(deniedScriptUrl),
+      'runtime script CSP request denial');
+    assert(expectedCspErrors.some(text => text.includes(deniedScriptUrl)),
+      'runtime script request lacked a correlated CSP violation');
+    cspProbeTargets.clear();
+    cspProbeArmed = false;
+    const beforeNested = requests.filter(row => row.path === `/ocu/preview/${CHAT}`).length;
+    frameCspArmed = true;
+    await frame().locator('#app').evaluate((_element, chat) => {
+      const nested = document.createElement('iframe');
+      nested.src = `/ocu/preview/${chat}`;
+      document.body.appendChild(nested);
+    }, CHAT);
+    await waitUntil(() => expectedCspErrors.some(text => text.includes("frame-src 'none'")),
+      'runtime frame-src denial');
+    assert.equal(requests.filter(row => row.path === `/ocu/preview/${CHAT}`).length,
+      beforeNested, 'runtime CSP allowed a nested frame request');
+    frameCspArmed = false;
+    assert.equal((await browserStatus).status(), 200);
+    assert.equal(await frame().locator('.view-tabs').count(), 0, 'browser embed mounted nested view tabs');
+    assert(requests.some(row => row.path === `/ocu/browser/${CHAT}/status`),
+      'browser embed did not discover existing browser status');
+    assert.equal(requests.filter(row =>
+      row.path.startsWith(`/ocu/terminal/${CHAT}/`) && !row.path.endsWith('/heartbeat')).length,
+      terminalBeforeBrowser, 'browser embed mounted the terminal client');
+    assert.equal(requests.filter(row => row.path === `/ocu/api/outputs/${CHAT}`).length,
+      listingBeforeRuntime, 'browser embed listed Files');
+    await page.screenshot({ path: path.join(artifacts, 'embedded-browser-inactive.png') });
+    await retireFrame();
+    const browserBeforeTerminal = requests.filter(row => row.path.startsWith(`/ocu/browser/${CHAT}/`)).length;
+    await page.evaluate(() => window.mount('?embed=terminal'));
+    await frame().locator('.dash-btn-primary').waitFor();
+    assert.equal(await frame().locator('.view-tabs').count(), 0, 'terminal embed mounted nested view tabs');
+    assert.equal(requests.filter(row => row.path.startsWith(`/ocu/browser/${CHAT}/`)).length,
+      browserBeforeTerminal, 'terminal embed mounted the browser client');
+    assert.equal(requests.filter(row => row.path === `/ocu/api/outputs/${CHAT}`).length,
+      listingBeforeRuntime, 'terminal embed listed Files');
+    assert.equal(requests.filter(row => /\/(restart-container|start-ttyd)$/.test(row.path)).length,
+      launchBeforeRuntime, 'runtime embedding implicitly launched a sandbox');
+    await page.screenshot({ path: path.join(artifacts, 'embedded-terminal-dashboard.png') });
+    await retireFrame();
+    const runtimeCalls = () => requests.filter(row =>
+      /\/(?:browser|terminal)\/|\/api\/uploads\//.test(row.path)).length;
+    const beforeInvalid = runtimeCalls();
+    await page.evaluate(() => window.mount('?embed=browser&embed=browser'));
+    await frame().locator('[role="alert"]').getByText('Invalid preview embedding').waitFor();
+    await retireFrame();
+    const unframed = await context.newPage();
+    try {
+      await unframed.goto(`${origin}/ocu/preview/${CHAT}?embed=browser`);
+      await unframed.locator('[role="alert"]').getByText('Invalid preview embedding').waitFor();
+    } finally {
+      await unframed.close();
+    }
+    assert.equal(runtimeCalls(), beforeInvalid, 'invalid runtime embedding issued a runtime request');
+
+    for (const state of ['failure', 'malformed']) {
+      browserFixture = state;
+      const beforeConnections = activeSockets.size;
+      await page.evaluate(() => window.mount('?embed=browser'));
+      await frame().getByRole('alert').getByText('Browser unavailable').waitFor();
+      assert.equal(activeSockets.size, beforeConnections, 'unavailable Browser started a connection');
+      await retireFrame();
+    }
+    browserFixture = 'held';
+    await page.evaluate(() => window.mount('?embed=browser'));
+    await waitUntil(() => heldBrowserStatuses.length === 1, 'held browser status');
+    await new Promise(resolve => setTimeout(resolve, 3100));
+    assert.equal(heldBrowserStatuses.length, 1, 'overlapping browser status polls');
+    const beforeLateStatus = requests.length;
+    await retireFrame();
+    browserFixture = 'active';
+    for (const response of heldBrowserStatuses.splice(0))
+      respond(response, 200, '{"active":true,"pages":[{"id":"fixture-page","type":"page"}]}');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(requests.slice(beforeLateStatus).filter(row => row.path.endsWith('/json')).length, 0,
+      'retired Browser created a viewer after late status');
+
+    browserPagesHeld = true;
+    await page.evaluate(() => window.mount('?embed=browser'));
+    await waitUntil(() => heldBrowserPages.length === 1, 'held browser pages');
+    await retireFrame();
+    browserPagesHeld = false;
+    for (const response of heldBrowserPages.splice(0))
+      respond(response, 200, '[{"id":"fixture-page","type":"page"}]');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(activeSockets.size, 0, 'retired Browser connected after late page discovery');
+
+    upgradesHeld = true;
+    const browserSocketsBeforeHold = observedBrowserSockets.length;
+    await page.evaluate(() => window.mount('?embed=browser'));
+    await waitUntil(() => heldUpgrades.length === 1, 'held browser WebSocket');
+    const heldBrowserSocket = heldUpgrades[0].socket;
+    await retireFrame();
+    await waitUntil(() => heldBrowserSocket.readableEnded || heldBrowserSocket.destroyed,
+      'retired Browser WebSocket peer FIN');
+    if (observedBrowserSockets.length > browserSocketsBeforeHold) {
+      await waitUntil(() => observedBrowserSockets.slice(browserSocketsBeforeHold).some(item => {
+        if (item.closed) return true;
+        try { return typeof item.socket.isClosed === 'function' && item.socket.isClosed(); }
+        catch { return false; }
+      }), 'browser WebSocket client close');
+    }
+    upgradesHeld = false;
+    for (const upgrade of heldUpgrades.splice(0)) acceptUpgrade(upgrade);
+    await waitUntil(() => heldBrowserSocket.destroyed, 'held browser transport close');
+    assert.equal(activeSockets.size, 0, 'retired Browser retained an accepted WebSocket');
+
+    upgradesHeld = true;
+    await page.evaluate(() => window.mount('?embed=terminal'));
+    await frame().locator('.dash-btn-primary').click();
+    await waitUntil(() => heldUpgrades.length === 1, 'held ttyd WebSocket');
+    const heldTtydSocket = heldUpgrades[0].socket;
+    await retireFrame();
+    await waitUntil(() => heldTtydSocket.readableEnded || heldTtydSocket.destroyed,
+      'retired ttyd WebSocket peer FIN');
+    upgradesHeld = false;
+    for (const upgrade of heldUpgrades.splice(0)) acceptUpgrade(upgrade);
+    await waitUntil(() => heldTtydSocket.destroyed, 'held ttyd transport close');
+    assert.equal(activeSockets.size, 0, 'retired Terminal retained an accepted WebSocket');
+
+    ttydSendsData = false;
+    const beforeTtydMessages = socketMessages.length;
+    await page.evaluate(() => window.mount('?embed=terminal'));
+    await frame().locator('.dash-btn-primary').click();
+    await waitUntil(() => socketMessages.slice(beforeTtydMessages).some(row =>
+      row.path === `/ocu/terminal/${CHAT}/ws` && row.method === 'ttyd-init') &&
+      activeSockets.size === 1, 'ttyd reconnect setup');
+    sendWsFrame([...activeSockets][0], 8, Buffer.alloc(0));
+    await waitUntil(() => activeSockets.size === 0, 'ttyd remote close');
+    const beforeBackoff = upgradeAttempts.length;
+    await page.waitForFunction(() =>
+      [...document.querySelector('#preview').contentWindow.__runtimeTimeouts.values()].includes(1000),
+    null, { timeout: 10000 });
+    await frame().locator('.terminal-toolbar .terminal-btn').first().click();
+    await frame().locator('.dash-btn-primary').waitFor();
+    assert.equal(await frame().locator('#app').evaluate(() =>
+      [...window.__runtimeTimeouts.values()].includes(1000)), false,
+    'TerminalSession retained reconnect timer after component unmount');
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal(upgradeAttempts.length, beforeBackoff,
+      'unmounted ttyd reconnect backoff created a new WebSocket');
+    await retireFrame();
+    const beforeExhaustion = socketMessages.length;
+    await page.evaluate(() => window.mount('?embed=terminal'));
+    await frame().locator('.dash-btn-primary').click();
+    await waitUntil(() => socketMessages.slice(beforeExhaustion).some(row =>
+      row.path === `/ocu/terminal/${CHAT}/ws` && row.method === 'ttyd-init'),
+    'terminal exhausted reconnect setup');
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const seen = socketMessages.length;
+      assert.equal(activeSockets.size, 1, 'terminal reconnect opened duplicate sockets');
+      sendWsFrame([...activeSockets][0], 8, Buffer.alloc(0));
+      await waitUntil(() => activeSockets.size === 0, `terminal remote close ${attempt}`);
+      if (attempt < 3) await waitUntil(() => socketMessages.slice(seen).some(row =>
+        row.path === `/ocu/terminal/${CHAT}/ws` && row.method === 'ttyd-init') &&
+        activeSockets.size === 1, `terminal reconnect ${attempt}`);
+    }
+    await page.waitForFunction(() =>
+      [...document.querySelector('#preview').contentWindow.__runtimeTimeouts.values()].includes(2000),
+    null, { timeout: 10000 });
+    const beforeBack = upgradeAttempts.length;
+    await frame().locator('.terminal-toolbar .terminal-btn').first().click();
+    await frame().locator('.dash-btn-primary').waitFor();
+    assert.equal(await frame().locator('#app').evaluate(() =>
+      [...window.__runtimeTimeouts.values()].includes(2000)), false,
+    'TerminalSession retained onBack timer after component unmount');
+    await new Promise(resolve => setTimeout(resolve, 2200));
+    assert.equal(upgradeAttempts.length, beforeBack, 'terminal created a socket after onBack cleanup');
+    await retireFrame();
+    ttydSendsData = true;
+
+    const allListingBeforeCycles = requests.filter(row => row.path.includes(`/api/outputs/${CHAT}`)).length;
+    for (let cycle = 0; cycle < 20; cycle++) {
+      const prefix = cycle % 2 ? '/tools/ocu' : '/ocu';
+      for (const mode of ['browser', 'terminal']) {
+        const beforeMessages = socketMessages.length;
+        const beforeRequests = requests.length;
+        await page.evaluate(({ mode, prefix }) => window.mount(`?embed=${mode}`, prefix), { mode, prefix });
+        if (mode === 'browser') {
+          await waitUntil(() => socketMessages.slice(beforeMessages).some(row =>
+            row.path === `${prefix}/browser/${CHAT}/devtools/page/fixture-page` &&
+            row.method === 'Page.enable'), `Browser CDP cycle ${cycle}`);
+          assert.equal(await frame().locator('.browser-panel canvas').count(), 1);
+        } else {
+          await frame().locator('.dash-btn-primary').waitFor();
+          await frame().locator('.dash-btn-primary').click();
+          await waitUntil(() => socketMessages.slice(beforeMessages).some(row =>
+            row.path === `${prefix}/terminal/${CHAT}/ws` && row.method === 'ttyd-init'),
+          `Terminal ttyd cycle ${cycle}`);
+          assert.equal(await frame().locator('.terminal-view').count(), 1);
+        }
+        const cycleRequests = requests.slice(beforeRequests);
+        const required = mode === 'browser'
+          ? [`${prefix}/browser/${CHAT}/status`, `${prefix}/browser/${CHAT}/json`]
+          : [`${prefix}/terminal/${CHAT}/status`, `${prefix}/terminal/${CHAT}/sessions`,
+            `${prefix}/terminal/${CHAT}/processes`, `${prefix}/terminal/${CHAT}/start-ttyd`,
+            `${prefix}/api/uploads/${CHAT}/list`];
+        for (const path of required)
+          assert(cycleRequests.some(row => row.path === path && row.header === 'ocu-workspace'),
+            `${mode} cycle ${cycle} missed the prefixed workspace request ${path}`);
+        const other = mode === 'browser' ? '/terminal/' : '/browser/';
+        assert.equal(cycleRequests.filter(row =>
+          row.path.includes(`${prefix}${other}${CHAT}/`) && !row.path.endsWith('/heartbeat')).length, 0,
+        `${mode} cycle ${cycle} mounted the unselected runtime`);
+        assert.equal(await frame().locator('#app').evaluate(() => window.__heartbeatTimers.size), 1,
+          `${mode} embed has multiple or missing heartbeat timers`);
+        assert.equal(activeSockets.size, 1, `${mode} cycle ${cycle} has duplicate connections`);
+        assert.equal(requests.filter(row => row.path.includes(`/api/outputs/${CHAT}`)).length,
+          allListingBeforeCycles, `${mode} embed listed Files`);
+        await retireFrame();
+        await waitUntil(() => activeSockets.size === 0, `${mode} cycle ${cycle} socket cleanup`);
+      }
+    }
+    const requestsAtRetirement = requests.length;
+    await new Promise(resolve => setTimeout(resolve, 3200));
+    assert.equal(requests.length, requestsAtRetirement,
+      'retired runtime scheduled a late status, heartbeat or tab-poll request');
+    assert.equal(activeSockets.size, 0);
+    assert.equal(heldBrowserStatuses.length + heldBrowserPages.length + heldUpgrades.length, 0,
+      'retired fixture retained a pending completion');
+    browserFixture = 'inactive';
     listMode = 'standalone';
     const standalone = await context.newPage();
     standalone.on('pageerror', error => consoleErrors.push({ text: String(error), url: '' }));
@@ -683,5 +1228,9 @@ main().catch(error => { console.error(error); process.exitCode = 1; }).finally(a
   for (const response of held.splice(0)) response.destroy();
   for (const response of heldListings.splice(0)) response.destroy();
   for (const response of heldSheets.splice(0)) response.destroy();
+  for (const response of heldBrowserStatuses.splice(0)) response.destroy();
+  for (const response of heldBrowserPages.splice(0)) response.destroy();
+  for (const upgrade of heldUpgrades.splice(0)) upgrade.socket.destroy();
+  for (const socket of activeSockets) socket.destroy();
   await new Promise(resolve => server.close(resolve));
 });
