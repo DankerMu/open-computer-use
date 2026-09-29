@@ -19,7 +19,7 @@ QUERIES = (
     "?embed=terminal",
     "?embed=unknown",
 )
-PREFIXES = ("/ocu", "/tools/ocu")
+PREFIXES = ("", "/ocu", "/tools/ocu")
 HEADERS = ("content-type", "cache-control", "content-security-policy", "x-content-type-options")
 
 

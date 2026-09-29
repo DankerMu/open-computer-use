@@ -115,7 +115,10 @@ arbitrary text and truncated records cannot masquerade as an Office workbook.
 The local real-SPA browser harness is
 `node tests/orchestrator/preview_embedding_browser.cjs` (Playwright 1.62.1
 and its Chromium required); its assets and Office fixtures are local.
-
+Prepare Draw.io viewer materials with `python3 computer-use-server/drawio/prepare_drawio.py`
+before native preview verification. The same command runs during the server
+image build. Runtime serving uses only `{prefix}/static/drawio/` and never
+downloads viewer resources.
 
 ### Browser (CDP Proxy)
 - `GET /browser/{chat_id}/status` — Browser status

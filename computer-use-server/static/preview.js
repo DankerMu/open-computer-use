@@ -50,16 +50,22 @@ function formatSize(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
-const _loadedScripts = new Set();
+const _loadedScripts = new Map();
 function loadScript(url) {
-  if (_loadedScripts.has(url)) return Promise.resolve();
-  return new Promise((resolve, reject) => {
+  const pending = _loadedScripts.get(url);
+  if (pending) return pending;
+  const work = new Promise((resolve, reject) => {
     const s = document.createElement('script');
     s.src = url;
-    s.onload = () => { _loadedScripts.add(url); resolve(); };
-    s.onerror = reject;
+    s.onload = () => resolve();
+    s.onerror = () => {
+      _loadedScripts.delete(url);
+      reject(new Error(`Failed to load ${url}`));
+    };
     document.head.appendChild(s);
   });
+  _loadedScripts.set(url, work);
+  return work;
 }
 
 function fetchOutput(url) {
@@ -72,16 +78,17 @@ function officeBanner() {
 // Office converters produce HTML from document-controlled bytes. Only this
 // detached, sanitized fragment may cross into the trusted preview DOM.
 export function safeOfficeHtml(markup) {
-  if (!window.DOMPurify?.isSupported) throw new Error('Office sanitizer unavailable');
+  const sanitizer = window.__OCU_OFFICE_PURIFY || window.DOMPurify;
+  if (!sanitizer?.isSupported) throw new Error('Office sanitizer unavailable');
   const inlineImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
   const blockRemoteImage = (node, data) => {
     if (data.attrName === 'src' && node.nodeName.toLowerCase() === 'img'
         && !inlineImage.test(data.attrValue)) data.keepAttr = false;
   };
-  window.DOMPurify.addHook('uponSanitizeAttribute', blockRemoteImage);
+  sanitizer.addHook('uponSanitizeAttribute', blockRemoteImage);
   let fragment;
   try {
-    fragment = window.DOMPurify.sanitize(markup, {
+    fragment = sanitizer.sanitize(markup, {
       RETURN_DOM_FRAGMENT: true,
       ALLOWED_TAGS: ['p', 'div', 'span', 'br', 'strong', 'em', 'b', 'i', 'u', 's',
         'sub', 'sup', 'blockquote', 'pre', 'code', 'ul', 'ol', 'li', 'h1', 'h2',
@@ -96,7 +103,7 @@ export function safeOfficeHtml(markup) {
       SANITIZE_NAMED_PROPS: true,
     });
   } finally {
-    window.DOMPurify.removeHook('uponSanitizeAttribute', blockRemoteImage);
+    sanitizer.removeHook('uponSanitizeAttribute', blockRemoteImage);
   }
   for (const image of fragment.querySelectorAll('img')) {
     const src = image.getAttribute('src') || '';
@@ -498,11 +505,37 @@ async function renderSpreadsheetPreview(container, file) {
   }
 }
 
+let officeSanitizerOwned = null;
+let sanitizerGate = Promise.resolve();
+
+function withSanitizerGate(work) {
+  const next = sanitizerGate.then(work, work);
+  sanitizerGate = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+async function ensureOfficeSanitizer() {
+  return withSanitizerGate(async () => {
+    if (officeSanitizerOwned?.isSupported) {
+      window.__OCU_OFFICE_PURIFY = officeSanitizerOwned;
+      return officeSanitizerOwned;
+    }
+    const previous = window.DOMPurify;
+    await loadScript(moduleAssetUrl('purify.min.js'));
+    const loaded = window.DOMPurify;
+    if (!loaded?.isSupported) throw new Error('Office sanitizer unavailable');
+    officeSanitizerOwned = loaded;
+    window.__OCU_OFFICE_PURIFY = loaded;
+    if (previous && previous !== loaded) window.DOMPurify = previous;
+    return loaded;
+  });
+}
+
 async function renderDocxPreview(container, file, embedded = false) {
   container.innerHTML = officeBanner() + '<div class="markdown-body" id="docxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
   try {
     await loadScript(moduleAssetUrl('mammoth.browser.min.js'));
-    await loadScript(moduleAssetUrl('purify.min.js'));
+    await ensureOfficeSanitizer();
     const resp = await fetchOutput(file.url);
     if (embedded && !resp.ok) throw new Error('Office response failed');
     const arrayBuffer = await resp.arrayBuffer();
@@ -537,7 +570,7 @@ async function renderXlsxPreview(container, file, embedded = false) {
   container.innerHTML = officeBanner() + '<div class="data-table-wrap" id="xlsxContainer"><div class="spinner" style="margin:20px auto"></div></div>';
   try {
     await loadScript(moduleAssetUrl('xlsx.full.min.js'));
-    await loadScript(moduleAssetUrl('purify.min.js'));
+    await ensureOfficeSanitizer();
     const resp = await fetchOutput(file.url);
     if (embedded && !resp.ok) throw new Error('Office response failed');
     const arrayBuffer = await resp.arrayBuffer();
@@ -709,29 +742,223 @@ async function renderPptxPreview(container, file, embedded = false) {
   return true;
 }
 
+
+function configureDrawioBases() {
+  const base = moduleAssetUrl('drawio/');
+  const root = base.replace(/\/$/, '');
+  window.DRAWIO_BASE_URL = root;
+  window.DRAWIO_SERVER_URL = base;
+  window.DRAWIO_LIGHTBOX_URL = root;
+  window.DRAWIO_VIEWER_URL = moduleAssetUrl('drawio/js/viewer-static.min.js');
+  window.EXPORT_URL = '';
+  window.PROXY_URL = '';
+  window.SAVE_URL = '';
+  window.OPEN_FORM = '';
+  window.VSS_CONVERT_URL = '';
+  window.REALTIME_URL = '';
+  window.NOTIFICATIONS_URL = '';
+  window.STYLE_PATH = root + '/styles';
+  window.CSS_PATH = root + '/styles';
+  window.SHAPES_PATH = root + '/shapes';
+  window.STENCIL_PATH = root + '/stencils';
+  window.IMAGE_PATH = root + '/images';
+  window.GRAPH_IMAGE_PATH = root + '/img';
+  window.DRAW_MATH_URL = root + '/math4/es5';
+  window.mxBasePath = root + '/mxgraph';
+  window.mxImageBasePath = root + '/mxgraph/images';
+  window.mxLoadStylesheets = false;
+}
+
+function parseDrawioDocument(xml) {
+  const doc = new DOMParser().parseFromString(xml, 'text/xml');
+  if (doc.querySelector('parsererror')) throw new Error('Invalid Draw.io document');
+  const root = doc.documentElement;
+  if (!root || (root.nodeName !== 'mxfile' && root.nodeName !== 'mxGraphModel')) {
+    throw new Error('Invalid Draw.io document');
+  }
+  return root;
+}
+
+function mxgraphShapeFromStyle(style) {
+  if (typeof style !== 'string') return null;
+  const match = /(?:^|;)shape=(mxgraph\.[^;]+)/i.exec(style);
+  return match ? match[1].trim().toLowerCase() : null;
+}
+
+function collectMxgraphShapes(root, names) {
+  if (!root || root.nodeType !== 1) return;
+  const name = mxgraphShapeFromStyle(root.getAttribute('style'));
+  if (name) names.add(name);
+  for (const child of root.children) collectMxgraphShapes(child, names);
+}
+
+function collectViewerMxgraphShapes(viewer, names) {
+  try {
+    const cells = viewer?.graph?.model?.cells;
+    if (!cells) return;
+    for (const cell of Object.values(cells)) {
+      const name = mxgraphShapeFromStyle(cell?.style);
+      if (name) names.add(name);
+    }
+  } catch {
+  }
+}
+
+function installStencilLoadTracker() {
+  const utils = window.mxUtils;
+  const failures = [];
+  if (!utils) return { failures, restore() {} };
+  const previousLoad = utils.load;
+  const previousGet = utils.get;
+  const note = (url, status) => {
+    if (!String(url || '').includes('/stencils/')) return;
+    if (!(status >= 200 && status < 300)) failures.push(String(url));
+  };
+  if (typeof previousLoad === 'function') {
+    utils.load = function(url) {
+      const result = previousLoad.apply(this, arguments);
+      try { note(url, result && result.getStatus()); } catch {
+        note(url, 0);
+      }
+      return result;
+    };
+  }
+  if (typeof previousGet === 'function') {
+    utils.get = function(url, onload, onerror) {
+      return previousGet.call(this, url, function(request) {
+        try { note(url, request && request.getStatus()); } catch {
+          note(url, 0);
+        }
+        if (onload) onload(request);
+      }, function(request) {
+        note(url, 0);
+        if (onerror) onerror(request);
+      });
+    };
+  }
+  return {
+    failures,
+    restore() {
+      utils.load = previousLoad;
+      utils.get = previousGet;
+      const registry = window.mxStencilRegistry;
+      if (!registry) return;
+      for (const url of failures) {
+        try {
+          if (registry.packages) delete registry.packages[url];
+          if (registry.filesLoaded) delete registry.filesLoaded[url];
+          const libraries = registry.libraries || {};
+          for (const [name, members] of Object.entries(libraries)) {
+            if (!Array.isArray(members)) continue;
+            if (members.some((member) => String(member) === url || String(member).includes(url) ||
+                url.endsWith(String(member)) || url.includes(String(member)))) {
+              if (registry.packages) delete registry.packages[name];
+            }
+          }
+        } catch {
+        }
+      }
+    }
+  };
+}
+
+function assertRequiredStencilsLoaded(names, failures) {
+  if (failures.length) throw new Error('Draw.io stencil fetch failed');
+  const registry = window.mxStencilRegistry && window.mxStencilRegistry.stencils;
+  for (const name of names) {
+    if (!registry || !Object.prototype.hasOwnProperty.call(registry, name) || !registry[name]) {
+      throw new Error('Draw.io required stencil unavailable');
+    }
+  }
+}
+
+function waitForDrawioRender(viewer, host) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      if (error) {
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+        return;
+      }
+      if (!host.querySelector('svg')) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (host.querySelector('svg')) finish();
+      else finish(new Error('Draw.io render timed out'));
+    }, 10000);
+    if (typeof viewer.addListener !== 'function') {
+      finish(new Error('Draw.io viewer API unavailable'));
+      return;
+    }
+    viewer.addListener('render', () => finish());
+    finish();
+  });
+}
+
+async function loadDrawioViewer() {
+  return withSanitizerGate(async () => {
+    const office = officeSanitizerOwned || window.__OCU_OFFICE_PURIFY;
+    const previous = window.DOMPurify;
+    let replaced = false;
+    if (office && window.DOMPurify === office) {
+      delete window.DOMPurify;
+      replaced = true;
+    }
+    try {
+      await loadScript(moduleAssetUrl('drawio/js/viewer-static.min.js'));
+      if (typeof GraphViewer !== 'function') throw new Error('Draw.io viewer unavailable');
+      if (office && window.DOMPurify === office) {
+        throw new Error('Draw.io viewer reused the Office sanitizer');
+      }
+      window.__OCU_OFFICE_PURIFY = office || window.__OCU_OFFICE_PURIFY;
+      return GraphViewer;
+    } finally {
+      if (replaced && office && !window.DOMPurify) window.DOMPurify = previous;
+      if (office) window.__OCU_OFFICE_PURIFY = office;
+    }
+  });
+}
+
 async function renderDrawioPreview(container, file) {
   container.innerHTML = `<div class="empty-state"><div class="spinner"></div><p class="loading-text">${t('loading')}</p></div>`;
+  const tracker = { restore() {} };
   try {
+    configureDrawioBases();
     const drawioResp = await fetchOutput(file.url);
+    if (!drawioResp.ok) throw new Error('Draw.io document fetch failed');
     const drawioXml = await drawioResp.text();
-    const mxDiv = document.createElement('div');
-    mxDiv.className = 'mxgraph';
-    mxDiv.style.cssText = 'max-width:100%;margin:0 auto;background:#fff;padding:20px;border-radius:8px;';
-    mxDiv.setAttribute('data-mxgraph', JSON.stringify({ xml: drawioXml }));
+    const xmlRoot = parseDrawioDocument(drawioXml);
+    const required = new Set();
+    collectMxgraphShapes(xmlRoot, required);
+    const Viewer = await loadDrawioViewer();
+    const host = document.createElement('div');
+    host.className = 'drawio-host';
+    host.style.cssText = 'max-width:100%;margin:0 auto;background:#fff;padding:20px;border-radius:8px;min-height:120px;';
     container.innerHTML = '';
     container.style.display = 'flex';
     container.style.justifyContent = 'center';
     container.style.alignItems = 'flex-start';
-    container.appendChild(mxDiv);
-    const viewerUrl = 'https://viewer.diagrams.net/js/viewer-static.min.js';
-    if (_loadedScripts.has(viewerUrl) && window.GraphViewer) {
-      GraphViewer.processElements();
-    } else {
-      await loadScript(viewerUrl);
-    }
+    container.appendChild(host);
+    Object.assign(tracker, installStencilLoadTracker());
+    const viewer = new Viewer(host, xmlRoot, { 'auto-fit': true, lightbox: false, nav: true });
+    await waitForDrawioRender(viewer, host);
+    if (!host.isConnected) return;
+    collectViewerMxgraphShapes(viewer, required);
+    assertRequiredStencilsLoaded(required, tracker.failures);
+    const svg = host.querySelector('svg');
+    if (!svg) throw new Error('Draw.io render produced no diagram');
   } catch (err) {
+    if (!container.isConnected) return;
     console.error('Draw.io render error:', err);
     renderDownloadFallback(container, file, 'diagram', t('drawio_fail'));
+  } finally {
+    tracker.restore();
   }
 }
 

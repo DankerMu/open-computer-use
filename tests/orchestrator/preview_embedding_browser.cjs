@@ -45,7 +45,7 @@ async function captureProductionPreviews() {
       throw new Error(`production preview capture failed (${result.error?.code || result.status}); ` +
         'OCU_PREVIEW_PYTHON must provide Python 3.12, server requirements and pytest');
     const captures = JSON.parse(await fs.readFile(output, 'utf8'));
-    if (!Array.isArray(captures) || captures.length !== 14)
+    if (!Array.isArray(captures) || captures.length !== 21)
       throw new Error('production preview capture omitted required prefix/mode responses');
     const byRoute = new Map();
     for (const response of captures) {
@@ -92,6 +92,13 @@ const files = [
   { file_id: 'xhtml', path: 'page.xhtml', type: 'other', mime: 'application/xhtml+xml' },
   { file_id: 'xml', path: 'data.xml', type: 'code', mime: 'application/xml' },
   { file_id: 'drawio', path: 'diagram.drawio', type: 'drawio', mime: 'application/xml' },
+  { file_id: 'drawio-empty', path: 'empty.drawio', type: 'drawio', mime: 'application/xml' },
+  { file_id: 'drawio-lazy', path: 'lazy.drawio', type: 'drawio', mime: 'application/xml' },
+  { file_id: 'drawio-broken', path: 'broken.drawio', type: 'drawio', mime: 'application/xml' },
+  { file_id: 'drawio-compressed', path: 'compressed.drawio', type: 'drawio', mime: 'application/xml' },
+  { file_id: 'drawio-image', path: 'image.drawio', type: 'drawio', mime: 'application/xml' },
+  { file_id: 'drawio-math', path: 'math.drawio', type: 'drawio', mime: 'application/xml' },
+  { file_id: 'drawio-missing', path: 'missing.drawio', type: 'drawio', mime: 'application/xml' },
   { file_id: 'html-doc', path: 'spoof.docx', type: 'docx', mime: 'text/html; charset=utf-8' },
   { file_id: 'xml-doc', path: 'text-xml.docx', type: 'docx', mime: 'text/xml' },
   { file_id: 'plusxml', path: 'suffix.docx', type: 'docx', mime: 'application/vnd.example+xml' },
@@ -129,8 +136,26 @@ const waitUntil = async (condition, label) => {
 };
 let listMode = 'normal';
 let injectedListingFailure = false;
+let drawioMissingViewer = false;
+let drawioCorruptViewer = false;
+let drawioMissingLazy = false;
+let drawioHeldDocument = false;
+const heldDrawio = [];
 const bytes = {};
-const contentTypes = { '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2' };
+const contentTypes = {
+  '.js': 'text/javascript',
+  '.mjs': 'text/javascript',
+  '.css': 'text/css',
+  '.woff2': 'font/woff2',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.xml': 'application/xml',
+  '.json': 'application/json',
+  '.txt': 'text/plain'
+};
 const respond = (res, status, body, type = 'application/json', headers = {}) => {
   if (res.destroyed) return;
   res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', ...headers });
@@ -138,13 +163,29 @@ const respond = (res, status, body, type = 'application/json', headers = {}) => 
 };
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
-  const prefix = url.pathname.startsWith('/tools/ocu/') ? '/tools/ocu' : '/ocu';
-  requests.push({ path: url.pathname, cursor: url.searchParams.get('cursor'), header: req.headers['x-requested-with'] });
+  const prefix = url.pathname.startsWith('/tools/ocu/') ? '/tools/ocu'
+    : url.pathname.startsWith('/ocu/') || url.pathname === '/ocu' ? '/ocu' : '';
+  requests.push({ path: url.pathname, cursor: url.searchParams.get('cursor'), header: req.headers['x-requested-with'], status: 0 });
   try {
-    if (url.pathname.startsWith(`${prefix}/static/`)) {
-      const name = decodeURIComponent(url.pathname.slice(`${prefix}/static/`.length));
+    if ((prefix && url.pathname.startsWith(`${prefix}/static/`)) || url.pathname.startsWith('/static/')) {
+      const staticRoot = prefix ? `${prefix}/static/` : '/static/';
+      const name = decodeURIComponent(url.pathname.slice(staticRoot.length));
       const filename = path.resolve(STATIC, name);
       if (!filename.startsWith(STATIC + path.sep)) return respond(res, 404, 'Not found', 'text/plain');
+      const rel = name.replaceAll('\\', '/');
+      if (drawioMissingViewer && rel === 'drawio/js/viewer-static.min.js') {
+        requests[requests.length - 1].status = 404;
+        return respond(res, 404, 'missing viewer', 'text/plain');
+      }
+      if (drawioCorruptViewer && rel === 'drawio/js/viewer-static.min.js') {
+        requests[requests.length - 1].status = 200;
+        return respond(res, 200, 'window.GraphViewer = 1;', 'text/javascript');
+      }
+      if (drawioMissingLazy && rel.startsWith('drawio/stencils/')) {
+        requests[requests.length - 1].status = 404;
+        return respond(res, 404, 'missing stencil', 'text/plain');
+      }
+      requests[requests.length - 1].status = 200;
       return respond(res, 200, await fs.readFile(filename), contentTypes[path.extname(filename)] || 'application/octet-stream');
     }
     if (url.pathname === `${prefix}/preview/${CHAT}`) {
@@ -161,11 +202,13 @@ const server = http.createServer(async (req, res) => {
       }
       if (listMode === 'timeout') { heldListings.push(res); return; }
       if (listMode === 'standalone') {
-        const file = { file_id: 'hostile', path: 'hostile.docx', name: 'hostile.docx',
-          type: 'docx', mime: OFFICE_MIME.docx, size: 128, revision: 1,
-          url: `/ocu/files/${CHAT}/hostile.docx` };
+        const listed = files.filter(f => ['hostile', 'drawio', 'drawio-empty', 'drawio-lazy', 'drawio-broken',
+          'drawio-compressed', 'drawio-image', 'drawio-math', 'drawio-missing'].includes(f.file_id));
         return respond(res, 200, JSON.stringify({
-          chat_id: CHAT, files: [file], total: 1, revision: 1, next_cursor: null,
+          chat_id: CHAT, files: listed.map(f => ({
+            name: f.path, size: 128, revision: 1,
+            url: `${prefix || ''}/files/${CHAT}/${encodeURIComponent(f.path)}`, ...f
+          })), total: listed.length, revision: 1, next_cursor: null,
         }));
       }
       const entries = files.filter(f => listMode !== 'deleted' || f.file_id !== 'doc');
@@ -179,11 +222,18 @@ const server = http.createServer(async (req, res) => {
         files: page.map(f => ({ name: f.path, size: 128, revision: 1,
           url: `/ocu/files/${CHAT}/${encodeURIComponent(f.path)}`, ...f })) }));
     }
-    if (url.pathname.startsWith(`${prefix}/files/${CHAT}/`)) {
+    if ((prefix && url.pathname.startsWith(`${prefix}/files/${CHAT}/`)) ||
+        (!prefix && url.pathname.startsWith(`/files/${CHAT}/`))) {
+      const filesRoot = `${prefix || ''}/files/${CHAT}/`;
       if (url.pathname.endsWith('/slow.docx')) { held.push(res); slowRequested(); return; }
       if (url.pathname.endsWith('/slow.xlsx')) { heldSheets.push(res); sheetRequested(); return; }
-      const name = decodeURIComponent(url.pathname.slice(`${prefix}/files/${CHAT}/`.length));
-      if (!(name in bytes)) return respond(res, 404, 'Not found', 'text/plain');
+      if (drawioHeldDocument && url.pathname.endsWith('/diagram.drawio')) { heldDrawio.push(res); return; }
+      const name = decodeURIComponent(url.pathname.slice(filesRoot.length));
+      if (!(name in bytes)) {
+        requests[requests.length - 1].status = 404;
+        return respond(res, 404, 'Not found', 'text/plain');
+      }
+      requests[requests.length - 1].status = 200;
       return respond(res, 200, bytes[name], 'application/octet-stream');
     }
     if (url.pathname === `${prefix}/browser/${CHAT}/status`) {
@@ -644,6 +694,13 @@ async function main() {
       'DOCX fixture did not expose the unsafe link when style maps were disabled');
     bytes['valid.docx'] = Buffer.from(fixture.doc);
     bytes['slow.docx'] = Buffer.from(fixture.oldDoc);
+    bytes['diagram.drawio'] = Buffer.from('<mxfile><diagram id="page-1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="Local shape" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="40" y="40" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>');
+    bytes['empty.drawio'] = Buffer.from('<mxfile host="app.diagrams.net"><diagram id="empty" name="Empty"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel></diagram></mxfile>');
+    bytes['lazy.drawio'] = Buffer.from('<mxfile><diagram id="lazy" name="Lazy"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="AND" style="shape=mxgraph.electrical.logic_gates.and;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="100" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>');
+    bytes['broken.drawio'] = Buffer.from('<not-drawio/>');
+    bytes['compressed.drawio'] = Buffer.from('<mxfile><diagram id="compressed" name="Compressed">' + require('node:zlib').deflateRawSync(Buffer.from(encodeURIComponent('<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="Compressed shape" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="40" y="40" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel>'))).toString('base64') + '</diagram></mxfile>');
+    bytes['image.drawio'] = Buffer.from('<mxfile><diagram id="image" name="Image"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="" style="shape=image;image=img/telecommunication/Cellphone_128x128.png;aspect=fixed;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="80" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>');
+    bytes['math.drawio'] = Buffer.from('<mxfile><diagram id="math" name="Math"><mxGraphModel math="1"><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="$$E=mc^2$$" style="html=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="120" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>');
     bytes["report (1)!'.docx"] = Buffer.from(fixture.doc);
     bytes['hostile.docx'] = Buffer.from(fixture.hostile);
     bytes['corrupt.docx'] = Buffer.from('not an Office ZIP');
@@ -1217,31 +1274,369 @@ async function main() {
       'retired fixture retained a pending completion');
     browserFixture = 'inactive';
     listMode = 'standalone';
-    const standalone = await context.newPage();
-    standalone.on('pageerror', error => consoleErrors.push({ text: String(error), url: '' }));
-    standalone.on('console', message => {
-      if (message.type() === 'error') consoleErrors.push({ text: message.text(), url: message.location().url });
-    });
+
+    const expectedOwnedErrors = [];
+    const attachDrawioConsole = (target) => {
+      target.on('pageerror', error => consoleErrors.push({ text: String(error), url: '' }));
+      target.on('console', message => {
+        if (message.type() !== 'error') return;
+        consoleErrors.push({ text: message.text(), url: message.location().url });
+      });
+    };
+    const selectStandaloneFile = async (target, name) => {
+      await target.locator('.file-selector-btn').click();
+      await target.locator('.dropdown-menu.open .item-name', { hasText: name }).click();
+    };
+    const openStandalone = async (prefix) => {
+      const isolated = await browser.newContext();
+      isolated.setDefaultTimeout(10000);
+      await isolated.route('**/*', route => {
+        const url = route.request().url();
+        if (/^https?:/.test(url) && !url.startsWith(origin + '/')) {
+          externalRequests.push(url);
+          return route.abort();
+        }
+        return route.continue();
+      });
+      const page = await isolated.newPage();
+      attachDrawioConsole(page);
+      const before = requests.length;
+      const beforeErrors = consoleErrors.length;
+      await page.goto(`${origin}${prefix}/preview/${CHAT}`);
+      await page.locator('.file-selector-btn').waitFor();
+      return { isolated, page, before, beforeErrors, prefix };
+    };
+    const closeStandalone = async (session) => {
+      await session.page.close();
+      await session.isolated.close();
+    };
+    const caseRequests = (session) => requests.slice(session.before);
+    const caseErrors = (session, after = session.beforeErrors) => consoleErrors.slice(after);
+    const requestUrl = (path) => `${origin}${path}`;
+    const isHttp404Text = (error) =>
+      /Failed to load resource: the server responded with a status of 404 \(Not Found\)/.test(error.text);
+    const isExpected404 = (error, path) =>
+      isHttp404Text(error) && (error.url === requestUrl(path) ||
+        (error.url && new URL(error.url).pathname === path));
+    const isDrawioRenderError = (error) => error.text.includes('Draw.io render error:');
+    const isLoadStencilSetLog = (error) => error.text.includes('error in loadStencilSet');
+    const acceptOwnedErrors = (session, isExpected, after) => {
+      const owned = caseErrors(session, after);
+      const unexpected = owned.filter(error => !isExpected(error));
+      assert.deepEqual(unexpected, [], 'unrecognized console errors');
+      expectedOwnedErrors.push(...owned.filter(isExpected));
+    };
+
+    const officeSession = await openStandalone('/ocu');
     try {
-      await standalone.goto(`${origin}/ocu/preview/${CHAT}`);
-      const standaloneUnsafe = standalone.locator('.preview-stage a').filter({ hasText: 'Unsafe link' });
-      await standaloneUnsafe.waitFor();
-      assert.equal(await standaloneUnsafe.getAttribute('href'), null);
-      await standaloneUnsafe.click();
-      assert.equal(await standalone.evaluate(() => window.__docxExecuted), undefined);
-      await standalone.locator('.preview-stage').getByText('Table cell').waitFor();
-      await standalone.screenshot({ path: path.join(artifacts, 'standalone-sanitized-office.png') });
+      const unsafe = officeSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' });
+      await unsafe.waitFor();
+      assert.equal(await unsafe.getAttribute('href'), null);
+      await unsafe.click();
+      assert.equal(await officeSession.page.evaluate(() => window.__docxExecuted), undefined);
+      await officeSession.page.locator('.preview-stage').getByText('Table cell').waitFor();
+      await officeSession.page.screenshot({ path: path.join(artifacts, 'standalone-sanitized-office.png') });
+      await selectStandaloneFile(officeSession.page, 'diagram.drawio');
+      await officeSession.page.locator('.drawio-host svg').waitFor();
+      await officeSession.page.getByText('Local shape').waitFor();
+      await officeSession.page.screenshot({ path: path.join(artifacts, 'standalone-drawio.png') });
+      const afterGeometry = caseRequests(officeSession);
+      assert(afterGeometry.some(row => row.path.includes('/static/drawio/js/viewer-static.min.js')),
+        'standalone Drawio did not load local viewer materials');
+      assert.equal(afterGeometry.filter(row => row.path.includes('viewer.diagrams.net')).length, 0);
+      await selectStandaloneFile(officeSession.page, 'hostile.docx');
+      const unsafeAfter = officeSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' });
+      await unsafeAfter.waitFor();
+      assert.equal(await unsafeAfter.getAttribute('href'), null);
+      await unsafeAfter.click();
+      assert.equal(await officeSession.page.evaluate(() => window.__docxExecuted), undefined);
+      await officeSession.page.locator('.preview-stage').getByText('Table cell').waitFor();
+      await officeSession.page.locator('.preview-stage').getByText('Safe content').waitFor();
+      assert.deepEqual(caseErrors(officeSession), [], 'unexpected Drawio geometry console errors');
     } finally {
-      await standalone.close();
-      listMode = 'normal';
+      await closeStandalone(officeSession);
     }
+
+    const emptySession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(emptySession.page, 'empty.drawio');
+      await emptySession.page.locator('.drawio-host svg').waitFor();
+      assert.equal(await emptySession.page.locator('.dl-error').count(), 0);
+      assert.equal(await emptySession.page.locator('.loading-text').count(), 0);
+      assert.deepEqual(caseErrors(emptySession), [], 'valid empty Drawio produced a render failure');
+    } finally {
+      await closeStandalone(emptySession);
+    }
+
+    const compressedSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(compressedSession.page, 'compressed.drawio');
+      await compressedSession.page.locator('.drawio-host svg').waitFor();
+      await compressedSession.page.getByText('Compressed shape').waitFor();
+      assert.deepEqual(caseErrors(compressedSession), [], 'compressed Drawio produced unexpected console errors');
+    } finally {
+      await closeStandalone(compressedSession);
+    }
+
+    const lazySession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(lazySession.page, 'lazy.drawio');
+      await lazySession.page.locator('.drawio-host svg').waitFor();
+      const andGeometry = await lazySession.page.locator('.drawio-host svg').evaluate((svg) => {
+        const paths = [...svg.querySelectorAll('path')].map((path) => path.getAttribute('d') || '');
+        return {
+          curved: paths.some((d) => /[AaCcQqSs]/.test(d)),
+          wired: paths.some((d) => d.includes('M') && d.includes('L') && !/[AaCcQqSs]/.test(d)),
+          pathCount: paths.length,
+        };
+      });
+      assert.equal(andGeometry.curved, true, 'AND stencil did not render the curved body');
+      assert.equal(andGeometry.wired && andGeometry.pathCount >= 2, true, 'AND stencil did not render wire geometry');
+      const lazyRequests = caseRequests(lazySession);
+      assert(lazyRequests.some(row => row.path.includes('/static/drawio/stencils/electrical/logic_gates.xml')),
+        'lazy Drawio did not request the electrical AND stencil');
+      assert.equal(await lazySession.page.locator('.dl-error').count(), 0);
+      assert.deepEqual(caseErrors(lazySession), [], 'lazy stencil Drawio produced unexpected console errors');
+    } finally {
+      await closeStandalone(lazySession);
+    }
+
+    const imageSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(imageSession.page, 'image.drawio');
+      const imageNode = imageSession.page.locator('.drawio-host svg image');
+      await imageNode.waitFor();
+      const imageHref = await imageNode.evaluate((node) =>
+        node.href?.baseVal || node.getAttribute('href') ||
+        node.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '');
+      assert(imageHref.includes('/static/drawio/img/telecommunication/Cellphone_128x128.png'),
+        `image Drawio used ${imageHref || 'no href'}`);
+      const imageRequests = caseRequests(imageSession);
+      assert(imageRequests.some(row =>
+        row.path === '/ocu/static/drawio/img/telecommunication/Cellphone_128x128.png'),
+        'image Drawio did not request the pinned cellphone asset');
+      const decoded = await imageSession.page.evaluate(async (src) => {
+        const img = new Image();
+        img.src = src;
+        await img.decode();
+        return { width: img.naturalWidth, height: img.naturalHeight };
+      }, imageHref);
+      assert(decoded.width > 0 && decoded.height > 0, 'image Drawio asset did not decode');
+      await imageSession.page.screenshot({ path: path.join(artifacts, 'standalone-drawio-image.png') });
+      assert.deepEqual(caseErrors(imageSession), [], 'image Drawio produced unexpected console errors');
+    } finally {
+      await closeStandalone(imageSession);
+    }
+
+    const mathSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(mathSession.page, 'math.drawio');
+      await mathSession.page.locator('.drawio-host mjx-container, .drawio-host mjx-math, .drawio-host .MathJax').waitFor();
+      const mathOutput = await mathSession.page.locator('.drawio-host').evaluate((host) => {
+        const mjx = host.querySelector('mjx-container, mjx-math, .MathJax');
+        return {
+          hasMjx: Boolean(mjx),
+          text: (mjx && mjx.textContent) || '',
+          hasGlyph: Boolean(host.querySelector('mjx-mi, mjx-mo, mjx-mn, mjx-mrow, use[data-c], [data-mjx-texclass]')),
+        };
+      });
+      assert.equal(mathOutput.hasMjx, true, 'math Drawio did not render MathJax output');
+      assert(mathOutput.hasGlyph || /E/.test(mathOutput.text),
+        'math Drawio did not render formula glyphs');
+      const mathRequests = caseRequests(mathSession);
+      assert(mathRequests.some(row => row.path.includes('/static/drawio/math4/')),
+        'math Drawio did not request local MathJax materials');
+      assert.deepEqual(caseErrors(mathSession), [], 'math Drawio produced unexpected console errors');
+    } finally {
+      await closeStandalone(mathSession);
+    }
+
+    const brokenSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(brokenSession.page, 'broken.drawio');
+      await brokenSession.page.locator('.dl-error').waitFor();
+      assert(caseErrors(brokenSession).some(isDrawioRenderError),
+        'broken Drawio did not report a render error');
+      acceptOwnedErrors(brokenSession, isDrawioRenderError);
+    } finally {
+      await closeStandalone(brokenSession);
+    }
+
+    const missingDocSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(missingDocSession.page, 'missing.drawio');
+      await missingDocSession.page.locator('.dl-error').waitFor();
+      const missingDocRequests = caseRequests(missingDocSession);
+      const missingDocPath = missingDocRequests.find(row => row.path.endsWith('/missing.drawio'))?.path;
+      assert(missingDocPath, 'missing Drawio document was not requested');
+      assert.equal(missingDocRequests.find(row => row.path === missingDocPath).status, 404);
+      const isMissingDocError = (error) =>
+        isDrawioRenderError(error) || isExpected404(error, missingDocPath);
+      assert(caseErrors(missingDocSession).some(isMissingDocError),
+        'missing Drawio document did not fail visibly');
+      acceptOwnedErrors(missingDocSession, isMissingDocError);
+    } finally {
+      await closeStandalone(missingDocSession);
+    }
+
+    drawioMissingViewer = true;
+    const missingViewerSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(missingViewerSession.page, 'diagram.drawio');
+      await missingViewerSession.page.locator('.dl-error').waitFor();
+      const missingViewerRequests = caseRequests(missingViewerSession);
+      const missingViewerPath = missingViewerRequests.find(row =>
+        row.path.endsWith('/drawio/js/viewer-static.min.js'))?.path;
+      assert(missingViewerPath, 'missing viewer case did not request viewer-static.min.js');
+      assert.equal(missingViewerRequests.find(row => row.path === missingViewerPath).status, 404);
+      const isMissingViewerError = (error) =>
+        isDrawioRenderError(error) || isExpected404(error, missingViewerPath);
+      assert(caseErrors(missingViewerSession).some(isMissingViewerError),
+        'missing viewer did not surface a load failure');
+      acceptOwnedErrors(missingViewerSession, isMissingViewerError);
+    } finally {
+      drawioMissingViewer = false;
+      await closeStandalone(missingViewerSession);
+    }
+
+    drawioCorruptViewer = true;
+    const corruptViewerSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(corruptViewerSession.page, 'diagram.drawio');
+      await corruptViewerSession.page.locator('.dl-error').waitFor();
+      const corruptRequests = caseRequests(corruptViewerSession);
+      assert(corruptRequests.some(row => row.path.endsWith('/drawio/js/viewer-static.min.js')),
+        'corrupt viewer case did not request viewer-static.min.js');
+      assert(caseErrors(corruptViewerSession).some(isDrawioRenderError),
+        'corrupt viewer did not fail visibly');
+      acceptOwnedErrors(corruptViewerSession, isDrawioRenderError);
+    } finally {
+      drawioCorruptViewer = false;
+      await closeStandalone(corruptViewerSession);
+    }
+
+    drawioMissingLazy = true;
+    const missingLazySession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(missingLazySession.page, 'lazy.drawio');
+      await missingLazySession.page.locator('.dl-error').waitFor();
+      assert.equal(await missingLazySession.page.locator('.drawio-host svg').count(), 0);
+      const fallbackRect = await missingLazySession.page.locator('.drawio-host').count().then(async (count) => {
+        if (!count) return false;
+        return missingLazySession.page.locator('.drawio-host').evaluate((host) => {
+          const svg = host.querySelector('svg');
+          if (!svg) return false;
+          return [...svg.querySelectorAll('rect, path')].some((node) => {
+            const d = node.getAttribute('d') || '';
+            return node.tagName.toLowerCase() === 'rect' || (!/[AaCc]/.test(d) && d.includes('H') && d.includes('V'));
+          });
+        });
+      });
+      assert.equal(fallbackRect, false, 'missing stencil substituted a rectangle');
+      const missingLazyRequests = caseRequests(missingLazySession);
+      const missingStencilPath = missingLazyRequests.find(row =>
+        row.path.includes('/static/drawio/stencils/electrical/logic_gates.xml'))?.path;
+      assert(missingStencilPath, 'missing stencil case did not request the electrical AND stencil');
+      assert.equal(missingLazyRequests.find(row => row.path === missingStencilPath).status, 404);
+      const viewerScriptPath = missingLazyRequests.find(row =>
+        row.path.endsWith('/drawio/js/viewer-static.min.js') && row.status === 200)?.path;
+      const isMissingStencilError = (error) => {
+        if (isDrawioRenderError(error) || isLoadStencilSetLog(error)) return true;
+        if (isExpected404(error, missingStencilPath)) return true;
+        return Boolean(viewerScriptPath) && isHttp404Text(error) &&
+          error.url === requestUrl(viewerScriptPath);
+      };
+      const ownedStencilErrors = caseErrors(missingLazySession).filter(isMissingStencilError);
+      assert(ownedStencilErrors.some(isDrawioRenderError) ||
+        ownedStencilErrors.some(error => isExpected404(error, missingStencilPath) ||
+          (viewerScriptPath && error.url === requestUrl(viewerScriptPath))),
+        'missing stencil did not fail visibly');
+      acceptOwnedErrors(missingLazySession, isMissingStencilError);
+      const afterFailureErrors = consoleErrors.length;
+      const afterFailureRequests = requests.length;
+      drawioMissingLazy = false;
+      await selectStandaloneFile(missingLazySession.page, 'hostile.docx');
+      await missingLazySession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' }).waitFor();
+      await selectStandaloneFile(missingLazySession.page, 'lazy.drawio');
+      await missingLazySession.page.locator('.drawio-host svg').waitFor();
+      const retriedRequests = requests.slice(afterFailureRequests);
+      const retriedStencil = retriedRequests.find(row =>
+        row.path.includes('/static/drawio/stencils/electrical/logic_gates.xml'));
+      assert(retriedStencil, 'AND stencil retry did not request the electrical stencil');
+      assert.equal(retriedStencil.status, 200, 'AND stencil retry did not receive HTTP 200');
+      const retriedGeometry = await missingLazySession.page.locator('.drawio-host svg').evaluate((svg) => {
+        const paths = [...svg.querySelectorAll('path')].map((path) => path.getAttribute('d') || '');
+        return {
+          curved: paths.some((d) => /[AaCcQqSs]/.test(d)),
+          wired: paths.some((d) => d.includes('M') && d.includes('L') && !/[AaCcQqSs]/.test(d)),
+          pathCount: paths.length,
+        };
+      });
+      assert.equal(retriedGeometry.curved, true, 'AND stencil retry did not render the curved body');
+      assert.equal(retriedGeometry.wired && retriedGeometry.pathCount >= 2, true,
+        'AND stencil retry did not render wire geometry');
+      assert.deepEqual(caseErrors(missingLazySession, afterFailureErrors), [],
+        'AND stencil retry produced unexpected console errors');
+    } finally {
+      drawioMissingLazy = false;
+      await closeStandalone(missingLazySession);
+    }
+
+    drawioHeldDocument = true;
+    const delayedSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(delayedSession.page, 'diagram.drawio');
+      await waitUntil(() => heldDrawio.length > 0, 'delayed Drawio document fetch');
+      await selectStandaloneFile(delayedSession.page, 'hostile.docx');
+      await delayedSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' }).waitFor();
+      for (const pending of heldDrawio.splice(0))
+        respond(pending, 200, bytes['diagram.drawio'], 'application/octet-stream');
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await delayedSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' }).waitFor();
+      await delayedSession.page.locator('.preview-stage').getByText('Table cell').waitFor();
+      assert.equal(await delayedSession.page.locator('.drawio-host svg').count(), 0);
+    } finally {
+      drawioHeldDocument = false;
+      for (const pending of heldDrawio.splice(0)) pending.destroy();
+      await closeStandalone(delayedSession);
+    }
+
+    const unprefixedSession = await openStandalone('');
+    try {
+      await selectStandaloneFile(unprefixedSession.page, 'diagram.drawio');
+      await unprefixedSession.page.locator('.drawio-host svg').waitFor();
+      const unprefixedRequests = caseRequests(unprefixedSession);
+      assert(unprefixedRequests.some(row => row.path === '/static/drawio/js/viewer-static.min.js'),
+        'empty prefix did not load unprefixed viewer materials');
+      assert.equal(unprefixedRequests.filter(row => row.path.startsWith('/ocu/static/drawio/')).length, 0);
+      assert.deepEqual(caseErrors(unprefixedSession), [], 'empty-prefix Drawio produced unexpected console errors');
+    } finally {
+      await closeStandalone(unprefixedSession);
+    }
+
+    const nestedSession = await openStandalone('/tools/ocu');
+    try {
+      await selectStandaloneFile(nestedSession.page, 'diagram.drawio');
+      await nestedSession.page.locator('.drawio-host svg').waitFor();
+      const nestedRequests = caseRequests(nestedSession);
+      assert(nestedRequests.some(row => row.path === '/tools/ocu/static/drawio/js/viewer-static.min.js'),
+        'nested prefix did not load prefixed viewer materials');
+      assert.equal(nestedRequests.filter(row => row.path === '/static/drawio/js/viewer-static.min.js').length, 0);
+      assert.deepEqual(caseErrors(nestedSession), [], 'nested-prefix Drawio produced unexpected console errors');
+    } finally {
+      await closeStandalone(nestedSession);
+    }
+
+    listMode = 'normal';
     assert.deepEqual(externalRequests, [], 'Office content requested an external resource');
     const abortLogs = consoleErrors.filter(error => error.text.includes('net::ERR_ABORTED'));
     assert(abortLogs.length <= expectedAbortUrls.length, 'unaccounted aborted-resource console errors');
     assert.deepEqual(abortLogs.filter(error => !expectedAbortUrls.includes(error.url)),
       [], 'unexpected aborted-resource URL');
     assert.deepEqual(unexpectedNetworkFailures, [], 'unexpected network failure');
-    assert.deepEqual(consoleErrors.filter(error => !error.text.includes('net::ERR_ABORTED')),
+    const expectedOwned = new Set(expectedOwnedErrors);
+    assert.deepEqual(consoleErrors.filter(error =>
+      !error.text.includes('net::ERR_ABORTED') && !expectedOwned.has(error)),
       [], 'unexpected browser console errors');
     console.log(JSON.stringify({ result: 'ok', screenshots: artifacts, listingRequests: requests.filter(r => r.path.includes('/api/outputs/')).length }));
   } finally {
@@ -1252,6 +1647,7 @@ main().catch(error => { console.error(error); process.exitCode = 1; }).finally(a
   for (const response of held.splice(0)) response.destroy();
   for (const response of heldListings.splice(0)) response.destroy();
   for (const response of heldSheets.splice(0)) response.destroy();
+  for (const response of heldDrawio.splice(0)) response.destroy();
   for (const response of heldBrowserStatuses.splice(0)) response.destroy();
   for (const response of heldBrowserPages.splice(0)) response.destroy();
   for (const upgrade of heldUpgrades.splice(0)) upgrade.socket.destroy();
