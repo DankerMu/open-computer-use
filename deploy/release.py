@@ -2206,6 +2206,7 @@ def verify_tracked_source(root: Path, commit: str) -> None:
     actual = full_commit(root)
     if actual.lower() != commit.lower():
         raise ReleaseError(f"source checkout HEAD is {actual}, expected {commit}")
+    git("update-index", "-q", "--refresh", cwd=root)
     result = git("diff-index", "--name-only", commit, "--", cwd=root)
     require_command(result, "compare tracked source to the bundled commit")
     changed = [line for line in result.stdout.splitlines() if line]

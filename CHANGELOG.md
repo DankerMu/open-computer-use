@@ -3,6 +3,13 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Cold backup and isolated restore.** `deploy/recovery.py` captures one
+  complete cold recovery set, restores it onto a distinct empty local
+  daemon/root, and activates a retained previous release through that
+  release's own `source/deploy/up.sh`. Workspace volumes, initializer
+  marker, orphan `ocu_chat_state` pruning, and migration/PostgreSQL
+  compatibility checks are included. Real engine recovery remains issue36.
+
 - **Offline image delivery.** `deploy/release.py` builds and imports a
   six-role linux/amd64 release from committed OCU and WebUI sources.
   `release.json` is the canonical inventory: both source SHAs, named
