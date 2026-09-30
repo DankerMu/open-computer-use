@@ -77,6 +77,10 @@ def _exec_postgres(container: str, command: str, *, database: str = "openwebui",
     argv.extend(
         [
             "psql",
+            "-h",
+            "127.0.0.1",
+            "-p",
+            "5432",
             "-U",
             "openwebui",
             "-d",
@@ -92,6 +96,7 @@ def _exec_postgres(container: str, command: str, *, database: str = "openwebui",
     if result.returncode != 0:
         raise RecoveryError(f"postgres inspection failed ({_safe_detail(result)})")
     return result.stdout or ""
+
 
 
 def inspect_source_schema(container: str) -> dict:
@@ -198,6 +203,10 @@ def prune_orphans(container: str) -> list[str]:
         "-i",
         container,
         "psql",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "5432",
         "-U",
         "openwebui",
         "-d",
@@ -207,6 +216,7 @@ def prune_orphans(container: str) -> list[str]:
         "-c",
         ORPHAN_DELETE,
     )
+
     if result.returncode != 0:
         raise RecoveryError("orphan prune failed")
     after = {row["chat_id"]: row for row in _chat_state_rows(container)}
@@ -276,12 +286,34 @@ def inspect_restored_state(container: str) -> dict:
 
 
 
-def inspect_provider_config(container: str) -> str:
-    return _exec_postgres(
+def inspect_provider_config(container: str) -> list[dict]:
+    raw = _exec_postgres(
         container,
-        "SELECT COALESCE(data::text, '') FROM config ORDER BY id LIMIT 5;",
+        "SELECT json_build_object("
+        "'key', key, "
+        "'value', value, "
+        "'updated_at', updated_at"
+        ") FROM config ORDER BY key;",
         read_only=True,
     )
+    rows = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as cop:
+            raise RecoveryError("malformed provider config inspection") from cop
+        if not isinstance(payload, dict) or "key" not in payload:
+            raise RecoveryError("malformed provider config inspection")
+        rows.append(
+            {
+                "key": str(payload["key"]),
+                "value": payload.get("value"),
+                "updated_at": payload.get("updated_at"),
+            }
+        )
+    return rows
 
 
 def inspect_migration_graph(image: str) -> dict:

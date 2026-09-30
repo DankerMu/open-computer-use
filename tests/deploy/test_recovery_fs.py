@@ -10,6 +10,8 @@ import stat
 import tarfile
 import unittest
 
+
+
 from support import ROOT, tmp_dir
 
 import sys
@@ -166,6 +168,44 @@ class RecoveryFilesystemTests(unittest.TestCase):
         finally:
             os.lchown = original
         self.assertIn("cannot restore ownership", str(raised.exception))
+
+    def test_literal_backslash_and_special_names_round_trip(self):
+        source = self.root / "names"
+        source.mkdir()
+        (source / "a\\b").write_bytes(b"backslash\n")
+        nested = source / "a"
+        nested.mkdir()
+        (nested / "b").write_bytes(b"slash\n")
+        (source / "-leading").write_bytes(b"dash\n")
+        (source / "new\nline").write_bytes(b"newline\n")
+        archive = self.root / "names.tar.gz"
+        recovery_fs.capture_tree(source, archive)
+        dest = self.root / "names-out"
+        recovery_fs.extract_tree(archive, dest)
+        self.assertEqual((dest / "a\\b").read_bytes(), b"backslash\n")
+        self.assertEqual((dest / "a" / "b").read_bytes(), b"slash\n")
+        self.assertEqual((dest / "-leading").read_bytes(), b"dash\n")
+        self.assertEqual((dest / "new\nline").read_bytes(), b"newline\n")
+        members = {record["name"] for record in recovery_fs.validate_archive(archive)}
+        self.assertIn("a\\b", members)
+        self.assertIn("a/b", members)
+
+    def test_destination_conflicts_use_ancestors_not_all_pairs(self):
+        names = {f"file-{index:05d}": tarfile.TarInfo(name=f"file-{index:05d}") for index in range(10_000)}
+        names["file-00000"].type = tarfile.REGTYPE
+        recovery_fs._reject_destination_conflicts(names)
+        nested = tarfile.TarInfo(name="file-00000/child")
+        nested.type = tarfile.REGTYPE
+        names["file-00000/child"] = nested
+
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery_fs._reject_destination_conflicts(names)
+        self.assertIn("non-directory", str(raised.exception))
+
+
+
+
+
 
 
 

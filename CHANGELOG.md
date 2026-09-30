@@ -9,10 +9,15 @@
   release's own `source/deploy/up.sh`. Workspace volumes, initializer
   marker, orphan `ocu_chat_state` pruning, and migration/PostgreSQL
   compatibility checks are included. Restore inspects the real
-  `ocu_chat_state` columns, streams PostgreSQL dumps, waits for the
-  final isolated server, and hands the restored volume to Compose
-  without retaining a conflicting temporary container. Real engine
-  recovery remains issue36.
+  `ocu_chat_state` and per-key `config` columns, waits for the final
+  TCP-authenticated isolated server, binds each workspace archive to
+  its declared chat and volume, and refuses missing-mount sandbox
+  attribution. Activation preflights retained-delivery compatibility
+  before publishing selected identity. Filesystem archives preserve
+  literal POSIX names, stream Python extraction, and check ancestor
+  conflicts without an all-pairs scan. Real engine recovery remains
+  issue36.
+
 
 
 - **Offline image delivery.** `deploy/release.py` builds and imports a

@@ -225,19 +225,25 @@ def _sandbox_attributed(sandbox: dict, identity: dict, expected_chats: set[str])
         return False
     mounts = _mounts(sandbox["payload"])
     if not mounts:
-        return True
+        return False
     wanted_volume = recovery.workspace_volume_name(chat_id)
     wanted_chat = str(identity["chat_dir"] / chat_id)
+    wanted_uploads = str(Path(wanted_chat) / "uploads")
+    wanted_outputs = str(Path(wanted_chat) / "outputs")
+    workspace = False
+    uploads = False
+    outputs = False
     for mount in mounts:
         source = str(mount.get("Name") or mount.get("Source") or "")
         destination = str(mount.get("Destination") or "")
-        if source in {wanted_volume, wanted_chat}:
-            return True
-        if destination in {"/home/assistant", "/root"} and wanted_volume in source:
-            return True
-        if destination.startswith("/mnt/user-data/") and chat_id in source:
-            return True
-    return False
+        if source == wanted_volume and destination in {"/home/assistant", "/root"}:
+            workspace = True
+        if source == wanted_uploads and destination == "/mnt/user-data/uploads":
+            uploads = True
+        if source == wanted_outputs and destination == "/mnt/user-data/outputs":
+            outputs = True
+    return workspace and uploads and outputs
+
 
 
 
@@ -535,7 +541,10 @@ def backup_deployment(*, deploy_root: Path, destination: Path, runtime_file: Pat
                 archive = workspace_dir / f"{chat_id}.tar.gz"
                 record = capture_volume(volume, archive, workspace_image)
                 record["path"] = f"workspaces/{chat_id}.tar.gz"
+                record["chat_id"] = chat_id
+                record["volume"] = volume
                 workspaces[chat_id] = record
+
             components["workspaces"] = workspaces
             copy_runtime = stage / "runtime.env"
             recovery.copy_private(runtime_path, copy_runtime)
@@ -628,14 +637,27 @@ def verify_recovery_set(root: Path, *, require_published: bool = True) -> dict:
         return path
 
     claim_path(components["database"]["path"], components["database"]["sha256"])
-    for key in ("webui-data", "chat-data", "skills-cache", "runtime-config", "release-inventory"):
+    expected_roles = {
+        "webui-data": "webui-data.tar.gz",
+        "chat-data": "chat-data.tar.gz",
+        "skills-cache": "skills-cache.tar.gz",
+        "runtime-config": "runtime.env",
+        "release-inventory": "release.json",
+    }
+    for key, expected in expected_roles.items():
         record = components[key]
+        if _normalized_component_path(record["path"]) != expected:
+            raise RecoveryError(f"{key} path is not the declared recovery component")
         claim_path(record["path"], record["sha256"])
     admin = components.get("admin-config") or {}
     if admin.get("path"):
+        if _normalized_component_path(admin["path"]) != "admin-credentials.txt":
+            raise RecoveryError("admin-config path is not the declared recovery component")
         claim_path(admin["path"], admin["sha256"])
     version = components.get("version-record") or {}
     if version.get("path"):
+        if _normalized_component_path(version["path"]) != "DEPLOYED_VERSION.md":
+            raise RecoveryError("version-record path is not the declared recovery component")
         claim_path(version["path"], version["sha256"])
     if not _archive_contains(
         recovery.confined_component_path(root, components["webui-data"]["path"]),
@@ -655,7 +677,15 @@ def verify_recovery_set(root: Path, *, require_published: bool = True) -> dict:
     if not isinstance(workspaces, dict):
         raise RecoveryError("workspace volume archives are missing")
     for chat_id, record in workspaces.items():
-        recovery.canonical_chat_id(chat_id)
+        canonical = recovery.canonical_chat_id(chat_id)
+        if str(record.get("chat_id") or "") != canonical:
+            raise RecoveryError(f"workspace {chat_id} is not bound to its declared chat")
+        expected_path = f"workspaces/{canonical}.tar.gz"
+        if _normalized_component_path(record["path"]) != expected_path:
+            raise RecoveryError(f"workspace {chat_id} path is not the declared recovery component")
+        expected_volume = recovery.workspace_volume_name(canonical)
+        if str(record.get("volume") or "") != expected_volume:
+            raise RecoveryError(f"workspace {chat_id} is not bound to its declared volume")
         path = claim_path(record["path"], record["sha256"])
         recovery_fs.validate_archive(path)
     release.load_inventory(
@@ -663,6 +693,7 @@ def verify_recovery_set(root: Path, *, require_published: bool = True) -> dict:
     )
     del require_published
     return payload
+
 
 
 def _require_component_file(root: Path, relative: str, digest: str) -> Path:
@@ -775,7 +806,6 @@ def _wait_for_postgres(container: str, deadline: float | None = None) -> None:
         deadline = float(os.environ.get("OCU_POSTGRES_READY_DEADLINE", "60"))
     started = time.monotonic()
     last = "not ready"
-
     while time.monotonic() - started < deadline:
         result = docker(
             "exec",
@@ -783,6 +813,10 @@ def _wait_for_postgres(container: str, deadline: float | None = None) -> None:
             "postgres",
             container,
             "pg_isready",
+            "-h",
+            "127.0.0.1",
+            "-p",
+            "5432",
             "-U",
             "openwebui",
             "-d",
@@ -796,6 +830,10 @@ def _wait_for_postgres(container: str, deadline: float | None = None) -> None:
                 "-i",
                 container,
                 "psql",
+                "-h",
+                "127.0.0.1",
+                "-p",
+                "5432",
                 "-U",
                 "openwebui",
                 "-d",
@@ -819,6 +857,7 @@ def _wait_for_postgres(container: str, deadline: float | None = None) -> None:
             raise RecoveryError("isolated postgres exited before it became ready")
         time.sleep(0.2)
     raise RecoveryError(f"isolated postgres was not ready before the deadline ({last})")
+
 
 
 def start_isolated_postgres(identity: dict, runtime: dict[str, str], image: str) -> str:
@@ -882,36 +921,77 @@ def require_selected_release(existing: dict, requested: dict) -> None:
         raise RecoveryError("requested retained delivery does not match the installed release identity")
 
 
+def _selected_source_root(install_root: Path) -> Path:
+    return install_root.parent / f"{install_root.name}.selected-source"
+
+
+def _owned_selected_root(source: Path, source_root: Path) -> Path | None:
+    wanted = source_root / "source"
+    if not source_root.is_dir() or not wanted.is_dir():
+        return None
+    if not source.is_symlink():
+        return None
+    try:
+        if source.resolve() == wanted.resolve():
+            return source_root
+    except OSError:
+        return None
+    return None
+
+
+def _require_matching_selected_root(source_root: Path, requested: dict) -> dict:
+    try:
+        payload = release.load_inventory(source_root / "release.json")
+        require_selected_release(payload, requested)
+        release.verify_tracked_source(source_root / "source", requested["ocu_source_sha"])
+        release.require_supported_source_contract(source_root / "source")
+    except (OSError, KeyError, TypeError, RecoveryError, release.ReleaseError) as cop:
+        raise RecoveryError(f"selected source already exists: {source_root}") from cop
+    return payload
+
+
+def _publish_selected_inventory(manifest: Path, source_root: Path) -> None:
+    selected = source_root / "release.json"
+    if manifest.exists():
+        recovery.replace_private_file(selected, manifest)
+    else:
+        recovery.copy_private(selected, manifest)
+
+
 def import_selected_release(delivery: Path, install_root: Path) -> dict:
     requested = release.load_inventory(delivery / "release.json")
     release.verify_archive_set(delivery, requested)
     source = install_root / "source"
     manifest = install_root / "release.json"
+    source_root = _selected_source_root(install_root)
+    owned = _owned_selected_root(source, source_root)
+    if owned is not None:
+        payload = _require_matching_selected_root(owned, requested)
+        _publish_selected_inventory(manifest, owned)
+        return payload
     if source.is_dir() and (source / ".git").exists():
         release.verify_tracked_source(source, requested["ocu_source_sha"])
         release.require_supported_source_contract(source)
         if manifest.exists():
-            recovery.replace_private_file(delivery / "release.json", manifest)
-        else:
-            recovery.copy_private(delivery / "release.json", manifest)
+            existing = release.load_inventory(manifest)
+            require_selected_release(existing, requested)
         return requested
     if source.exists() or source.is_symlink():
         raise RecoveryError("restored source path is already occupied")
     if recovery.destination_occupied(install_root):
-        source_root = install_root.parent / f"{install_root.name}.selected-source"
         if source_root.exists():
-            raise RecoveryError(f"selected source already exists: {source_root}")
-        payload = release.import_release(delivery=delivery, install_root=source_root)
-        require_selected_release(payload, requested)
-        os.symlink(source_root / "source", source)
-        if manifest.exists():
-            recovery.replace_private_file(source_root / "release.json", manifest)
+            payload = _require_matching_selected_root(source_root, requested)
         else:
-            recovery.copy_private(source_root / "release.json", manifest)
+            payload = release.import_release(delivery=delivery, install_root=source_root)
+            require_selected_release(payload, requested)
+        os.symlink(source_root / "source", source)
+        _publish_selected_inventory(manifest, source_root)
         return payload
     payload = release.import_release(delivery=delivery, install_root=install_root)
     require_selected_release(payload, requested)
     return payload
+
+
 
 
 
@@ -1164,12 +1244,14 @@ def _require_cursor_lag(restored: dict, chat_dir: Path, image: str) -> None:
             )
 
 
-def _require_provider_precedence(db_text: str, provider: dict[str, str]) -> None:
+def _require_provider_precedence(rows: list[dict], provider: dict[str, str]) -> None:
+    persisted = json.dumps(rows, separators=(",", ":"))
     for name, value in provider.items():
         if name in recovery.PROVIDER_KEYS and value:
-            if value in db_text:
+            if value in persisted:
                 recovery.report("restored persistent provider settings remain in effect")
             return
+
 
 
 def activation_env(runtime: dict[str, str], inventory: dict, destination_root: Path, provider: dict[str, str] | None = None) -> dict[str, str]:
@@ -1202,6 +1284,9 @@ def activate_release(*, destination_root: Path, retained_delivery: Path, docker_
         if container_running(inspect_container(sandbox["id"])):
             raise RecoveryError("target already has a running sandbox")
     requested = release.load_inventory(retained_delivery / "release.json")
+    schema = recovery.load_json_object(destination_root / recovery.MANIFEST_NAME).get("schema") or {}
+    recovery_db.require_compatible_revision(schema, requested["images"]["open-webui"]["reference"])
+    recovery_db.require_compatible_tools(schema, requested["images"]["postgres"]["reference"])
     source = destination_root / "source"
     if source.is_dir() and (source / ".git").exists():
         try:
@@ -1216,12 +1301,12 @@ def activate_release(*, destination_root: Path, retained_delivery: Path, docker_
         release.verify_tracked_source(destination_root / "source", inventory["ocu_source_sha"])
         release.verify_local_images(inventory)
         release.require_supported_source_contract(destination_root / "source")
-        schema = recovery.load_json_object(destination_root / recovery.MANIFEST_NAME).get("schema") or {}
         recovery_db.require_compatible_revision(schema, inventory["images"]["open-webui"]["reference"])
         recovery_db.require_compatible_tools(schema, inventory["images"]["postgres"]["reference"])
         script = destination_root / "source" / "deploy" / "up.sh"
         if not script.exists():
             raise RecoveryError("selected release source/deploy/up.sh is missing")
+
 
         published = persist_selected_runtime_identity(
             destination_root=destination_root,

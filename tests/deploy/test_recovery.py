@@ -85,7 +85,8 @@ def stack_container(name: str, *, running=True, paused=False, extra=None, image=
     return body
 
 
-def sandbox(name: str, chat_id: str, *, running=True, paused=False):
+def sandbox(name: str, chat_id: str, *, running=True, paused=False, chat_dir: Path | None = None):
+    chat_root = str(chat_dir / chat_id) if chat_dir is not None else chat_id
     return stack_container(
         name,
         running=running,
@@ -107,10 +108,19 @@ def sandbox(name: str, chat_id: str, *, running=True, paused=False):
                     "Name": f"chat-{chat_id}-workspace",
                     "Source": f"chat-{chat_id}-workspace",
                     "Destination": "/home/assistant",
-                }
+                },
+                {
+                    "Source": f"{chat_root}/uploads",
+                    "Destination": "/mnt/user-data/uploads",
+                },
+                {
+                    "Source": f"{chat_root}/outputs",
+                    "Destination": "/mnt/user-data/outputs",
+                },
             ],
         },
     )
+
 
 
 
@@ -270,7 +280,14 @@ class RecoveryCliTests(unittest.TestCase):
                 image=images["postgres"],
                 service="postgres",
             ),
-            sandbox(f"owui-chat-{CHAT_ID}", CHAT_ID, running=running_sandbox, paused=paused),
+            sandbox(
+                f"owui-chat-{CHAT_ID}",
+                CHAT_ID,
+                running=running_sandbox,
+                paused=paused,
+                chat_dir=self.chat_dir,
+            ),
+
         ]
         if extra_containers:
             containers.extend(extra_containers)
@@ -298,8 +315,14 @@ class RecoveryCliTests(unittest.TestCase):
                                 "updated_at": 1700000001,
                             },
                         ],
+                        "config": [
+                            {
+                                "key": "openai.api_key",
+                                "value": PROVIDER_A,
+                                "updated_at": 1700000000,
+                            }
+                        ],
 
-                        "config": [json.dumps({"OPENAI_API_KEY": PROVIDER_A})],
                     }
                 }
             ),
@@ -621,7 +644,17 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(restored_db["chat_owners"][CHAT_ID], "owner-live")
         self.assertNotIn("owner_id", state_rows[0])
         self.assertNotIn("file_ids", state_rows[0])
-        self.assertIn(PROVIDER_A, json.dumps(restored_db["config"]))
+        self.assertEqual(
+            restored_db["config"],
+            [
+                {
+                    "key": "openai.api_key",
+                    "value": PROVIDER_A,
+                    "updated_at": 1700000000,
+                }
+            ],
+        )
+
         self.assertNotIn(PROVIDER_B, restored.stdout + restored.stderr)
         self.assertTrue(
             any(name.startswith("ocu-test-postgres-restore-") for name in db),
@@ -762,6 +795,152 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertTrue(foreign["State"]["Running"])
         stopped = (self.state / "stopped.log").read_text(encoding="utf-8") if (self.state / "stopped.log").exists() else ""
         self.assertNotIn(foreign["Id"], stopped)
+
+    def test_same_chat_without_mounts_is_not_attributed(self):
+        extra = sandbox(f"owui-chat-{CHAT_ID}-foreign", CHAT_ID, chat_dir=self.chat_dir)
+        extra["Mounts"] = []
+        extra["Id"] = "foreign-no-mounts"
+        self._seed_volumes_and_db(extra_containers=[extra])
+        dest = self.root / "backup-no-mounts"
+        result = self.run_cli(
+            [
+                "backup",
+                "--deploy-root",
+                str(self.deploy_root),
+                "--destination",
+                str(dest),
+                "--runtime-file",
+                str(self.runtime),
+            ]
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(dest.exists())
+        containers = json.loads((self.state / "containers.json").read_text(encoding="utf-8"))
+        foreign = next(item for item in containers if item["Name"] == extra["Name"])
+        self.assertTrue(foreign["State"]["Running"])
+        stopped = (self.state / "stopped.log").read_text(encoding="utf-8") if (self.state / "stopped.log").exists() else ""
+        self.assertNotIn(foreign["Id"], stopped)
+
+    def test_swapped_workspace_archives_reject_before_allocation(self):
+        other = "chat-other"
+        self._volume(f"chat-{other}-workspace", {"README.md": b"other-home\n"})
+        extra = sandbox(f"owui-chat-{other}", other, running=False, chat_dir=self.chat_dir)
+        (self.chat_dir / other / "uploads").mkdir(parents=True)
+        (self.chat_dir / other / "outputs").mkdir(parents=True)
+        self._seed_volumes_and_db(running_sandbox=False, extra_containers=[extra])
+        backup = self.root / "two-chat-backup"
+        created = self.run_cli(
+            [
+                "backup",
+                "--deploy-root",
+                str(self.deploy_root),
+                "--destination",
+                str(backup),
+                "--runtime-file",
+                str(self.runtime),
+            ]
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        manifest = json.loads((backup / "recovery.json").read_text(encoding="utf-8"))
+        workspaces = manifest["components"]["workspaces"]
+
+        first, second = sorted(workspaces)
+        workspaces[first]["path"], workspaces[second]["path"] = (
+            workspaces[second]["path"],
+            workspaces[first]["path"],
+        )
+        workspaces[first]["sha256"], workspaces[second]["sha256"] = (
+            workspaces[second]["sha256"],
+            workspaces[first]["sha256"],
+        )
+        (backup / "recovery.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self.root / "swapped-state"
+        target_state.mkdir()
+        seed_images(target_state)
+        seed_healthy_host(target_state)
+        write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+        write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+        write_fake_configs(target_state)
+        (target_state / "docker-info.json").write_text(json.dumps({"ID": "swapped-daemon"}), encoding="utf-8")
+        dest = self.root / "swapped-root"
+        result = self.run_cli(
+            [
+                "restore",
+                "--recovery-set",
+                str(backup),
+                "--destination-root",
+                str(dest),
+                "--provider-file",
+                str(provider),
+            ],
+            extra={"FAKE_DOCKER_STATE": str(target_state)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("declared recovery component", result.stderr)
+        self.assertFalse(dest.exists())
+        self.assertFalse((target_state / "volumes.json").exists())
+        self.assertFalse((target_state / "postgres.json").exists())
+        self.assertFalse(list(target_state.glob("postgres-phase-*")))
+
+
+
+    def test_two_chat_restore_keeps_each_workspace_home(self):
+        other = "chat-other"
+        self._volume(f"chat-{other}-workspace", {"README.md": b"other-home\n"})
+        extra = sandbox(f"owui-chat-{other}", other, running=False, chat_dir=self.chat_dir)
+        (self.chat_dir / other / "uploads").mkdir(parents=True)
+        (self.chat_dir / other / "outputs").mkdir(parents=True)
+        self._seed_volumes_and_db(running_sandbox=False, extra_containers=[extra])
+        backup = self.root / "keep-two-backup"
+        created = self.run_cli(
+            [
+                "backup",
+                "--deploy-root",
+                str(self.deploy_root),
+                "--destination",
+                str(backup),
+                "--runtime-file",
+                str(self.runtime),
+            ]
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self.root / "keep-two-state"
+        target_state.mkdir()
+        seed_images(target_state)
+        seed_healthy_host(target_state)
+        write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+        write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+        write_fake_configs(target_state)
+        (target_state / "docker-info.json").write_text(json.dumps({"ID": "keep-two-daemon"}), encoding="utf-8")
+        dest = self.root / "keep-two-root"
+        restored = self.run_cli(
+            [
+                "restore",
+                "--recovery-set",
+                str(backup),
+                "--destination-root",
+                str(dest),
+                "--provider-file",
+                str(provider),
+            ],
+            extra={"FAKE_DOCKER_STATE": str(target_state)},
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        import recovery_fs
+
+        first = self.root / "first-home"
+        second = self.root / "second-home"
+        recovery_fs.extract_tree(backup / "workspaces" / f"{CHAT_ID}.tar.gz", first)
+        recovery_fs.extract_tree(backup / "workspaces" / f"{other}.tar.gz", second)
+        self.assertEqual((first / "README.md").read_bytes(), b"sandbox-home\n")
+        self.assertEqual((second / "README.md").read_bytes(), b"other-home\n")
+
 
     def test_stale_runtime_images_fail_before_capture(self):
         containers = json.loads((self.state / "containers.json").read_text(encoding="utf-8"))
@@ -1207,6 +1386,195 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertFalse((target_state / "starts.log").exists())
         self.assertEqual((dest / "release.json").read_bytes(), before_manifest)
 
+    def test_incompatible_activation_leaves_compatible_retry(self):
+        backup = self.root / "backup"
+        created = self.run_cli(
+            [
+                "backup",
+                "--deploy-root",
+                str(self.deploy_root),
+                "--destination",
+                str(backup),
+                "--runtime-file",
+                str(self.runtime),
+            ]
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self.root / "compat-state"
+        target_state.mkdir()
+        seed_images(target_state)
+        seed_healthy_host(target_state)
+        write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+        write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+        write_fake_configs(target_state)
+        (target_state / "docker-info.json").write_text(json.dumps({"ID": "compat-daemon"}), encoding="utf-8")
+        dest = self.root / "compat-root"
+        extra = {"FAKE_DOCKER_STATE": str(target_state)}
+        restored = self.run_cli(
+            [
+                "restore",
+                "--recovery-set",
+                str(backup),
+                "--destination-root",
+                str(dest),
+                "--provider-file",
+                str(provider),
+            ],
+            extra=extra,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        matching, matching_payload, _matching_source = self._write_retained_delivery("matching-b")
+        other, other_payload, _other_source = self._write_retained_delivery("incompatible-c")
+        self.assertNotEqual(matching_payload["ocu_source_sha"], other_payload["ocu_source_sha"])
+        before_manifest = (dest / "release.json").read_bytes()
+        before_runtime = (dest / "config" / "runtime.env").read_bytes()
+        refused = self.run_cli(
+            [
+                "activate",
+                "--destination-root",
+                str(dest),
+                "--retained-delivery",
+                str(other),
+            ],
+            extra={**extra, "FAKE_DOCKER_MIGRATION_HEADS": "deadbeefc0de"},
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse((target_state / "starts.log").exists())
+        self.assertFalse((dest / "source").exists())
+        self.assertEqual((dest / "release.json").read_bytes(), before_manifest)
+        self.assertEqual((dest / "config" / "runtime.env").read_bytes(), before_runtime)
+        activated = self.run_cli(
+            [
+                "activate",
+                "--destination-root",
+                str(dest),
+                "--retained-delivery",
+                str(matching),
+            ],
+            extra=extra,
+        )
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        installed = json.loads((dest / "release.json").read_text(encoding="utf-8"))
+        self.assertEqual(installed["ocu_source_sha"], matching_payload["ocu_source_sha"])
+        persisted = {}
+        for line in (dest / "config" / "runtime.env").read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.startswith("#"):
+                name, value = line.split("=", 1)
+                persisted[name] = value
+        self.assertEqual(persisted["SOURCE_SHA"], matching_payload["ocu_source_sha"])
+        self.assertTrue((dest / "DEPLOYED_VERSION.md").is_file())
+        self.assertIn(matching_payload["ocu_source_sha"], (dest / "DEPLOYED_VERSION.md").read_text(encoding="utf-8"))
+
+    def test_interrupted_selected_source_publication_retries_same_delivery(self):
+        backup = self.root / "backup"
+        created = self.run_cli(
+            [
+                "backup",
+                "--deploy-root",
+                str(self.deploy_root),
+                "--destination",
+                str(backup),
+                "--runtime-file",
+                str(self.runtime),
+            ]
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self.root / "interrupt-state"
+        target_state.mkdir()
+        seed_images(target_state)
+        seed_healthy_host(target_state)
+        write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+        write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+        write_fake_configs(target_state)
+        (target_state / "docker-info.json").write_text(json.dumps({"ID": "interrupt-daemon"}), encoding="utf-8")
+        dest = self.root / "interrupt-root"
+        extra = {"FAKE_DOCKER_STATE": str(target_state)}
+        restored = self.run_cli(
+            [
+                "restore",
+                "--recovery-set",
+                str(backup),
+                "--destination-root",
+                str(dest),
+                "--provider-file",
+                str(provider),
+            ],
+            extra=extra,
+        )
+
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        delivery, inventory, _source = self._write_retained_delivery("interrupt-delivery")
+        package = self.recovery_pkg / "recovery_resources.py"
+        original = package.read_text(encoding="utf-8")
+        after_import = '            payload = release.import_release(delivery=delivery, install_root=source_root)'
+        after_symlink = '        os.symlink(source_root / "source", source)'
+        after_inventory = "        _publish_selected_inventory(manifest, source_root)"
+        after_runtime = "        published = persist_selected_runtime_identity("
+        foreign = dest.parent / "foreign-keep"
+        foreign.mkdir()
+        (foreign / "keep.txt").write_text("untouched\n", encoding="utf-8")
+        before_manifest = (dest / "release.json").read_bytes()
+        before_runtime = (dest / "config" / "runtime.env").read_bytes()
+        selected_root = dest.parent / f"{dest.name}.selected-source"
+        for needle, injection in (
+            (after_import, after_import + '\n            raise RecoveryError("injected interruption after source-root")'),
+            (after_symlink, after_symlink + '\n        raise RecoveryError("injected interruption after source publication")'),
+            (after_inventory, after_inventory + '\n        raise RecoveryError("injected interruption after inventory publication")'),
+            (after_runtime, '        raise RecoveryError("injected interruption after runtime publication")\n' + after_runtime),
+        ):
+            self.assertIn(needle, original)
+            if (dest / "source").exists() or (dest / "source").is_symlink():
+                (dest / "source").unlink()
+            if selected_root.exists():
+                shutil.rmtree(selected_root)
+            (dest / "release.json").write_bytes(before_manifest)
+            (dest / "config" / "runtime.env").write_bytes(before_runtime)
+            (dest / "DEPLOYED_VERSION.md").unlink(missing_ok=True)
+            (target_state / "starts.log").unlink(missing_ok=True)
+            package.write_text(original.replace(needle, injection, 1), encoding="utf-8")
+            interrupted = self.run_cli(
+                [
+                    "activate",
+                    "--destination-root",
+                    str(dest),
+                    "--retained-delivery",
+                    str(delivery),
+                ],
+                extra=extra,
+            )
+            self.assertNotEqual(interrupted.returncode, 0, injection)
+            self.assertFalse((target_state / "starts.log").exists())
+            self.assertEqual((foreign / "keep.txt").read_text(encoding="utf-8"), "untouched\n")
+            package.write_text(original, encoding="utf-8")
+            retry = self.run_cli(
+                [
+                    "activate",
+                    "--destination-root",
+                    str(dest),
+                    "--retained-delivery",
+                    str(delivery),
+                ],
+                extra=extra,
+            )
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+            installed = json.loads((dest / "release.json").read_text(encoding="utf-8"))
+            self.assertEqual(installed["ocu_source_sha"], inventory["ocu_source_sha"])
+            persisted = {}
+            for line in (dest / "config" / "runtime.env").read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.startswith("#"):
+                    name, value = line.split("=", 1)
+                    persisted[name] = value
+            self.assertEqual(persisted["SOURCE_SHA"], inventory["ocu_source_sha"])
+            self.assertTrue((dest / "DEPLOYED_VERSION.md").is_file())
+        self.assertEqual((foreign / "keep.txt").read_text(encoding="utf-8"), "untouched\n")
+
+
     def test_cli_help_names_tracked_commands(self):
         result = self.run_cli(["--help"])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1347,6 +1715,51 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(runtime["OPENWEBUI_IMAGE"], previous["open-webui"])
         self.assertNotEqual(runtime["DOCKER_IMAGE"], DEFAULT_RELEASE_IMAGES["workspace"])
         self.assertTrue((dest / ".restored").exists())
+
+    def test_restore_waits_through_temporary_postgres_socket(self):
+        backup = self.root / "backup"
+        created = self.run_cli(
+            [
+                "backup",
+                "--deploy-root",
+                str(self.deploy_root),
+                "--destination",
+                str(backup),
+                "--runtime-file",
+                str(self.runtime),
+            ]
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self.root / "pg-phase-state"
+        target_state.mkdir()
+        seed_images(target_state)
+        seed_healthy_host(target_state)
+        write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+        write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+        write_fake_configs(target_state)
+        (target_state / "docker-info.json").write_text(json.dumps({"ID": "pg-phase-daemon"}), encoding="utf-8")
+        dest = self.root / "pg-phase-root"
+        restored = self.run_cli(
+            [
+                "restore",
+                "--recovery-set",
+                str(backup),
+                "--destination-root",
+                str(dest),
+                "--provider-file",
+                str(provider),
+            ],
+            extra={
+                "FAKE_DOCKER_STATE": str(target_state),
+                "FAKE_POSTGRES_READY_AFTER": "0.3",
+            },
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertTrue((dest / ".restored").exists())
+
 
 
 

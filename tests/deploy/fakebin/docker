@@ -1548,8 +1548,13 @@ def docker_run(state: Path, argv: list[str]) -> int:
     if entrypoint in {"/usr/local/bin/python3", "python3"} and "-c" in command:
         script = command[command.index("-c") + 1]
         if "ScriptDirectory" in script or "alembic.ini" in script:
-            sys.stdout.write("HEADS=e6f7a8b9c0d1\nREV=e6f7a8b9c0d1->d4c1a8e37b62\nREV=d4c1a8e37b62->\n")
+            heads = os.environ.get("FAKE_DOCKER_MIGRATION_HEADS", "e6f7a8b9c0d1")
+            if heads == "e6f7a8b9c0d1":
+                sys.stdout.write("HEADS=e6f7a8b9c0d1\nREV=e6f7a8b9c0d1->d4c1a8e37b62\nREV=d4c1a8e37b62->\n")
+            else:
+                sys.stdout.write(f"HEADS={heads}\nREV={heads}->\n")
             return 0
+
     if entrypoint in {"/usr/bin/python3", "/usr/local/bin/python3", "python3"} and command:
         return execute_python_helper(command, translated, workdir=workdir, image=image)
     if entrypoint in {"pg_dump", "pg_restore", "psql", "postgres"} and "--version" in command:
@@ -1613,7 +1618,9 @@ def empty_database() -> dict:
         "dump": b"",
         "ready": True,
         "ready_after": 0.0,
+        "phase": "final",
     }
+
 
 
 
@@ -1698,39 +1705,68 @@ def handle_postgres_command(state: Path, container: str, command: list[str], *, 
     if command and command[0] in {"pg_dump", "pg_restore", "psql", "postgres"} and "--version" in command:
         return 0, "postgres (PostgreSQL) 17.5\n", ""
     if command[:1] == ["pg_isready"]:
-        return handle_pg_isready(record, state, container)
+        return handle_pg_isready(record, state, container, command)
     if command[:1] == ["psql"]:
         sql = ""
         if "-c" in command:
             sql = command[command.index("-c") + 1]
-        return handle_psql(record, sql, state, container)
+        return handle_psql(record, sql, state, container, command)
+
     del interactive
     return None
 
 
-def postgres_ready(record: dict, state: Path, container: str) -> bool:
-    ready_after = float(record.get("ready_after") or 0)
-    if ready_after and time.monotonic() < ready_after:
-        return False
+def postgres_phase(record: dict, state: Path, container: str) -> str:
     forever = state / f"postgres-unready-{container}"
     if forever.exists():
-        return False
-    return True
+        return "starting"
+    delay = float(record.get("ready_after") or 0)
+    if delay and time.monotonic() < delay:
+        return "socket"
+    sequence = state / f"postgres-phase-{container}"
+    if sequence.exists():
+        return sequence.read_text(encoding="utf-8").strip() or "final"
+    return str(record.get("phase") or "final")
 
 
-def handle_pg_isready(record: dict, state: Path, container: str) -> tuple[int, str, str]:
-    if postgres_ready(record, state, container):
+def postgres_ready(record: dict, state: Path, container: str) -> bool:
+    return postgres_phase(record, state, container) == "final"
+
+
+def handle_pg_isready(record: dict, state: Path, container: str, argv: list[str]) -> tuple[int, str, str]:
+    host = "socket"
+    if "-h" in argv:
+        host = argv[argv.index("-h") + 1]
+    phase = postgres_phase(record, state, container)
+    if phase == "socket":
+        if host in {"127.0.0.1", "localhost", "0.0.0.0"}:
+            return 1, "", "the database system is starting up"
+        return 0, "/var/run/postgresql:5432 - accepting connections\n", ""
+    if phase == "shutdown":
+        return 1, "", "the database system is shutting down"
+    if phase == "final":
+        if host in {"127.0.0.1", "localhost", "0.0.0.0"}:
+            return 0, "127.0.0.1:5432 - accepting connections\n", ""
         return 0, "openwebui:5432 - accepting connections\n", ""
     return 1, "", "no response"
 
 
-def handle_psql(record: dict, sql: str, state: Path, container: str) -> tuple[int, str, str]:
+def handle_psql(record: dict, sql: str, state: Path, container: str, argv: list[str]) -> tuple[int, str, str]:
     text = " ".join(sql.split())
-    if not postgres_ready(record, state, container) and "SELECT 1" not in text:
-        return 1, "", "the database system is starting up"
-    if text.strip() in {"SELECT 1;", "SELECT 1"}:
-        if not postgres_ready(record, state, container):
+    host = "socket"
+    if "-h" in argv:
+        host = argv[argv.index("-h") + 1]
+    phase = postgres_phase(record, state, container)
+    tcp = host in {"127.0.0.1", "localhost", "0.0.0.0"}
+    if phase != "final" or (phase == "final" and not tcp and "SELECT 1" in text):
+        if phase == "socket" and not tcp:
+            if text.strip() in {"SELECT 1;", "SELECT 1"}:
+                return 0, "1\n", ""
             return 1, "", "the database system is starting up"
+        return 1, "", "the database system is starting up"
+    if not tcp:
+        return 1, "", "refusing occupancy on the temporary socket"
+    if text.strip() in {"SELECT 1;", "SELECT 1"}:
         return 0, "1\n", ""
     if "alembic_version" in text:
         lines = [str(record.get("alembic_revision") or "e6f7a8b9c0d1")]
@@ -1756,7 +1792,7 @@ def handle_psql(record: dict, sql: str, state: Path, container: str) -> tuple[in
                     {
                         "chat_id": item.get("chat_id") or "",
                         "last_seen_revision": int(item.get("last_seen_revision") or 0),
-                        "prefs": item.get("prefs") if item.get("prefs") is not None else item.get("preferences") or {},
+                        "prefs": item.get("prefs") if item.get("prefs") is not None else {},
                         "updated_at": int(item.get("updated_at") or 0),
                     },
                     separators=(",", ":"),
@@ -1774,7 +1810,6 @@ def handle_psql(record: dict, sql: str, state: Path, container: str) -> tuple[in
                 )
             )
         return 0, ("\n".join(rows) + ("\n" if rows else "")), ""
-
     if "FROM chat" in text:
         ids = [str(item) for item in record.get("chats") or []]
         return 0, ("\n".join(ids) + ("\n" if ids else "")), ""
@@ -1783,10 +1818,25 @@ def handle_psql(record: dict, sql: str, state: Path, container: str) -> tuple[in
     if "FROM pg_class" in text:
         return 0, "0\n", ""
     if "FROM config" in text:
-        values = record.get("config") or []
-        return 0, ("\n".join(str(item) for item in values) + ("\n" if values else "")), ""
+        if any(token in text for token in (" data", "ORDER BY id", "FROM config ORDER BY id")) and "json_build_object" not in text:
+            return 1, "", 'column "data" does not exist'
+        if "json_build_object" not in text or "key" not in text or "value" not in text:
+            return 1, "", 'column "data" does not exist'
+        rows = []
+        for item in record.get("config") or []:
+            if isinstance(item, dict) and "key" in item:
+                payload = {
+                    "key": item.get("key") or "",
+                    "value": item.get("value"),
+                    "updated_at": item.get("updated_at"),
+                }
+            else:
+                return 1, "", 'column "data" does not exist'
+            rows.append(json.dumps(payload, separators=(",", ":")))
+        return 0, ("\n".join(rows) + ("\n" if rows else "")), ""
     sys.stderr.write("unsupported exec command\n")
     return 1, "", "unsupported exec command"
+
 
 
 

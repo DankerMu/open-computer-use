@@ -66,7 +66,14 @@ class RecoveryDatabaseTests(unittest.TestCase):
                                 "updated_at": 1700000001,
                             },
                         ],
-                        "config": ['{"OPENAI_API_KEY":"credential-A"}'],
+                        "config": [
+                            {
+                                "key": "openai.api_key",
+                                "value": "credential-A",
+                                "updated_at": 1700000000,
+                            }
+                        ],
+
                     }
                 }
             ),
@@ -97,6 +104,15 @@ class RecoveryDatabaseTests(unittest.TestCase):
                 self.container,
                 "SELECT preferences, owner_id, file_ids FROM ocu_chat_state",
             )
+        with self.assertRaises(recovery.RecoveryError):
+            recovery_db._exec_postgres(
+                self.container,
+                "SELECT COALESCE(data::text, '') FROM config ORDER BY id LIMIT 5;",
+            )
+        rows = recovery_db.inspect_provider_config(self.container)
+        self.assertEqual(rows[0]["key"], "openai.api_key")
+        self.assertEqual(rows[0]["value"], "credential-A")
+
 
     def test_incompatible_revision_and_tools_reject(self):
         schema = {"alembic_revision": "deadbeefc0de", "server_version": "17.5"}

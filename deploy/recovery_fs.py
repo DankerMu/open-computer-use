@@ -61,12 +61,12 @@ def confined_relative(root: Path, path: Path) -> str:
 
 
 def canonical_member_name(name: str) -> str:
-    text = name.replace("\\", "/")
+    text = name
     while text.startswith("./"):
         text = text[2:]
     if text in ("", ".", "./"):
         return "."
-    if text.startswith("/") or ".." in Path(text).parts or "\x00" in text:
+    if text.startswith("/") or "\x00" in text:
         fail(f"unsafe archive member {name}")
     parts = [part for part in text.rstrip("/").split("/") if part not in ("", ".")]
     if not parts:
@@ -78,6 +78,7 @@ def canonical_member_name(name: str) -> str:
 
 def destination_member_name(name: str) -> str:
     return canonical_member_name(name)
+
 
 
 def _lstat(path: Path):
@@ -235,10 +236,15 @@ def _python_extract(archive: Path, dest: Path, members: list[tarfile.TarInfo]) -
                 if extracted is None:
                     fail(f"{archive}: missing file content for {name}")
                 with open(target, "wb") as stream:
-                    stream.write(extracted.read())
+                    while True:
+                        chunk = extracted.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        stream.write(chunk)
             else:
                 fail(f"{archive}: unsupported member {name}")
             _apply_metadata(target, member)
+
 
 def _walk_tree(root: Path) -> list[tuple[Path, str, os.stat_result]]:
     stack = [root]
@@ -401,7 +407,6 @@ def _reject_link_escapes(names: dict[str, tarfile.TarInfo]) -> None:
 
 
 def _reject_destination_conflicts(destinations: dict[str, tarfile.TarInfo]) -> None:
-    names = set(destinations)
     for name, member in destinations.items():
         if name == ".":
             if not member.isdir():
@@ -419,11 +424,6 @@ def _reject_destination_conflicts(destinations: dict[str, tarfile.TarInfo]) -> N
                 fail(f"archive member {name} conflicts with non-directory {ancestor}")
             if parent.issym() or parent.islnk():
                 fail(f"archive member {name} traverses link {ancestor}")
-        for other in names:
-            if other == name or other == ".":
-                continue
-            if other.startswith(name + "/") and not member.isdir():
-                fail(f"archive member {name} is a non-directory prefix of {other}")
 
 
 def validate_archive(archive: Path) -> list[dict]:
