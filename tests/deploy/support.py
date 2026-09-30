@@ -4,12 +4,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
+
+
+
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +48,66 @@ DEFAULT_DNS = "8.8.8.8"
 METADATA_ADDR = "169.254.169.254"
 OWNED_IPV4 = "OCU-SANDBOX-EGRESS"
 OWNED_IPV6 = "OCU-SANDBOX-EGRESS6"
+ROLE_ORDER = (
+    "workspace",
+    "computer-use-server",
+    "retention-guard",
+    "proxy",
+    "open-webui",
+    "postgres",
+)
+RUNTIME_IMAGE_VARS = {
+    "workspace": "DOCKER_IMAGE",
+    "computer-use-server": "COMPUTER_USE_SERVER_IMAGE",
+    "retention-guard": "RETENTION_GUARD_IMAGE",
+    "proxy": "OCU_PROXY_IMAGE",
+    "open-webui": "OPENWEBUI_IMAGE",
+    "postgres": "POSTGRES_IMAGE",
+}
+DEFAULT_RELEASE_IMAGES = {
+    "workspace": "open-computer-use:synthetic",
+    "computer-use-server": "ocu-computer-use-server:synthetic",
+    "retention-guard": "ocu-retention-guard:synthetic",
+    "proxy": "ocu-test-proxy:synthetic",
+    "open-webui": "ocu-open-webui:synthetic",
+    "postgres": "postgres:17-alpine",
+}
+DEFAULT_RELEASE_DIGESTS = {
+    role: "sha256:" + hashlib.sha256(f"synthetic-{role}".encode("utf-8")).hexdigest()
+    for role in ROLE_ORDER
+}
+FORMAT_VERSION = 1
+PLATFORM = "linux/amd64"
+WEBUI_SYNTHETIC_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+UP_FIXTURE_PATHS = (
+    "deploy/up.sh",
+    "deploy/release.py",
+    "deploy/__init__.py",
+    "deploy/check-ports.sh",
+
+    "deploy/provision-networks.sh",
+    "deploy/check-sandbox-dns.sh",
+    "deploy/check_sandbox_dns.py",
+    "deploy/netinspect.py",
+    "deploy/firewall/docker-user-rules.sh",
+    "deploy/firewall/check.sh",
+    "deploy/firewall/policy.py",
+    "deploy/firewall/__init__.py",
+
+    "deploy/production-like-test/compose.core.override.yml",
+    "deploy/production-like-test/compose.webui.override.yml",
+    "deploy/production-like-test/compose.proxy.yml",
+    "deploy/production-like-test/init/run-init.sh",
+    "openwebui/init.sh",
+    "openwebui/tools/computer_use_tools.py",
+    "openwebui/functions/computer_link_filter.py",
+    "computer-use-server/sandbox_dns.py",
+    "docker-compose.yml",
+    "docker-compose.webui.yml",
+)
+
 
 
 def control_networks():
@@ -60,7 +127,7 @@ def proxy_mapping(*, published=PROXY_PUBLISHED, target=PROXY_TARGET, protocol="t
     return mapping
 
 
-def service(*, ports=None, networks=None, network_mode=None, expose=None, environment=None):
+def service(*, ports=None, networks=None, network_mode=None, expose=None, environment=None, image=None):
     body = {}
     if ports is not None:
         body["ports"] = ports
@@ -72,7 +139,10 @@ def service(*, ports=None, networks=None, network_mode=None, expose=None, enviro
         body["expose"] = expose
     if environment is not None:
         body["environment"] = environment
+    if image is not None:
+        body["image"] = image
     return body
+
 
 
 def stack(services, networks=None):
@@ -82,15 +152,23 @@ def stack(services, networks=None):
 def intended_core():
     return stack(
         {
-            "workspace": service(networks={"default": {}}),
+            "workspace": service(networks={"default": {}}, image=DEFAULT_RELEASE_IMAGES["workspace"]),
             OCU_SERVICE: service(
                 networks={"default": {}},
-                environment={"OCU_SANDBOX_DNS": DEFAULT_DNS},
+                environment={
+                    "OCU_SANDBOX_DNS": DEFAULT_DNS,
+                    "DOCKER_IMAGE": DEFAULT_RELEASE_IMAGES["workspace"],
+                },
+                image=DEFAULT_RELEASE_IMAGES["computer-use-server"],
             ),
             "cleanup": service(networks={"default": {}}),
-            "retention-guard": service(networks={"default": {}}),
+            "retention-guard": service(
+                networks={"default": {}},
+                image=DEFAULT_RELEASE_IMAGES["retention-guard"],
+            ),
         }
     )
+
 
 def with_core_dns(docs, value):
     payload = dict(docs)
@@ -109,11 +187,22 @@ def with_core_dns(docs, value):
 def intended_webui():
     return stack(
         {
-            WEBUI_SERVICE: service(networks={"default": {}}, expose=["8080"]),
-            "postgres": service(networks={"default": {}}),
-            "open-webui-init": service(networks={"default": {}}),
+            WEBUI_SERVICE: service(
+                networks={"default": {}},
+                expose=["8080"],
+                image=DEFAULT_RELEASE_IMAGES["open-webui"],
+            ),
+            "postgres": service(
+                networks={"default": {}},
+                image=DEFAULT_RELEASE_IMAGES["postgres"],
+            ),
+            "open-webui-init": service(
+                networks={"default": {}},
+                image=DEFAULT_RELEASE_IMAGES["open-webui"],
+            ),
         }
     )
+
 
 
 def intended_proxy():
@@ -127,7 +216,9 @@ def intended_proxy():
                     "OCU_WEBUI_UPSTREAM": "http://open-webui:8080",
                     "OCU_PROXY_UPSTREAM": "http://computer-use-server:8081",
                 },
+                image=DEFAULT_RELEASE_IMAGES["proxy"],
             )
+
         }
     )
 
@@ -346,13 +437,14 @@ def seed_healthy_host(state_dir: Path) -> None:
 def run_script(script: Path, env, *, timeout=20):
     return subprocess.run(
         ["bash", str(script)],
-        cwd=str(ROOT),
+        cwd=str(env.get("OCU_TEST_ROOT", ROOT)),
         capture_output=True,
         text=True,
         env=env,
         check=False,
         timeout=timeout,
     )
+
 
 def write_fake_configs(state_dir: Path, docs=None):
     config_dir = state_dir / "config"
@@ -370,4 +462,193 @@ def ops(state_dir: Path) -> list[str]:
 def tmp_dir():
     return tempfile.TemporaryDirectory(prefix="ocu-deploy-test-")
 
+
+def empty_build(role: str) -> dict:
+    return {
+        "dockerfile": f"{role}.Dockerfile",
+        "dockerfile_sha256": hashlib.sha256(role.encode("utf-8")).hexdigest(),
+        "context": ".",
+        "arguments": {},
+        "argument_defaults": {},
+        "argument_overrides": {},
+        "input_manifest_sha256": hashlib.sha256(f"input-{role}".encode("utf-8")).hexdigest(),
+        "materials": [{"name": role, "requested": "synthetic", "kind": "test"}],
+    }
+
+
+def synthetic_inventory(*, ocu_sha: str, webui_sha: str, images=None, bundle_sha=None) -> dict:
+    records = {}
+    for role in ROLE_ORDER:
+        source = (images or {}).get(role, {})
+        reference = source.get("reference", DEFAULT_RELEASE_IMAGES[role])
+        digest = source.get("configuration_digest", default_config_id(role))
+        archive = source.get(
+            "archive",
+            {"path": f"images/{role}.tar", "sha256": hashlib.sha256(role.encode("utf-8")).hexdigest()},
+        )
+        records[role] = {
+            "reference": reference,
+            "configuration_digest": digest,
+            "archive": archive,
+            "build": source.get("build", empty_build(role)),
+        }
+        if "registry_digests" in source:
+            records[role]["registry_digests"] = source["registry_digests"]
+    return {
+        "format_version": FORMAT_VERSION,
+        "platform": PLATFORM,
+        "ocu_source_sha": ocu_sha,
+        "webui_source_sha": webui_sha,
+        "source_bundle": {
+            "path": "source.bundle",
+            "sha256": bundle_sha or hashlib.sha256(b"bundle").hexdigest(),
+        },
+        "images": records,
+    }
+
+
+
+def write_inventory(path: Path, payload: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    return path
+
+
+def config_payload(digest: str, os_name="linux", architecture="amd64") -> bytes:
+    return json.dumps(
+        {
+            "os": os_name,
+            "architecture": architecture,
+            "rootfs": {"diff_ids": [digest]},
+            "config": {"Env": [f"OCU_FAKE={digest}"]},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def image_id_for_config(config: bytes) -> str:
+    return "sha256:" + hashlib.sha256(config).hexdigest()
+
+
+def default_config_id(role: str) -> str:
+    return image_id_for_config(config_payload(DEFAULT_RELEASE_DIGESTS[role]))
+
+
+def write_image_archive(path: Path, tags: dict[str, bytes]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = []
+    repositories = {}
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w") as archive:
+        for tag, config in tags.items():
+            digest = hashlib.sha256(config).hexdigest()
+            name = digest + ".json"
+            info = tarfile.TarInfo(name=name)
+            info.size = len(config)
+            archive.addfile(info, io.BytesIO(config))
+            entries.append({"Config": name, "RepoTags": [tag], "Layers": []})
+            repo, _, label = tag.partition(":")
+            repositories.setdefault(repo, {})[label or "latest"] = digest
+        manifest = json.dumps(entries).encode("utf-8")
+        info = tarfile.TarInfo(name="manifest.json")
+        info.size = len(manifest)
+        archive.addfile(info, io.BytesIO(manifest))
+        repos = json.dumps(repositories).encode("utf-8")
+        info = tarfile.TarInfo(name="repositories")
+        info.size = len(repos)
+        archive.addfile(info, io.BytesIO(repos))
+    path.write_bytes(payload.getvalue())
+    return path
+
+
+
+def seed_images(state_dir: Path, mapping: dict[str, dict] | None = None) -> dict:
+    payload = {}
+    if mapping is None:
+        mapping = {}
+        for role in ROLE_ORDER:
+
+            config = config_payload(DEFAULT_RELEASE_DIGESTS[role])
+            mapping[DEFAULT_RELEASE_IMAGES[role]] = {
+                "Id": image_id_for_config(config),
+                "Os": "linux",
+                "Architecture": "amd64",
+                "ConfigBytes": config.decode("utf-8"),
+            }
+    for name, record in mapping.items():
+        payload[name] = record
+    (state_dir / "images.json").write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+
+def git_init_commit(root: Path, message="synthetic") -> str:
+    subprocess.run(["git", "init", "-q"], cwd=str(root), check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "release@example.test"], cwd=str(root), check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Release Test"], cwd=str(root), check=True, capture_output=True, text=True)
+    subprocess.run(["git", "add", "-A"], cwd=str(root), check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", message],
+        cwd=str(root),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(root), text=True).strip()
+
+
+def copy_tracked(relative: str, dest_root: Path) -> None:
+    source = ROOT / relative
+    target = dest_root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, target, dirs_exist_ok=True)
+    else:
+        shutil.copy2(source, target)
+
+
+def committed_up_fixture(dest_root: Path) -> str:
+    for relative in UP_FIXTURE_PATHS:
+        copy_tracked(relative, dest_root)
+    (dest_root / "README").write_text("synthetic committed fixture\n", encoding="utf-8")
+    return git_init_commit(dest_root, "committed deploy fixture")
+
+
+def write_release_for_sha(dest: Path, ocu_sha: str, webui_sha: str, *, images=None) -> Path:
+    payload = synthetic_inventory(ocu_sha=ocu_sha, webui_sha=webui_sha, images=images)
+    return write_inventory(dest, payload)
+
+
+def seed_release_env(env: dict, state_dir: Path, source_root: Path, inventory: Path) -> dict:
+    merged = dict(env)
+    merged["OCU_RELEASE_MANIFEST"] = str(inventory)
+    merged["OCU_TEST_ROOT"] = str(source_root)
+    if "SOURCE_SHA" not in merged:
+        merged["SOURCE_SHA"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(source_root), text=True).strip()
+    merged.setdefault("WEBUI_SOURCE_SHA", WEBUI_SYNTHETIC_SHA)
+    for role, name in RUNTIME_IMAGE_VARS.items():
+        merged.setdefault(name, DEFAULT_RELEASE_IMAGES[role])
+    if not (state_dir / "images.json").exists():
+        seed_images(state_dir)
+    return merged
+
+
+def prepare_up_context(state_dir: Path, extra=None):
+    source = state_dir / "committed-source"
+    if not (source / ".git").exists():
+        source.mkdir(parents=True, exist_ok=True)
+        sha = committed_up_fixture(source)
+        inventory = write_release_for_sha(state_dir / "release.json", sha, WEBUI_SYNTHETIC_SHA)
+        if not (state_dir / "images.json").exists():
+            seed_images(state_dir)
+    else:
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(source), text=True).strip()
+        inventory = state_dir / "release.json"
+        if not inventory.exists():
+            inventory = write_release_for_sha(inventory, sha, WEBUI_SYNTHETIC_SHA)
+    env = dict(extra) if extra is not None else fake_env(state_dir)
+    env = seed_release_env(env, state_dir, source, inventory)
+    return env, source / "deploy" / "up.sh", source
 

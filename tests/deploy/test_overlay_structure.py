@@ -109,6 +109,15 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertEqual(webui_env["ENABLE_OCU_WORKSPACE"], "true")
         self.assertEqual(webui_env["OCU_INTERNAL_URL"], "http://computer-use-server:8081")
         self.assertEqual(webui_env["ORCHESTRATOR_URL"], "http://computer-use-server:8081")
+        self.assertEqual(webui_env["OFFLINE_MODE"], "true")
+        self.assertEqual(webui_env["ENABLE_VERSION_UPDATE_CHECK"], "false")
+        self.assertEqual(webui_env["WHISPER_MODEL_AUTO_UPDATE"], "false")
+        self.assertEqual(webui_env["RAG_EMBEDDING_MODEL_AUTO_UPDATE"], "false")
+        self.assertEqual(webui_env["RAG_RERANKING_MODEL_AUTO_UPDATE"], "false")
+        internal_provider = {"DMXAPI_BASE_URL": "http://lan-model:8000/v1"}
+        for setting in ("OPENAI_API_BASE_URL", "RAG_OPENAI_API_BASE_URL"):
+            self.assertEqual(interpolate_value(webui_env[setting], internal_provider), "http://lan-model:8000/v1")
+
         self.assertTrue(interpolated(core["networks"]["default"]["name"], "OCU_PRIVATE_NETWORK"))
         self.assertTrue(interpolated(core["networks"]["default"]["ipam"]["config"][0]["subnet"], "OCU_PRIVATE_SUBNET"))
         self.assertTrue(interpolated(core["networks"]["default"]["ipam"]["config"][0]["gateway"], "OCU_PRIVATE_GATEWAY"))

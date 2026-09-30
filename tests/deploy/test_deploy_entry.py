@@ -19,12 +19,12 @@ from support import (
     METADATA_ADDR,
     OCU_SERVICE,
     PROVISION,
-    ROOT,
     SANDBOX_NETWORK,
-    UP,
     fake_env,
     intended_docs,
     ops,
+    prepare_up_context,
+    run_script,
     sandbox_container,
     seed_healthy_host,
     tmp_dir,
@@ -34,19 +34,11 @@ from support import (
     write_network,
 )
 
+
+
 DESTRUCTIVE = ("network rm", "network disconnect", "compose down", " rm -f", " container rm")
 
 
-def run_script(script: Path, env, *, timeout=20):
-    return subprocess.run(
-        ["bash", str(script)],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-        timeout=timeout,
-    )
 
 
 def starts(state_dir: Path) -> list[str]:
@@ -139,6 +131,23 @@ class DeployEntryTests(unittest.TestCase):
             gateway="172.30.0.1",
         )
         self.env = fake_env(self.state)
+
+    def up(self, env=None, *, timeout=20):
+        merged, script, _source = prepare_up_context(self.state, extra=self.env if env is None else env)
+        return run_script(script, merged, timeout=timeout)
+
+    def up_popen(self, env=None):
+        merged, script, source = prepare_up_context(self.state, extra=self.env if env is None else env)
+        return subprocess.Popen(
+            ["bash", str(script)],
+            cwd=str(source),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=merged,
+            start_new_session=True,
+        ), merged
+
     def tearDown(self):
         self.context.cleanup()
 
@@ -312,7 +321,7 @@ class DeployEntryTests(unittest.TestCase):
 
     def test_config_resolution_failure_starts_no_service(self):
         (self.state / "config-fail").write_text("1", encoding="utf-8")
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assertEqual(compose_up_ops(self.state), [])
@@ -325,7 +334,7 @@ class DeployEntryTests(unittest.TestCase):
         ]
         write_fake_configs(self.state, docs)
         before = leftover_tmp(self.state)
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assertEqual(compose_up_ops(self.state), [])
@@ -338,7 +347,7 @@ class DeployEntryTests(unittest.TestCase):
         docs["webui.json"]["services"]["open-webui"].pop("networks", None)
         docs["webui.json"]["services"]["open-webui"]["network_mode"] = "bridge"
         write_fake_configs(self.state, docs)
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assert_no_destructive()
@@ -350,7 +359,7 @@ class DeployEntryTests(unittest.TestCase):
             subnet="10.8.0.0/24",
             gateway="10.8.0.1",
         )
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assert_no_destructive()
@@ -359,7 +368,7 @@ class DeployEntryTests(unittest.TestCase):
         env = dict(self.env)
         env["COMPOSE_REMOVE_ORPHANS"] = "1"
         env["COMPOSE_PROFILES"] = "manual-maintenance"
-        result = run_script(UP, env)
+        result = self.up(env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(leftover_tmp(self.state), [])
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
@@ -371,6 +380,12 @@ class DeployEntryTests(unittest.TestCase):
         self.assertTrue(all(row["snapshot"] for row in rows))
         self.assertTrue(all(row["env_remove_orphans"] == "false" for row in rows))
         self.assertTrue(all(row["env_profiles"] == "" for row in rows))
+        self.assertTrue(all(row["no_build"] for row in rows))
+        self.assertTrue(all(row["pull"] == "never" for row in rows))
+        self.assertTrue(all(row.get("build") is False for row in rows))
+        self.assertNotIn(" docker build ", " " + recorded + " ")
+        self.assertNotIn(" docker pull ", " " + recorded + " ")
+
         self.assertNotIn("cleanup", running_services(self.state))
         self.assertEqual(
             set(running_services(self.state)),
@@ -394,7 +409,7 @@ class DeployEntryTests(unittest.TestCase):
             gateway="172.31.0.1",
         )
         (self.state / "up-fail-webui").write_text("1", encoding="utf-8")
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), ["core", "webui:failed"])
         self.assertEqual(
@@ -422,15 +437,8 @@ class DeployEntryTests(unittest.TestCase):
         env = dict(self.env)
         env["FAKE_DOCKER_HOLD_UP"] = str(marker)
         env["TOKEN"] = "hostile-token-value"
-        process = subprocess.Popen(
-            ["bash", str(UP)],
-            cwd=str(ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            start_new_session=True,
-        )
+        process, env = self.up_popen(env)
+
         try:
             self.assertTrue(
                 wait_for(lambda: (self.state / "entered-up").exists()),
@@ -471,15 +479,8 @@ class DeployEntryTests(unittest.TestCase):
         env = dict(self.env)
         env[hold_env] = str(marker)
         before = leftover_tmp(self.state)
-        process = subprocess.Popen(
-            ["bash", str(UP)],
-            cwd=str(ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            start_new_session=True,
-        )
+        process, env = self.up_popen(env)
+
         children: set[int] = set()
         try:
             self.assertTrue(
@@ -574,7 +575,7 @@ class DeployEntryTests(unittest.TestCase):
     def test_unset_dns_starts_no_service(self):
         env = dict(self.env)
         del env["OCU_SANDBOX_DNS"]
-        result = run_script(UP, env)
+        result = self.up(env)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("OCU_SANDBOX_DNS", result.stderr)
         self.assertEqual(starts(self.state), [])
@@ -585,7 +586,7 @@ class DeployEntryTests(unittest.TestCase):
         env = dict(self.env)
         env["OCU_SANDBOX_DNS"] = ""
         write_fake_configs(self.state, with_core_dns(intended_docs(), ""))
-        result = run_script(UP, env)
+        result = self.up(env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
         self.assert_no_destructive()
@@ -603,7 +604,7 @@ class DeployEntryTests(unittest.TestCase):
                 env = dict(self.env)
                 env["OCU_SANDBOX_DNS"] = value
                 write_fake_configs(self.state, with_core_dns(intended_docs(), value))
-                result = run_script(UP, env)
+                result = self.up(env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(starts(self.state), [])
                 self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before_firewall)
@@ -615,13 +616,13 @@ class DeployEntryTests(unittest.TestCase):
         docs = intended_docs()
         docs["core.json"]["services"][OCU_SERVICE].pop("environment", None)
         write_fake_configs(self.state, docs)
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assert_no_destructive()
 
         write_fake_configs(self.state, with_core_dns(intended_docs(), "1.1.1.1"))
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assert_no_destructive()
@@ -650,7 +651,7 @@ class DeployEntryTests(unittest.TestCase):
         )
         before = (self.state / "containers.json").read_text(encoding="utf-8")
         before_firewall = (self.state / "firewall.json").read_text(encoding="utf-8")
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         combined = result.stdout + result.stderr
         self.assertIn("running-sandbox", combined)
@@ -679,7 +680,7 @@ class DeployEntryTests(unittest.TestCase):
         (self.state / "inspect-fail-cid-fail").write_text("1", encoding="utf-8")
         before = (self.state / "containers.json").read_text(encoding="utf-8")
         before_firewall = (self.state / "firewall.json").read_text(encoding="utf-8")
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cid-fail", result.stderr)
         self.assertEqual(starts(self.state), [])
@@ -700,7 +701,7 @@ class DeployEntryTests(unittest.TestCase):
                 )
             ],
         )
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
         self.assert_no_destructive()
@@ -721,7 +722,7 @@ class DeployEntryTests(unittest.TestCase):
         )
         before = (self.state / "containers.json").read_text(encoding="utf-8")
         before_firewall = (self.state / "firewall.json").read_text(encoding="utf-8")
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         combined = result.stdout + result.stderr
         self.assertIn("unknown-shape", combined)

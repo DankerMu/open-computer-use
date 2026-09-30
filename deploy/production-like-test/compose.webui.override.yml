@@ -19,6 +19,10 @@ services:
       # host.docker.internal:11434 endpoint.
       ENABLE_OLLAMA_API: "false"
       ENABLE_WEB_SEARCH: "false"
+      OFFLINE_MODE: "true"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+      WHISPER_MODEL_AUTO_UPDATE: "false"
+
       ENABLE_OPENAI_API_SSL_VERIFY: "true"
       OPENAI_API_BASE_URL: ${DMXAPI_BASE_URL}
       OPENAI_API_KEY: ${DMXAPI_API_KEY}
