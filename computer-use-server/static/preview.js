@@ -925,28 +925,93 @@ function waitForDrawioRender(viewer, host) {
   });
 }
 
-function attachRenderedPageGuard(viewer, host, file, tracker) {
-  const check = () => {
-    if (!host.isConnected) return;
+function graphFromOwner(owner) {
+  return owner?.editor?.graph || owner?.graph || null;
+}
+
+function ownedPreviewTarget(target) {
+  if (!target || target === document.body || target === document.documentElement) return null;
+  return target;
+}
+
+function failOwnedPreview(owner, target, file) {
+  const preview = ownedPreviewTarget(target);
+  if (!preview) {
+    try { if (typeof owner?.destroy === 'function') owner.destroy(); } catch {}
+    return;
+  }
+  try { if (typeof owner?.destroy === 'function') owner.destroy(); } catch {}
+  if (preview.isConnected) renderDownloadFallback(preview, file, 'diagram', t('drawio_fail'));
+}
+
+function attachRenderedPageGuard(owner, target, file, tracker) {
+  const subscriptions = [];
+  let retired = false;
+  let queued = false;
+  const ownedTracker = tracker;
+  const run = () => {
+    queued = false;
+    if (retired) return;
+    const preview = ownedPreviewTarget(target);
+    if (!preview || !preview.isConnected) return;
+    const graph = graphFromOwner(owner);
     const required = new Set();
-    collectViewerMxgraphShapes(viewer, required);
+    collectViewerMxgraphShapes({ graph }, required);
     try {
-      assertRequiredStencilsLoaded(required, tracker);
+      assertRequiredStencilsLoaded(required, ownedTracker);
     } catch (error) {
       console.error('Draw.io render error:', error);
-      tracker.restore();
-      if (host.isConnected) renderDownloadFallback(host.parentNode || host, file, 'diagram', t('drawio_fail'));
+      failOwnedPreview(owner, preview, file);
     }
   };
-  if (typeof viewer.addListener === 'function') {
-    viewer.addListener('render', check);
-    viewer.addListener('graphChanged', check);
-    viewer.addListener('xmlNodeChanged', check);
+  const check = () => {
+    if (retired || queued) return;
+    queued = true;
+    queueMicrotask(run);
+  };
+  const listen = (targetNode, names) => {
+    if (!targetNode || typeof targetNode.addListener !== 'function') return;
+    for (const name of names) {
+      targetNode.addListener(name, check);
+      subscriptions.push([targetNode, check]);
+    }
+  };
+  listen(owner, ['render', 'graphChanged', 'xmlNodeChanged']);
+  listen(owner?.editor, ['fileLoaded', 'pageSelected']);
+  const graph = graphFromOwner(owner);
+  listen(graph, ['render']);
+  listen(graph?.model, ['change']);
+  const destroy = owner?.destroy;
+  if (typeof destroy === 'function' && !owner.__ocuDrawioGuarded) {
+    owner.__ocuDrawioGuarded = true;
+    owner.destroy = function() {
+      retired = true;
+      queued = false;
+      try { return destroy.apply(this, arguments); }
+      finally {
+        for (const [targetNode, handler] of subscriptions) {
+          try {
+            if (typeof targetNode.removeListener === 'function') targetNode.removeListener(handler);
+          } catch {}
+        }
+        ownedTracker?.restore?.();
+      }
+    };
   }
-  const graph = viewer.graph;
-  if (graph && typeof graph.addListener === 'function') {
-    graph.addListener('render', check);
-  }
+  check();
+}
+
+function attachLocalLightboxGuard(viewer, Viewer, host, file, tracker) {
+  if (typeof viewer.showLocalLightbox !== 'function') return;
+  const previous = Viewer.prototype.showLocalLightbox;
+  viewer.showLocalLightbox = function() {
+    const ui = previous.apply(this, arguments);
+    if (ui) {
+      const uiTracker = installStencilLoadTracker();
+      attachRenderedPageGuard(ui, host, file, uiTracker);
+    }
+    return ui;
+  };
 }
 
 async function loadDrawioViewer() {
@@ -1003,7 +1068,8 @@ async function renderDrawioPreview(container, file) {
     const required = new Set();
     collectViewerMxgraphShapes(viewer, required);
     assertRequiredStencilsLoaded(required, tracker);
-    attachRenderedPageGuard(viewer, host, file, tracker);
+    attachRenderedPageGuard(viewer, container, file, tracker);
+    attachLocalLightboxGuard(viewer, Viewer, container, file, tracker);
     const svg = host.querySelector('svg');
     if (!svg) throw new Error('Draw.io render produced no diagram');
   } catch (err) {

@@ -1400,6 +1400,18 @@ async function main() {
     const clickNextPage = async (session) => {
       await clickViewerToolbar(session, 'Next Page');
     };
+    const clickFullscreenNextAnd = async (session) => {
+      const lightbox = session.page.locator('body > .geDiagramContainer');
+      await lightbox.hover();
+      await session.page.locator('body').getByTitle('Next Page: AND', { exact: true }).click();
+      return lightbox;
+    };
+    const assertStandaloneChrome = async (session, label) => {
+      assert.equal(await session.page.locator('#app').count(), 1, `${label} lost #app`);
+      assert.equal(await session.page.locator('.file-selector').count(), 1, `${label} lost .file-selector`);
+      assert.equal(await session.page.locator('body > .download-prompt').count(), 0,
+        `${label} replaced document.body with the download fallback`);
+    };
     const caseRequests = (session) => requests.slice(session.before);
     const caseErrors = (session, after = session.beforeErrors) => consoleErrors.slice(after);
     const requestUrl = (path) => `${origin}${path}`;
@@ -1782,8 +1794,31 @@ async function main() {
       const lightbox = pagesSession.page.locator('body > .geDiagramContainer');
       await lightbox.locator('svg').waitFor();
       await lightbox.getByText('Page one', { exact: true }).waitFor();
+      const beforeFullscreenPageTwo = requests.length;
+      await clickFullscreenNextAnd(pagesSession);
+      await lightbox.getByText('AND', { exact: true }).waitFor();
+      const fullscreenStencil = requests.slice(beforeFullscreenPageTwo).find(row =>
+        row.path.includes('/static/drawio/stencils/electrical/logic_gates.xml'));
+      assert(fullscreenStencil && fullscreenStencil.status === 200, 'fullscreen page two did not load the AND stencil');
+      const fullscreenGeometry = await lightbox.locator('svg').evaluate((svg) => {
+        const paths = [...svg.querySelectorAll('path')].map((path) => path.getAttribute('d') || '');
+        return {
+          curved: paths.some((d) => /[AaCcQqSs]/.test(d)),
+          wired: paths.some((d) => d.includes('M') && d.includes('L') && !/[AaCcQqSs]/.test(d)),
+          pathCount: paths.length,
+        };
+      });
+      assert.equal(fullscreenGeometry.curved, true, 'fullscreen page two did not render the curved AND body');
+      assert.equal(fullscreenGeometry.wired && fullscreenGeometry.pathCount >= 2, true,
+        'fullscreen page two did not render AND wire geometry');
       await pagesSession.page.locator('body > img.geAdaptiveAsset[style*="position: fixed"]').click();
       await lightbox.waitFor({ state: 'detached' });
+      await clickViewerToolbar(pagesSession, 'Fullscreen');
+      const reopened = pagesSession.page.locator('body > .geDiagramContainer');
+      await reopened.locator('svg').waitFor();
+      await reopened.getByText('Page one', { exact: true }).waitFor();
+      await pagesSession.page.locator('body > img.geAdaptiveAsset[style*="position: fixed"]').click();
+      await reopened.waitFor({ state: 'detached' });
       await clickNextPage(pagesSession);
       await pagesSession.page.locator('.drawio-host').getByText('AND', { exact: true }).waitFor();
       const pageTwoStencil = requests.slice(beforePageTwo).find(row =>
@@ -1815,6 +1850,75 @@ async function main() {
     } finally {
       drawioMissingLazy = false;
       await closeStandalone(pagesMissingSession);
+    }
+
+    drawioMissingLazy = true;
+    const fullscreenMissingSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(fullscreenMissingSession.page, 'pages-missing.drawio');
+      await fullscreenMissingSession.page.locator('.drawio-host svg').waitFor();
+      await clickViewerToolbar(fullscreenMissingSession, 'Fullscreen');
+      const missingLightbox = fullscreenMissingSession.page.locator('body > .geDiagramContainer');
+      await missingLightbox.getByText('Page one', { exact: true }).waitFor();
+      await clickFullscreenNextAnd(fullscreenMissingSession);
+      await fullscreenMissingSession.page.locator('.dl-error').waitFor();
+      assert.equal(await missingLightbox.locator('svg').count(), 0);
+      await assertStandaloneChrome(fullscreenMissingSession, 'fullscreen-missing');
+      acceptMissingStencilErrors(fullscreenMissingSession);
+    } catch (error) {
+      await captureStandaloneFailure(fullscreenMissingSession, 'fullscreen-missing');
+      throw error;
+    } finally {
+      drawioMissingLazy = false;
+      await closeStandalone(fullscreenMissingSession);
+    }
+
+    drawioCorruptLazy = true;
+    const fullscreenCorruptSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(fullscreenCorruptSession.page, 'pages-missing.drawio');
+      await fullscreenCorruptSession.page.locator('.drawio-host svg').waitFor();
+      await clickViewerToolbar(fullscreenCorruptSession, 'Fullscreen');
+      const corruptLightbox = fullscreenCorruptSession.page.locator('body > .geDiagramContainer');
+      await corruptLightbox.getByText('Page one', { exact: true }).waitFor();
+      await clickFullscreenNextAnd(fullscreenCorruptSession);
+      await fullscreenCorruptSession.page.locator('.dl-error').waitFor();
+      assert.equal(await corruptLightbox.locator('svg').count(), 0);
+      await fullscreenCorruptSession.page.locator('body > .geDiagramContainer').waitFor({ state: 'detached' });
+      await assertStandaloneChrome(fullscreenCorruptSession, 'fullscreen-corrupt');
+      acceptOwnedErrors(fullscreenCorruptSession, isDrawioRenderError);
+      const afterCorruptFullscreenErrors = consoleErrors.length;
+      const afterCorruptFullscreenRequests = requests.length;
+      drawioCorruptLazy = false;
+      await selectStandaloneFile(fullscreenCorruptSession.page, 'hostile.docx');
+      await fullscreenCorruptSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' }).waitFor();
+      await selectStandaloneFile(fullscreenCorruptSession.page, 'pages-missing.drawio');
+      await fullscreenCorruptSession.page.locator('.drawio-host svg').waitFor();
+      await clickViewerToolbar(fullscreenCorruptSession, 'Fullscreen');
+      const recoveredLightbox = fullscreenCorruptSession.page.locator('body > .geDiagramContainer');
+      await recoveredLightbox.getByText('Page one', { exact: true }).waitFor();
+      await clickFullscreenNextAnd(fullscreenCorruptSession);
+      await recoveredLightbox.getByText('AND', { exact: true }).waitFor();
+      const recovered = requests.slice(afterCorruptFullscreenRequests).find(row =>
+        row.path.includes('/static/drawio/stencils/electrical/logic_gates.xml'));
+      assert(recovered && recovered.status === 200, 'fullscreen corrupt retry did not receive HTTP 200');
+      const recoveredGeometry = await recoveredLightbox.locator('svg').evaluate((svg) => {
+        const paths = [...svg.querySelectorAll('path')].map((path) => path.getAttribute('d') || '');
+        return {
+          curved: paths.some((d) => /[AaCcQqSs]/.test(d)),
+          wired: paths.some((d) => d.includes('M') && d.includes('L') && !/[AaCcQqSs]/.test(d)),
+          pathCount: paths.length,
+        };
+      });
+      assert.equal(recoveredGeometry.curved, true, 'fullscreen corrupt retry did not render the curved AND body');
+      assert.deepEqual(caseErrors(fullscreenCorruptSession, afterCorruptFullscreenErrors), [],
+        'fullscreen corrupt retry produced unexpected console errors');
+    } catch (error) {
+      await captureStandaloneFailure(fullscreenCorruptSession, 'fullscreen-corrupt');
+      throw error;
+    } finally {
+      drawioCorruptLazy = false;
+      await closeStandalone(fullscreenCorruptSession);
     }
 
     drawioCorruptLazy = true;
