@@ -115,7 +115,13 @@ arbitrary text and truncated records cannot masquerade as an Office workbook.
 The local real-SPA browser harness is
 `node tests/orchestrator/preview_embedding_browser.cjs` (Playwright 1.62.1
 and its Chromium required); its assets and Office fixtures are local.
-
+Prepare Draw.io viewer materials with `python3 computer-use-server/drawio/prepare_drawio.py`
+before native preview verification. The same command runs during the server
+image build. Viewer materials are served from `{prefix}/static/drawio/`.
+Authored remote diagram resources are outside that offline material closure.
+A process-killed publish lock is not automatically taken over; remove a stale
+`static/drawio.publish.lock` and restore any `static/drawio.prev-*` directory
+before retrying native preparation.
 
 ### Browser (CDP Proxy)
 - `GET /browser/{chat_id}/status` — Browser status

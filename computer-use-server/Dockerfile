@@ -13,7 +13,6 @@ WORKDIR /app
 # Copy requirements and install dependencies
 COPY ./requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
 # Copy application code
 COPY ./app.py .
 COPY ./mcp_tools.py .
@@ -31,8 +30,9 @@ COPY ./auth_guard.py .
 COPY ./ws_recheck.py .
 COPY ./cli_runtime.py .
 COPY ./cli_adapters/ ./cli_adapters/
+COPY ./drawio/ ./drawio/
 COPY ./static/ ./static/
-
+RUN python3 drawio/prepare_drawio.py
 # MCP API Key for authorization
 ENV MCP_API_KEY=""
 

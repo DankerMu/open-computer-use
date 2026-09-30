@@ -80,6 +80,9 @@ sessions/
 skills_archive.zip
 .playwright-mcp/
 FIXES_*.md
+
+# Generated Draw.io viewer materials (prepared from the pinned archive)
+computer-use-server/static/drawio/
 demo-recordings/
 demo-frames/
 docs/demo-prompts/
