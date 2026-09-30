@@ -104,6 +104,7 @@ const files = [
   { file_id: 'drawio-pages', path: 'pages.drawio', type: 'drawio', mime: 'application/xml' },
   { file_id: 'drawio-pages-missing', path: 'pages-missing.drawio', type: 'drawio', mime: 'application/xml' },
   { file_id: 'drawio-corrupt-lazy', path: 'corrupt-lazy.drawio', type: 'drawio', mime: 'application/xml' },
+  { file_id: 'drawio-pages-image', path: 'pages-image.drawio', type: 'drawio', mime: 'application/xml' },
   { file_id: 'html-doc', path: 'spoof.docx', type: 'docx', mime: 'text/html; charset=utf-8' },
   { file_id: 'xml-doc', path: 'text-xml.docx', type: 'docx', mime: 'text/xml' },
   { file_id: 'plusxml', path: 'suffix.docx', type: 'docx', mime: 'application/vnd.example+xml' },
@@ -145,10 +146,14 @@ let drawioMissingViewer = false;
 let drawioCorruptViewer = false;
 let drawioMissingLazy = false;
 let drawioCorruptLazy = false;
+let drawioMissingImage = false;
+let drawioCorruptImage = false;
+let drawioHeldImage = false;
 let drawioHeldDocument = false;
 let drawioHeldViewer = false;
 const heldDrawio = [];
 const heldViewer = [];
+const heldImages = [];
 const bytes = {};
 const contentTypes = {
   '.js': 'text/javascript',
@@ -202,6 +207,20 @@ const server = http.createServer(async (req, res) => {
         heldViewer.push({ res, record });
         return;
       }
+      if (rel === 'drawio/img/telecommunication/Cellphone_128x128.png') {
+        if (drawioHeldImage) {
+          heldImages.push({ res, record });
+          return;
+        }
+        if (drawioMissingImage) {
+          record.status = 404;
+          return respond(res, 404, 'missing image', 'text/plain');
+        }
+        if (drawioCorruptImage) {
+          record.status = 200;
+          return respond(res, 200, 'invalid PNG', 'image/png');
+        }
+      }
       record.status = 200;
       return respond(res, 200, await fs.readFile(filename), contentTypes[path.extname(filename)] || 'application/octet-stream');
     }
@@ -221,7 +240,8 @@ const server = http.createServer(async (req, res) => {
       if (listMode === 'standalone') {
         const listed = files.filter(f => ['hostile', 'drawio', 'drawio-empty', 'drawio-lazy', 'drawio-broken',
           'drawio-compressed', 'drawio-image', 'drawio-math', 'drawio-missing',
-          'drawio-bpmn', 'drawio-er', 'drawio-pages', 'drawio-pages-missing', 'drawio-corrupt-lazy'].includes(f.file_id));
+          'drawio-bpmn', 'drawio-er', 'drawio-pages', 'drawio-pages-missing', 'drawio-corrupt-lazy',
+          'drawio-pages-image'].includes(f.file_id));
         return respond(res, 200, JSON.stringify({
           chat_id: CHAT, files: listed.map(f => ({
             name: f.path, size: 128, revision: 1,
@@ -724,6 +744,7 @@ async function main() {
     bytes['pages.drawio'] = Buffer.from('<mxfile><diagram id="page-ordinary" name="Ordinary"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="Page one" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="40" y="40" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram><diagram id="page-and" name="AND"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="AND" style="shape=mxgraph.electrical.logic_gates.and;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="100" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>');
     bytes['pages-missing.drawio'] = Buffer.from(bytes['pages.drawio']);
     bytes['corrupt-lazy.drawio'] = Buffer.from('<mxfile><diagram id="lazy" name="Lazy"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="AND" style="shape=mxgraph.electrical.logic_gates.and;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="100" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>');
+    bytes['pages-image.drawio'] = Buffer.from('<mxfile><diagram id="page-ordinary" name="Ordinary"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="Page one" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="40" y="40" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram><diagram id="page-image" name="Image"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="" style="shape=image;image=img/telecommunication/Cellphone_128x128.png;aspect=fixed;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="80" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>');
     bytes["report (1)!'.docx"] = Buffer.from(fixture.doc);
     bytes['hostile.docx'] = Buffer.from(fixture.hostile);
     bytes['corrupt.docx'] = Buffer.from('not an Office ZIP');
@@ -1406,6 +1427,12 @@ async function main() {
       await session.page.locator('body').getByTitle('Next Page: AND', { exact: true }).click();
       return lightbox;
     };
+    const clickFullscreenNextImage = async (session) => {
+      const lightbox = session.page.locator('body > .geDiagramContainer');
+      await lightbox.hover();
+      await session.page.locator('body').getByTitle('Next Page: Image', { exact: true }).click();
+      return lightbox;
+    };
     const assertStandaloneChrome = async (session, label) => {
       assert.equal(await session.page.locator('#app').count(), 1, `${label} lost #app`);
       assert.equal(await session.page.locator('.file-selector').count(), 1, `${label} lost .file-selector`);
@@ -1447,6 +1474,26 @@ async function main() {
       const unexpected = owned.filter(error => !isExpected(error));
       assert.deepEqual(unexpected, [], 'unrecognized console errors');
       expectedOwnedErrors.push(...owned.filter(isExpected));
+    };
+    const cellphoneImagePath = (session) =>
+      `${session.prefix || '/ocu'}/static/drawio/img/telecommunication/Cellphone_128x128.png`;
+    const waitCellphoneImage = async (session, after = session.before) => {
+      await waitUntil(() => requests.slice(after).some(row =>
+        row.path.endsWith('/drawio/img/telecommunication/Cellphone_128x128.png')),
+        'cellphone image request');
+      return requests.slice(after).find(row =>
+        row.path.endsWith('/drawio/img/telecommunication/Cellphone_128x128.png'));
+    };
+    const acceptMissingImageErrors = (session, after) => {
+      const ownedRequests = caseRequests(session);
+      const missingPath = ownedRequests.find(row =>
+        row.path.endsWith('/drawio/img/telecommunication/Cellphone_128x128.png') && row.status === 404)?.path;
+      assert(missingPath, 'missing image case did not request the cellphone PNG');
+      const isMissingImageError = (error) =>
+        isDrawioRenderError(error) || isExpected404(error, missingPath);
+      assert(caseErrors(session, after).some(isMissingImageError),
+        'missing bundled image did not fail visibly');
+      acceptOwnedErrors(session, isMissingImageError, after);
     };
 
     const officeSession = await openStandalone('/ocu');
@@ -1548,6 +1595,206 @@ async function main() {
       assert.deepEqual(caseErrors(imageSession), [], 'image Drawio produced unexpected console errors');
     } finally {
       await closeStandalone(imageSession);
+    }
+
+    drawioMissingImage = true;
+    const missingImageSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(missingImageSession.page, 'image.drawio');
+      const missingImageRequest = await waitCellphoneImage(missingImageSession);
+      assert.equal(missingImageRequest.status, 404);
+      await missingImageSession.page.locator('.dl-error').waitFor();
+      assert.equal(await missingImageSession.page.locator('.drawio-host svg').count(), 0);
+      await assertStandaloneChrome(missingImageSession, 'missing-image');
+      acceptMissingImageErrors(missingImageSession);
+      const afterMissingImageErrors = consoleErrors.length;
+      const afterMissingImageRequests = requests.length;
+      drawioMissingImage = false;
+      await selectStandaloneFile(missingImageSession.page, 'hostile.docx');
+      await missingImageSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' }).waitFor();
+      await selectStandaloneFile(missingImageSession.page, 'image.drawio');
+      await decodeImageHref(missingImageSession, '/static/drawio/img/telecommunication/Cellphone_128x128.png');
+      const restored = requests.slice(afterMissingImageRequests).find(row =>
+        row.path.endsWith('/drawio/img/telecommunication/Cellphone_128x128.png'));
+      assert(restored && restored.status === 200, 'restored cellphone PNG did not receive HTTP 200');
+      assert.deepEqual(caseErrors(missingImageSession, afterMissingImageErrors), [],
+        'restored cellphone PNG produced unexpected console errors');
+    } catch (error) {
+      await captureStandaloneFailure(missingImageSession, 'missing-image');
+      throw error;
+    } finally {
+      drawioMissingImage = false;
+      await closeStandalone(missingImageSession);
+    }
+
+    drawioCorruptImage = true;
+    const corruptImageSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(corruptImageSession.page, 'image.drawio');
+      const corruptImageRequest = await waitCellphoneImage(corruptImageSession);
+      assert.equal(corruptImageRequest.status, 200);
+      await corruptImageSession.page.locator('.dl-error').waitFor();
+      assert.equal(await corruptImageSession.page.locator('.drawio-host svg').count(), 0);
+      await assertStandaloneChrome(corruptImageSession, 'corrupt-image');
+      acceptOwnedErrors(corruptImageSession, isDrawioRenderError);
+      const afterCorruptImageErrors = consoleErrors.length;
+      const afterCorruptImageRequests = requests.length;
+      drawioCorruptImage = false;
+      await selectStandaloneFile(corruptImageSession.page, 'hostile.docx');
+      await corruptImageSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' }).waitFor();
+      await selectStandaloneFile(corruptImageSession.page, 'image.drawio');
+      await decodeImageHref(corruptImageSession, '/static/drawio/img/telecommunication/Cellphone_128x128.png');
+      const restoredCorrupt = requests.slice(afterCorruptImageRequests).find(row =>
+        row.path.endsWith('/drawio/img/telecommunication/Cellphone_128x128.png'));
+      assert(restoredCorrupt && restoredCorrupt.status === 200, 'restored invalid PNG did not receive HTTP 200');
+      assert.deepEqual(caseErrors(corruptImageSession, afterCorruptImageErrors), [],
+        'restored invalid PNG produced unexpected console errors');
+    } catch (error) {
+      await captureStandaloneFailure(corruptImageSession, 'corrupt-image');
+      throw error;
+    } finally {
+      drawioCorruptImage = false;
+      await closeStandalone(corruptImageSession);
+    }
+
+    drawioMissingImage = true;
+    const fullscreenMissingImageSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(fullscreenMissingImageSession.page, 'pages-image.drawio');
+      await fullscreenMissingImageSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      assert.equal(await fullscreenMissingImageSession.page.locator('.dl-error').count(), 0);
+      await clickViewerToolbar(fullscreenMissingImageSession, 'Fullscreen');
+      const missingImageLightbox = fullscreenMissingImageSession.page.locator('body > .geDiagramContainer');
+      await missingImageLightbox.getByText('Page one', { exact: true }).waitFor();
+      const beforeFullscreenImage = requests.length;
+      await clickFullscreenNextImage(fullscreenMissingImageSession);
+      const fullscreenMissingRequest = await waitCellphoneImage(fullscreenMissingImageSession, beforeFullscreenImage);
+      assert.equal(fullscreenMissingRequest.status, 404);
+      await fullscreenMissingImageSession.page.locator('.dl-error').waitFor();
+      await fullscreenMissingImageSession.page.locator('body > .geDiagramContainer').waitFor({ state: 'detached' });
+      await assertStandaloneChrome(fullscreenMissingImageSession, 'fullscreen-missing-image');
+      acceptMissingImageErrors(fullscreenMissingImageSession);
+    } catch (error) {
+      await captureStandaloneFailure(fullscreenMissingImageSession, 'fullscreen-missing-image');
+      throw error;
+    } finally {
+      drawioMissingImage = false;
+      await closeStandalone(fullscreenMissingImageSession);
+    }
+
+    drawioCorruptImage = true;
+    const fullscreenCorruptImageSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(fullscreenCorruptImageSession.page, 'pages-image.drawio');
+      await fullscreenCorruptImageSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      await clickViewerToolbar(fullscreenCorruptImageSession, 'Fullscreen');
+      const corruptImageLightbox = fullscreenCorruptImageSession.page.locator('body > .geDiagramContainer');
+      await corruptImageLightbox.getByText('Page one', { exact: true }).waitFor();
+      const beforeFullscreenCorruptImage = requests.length;
+      await clickFullscreenNextImage(fullscreenCorruptImageSession);
+      const fullscreenCorruptRequest = await waitCellphoneImage(fullscreenCorruptImageSession, beforeFullscreenCorruptImage);
+      assert.equal(fullscreenCorruptRequest.status, 200);
+      await fullscreenCorruptImageSession.page.locator('.dl-error').waitFor();
+      await fullscreenCorruptImageSession.page.locator('body > .geDiagramContainer').waitFor({ state: 'detached' });
+      await assertStandaloneChrome(fullscreenCorruptImageSession, 'fullscreen-corrupt-image');
+      acceptOwnedErrors(fullscreenCorruptImageSession, isDrawioRenderError);
+      const afterFullscreenCorruptImageErrors = consoleErrors.length;
+      const afterFullscreenCorruptImageRequests = requests.length;
+      drawioCorruptImage = false;
+      await selectStandaloneFile(fullscreenCorruptImageSession.page, 'hostile.docx');
+      await fullscreenCorruptImageSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' }).waitFor();
+      await selectStandaloneFile(fullscreenCorruptImageSession.page, 'pages-image.drawio');
+      await fullscreenCorruptImageSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      await clickViewerToolbar(fullscreenCorruptImageSession, 'Fullscreen');
+      const recoveredImageLightbox = fullscreenCorruptImageSession.page.locator('body > .geDiagramContainer');
+      await recoveredImageLightbox.getByText('Page one', { exact: true }).waitFor();
+      await clickFullscreenNextImage(fullscreenCorruptImageSession);
+      await recoveredImageLightbox.locator('svg image').waitFor();
+      const recoveredFullscreenImage = requests.slice(afterFullscreenCorruptImageRequests).find(row =>
+        row.path.endsWith('/drawio/img/telecommunication/Cellphone_128x128.png'));
+      assert(recoveredFullscreenImage && recoveredFullscreenImage.status === 200,
+        'fullscreen restored cellphone PNG did not receive HTTP 200');
+      const recoveredDecoded = await recoveredImageLightbox.locator('svg image').evaluate(async (node) => {
+        const src = node.href?.baseVal || node.getAttribute('href') ||
+          node.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '';
+        const img = new Image();
+        img.src = src;
+        await img.decode();
+        return { width: img.naturalWidth, height: img.naturalHeight };
+      });
+      assert(recoveredDecoded.width > 0 && recoveredDecoded.height > 0,
+        'fullscreen restored cellphone PNG did not decode');
+      assert.deepEqual(caseErrors(fullscreenCorruptImageSession, afterFullscreenCorruptImageErrors), [],
+        'fullscreen restored cellphone PNG produced unexpected console errors');
+    } catch (error) {
+      await captureStandaloneFailure(fullscreenCorruptImageSession, 'fullscreen-corrupt-image');
+      throw error;
+    } finally {
+      drawioCorruptImage = false;
+      await closeStandalone(fullscreenCorruptImageSession);
+    }
+
+    drawioMissingImage = true;
+    const offscreenImageSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(offscreenImageSession.page, 'pages-image.drawio');
+      await offscreenImageSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      assert.equal(await offscreenImageSession.page.locator('.dl-error').count(), 0);
+      assert.equal(caseRequests(offscreenImageSession).filter(row =>
+        row.path.endsWith('/drawio/img/telecommunication/Cellphone_128x128.png')).length, 0);
+      const beforeOffscreenNav = requests.length;
+      await clickNextPage(offscreenImageSession);
+      const offscreenRequest = await waitCellphoneImage(offscreenImageSession, beforeOffscreenNav);
+      assert.equal(offscreenRequest.status, 404);
+      await offscreenImageSession.page.locator('.dl-error').waitFor();
+      await assertStandaloneChrome(offscreenImageSession, 'offscreen-image');
+      acceptMissingImageErrors(offscreenImageSession);
+    } catch (error) {
+      await captureStandaloneFailure(offscreenImageSession, 'offscreen-image');
+      throw error;
+    } finally {
+      drawioMissingImage = false;
+      await closeStandalone(offscreenImageSession);
+    }
+
+    drawioHeldImage = true;
+    const heldImageSession = await openStandalone('/ocu');
+    try {
+      await selectStandaloneFile(heldImageSession.page, 'image.drawio');
+      await waitUntil(() => heldImages.length > 0, 'held cellphone PNG');
+      const pngPath = cellphoneImagePath(heldImageSession);
+      await selectStandaloneFile(heldImageSession.page, 'hostile.docx');
+      const unsafeHeld = heldImageSession.page.locator('.preview-stage a').filter({ hasText: 'Unsafe link' });
+      await unsafeHeld.waitFor();
+      const beforeHeldErrors = consoleErrors.length;
+      const pngResponse = heldImageSession.page.waitForResponse((response) => {
+        try {
+          return new URL(response.url()).pathname === pngPath && response.status() === 404;
+        } catch {
+          return false;
+        }
+      }, { timeout: 10000 });
+      for (const pending of heldImages.splice(0)) {
+        pending.record.status = 404;
+        respond(pending.res, 404, 'missing image', 'text/plain');
+      }
+      assert.equal((await pngResponse).status(), 404);
+      await waitUntil(() => caseErrors(heldImageSession, beforeHeldErrors).some((error) =>
+        isExpected404(error, pngPath)), 'held cellphone PNG 404 console');
+      await unsafeHeld.waitFor();
+      assert.equal(await unsafeHeld.getAttribute('href'), null);
+      assert.equal(await heldImageSession.page.locator('.dl-error').count(), 0);
+      await assertStandaloneChrome(heldImageSession, 'held-image');
+      assert.equal(caseErrors(heldImageSession, beforeHeldErrors).some(isDrawioRenderError), false,
+        'retired image decode reported a Draw.io render error');
+      acceptOwnedErrors(heldImageSession, (error) => isExpected404(error, pngPath), beforeHeldErrors);
+    } catch (error) {
+      await captureStandaloneFailure(heldImageSession, 'held-image');
+      throw error;
+    } finally {
+      drawioHeldImage = false;
+      for (const pending of heldImages.splice(0)) pending.res.destroy();
+      await closeStandalone(heldImageSession);
     }
 
     const mathSession = await openStandalone('/ocu');
@@ -2017,6 +2264,7 @@ main().catch(error => { console.error(error); process.exitCode = 1; }).finally(a
   for (const response of heldSheets.splice(0)) response.destroy();
   for (const response of heldDrawio.splice(0)) response.destroy();
   for (const pending of heldViewer.splice(0)) pending.res.destroy();
+  for (const pending of heldImages.splice(0)) pending.res.destroy();
   for (const response of heldBrowserStatuses.splice(0)) response.destroy();
   for (const response of heldBrowserPages.splice(0)) response.destroy();
   for (const upgrade of heldUpgrades.splice(0)) upgrade.socket.destroy();

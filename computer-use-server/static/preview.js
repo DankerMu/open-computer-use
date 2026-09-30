@@ -797,84 +797,121 @@ function collectViewerMxgraphShapes(viewer, names) {
   }
 }
 
-function installStencilLoadTracker() {
+const drawioStencilIntercept = { utils: null, previousLoad: null, previousGet: null, trackers: [] };
+
+function noteStencilAttempt(url, status, tracker) {
+  if (!tracker || !String(url || '').includes('/stencils/')) return;
+  tracker.attempted.push(String(url));
+  if (!(status >= 200 && status < 300)) tracker.failures.push(String(url));
+}
+
+function installSharedStencilIntercept() {
   const utils = window.mxUtils;
-  const failures = [];
-  const attempted = [];
-  if (!utils) return { failures, attempted, restore() {}, invalidateUnresolved() {} };
-  const previousLoad = utils.load;
-  const previousGet = utils.get;
-  const noteAttempt = (url, status) => {
-    if (!String(url || '').includes('/stencils/')) return;
-    attempted.push(String(url));
-    if (!(status >= 200 && status < 300)) failures.push(String(url));
-  };
-  if (typeof previousLoad === 'function') {
+  if (!utils || drawioStencilIntercept.utils === utils) return;
+  drawioStencilIntercept.utils = utils;
+  drawioStencilIntercept.previousLoad = utils.load;
+  drawioStencilIntercept.previousGet = utils.get;
+  if (typeof drawioStencilIntercept.previousLoad === 'function') {
     utils.load = function(url) {
-      const result = previousLoad.apply(this, arguments);
-      try { noteAttempt(url, result && result.getStatus()); } catch {
-        noteAttempt(url, 0);
+      const tracker = drawioStencilIntercept.trackers[drawioStencilIntercept.trackers.length - 1];
+      const result = drawioStencilIntercept.previousLoad.apply(this, arguments);
+      if (tracker) {
+        try { noteStencilAttempt(url, result && result.getStatus(), tracker); } catch {
+          noteStencilAttempt(url, 0, tracker);
+        }
       }
       return result;
     };
   }
-  if (typeof previousGet === 'function') {
+  if (typeof drawioStencilIntercept.previousGet === 'function') {
     utils.get = function(url, onload, onerror) {
-      return previousGet.call(this, url, function(request) {
-        try { noteAttempt(url, request && request.getStatus()); } catch {
-          noteAttempt(url, 0);
+      const tracker = drawioStencilIntercept.trackers[drawioStencilIntercept.trackers.length - 1];
+      return drawioStencilIntercept.previousGet.call(this, url, function(request) {
+        if (tracker) {
+          try { noteStencilAttempt(url, request && request.getStatus(), tracker); } catch {
+            noteStencilAttempt(url, 0, tracker);
+          }
         }
         if (onload) onload(request);
       }, function(request) {
-        noteAttempt(url, 0);
+        if (tracker) noteStencilAttempt(url, 0, tracker);
         if (onerror) onerror(request);
       });
     };
   }
-  const invalidateUrl = (registry, url) => {
-    if (registry.packages) delete registry.packages[url];
-    if (registry.filesLoaded) delete registry.filesLoaded[url];
-    const libraries = registry.libraries || {};
-    for (const [name, members] of Object.entries(libraries)) {
-      if (!Array.isArray(members)) continue;
-      if (members.some((member) => String(member) === url || String(member).includes(url) ||
-          url.endsWith(String(member)) || url.includes(String(member)))) {
-        if (registry.packages) delete registry.packages[name];
-      }
-    }
-  };
-  const invalidateUnresolved = (names) => {
-    const registry = window.mxStencilRegistry;
-    if (!registry) return;
-    for (const name of names) {
-      if (shapeIsResolved(name)) continue;
-      const basename = typeof registry.getBasenameForStencil === 'function'
-        ? registry.getBasenameForStencil(name)
-        : null;
-      if (basename && registry.packages) delete registry.packages[basename];
-      const members = basename && registry.libraries ? registry.libraries[basename] : null;
-      if (Array.isArray(members)) {
-        for (const member of members) invalidateUrl(registry, String(member));
-      }
-      for (const url of attempted) {
-        if (basename && url.includes(basename)) invalidateUrl(registry, url);
-      }
-    }
-  };
-  return {
+}
+
+function restoreSharedStencilIntercept() {
+  if (drawioStencilIntercept.trackers.length) return;
+  const utils = drawioStencilIntercept.utils;
+  if (!utils) return;
+  if (drawioStencilIntercept.previousLoad) utils.load = drawioStencilIntercept.previousLoad;
+  if (drawioStencilIntercept.previousGet) utils.get = drawioStencilIntercept.previousGet;
+  drawioStencilIntercept.utils = null;
+  drawioStencilIntercept.previousLoad = null;
+  drawioStencilIntercept.previousGet = null;
+}
+
+function createStencilTracker() {
+  const failures = [];
+  const attempted = [];
+  const tracker = {
     failures,
     attempted,
-    invalidateUnresolved,
-    restore() {
-      utils.load = previousLoad;
-      utils.get = previousGet;
+    invalidateUnresolved(names) {
       const registry = window.mxStencilRegistry;
       if (!registry) return;
-      for (const url of failures) {
-        try { invalidateUrl(registry, url); } catch {}
+      const invalidateUrl = (url) => {
+        if (registry.packages) delete registry.packages[url];
+        if (registry.filesLoaded) delete registry.filesLoaded[url];
+        const libraries = registry.libraries || {};
+        for (const [name, members] of Object.entries(libraries)) {
+          if (!Array.isArray(members)) continue;
+          if (members.some((member) => String(member) === url || String(member).includes(url) ||
+              url.endsWith(String(member)) || url.includes(String(member)))) {
+            if (registry.packages) delete registry.packages[name];
+          }
+        }
+      };
+      for (const name of names) {
+        if (shapeIsResolved(name)) continue;
+        const basename = typeof registry.getBasenameForStencil === 'function'
+          ? registry.getBasenameForStencil(name)
+          : null;
+        if (basename && registry.packages) delete registry.packages[basename];
+        const members = basename && registry.libraries ? registry.libraries[basename] : null;
+        if (Array.isArray(members)) {
+          for (const member of members) invalidateUrl(String(member));
+        }
+        for (const url of attempted) {
+          if (basename && url.includes(basename)) invalidateUrl(url);
+        }
       }
+    },
+    restore() {
+      if (tracker.restored) return;
+      tracker.restored = true;
+      const index = drawioStencilIntercept.trackers.indexOf(tracker);
+      if (index >= 0) drawioStencilIntercept.trackers.splice(index, 1);
+      const registry = window.mxStencilRegistry;
+      if (registry) {
+        for (const url of failures) {
+          try {
+            if (registry.packages) delete registry.packages[url];
+            if (registry.filesLoaded) delete registry.filesLoaded[url];
+          } catch {}
+        }
+      }
+      restoreSharedStencilIntercept();
     }
   };
+  installSharedStencilIntercept();
+  drawioStencilIntercept.trackers.push(tracker);
+  return tracker;
+}
+
+function installStencilLoadTracker() {
+  return createStencilTracker();
 }
 
 function shapeIsResolved(name) {
@@ -896,7 +933,7 @@ function assertRequiredStencilsLoaded(names, tracker) {
   }
 }
 
-function waitForDrawioRender(viewer, host) {
+function waitForDrawioRender(viewer, host, lifetime) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (error) => {
@@ -920,7 +957,17 @@ function waitForDrawioRender(viewer, host) {
       finish(new Error('Draw.io viewer API unavailable'));
       return;
     }
-    viewer.addListener('render', () => finish());
+    const onRender = () => finish();
+    viewer.addListener('render', onRender);
+    lifetime?.addCleanup(() => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        if (typeof viewer.removeListener === 'function') viewer.removeListener(onRender);
+      } catch {}
+      resolve();
+    });
     finish();
   });
 }
@@ -934,38 +981,164 @@ function ownedPreviewTarget(target) {
   return target;
 }
 
-function failOwnedPreview(owner, target, file) {
-  const preview = ownedPreviewTarget(target);
-  if (!preview) {
-    try { if (typeof owner?.destroy === 'function') owner.destroy(); } catch {}
-    return;
-  }
-  try { if (typeof owner?.destroy === 'function') owner.destroy(); } catch {}
-  if (preview.isConnected) renderDownloadFallback(preview, file, 'diagram', t('drawio_fail'));
+function createDrawioLifetime(preview, parent) {
+  const lifetime = {
+    retired: false,
+    generation: 0,
+    pageId: null,
+    children: new Set(),
+    cleanups: [],
+    parent: parent || null,
+    preview,
+    bump() {
+      lifetime.generation += 1;
+      return lifetime.generation;
+    },
+    current() {
+      return !lifetime.retired && Boolean(ownedPreviewTarget(lifetime.preview)?.isConnected);
+    },
+    addCleanup(fn) {
+      lifetime.cleanups.push(fn);
+    },
+    dispose() {
+      if (lifetime.retired) return;
+      lifetime.retired = true;
+      for (const child of [...lifetime.children]) child.dispose();
+      lifetime.children.clear();
+      const cleanups = lifetime.cleanups.splice(0);
+      for (const fn of cleanups) {
+        try { fn(); } catch {}
+      }
+      if (lifetime.parent) lifetime.parent.children.delete(lifetime);
+    }
+  };
+  if (parent) parent.children.add(lifetime);
+  if (preview && !preview.__ocuDrawioLifetime) preview.__ocuDrawioLifetime = lifetime;
+  return lifetime;
 }
 
-function attachRenderedPageGuard(owner, target, file, tracker) {
+function disposeDrawioStage(stage) {
+  const lifetime = stage?.__ocuDrawioLifetime;
+  if (lifetime) {
+    lifetime.dispose();
+    if (stage.__ocuDrawioLifetime === lifetime) delete stage.__ocuDrawioLifetime;
+  }
+}
+
+function failOwnedPreview(owner, target, file, lifetime) {
+  const preview = ownedPreviewTarget(target);
+  try { if (typeof owner?.destroy === 'function') owner.destroy(); } catch {}
+  lifetime?.dispose();
+  disposeDrawioStage(preview);
+  if (preview?.isConnected) renderDownloadFallback(preview, file, 'diagram', t('drawio_fail'));
+}
+
+function bundledDrawioMaterialBase() {
+  try {
+    return new URL(moduleAssetUrl('drawio/'));
+  } catch {
+    return null;
+  }
+}
+
+function isBundledDrawioMaterialUrl(href, base) {
+  if (!href || !base) return false;
+  let resolved;
+  try {
+    resolved = new URL(href, document.baseURI);
+  } catch {
+    return false;
+  }
+  if (resolved.origin !== base.origin) return false;
+  if (resolved.protocol === 'data:' || resolved.protocol === 'blob:') return false;
+  const material = base.pathname.endsWith('/') ? base.pathname : `${base.pathname}/`;
+  const path = resolved.pathname;
+  return path === material.slice(0, -1) || path.startsWith(material);
+}
+
+function collectRenderedBundledImages(graph) {
+  const urls = [];
+  const seen = new Set();
+  const base = bundledDrawioMaterialBase();
+  const root = graph?.container || graph?.view?.canvas?.ownerSVGElement || null;
+  if (!root) return urls;
+  for (const node of root.querySelectorAll('image, img')) {
+    const href = node.href?.baseVal || node.getAttribute('href') ||
+      node.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || node.getAttribute('src') || '';
+    if (!href || seen.has(href) || !isBundledDrawioMaterialUrl(href, base)) continue;
+    seen.add(href);
+    urls.push(href);
+  }
+  return urls;
+}
+
+function decodeBundledImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      if (img.naturalWidth > 0 && img.naturalHeight > 0) resolve(img);
+      else reject(new Error('Draw.io bundled image did not decode'));
+    };
+    img.onerror = () => reject(new Error('Draw.io bundled image failed to load'));
+    img.src = src;
+  }).then((img) => {
+    if (typeof img.decode === 'function') return img.decode().then(() => img);
+    return img;
+  });
+}
+
+async function assertRequiredBundledImages(graph) {
+  const urls = collectRenderedBundledImages(graph);
+  for (const src of urls) {
+    try {
+      await decodeBundledImage(src);
+    } catch {
+      throw new Error('Draw.io bundled image unavailable');
+    }
+  }
+}
+
+function pageIdentity(owner) {
+  const graph = graphFromOwner(owner);
+  const page = owner?.editor?.currentPage || owner?.currentPage || null;
+  return page?.getId?.() || page?.id || graph?.model?.root?.id || null;
+}
+
+function attachRenderedPageGuard(owner, target, file, tracker, lifetime) {
   const subscriptions = [];
-  let retired = false;
   let queued = false;
   const ownedTracker = tracker;
+  const ownedLifetime = lifetime;
   const run = () => {
     queued = false;
-    if (retired) return;
+    if (!ownedLifetime?.current()) return;
     const preview = ownedPreviewTarget(target);
-    if (!preview || !preview.isConnected) return;
+    if (!preview) return;
+    const generation = ownedLifetime.generation;
+    const identity = pageIdentity(owner);
+    ownedLifetime.pageId = identity;
     const graph = graphFromOwner(owner);
     const required = new Set();
     collectViewerMxgraphShapes({ graph }, required);
+    const finish = (error) => {
+      if (!ownedLifetime.current() || ownedLifetime.generation !== generation) return;
+      if (pageIdentity(owner) !== identity) return;
+      if (!error) return;
+      console.error('Draw.io render error:', error);
+      failOwnedPreview(owner, preview, file, ownedLifetime);
+    };
     try {
       assertRequiredStencilsLoaded(required, ownedTracker);
     } catch (error) {
-      console.error('Draw.io render error:', error);
-      failOwnedPreview(owner, preview, file);
+      finish(error);
+      return;
     }
+    Promise.resolve(assertRequiredBundledImages(graph)).then(() => finish()).catch(finish);
   };
   const check = () => {
-    if (retired || queued) return;
+    if (!ownedLifetime?.current()) return;
+    ownedLifetime.bump();
+    if (queued) return;
     queued = true;
     queueMicrotask(run);
   };
@@ -981,34 +1154,35 @@ function attachRenderedPageGuard(owner, target, file, tracker) {
   const graph = graphFromOwner(owner);
   listen(graph, ['render']);
   listen(graph?.model, ['change']);
+  ownedLifetime.addCleanup(() => {
+    queued = false;
+    for (const [targetNode, handler] of subscriptions) {
+      try {
+        if (typeof targetNode.removeListener === 'function') targetNode.removeListener(handler);
+      } catch {}
+    }
+    ownedTracker?.restore?.();
+  });
   const destroy = owner?.destroy;
   if (typeof destroy === 'function' && !owner.__ocuDrawioGuarded) {
     owner.__ocuDrawioGuarded = true;
     owner.destroy = function() {
-      retired = true;
-      queued = false;
       try { return destroy.apply(this, arguments); }
-      finally {
-        for (const [targetNode, handler] of subscriptions) {
-          try {
-            if (typeof targetNode.removeListener === 'function') targetNode.removeListener(handler);
-          } catch {}
-        }
-        ownedTracker?.restore?.();
-      }
+      finally { ownedLifetime.dispose(); }
     };
   }
   check();
 }
 
-function attachLocalLightboxGuard(viewer, Viewer, host, file, tracker) {
+function attachLocalLightboxGuard(viewer, Viewer, host, file, parentLifetime) {
   if (typeof viewer.showLocalLightbox !== 'function') return;
   const previous = Viewer.prototype.showLocalLightbox;
   viewer.showLocalLightbox = function() {
     const ui = previous.apply(this, arguments);
-    if (ui) {
+    if (ui && parentLifetime?.current()) {
       const uiTracker = installStencilLoadTracker();
-      attachRenderedPageGuard(ui, host, file, uiTracker);
+      const uiLifetime = createDrawioLifetime(host, parentLifetime);
+      attachRenderedPageGuard(ui, host, file, uiTracker, uiLifetime);
     }
     return ui;
   };
@@ -1039,15 +1213,19 @@ async function loadDrawioViewer() {
 }
 
 async function renderDrawioPreview(container, file) {
+  const lifetime = createDrawioLifetime(container);
   container.innerHTML = `<div class="empty-state"><div class="spinner"></div><p class="loading-text">${t('loading')}</p></div>`;
   const tracker = { restore() {} };
   try {
     configureDrawioBases();
     const drawioResp = await fetchOutput(file.url);
+    if (!lifetime.current()) return;
     if (!drawioResp.ok) throw new Error('Draw.io document fetch failed');
     const drawioXml = await drawioResp.text();
+    if (!lifetime.current()) return;
     const xmlRoot = parseDrawioDocument(drawioXml);
     const Viewer = await loadDrawioViewer();
+    if (!lifetime.current()) return;
     const host = document.createElement('div');
     host.className = 'drawio-host';
     host.style.cssText = 'max-width:100%;margin:0 auto;background:#fff;padding:20px;border-radius:8px;min-height:120px;';
@@ -1057,26 +1235,27 @@ async function renderDrawioPreview(container, file) {
     container.style.alignItems = 'flex-start';
     container.appendChild(host);
     Object.assign(tracker, installStencilLoadTracker());
+    lifetime.addCleanup(() => tracker.restore());
     const viewer = new Viewer(host, xmlRoot, {
       'auto-fit': true,
       nav: true,
       lightbox: true,
       toolbar: 'pages zoom lightbox',
     });
-    await waitForDrawioRender(viewer, host);
-    if (!host.isConnected) return;
+    await waitForDrawioRender(viewer, host, lifetime);
+    if (!lifetime.current()) return;
     const required = new Set();
     collectViewerMxgraphShapes(viewer, required);
     assertRequiredStencilsLoaded(required, tracker);
-    attachRenderedPageGuard(viewer, container, file, tracker);
-    attachLocalLightboxGuard(viewer, Viewer, container, file, tracker);
+    if (!lifetime.current()) return;
+    attachRenderedPageGuard(viewer, container, file, tracker, lifetime);
+    attachLocalLightboxGuard(viewer, Viewer, container, file, lifetime);
     const svg = host.querySelector('svg');
     if (!svg) throw new Error('Draw.io render produced no diagram');
   } catch (err) {
-    if (!container.isConnected) return;
+    if (!lifetime.current()) return;
     console.error('Draw.io render error:', err);
-    renderDownloadFallback(container, file, 'diagram', t('drawio_fail'));
-    tracker.restore();
+    failOwnedPreview(null, container, file, lifetime);
   }
 }
 
@@ -1225,8 +1404,8 @@ function FilesView({ files, selectedFile, onSelectFile, selectionKey, onRenderSt
   const generationRef = useRef(0);
   const ownedStageRef = useRef(null);
   const mountedRef = useRef(true);
-
   const dropOwnedStage = (stage) => {
+    disposeDrawioStage(stage);
     disconnectPreviewObserver(stage);
     if (stage && stage !== containerRef.current) stage.remove();
     if (ownedStageRef.current === stage) ownedStageRef.current = null;
@@ -1249,7 +1428,10 @@ function FilesView({ files, selectedFile, onSelectFile, selectionKey, onRenderSt
       dropOwnedStage(ownedStageRef.current);
       disconnectPreviewObserver(containerRef.current);
       const host = containerRef.current;
-      if (host) host.querySelectorAll('.preview-stage').forEach((node) => disconnectPreviewObserver(node));
+      if (host) host.querySelectorAll('.preview-stage').forEach((node) => {
+        disposeDrawioStage(node);
+        disconnectPreviewObserver(node);
+      });
       return;
     }
     if (!containerRef.current) return;
@@ -1259,6 +1441,7 @@ function FilesView({ files, selectedFile, onSelectFile, selectionKey, onRenderSt
     const generation = ++generationRef.current;
     const host = containerRef.current;
     host.querySelectorAll('.preview-stage').forEach((node) => {
+      disposeDrawioStage(node);
       disconnectPreviewObserver(node);
       if (node !== host) node.remove();
     });
