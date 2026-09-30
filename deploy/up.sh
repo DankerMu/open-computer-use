@@ -102,10 +102,42 @@ if ! declare -p OCU_SANDBOX_DNS >/dev/null 2>&1; then
 fi
 export OCU_SANDBOX_DNS
 PROJECT="$COMPOSE_PROJECT_NAME"
-
 # Shared-project siblings must survive later ups; the cleanup profile must stay off.
 export COMPOSE_REMOVE_ORPHANS=false
 export COMPOSE_PROFILES=""
+
+if [[ -z "${OCU_RELEASE_MANIFEST:-}" ]]; then
+    printf '%s\n' 'deploy: OCU_RELEASE_MANIFEST is required' >&2
+    exit 1
+fi
+export PYTHONPATH="$ROOT/deploy${PYTHONPATH:+:$PYTHONPATH}"
+if ! run_owned python3 - "$ROOT" "$OCU_RELEASE_MANIFEST" <<'PY'
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import release
+
+
+root = Path(sys.argv[1])
+try:
+    payload = release.load_inventory(Path(sys.argv[2]))
+    runtime = dict(os.environ)
+    release.verify_runtime_binding(payload, runtime)
+    release.verify_tracked_source(root, payload["ocu_source_sha"])
+    release.verify_local_images(payload)
+except release.ReleaseError as exc:
+    print(f"deploy: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+    printf '%s\n' 'deploy: release inventory verification failed' >&2
+    exit 1
+fi
+
+
 
 CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ocu-deploy-config.XXXXXX")"
 : >"$CONFIG_DIR/empty.env"
@@ -159,6 +191,36 @@ resolve "$CONFIG_DIR/proxy.json" "${proxy_files[@]}"
 freeze "$CONFIG_DIR/core.json" "$CONFIG_DIR/core.up.json"
 freeze "$CONFIG_DIR/webui.json" "$CONFIG_DIR/webui.up.json"
 freeze "$CONFIG_DIR/proxy.json" "$CONFIG_DIR/proxy.up.json"
+if ! run_owned python3 - "$OCU_RELEASE_MANIFEST" "$CONFIG_DIR/core.json" "$CONFIG_DIR/webui.json" "$CONFIG_DIR/proxy.json" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import release
+
+
+try:
+    payload = release.load_inventory(Path(sys.argv[1]))
+    docs = {
+        "core.json": json.loads(Path(sys.argv[2]).read_text(encoding="utf-8")),
+        "webui.json": json.loads(Path(sys.argv[3]).read_text(encoding="utf-8")),
+        "proxy.json": json.loads(Path(sys.argv[4]).read_text(encoding="utf-8")),
+    }
+    release.verify_service_images(payload, docs)
+except release.ReleaseError as cop:
+    print(f"deploy: {cop}", file=sys.stderr)
+    raise SystemExit(1)
+except (OSError, json.JSONDecodeError) as cop:
+    print(f"deploy: resolved compose documents are unreadable: {cop}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+    printf '%s\n' 'deploy: resolved service image verification failed' >&2
+    exit 1
+fi
+
 
 if ! run_owned bash "$ROOT/deploy/check-ports.sh" \
     "$CONFIG_DIR/core.json" "$CONFIG_DIR/webui.json" "$CONFIG_DIR/proxy.json"; then
@@ -186,10 +248,11 @@ start_stack() {
     local project_dir=$1
     local snapshot=$2
     if ! run_owned docker compose -p "$PROJECT" --project-directory "$project_dir" \
-        --env-file "$CONFIG_DIR/empty.env" -f "$snapshot" up -d --build; then
+        --env-file "$CONFIG_DIR/empty.env" -f "$snapshot" up -d --no-build --pull never; then
         printf '%s\n' "deploy: compose up failed for ${snapshot}" >&2
         return 1
     fi
+
 }
 
 # Execute the already-checked documents, not the mutable source YAML.

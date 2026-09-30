@@ -4,15 +4,17 @@
 # deployment. The DMXAPI token remains in the separately supplied 0600 file.
 #
 # Required operator inputs (no historical source, image, or publication defaults):
+#   OCU_RELEASE_MANIFEST — imported release.json
 #   SOURCE_SHA — full 40-character commit matching the selected source checkout
-#   OPENWEBUI_IMAGE DOCKER_IMAGE COMPUTER_USE_SERVER_IMAGE
-#   RETENTION_GUARD_IMAGE OCU_PROXY_IMAGE
 #   OCU_WEBUI_ORIGIN — absolute HTTP(S) origin, no path/credentials/query/fragment/slash
 #   OCU_SANDBOX_EGRESS_ALLOW — must be present; empty is deny-all
 #   OCU_SANDBOX_DNS — must be present; empty disables external sandbox DNS
 # Optional:
+#   OPENWEBUI_IMAGE DOCKER_IMAGE COMPUTER_USE_SERVER_IMAGE RETENTION_GUARD_IMAGE
+#   OCU_PROXY_IMAGE POSTGRES_IMAGE — may match or be derived from the inventory
 #   OCU_ADMIN_CREDENTIALS_FILE — isolated-test output path; default unchanged
-#   POSTGRES_IMAGE OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
+#   OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
+
 
 set -euo pipefail
 umask 077
@@ -119,11 +121,61 @@ if [ "$actual_sha" != "$SOURCE_SHA" ]; then
     fail "source checkout must be $SOURCE_SHA, found $actual_sha"
 fi
 
+require_nonempty OCU_RELEASE_MANIFEST
+safe_dotenv_value OCU_RELEASE_MANIFEST "$OCU_RELEASE_MANIFEST"
+export PYTHONPATH="$source_root/deploy${PYTHONPATH:+:$PYTHONPATH}"
+release_assign_file=$(python3 - "$source_root" <<'PY' || fail 'release inventory verification failed'
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(sys.argv[1], "deploy"))
+import release
+
+payload = release.load_inventory(Path(os.environ["OCU_RELEASE_MANIFEST"]))
+assignments = release.bootstrap_dotenv_assignments(payload, dict(os.environ))
+allowed = {
+    "SOURCE_SHA",
+    "WEBUI_SOURCE_SHA",
+    "OPENWEBUI_IMAGE",
+    "DOCKER_IMAGE",
+    "COMPUTER_USE_SERVER_IMAGE",
+    "RETENTION_GUARD_IMAGE",
+    "OCU_PROXY_IMAGE",
+    "POSTGRES_IMAGE",
+}
+for line in assignments:
+    name, value = line.split("=", 1)
+    if name not in allowed:
+        raise SystemExit(1)
+    if any(ord(ch) < 0x20 or ch in "$`\\\"'= #\t" for ch in value):
+        raise SystemExit(1)
+    print(f"{name}\t{value}")
+PY
+) || fail 'release inventory verification failed'
+while IFS=$'\t' read -r assign_name assign_value; do
+    case "$assign_name" in
+        SOURCE_SHA) SOURCE_SHA=$assign_value ;;
+        WEBUI_SOURCE_SHA) WEBUI_SOURCE_SHA=$assign_value ;;
+        OPENWEBUI_IMAGE) OPENWEBUI_IMAGE=$assign_value ;;
+        DOCKER_IMAGE) DOCKER_IMAGE=$assign_value ;;
+        COMPUTER_USE_SERVER_IMAGE) COMPUTER_USE_SERVER_IMAGE=$assign_value ;;
+        RETENTION_GUARD_IMAGE) RETENTION_GUARD_IMAGE=$assign_value ;;
+        OCU_PROXY_IMAGE) OCU_PROXY_IMAGE=$assign_value ;;
+        POSTGRES_IMAGE) POSTGRES_IMAGE=$assign_value ;;
+        *) fail "unexpected release assignment $assign_name" ;;
+    esac
+done <<< "$release_assign_file"
+export SOURCE_SHA WEBUI_SOURCE_SHA OPENWEBUI_IMAGE DOCKER_IMAGE COMPUTER_USE_SERVER_IMAGE RETENTION_GUARD_IMAGE OCU_PROXY_IMAGE POSTGRES_IMAGE
+
+
+
 require_image OPENWEBUI_IMAGE
 require_image DOCKER_IMAGE
 require_image COMPUTER_USE_SERVER_IMAGE
 require_image RETENTION_GUARD_IMAGE
 require_image OCU_PROXY_IMAGE
+require_image POSTGRES_IMAGE
 
 case "$DOCKER_IMAGE" in
     *open-computer-use*)
@@ -132,6 +184,7 @@ case "$DOCKER_IMAGE" in
         fail 'DOCKER_IMAGE must retain the open-computer-use name used for /home/assistant mounts'
         ;;
 esac
+
 
 require_present OCU_SANDBOX_EGRESS_ALLOW
 safe_dotenv_value OCU_SANDBOX_EGRESS_ALLOW "$OCU_SANDBOX_EGRESS_ALLOW"
@@ -190,8 +243,8 @@ if port is not None and not (1 <= port <= 65535):
     raise SystemExit(1)
 PY
 
-postgres_image=${POSTGRES_IMAGE:-postgres:17-alpine}
 openwebui_version=${OPENWEBUI_VERSION:-0.11.3}
+
 proxy_port=${OCU_PROXY_PORT:-8082}
 private_network=${OCU_PRIVATE_NETWORK:-ocu-test-private}
 private_subnet=${OCU_PRIVATE_SUBNET:-172.30.0.0/24}
@@ -205,7 +258,7 @@ chat_data_dir="$deploy_root/data/chat"
 skills_cache_dir="$deploy_root/data/skills-cache"
 
 for pair in \
-    POSTGRES_IMAGE:"$postgres_image" \
+    POSTGRES_IMAGE:"$POSTGRES_IMAGE" \
     OPENWEBUI_VERSION:"$openwebui_version" \
     OCU_PROXY_PORT:"$proxy_port" \
     OCU_PRIVATE_NETWORK:"$private_network" \
@@ -246,9 +299,11 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
 {
     printf '%s\n' 'COMPOSE_PROJECT_NAME=ocu-test'
     printf '%s\n' "SOURCE_SHA=$SOURCE_SHA"
+    printf '%s\n' "WEBUI_SOURCE_SHA=$WEBUI_SOURCE_SHA"
     printf '%s\n' "OPENWEBUI_VERSION=$openwebui_version"
     printf '%s\n' "OPENWEBUI_IMAGE=$OPENWEBUI_IMAGE"
-    printf '%s\n' "POSTGRES_IMAGE=$postgres_image"
+    printf '%s\n' "POSTGRES_IMAGE=$POSTGRES_IMAGE"
+    printf '%s\n' "OCU_RELEASE_MANIFEST=$OCU_RELEASE_MANIFEST"
     # docker_manager identifies the production workspace path from this image
     # name. Keep "open-computer-use" in the tag so each workspace volume is
     # mounted at /home/assistant rather than the development /root path.
@@ -256,6 +311,7 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' "COMPUTER_USE_SERVER_IMAGE=$COMPUTER_USE_SERVER_IMAGE"
     printf '%s\n' "RETENTION_GUARD_IMAGE=$RETENTION_GUARD_IMAGE"
     printf '%s\n' "OCU_PROXY_IMAGE=$OCU_PROXY_IMAGE"
+
     printf '%s\n' "OCU_PRIVATE_NETWORK=$private_network"
     printf '%s\n' "OCU_PRIVATE_SUBNET=$private_subnet"
     printf '%s\n' "OCU_PRIVATE_GATEWAY=$private_gateway"

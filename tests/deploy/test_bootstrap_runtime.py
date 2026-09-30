@@ -13,18 +13,28 @@ import tempfile
 import unittest
 
 from support import (
+    DEFAULT_RELEASE_IMAGES,
     FAKE_DOCKER,
     OCU_SERVICE,
     PROXY_SERVICE,
     ROOT,
     SANDBOX_NETWORK,
-    UP,
     WEBUI_SERVICE,
+    WEBUI_SYNTHETIC_SHA,
+    committed_up_fixture,
+    default_config_id,
     intended_docs,
     seed_healthy_host,
+    seed_images,
     write_fake_configs,
     write_network,
+    write_release_for_sha,
 )
+
+
+
+
+
 
 
 BOOTSTRAP = ROOT / "deploy" / "production-like-test" / "scripts" / "bootstrap-test.sh"
@@ -34,12 +44,13 @@ ORIGIN = "https://workbench.example.test"
 PUBLIC_BASE = ORIGIN + "/ocu"
 INTERNAL_AUTH = "http://open-webui:8080/api/v1/ocu/auth"
 IMAGES = {
-    "OPENWEBUI_IMAGE": "ocu-test-openwebui:local",
-    "DOCKER_IMAGE": "open-computer-use-test:local",
-    "COMPUTER_USE_SERVER_IMAGE": "ocu-test-server:local",
-    "RETENTION_GUARD_IMAGE": "ocu-test-retention:local",
-    "OCU_PROXY_IMAGE": "ocu-test-proxy:local",
+    "OPENWEBUI_IMAGE": DEFAULT_RELEASE_IMAGES["open-webui"],
+    "DOCKER_IMAGE": DEFAULT_RELEASE_IMAGES["workspace"],
+    "COMPUTER_USE_SERVER_IMAGE": DEFAULT_RELEASE_IMAGES["computer-use-server"],
+    "RETENTION_GUARD_IMAGE": DEFAULT_RELEASE_IMAGES["retention-guard"],
+    "OCU_PROXY_IMAGE": DEFAULT_RELEASE_IMAGES["proxy"],
 }
+
 GENERATED_SECRETS = (
     "OCU_INTERNAL_TOKEN",
     "ADMIN_PASSWORD",
@@ -50,12 +61,15 @@ GENERATED_SECRETS = (
 REQUIRED_RUNTIME = (
     "COMPOSE_PROJECT_NAME",
     "SOURCE_SHA",
+    "WEBUI_SOURCE_SHA",
+    "OCU_RELEASE_MANIFEST",
     "OPENWEBUI_IMAGE",
     "POSTGRES_IMAGE",
     "DOCKER_IMAGE",
     "COMPUTER_USE_SERVER_IMAGE",
     "RETENTION_GUARD_IMAGE",
     "OCU_PROXY_IMAGE",
+
     "OCU_PRIVATE_NETWORK",
     "OCU_PRIVATE_SUBNET",
     "OCU_PRIVATE_GATEWAY",
@@ -123,34 +137,12 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.credentials = self.private / "admin-credentials.txt"
         source = self.deploy_root / "source"
         source.mkdir(parents=True)
-        subprocess.run(["git", "init", "-q"], cwd=str(source), check=True, capture_output=True, text=True)
-        subprocess.run(
-            ["git", "config", "user.email", "bootstrap@example.test"],
-            cwd=str(source),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Bootstrap Test"],
-            cwd=str(source),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        (source / "README").write_text("synthetic checkout\n", encoding="utf-8")
-        subprocess.run(["git", "add", "README"], cwd=str(source), check=True, capture_output=True, text=True)
-        subprocess.run(
-            ["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "synthetic"],
-            cwd=str(source),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(source), text=True).strip()
+        self.sha = committed_up_fixture(source, lock_dir=self.state / "image-store-lock")
+        self.webui_sha = WEBUI_SYNTHETIC_SHA
         self.env = os.environ.copy()
         self.env["PATH"] = str(FAKE_DOCKER.parent) + os.pathsep + self.env.get("PATH", "")
         self.env["FAKE_DOCKER_STATE"] = str(self.state)
+        self.env["DOCKER_HOST"] = "unix://" + str(self.state / "docker.sock")
         self.env["TMPDIR"] = str(self.private)
         self.env["HOME"] = str(self.private)
         self.env["DEPLOY_ROOT"] = str(self.deploy_root)
@@ -161,6 +153,17 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.env["OCU_SANDBOX_EGRESS_ALLOW"] = "8.8.8.8/32"
         self.env["OCU_SANDBOX_DNS"] = ""
         self.env.update(IMAGES)
+        self.inventory = write_release_for_sha(
+            self.root / "release.json",
+            self.sha,
+            self.webui_sha,
+        )
+        self.env["OCU_RELEASE_MANIFEST"] = str(self.inventory)
+        self.env["WEBUI_SOURCE_SHA"] = self.webui_sha
+        seed_images(self.state)
+
+
+
 
     def tearDown(self):
         self.context.cleanup()
@@ -214,9 +217,12 @@ class BootstrapRuntimeTests(unittest.TestCase):
             "TMPDIR": str(self.state),
             "FAKE_DOCKER_STATE": str(self.state),
             "OCU_SANDBOX_EGRESS_LOCK": str(self.state / "ocu-sandbox-egress.lock"),
+            "OCU_TEST_ROOT": str(self.deploy_root / "source"),
         }
         env.update(runtime)
-        return env
+        return env, self.deploy_root / "source" / "deploy" / "up.sh", self.deploy_root / "source"
+
+
 
     def test_non_root_fails_before_publishing(self):
         result = self.run_bootstrap({"FAKE_ID_UID": "1000"})
@@ -235,6 +241,8 @@ class BootstrapRuntimeTests(unittest.TestCase):
         for name in REQUIRED_RUNTIME:
             self.assertIn(name, runtime, name)
         self.assertEqual(runtime["SOURCE_SHA"], self.sha)
+        self.assertEqual(runtime["WEBUI_SOURCE_SHA"], self.webui_sha)
+        self.assertEqual(runtime["OCU_RELEASE_MANIFEST"], str(self.inventory))
         self.assertEqual(runtime["OCU_WEBUI_ORIGIN"], ORIGIN)
         self.assertEqual(runtime["PUBLIC_BASE_URL"], PUBLIC_BASE)
         self.assertEqual(runtime["OCU_WEBUI_AUTH_URL"], INTERNAL_AUTH)
@@ -252,6 +260,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
         for name, value in IMAGES.items():
             self.assertEqual(runtime[name], value, name)
         self.assertEqual(runtime["POSTGRES_IMAGE"], "postgres:17-alpine")
+
         self.assert_generated_secrets_hidden(runtime, result)
         self.assertNotIn("MCP_PORT=8081", self.runtime_path().read_text(encoding="utf-8"))
         self.assertNotIn("OPENWEBUI_PORT=3000", self.runtime_path().read_text(encoding="utf-8"))
@@ -281,15 +290,17 @@ class BootstrapRuntimeTests(unittest.TestCase):
             gateway=runtime["OCU_SANDBOX_GATEWAY"],
         )
         token = runtime["OCU_INTERNAL_TOKEN"]
+        env, script, source = self.consumer_up_env(runtime)
         up = subprocess.run(
-            ["bash", str(UP)],
-            cwd=str(ROOT),
+            ["bash", str(script)],
+            cwd=str(source),
             capture_output=True,
             text=True,
-            env=self.consumer_up_env(runtime),
+            env=env,
             check=False,
             timeout=20,
         )
+
         self.assertEqual(up.returncode, 0, up.stderr)
         self.assertNotIn(token, up.stdout + up.stderr)
         executed = [
@@ -362,15 +373,12 @@ class BootstrapRuntimeTests(unittest.TestCase):
         cases = (
             ({}, ["SOURCE_SHA"]),
             ({"SOURCE_SHA": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, None),
-            ({}, ["OPENWEBUI_IMAGE"]),
-            ({}, ["DOCKER_IMAGE"]),
+            ({}, ["OCU_RELEASE_MANIFEST"]),
             ({"DOCKER_IMAGE": "custom-workspace:local"}, None),
-            ({}, ["COMPUTER_USE_SERVER_IMAGE"]),
             ({"COMPUTER_USE_SERVER_IMAGE": "ocu-test-server:local\nINJECTED=1"}, None),
-            ({}, ["RETENTION_GUARD_IMAGE"]),
             ({"RETENTION_GUARD_IMAGE": "ocu-test-retention:local\nINJECTED=1"}, None),
-            ({}, ["OCU_PROXY_IMAGE"]),
             ({}, ["OCU_WEBUI_ORIGIN"]),
+
             ({"OCU_WEBUI_ORIGIN": "https://workbench.example.test/"}, None),
             ({"OCU_WEBUI_ORIGIN": "https://user:pass@workbench.example.test"}, None),
             ({"OCU_WEBUI_ORIGIN": "https://workbench.example.test/ocu"}, None),
@@ -451,23 +459,26 @@ class BootstrapRuntimeTests(unittest.TestCase):
         created = self.run_bootstrap()
         self.assertEqual(created.returncode, 0, created.stderr)
         runtime = parse_env_file(self.runtime_path())
-        (self.state / "images.json").write_text(
-            json.dumps(
-                {
-                    runtime["DOCKER_IMAGE"]: {"Id": "sha256:workspace-fake"},
-                    runtime["COMPUTER_USE_SERVER_IMAGE"]: {"Id": "sha256:server-fake"},
-                    runtime["RETENTION_GUARD_IMAGE"]: {"Id": "sha256:retention-fake"},
-                }
-            ),
-            encoding="utf-8",
+        seed_images(
+            self.state,
+            {
+                runtime["DOCKER_IMAGE"]: {"Id": default_config_id("workspace"), "Os": "linux", "Architecture": "amd64"},
+                runtime["COMPUTER_USE_SERVER_IMAGE"]: {"Id": default_config_id("computer-use-server"), "Os": "linux", "Architecture": "amd64"},
+                runtime["RETENTION_GUARD_IMAGE"]: {"Id": default_config_id("retention-guard"), "Os": "linux", "Architecture": "amd64"},
+                runtime["OCU_PROXY_IMAGE"]: {"Id": default_config_id("proxy"), "Os": "linux", "Architecture": "amd64"},
+                runtime["OPENWEBUI_IMAGE"]: {"Id": default_config_id("open-webui"), "Os": "linux", "Architecture": "amd64"},
+                runtime["POSTGRES_IMAGE"]: {"Id": default_config_id("postgres"), "Os": "linux", "Architecture": "amd64"},
+            },
         )
         (self.state / "now-epoch").write_text("1800000000", encoding="utf-8")
+        env = dict(self.env)
+        env["OCU_RELEASE_MANIFEST"] = runtime["OCU_RELEASE_MANIFEST"]
         result = subprocess.run(
             ["bash", str(WRITE_VERSION)],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
-            env=self.env,
+            env=env,
             check=False,
             timeout=20,
         )
@@ -478,10 +489,53 @@ class BootstrapRuntimeTests(unittest.TestCase):
         for name in GENERATED_SECRETS:
             self.assertNotIn(runtime[name], record, name)
         self.assertNotIn(PROVIDER_SENTINEL, record)
-        self.assertIn("sha256:workspace-fake", record)
+        self.assertIn(default_config_id("workspace"), record)
         self.assertIn(runtime["COMPUTER_USE_SERVER_IMAGE"], record)
         self.assertIn(runtime["RETENTION_GUARD_IMAGE"], record)
+        self.assertIn(runtime["OCU_PROXY_IMAGE"], record)
+        self.assertIn(runtime["OPENWEBUI_IMAGE"], record)
+        self.assertIn(runtime["POSTGRES_IMAGE"], record)
+        self.assertIn(self.sha, record)
+        self.assertIn(self.webui_sha, record)
+        self.assertIn("not registry manifest digests", record)
+        self.assertIn("not installed package versions", record)
+        self.assertNotIn(runtime["WEBUI_SECRET_KEY"], record)
         self.assertEqual(stat.S_IMODE((self.deploy_root / "DEPLOYED_VERSION.md").stat().st_mode), 0o644)
+
+    def test_replaced_image_rejects_bootstrap_before_publication(self):
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        tag = DEFAULT_RELEASE_IMAGES["proxy"]
+        images[tag]["Id"] = "sha256:" + ("c" * 64)
+        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
+        result = self.run_bootstrap()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("configuration digest", result.stderr)
+        self.assert_unpublished()
+
+    def test_replaced_image_preserves_existing_version_record(self):
+        created = self.run_bootstrap()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        existing = self.deploy_root / "DEPLOYED_VERSION.md"
+        existing.write_text("keep-me\n", encoding="utf-8")
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        images[runtime["OCU_PROXY_IMAGE"]]["Id"] = "sha256:" + ("d" * 64)
+        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
+        env = dict(self.env)
+        env["OCU_RELEASE_MANIFEST"] = runtime["OCU_RELEASE_MANIFEST"]
+        result = subprocess.run(
+            ["bash", str(WRITE_VERSION)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=20,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "keep-me\n")
+
+
 
 
 if __name__ == "__main__":

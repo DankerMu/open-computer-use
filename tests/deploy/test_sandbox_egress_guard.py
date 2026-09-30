@@ -15,6 +15,7 @@ import time
 import unittest
 
 from packet_oracle import evaluate_packet
+
 from support import (
     CONTROL_NETWORK,
     DEFAULT_ALLOW,
@@ -26,11 +27,11 @@ from support import (
     OWNED_IPV6,
     ROOT,
     SANDBOX_NETWORK,
-    UP,
     fake_env,
     intended_docs,
     load_firewall,
     ops,
+    prepare_up_context,
     run_script,
     seed_healthy_host,
     tmp_dir,
@@ -38,6 +39,7 @@ from support import (
     write_firewall,
     write_network,
 )
+
 
 
 BRIDGE = "br-id-ocu-sandb"
@@ -111,6 +113,25 @@ class EgressGuardTests(unittest.TestCase):
         payload["ipv6"]["FORWARD"].insert(0, FOREIGN_V6)
         write_firewall(self.state, payload)
         self.env = fake_env(self.state)
+
+    def up(self, extra=None):
+        env = dict(self.env if extra is None else extra)
+        merged, script, _source = prepare_up_context(self.state, extra=env)
+        return run_script(script, merged)
+
+    def up_popen(self, extra=None):
+        env = dict(self.env if extra is None else extra)
+        merged, script, source = prepare_up_context(self.state, extra=env)
+        return subprocess.Popen(
+            ["bash", str(script)],
+            cwd=str(source),
+            env=merged,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
 
     def tearDown(self):
         self.context.cleanup()
@@ -305,7 +326,7 @@ class EgressGuardTests(unittest.TestCase):
 
     def test_restore_failure_leaves_no_service_start_from_up(self):
         (self.state / "ipv4-restore-fail").write_text("1", encoding="utf-8")
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assertEqual(leftover_tmp(self.state), [])
@@ -581,7 +602,7 @@ class EgressGuardTests(unittest.TestCase):
         )
 
     def test_up_runs_installer_and_checker_before_starts_on_reused_bridge(self):
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
         recorded = ops(self.state)
@@ -597,7 +618,7 @@ class EgressGuardTests(unittest.TestCase):
 
     def test_fresh_host_up_uses_configured_control_cidr(self):
         (self.state / "networks" / f"{CONTROL_NETWORK}.json").unlink()
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
         firewall = load_firewall(self.state)
@@ -641,7 +662,7 @@ class EgressGuardTests(unittest.TestCase):
     def test_unset_allowlist_in_up_starts_no_service(self):
         env = dict(self.env)
         del env["OCU_SANDBOX_EGRESS_ALLOW"]
-        result = run_script(UP, env)
+        result = self.up(env)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("OCU_SANDBOX_EGRESS_ALLOW", result.stderr)
         self.assertEqual(starts(self.state), [])
@@ -654,7 +675,7 @@ class EgressGuardTests(unittest.TestCase):
         docs = intended_docs()
         docs["core.json"]["services"][OCU_SERVICE]["environment"] = {"OCU_SANDBOX_DNS": ""}
         write_fake_configs(self.state, docs)
-        result = run_script(UP, env)
+        result = self.up(env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
         firewall = load_firewall(self.state)
@@ -665,14 +686,14 @@ class EgressGuardTests(unittest.TestCase):
 
     def test_installer_restore_failure_in_up_starts_no_service(self):
         (self.state / "ipv4-restore-fail").write_text("1", encoding="utf-8")
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assertEqual(leftover_tmp(self.state), [])
 
     def test_check_failure_after_install_blocks_start(self):
         (self.state / "check-fail-once").write_text("1", encoding="utf-8")
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("sandbox egress policy check failed", result.stderr)
         self.assertEqual(starts(self.state), [])
@@ -804,15 +825,7 @@ class EgressGuardTests(unittest.TestCase):
         hold.write_text("1", encoding="utf-8")
         env = dict(self.env)
         env["FAKE_FIREWALL_HOLD_RESTORE"] = str(hold)
-        process = subprocess.Popen(
-            ["bash", str(UP)],
-            cwd=str(ROOT),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        process = self.up_popen(env)
         try:
             self.assertTrue(_wait(lambda: (self.state / "entered-restore").exists()), "up never entered restore")
             process.send_signal(signal.SIGTERM)

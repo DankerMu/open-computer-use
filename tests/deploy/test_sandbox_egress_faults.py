@@ -16,9 +16,9 @@ from support import (
     OWNED_IPV4,
     OWNED_IPV6,
     SANDBOX_NETWORK,
-    UP,
     fake_env,
     load_firewall,
+    prepare_up_context,
     run_script,
     seed_healthy_host,
     tmp_dir,
@@ -26,6 +26,7 @@ from support import (
     write_firewall,
     write_network,
 )
+
 
 
 BRIDGE = "br-id-ocu-sandb"
@@ -47,6 +48,14 @@ class EgressFaultQualificationTests(unittest.TestCase):
         write_network(self.state, CONTROL_NETWORK, subnet="172.30.0.0/24", gateway="172.30.0.1")
         write_network(self.state, SANDBOX_NETWORK, subnet="172.31.0.0/24", gateway="172.31.0.1")
         self.env = fake_env(self.state)
+
+    def up(self, extra=None):
+        env = dict(self.env)
+        if extra:
+            env.update(extra)
+        merged, script, _source = prepare_up_context(self.state, extra=env)
+        return run_script(script, merged)
+
 
     def tearDown(self):
         self.context.cleanup()
@@ -174,7 +183,7 @@ class EgressFaultQualificationTests(unittest.TestCase):
 
     def test_ignored_preflight_failure_must_not_start_services(self):
         del self.env["OCU_SANDBOX_EGRESS_ALLOW"]
-        result = run_script(UP, self.env)
+        result = self.up()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(starts(self.state), [])
         self.assertIn("OCU_SANDBOX_EGRESS_ALLOW", result.stderr)

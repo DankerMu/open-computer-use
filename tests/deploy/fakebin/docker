@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import sys
+import tarfile
 import time
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from interpolation import UnsupportedInterpolation, interpolate_value
@@ -41,6 +45,20 @@ def log(argv: list[str], state: Path) -> None:
 
 def write_json(path: Path, payload) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def append_json_list(path: Path, payload) -> None:
+    records = []
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"malformed {path.name}") from exc
+        if not isinstance(existing, list):
+            raise SystemExit(f"malformed {path.name}")
+        records = existing
+    records.append(payload)
+    write_json(path, records)
 
 
 def network_path(state: Path, name: str) -> Path:
@@ -249,7 +267,19 @@ def compose_up(state: Path, argv: list[str]) -> int:
         "remove_orphans": remove_orphans(argv),
         "env_remove_orphans": os.environ.get("COMPOSE_REMOVE_ORPHANS", ""),
         "env_profiles": os.environ.get("COMPOSE_PROFILES", ""),
+        "argv": argv,
+        "no_build": "--no-build" in argv,
+        "pull": None,
+        "build": "--build" in argv,
     }
+    args = argv[:]
+    while args:
+        token = args.pop(0)
+        if token == "--pull" and args:
+            payload["pull"] = args.pop(0)
+        elif token.startswith("--pull="):
+            payload["pull"] = token.split("=", 1)[1]
+
     if snapshot and files:
         first = Path(files[0])
         if first.exists():
@@ -298,13 +328,16 @@ def compose_up(state: Path, argv: list[str]) -> int:
     return 0
 
 
-def docker_info(state: Path) -> int:
+def docker_info(state: Path, argv: list[str] | None = None) -> int:
     payload = {
+        "ID": "fake-daemon-" + hashlib.sha256(str(state).encode("utf-8")).hexdigest(),
+        "Name": "ocu-fake-docker",
         "Driver": "overlay2",
         "SecurityOptions": [],
         "CgroupDriver": "systemd",
         "FirewallBackend": "iptables",
         "Rootless": False,
+        "DockerRootDir": str(state / "docker-root"),
     }
     override = state / "docker-info.json"
     if override.exists():
@@ -312,7 +345,35 @@ def docker_info(state: Path) -> int:
     if payload.get("error"):
         sys.stderr.write(str(payload.get("message", "docker info failed")) + "\n")
         return int(payload.get("code", 1))
+    fmt = ""
+    args = list(argv or [])
+    while args:
+        token = args.pop(0)
+        if token in {"--format", "-f"} and args:
+            fmt = args.pop(0)
+    if fmt and fmt not in {"{{json .}}", "{{.ID}}"}:
+        sys.stderr.write("unsupported docker info format\n")
+        return 1
+    if fmt == "{{.ID}}":
+        sys.stdout.write(str(payload.get("ID") or "") + "\n")
+        return 0
     sys.stdout.write(json.dumps(payload))
+    return 0
+
+
+def docker_context_inspect(state: Path, argv: list[str]) -> int:
+    payload = {
+        "Name": "default",
+        "Endpoints": {"docker": {"Host": "unix:///var/run/docker.sock"}},
+    }
+    override = state / "docker-context.json"
+    if override.exists():
+        payload.update(json.loads(override.read_text(encoding="utf-8")))
+    if payload.get("error"):
+        sys.stderr.write(str(payload.get("message", "docker context inspect failed")) + "\n")
+        return int(payload.get("code", 1))
+    sys.stdout.write(json.dumps(payload))
+    del argv
     return 0
 
 
@@ -464,6 +525,31 @@ def docker_stop(state: Path, argv: list[str]) -> int:
     return 1
 
 
+def images_path(state: Path) -> Path:
+    return state / "images.json"
+
+
+def load_images(state: Path) -> dict:
+    path = images_path(state)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_images(state: Path, payload: dict) -> None:
+    write_json(images_path(state), payload)
+
+
+def lookup_image(payload: dict, target: str):
+    record = payload.get(target)
+    if record:
+        return record
+    for item in payload.values():
+        if item.get("Id") == target:
+            return item
+    return None
+
+
 def docker_image_inspect(state: Path, argv: list[str]) -> int:
     fmt = ""
     args = argv[:]
@@ -480,19 +566,441 @@ def docker_image_inspect(state: Path, argv: list[str]) -> int:
     if not target:
         sys.stderr.write("docker image inspect requires an image\n")
         return 1
-    images = state / "images.json"
-    payload = {}
-    if images.exists():
-        payload = json.loads(images.read_text(encoding="utf-8"))
-    record = payload.get(target)
+    errors = state / "image-inspect-error.json"
+    if errors.exists():
+        payload = json.loads(errors.read_text(encoding="utf-8"))
+        detail = payload.get(target) or payload.get("*")
+        if detail:
+            sys.stderr.write(str(detail.get("message", "image inspect failed")) + "\n")
+            return int(detail.get("code", 1))
+    record = lookup_image(load_images(state), target)
     if not record:
         sys.stderr.write(f"Error: No such image: {target}\n")
         return 1
     if fmt == "{{.Id}}":
         sys.stdout.write(record["Id"] + "\n")
         return 0
+    if fmt == "{{.Os}}/{{.Architecture}}":
+        sys.stdout.write(f"{record.get('Os', 'linux')}/{record.get('Architecture', 'amd64')}\n")
+        return 0
     sys.stdout.write(json.dumps(record))
     return 0
+
+
+def parse_build_args(argv: list[str]) -> tuple[str, str, str, dict[str, str], str]:
+    tag = ""
+    dockerfile = "Dockerfile"
+    platform = ""
+    build_args: dict[str, str] = {}
+    args = argv[:]
+    positionals: list[str] = []
+    while args:
+        token = args.pop(0)
+        if token in {"-t", "--tag"} and args:
+            tag = args.pop(0)
+        elif token in {"-f", "--file"} and args:
+            dockerfile = args.pop(0)
+        elif token == "--platform" and args:
+            platform = args.pop(0)
+        elif token == "--build-arg" and args:
+            raw = args.pop(0)
+            if "=" not in raw:
+                sys.stderr.write("docker build requires KEY=VALUE build args\n")
+                raise SystemExit(1)
+            key, value = raw.split("=", 1)
+            build_args[key] = value
+        elif token.startswith("-"):
+            sys.stderr.write("unsupported docker command\n")
+            raise SystemExit(1)
+        else:
+            positionals.append(token)
+    if len(positionals) != 1:
+        sys.stderr.write("docker build requires a context\n")
+        raise SystemExit(1)
+    return tag, dockerfile, platform, build_args, positionals[0]
+
+
+def list_context_files(context: Path) -> list[str]:
+    names = []
+    if not context.exists():
+        return names
+    for path in sorted(context.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            names.append(str(path.relative_to(context)))
+    return names
+
+
+def image_record(*, image_id: str, os_name: str, architecture: str, extra=None) -> dict:
+    record = {
+        "Id": image_id,
+        "Os": os_name,
+        "Architecture": architecture,
+        "RepoDigests": [],
+        "Config": {"Os": os_name, "Architecture": architecture},
+    }
+    if extra:
+        record.update(extra)
+    return record
+
+
+def config_bytes_for(record: dict) -> bytes:
+    stored = record.get("ConfigBytes")
+    if stored:
+        return stored.encode("utf-8") if isinstance(stored, str) else stored
+    payload = {
+        "os": record.get("Os", "linux"),
+        "architecture": record.get("Architecture", "amd64"),
+        "id": record.get("Id"),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def docker_build(state: Path, argv: list[str]) -> int:
+    hold_named(state, "FAKE_DOCKER_HOLD_BUILD", "entered-build")
+    fail = state / "build-fail"
+    if fail.exists():
+        sys.stderr.write("docker build failed\n")
+        return 1
+    try:
+        tag, dockerfile, platform, build_args, context = parse_build_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 1)
+    if not tag:
+        sys.stderr.write("docker build requires a tag\n")
+        return 1
+    script = state / "build-script.json"
+    if script.exists():
+        payload = json.loads(script.read_text(encoding="utf-8"))
+        if payload.get("once"):
+            script.unlink()
+        sys.stderr.write(str(payload.get("message", "build failed")) + "\n")
+        return int(payload.get("code", 1))
+    context_path = Path(context)
+    dockerfile_path = Path(dockerfile)
+    if not dockerfile_path.is_absolute():
+        dockerfile_path = context_path / dockerfile
+    try:
+        dockerfile_bytes = dockerfile_path.read_bytes()
+    except OSError:
+        sys.stderr.write(f"docker build: missing Dockerfile {dockerfile_path}\n")
+        return 1
+    files = list_context_files(context_path)
+    os_name, architecture = ("linux", "amd64")
+    if platform:
+        if "/" not in platform:
+            sys.stderr.write("docker build: invalid platform\n")
+            return 1
+        os_name, architecture = platform.split("/", 1)
+    else:
+        os_name, architecture = os.environ.get("FAKE_DOCKER_DEFAULT_PLATFORM", "linux/arm64").split("/", 1)
+    identity = json.dumps(
+        {
+            "dockerfile": dockerfile_bytes.decode("utf-8", "replace"),
+            "args": build_args,
+            "platform": f"{os_name}/{architecture}",
+            "files": files,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    config = json.dumps(
+        {
+            "os": os_name,
+            "architecture": architecture,
+            "rootfs": {"diff_ids": ["sha256:" + hashlib.sha256(identity).hexdigest()]},
+            "config": {"Env": [f"OCU_FAKE_TAG={tag}"]},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    image_id = "sha256:" + hashlib.sha256(config.encode("utf-8")).hexdigest()
+    record = image_record(
+        image_id=image_id,
+        os_name=os_name,
+        architecture=architecture,
+        extra={"ConfigBytes": config},
+    )
+    images = load_images(state)
+    images[tag] = record
+    save_images(state, images)
+    record_payload = {
+        "tag": tag,
+        "dockerfile": str(dockerfile_path),
+        "context": str(context_path),
+        "platform": f"{os_name}/{architecture}",
+        "build_args": build_args,
+        "files": files,
+        "id": image_id,
+        "kind": "build",
+    }
+    write_json(state / "last-build.json", record_payload)
+    append_json_list(state / "builds.json", record_payload)
+    with (state / "builds.log").open("a", encoding="utf-8") as stream:
+        stream.write(tag + "\n")
+    sys.stdout.write(f"Successfully tagged {tag}\n")
+    return 0
+
+
+def docker_tag(state: Path, argv: list[str]) -> int:
+    if len(argv) != 2:
+        sys.stderr.write("docker tag requires source and target\n")
+        return 1
+    source, target = argv
+    images = load_images(state)
+    record = lookup_image(images, source)
+    if not record:
+        sys.stderr.write(f"Error: No such image: {source}\n")
+        return 1
+    images[target] = dict(record)
+    save_images(state, images)
+    return 0
+
+
+def docker_pull(state: Path, argv: list[str]) -> int:
+    hold_named(state, "FAKE_DOCKER_HOLD_PULL", "entered-pull")
+    fail = state / "pull-fail"
+    if fail.exists():
+        sys.stderr.write("docker pull failed\n")
+        return 1
+    platform = ""
+    args = argv[:]
+    reference = None
+    while args:
+        token = args.pop(0)
+        if token == "--platform" and args:
+            platform = args.pop(0)
+        elif not token.startswith("-") and reference is None:
+            reference = token
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not reference:
+        sys.stderr.write("docker pull requires an image\n")
+        return 1
+    os_name, architecture = ("linux", "amd64")
+    if platform:
+        os_name, architecture = platform.split("/", 1)
+    identity = f"pull:{platform}:{reference}".encode("utf-8")
+    config = json.dumps(
+        {
+            "os": os_name,
+            "architecture": architecture,
+            "rootfs": {"diff_ids": ["sha256:" + hashlib.sha256(identity).hexdigest()]},
+            "config": {"Env": [f"OCU_FAKE_PULL={reference}"]},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    image_id = "sha256:" + hashlib.sha256(config.encode("utf-8")).hexdigest()
+    images = load_images(state)
+    images[reference] = image_record(
+        image_id=image_id,
+        os_name=os_name,
+        architecture=architecture,
+        extra={
+            "RepoDigests": [f"{reference.split(':')[0]}@sha256:{image_id[7:]}"],
+            "ConfigBytes": config,
+        },
+    )
+
+    save_images(state, images)
+    append_json_list(
+        state / "builds.json",
+        {
+            "tag": reference,
+            "kind": "pull",
+            "platform": f"{os_name}/{architecture}",
+            "id": image_id,
+        },
+    )
+    sys.stdout.write(f"Pulled {reference}\n")
+    return 0
+
+
+def docker_save(state: Path, argv: list[str]) -> int:
+    output = None
+    args = argv[:]
+    tags: list[str] = []
+    while args:
+        token = args.pop(0)
+        if token in {"-o", "--output"} and args:
+            output = args.pop(0)
+        elif not token.startswith("-"):
+            tags.append(token)
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not output or not tags:
+        sys.stderr.write("docker save requires an output and at least one image\n")
+        return 1
+    images = load_images(state)
+    entries = []
+    repositories: dict[str, dict[str, str]] = {}
+    buffer = io.BytesIO()
+
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for tag in tags:
+            record = lookup_image(images, tag)
+            if not record:
+                sys.stderr.write(f"Error: No such image: {tag}\n")
+                return 1
+            config = config_bytes_for(record)
+            digest = hashlib.sha256(config).hexdigest()
+            config_name = digest + ".json"
+            info = tarfile.TarInfo(name=config_name)
+            info.size = len(config)
+            archive.addfile(info, io.BytesIO(config))
+            entries.append({"Config": config_name, "RepoTags": [tag], "Layers": []})
+            name, _, label = tag.partition(":")
+            repositories.setdefault(name, {})[label or "latest"] = digest
+        manifest = json.dumps(entries).encode("utf-8")
+        info = tarfile.TarInfo(name="manifest.json")
+        info.size = len(manifest)
+        archive.addfile(info, io.BytesIO(manifest))
+        repos = json.dumps(repositories).encode("utf-8")
+        info = tarfile.TarInfo(name="repositories")
+        info.size = len(repos)
+        archive.addfile(info, io.BytesIO(repos))
+    Path(output).write_bytes(buffer.getvalue())
+    return 0
+
+
+def _archive_member_name(name: str) -> str:
+    return name[2:] if name.startswith("./") else name
+
+
+def _familiar_name(reference: str) -> str:
+    text = str(reference or "")
+    if text.startswith("docker.io/library/"):
+        return text[len("docker.io/library/") :]
+    if text.startswith("docker.io/"):
+        return text[len("docker.io/") :]
+    return text
+
+
+def iter_archive_tags(archive_path: Path):
+    with tarfile.open(archive_path, "r") as archive:
+        members = archive.getmembers()
+        names = {_archive_member_name(member.name): member.name for member in members}
+        configs = {}
+        if "manifest.json" in names:
+            with archive.extractfile(names["manifest.json"]) as stream:
+                manifest = json.loads(stream.read().decode("utf-8"))
+            for entry in manifest:
+                config_name = entry.get("Config")
+                member_name = names.get(_archive_member_name(str(config_name or "")), config_name)
+                with archive.extractfile(member_name) as stream:
+                    configs[str(config_name)] = stream.read()
+                for tag in entry.get("RepoTags") or []:
+                    yield tag, configs[str(config_name)]
+        if "repositories" in names:
+            with archive.extractfile(names["repositories"]) as stream:
+                repositories = json.loads(stream.read().decode("utf-8"))
+            for name, tags in repositories.items():
+                for label, _digest in tags.items():
+                    tag = f"{name}:{label}"
+                    matched = None
+                    for data in configs.values():
+                        matched = data
+                        break
+                    if matched is None:
+                        matched = json.dumps(
+                            {"os": "linux", "architecture": "amd64"}
+                        ).encode("utf-8")
+                    yield tag, matched
+        if "oci-layout" in names and "index.json" in names:
+            with archive.extractfile(names["index.json"]) as stream:
+                index = json.loads(stream.read().decode("utf-8"))
+            pending = list(index.get("manifests") or [])
+            visited = 0
+            while pending and visited < 16:
+                desc = pending.pop(0)
+                visited += 1
+                if not isinstance(desc, dict):
+                    continue
+                annotations = desc.get("annotations") or {}
+                if not isinstance(annotations, dict):
+                    continue
+                if annotations.get("containerd.io/manifest.subject") or annotations.get(
+                    "vnd.docker.reference.type"
+                ) == "attestation-manifest":
+                    continue
+                digest = str(desc.get("digest") or "")
+                if not digest.startswith("sha256:"):
+                    continue
+                blob_name = f"blobs/sha256/{digest[7:]}"
+                if blob_name not in names:
+                    continue
+                with archive.extractfile(names[blob_name]) as stream:
+                    payload = json.loads(stream.read().decode("utf-8"))
+                media = str(desc.get("mediaType") or "")
+                if "index" in media or media.endswith("manifest.list.v2+json"):
+                    pending.extend(payload.get("manifests") or [])
+                    continue
+                image_name = annotations.get("io.containerd.image.name")
+                if not image_name:
+                    continue
+                config_desc = payload.get("config") or {}
+                config_digest = str(config_desc.get("digest") or "")
+                if not config_digest.startswith("sha256:"):
+                    continue
+                config_blob = f"blobs/sha256/{config_digest[7:]}"
+                if config_blob not in names:
+                    continue
+                with archive.extractfile(names[config_blob]) as stream:
+                    config = stream.read()
+                yield _familiar_name(str(image_name)), config
+
+def docker_load(state: Path, argv: list[str]) -> int:
+    hold_named(state, "FAKE_DOCKER_HOLD_LOAD", "entered-load")
+    input_path = None
+    args = argv[:]
+    while args:
+        token = args.pop(0)
+        if token in {"-i", "--input"} and args:
+            input_path = args.pop(0)
+        elif not token.startswith("-") and input_path is None:
+            input_path = token
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not input_path:
+        sys.stderr.write("docker load requires an input archive\n")
+        return 1
+    count_path = state / "load-count"
+    count = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+    count += 1
+    count_path.write_text(str(count), encoding="utf-8")
+    fail_before = state / "load-fail"
+    fail_after = state / "load-fail-after"
+    if fail_before.exists():
+        sys.stderr.write("docker load failed\n")
+        return 1
+    images = load_images(state)
+
+    try:
+        for tag, config in iter_archive_tags(Path(input_path)):
+            digest = hashlib.sha256(config).hexdigest()
+            payload = json.loads(config.decode("utf-8"))
+            images[tag] = image_record(
+                image_id="sha256:" + digest,
+                os_name=str(payload.get("os") or "linux"),
+                architecture=str(payload.get("architecture") or "amd64"),
+                extra={"ConfigBytes": config.decode("utf-8")},
+            )
+    except Exception as exc:
+        sys.stderr.write(f"docker load failed: {exc}\n")
+        return 1
+    save_images(state, images)
+    if fail_after.exists():
+        limit = int(fail_after.read_text(encoding="utf-8") or "1")
+        if count >= limit:
+            sys.stderr.write("docker load failed after importing archive tags\n")
+            return 1
+    sys.stdout.write(f"Loaded image from {input_path}\n")
+    return 0
+
+
 
 
 def docker_version(state: Path, argv: list[str]) -> int:
@@ -740,7 +1248,9 @@ def main(argv: list[str]) -> int:
     if len(argv) >= 2 and argv[0] == "network" and argv[1] == "create":
         return create_network(state, argv[2:])
     if argv and argv[0] == "info":
-        return docker_info(state)
+        return docker_info(state, argv[1:])
+    if len(argv) >= 2 and argv[0] == "context" and argv[1] == "inspect":
+        return docker_context_inspect(state, argv[2:])
     if argv and argv[0] == "ps":
         return docker_ps(state, argv[1:])
     if argv and argv[0] == "inspect":
@@ -751,6 +1261,17 @@ def main(argv: list[str]) -> int:
         return docker_version(state, argv[1:])
     if len(argv) >= 2 and argv[0] == "image" and argv[1] == "inspect":
         return docker_image_inspect(state, argv[2:])
+    if argv and argv[0] == "build":
+        return docker_build(state, argv[1:])
+    if argv and argv[0] == "tag":
+        return docker_tag(state, argv[1:])
+    if argv and argv[0] == "pull":
+        return docker_pull(state, argv[1:])
+    if argv and argv[0] == "save":
+        return docker_save(state, argv[1:])
+    if argv and argv[0] == "load":
+        return docker_load(state, argv[1:])
+
     if argv and argv[0] == "compose":
         rest = argv[1:]
         if "config" in rest:

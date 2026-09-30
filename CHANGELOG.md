@@ -3,6 +3,16 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Offline image delivery.** `deploy/release.py` builds and imports a
+  six-role linux/amd64 release from committed OCU and WebUI sources.
+  `release.json` is the canonical inventory: both source SHAs, named
+  references, image configuration digests, archive checksums, and
+  non-secret build/material provenance. Bootstrap and `deploy/up.sh`
+  require `OCU_RELEASE_MANIFEST`, verify local images and tracked source
+  bytes before mutation, and start frozen snapshots with
+  `--no-build --pull never`. The version record renders that inventory
+  without credentials. Engine import and WAN-free restart remain issue36.
+
 - **Files-only preview embedding.** An explicit `?embed=files` iframe accepts
   strict same-origin, same-parent, same-chat, increasing-generation `file_id`
   selection and reports loading/ready/error/missing/unsupported. Bounded
