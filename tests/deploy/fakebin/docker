@@ -328,13 +328,16 @@ def compose_up(state: Path, argv: list[str]) -> int:
     return 0
 
 
-def docker_info(state: Path) -> int:
+def docker_info(state: Path, argv: list[str] | None = None) -> int:
     payload = {
+        "ID": "fake-daemon-" + hashlib.sha256(str(state).encode("utf-8")).hexdigest(),
+        "Name": "ocu-fake-docker",
         "Driver": "overlay2",
         "SecurityOptions": [],
         "CgroupDriver": "systemd",
         "FirewallBackend": "iptables",
         "Rootless": False,
+        "DockerRootDir": str(state / "docker-root"),
     }
     override = state / "docker-info.json"
     if override.exists():
@@ -342,7 +345,35 @@ def docker_info(state: Path) -> int:
     if payload.get("error"):
         sys.stderr.write(str(payload.get("message", "docker info failed")) + "\n")
         return int(payload.get("code", 1))
+    fmt = ""
+    args = list(argv or [])
+    while args:
+        token = args.pop(0)
+        if token in {"--format", "-f"} and args:
+            fmt = args.pop(0)
+    if fmt and fmt not in {"{{json .}}", "{{.ID}}"}:
+        sys.stderr.write("unsupported docker info format\n")
+        return 1
+    if fmt == "{{.ID}}":
+        sys.stdout.write(str(payload.get("ID") or "") + "\n")
+        return 0
     sys.stdout.write(json.dumps(payload))
+    return 0
+
+
+def docker_context_inspect(state: Path, argv: list[str]) -> int:
+    payload = {
+        "Name": "default",
+        "Endpoints": {"docker": {"Host": "unix:///var/run/docker.sock"}},
+    }
+    override = state / "docker-context.json"
+    if override.exists():
+        payload.update(json.loads(override.read_text(encoding="utf-8")))
+    if payload.get("error"):
+        sys.stderr.write(str(payload.get("message", "docker context inspect failed")) + "\n")
+        return int(payload.get("code", 1))
+    sys.stdout.write(json.dumps(payload))
+    del argv
     return 0
 
 
@@ -834,39 +865,91 @@ def docker_save(state: Path, argv: list[str]) -> int:
     return 0
 
 
+def _archive_member_name(name: str) -> str:
+    return name[2:] if name.startswith("./") else name
+
+
+def _familiar_name(reference: str) -> str:
+    text = str(reference or "")
+    if text.startswith("docker.io/library/"):
+        return text[len("docker.io/library/") :]
+    if text.startswith("docker.io/"):
+        return text[len("docker.io/") :]
+    return text
+
+
 def iter_archive_tags(archive_path: Path):
     with tarfile.open(archive_path, "r") as archive:
-
         members = archive.getmembers()
-        names = [member.name for member in members]
-        if "manifest.json" not in names:
-            raise ValueError("image archive is missing manifest.json")
-        with archive.extractfile("manifest.json") as stream:
-            manifest = json.loads(stream.read().decode("utf-8"))
+        names = {_archive_member_name(member.name): member.name for member in members}
         configs = {}
-        for entry in manifest:
-            config_name = entry.get("Config")
-            with archive.extractfile(config_name) as stream:
-                configs[config_name] = stream.read()
-            for tag in entry.get("RepoTags") or []:
-                yield tag, configs[config_name]
+        if "manifest.json" in names:
+            with archive.extractfile(names["manifest.json"]) as stream:
+                manifest = json.loads(stream.read().decode("utf-8"))
+            for entry in manifest:
+                config_name = entry.get("Config")
+                member_name = names.get(_archive_member_name(str(config_name or "")), config_name)
+                with archive.extractfile(member_name) as stream:
+                    configs[str(config_name)] = stream.read()
+                for tag in entry.get("RepoTags") or []:
+                    yield tag, configs[str(config_name)]
         if "repositories" in names:
-            with archive.extractfile("repositories") as stream:
+            with archive.extractfile(names["repositories"]) as stream:
                 repositories = json.loads(stream.read().decode("utf-8"))
             for name, tags in repositories.items():
                 for label, _digest in tags.items():
                     tag = f"{name}:{label}"
-                    # Legacy repositories do not carry config bytes; reuse the
-                    # first matching manifest tag's config when present.
                     matched = None
-                    for existing, data in list(configs.items()):
-                        del existing
+                    for data in configs.values():
                         matched = data
                         break
                     if matched is None:
-                        matched = json.dumps({"os": "linux", "architecture": "amd64"}).encode("utf-8")
+                        matched = json.dumps(
+                            {"os": "linux", "architecture": "amd64"}
+                        ).encode("utf-8")
                     yield tag, matched
-
+        if "oci-layout" in names and "index.json" in names:
+            with archive.extractfile(names["index.json"]) as stream:
+                index = json.loads(stream.read().decode("utf-8"))
+            pending = list(index.get("manifests") or [])
+            visited = 0
+            while pending and visited < 16:
+                desc = pending.pop(0)
+                visited += 1
+                if not isinstance(desc, dict):
+                    continue
+                annotations = desc.get("annotations") or {}
+                if not isinstance(annotations, dict):
+                    continue
+                if annotations.get("containerd.io/manifest.subject") or annotations.get(
+                    "vnd.docker.reference.type"
+                ) == "attestation-manifest":
+                    continue
+                digest = str(desc.get("digest") or "")
+                if not digest.startswith("sha256:"):
+                    continue
+                blob_name = f"blobs/sha256/{digest[7:]}"
+                if blob_name not in names:
+                    continue
+                with archive.extractfile(names[blob_name]) as stream:
+                    payload = json.loads(stream.read().decode("utf-8"))
+                media = str(desc.get("mediaType") or "")
+                if "index" in media or media.endswith("manifest.list.v2+json"):
+                    pending.extend(payload.get("manifests") or [])
+                    continue
+                image_name = annotations.get("io.containerd.image.name")
+                if not image_name:
+                    continue
+                config_desc = payload.get("config") or {}
+                config_digest = str(config_desc.get("digest") or "")
+                if not config_digest.startswith("sha256:"):
+                    continue
+                config_blob = f"blobs/sha256/{config_digest[7:]}"
+                if config_blob not in names:
+                    continue
+                with archive.extractfile(names[config_blob]) as stream:
+                    config = stream.read()
+                yield _familiar_name(str(image_name)), config
 
 def docker_load(state: Path, argv: list[str]) -> int:
     hold_named(state, "FAKE_DOCKER_HOLD_LOAD", "entered-load")
@@ -1165,7 +1248,9 @@ def main(argv: list[str]) -> int:
     if len(argv) >= 2 and argv[0] == "network" and argv[1] == "create":
         return create_network(state, argv[2:])
     if argv and argv[0] == "info":
-        return docker_info(state)
+        return docker_info(state, argv[1:])
+    if len(argv) >= 2 and argv[0] == "context" and argv[1] == "inspect":
+        return docker_context_inspect(state, argv[2:])
     if argv and argv[0] == "ps":
         return docker_ps(state, argv[1:])
     if argv and argv[0] == "inspect":

@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -25,6 +28,27 @@ FORMAT_VERSION = 1
 PLATFORM = "linux/amd64"
 HEX_LEN = 64
 SHA_LEN = 40
+SOURCE_CONSUMER_CONTRACT = 1
+SOURCE_CONSUMER_CONTRACT_NAME = "SOURCE_CONSUMER_CONTRACT"
+IMAGE_STORE_LOCK_DIR = Path("/run/ocu-image-store")
+METADATA_JSON_LIMIT = 20 * 1024 * 1024
+METADATA_MEMBER_LIMIT = 256
+METADATA_TRAVERSAL_LIMIT = 32
+METADATA_INDEX_DEPTH = 2
+OCI_LAYOUT_VERSION = "1.0.0"
+OCI_LAYOUT_FILE = "oci-layout"
+OCI_INDEX_FILE = "index.json"
+OCI_BLOBS_DIR = "blobs"
+ANNOTATION_IMAGE_NAME = "io.containerd.image.name"
+ANNOTATION_REF_NAME = "org.opencontainers.image.ref.name"
+ANNOTATION_MANIFEST_SUBJECT = "containerd.io/manifest.subject"
+ATTESTATION_TYPE_KEY = "vnd.docker.reference.type"
+ATTESTATION_MANIFEST = "attestation-manifest"
+OCI_INDEX_MEDIA = "application/vnd.oci.image.index.v1+json"
+DOCKER_INDEX_MEDIA = "application/vnd.docker.distribution.manifest.list.v2+json"
+OCI_MANIFEST_MEDIA = "application/vnd.oci.image.manifest.v1+json"
+DOCKER_MANIFEST_MEDIA = "application/vnd.docker.distribution.manifest.v2+json"
+CANCELLATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 ROLE_ORDER = (
     "workspace",
     "computer-use-server",
@@ -56,11 +80,18 @@ SOURCE_BIND_PATHS = (
     "openwebui/tools/computer_use_tools.py",
     "openwebui/functions/computer_link_filter.py",
 )
+SOURCE_CONSUMER_PATHS = (
+    "deploy/release.py",
+    "deploy/up.sh",
+    "deploy/production-like-test/scripts/bootstrap-test.sh",
+    "deploy/production-like-test/scripts/write-deployed-version.sh",
+)
 INVENTORY_REQUIRED = (
     "format_version",
     "platform",
     "ocu_source_sha",
     "webui_source_sha",
+    "source_consumer_contract",
     "source_bundle",
     "images",
 )
@@ -95,10 +126,8 @@ DRAWIO_INVENTORY_RELATIVE = "computer-use-server/drawio/inventory.json"
 HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_WHEEL_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 PINNED_ASSIGNMENT_RE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*=\s*([\"'])([^\"']+)\2\s*$")
-OCI_METADATA_NAMES = {
-    "index.json",
-    "oci-layout",
-}
+
+_PINNED_DOCKER_HOST: str | None = None
 
 
 ROLE_SPECS = {
@@ -176,12 +205,17 @@ def is_hex(value: str, length: int) -> bool:
 
 
 def docker(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    if _PINNED_DOCKER_HOST:
+        env["DOCKER_HOST"] = _PINNED_DOCKER_HOST
+        env.pop("DOCKER_CONTEXT", None)
     return subprocess.run(
         ["docker", *args],
         cwd=None if cwd is None else str(cwd),
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
 
 
@@ -209,6 +243,838 @@ def require_command(result: subprocess.CompletedProcess, action: str) -> str:
     if isinstance(stdout, bytes):
         return stdout.decode("utf-8")
     return stdout
+
+
+
+def decode_json_bytes(data: bytes, label: str):
+    if len(data) > METADATA_JSON_LIMIT:
+        raise ReleaseError(f"{label} exceeds the metadata size bound")
+    decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_keys)
+    try:
+        text = data.decode("utf-8")
+        payload, index = decoder.raw_decode(text)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"{label} is not valid JSON") from exc
+    if index != len(text.rstrip()):
+        trailing = text[index:].strip()
+        if trailing:
+            raise ReleaseError(f"{label} contains trailing data")
+    return payload
+
+
+@contextlib.contextmanager
+def _blocked_signals():
+    if hasattr(signal, "pthread_sigmask"):
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        return
+    yield
+
+
+def _lstat(path: Path):
+    try:
+        return path.lstat()
+    except OSError as exc:
+        raise ReleaseError(f"cannot inspect {path}: {exc}") from exc
+
+
+def _require_private_dir(path: Path, info) -> None:
+    if stat.S_ISLNK(info.st_mode):
+        raise ReleaseError(f"{path}: lock directory is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        raise ReleaseError(f"{path}: lock directory is not a directory")
+    if info.st_uid != os.geteuid():
+        raise ReleaseError(f"{path}: lock directory is not owned by the current user")
+    if info.st_mode & 0o022:
+        raise ReleaseError(f"{path}: lock directory is world/group writable")
+
+
+def _ensure_lock_dir(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        _require_private_dir(path, _lstat(path))
+        return
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as cop:
+        raise ReleaseError(f"cannot create lock directory {path}: {cop}") from cop
+    _require_private_dir(path, _lstat(path))
+
+
+def _parse_context_host(payload) -> str:
+    if isinstance(payload, list) and payload:
+        payload = payload[0]
+    if not isinstance(payload, dict):
+        raise ReleaseError("docker context inspect returned malformed JSON")
+    endpoints = payload.get("Endpoints") or payload.get("endpoints") or {}
+    if isinstance(endpoints, dict):
+        docker_endpoint = endpoints.get("docker") or endpoints.get("Docker") or {}
+        if isinstance(docker_endpoint, dict):
+            host = str(docker_endpoint.get("Host") or docker_endpoint.get("host") or "")
+            if host:
+                return host
+    metadata = payload.get("Metadata") or payload.get("metadata") or {}
+    if isinstance(metadata, dict):
+        host = str(metadata.get("Host") or metadata.get("host") or "")
+        if host:
+            return host
+    raise ReleaseError("selected Docker context does not name a host endpoint")
+
+
+def selected_docker_host() -> str:
+    if os.environ.get("DOCKER_HOST", "").strip():
+        return os.environ["DOCKER_HOST"].strip()
+    result = subprocess.run(
+        ["docker", "context", "inspect"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise ReleaseError(
+            "cannot inspect the selected Docker context"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReleaseError("docker context inspect returned malformed JSON") from exc
+    return _parse_context_host(payload)
+
+
+def require_local_docker_host(host: str) -> str:
+    text = str(host or "").strip()
+    if not text:
+        raise ReleaseError("selected Docker host is empty")
+    if text.startswith("unix://"):
+        return text
+    if text.startswith("npipe://") or text.startswith("fd://"):
+        return text
+    if "://" not in text and text.startswith("/"):
+        return "unix://" + text
+    raise ReleaseError(
+        "remote Docker daemon coordination is unsupported; use a local unix socket"
+    )
+
+
+def pin_local_docker_host() -> str:
+    global _PINNED_DOCKER_HOST
+    host = require_local_docker_host(selected_docker_host())
+    _PINNED_DOCKER_HOST = host
+    return host
+
+
+def local_daemon_identity() -> str:
+    pin_local_docker_host()
+    result = docker("info", "--format", "{{json .}}")
+    require_command(result, "inspect local Docker daemon")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReleaseError("docker info returned malformed JSON") from exc
+    if not isinstance(payload, dict):
+        raise ReleaseError("docker info returned malformed JSON")
+    identity = str(payload.get("ID") or payload.get("id") or "").strip()
+    if not identity:
+        raise ReleaseError("docker info did not report a daemon identity")
+    return identity
+
+
+def image_store_lock_path(identity: str) -> Path:
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return IMAGE_STORE_LOCK_DIR / f"{digest}.lock"
+
+
+class ImageStoreLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.fd = None
+
+    def __enter__(self):
+        _ensure_lock_dir(self.path.parent)
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+        try:
+            self.fd = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ReleaseError(f"image-store lock {self.path} is a symlink") from exc
+            raise ReleaseError(f"cannot open image-store lock {self.path}: {exc}") from exc
+        try:
+            info = os.fstat(self.fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ReleaseError(f"image-store lock {self.path} is not a regular file")
+            if info.st_uid != os.geteuid():
+                raise ReleaseError(
+                    f"image-store lock {self.path} is not owned by the current user"
+                )
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                raise ReleaseError(
+                    f"image-store lock {self.path} must be mode 0600"
+                )
+            if info.st_nlink != 1:
+                raise ReleaseError(
+                    f"image-store lock {self.path} has unexpected link count"
+                )
+            path_info = _lstat(self.path)
+            if (
+                path_info.st_ino != info.st_ino
+                or path_info.st_dev != info.st_dev
+            ):
+                raise ReleaseError(
+                    f"image-store lock {self.path} changed during acquisition"
+                )
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(self.fd)
+            self.fd = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+def acquire_exclusive(dest: Path) -> Path:
+    lock_path = dest.with_name(dest.name + ".publish.lock")
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError as cop:
+        raise ReleaseError(f"publication already in progress for {dest}") from cop
+    os.close(fd)
+    return lock_path
+
+
+def release_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+class PublicationSession:
+    def __init__(self, dest: Path) -> None:
+        self.dest = dest
+        self.lock_path: Path | None = None
+        self.stage: Path | None = None
+        self.snapshots: Path | None = None
+        self.committed = False
+        self._owns_lock = False
+
+    def acquire(self) -> Path:
+        parent = self.dest.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        with _blocked_signals():
+            self.lock_path = acquire_exclusive(self.dest)
+            self._owns_lock = True
+        return self.lock_path
+
+    def allocate_stage(self) -> Path:
+        if self.lock_path is None:
+            raise ReleaseError(f"publication reservation is missing for {self.dest}")
+        try:
+            self.stage = Path(
+                tempfile.mkdtemp(
+                    prefix=f"{self.dest.name}.stage-", dir=str(self.dest.parent)
+                )
+            )
+        except OSError as cop:
+            raise ReleaseError(f"cannot allocate staging for {self.dest}: {cop}") from cop
+        return self.stage
+
+    def allocate_snapshots(self) -> Path:
+        if self.lock_path is None:
+            raise ReleaseError(f"publication reservation is missing for {self.dest}")
+        try:
+            self.snapshots = Path(
+                tempfile.mkdtemp(prefix="ocu-release-src-", dir=str(self.dest.parent))
+            )
+        except OSError as cop:
+            raise ReleaseError(
+                f"cannot allocate source snapshots for {self.dest}: {cop}"
+            ) from cop
+        return self.snapshots
+
+    def cleanup(self) -> None:
+        if not self.committed and self.stage is not None:
+            shutil.rmtree(self.stage, ignore_errors=True)
+            self.stage = None
+        if self.snapshots is not None:
+            shutil.rmtree(self.snapshots, ignore_errors=True)
+            self.snapshots = None
+        if self._owns_lock and self.lock_path is not None:
+            release_lock(self.lock_path)
+            self._owns_lock = False
+
+
+def normalize_docker_ref(reference: str) -> str:
+    text = str(reference or "").strip()
+    if not text or any(ch.isspace() for ch in text) or "@sha256:" in text:
+        raise ReleaseError(f"invalid imported reference {reference!r}")
+    name, sep, tag = text.rpartition(":")
+    if not sep or "/" in tag:
+        name, tag = text, "latest"
+    if not name or not tag:
+        raise ReleaseError(f"invalid imported reference {reference!r}")
+    if "/" not in name:
+        name = "docker.io/library/" + name
+    else:
+        registry = name.split("/", 1)[0]
+        if "." not in registry and ":" not in registry and registry != "localhost":
+            name = "docker.io/" + name
+    return f"{name}:{tag}"
+
+
+def familiar_docker_ref(reference: str) -> str:
+    normalized = normalize_docker_ref(reference)
+    if normalized.startswith("docker.io/library/"):
+        return normalized[len("docker.io/library/") :]
+    if normalized.startswith("docker.io/"):
+        return normalized[len("docker.io/") :]
+    return normalized
+
+
+def oci_ref_name(reference: str) -> str:
+    normalized = normalize_docker_ref(reference)
+    _, _, tag = normalized.rpartition(":")
+    return tag
+
+
+def alias_set(reference: str) -> set[str]:
+    normalized = normalize_docker_ref(reference)
+    aliases = {normalized, familiar_docker_ref(normalized)}
+    if normalized.startswith("docker.io/") and not normalized.startswith(
+        "docker.io/library/"
+    ):
+        aliases.add(normalized[len("docker.io/") :])
+    return {item for item in aliases if item}
+
+
+def require_digest(value: str, label: str) -> str:
+    text = str(value or "")
+    if not text.startswith("sha256:") or not is_hex(text[7:], HEX_LEN):
+        raise ReleaseError(f"{label} is not a sha256 digest")
+    return text
+
+
+def require_size(value, label: str) -> int:
+    try:
+        size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseError(f"{label} size is invalid") from exc
+    if size < 0:
+        raise ReleaseError(f"{label} size is invalid")
+    return size
+
+
+def canonical_member_name(name: str, archive: Path) -> str:
+    text = name[2:] if name.startswith("./") else name
+    if not text or text.startswith("/") or ".." in Path(text).parts:
+        raise ReleaseError(f"{archive}: unsafe archive member {name}")
+    return text
+
+
+def blob_member_name(digest: str) -> str:
+    return f"{OCI_BLOBS_DIR}/sha256/{digest[7:]}"
+
+
+def _tar_regular(member) -> bool:
+    return member.isfile() and not member.issym() and not member.islnk()
+
+
+def read_archive_member(bundle: tarfile.TarFile, names: dict[str, tarfile.TarInfo], name: str, archive: Path, *, limit: int | None = None) -> bytes:
+    member = names.get(name)
+    if member is None or not _tar_regular(member):
+        raise ReleaseError(f"{archive}: missing regular member {name}")
+    bound = METADATA_JSON_LIMIT if limit is None else limit
+    if member.size > bound:
+        raise ReleaseError(f"{archive}: {name} exceeds the metadata size bound")
+    extracted = bundle.extractfile(member)
+    if extracted is None:
+        raise ReleaseError(f"{archive}: {name} is not a regular file")
+    with extracted:
+        data = extracted.read(bound + 1)
+    if len(data) != member.size:
+        raise ReleaseError(f"{archive}: {name} size does not match its header")
+    return data
+
+
+def require_blob(
+    bundle: tarfile.TarFile,
+    names: dict[str, tarfile.TarInfo],
+    digest: str,
+    size: int,
+    archive: Path,
+    *,
+    limit: int | None = None,
+) -> bytes:
+    name = blob_member_name(digest)
+    data = read_archive_member(bundle, names, name, archive, limit=limit)
+    if size != len(data):
+        raise ReleaseError(f"{archive}: {name} size does not match its descriptor")
+    actual = "sha256:" + sha256_bytes(data)
+    if actual != digest:
+        raise ReleaseError(f"{archive}: {name} digest does not match its descriptor")
+    return data
+
+
+def descriptor_platform(desc: dict) -> str | None:
+    platform = desc.get("platform")
+    if platform is None:
+        return None
+    if not isinstance(platform, dict):
+        raise ReleaseError("archive descriptor platform is not an object")
+    os_name = str(platform.get("os") or "")
+    architecture = str(platform.get("architecture") or "")
+    if not os_name or not architecture:
+        raise ReleaseError("archive descriptor platform is incomplete")
+    variant = str(platform.get("variant") or "")
+    if variant:
+        return f"{os_name}/{architecture}/{variant}"
+    return f"{os_name}/{architecture}"
+
+
+def record_mapping(
+    mappings: dict[str, dict],
+    reference: str,
+    digest: str,
+    platform: str,
+    archive: Path,
+) -> None:
+    for alias in alias_set(reference):
+        current = mappings.get(alias)
+        if current is None:
+            mappings[alias] = {"digest": digest, "platform": platform}
+            continue
+        if current["digest"] != digest or current["platform"] != platform:
+            raise ReleaseError(f"{archive}: conflicting imported reference {alias}")
+
+
+def parse_docker_manifest(
+    archive: Path,
+    bundle: tarfile.TarFile,
+    names: dict[str, tarfile.TarInfo],
+    data: bytes,
+) -> dict[str, dict]:
+    manifest = decode_json_bytes(data, f"{archive}: manifest.json")
+    if not isinstance(manifest, list):
+        raise ReleaseError(f"{archive}: manifest.json must be a list")
+    mappings: dict[str, dict] = {}
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            raise ReleaseError(f"{archive}: manifest entry is not an object")
+        config_name = str(entry.get("Config") or "")
+        if not config_name:
+            raise ReleaseError(f"{archive}: manifest entry is missing Config")
+        config_name = canonical_member_name(config_name, archive)
+        config_bytes = read_archive_member(bundle, names, config_name, archive)
+        digest = "sha256:" + sha256_bytes(config_bytes)
+        config_payload = decode_json_bytes(
+            config_bytes, f"{archive}: configuration {config_name}"
+        )
+        if not isinstance(config_payload, dict):
+            raise ReleaseError(f"{archive}: configuration {config_name} is not an object")
+        os_name = str(config_payload.get("os") or "")
+        architecture = str(config_payload.get("architecture") or "")
+        if not os_name or not architecture:
+            raise ReleaseError(
+                f"{archive}: configuration {config_name} is missing platform metadata"
+            )
+        platform = f"{os_name}/{architecture}"
+        tags = entry.get("RepoTags")
+        if tags is None:
+            tags = []
+        if not isinstance(tags, list):
+            raise ReleaseError(f"{archive}: RepoTags must be a list")
+        for tag in tags:
+            if not isinstance(tag, str) or not tag:
+                raise ReleaseError(f"{archive}: empty imported reference")
+            record_mapping(mappings, tag, digest, platform, archive)
+        layers = entry.get("Layers")
+        if layers is None:
+            layers = []
+        if not isinstance(layers, list):
+            raise ReleaseError(f"{archive}: Layers must be a list")
+        for layer in layers:
+            if not isinstance(layer, str) or not layer:
+                raise ReleaseError(f"{archive}: empty layer member")
+            canonical_member_name(layer, archive)
+            member = names.get(canonical_member_name(layer, archive))
+            if member is None or not _tar_regular(member):
+                raise ReleaseError(f"{archive}: missing layer {layer}")
+    if "repositories" in names:
+        repositories = decode_json_bytes(
+            read_archive_member(bundle, names, "repositories", archive),
+            f"{archive}: repositories",
+        )
+        if not isinstance(repositories, dict):
+            raise ReleaseError(f"{archive}: repositories must be an object")
+        for name, tags in repositories.items():
+            if not isinstance(tags, dict):
+                raise ReleaseError(f"{archive}: repositories[{name}] must be an object")
+            for label, value in tags.items():
+                tag = f"{name}:{label}"
+                digest_value = str(value)
+                if not digest_value.startswith("sha256:"):
+                    digest_value = (
+                        "sha256:" + digest_value
+                        if is_hex(digest_value, HEX_LEN)
+                        else digest_value
+                    )
+                aliases = alias_set(tag)
+                matched = next((mappings[alias] for alias in aliases if alias in mappings), None)
+                if matched is None:
+                    raise ReleaseError(
+                        f"{archive}: repositories names undeclared reference {tag}"
+                    )
+                if matched["digest"] != digest_value and matched["digest"][7:] != str(value):
+                    raise ReleaseError(f"{archive}: repositories conflict for {tag}")
+    return mappings
+
+
+def parse_oci_image_manifest(
+    archive: Path,
+    bundle: tarfile.TarFile,
+    names: dict[str, tarfile.TarInfo],
+    desc: dict,
+    data: bytes,
+) -> tuple[str, str]:
+    payload = decode_json_bytes(data, f"{archive}: image manifest")
+    if not isinstance(payload, dict):
+        raise ReleaseError(f"{archive}: image manifest is not an object")
+    if payload.get("subject") not in (None, {}):
+        raise ReleaseError(f"{archive}: unsupported nested image subject")
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        raise ReleaseError(f"{archive}: image manifest is missing config")
+    config_digest = require_digest(str(config.get("digest") or ""), f"{archive}: config digest")
+    config_size = require_size(config.get("size"), f"{archive}: config")
+    config_bytes = require_blob(
+        bundle, names, config_digest, config_size, archive
+    )
+    config_payload = decode_json_bytes(config_bytes, f"{archive}: configuration blob")
+    if not isinstance(config_payload, dict):
+        raise ReleaseError(f"{archive}: configuration blob is not an object")
+    os_name = str(config_payload.get("os") or "")
+    architecture = str(config_payload.get("architecture") or "")
+    if not os_name or not architecture:
+        raise ReleaseError(f"{archive}: configuration blob is missing platform metadata")
+    platform = descriptor_platform(desc) or f"{os_name}/{architecture}"
+    if platform != f"{os_name}/{architecture}":
+        raise ReleaseError(
+            f"{archive}: descriptor platform {platform} does not match configuration {os_name}/{architecture}"
+        )
+    layers = payload.get("layers")
+    if layers is None:
+        layers = []
+    if not isinstance(layers, list):
+        raise ReleaseError(f"{archive}: image layers must be a list")
+    for layer in layers:
+        if not isinstance(layer, dict):
+            raise ReleaseError(f"{archive}: layer descriptor is not an object")
+        digest = require_digest(str(layer.get("digest") or ""), f"{archive}: layer digest")
+        size = require_size(layer.get("size"), f"{archive}: layer")
+        member = names.get(blob_member_name(digest))
+        if member is None or not _tar_regular(member):
+            raise ReleaseError(f"{archive}: missing layer blob {digest}")
+        if member.size != size:
+            raise ReleaseError(f"{archive}: layer blob {digest} size does not match its descriptor")
+    return config_digest, platform
+
+def parse_oci_index(
+    archive: Path,
+    bundle: tarfile.TarFile,
+    names: dict[str, tarfile.TarInfo],
+    data: bytes,
+    *,
+    depth: int = 0,
+    remaining: list[int],
+    inherited_name: str | None = None,
+) -> dict[str, dict]:
+    if depth > METADATA_INDEX_DEPTH:
+        raise ReleaseError(f"{archive}: nested index depth is unsupported")
+    payload = decode_json_bytes(data, f"{archive}: OCI index")
+    if not isinstance(payload, dict):
+        raise ReleaseError(f"{archive}: OCI index is not an object")
+    manifests = payload.get("manifests")
+    if not isinstance(manifests, list):
+        raise ReleaseError(f"{archive}: OCI index manifests must be a list")
+    mappings: dict[str, dict] = {}
+    for desc in manifests:
+        remaining[0] -= 1
+        if remaining[0] < 0:
+            raise ReleaseError(f"{archive}: OCI metadata traversal exceeded its bound")
+        if not isinstance(desc, dict):
+            raise ReleaseError(f"{archive}: OCI descriptor is not an object")
+        media = str(desc.get("mediaType") or "")
+        digest = require_digest(str(desc.get("digest") or ""), f"{archive}: descriptor digest")
+        size = require_size(desc.get("size"), f"{archive}: descriptor")
+        child = require_blob(bundle, names, digest, size, archive)
+        annotations = desc.get("annotations") or {}
+        if annotations is None:
+            annotations = {}
+        if not isinstance(annotations, dict):
+            raise ReleaseError(f"{archive}: descriptor annotations must be an object")
+        image_name = annotations.get(ANNOTATION_IMAGE_NAME) or inherited_name
+        if (
+            annotations.get(ATTESTATION_TYPE_KEY) == ATTESTATION_MANIFEST
+            or ANNOTATION_MANIFEST_SUBJECT in annotations
+            or desc.get("artifactType")
+        ):
+            if image_name:
+                raise ReleaseError(
+                    f"{archive}: attestation metadata names a runtime reference"
+                )
+            continue
+        if media in {OCI_INDEX_MEDIA, DOCKER_INDEX_MEDIA} or media.endswith(
+            "manifest.list.v2+json"
+        ):
+            nested = parse_oci_index(
+                archive,
+                bundle,
+                names,
+                child,
+                depth=depth + 1,
+                remaining=remaining,
+                inherited_name=image_name if isinstance(image_name, str) else None,
+            )
+            for tag, info in nested.items():
+                record_mapping(mappings, tag, info["digest"], info["platform"], archive)
+            continue
+        if media not in {OCI_MANIFEST_MEDIA, DOCKER_MANIFEST_MEDIA} and media:
+            raise ReleaseError(f"{archive}: unsupported OCI media type {media}")
+        image_digest, platform = parse_oci_image_manifest(
+            archive, bundle, names, desc, child
+        )
+        if image_name:
+            if not isinstance(image_name, str) or not image_name:
+                raise ReleaseError(f"{archive}: empty OCI image name")
+            record_mapping(mappings, image_name, image_digest, platform, archive)
+        elif annotations.get(ANNOTATION_REF_NAME):
+            raise ReleaseError(
+                f"{archive}: org.opencontainers.image.ref.name is not a complete image reference"
+            )
+        elif inherited_name:
+            record_mapping(mappings, inherited_name, image_digest, platform, archive)
+        elif depth == 0:
+            raise ReleaseError(f"{archive}: unnamed OCI manifest is unsupported")
+    return mappings
+
+
+def parse_oci_layout(
+    archive: Path,
+    bundle: tarfile.TarFile,
+    names: dict[str, tarfile.TarInfo],
+) -> dict[str, dict]:
+    layout = decode_json_bytes(
+        read_archive_member(bundle, names, OCI_LAYOUT_FILE, archive),
+        f"{archive}: oci-layout",
+    )
+    if not isinstance(layout, dict):
+        raise ReleaseError(f"{archive}: oci-layout is not an object")
+    version = str(layout.get("imageLayoutVersion") or "")
+    if version != OCI_LAYOUT_VERSION:
+        raise ReleaseError(f"{archive}: unsupported OCI layout version {version}")
+    if OCI_INDEX_FILE not in names:
+        raise ReleaseError(f"{archive}: missing index.json")
+    return parse_oci_index(
+        archive,
+        bundle,
+        names,
+        read_archive_member(bundle, names, OCI_INDEX_FILE, archive),
+        remaining=[METADATA_TRAVERSAL_LIMIT],
+    )
+
+
+def agree_reference_maps(
+    docker_map: dict[str, dict], oci_map: dict[str, dict], archive: Path
+) -> dict[str, dict]:
+    combined: dict[str, dict] = {}
+    for source in (docker_map, oci_map):
+        for tag, info in source.items():
+            record_mapping(combined, tag, info["digest"], info["platform"], archive)
+    docker_normalized = {
+        normalize_docker_ref(tag): info for tag, info in docker_map.items()
+    }
+    oci_normalized = {normalize_docker_ref(tag): info for tag, info in oci_map.items()}
+    if set(docker_normalized) != set(oci_normalized):
+        raise ReleaseError(
+            f"{archive}: Docker and OCI reference maps do not agree"
+        )
+    for tag, info in docker_normalized.items():
+        other = oci_normalized[tag]
+        if info["digest"] != other["digest"] or info["platform"] != other["platform"]:
+            raise ReleaseError(
+                f"{archive}: Docker and OCI configuration identities disagree for {tag}"
+            )
+    return combined
+
+
+def inspect_archive_bytes(archive: Path) -> dict[str, dict]:
+    require_regular_file(archive)
+    with tarfile.open(archive, "r") as bundle:
+        members = bundle.getmembers()
+        if len(members) > METADATA_MEMBER_LIMIT:
+            raise ReleaseError(f"{archive}: too many archive members")
+        names: dict[str, tarfile.TarInfo] = {}
+        for member in members:
+            name = canonical_member_name(member.name, archive)
+            if name in names:
+                raise ReleaseError(f"{archive}: duplicate archive member {name}")
+            if member.issym() or member.islnk():
+                raise ReleaseError(f"{archive}: archive member {name} is a link")
+            names[name] = member
+        has_layout = OCI_LAYOUT_FILE in names
+        has_index = OCI_INDEX_FILE in names
+        has_docker = "manifest.json" in names
+        if has_layout ^ has_index:
+            raise ReleaseError(f"{archive}: OCI layout and index must both be present")
+        docker_map: dict[str, dict] = {}
+        if has_docker:
+            docker_map = parse_docker_manifest(
+                archive,
+                bundle,
+                names,
+                read_archive_member(bundle, names, "manifest.json", archive),
+            )
+        if has_layout:
+            if not has_docker:
+                raise ReleaseError(
+                    f"{archive}: canonical hybrid archives require Docker manifest.json"
+                )
+            oci_map = parse_oci_layout(archive, bundle, names)
+            return agree_reference_maps(docker_map, oci_map, archive)
+        if not has_docker:
+            raise ReleaseError(f"{archive}: missing manifest.json")
+        return docker_map
+
+
+def existing_reference(reference: str) -> dict | None:
+    seen: dict[str, dict] = {}
+    for alias in sorted(alias_set(reference)):
+        result = docker("image", "inspect", alias)
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip().lower()
+            if "no such image" in detail or "not found" in detail:
+                continue
+            raise ReleaseError(
+                f"inspect existing {alias} failed: {(result.stderr or '').strip()}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ReleaseError(
+                f"inspect existing {alias} returned malformed JSON"
+            ) from exc
+        if isinstance(payload, list):
+            payload = payload[0] if payload else {}
+        if not isinstance(payload, dict):
+            continue
+        seen[alias] = payload
+    if not seen:
+        return None
+    identities = {image_identity(payload)[0] for payload in seen.values()}
+    if len(identities) != 1:
+        raise ReleaseError(f"existing image {reference} has conflicting aliases")
+    return next(iter(seen.values()))
+
+
+def reject_existing_conflicts(imported: dict[str, dict]) -> None:
+    for reference, info in imported.items():
+        existing = existing_reference(reference)
+        if existing is None:
+            continue
+        image_id, _platform = image_identity(existing)
+        if image_id != info["digest"]:
+            raise ReleaseError(f"existing image {reference} conflicts with the release")
+
+def reject_occupied_reference(reference: str) -> None:
+    if existing_reference(reference) is not None:
+        raise ReleaseError(f"existing image {reference} conflicts with the release")
+
+
+def reject_output_conflict(reference: str, image_id: str) -> None:
+    existing = existing_reference(reference)
+    if existing is None:
+        return
+    found, _platform = image_identity(existing)
+    if found != image_id:
+        raise ReleaseError(f"existing image {reference} conflicts with the release")
+
+
+def source_consumer_contract_from_tree(root: Path) -> int:
+    path = require_tracked_regular_file(root, "deploy/release.py")
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, UnicodeError, SyntaxError) as exc:
+        raise ReleaseError("selected source is missing a supported consumer contract") from exc
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id != SOURCE_CONSUMER_CONTRACT_NAME:
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, int):
+            return node.value.value
+        raise ReleaseError("selected source consumer contract is not an integer literal")
+    raise ReleaseError("selected source is missing a supported consumer contract")
+
+
+def require_supported_source_contract(root: Path, expected: str | None = None) -> int:
+    for relative in SOURCE_CONSUMER_PATHS:
+        require_tracked_regular_file(root, relative)
+    contract = source_consumer_contract_from_tree(root)
+    if contract != SOURCE_CONSUMER_CONTRACT:
+        raise ReleaseError(
+            f"selected source consumer contract {contract} is unsupported"
+        )
+    if expected is not None and str(expected) != str(contract):
+        raise ReleaseError("source consumer contract does not match the inventory")
+    return contract
+
+
+def retained_cache_error(exc: BaseException) -> ReleaseError:
+    message = str(exc)
+    if "image cache entries may remain" in message:
+        return ReleaseError(message)
+    return ReleaseError(f"{message}; image cache entries may remain and were not deleted")
+
+
+def verify_source_bundle(
+    root: Path, payload: dict, *, reconstruct_into: Path | None = None
+) -> str:
+    bundle_rel = payload["source_bundle"]["path"]
+    bundle = relative_archive_path(root, bundle_rel)
+    require_regular_file(bundle)
+    if sha256_file(bundle) != payload["source_bundle"]["sha256"]:
+        raise ReleaseError("source bundle checksum mismatch")
+    owned = reconstruct_into is None
+    dest = reconstruct_into or Path(
+        tempfile.mkdtemp(prefix="ocu-source-verify-", dir=str(root.parent))
+    )
+    try:
+        reconstructed = reconstruct_source(bundle, dest)
+        if reconstructed != payload["ocu_source_sha"]:
+            raise ReleaseError(
+                "reconstructed source commit does not match the inventory"
+            )
+        verify_tracked_source(dest, payload["ocu_source_sha"])
+        require_supported_source_contract(
+            dest, payload.get("source_consumer_contract")
+        )
+        return reconstructed
+    finally:
+        if owned:
+            shutil.rmtree(dest, ignore_errors=True)
 
 
 def load_json_object(path: Path) -> dict:
@@ -807,7 +1673,9 @@ def image_identity(payload: dict) -> tuple[str, str]:
 
 
 def content_reference(role: str, image_id: str) -> str:
-    digest = image_id[7:19]
+    digest = image_id[7:]
+    if not is_hex(digest, HEX_LEN):
+        raise ReleaseError(f"{role}: configuration digest is not an image ID")
     if role == "workspace":
         return f"open-computer-use:{digest}"
     return f"ocu-{role}:{digest}"
@@ -882,6 +1750,11 @@ def validate_inventory_schema(payload: dict) -> None:
     webui_sha = str(payload.get("webui_source_sha") or "")
     if not is_hex(ocu_sha, SHA_LEN):
         raise ReleaseError("ocu_source_sha must be a full commit")
+    contract = payload.get("source_consumer_contract")
+    if not isinstance(contract, int) or isinstance(contract, bool):
+        raise ReleaseError("source_consumer_contract must be an integer")
+    if contract != SOURCE_CONSUMER_CONTRACT:
+        raise ReleaseError("source_consumer_contract is unsupported")
     if not is_hex(webui_sha, SHA_LEN):
         raise ReleaseError("webui_source_sha must be a full commit")
     source_bundle = payload.get("source_bundle")
@@ -1000,177 +1873,16 @@ def relative_archive_path(root: Path, value: str) -> Path:
     return path
 
 
-def inspect_archive_bytes(archive: Path) -> dict[str, dict]:
-    require_regular_file(archive)
-    mappings: dict[str, dict] = {}
-    with tarfile.open(archive, "r") as bundle:
-        members = bundle.getmembers()
-        names = []
-        seen = set()
-        for member in members:
-            name = member.name[2:] if member.name.startswith("./") else member.name
-            if not name or name.startswith("/") or ".." in Path(name).parts:
-                raise ReleaseError(f"{archive}: unsafe archive member {member.name}")
-            if name in seen:
-                raise ReleaseError(f"{archive}: duplicate archive member {name}")
-            seen.add(name)
-            names.append(name)
-            if member.issym() or member.islnk():
-                raise ReleaseError(f"{archive}: archive member {name} is a link")
-        metadata = [
-            name
-            for name in names
-            if name in OCI_METADATA_NAMES or name.startswith("blobs/")
-        ]
-        if metadata and "manifest.json" not in names:
-            raise ReleaseError(
-                f"{archive}: unsupported OCI import metadata {', '.join(sorted(metadata))}"
-            )
-        if "manifest.json" not in names:
-            raise ReleaseError(f"{archive}: missing manifest.json")
-        extracted = bundle.extractfile("manifest.json")
-        if extracted is None:
-            raise ReleaseError(f"{archive}: manifest.json is not a regular file")
-        with extracted:
-            try:
-                manifest = json.loads(extracted.read().decode("utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise ReleaseError(
-                    f"{archive}: manifest.json is not valid JSON"
-                ) from exc
-        if not isinstance(manifest, list):
-            raise ReleaseError(f"{archive}: manifest.json must be a list")
-        configs: dict[str, bytes] = {}
-        for entry in manifest:
-            if not isinstance(entry, dict):
-                raise ReleaseError(f"{archive}: manifest entry is not an object")
-            config_name = str(entry.get("Config") or "")
-            if not config_name:
-                raise ReleaseError(f"{archive}: manifest entry is missing Config")
-            config_member = bundle.extractfile(config_name)
-            if config_member is None:
-                raise ReleaseError(f"{archive}: missing configuration {config_name}")
-            with config_member:
-                config_bytes = config_member.read()
-            configs[config_name] = config_bytes
-            digest = "sha256:" + sha256_bytes(config_bytes)
-            try:
-                config_payload = json.loads(config_bytes.decode("utf-8"))
-            except (UnicodeError, json.JSONDecodeError) as exc:
-                raise ReleaseError(
-                    f"{archive}: configuration {config_name} is not JSON"
-                ) from exc
-            os_name = str(config_payload.get("os") or "")
-            architecture = str(config_payload.get("architecture") or "")
-            if not os_name or not architecture:
-                raise ReleaseError(
-                    f"{archive}: configuration {config_name} is missing platform metadata"
-                )
-            tags = entry.get("RepoTags")
-            if tags is None:
-                tags = []
-            if not isinstance(tags, list):
-                raise ReleaseError(f"{archive}: RepoTags must be a list")
-            for tag in tags:
-                if not isinstance(tag, str) or not tag:
-                    raise ReleaseError(f"{archive}: empty imported reference")
-                if tag in mappings and mappings[tag]["digest"] != digest:
-                    raise ReleaseError(
-                        f"{archive}: conflicting imported reference {tag}"
-                    )
-                mappings[tag] = {
-                    "digest": digest,
-                    "platform": f"{os_name}/{architecture}",
-                    "config": config_bytes,
-                }
-        if "repositories" in names:
-            extracted = bundle.extractfile("repositories")
-            if extracted is None:
-                raise ReleaseError(f"{archive}: repositories is not a regular file")
-            with extracted:
-                try:
-                    repositories = json.loads(extracted.read().decode("utf-8"))
-                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                    raise ReleaseError(
-                        f"{archive}: repositories is not valid JSON"
-                    ) from exc
-            if not isinstance(repositories, dict):
-                raise ReleaseError(f"{archive}: repositories must be an object")
-            for name, tags in repositories.items():
-                if not isinstance(tags, dict):
-                    raise ReleaseError(
-                        f"{archive}: repositories[{name}] must be an object"
-                    )
-                for label, value in tags.items():
-                    tag = f"{name}:{label}"
-                    digest_value = str(value)
-                    if not digest_value.startswith("sha256:"):
-                        digest_value = (
-                            "sha256:" + digest_value
-                            if is_hex(digest_value, HEX_LEN)
-                            else digest_value
-                        )
-                    if tag in mappings:
-                        if mappings[tag]["digest"] != digest_value and mappings[tag][
-                            "digest"
-                        ][7:] != str(value):
-                            raise ReleaseError(
-                                f"{archive}: repositories conflict for {tag}"
-                            )
-                    else:
-                        raise ReleaseError(
-                            f"{archive}: repositories names undeclared reference {tag}"
-                        )
-    return mappings
-
-
-def existing_reference(reference: str) -> dict | None:
-    result = docker("image", "inspect", reference)
-    if result.returncode != 0:
-        detail = (result.stderr or "").strip().lower()
-        if "no such image" in detail or "not found" in detail:
-            return None
-        raise ReleaseError(
-            f"inspect existing {reference} failed: {(result.stderr or '').strip()}"
-        )
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise ReleaseError(
-            f"inspect existing {reference} returned malformed JSON"
-        ) from exc
-    if isinstance(payload, list):
-        payload = payload[0] if payload else {}
-    if not isinstance(payload, dict):
-        return None
-    return payload
-
-
 def destination_occupied(dest: Path) -> bool:
     try:
         dest.lstat()
     except FileNotFoundError:
         return False
-    except OSError as exc:
-        raise ReleaseError(f"cannot inspect destination {dest}: {exc}") from exc
+    except OSError as cop:
+        raise ReleaseError(f"cannot inspect destination {dest}: {cop}") from cop
     return True
 
 
-def acquire_exclusive(dest: Path) -> Path:
-    lock_path = dest.with_name(dest.name + ".publish.lock")
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError as cop:
-        raise ReleaseError(f"publication already in progress for {dest}") from cop
-    os.close(fd)
-    return lock_path
-
-
-def release_lock(lock_path: Path) -> None:
-    try:
-        lock_path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def publish_exclusive(
@@ -1341,19 +2053,27 @@ def plan_role(
 def export_built_image(*, role: str, plan: dict, archive_dir: Path) -> dict:
     temp_tag = plan["temp_tag"]
     if plan["image_kind"] == "pull":
-        pull_image(temp_tag)
+        existing = existing_reference(temp_tag)
+        if existing is None:
+            pull_image(temp_tag)
+            payload = inspect_image(temp_tag)
+        else:
+            payload = existing
     else:
+        reject_occupied_reference(temp_tag)
         build_image(
             context=plan["context"],
             dockerfile=plan["dockerfile"],
             tag=temp_tag,
             arguments=plan["arguments"],
         )
-    payload = inspect_image(temp_tag)
+        payload = inspect_image(temp_tag)
     image_id, _platform = image_identity(payload)
     reference = content_reference(role, image_id)
     if reference != temp_tag:
-        tag_image(temp_tag, reference)
+        reject_output_conflict(reference, image_id)
+        if existing_reference(reference) is None:
+            tag_image(temp_tag, reference)
     archive_path = archive_dir / f"{role}.tar"
     save_image(reference, archive_path)
     repo_digests = payload.get("RepoDigests") or []
@@ -1401,12 +2121,11 @@ def build_release(
     unknown_roles = sorted(name for name in requested if name not in ROLE_ORDER)
     if unknown_roles:
         raise ReleaseError(f"unknown role {', '.join(unknown_roles)}")
-    parent = destination.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    lock_path = acquire_exclusive(destination)
-    stage = Path(tempfile.mkdtemp(prefix=f"{destination.name}.stage-", dir=str(parent)))
-    snapshots = Path(tempfile.mkdtemp(prefix="ocu-release-src-", dir=str(parent)))
+    session = PublicationSession(destination)
     try:
+        session.acquire()
+        stage = session.allocate_stage()
+        snapshots = session.allocate_snapshots()
         ocu_snap = snapshots / "ocu"
         webui_snap = snapshots / "webui"
         ocu_sha = snapshot_commit(ocu_source, ocu_snap)
@@ -1415,6 +2134,7 @@ def build_release(
         webui_tree = snapshots / "webui-tree"
         checkout_tracked_tree(ocu_snap, ocu_tree, ocu_sha)
         checkout_tracked_tree(webui_snap, webui_tree, webui_sha)
+        contract = require_supported_source_contract(ocu_tree)
         plans = {}
         for role in ROLE_ORDER:
             source_sha = webui_sha if ROLE_SPECS[role]["source"] == "webui" else ocu_sha
@@ -1429,29 +2149,29 @@ def build_release(
         images_dir = stage / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
         images = {}
-        for role in ROLE_ORDER:
-            images[role] = export_built_image(
-                role=role, plan=plans[role], archive_dir=images_dir
-            )
-        source_bundle = create_source_bundle(ocu_snap, stage / "source.bundle")
-        payload = {
-            "format_version": FORMAT_VERSION,
-            "platform": PLATFORM,
-            "ocu_source_sha": ocu_sha,
-            "webui_source_sha": webui_sha,
-            "source_bundle": source_bundle,
-            "images": images,
-        }
-        validate_inventory_schema(payload)
-        write_inventory(stage / "release.json", payload)
-        publish_exclusive(stage, destination, lock_path)
+        with ImageStoreLock(image_store_lock_path(local_daemon_identity())):
+            for role in ROLE_ORDER:
+                images[role] = export_built_image(
+                    role=role, plan=plans[role], archive_dir=images_dir
+                )
+            source_bundle = create_source_bundle(ocu_snap, stage / "source.bundle")
+            payload = {
+                "format_version": FORMAT_VERSION,
+                "platform": PLATFORM,
+                "ocu_source_sha": ocu_sha,
+                "webui_source_sha": webui_sha,
+                "source_consumer_contract": contract,
+                "source_bundle": source_bundle,
+                "images": images,
+            }
+            validate_inventory_schema(payload)
+            write_inventory(stage / "release.json", payload)
+            publish_exclusive(stage, destination, session.lock_path)
+        session.committed = True
+        session.stage = None
         return payload
-    except BaseException:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
     finally:
-        shutil.rmtree(snapshots, ignore_errors=True)
-        release_lock(lock_path)
+        session.cleanup()
 
 
 def create_source_bundle(ocu_root: Path, dest: Path) -> dict:
@@ -1512,7 +2232,10 @@ def load_inventory(path: Path) -> dict:
 def expected_imported_refs(payload: dict) -> dict[str, str]:
     mapping = {}
     for role, record in payload["images"].items():
-        mapping[record["reference"]] = record["configuration_digest"]
+        for alias in alias_set(record["reference"]):
+            if alias in mapping and mapping[alias] != record["configuration_digest"]:
+                raise ReleaseError(f"conflicting imported reference {alias}")
+            mapping[alias] = record["configuration_digest"]
         del role
     return mapping
 
@@ -1520,6 +2243,9 @@ def expected_imported_refs(payload: dict) -> dict[str, str]:
 def verify_archive_set(root: Path, payload: dict) -> dict[str, dict]:
     imported: dict[str, dict] = {}
     expected = expected_imported_refs(payload)
+    declared = {
+        normalize_docker_ref(record["reference"]) for record in payload["images"].values()
+    }
     for role in ROLE_ORDER:
         record = payload["images"][role]
         archive_path = relative_archive_path(root, record["archive"]["path"])
@@ -1528,16 +2254,17 @@ def verify_archive_set(root: Path, payload: dict) -> dict[str, dict]:
         if digest != record["archive"]["sha256"]:
             raise ReleaseError(f"{role}: archive checksum mismatch")
         mappings = inspect_archive_bytes(archive_path)
-        if record["reference"] not in mappings:
+        if not any(alias in mappings for alias in alias_set(record["reference"])):
             raise ReleaseError(
                 f"{role}: archive does not contain {record['reference']}"
             )
         for tag, info in mappings.items():
-            if tag not in expected:
+            normalized = normalize_docker_ref(tag)
+            if normalized not in expected:
                 raise ReleaseError(
                     f"{role}: archive contains undeclared reference {tag}"
                 )
-            if info["digest"] != expected[tag]:
+            if info["digest"] != expected[normalized]:
                 raise ReleaseError(
                     f"{role}: archive configuration digest for {tag} does not match the inventory"
                 )
@@ -1548,9 +2275,10 @@ def verify_archive_set(root: Path, payload: dict) -> dict[str, dict]:
             if tag in imported and imported[tag]["digest"] != info["digest"]:
                 raise ReleaseError(f"conflicting imported reference {tag}")
             imported[tag] = info
-    if set(imported) != set(expected):
-        missing = sorted(set(expected) - set(imported))
-        extra = sorted(set(imported) - set(expected))
+    present = {normalize_docker_ref(tag) for tag in imported}
+    if present != declared:
+        missing = sorted(declared - present)
+        extra = sorted(present - declared)
         detail = []
         if missing:
             detail.append("missing " + ", ".join(missing))
@@ -1562,15 +2290,6 @@ def verify_archive_set(root: Path, payload: dict) -> dict[str, dict]:
         )
     return imported
 
-
-def reject_existing_conflicts(imported: dict[str, dict]) -> None:
-    for reference, info in imported.items():
-        existing = existing_reference(reference)
-        if existing is None:
-            continue
-        image_id, _platform = image_identity(existing)
-        if image_id != info["digest"]:
-            raise ReleaseError(f"existing image {reference} conflicts with the release")
 
 
 def verify_loaded_images(payload: dict) -> None:
@@ -1590,30 +2309,24 @@ def import_release(*, delivery: Path, install_root: Path) -> dict:
         raise ReleaseError(f"install root already exists: {install_root}")
     inventory_path = delivery / "release.json"
     payload = load_inventory(inventory_path)
-    parent = install_root.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    lock_path = acquire_exclusive(install_root)
-    stage = Path(
-        tempfile.mkdtemp(prefix=f"{install_root.name}.stage-", dir=str(parent))
-    )
+    session = PublicationSession(install_root)
+    attempted_load = False
     try:
+        session.acquire()
+        stage = session.allocate_stage()
         staged_inventory = stage / "release.json"
         copy_regular(inventory_path, staged_inventory)
         staged_payload = load_inventory(staged_inventory)
         if staged_payload != payload:
             raise ReleaseError("staged inventory does not match the delivery inventory")
-        bundle_rel = staged_payload["source_bundle"]["path"]
         staged_bundle = stage / "source.bundle"
-        copy_regular(relative_archive_path(delivery, bundle_rel), staged_bundle)
-        if sha256_file(staged_bundle) != staged_payload["source_bundle"]["sha256"]:
-            raise ReleaseError("source bundle checksum mismatch")
+        copy_regular(
+            relative_archive_path(delivery, payload["source_bundle"]["path"]),
+            staged_bundle,
+        )
+        staged_payload["source_bundle"]["path"] = "source.bundle"
         source_dir = stage / "source"
-        reconstructed = reconstruct_source(staged_bundle, source_dir)
-        if reconstructed != staged_payload["ocu_source_sha"]:
-            raise ReleaseError(
-                "reconstructed source commit does not match the inventory"
-            )
-        verify_tracked_source(source_dir, staged_payload["ocu_source_sha"])
+        verify_source_bundle(stage, staged_payload, reconstruct_into=source_dir)
         staged_images = stage / "images"
         staged_images.mkdir()
         seen_paths = set()
@@ -1631,29 +2344,43 @@ def import_release(*, delivery: Path, install_root: Path) -> dict:
             if sha256_file(dest) != record["archive"]["sha256"]:
                 raise ReleaseError(f"{role}: staged archive checksum mismatch")
         imported = verify_archive_set(stage, staged_payload)
-        reject_existing_conflicts(imported)
-        for role in ROLE_ORDER:
-            archive = stage / staged_payload["images"][role]["archive"]["path"]
-            load_image(archive)
-        try:
-            verify_loaded_images(staged_payload)
-        except ReleaseError as exc:
-            raise ReleaseError(
-                f"{exc}; image cache entries may remain and were not deleted"
-            ) from exc
-        for path in (staged_bundle, staged_images):
-            if path.exists():
-                if path.is_dir():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink()
-        publish_exclusive(stage, install_root, lock_path)
+        with ImageStoreLock(image_store_lock_path(local_daemon_identity())):
+            reject_existing_conflicts(imported)
+            attempted_load = True
+            for role in ROLE_ORDER:
+                archive = stage / staged_payload["images"][role]["archive"]["path"]
+                try:
+                    load_image(archive)
+                except ReleaseError as cop:
+                    raise retained_cache_error(cop) from cop
+            try:
+                verify_loaded_images(staged_payload)
+            except ReleaseError as cop:
+                raise retained_cache_error(cop) from cop
+            for path in (staged_bundle, staged_images):
+                if path.exists():
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+            try:
+                publish_exclusive(stage, install_root, session.lock_path)
+            except ReleaseError as cop:
+                raise retained_cache_error(cop) from cop
+        session.committed = True
+        session.stage = None
         return staged_payload
-    except BaseException:
-        shutil.rmtree(stage, ignore_errors=True)
+    except BaseException as cop:
+        if attempted_load:
+            message = str(cop)
+            if "image cache entries may remain" not in message:
+                print(
+                    "release: image cache entries may remain and were not deleted",
+                    file=sys.stderr,
+                )
         raise
     finally:
-        release_lock(lock_path)
+        session.cleanup()
 
 
 def require_env(name: str) -> str:
@@ -1890,14 +2617,22 @@ def cmd_verify(args: argparse.Namespace) -> int:
         if args.mode == "images":
             verify_local_images(payload)
         elif args.mode == "delivery":
-            verify_archive_set(Path(args.delivery).resolve(), payload)
+            if not args.delivery:
+                raise ReleaseError("verify --mode delivery requires --delivery")
+            delivery = Path(args.delivery).resolve()
+            verify_source_bundle(delivery, payload)
+            verify_archive_set(delivery, payload)
         else:
-            verify_tracked_source(
-                Path(args.source).resolve(), payload["ocu_source_sha"]
+            if not args.source:
+                raise ReleaseError("verify --mode startup requires --source")
+            source = Path(args.source).resolve()
+            verify_tracked_source(source, payload["ocu_source_sha"])
+            require_supported_source_contract(
+                source, payload.get("source_consumer_contract")
             )
             verify_local_images(payload)
-    except ReleaseError as exc:
-        fail(str(exc))
+    except ReleaseError as cop:
+        fail(str(cop))
     print("release verification passed")
     return 0
 
@@ -1933,15 +2668,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    cancellation_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-
     def cancel(signum, _frame):
-        # Ignore repeated cancellation while owned subprocess/staging cleanup runs.
-        for sig in cancellation_signals:
+        for sig in CANCELLATION_SIGNALS:
             signal.signal(sig, signal.SIG_IGN)
         raise SystemExit(128 + signum)
 
-    previous = {sig: signal.signal(sig, cancel) for sig in cancellation_signals}
+    previous = {sig: signal.signal(sig, cancel) for sig in CANCELLATION_SIGNALS}
     try:
         parser = build_parser()
         args = parser.parse_args(argv)

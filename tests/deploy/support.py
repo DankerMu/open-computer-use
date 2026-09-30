@@ -79,6 +79,11 @@ DEFAULT_RELEASE_DIGESTS = {
 FORMAT_VERSION = 1
 PLATFORM = "linux/amd64"
 WEBUI_SYNTHETIC_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+SOURCE_CONSUMER_CONTRACT = 1
+HISTORICAL_INCOMPATIBLE_SOURCE = "f851621f7d425487c99b0f548dcb4dab06a9648e"
+OCI_LAYOUT_VERSION = "1.0.0"
+ANNOTATION_IMAGE_NAME = "io.containerd.image.name"
+ANNOTATION_REF_NAME = "org.opencontainers.image.ref.name"
 
 
 UP_FIXTURE_PATHS = (
@@ -100,6 +105,8 @@ UP_FIXTURE_PATHS = (
     "deploy/production-like-test/compose.webui.override.yml",
     "deploy/production-like-test/compose.proxy.yml",
     "deploy/production-like-test/init/run-init.sh",
+    "deploy/production-like-test/scripts/bootstrap-test.sh",
+    "deploy/production-like-test/scripts/write-deployed-version.sh",
     "openwebui/init.sh",
     "openwebui/tools/computer_use_tools.py",
     "openwebui/functions/computer_link_filter.py",
@@ -230,6 +237,28 @@ def intended_docs():
         "proxy.json": intended_proxy(),
     }
 
+def intended_docs_for_images(images: dict) -> dict:
+    docs = intended_docs()
+    mapping = {
+        "workspace": images["workspace"]["reference"],
+        "computer-use-server": images["computer-use-server"]["reference"],
+        "retention-guard": images["retention-guard"]["reference"],
+        "open-webui": images["open-webui"]["reference"],
+        "postgres": images["postgres"]["reference"],
+        "proxy": images["proxy"]["reference"],
+    }
+    core = docs["core.json"]
+    core["services"]["workspace"]["image"] = mapping["workspace"]
+    core["services"][OCU_SERVICE]["image"] = mapping["computer-use-server"]
+    core["services"][OCU_SERVICE]["environment"]["DOCKER_IMAGE"] = mapping["workspace"]
+    core["services"]["retention-guard"]["image"] = mapping["retention-guard"]
+    webui = docs["webui.json"]
+    webui["services"][WEBUI_SERVICE]["image"] = mapping["open-webui"]
+    webui["services"]["postgres"]["image"] = mapping["postgres"]
+    webui["services"]["open-webui-init"]["image"] = mapping["open-webui"]
+    docs["proxy.json"]["services"][PROXY_SERVICE]["image"] = mapping["proxy"]
+    return docs
+
 
 def write_json(path: Path, payload) -> Path:
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -286,6 +315,7 @@ def fake_env(state_dir: Path, extra=None):
     env["OCU_SANDBOX_EGRESS_ALLOW"] = DEFAULT_ALLOW
     env["OCU_SANDBOX_DNS"] = DEFAULT_DNS
     env["OCU_SANDBOX_EGRESS_LOCK"] = str(state_dir / "ocu-sandbox-egress.lock")
+    env["DOCKER_HOST"] = "unix://" + str(state_dir / "docker.sock")
     if extra:
         env.update(extra)
     return env
@@ -499,6 +529,7 @@ def synthetic_inventory(*, ocu_sha: str, webui_sha: str, images=None, bundle_sha
         "platform": PLATFORM,
         "ocu_source_sha": ocu_sha,
         "webui_source_sha": webui_sha,
+        "source_consumer_contract": SOURCE_CONSUMER_CONTRACT,
         "source_bundle": {
             "path": "source.bundle",
             "sha256": bundle_sha or hashlib.sha256(b"bundle").hexdigest(),
@@ -563,6 +594,188 @@ def write_image_archive(path: Path, tags: dict[str, bytes]) -> Path:
     return path
 
 
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def normalize_docker_ref(reference: str) -> str:
+    text = str(reference or "")
+    if not text or any(ch.isspace() for ch in text) or "@" in text:
+        raise ValueError(f"invalid docker reference {reference!r}")
+    name, sep, tag = text.rpartition(":")
+    if not sep or "/" in tag:
+        name, tag = text, "latest"
+    if "/" not in name:
+        name = "docker.io/library/" + name
+    else:
+        registry = name.split("/", 1)[0]
+        if "." not in registry and ":" not in registry and registry != "localhost":
+            name = "docker.io/" + name
+    return f"{name}:{tag}"
+
+
+def familiar_docker_ref(reference: str) -> str:
+    normalized = normalize_docker_ref(reference)
+    if normalized.startswith("docker.io/library/"):
+        return normalized[len("docker.io/library/") :]
+    if normalized.startswith("docker.io/"):
+        return normalized[len("docker.io/") :]
+    return normalized
+
+
+def oci_ref_name(reference: str) -> str:
+    normalized = normalize_docker_ref(reference)
+    return normalized.rsplit(":", 1)[1]
+
+
+def write_hybrid_image_archive(
+    path: Path,
+    *,
+    reference: str,
+    config: bytes,
+    extra_oci_names=(),
+    extra_index_descriptors=(),
+    nested_index=False,
+    attestation=None,
+    layer: bytes | None = None,
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    layer_bytes = b"ocu-hybrid-layer\n" if layer is None else layer
+    config_digest = _sha256_hex(config)
+    layer_digest = _sha256_hex(layer_bytes)
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": f"sha256:{config_digest}",
+            "size": len(config),
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": f"sha256:{layer_digest}",
+                "size": len(layer_bytes),
+            }
+        ],
+    }
+    manifest_bytes = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    manifest_digest = _sha256_hex(manifest_bytes)
+    named = [
+        {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": f"sha256:{manifest_digest}",
+            "size": len(manifest_bytes),
+            "platform": {"os": "linux", "architecture": "amd64"},
+            "annotations": {
+                ANNOTATION_IMAGE_NAME: normalize_docker_ref(reference),
+                ANNOTATION_REF_NAME: oci_ref_name(reference),
+            },
+        }
+    ]
+    for extra in extra_oci_names:
+        named.append(
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": f"sha256:{manifest_digest}",
+                "size": len(manifest_bytes),
+                "platform": {"os": "linux", "architecture": "amd64"},
+                "annotations": {
+                    ANNOTATION_IMAGE_NAME: normalize_docker_ref(extra),
+                    ANNOTATION_REF_NAME: oci_ref_name(extra),
+                },
+            }
+        )
+    blobs: dict[str, bytes] = {
+        config_digest: config,
+        layer_digest: layer_bytes,
+        manifest_digest: manifest_bytes,
+    }
+    index_manifests = list(named)
+    if nested_index:
+        child = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": named,
+        }
+        child_bytes = json.dumps(child, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        child_digest = _sha256_hex(child_bytes)
+        blobs[child_digest] = child_bytes
+        index_manifests = [
+            {
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "digest": f"sha256:{child_digest}",
+                "size": len(child_bytes),
+            }
+        ]
+    if attestation is not None:
+        subject = f"sha256:{manifest_digest}"
+        attestation_manifest = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": f"sha256:{config_digest}",
+                "size": len(config),
+            },
+            "layers": [],
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": subject,
+                "size": len(manifest_bytes),
+            },
+        }
+        attestation_bytes = json.dumps(
+            attestation_manifest, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        attestation_digest = _sha256_hex(attestation_bytes)
+        blobs[attestation_digest] = attestation_bytes
+        index_manifests.append(
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": f"sha256:{attestation_digest}",
+                "size": len(attestation_bytes),
+                "annotations": {
+                    "vnd.docker.reference.type": "attestation-manifest",
+                    "containerd.io/manifest.subject": subject,
+                },
+            }
+        )
+    index_manifests.extend(list(extra_index_descriptors))
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": index_manifests,
+    }
+    index_bytes = json.dumps(index, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    layout_bytes = json.dumps(
+        {"imageLayoutVersion": OCI_LAYOUT_VERSION}, separators=(",", ":")
+    ).encode("utf-8")
+    docker_manifest = json.dumps(
+        [
+            {
+                "Config": f"blobs/sha256/{config_digest}",
+                "RepoTags": [familiar_docker_ref(reference)],
+                "Layers": [f"blobs/sha256/{layer_digest}"],
+            }
+        ]
+    ).encode("utf-8")
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w") as archive:
+        def add(name: str, data: bytes) -> None:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+
+        add("oci-layout", layout_bytes)
+        add("index.json", index_bytes)
+        add("manifest.json", docker_manifest)
+        for digest, data in blobs.items():
+            add(f"blobs/sha256/{digest}", data)
+    path.write_bytes(payload.getvalue())
+    return path
+
+
 
 def seed_images(state_dir: Path, mapping: dict[str, dict] | None = None) -> dict:
     payload = {}
@@ -609,9 +822,23 @@ def copy_tracked(relative: str, dest_root: Path) -> None:
         shutil.copy2(source, target)
 
 
-def committed_up_fixture(dest_root: Path) -> str:
+def committed_up_fixture(dest_root: Path, *, lock_dir: Path | None = None) -> str:
     for relative in UP_FIXTURE_PATHS:
         copy_tracked(relative, dest_root)
+    if lock_dir is not None:
+        release_path = dest_root / "deploy" / "release.py"
+        text = release_path.read_text(encoding="utf-8")
+        lock_literal = 'IMAGE_STORE_LOCK_DIR = Path("/run/ocu-image-store")'
+        if lock_literal not in text:
+            raise RuntimeError("release fixture is missing IMAGE_STORE_LOCK_DIR")
+        release_path.write_text(
+            text.replace(
+                lock_literal,
+                f"IMAGE_STORE_LOCK_DIR = Path({str(lock_dir)!r})",
+                1,
+            ),
+            encoding="utf-8",
+        )
     (dest_root / "README").write_text("synthetic committed fixture\n", encoding="utf-8")
     return git_init_commit(dest_root, "committed deploy fixture")
 
@@ -637,9 +864,11 @@ def seed_release_env(env: dict, state_dir: Path, source_root: Path, inventory: P
 
 def prepare_up_context(state_dir: Path, extra=None):
     source = state_dir / "committed-source"
+    lock_dir = state_dir / "image-store-lock"
+    lock_dir.mkdir(parents=True, exist_ok=True)
     if not (source / ".git").exists():
         source.mkdir(parents=True, exist_ok=True)
-        sha = committed_up_fixture(source)
+        sha = committed_up_fixture(source, lock_dir=lock_dir)
         inventory = write_release_for_sha(state_dir / "release.json", sha, WEBUI_SYNTHETIC_SHA)
         if not (state_dir / "images.json").exists():
             seed_images(state_dir)

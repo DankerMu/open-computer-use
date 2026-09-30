@@ -18,12 +18,16 @@ from support import (
     DEFAULT_RELEASE_DIGESTS,
     DEFAULT_RELEASE_IMAGES,
     FAKE_DOCKER,
+    HISTORICAL_INCOMPATIBLE_SOURCE,
     ROOT,
     ROLE_ORDER,
+    SOURCE_CONSUMER_CONTRACT,
     WEBUI_SYNTHETIC_SHA,
     config_payload,
     fake_env,
     git_init_commit,
+    image_id_for_config,
+    intended_docs_for_images,
     ops,
     prepare_up_context,
     run_script,
@@ -32,6 +36,7 @@ from support import (
     synthetic_inventory,
     tmp_dir,
     write_fake_configs,
+    write_hybrid_image_archive,
     write_image_archive,
     write_inventory,
     write_network,
@@ -170,22 +175,30 @@ class OfflineReleaseTests(unittest.TestCase):
         self.root = Path(self.context.name)
         self.state = self.root / "fake-state"
         self.state.mkdir()
+        self.lock_dir = self.root / "image-store-lock"
+        self.lock_dir.mkdir()
         self.env = fake_env(self.state)
         self.env["PATH"] = (
             str(FAKE_DOCKER.parent) + os.pathsep + self.env.get("PATH", "")
         )
+        self.env["DOCKER_HOST"] = "unix://" + str(self.state / "docker.sock")
+        self.release_script = self.isolated_release()
 
     def tearDown(self):
         self.context.cleanup()
 
-    def write_delivery(self, *, extra_tag=None, mutate=None, skip_role=None):
-        ocu = self.root / "ocu-src"
+    def write_delivery(self, *, extra_tag=None, mutate=None, skip_role=None, name="delivery"):
+        ocu = self.root / f"{name}-ocu-src"
         ocu.mkdir()
         for relative in (
             "deploy/production-like-test/init/run-init.sh",
             "openwebui/init.sh",
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
+            "deploy/release.py",
+            "deploy/up.sh",
+            "deploy/production-like-test/scripts/bootstrap-test.sh",
+            "deploy/production-like-test/scripts/write-deployed-version.sh",
         ):
             source = ROOT / relative
             dest = ocu / relative
@@ -193,7 +206,7 @@ class OfflineReleaseTests(unittest.TestCase):
             dest.write_bytes(source.read_bytes())
         (ocu / "README").write_text("delivery source\n", encoding="utf-8")
         ocu_sha = git_init_commit(ocu, "delivery source")
-        delivery = self.root / "delivery"
+        delivery = self.root / name
         images_dir = delivery / "images"
         images_dir.mkdir(parents=True)
         image_records = {}
@@ -235,10 +248,61 @@ class OfflineReleaseTests(unittest.TestCase):
         return delivery, payload, ocu_sha
 
     def import_cmd(self, delivery: Path, install: Path):
+        return self.import_with(self.release_script, delivery, install)
+
+    def verify_cmd(self, inventory: Path, *, mode="delivery", delivery=None, source=None):
+        argv = [
+            "python3",
+            str(self.release_script),
+            "verify",
+            "--inventory",
+            str(inventory),
+            "--mode",
+            mode,
+        ]
+        if delivery is not None:
+            argv.extend(["--delivery", str(delivery)])
+        if source is not None:
+            argv.extend(["--source", str(source)])
+        return subprocess.run(
+            argv,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            check=False,
+            timeout=20,
+        )
+
+    def isolated_release(self, *replacements: tuple[str, str]) -> Path:
+        source = (ROOT / "deploy" / "release.py").read_text(encoding="utf-8")
+        lock_literal = 'IMAGE_STORE_LOCK_DIR = Path("/run/ocu-image-store")'
+        self.assertIn(lock_literal, source)
+        source = source.replace(
+            lock_literal,
+            f"IMAGE_STORE_LOCK_DIR = Path({str(self.lock_dir)!r})",
+            1,
+        )
+        for old, new in replacements:
+            self.assertIn(old, source)
+            source = source.replace(old, new, 1)
+        self._script_serial = getattr(self, "_script_serial", 0) + 1
+        dest = self.root / f"isolated-release-{self._script_serial}.py"
+        dest.write_text(source, encoding="utf-8")
+        dest.chmod(0o755)
+        return dest
+
+    def patched_release(self, *replacements: tuple[str, str]) -> Path:
+        return self.isolated_release(*replacements)
+
+    def import_with(self, script: Path, delivery: Path, install: Path, extra_env=None):
+        env = dict(self.env)
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             [
                 "python3",
-                str(ROOT / "deploy" / "release.py"),
+                str(script),
                 "import",
                 "--delivery",
                 str(delivery),
@@ -248,15 +312,152 @@ class OfflineReleaseTests(unittest.TestCase):
             cwd=str(ROOT),
             capture_output=True,
             text=True,
-            env=self.env,
+            env=env,
             check=False,
             timeout=20,
         )
 
+    def build_with(self, script: Path, ocu: Path, webui: Path, dest: Path, extra_env=None):
+        env = dict(self.env)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            [
+                "python3",
+                str(script),
+                "build",
+                "--ocu-source",
+                str(ocu),
+                "--webui-source",
+                str(webui),
+                "--destination",
+                str(dest),
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=30,
+        )
+
+    def write_hybrid_delivery(self, *, extra_oci_names=(), extra_index_descriptors=(), nested_index=False, attestation=None):
+        ocu = self.root / "hybrid-src"
+        ocu.mkdir()
+        for relative in (
+            "deploy/production-like-test/init/run-init.sh",
+            "openwebui/init.sh",
+            "openwebui/tools/computer_use_tools.py",
+            "openwebui/functions/computer_link_filter.py",
+            "deploy/release.py",
+            "deploy/up.sh",
+            "deploy/production-like-test/scripts/bootstrap-test.sh",
+            "deploy/production-like-test/scripts/write-deployed-version.sh",
+        ):
+            dest = ocu / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes((ROOT / relative).read_bytes())
+        (ocu / "README").write_text("hybrid delivery source\n", encoding="utf-8")
+        ocu_sha = git_init_commit(ocu, "hybrid delivery source")
+        delivery = self.root / "hybrid-delivery"
+        images_dir = delivery / "images"
+        images_dir.mkdir(parents=True)
+        image_records = {}
+        for role in ROLE_ORDER:
+            tag = DEFAULT_RELEASE_IMAGES[role]
+            digest = DEFAULT_RELEASE_DIGESTS[role]
+            config = config_payload(digest)
+            extras = extra_oci_names if role == "workspace" else ()
+            archive = write_hybrid_image_archive(
+                images_dir / f"{role}.tar",
+                reference=tag,
+                config=config,
+                extra_oci_names=extras,
+                extra_index_descriptors=extra_index_descriptors if role == "workspace" else (),
+                nested_index=nested_index and role == "workspace",
+                attestation=attestation if role == "workspace" else None,
+            )
+            image_records[role] = {
+                "reference": tag,
+                "configuration_digest": image_id_for_config(config),
+                "archive": {
+                    "path": f"images/{role}.tar",
+                    "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                },
+            }
+        bundle = delivery / "source.bundle"
+        subprocess.run(
+            ["git", "bundle", "create", str(bundle), "HEAD"],
+            cwd=str(ocu),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = synthetic_inventory(
+            ocu_sha=ocu_sha,
+            webui_sha=WEBUI_SYNTHETIC_SHA,
+            images=image_records,
+            bundle_sha=hashlib.sha256(bundle.read_bytes()).hexdigest(),
+        )
+        write_inventory(delivery / "release.json", payload)
+        return delivery, payload, ocu_sha
+
+    def write_incompatible_delivery(self):
+        ocu = self.root / "legacy-src"
+        for relative in (
+            "deploy/production-like-test/init/run-init.sh",
+            "openwebui/init.sh",
+            "openwebui/tools/computer_use_tools.py",
+            "openwebui/functions/computer_link_filter.py",
+            "deploy/up.sh",
+            "deploy/production-like-test/scripts/bootstrap-test.sh",
+            "deploy/production-like-test/scripts/write-deployed-version.sh",
+        ):
+            dest = ocu / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes((ROOT / relative).read_bytes())
+        (ocu / "deploy" / "release.py").parent.mkdir(parents=True, exist_ok=True)
+        (ocu / "deploy" / "release.py").write_text("FORMAT_VERSION = 1\n", encoding="utf-8")
+        (ocu / "README").write_text(f"legacy {HISTORICAL_INCOMPATIBLE_SOURCE}\n", encoding="utf-8")
+        ocu_sha = git_init_commit(ocu, "legacy source")
+        delivery = self.root / "legacy-delivery"
+        images_dir = delivery / "images"
+        images_dir.mkdir(parents=True)
+        image_records = {}
+        for role in ROLE_ORDER:
+            tag = DEFAULT_RELEASE_IMAGES[role]
+            digest = DEFAULT_RELEASE_DIGESTS[role]
+            config = config_payload(digest)
+            archive = write_image_archive(images_dir / f"{role}.tar", {tag: config})
+            image_records[role] = {
+                "reference": tag,
+                "configuration_digest": image_id_for_config(config),
+                "archive": {
+                    "path": f"images/{role}.tar",
+                    "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                },
+            }
+        bundle = delivery / "source.bundle"
+        subprocess.run(
+            ["git", "bundle", "create", str(bundle), "HEAD"],
+            cwd=str(ocu),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = synthetic_inventory(
+            ocu_sha=ocu_sha,
+            webui_sha=WEBUI_SYNTHETIC_SHA,
+            images=image_records,
+            bundle_sha=hashlib.sha256(bundle.read_bytes()).hexdigest(),
+        )
+        write_inventory(delivery / "release.json", payload)
+        return delivery, payload, ocu_sha
+
     def build_cmd(self, ocu: Path, webui: Path, dest: Path, extra=None):
         argv = [
             "python3",
-            str(ROOT / "deploy" / "release.py"),
+            str(self.release_script),
             "build",
             "--ocu-source",
             str(ocu),
@@ -312,6 +513,26 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/init.sh",
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
+            "deploy/release.py",
+            "deploy/up.sh",
+            "deploy/__init__.py",
+            "deploy/check-ports.sh",
+            "deploy/provision-networks.sh",
+            "deploy/check-sandbox-dns.sh",
+            "deploy/check_sandbox_dns.py",
+            "deploy/netinspect.py",
+            "deploy/firewall/docker-user-rules.sh",
+            "deploy/firewall/check.sh",
+            "deploy/firewall/policy.py",
+            "deploy/firewall/__init__.py",
+            "deploy/production-like-test/compose.core.override.yml",
+            "deploy/production-like-test/compose.webui.override.yml",
+            "deploy/production-like-test/compose.proxy.yml",
+            "deploy/production-like-test/scripts/bootstrap-test.sh",
+            "deploy/production-like-test/scripts/write-deployed-version.sh",
+            "computer-use-server/sandbox_dns.py",
+            "docker-compose.yml",
+            "docker-compose.webui.yml",
         ):
             dest = ocu / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -481,7 +702,7 @@ class OfflineReleaseTests(unittest.TestCase):
         process = subprocess.Popen(
             [
                 sys.executable,
-                str(ROOT / "deploy/release.py"),
+                str(self.release_script),
                 "import",
                 "--delivery",
                 str(delivery),
@@ -588,6 +809,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "platform": inventory["platform"],
             "ocu_source_sha": inventory["ocu_source_sha"],
             "webui_source_sha": inventory["webui_source_sha"],
+            "source_consumer_contract": inventory["source_consumer_contract"],
             "source_bundle": inventory["source_bundle"],
             "images": {
                 role: inventory["images"][role]
@@ -1295,6 +1517,562 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertFalse(dest.exists())
         self.assertFalse((self.state / "builds.json").exists())
         self.assertFalse((self.state / "ops.log").exists())
+
+    def test_declared_reference_conflict_rejects_before_load(self):
+        delivery, inventory, _sha = self.write_delivery()
+        tag = inventory["images"]["workspace"]["reference"]
+        original = digest_for("present-workspace")
+        seed_images(
+            self.state,
+            {
+                tag: {
+                    "Id": original,
+                    "Os": "linux",
+                    "Architecture": "amd64",
+                    "ConfigBytes": config_payload(original).decode("utf-8"),
+                }
+            },
+        )
+        before = (self.state / "images.json").read_text(encoding="utf-8")
+        install = self.root / "install-declared-conflict"
+        result = self.import_cmd(delivery, install)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conflicts", result.stderr)
+        self.assertFalse(install.exists())
+        self.assertFalse((self.state / "load-count").exists())
+        self.assertEqual((self.state / "images.json").read_text(encoding="utf-8"), before)
+
+    def test_declared_conflict_bypass_mutant_overwrites_existing_mapping(self):
+        delivery, inventory, _sha = self.write_delivery()
+        tag = inventory["images"]["workspace"]["reference"]
+        original = digest_for("present-workspace")
+        seed_images(
+            self.state,
+            {
+                tag: {
+                    "Id": original,
+                    "Os": "linux",
+                    "Architecture": "amd64",
+                    "ConfigBytes": config_payload(original).decode("utf-8"),
+                }
+            },
+        )
+        before = (self.state / "images.json").read_text(encoding="utf-8")
+        script = self.patched_release(
+            (
+                "        if image_id != info[\"digest\"]:\n"
+                "            raise ReleaseError(f\"existing image {reference} conflicts with the release\")\n",
+                "        if False and image_id != info[\"digest\"]:\n"
+                "            raise ReleaseError(f\"existing image {reference} conflicts with the release\")\n",
+            )
+        )
+        result = self.import_with(script, delivery, self.root / "install-bypass-conflict")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        self.assertNotEqual((self.state / "images.json").read_text(encoding="utf-8"), before)
+        self.assertEqual(
+            after[tag]["Id"], inventory["images"]["workspace"]["configuration_digest"]
+        )
+
+    def test_cross_destination_conflicting_imports_serialize(self):
+        first_delivery, first_inventory, _sha = self.write_delivery(name="delivery-a")
+        second_delivery, second_inventory, _sha2 = self.write_delivery(name="delivery-b")
+        tag = first_inventory["images"]["workspace"]["reference"]
+        other_config = config_payload(digest_for("second-workspace"))
+        archive = second_delivery / second_inventory["images"]["workspace"]["archive"]["path"]
+        write_image_archive(archive, {tag: other_config})
+        second_inventory["images"]["workspace"]["configuration_digest"] = image_id_for_config(
+            other_config
+        )
+        second_inventory["images"]["workspace"]["archive"]["sha256"] = hashlib.sha256(
+            archive.read_bytes()
+        ).hexdigest()
+        write_inventory(second_delivery / "release.json", second_inventory)
+        hold = self.root / "hold-first-load"
+        hold.touch()
+        first = self.root / "install-first"
+        second = self.root / "install-second"
+        env_a = {**self.env, "FAKE_DOCKER_HOLD_LOAD": str(hold)}
+        process_a = subprocess.Popen(
+            [
+                sys.executable,
+                str(self.release_script),
+                "import",
+                "--delivery",
+                str(first_delivery),
+                "--install-root",
+                str(first),
+            ],
+            env=env_a,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        process_b = None
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.state / "entered-load").exists():
+                self.assertIsNone(process_a.poll(), "first import exited before load")
+                self.assertLess(time.monotonic(), deadline, "first import did not reach load")
+                time.sleep(0.02)
+            process_b = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(self.release_script),
+                    "import",
+                    "--delivery",
+                    str(second_delivery),
+                    "--install-root",
+                    str(second),
+                ],
+                env=self.env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            time.sleep(0.2)
+            self.assertIsNone(process_b.poll(), "second import finished while first held the store")
+            hold.unlink()
+            stdout_a, stderr_a = process_a.communicate(timeout=20)
+            self.assertEqual(process_a.returncode, 0, stdout_a + stderr_a)
+            stdout_b, stderr_b = process_b.communicate(timeout=20)
+            self.assertNotEqual(process_b.returncode, 0, stdout_b + stderr_b)
+            self.assertFalse(second.exists())
+            self.assertTrue((first / "release.json").is_file())
+            images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                images[tag]["Id"],
+                first_inventory["images"]["workspace"]["configuration_digest"],
+            )
+        finally:
+            hold.unlink(missing_ok=True)
+            for process in (process_a, process_b):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    def test_canonical_hybrid_archive_imports(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery(nested_index=True, attestation={})
+        install = self.root / "install-hybrid"
+        result = self.import_cmd(delivery, install)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        for role, record in inventory["images"].items():
+            self.assertEqual(images[record["reference"]]["Id"], record["configuration_digest"], role)
+
+    def test_hidden_oci_alias_is_rejected_before_load(self):
+        extra = "unrelated.example/app:keep"
+        seed_images(
+            self.state,
+            {
+                extra: {
+                    "Id": digest_for(extra),
+                    "Os": "linux",
+                    "Architecture": "amd64",
+                    "ConfigBytes": config_payload(digest_for(extra)).decode("utf-8"),
+                }
+            },
+        )
+        before = (self.state / "images.json").read_text(encoding="utf-8")
+        delivery, _inventory, _sha = self.write_hybrid_delivery(extra_oci_names=(extra,))
+        result = self.import_cmd(delivery, self.root / "install-hidden-alias")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "install-hidden-alias").exists())
+        self.assertFalse((self.state / "load-count").exists())
+        self.assertEqual((self.state / "images.json").read_text(encoding="utf-8"), before)
+
+    def test_hybrid_agreement_bypass_mutant_loads_hidden_alias(self):
+        extra = "unrelated.example/app:keep"
+        original = digest_for("keep-original")
+        seed_images(
+            self.state,
+            {
+                extra: {
+                    "Id": original,
+                    "Os": "linux",
+                    "Architecture": "amd64",
+                    "ConfigBytes": config_payload(original).decode("utf-8"),
+                }
+            },
+        )
+        delivery, _inventory, _sha = self.write_hybrid_delivery(extra_oci_names=(extra,))
+        script = self.patched_release(
+            (
+                "            oci_map = parse_oci_layout(archive, bundle, names)\n"
+                "            return agree_reference_maps(docker_map, oci_map, archive)\n",
+                "            oci_map = parse_oci_layout(archive, bundle, names)\n"
+                "            return docker_map\n",
+            )
+        )
+        result = self.import_with(script, delivery, self.root / "install-hybrid-bypass")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(images[extra]["Id"], original)
+
+    def test_allocation_faults_release_reservation(self):
+        delivery, _inventory, _sha = self.write_delivery()
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        stage_fail = self.patched_release(
+            (
+                "        try:\n"
+                "            self.stage = Path(\n"
+                "                tempfile.mkdtemp(\n"
+                "                    prefix=f\"{self.dest.name}.stage-\", dir=str(self.dest.parent)\n"
+                "                )\n"
+                "            )\n",
+                "        raise OSError(28, \"injected stage allocation failure\")\n"
+                "        try:\n"
+                "            self.stage = Path(\n"
+                "                tempfile.mkdtemp(\n"
+                "                    prefix=f\"{self.dest.name}.stage-\", dir=str(self.dest.parent)\n"
+                "                )\n"
+                "            )\n",
+            )
+        )
+        snapshot_fail = self.patched_release(
+            (
+                "        try:\n"
+                "            self.snapshots = Path(\n"
+                "                tempfile.mkdtemp(prefix=\"ocu-release-src-\", dir=str(self.dest.parent))\n"
+                "            )\n",
+                "        raise OSError(28, \"injected snapshot allocation failure\")\n"
+                "        try:\n"
+                "            self.snapshots = Path(\n"
+                "                tempfile.mkdtemp(prefix=\"ocu-release-src-\", dir=str(self.dest.parent))\n"
+                "            )\n",
+            )
+        )
+        import_dest = self.root / "install-alloc"
+        failed_import = self.import_with(stage_fail, delivery, import_dest)
+        self.assertNotEqual(failed_import.returncode, 0)
+        self.assertFalse(import_dest.exists())
+        self.assertFalse(list(self.root.glob("install-alloc.publish.lock")))
+        retry = self.import_cmd(delivery, import_dest)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        failed_build = self.build_with(
+            snapshot_fail, ocu, webui, self.root / "build-alloc"
+        )
+        self.assertNotEqual(failed_build.returncode, 0)
+        self.assertFalse((self.root / "build-alloc").exists())
+        self.assertFalse(list(self.root.glob("build-alloc.publish.lock")))
+
+    def test_cancellation_at_allocation_boundary_releases_reservation(self):
+        delivery, _inventory, _sha = self.write_delivery()
+        marker = self.root / "entered-alloc"
+        hold = self.root / "hold-alloc"
+        hold.touch()
+        script = self.patched_release(
+            (
+                "        try:\n"
+                "            self.stage = Path(\n"
+                "                tempfile.mkdtemp(\n"
+                "                    prefix=f\"{self.dest.name}.stage-\", dir=str(self.dest.parent)\n"
+                "                )\n"
+                "            )\n",
+                (
+                    "        import time as _ocu_hold_time\n"
+                    "        Path(%r).write_text(\"1\")\n"
+                    "        while Path(%r).exists():\n"
+                    "            _ocu_hold_time.sleep(0.05)\n"
+                    "        try:\n"
+                    "            self.stage = Path(\n"
+                    "                tempfile.mkdtemp(\n"
+                    "                    prefix=f\"{self.dest.name}.stage-\", dir=str(self.dest.parent)\n"
+                    "                )\n"
+                    "            )\n"
+                )
+                % (str(marker), str(hold)),
+            )
+        )
+        dest = self.root / "install-alloc-cancel"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(script),
+                "import",
+                "--delivery",
+                str(delivery),
+                "--install-root",
+                str(dest),
+            ],
+            env=self.env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists():
+                self.assertIsNone(process.poll(), "import exited before allocation")
+                self.assertLess(time.monotonic(), deadline, "allocation barrier not reached")
+                time.sleep(0.02)
+            process.send_signal(signal.SIGTERM)
+            self.assertEqual(process.wait(timeout=10), 128 + signal.SIGTERM)
+            self.assertFalse(dest.exists())
+            self.assertFalse(list(self.root.glob("install-alloc-cancel.publish.lock")))
+            self.assertFalse(list(self.root.glob("install-alloc-cancel.stage-*")))
+        finally:
+            hold.unlink(missing_ok=True)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+    def test_partial_load_failure_discloses_retained_cache(self):
+        delivery, inventory, _sha = self.write_delivery()
+        (self.state / "load-fail-after").write_text("1", encoding="utf-8")
+        result = self.import_cmd(delivery, self.root / "install-partial")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("image cache entries may remain", result.stderr)
+        self.assertFalse((self.root / "install-partial").exists())
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        workspace = inventory["images"]["workspace"]["reference"]
+        self.assertEqual(
+            images[workspace]["Id"],
+            inventory["images"]["workspace"]["configuration_digest"],
+        )
+        self.assertNotIn("rmi", "\n".join(ops(self.state)))
+
+    def test_delivery_verify_requires_source_bundle(self):
+        delivery, inventory, _sha = self.write_delivery()
+        inventory_path = delivery / "release.json"
+        missing = self.verify_cmd(inventory_path, mode="delivery")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("requires --delivery", missing.stderr)
+        intact = self.verify_cmd(inventory_path, mode="delivery", delivery=delivery)
+        self.assertEqual(intact.returncode, 0, intact.stderr)
+        bundle = delivery / inventory["source_bundle"]["path"]
+        bundle.unlink()
+        absent = self.verify_cmd(inventory_path, mode="delivery", delivery=delivery)
+        self.assertNotEqual(absent.returncode, 0)
+        bundle.write_bytes(b"not-a-git-bundle")
+        corrupt = self.verify_cmd(inventory_path, mode="delivery", delivery=delivery)
+        self.assertNotEqual(corrupt.returncode, 0)
+
+    def test_incompatible_source_bundle_is_rejected_before_load(self):
+        delivery, _inventory, _sha = self.write_incompatible_delivery()
+        result = self.import_cmd(delivery, self.root / "install-legacy")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("consumer contract", result.stderr)
+        self.assertFalse((self.root / "install-legacy").exists())
+        self.assertFalse((self.state / "load-count").exists())
+
+    def test_imported_checkout_startup_uses_frozen_no_build(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        dest = self.root / "compat-release"
+        built = self.build_cmd(ocu, webui, dest)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        install = self.root / "compat-install"
+        imported = self.import_cmd(dest, install)
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        payload = json.loads((install / "release.json").read_text(encoding="utf-8"))
+        write_fake_configs(self.state, intended_docs_for_images(payload["images"]))
+        seed_healthy_host(self.state)
+        write_network(
+            self.state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1"
+        )
+        write_network(
+            self.state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1"
+        )
+        self.assertEqual(payload["source_consumer_contract"], SOURCE_CONSUMER_CONTRACT)
+        loaded = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        for role, record in payload["images"].items():
+            self.assertEqual(loaded[record["reference"]]["Id"], record["configuration_digest"], role)
+        env = fake_env(self.state)
+        env["OCU_RELEASE_MANIFEST"] = str(install / "release.json")
+        env["OCU_TEST_ROOT"] = str(install / "source")
+        env["SOURCE_SHA"] = payload["ocu_source_sha"]
+        env["WEBUI_SOURCE_SHA"] = payload["webui_source_sha"]
+        for role, name in (
+            ("workspace", "DOCKER_IMAGE"),
+            ("computer-use-server", "COMPUTER_USE_SERVER_IMAGE"),
+            ("retention-guard", "RETENTION_GUARD_IMAGE"),
+            ("proxy", "OCU_PROXY_IMAGE"),
+            ("open-webui", "OPENWEBUI_IMAGE"),
+            ("postgres", "POSTGRES_IMAGE"),
+        ):
+            env[name] = payload["images"][role]["reference"]
+        result = run_script(install / "source" / "deploy" / "up.sh", env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        executed = (self.state / "executed.json").read_text(encoding="utf-8") if (self.state / "executed.json").exists() else ""
+        self.assertIn("--no-build", executed)
+        self.assertIn("never", executed)
+        self.assertTrue((self.state / "starts.log").exists())
+        self.assertEqual(
+            (self.state / "starts.log").read_text(encoding="utf-8").splitlines(),
+            ["core", "webui", "proxy"],
+        )
+        (self.root / "dmxapi.env").write_text(
+            "DMXAPI_API_KEY=provider-secret-not-for-logs\n", encoding="utf-8"
+        )
+        (self.root / "dmxapi.env").chmod(0o600)
+        bootstrap_root = self.root / "bootstrap-root"
+        (bootstrap_root / "source").mkdir(parents=True)
+        subprocess.run(
+            ["cp", "-a", str(install / "source") + "/.", str(bootstrap_root / "source")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        bootstrap = subprocess.run(
+            [
+                "bash",
+                str(
+                    bootstrap_root
+                    / "source"
+                    / "deploy"
+                    / "production-like-test"
+                    / "scripts"
+                    / "bootstrap-test.sh"
+                ),
+            ],
+            cwd=str(bootstrap_root / "source"),
+            capture_output=True,
+            text=True,
+            env={
+                **env,
+                "DEPLOY_ROOT": str(bootstrap_root),
+                "DMX_ENV_FILE": str(self.root / "dmxapi.env"),
+                "OCU_ADMIN_CREDENTIALS_FILE": str(self.root / "admin-credentials.txt"),
+                "FAKE_ID_UID": "0",
+                "OCU_WEBUI_ORIGIN": "https://workbench.example.test",
+            },
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
+        self.assertTrue((bootstrap_root / "config" / "runtime.env").exists())
+
+    def test_dirty_tracked_ocu_source_rejects_before_docker(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        (ocu / "deploy" / "up.sh").write_text(
+            (ocu / "deploy" / "up.sh").read_text(encoding="utf-8") + "# dirty\n",
+            encoding="utf-8",
+        )
+        dest = self.root / "dirty-ocu"
+        result = self.build_cmd(ocu, webui, dest)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tracked source is dirty", result.stderr)
+        self.assertFalse(dest.exists())
+        self.assertFalse((self.state / "builds.json").exists())
+        self.assertFalse((self.state / "ops.log").exists())
+
+    def test_dirty_tracked_webui_source_rejects_before_docker(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        (webui / "Dockerfile").write_text(
+            (webui / "Dockerfile").read_text(encoding="utf-8") + "# dirty\n",
+            encoding="utf-8",
+        )
+        dest = self.root / "dirty-webui"
+        result = self.build_cmd(ocu, webui, dest)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tracked source is dirty", result.stderr)
+        self.assertFalse(dest.exists())
+        self.assertFalse((self.state / "builds.json").exists())
+        self.assertFalse((self.state / "ops.log").exists())
+
+    def test_clean_head_bypass_mutant_publishes_from_dirty_tree(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        (ocu / "deploy" / "up.sh").write_text(
+            (ocu / "deploy" / "up.sh").read_text(encoding="utf-8") + "# dirty\n",
+            encoding="utf-8",
+        )
+        script = self.patched_release(
+            (
+                "    if dirty:\n"
+                "        raise ReleaseError(\n"
+                "            f\"{cwd}: tracked source is dirty; build from a committed snapshot\"\n"
+                "        )\n",
+                "    if False and dirty:\n"
+                "        raise ReleaseError(\n"
+                "            f\"{cwd}: tracked source is dirty; build from a committed snapshot\"\n"
+                "        )\n",
+            )
+        )
+        dest = self.root / "dirty-bypass"
+        result = self.build_with(script, ocu, webui, dest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((dest / "release.json").is_file())
+
+    def test_replaced_image_fails_startup_before_mutation(self):
+        env, script, _source = prepare_up_context(self.state)
+        write_fake_configs(self.state)
+        seed_healthy_host(self.state)
+        write_network(
+            self.state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1"
+        )
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        tag = DEFAULT_RELEASE_IMAGES["proxy"]
+        images[tag]["Id"] = digest_for("replaced-proxy")
+        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
+        result = run_script(script, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("configuration digest", result.stderr)
+        self.assertFalse((self.state / "starts.log").exists())
+        recorded = "\n".join(ops(self.state))
+        self.assertNotIn("network create", recorded)
+        self.assertNotIn("compose up", recorded)
+
+    def test_image_equality_bypass_mutant_starts_replaced_image(self):
+        env, _script, source = prepare_up_context(self.state)
+        write_fake_configs(self.state)
+        seed_healthy_host(self.state)
+        write_network(
+            self.state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1"
+        )
+        write_network(
+            self.state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1"
+        )
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        tag = DEFAULT_RELEASE_IMAGES["proxy"]
+        images[tag]["Id"] = digest_for("replaced-proxy")
+        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
+        script = self.patched_release(
+            (
+                "        if image_id != record[\"configuration_digest\"]:\n"
+                "            raise ReleaseError(\n"
+                "                f\"{role} image {record['reference']} has configuration digest {image_id}, expected {record['configuration_digest']}\"\n"
+                "            )\n",
+                "        if False and image_id != record[\"configuration_digest\"]:\n"
+                "            raise ReleaseError(\n"
+                "                f\"{role} image {record['reference']} has configuration digest {image_id}, expected {record['configuration_digest']}\"\n"
+                "            )\n",
+            )
+        )
+        mutant_source = source / "deploy" / "release.py"
+        mutant_source.write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "deploy/release.py"],
+            cwd=str(source),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "bypass image equality",
+            ],
+            cwd=str(source),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(source), text=True
+        ).strip()
+        inventory = write_release_for_sha(self.state / "release.json", sha, WEBUI_SYNTHETIC_SHA)
+        env["OCU_RELEASE_MANIFEST"] = str(inventory)
+        env["SOURCE_SHA"] = sha
+        result = run_script(source / "deploy" / "up.sh", env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.state / "starts.log").exists())
 
 
 if __name__ == "__main__":

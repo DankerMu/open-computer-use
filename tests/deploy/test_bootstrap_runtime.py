@@ -137,11 +137,12 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.credentials = self.private / "admin-credentials.txt"
         source = self.deploy_root / "source"
         source.mkdir(parents=True)
-        self.sha = committed_up_fixture(source)
+        self.sha = committed_up_fixture(source, lock_dir=self.state / "image-store-lock")
         self.webui_sha = WEBUI_SYNTHETIC_SHA
         self.env = os.environ.copy()
         self.env["PATH"] = str(FAKE_DOCKER.parent) + os.pathsep + self.env.get("PATH", "")
         self.env["FAKE_DOCKER_STATE"] = str(self.state)
+        self.env["DOCKER_HOST"] = "unix://" + str(self.state / "docker.sock")
         self.env["TMPDIR"] = str(self.private)
         self.env["HOME"] = str(self.private)
         self.env["DEPLOY_ROOT"] = str(self.deploy_root)
@@ -500,6 +501,39 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertIn("not installed package versions", record)
         self.assertNotIn(runtime["WEBUI_SECRET_KEY"], record)
         self.assertEqual(stat.S_IMODE((self.deploy_root / "DEPLOYED_VERSION.md").stat().st_mode), 0o644)
+
+    def test_replaced_image_rejects_bootstrap_before_publication(self):
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        tag = DEFAULT_RELEASE_IMAGES["proxy"]
+        images[tag]["Id"] = "sha256:" + ("c" * 64)
+        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
+        result = self.run_bootstrap()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("configuration digest", result.stderr)
+        self.assert_unpublished()
+
+    def test_replaced_image_preserves_existing_version_record(self):
+        created = self.run_bootstrap()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        existing = self.deploy_root / "DEPLOYED_VERSION.md"
+        existing.write_text("keep-me\n", encoding="utf-8")
+        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
+        images[runtime["OCU_PROXY_IMAGE"]]["Id"] = "sha256:" + ("d" * 64)
+        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
+        env = dict(self.env)
+        env["OCU_RELEASE_MANIFEST"] = runtime["OCU_RELEASE_MANIFEST"]
+        result = subprocess.run(
+            ["bash", str(WRITE_VERSION)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=20,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "keep-me\n")
 
 
 
