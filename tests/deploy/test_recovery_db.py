@@ -51,20 +51,19 @@ class RecoveryDatabaseTests(unittest.TestCase):
                         "server_version": "17.5",
                         "extensions": ["plpgsql=1.0"],
                         "chats": ["chat-live"],
+                        "chat_owners": {"chat-live": "owner-live"},
                         "chat_state": [
                             {
                                 "chat_id": "chat-live",
                                 "last_seen_revision": 2,
-                                "preferences": "keep-live",
-                                "owner_id": "owner-live",
-                                "file_ids": "file-live",
+                                "prefs": {"theme": "keep|live", "note": "line\nbreak"},
+                                "updated_at": 1700000000,
                             },
                             {
                                 "chat_id": "chat-orphan",
                                 "last_seen_revision": 9,
-                                "preferences": "drop-me",
-                                "owner_id": "owner-orphan",
-                                "file_ids": "file-orphan",
+                                "prefs": {"drop": "me"},
+                                "updated_at": 1700000001,
                             },
                         ],
                         "config": ['{"OPENAI_API_KEY":"credential-A"}'],
@@ -84,10 +83,20 @@ class RecoveryDatabaseTests(unittest.TestCase):
         self.assertEqual(restored["live_chats"], ["chat-live"])
         self.assertEqual(len(restored["chat_state"]), 1)
         live = restored["chat_state"][0]
-        self.assertEqual(live["owner_id"], "owner-live")
-        self.assertEqual(live["preferences"], "keep-live")
+        self.assertEqual(live["prefs"], {"theme": "keep|live", "note": "line\nbreak"})
         self.assertEqual(live["last_seen_revision"], 2)
-        self.assertEqual(live["file_ids"], "file-live")
+        self.assertEqual(live["updated_at"], 1700000000)
+        self.assertNotIn("owner_id", live)
+        self.assertNotIn("file_ids", live)
+        self.assertEqual(restored["owners"]["chat-live"], "owner-live")
+
+
+    def test_invented_columns_are_rejected(self):
+        with self.assertRaises(recovery.RecoveryError):
+            recovery_db._exec_postgres(
+                self.container,
+                "SELECT preferences, owner_id, file_ids FROM ocu_chat_state",
+            )
 
     def test_incompatible_revision_and_tools_reject(self):
         schema = {"alembic_revision": "deadbeefc0de", "server_version": "17.5"}

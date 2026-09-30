@@ -37,9 +37,9 @@ EXTRACT_FLAGS = (
     "--xattrs",
     "--xattrs-include=user.*",
     "--xattrs-include=security.selinux",
-    "--no-overwrite-dir",
     "-xzf",
 )
+
 
 
 def fail(message: str) -> None:
@@ -68,7 +68,16 @@ def canonical_member_name(name: str) -> str:
         return "."
     if text.startswith("/") or ".." in Path(text).parts or "\x00" in text:
         fail(f"unsafe archive member {name}")
-    return text.rstrip("/") or "."
+    parts = [part for part in text.rstrip("/").split("/") if part not in ("", ".")]
+    if not parts:
+        return "."
+    if ".." in parts:
+        fail(f"unsafe archive member {name}")
+    return "/".join(parts)
+
+
+def destination_member_name(name: str) -> str:
+    return canonical_member_name(name)
 
 
 def _lstat(path: Path):
@@ -193,10 +202,14 @@ def _apply_metadata(path: Path, member: tarfile.TarInfo) -> None:
         setxattr(path, name, value.encode("utf-8", "surrogateescape"), follow_symlinks=False)
     if (PAX_ACL_ACCESS in headers or PAX_ACL_DEFAULT in headers) and not _gnu_tar():
         fail(f"{path}: POSIX ACL restore requires GNU tar --acls")
+    wanted_uid = int(member.uid)
+    wanted_gid = int(member.gid)
     try:
-        os.lchown(path, int(member.uid), int(member.gid))
-    except OSError:
-        pass
+        os.lchown(path, wanted_uid, wanted_gid)
+    except OSError as cop:
+        existing = path.lstat()
+        if existing.st_uid != wanted_uid or existing.st_gid != wanted_gid:
+            fail(f"{path}: cannot restore ownership {wanted_uid}:{wanted_gid}: {cop}")
     if not member.issym():
         os.chmod(path, member.mode & 0o7777)
         os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
@@ -265,13 +278,15 @@ def capture_tree(root: Path, archive: Path) -> dict:
         seen.add(name)
     if _gnu_tar():
         listing = archive.parent / (archive.name + ".list")
-        listing.write_text("\n".join(names) + "\n", encoding="utf-8")
+        listing.write_bytes(b"\0".join(name.encode("utf-8") for name in names) + b"\0")
         try:
             _run_tar(
                 [
                     *CAPTURE_FLAGS,
                     str(archive),
                     f"--directory={root}",
+                    "--null",
+                    "--verbatim-files-from",
                     f"--files-from={listing}",
                 ]
             )
@@ -280,6 +295,9 @@ def capture_tree(root: Path, archive: Path) -> dict:
     else:
         _python_capture(root, archive, rows)
     members = validate_archive(archive)
+    archived = {record["name"] for record in members}
+    if archived != set(names):
+        fail(f"{root}: captured archive members do not match the source tree")
     return {
         "format": ARCHIVE_FORMAT,
         "root": str(root),
@@ -311,12 +329,18 @@ def inspect_archive(archive: Path) -> list[tarfile.TarInfo]:
     if len(members) > MAX_ARCHIVE_MEMBERS:
         fail(f"{archive}: archive member limit exceeded")
     names: dict[str, tarfile.TarInfo] = {}
+    destinations: dict[str, tarfile.TarInfo] = {}
     total = 0
     for member in members:
         name = canonical_member_name(member.name)
         if name in names:
             fail(f"{archive}: duplicate member {name}")
         names[name] = member
+        destination = destination_member_name(member.name)
+        previous = destinations.get(destination)
+        if previous is not None:
+            fail(f"{archive}: destination alias {destination}")
+        destinations[destination] = member
         kind = _member_kind(member)
         if kind == "unsupported" or member.isdev() or member.isfifo():
             fail(f"{archive}: unsupported member type {member.name}")
@@ -344,7 +368,9 @@ def inspect_archive(archive: Path) -> list[tarfile.TarInfo]:
         if total > MAX_ARCHIVE_BYTES:
             fail(f"{archive}: archive size limit exceeded")
     _reject_link_escapes(names)
+    _reject_destination_conflicts(destinations)
     return members
+
 
 
 def _reject_link_escapes(names: dict[str, tarfile.TarInfo]) -> None:
@@ -364,12 +390,40 @@ def _reject_link_escapes(names: dict[str, tarfile.TarInfo]) -> None:
                 continue
             if parent.issym() or parent.islnk():
                 fail(f"archive member {name} traverses link {ancestor}")
+            if ancestor != "." and not parent.isdir():
+                fail(f"archive member {name} has a non-directory ancestor {ancestor}")
         if member.islnk():
             target = canonical_member_name(member.linkname)
             if target not in names:
                 fail(f"hardlink {name} target is missing")
             if names[target].issym():
                 fail(f"hardlink {name} may not target a symlink")
+
+
+def _reject_destination_conflicts(destinations: dict[str, tarfile.TarInfo]) -> None:
+    names = set(destinations)
+    for name, member in destinations.items():
+        if name == ".":
+            if not member.isdir():
+                fail("archive root member must be a directory")
+            continue
+        parts = name.split("/")
+        current = []
+        for part in parts[:-1]:
+            current.append(part)
+            ancestor = "/".join(current)
+            parent = destinations.get(ancestor)
+            if parent is None:
+                continue
+            if not parent.isdir():
+                fail(f"archive member {name} conflicts with non-directory {ancestor}")
+            if parent.issym() or parent.islnk():
+                fail(f"archive member {name} traverses link {ancestor}")
+        for other in names:
+            if other == name or other == ".":
+                continue
+            if other.startswith(name + "/") and not member.isdir():
+                fail(f"archive member {name} is a non-directory prefix of {other}")
 
 
 def validate_archive(archive: Path) -> list[dict]:
@@ -422,9 +476,30 @@ def extract_tree(archive: Path, dest: Path) -> None:
     _destination_empty(dest)
     if _gnu_tar():
         _run_tar([*EXTRACT_FLAGS, str(archive), "-C", str(dest)])
+        _apply_archive_root_metadata(dest, members)
     else:
         _python_extract(archive, dest, members)
     restored = {relative for _path, relative, _info in _walk_tree(dest)}
     expected = {record["name"] for record in validate_archive(archive)}
     if not expected.issubset(restored):
         fail(f"{archive}: extraction omitted members")
+
+
+def _apply_archive_root_metadata(dest: Path, members: list[tarfile.TarInfo]) -> None:
+    root_member = None
+    for member in members:
+        if canonical_member_name(member.name) == ".":
+            root_member = member
+            break
+    if root_member is None or not root_member.isdir():
+        return
+    _apply_metadata(dest, root_member)
+
+
+def archive_has_regular_root_member(archive: Path, relative: str) -> bool:
+    wanted = canonical_member_name(relative)
+    for member in inspect_archive(archive):
+        if canonical_member_name(member.name) == wanted and member.isfile() and not member.issym():
+            return True
+    return False
+

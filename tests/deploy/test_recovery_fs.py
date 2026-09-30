@@ -102,6 +102,73 @@ class RecoveryFilesystemTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             recovery_fs.validate_archive(device)
 
+    def test_destination_alias_and_file_prefix_reject_before_mutation(self):
+        dest = self.root / "target"
+        dest.mkdir()
+        sentinel = dest / "keep.txt"
+        sentinel.write_text("untouched\n", encoding="utf-8")
+        alias = self.root / "alias.tar.gz"
+        with tarfile.open(alias, "w:gz") as bundle:
+            first = tarfile.TarInfo(name="a/b")
+            first.size = 1
+            bundle.addfile(first, io.BytesIO(b"a"))
+            second = tarfile.TarInfo(name="a/./b")
+            second.size = 1
+            bundle.addfile(second, io.BytesIO(b"b"))
+        with self.assertRaises(recovery.RecoveryError):
+            recovery_fs.validate_archive(alias)
+        prefix = self.root / "prefix.tar.gz"
+        with tarfile.open(prefix, "w:gz") as bundle:
+            file_member = tarfile.TarInfo(name="a")
+            file_member.size = 1
+            bundle.addfile(file_member, io.BytesIO(b"a"))
+            nested = tarfile.TarInfo(name="a/b")
+            nested.size = 1
+            bundle.addfile(nested, io.BytesIO(b"b"))
+        with self.assertRaises(recovery.RecoveryError):
+            recovery_fs.extract_tree(prefix, dest)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "untouched\n")
+
+    def test_python_ownership_failure_is_explicit(self):
+        source = self.root / "owned"
+        source.mkdir()
+        (source / "secret.txt").write_bytes(b"secret\n")
+        archive = self.root / "owned.tar.gz"
+        recovery_fs.capture_tree(source, archive)
+        rewritten = self.root / "owned-mismatch.tar.gz"
+        with tarfile.open(archive, "r:*") as bundle:
+            members = bundle.getmembers()
+            contents = {}
+            for member in members:
+                if member.isfile():
+                    extracted = bundle.extractfile(member)
+                    contents[member.name] = extracted.read() if extracted is not None else b""
+        with tarfile.open(rewritten, "w:gz", format=tarfile.PAX_FORMAT) as bundle:
+            for member in members:
+                member.uid = 65534
+                member.gid = 65534
+                if member.isfile():
+                    data = contents[member.name]
+                    member.size = len(data)
+                    bundle.addfile(member, io.BytesIO(data))
+                else:
+                    bundle.addfile(member)
+        dest = self.root / "owned-out"
+        original = os.lchown
+
+        def refuse(path, uid, gid):
+            raise OSError(1, "operation not permitted")
+
+        os.lchown = refuse
+        try:
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery_fs.extract_tree(rewritten, dest)
+        finally:
+            os.lchown = original
+        self.assertIn("cannot restore ownership", str(raised.exception))
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

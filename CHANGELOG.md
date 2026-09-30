@@ -8,7 +8,12 @@
   daemon/root, and activates a retained previous release through that
   release's own `source/deploy/up.sh`. Workspace volumes, initializer
   marker, orphan `ocu_chat_state` pruning, and migration/PostgreSQL
-  compatibility checks are included. Real engine recovery remains issue36.
+  compatibility checks are included. Restore inspects the real
+  `ocu_chat_state` columns, streams PostgreSQL dumps, waits for the
+  final isolated server, and hands the restored volume to Compose
+  without retaining a conflicting temporary container. Real engine
+  recovery remains issue36.
+
 
 - **Offline image delivery.** `deploy/release.py` builds and imports a
   six-role linux/amd64 release from committed OCU and WebUI sources.
@@ -18,7 +23,12 @@
   require `OCU_RELEASE_MANIFEST`, verify local images and tracked source
   bytes before mutation, and start frozen snapshots with
   `--no-build --pull never`. The version record renders that inventory
-  without credentials. Engine import and WAN-free restart remain issue36.
+  without credentials. Publication allocates private staging through one
+  `allocate_private_dir` seam, records the path before unmasking, and
+  deletes only that session's allocated paths on cancellation.
+  Engine import and WAN-free restart remain issue36.
+
+
 
 - **Files-only preview embedding.** An explicit `?embed=files` iframe accepts
   strict same-origin, same-parent, same-chat, increasing-generation `file_id`

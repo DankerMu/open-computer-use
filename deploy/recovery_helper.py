@@ -56,7 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "extract":
         recovery_fs.extract_tree(Path(args.archive), Path(args.target))
         return 0
-    if Path(args.path).exists():
+    marker = Path(args.path)
+    if marker.is_file() and not marker.is_symlink():
         return 0
     return 1
 

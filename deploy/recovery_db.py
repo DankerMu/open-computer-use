@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
 
 import recovery
 from recovery import RecoveryError, docker, sha256_file
+
 
 
 DUMP_NAME = "openwebui.dump"
@@ -24,11 +26,19 @@ SCHEMA_QUERY = (
     "SHOW server_version;"
 )
 CHAT_STATE_QUERY = (
-    "SELECT chat_id, last_seen_revision, COALESCE(preferences::text, ''), "
-    "COALESCE(owner_id, ''), COALESCE(file_ids::text, '') "
-    "FROM ocu_chat_state ORDER BY chat_id;"
+    "SELECT json_build_object("
+    "'chat_id', chat_id, "
+    "'last_seen_revision', last_seen_revision, "
+    "'prefs', COALESCE(prefs, '{}'::json), "
+    "'updated_at', updated_at"
+    ") FROM ocu_chat_state ORDER BY chat_id;"
+)
+CHAT_OWNERS_QUERY = (
+    "SELECT json_build_object('id', id, 'user_id', COALESCE(user_id, '')) "
+    "FROM chat ORDER BY id;"
 )
 LIVE_CHATS_QUERY = "SELECT id FROM chat ORDER BY id;"
+
 ORPHAN_DELETE = (
     "BEGIN; "
     "DELETE FROM ocu_chat_state s WHERE NOT EXISTS "
@@ -114,7 +124,10 @@ def _tool_version(container: str, tool: str) -> str:
 
 def capture_database(container: str, dest_dir: Path) -> dict:
     dump = dest_dir / DUMP_NAME
-    result = recovery._docker_with_input(
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(dest_dir, 0o700)
+    recovery.write_private_bytes(dump, b"", 0o600)
+    result = recovery.docker_stream_to_file(
         (
             "exec",
             "-u",
@@ -128,19 +141,15 @@ def capture_database(container: str, dest_dir: Path) -> dict:
             "openwebui",
             "-Fc",
         ),
-        None,
-        b"",
+        dump,
     )
     if result.returncode != 0:
         raise RecoveryError(f"postgres dump failed ({_safe_detail(result)})")
-    dump.write_bytes(result.stdout or b"")
-    os.chmod(dump, 0o600)
     if dump.stat().st_size == 0:
         raise RecoveryError("postgres dump is empty")
-    listing = recovery._docker_with_input(
+    listing = recovery.docker_stream_from_file(
         ("exec", "-u", "postgres", "-i", container, "pg_restore", "-l"),
-        None,
-        dump.read_bytes(),
+        dump,
     )
     if listing.returncode != 0:
         raise RecoveryError("postgres dump listing failed")
@@ -156,8 +165,7 @@ def restore_database(container: str, dump: Path) -> None:
     occupancy = _exec_postgres(container, EMPTY_DB_QUERY, read_only=True)
     if occupancy.strip() not in {"", "0"}:
         raise RecoveryError("target database is not empty")
-    data = dump.read_bytes()
-    result = recovery._docker_with_input(
+    result = recovery.docker_stream_from_file(
         (
             "exec",
             "-u",
@@ -172,11 +180,11 @@ def restore_database(container: str, dump: Path) -> None:
             "--exit-on-error",
             "--single-transaction",
         ),
-        None,
-        data,
+        dump,
     )
     if result.returncode != 0:
         raise RecoveryError(f"postgres restore failed ({_safe_detail(result)})")
+
 
 
 def prune_orphans(container: str) -> list[str]:
@@ -217,18 +225,22 @@ def _chat_state_rows(container: str) -> list[dict]:
     for line in raw.splitlines():
         if not line.strip():
             continue
-        parts = line.strip().split("|")
-        if len(parts) < 2:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as cop:
+            raise RecoveryError("malformed ocu_chat_state inspection") from cop
+        if not isinstance(payload, dict):
             raise RecoveryError("malformed ocu_chat_state inspection")
         rows.append(
             {
-                "chat_id": parts[0],
-                "last_seen_revision": int(parts[1] or 0),
-                "preferences": parts[2] if len(parts) > 2 else "",
-                "owner_id": parts[3] if len(parts) > 3 else "",
-                "file_ids": parts[4] if len(parts) > 4 else "",
+                "chat_id": str(payload.get("chat_id") or ""),
+                "last_seen_revision": int(payload.get("last_seen_revision") or 0),
+                "prefs": payload.get("prefs") if payload.get("prefs") is not None else {},
+                "updated_at": int(payload.get("updated_at") or 0),
             }
         )
+        if not rows[-1]["chat_id"]:
+            raise RecoveryError("malformed ocu_chat_state inspection")
     return rows
 
 
@@ -237,8 +249,31 @@ def _live_chat_ids(container: str) -> list[str]:
     return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
+def inspect_chat_owners(container: str) -> dict[str, str]:
+    raw = _exec_postgres(container, CHAT_OWNERS_QUERY, read_only=True)
+    owners = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as cop:
+            raise RecoveryError("malformed chat ownership inspection") from cop
+        if not isinstance(payload, dict) or "id" not in payload:
+            raise RecoveryError("malformed chat ownership inspection")
+        owners[str(payload["id"])] = str(payload.get("user_id") or "")
+    return owners
+
+
+
+
 def inspect_restored_state(container: str) -> dict:
-    return {"chat_state": _chat_state_rows(container), "live_chats": _live_chat_ids(container)}
+    return {
+        "chat_state": _chat_state_rows(container),
+        "live_chats": _live_chat_ids(container),
+        "owners": inspect_chat_owners(container),
+    }
+
 
 
 def inspect_provider_config(container: str) -> str:

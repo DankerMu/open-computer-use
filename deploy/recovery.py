@@ -16,6 +16,9 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 
 import release
 
@@ -114,21 +117,150 @@ def docker(*args: str, cwd: Path | None = None, input: bytes | None = None) -> s
     return release.docker(*args, cwd=cwd) if input is None else _docker_with_input(args, cwd, input)
 
 
-def _docker_with_input(
-    args: tuple[str, ...], cwd: Path | None, input: bytes
-) -> subprocess.CompletedProcess:
+def _docker_env() -> dict[str, str]:
     env = os.environ.copy()
     if release._PINNED_DOCKER_HOST:
         env["DOCKER_HOST"] = release._PINNED_DOCKER_HOST
         env.pop("DOCKER_CONTEXT", None)
-    return subprocess.run(
+    return env
+
+
+def _bounded_stream_text(stream, limit: int = 64 * 1024) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        piece = stream.read(4096)
+        if not piece:
+            break
+        remaining = limit - total
+        if remaining <= 0:
+            continue
+        chunks.append(piece[:remaining])
+        total += min(len(piece), remaining)
+    return b"".join(chunks)
+
+
+def _decode_bounded(data: bytes) -> str:
+    if not data:
+        return ""
+    return data.decode("utf-8", "replace")
+
+
+def _drain_bounded(stream, bucket: list[bytes], limit: int = 64 * 1024) -> None:
+    bucket.append(_bounded_stream_text(stream, limit))
+
+
+def _docker_with_input(
+    args: tuple[str, ...], cwd: Path | None, input: bytes
+) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
         ["docker", *args],
         cwd=None if cwd is None else str(cwd),
-        capture_output=True,
-        check=False,
-        env=env,
-        input=input,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_docker_env(),
     )
+    try:
+        stdout, stderr = process.communicate(input)
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    return subprocess.CompletedProcess(
+        ["docker", *args],
+        process.returncode,
+        stdout=_decode_bounded(stdout or b""),
+        stderr=_decode_bounded(stderr or b""),
+    )
+
+
+def docker_stream_to_file(
+    args: tuple[str, ...], dest: Path, *, cwd: Path | None = None
+) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        ["docker", *args],
+        cwd=None if cwd is None else str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_docker_env(),
+    )
+    written = 0
+    stderr_chunks: list[bytes] = []
+    try:
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stderr_thread = threading.Thread(
+            target=_drain_bounded, args=(process.stderr, stderr_chunks), daemon=True
+        )
+        stderr_thread.start()
+        fd = os.open(dest, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                fd = -1
+                while True:
+                    chunk = process.stdout.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    written += len(chunk)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        stderr_thread.join()
+        returncode = process.wait()
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    return subprocess.CompletedProcess(
+        ["docker", *args],
+        returncode,
+        stdout=str(written),
+        stderr=_decode_bounded(b"".join(stderr_chunks)),
+    )
+
+
+def docker_stream_from_file(
+    args: tuple[str, ...], source: Path, *, cwd: Path | None = None
+) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        ["docker", *args],
+        cwd=None if cwd is None else str(cwd),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_docker_env(),
+    )
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        readers = [
+            threading.Thread(target=_drain_bounded, args=(process.stdout, stdout_chunks), daemon=True),
+            threading.Thread(target=_drain_bounded, args=(process.stderr, stderr_chunks), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        with open(source, "rb") as incoming:
+            shutil.copyfileobj(incoming, process.stdin, 1024 * 1024)
+        process.stdin.close()
+        for reader in readers:
+            reader.join()
+        returncode = process.wait()
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    return subprocess.CompletedProcess(
+        ["docker", *args],
+        returncode,
+        stdout=_decode_bounded(b"".join(stdout_chunks)),
+        stderr=_decode_bounded(b"".join(stderr_chunks)),
+    )
+
 
 
 def require_command(result: subprocess.CompletedProcess, action: str) -> str:
@@ -162,22 +294,120 @@ def load_json_object(path: Path) -> dict:
     return release.load_json_object(path)
 
 
-def write_private_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.chmod(path, 0o600)
+
+def _ensure_private_dir(path: Path) -> None:
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as cop:
+        raise RecoveryError(f"cannot create private directory {path}: {cop}") from cop
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RecoveryError(f"{path}: private directory must not be a symlink")
+    if info.st_uid != os.geteuid():
+        raise RecoveryError(f"{path}: private directory is not owned by the current user")
+    if info.st_mode & 0o077:
+        raise RecoveryError(f"{path}: private directory must be mode 0700")
+
+
+def _open_private_file(path: Path, mode: int = 0o600) -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, mode)
+    except OSError as cop:
+        raise RecoveryError(f"cannot create private file {path}: {cop}") from cop
+    try:
+        os.fchmod(fd, mode)
+    except OSError as cop:
+        os.close(fd)
+        raise RecoveryError(f"cannot protect private file {path}: {cop}") from cop
+    return fd
 
 
 def write_private_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-    os.chmod(path, mode)
+    _ensure_private_dir(path.parent)
+    try:
+        fd = _open_private_file(path, mode)
+    except RecoveryError:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RecoveryError(f"{path}: private file must be a regular file")
+        if info.st_uid != os.geteuid():
+            raise RecoveryError(f"{path}: private file is not owned by the current user")
+        if stat.S_IMODE(info.st_mode) != mode:
+            raise RecoveryError(f"{path}: private file must be mode {oct(mode)}")
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    try:
+        os.write(fd, data)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+
+def write_private_json(path: Path, payload: dict) -> None:
+    write_private_bytes(
+        path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
 
 
 def copy_private(source: Path, dest: Path, mode: int = 0o600) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, dest)
-    os.chmod(dest, mode)
+    _ensure_private_dir(dest.parent)
+    fd = _open_private_file(dest, mode)
+    try:
+        with open(source, "rb") as incoming, os.fdopen(fd, "wb") as outgoing:
+            shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+            fd = -1
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def replace_private_file(source: Path, dest: Path, mode: int = 0o600) -> None:
+    """Atomically replace an owned regular private file after exclusive staging."""
+    _ensure_private_dir(dest.parent)
+    staged = dest.with_name(dest.name + f".replace-{os.getpid()}-{os.urandom(4).hex()}")
+    copy_private(source, staged, mode)
+    try:
+        info = dest.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RecoveryError(f"{dest}: owned replacement target must be a regular file")
+        if info.st_uid != os.geteuid():
+            raise RecoveryError(f"{dest}: owned replacement target is not owned by the current user")
+        os.replace(staged, dest)
+        os.chmod(dest, mode)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+
+
+def exclusive_private_file(directory: Path, prefix: str, suffix: str = "", mode: int = 0o600) -> Path:
+    _ensure_private_dir(directory)
+    for _ in range(32):
+        candidate = directory / f"{prefix}{os.urandom(8).hex()}{suffix}"
+        try:
+            fd = _open_private_file(candidate, mode)
+        except RecoveryError:
+            continue
+        os.close(fd)
+        return candidate
+    raise RecoveryError(f"cannot allocate private file in {directory}")
+
+
+def private_workspace(prefix: str) -> Path:
+    parent = Path(os.environ.get("TMPDIR") or "/tmp") / f"ocu-private-{os.getpid()}"
+    _ensure_private_dir(parent)
+    try:
+        path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
+    except OSError as cop:
+        raise RecoveryError(f"cannot allocate private workspace: {cop}") from cop
+    try:
+        os.chmod(path, 0o700)
+    except OSError as cop:
+        shutil.rmtree(path, ignore_errors=True)
+        raise RecoveryError(f"cannot protect private workspace: {cop}") from cop
+    return path
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -308,19 +538,111 @@ def helper_env() -> dict[str, str]:
     return env
 
 
+def _signal_process_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        try:
+            os.kill(pgid, sig)
+        except ProcessLookupError:
+            return
+
+
+def _reap_process_group(process: subprocess.Popen, timeout: float = 20.0) -> int:
+    pgid = process.pid
+    try:
+        pgid = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return process.wait()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return process.returncode
+        time.sleep(0.05)
+    _signal_process_group(pgid, signal.SIGKILL)
+    return process.wait()
+
+
 def run_up(script: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
     merged = dict(env)
     merged["DOCKER_HOST"] = pin_runtime_docker_host()
     merged.pop("DOCKER_CONTEXT", None)
-    return subprocess.run(
+    process = subprocess.Popen(
         ["bash", str(script)],
         cwd=str(script.parent.parent),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
         env=merged,
+        start_new_session=True,
+    )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def _drain(stream, chunks):
+        try:
+            while True:
+                piece = stream.read(4096)
+                if not piece:
+                    break
+                chunks.append(piece)
+        except ValueError:
+            return
+
+    readers = [
+        threading.Thread(target=_drain, args=(process.stdout, stdout_chunks), daemon=True),
+        threading.Thread(target=_drain, args=(process.stderr, stderr_chunks), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        returncode = process.wait()
+    except BaseException:
+        try:
+            pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
+            pgid = process.pid
+        _signal_process_group(pgid, signal.SIGTERM)
+        _reap_process_group(process)
+        raise
+    for reader in readers:
+        reader.join(timeout=1)
+    return subprocess.CompletedProcess(
+        ["bash", str(script)],
+        returncode,
+        stdout="".join(stdout_chunks),
+        stderr="".join(stderr_chunks),
     )
 
+
+def run_version_writer(script: Path, env: dict[str, str], cwd: Path) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        ["bash", str(script)],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate()
+    except BaseException:
+        try:
+            pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
+            pgid = process.pid
+        _signal_process_group(pgid, signal.SIGTERM)
+        _reap_process_group(process)
+        raise
+    return subprocess.CompletedProcess(
+        ["bash", str(script)],
+        process.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
+    )
 
 def cmd_backup(args: argparse.Namespace) -> int:
     from recovery_resources import backup_deployment

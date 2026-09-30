@@ -274,6 +274,21 @@ def _blocked_signals():
     yield
 
 
+def allocate_private_dir(*, prefix: str, parent: Path) -> Path:
+    try:
+        path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
+    except OSError as cop:
+        raise ReleaseError(f"cannot allocate private directory {prefix}: {cop}") from cop
+    try:
+        os.chmod(path, 0o700)
+    except OSError as cop:
+        shutil.rmtree(path, ignore_errors=True)
+        raise ReleaseError(f"cannot protect private directory {path}: {cop}") from cop
+    return path
+
+
+
+
 def _lstat(path: Path):
     try:
         return path.lstat()
@@ -481,28 +496,24 @@ class PublicationSession:
     def allocate_stage(self) -> Path:
         if self.lock_path is None:
             raise ReleaseError(f"publication reservation is missing for {self.dest}")
-        try:
-            self.stage = Path(
-                tempfile.mkdtemp(
-                    prefix=f"{self.dest.name}.stage-", dir=str(self.dest.parent)
-                )
+        with _blocked_signals():
+            allocated = allocate_private_dir(
+                prefix=f"{self.dest.name}.stage-", parent=self.dest.parent
             )
-        except OSError as cop:
-            raise ReleaseError(f"cannot allocate staging for {self.dest}: {cop}") from cop
+            self.stage = allocated
         return self.stage
 
     def allocate_snapshots(self) -> Path:
         if self.lock_path is None:
             raise ReleaseError(f"publication reservation is missing for {self.dest}")
-        try:
-            self.snapshots = Path(
-                tempfile.mkdtemp(prefix="ocu-release-src-", dir=str(self.dest.parent))
+        with _blocked_signals():
+            allocated = allocate_private_dir(
+                prefix="ocu-release-src-", parent=self.dest.parent
             )
-        except OSError as cop:
-            raise ReleaseError(
-                f"cannot allocate source snapshots for {self.dest}: {cop}"
-            ) from cop
+            self.snapshots = allocated
         return self.snapshots
+
+
 
     def cleanup(self) -> None:
         if not self.committed and self.stage is not None:
@@ -514,6 +525,8 @@ class PublicationSession:
         if self._owns_lock and self.lock_path is not None:
             release_lock(self.lock_path)
             self._owns_lock = False
+
+
 
 
 def normalize_docker_ref(reference: str) -> str:
@@ -1058,10 +1071,11 @@ def verify_source_bundle(
     if sha256_file(bundle) != payload["source_bundle"]["sha256"]:
         raise ReleaseError("source bundle checksum mismatch")
     owned = reconstruct_into is None
-    dest = reconstruct_into or Path(
-        tempfile.mkdtemp(prefix="ocu-source-verify-", dir=str(root.parent))
-    )
+    dest = reconstruct_into
     try:
+        if owned:
+            with _blocked_signals():
+                dest = allocate_private_dir(prefix="ocu-source-verify-", parent=root.parent)
         reconstructed = reconstruct_source(bundle, dest)
         if reconstructed != payload["ocu_source_sha"]:
             raise ReleaseError(
@@ -1073,8 +1087,9 @@ def verify_source_bundle(
         )
         return reconstructed
     finally:
-        if owned:
+        if owned and dest is not None:
             shutil.rmtree(dest, ignore_errors=True)
+
 
 
 def load_json_object(path: Path) -> dict:
