@@ -1592,6 +1592,21 @@ class OfflineReleaseTests(unittest.TestCase):
         hold.touch()
         first = self.root / "install-first"
         second = self.root / "install-second"
+        ready = self.root / "second-store-ready"
+        needle = "        imported = verify_archive_set(stage, staged_payload)\n"
+        source = self.release_script.read_text(encoding="utf-8")
+        self.assertIn(needle, source)
+        self._script_serial = getattr(self, "_script_serial", 0) + 1
+        script_b = self.root / f"isolated-release-{self._script_serial}.py"
+        script_b.write_text(
+            source.replace(
+                needle,
+                needle + f"        Path({str(ready)!r}).write_text('1')\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        script_b.chmod(0o755)
         env_a = {**self.env, "FAKE_DOCKER_HOLD_LOAD": str(hold)}
         process_a = subprocess.Popen(
             [
@@ -1607,6 +1622,7 @@ class OfflineReleaseTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
         process_b = None
         try:
@@ -1618,7 +1634,7 @@ class OfflineReleaseTests(unittest.TestCase):
             process_b = subprocess.Popen(
                 [
                     sys.executable,
-                    str(self.release_script),
+                    str(script_b),
                     "import",
                     "--delivery",
                     str(second_delivery),
@@ -1629,9 +1645,43 @@ class OfflineReleaseTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
-            time.sleep(0.2)
-            self.assertIsNone(process_b.poll(), "second import finished while first held the store")
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                self.assertIsNone(
+                    process_a.poll(), "first import exited before second was store-ready"
+                )
+                self.assertIsNone(process_b.poll(), "second import exited before store-ready")
+                self.assertLess(
+                    time.monotonic(), deadline, "second import did not reach store-ready"
+                )
+                time.sleep(0.02)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if (second / "release.json").is_file() or (self.state / "load-count").exists():
+                    break
+                if process_b.poll() is not None:
+                    break
+                time.sleep(0.02)
+            if (self.state / "load-count").exists() and not (second / "release.json").is_file():
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and not (second / "release.json").is_file():
+                    if process_b.poll() is not None:
+                        break
+                    time.sleep(0.02)
+            self.assertFalse(
+                (second / "release.json").is_file(),
+                "second import published while first held the store",
+            )
+            self.assertFalse(
+                (self.state / "load-count").exists(),
+                "second import loaded while first held the store",
+            )
+            self.assertIsNone(
+                process_b.poll(), "second import finished while first held the store"
+            )
+            self.assertIsNone(process_a.poll(), "first import exited while still held")
             hold.unlink()
             stdout_a, stderr_a = process_a.communicate(timeout=20)
             self.assertEqual(process_a.returncode, 0, stdout_a + stderr_a)
@@ -1647,9 +1697,17 @@ class OfflineReleaseTests(unittest.TestCase):
         finally:
             hold.unlink(missing_ok=True)
             for process in (process_a, process_b):
-                if process is not None and process.poll() is None:
-                    process.kill()
-                    process.wait()
+                if process is None:
+                    continue
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                process.wait()
 
     def test_canonical_hybrid_archive_imports(self):
         delivery, inventory, _sha = self.write_hybrid_delivery(nested_index=True, attestation={})
