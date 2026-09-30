@@ -176,7 +176,7 @@ def publish_bundle(stage_dir: Path, dest_dir: Path) -> None:
                 raise RuntimeError(
                     f"published {dest_dir}; residual backup remains at {backup}"
                 ) from cleanup_error
-    except Exception as error:
+    except BaseException as error:
         if not committed:
             failures = [error]
             if backup.exists():
@@ -193,7 +193,7 @@ def publish_bundle(stage_dir: Path, dest_dir: Path) -> None:
             if staged.exists():
                 shutil.rmtree(staged, ignore_errors=True)
             if len(failures) > 1:
-                raise ExceptionGroup("publication failed", failures) from error
+                raise BaseExceptionGroup("publication failed", failures) from error
         raise
     finally:
         try:
@@ -256,7 +256,7 @@ def prepare_drawio(
                 raise ValueError(f"Staged hash mismatch {entry['path']}")
         publish_bundle(stage_dir, dest_dir)
         return {"destDir": str(dest_dir), "files": len(inventory)}
-    except Exception:
+    except BaseException:
         shutil.rmtree(stage_dir, ignore_errors=True)
         raise
 

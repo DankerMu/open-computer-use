@@ -143,6 +143,55 @@ def test_final_rename_failure_keeps_prior_bytes(tmp_path, monkeypatch):
     assert (dest / "marker.txt").read_text() == "prior-valid-bundle"
 
 
+def test_keyboard_interrupt_after_backup_restores_prior_bytes(tmp_path, monkeypatch):
+    dest = tmp_path / "drawio"
+    stage = tmp_path / "stage"
+    dest.mkdir()
+    stage.mkdir()
+    (dest / "marker.txt").write_text("prior-valid-bundle")
+    (stage / "marker.txt").write_text("staged-replacement")
+    original = Path.replace
+
+    def interrupting_replace(self, target):
+        if Path(self).name.startswith("drawio.next-") and Path(target) == dest:
+            raise KeyboardInterrupt("forced publication interrupt")
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", interrupting_replace)
+    with pytest.raises(KeyboardInterrupt, match="forced publication interrupt"):
+        publish_bundle(stage, dest)
+    assert (dest / "marker.txt").read_text() == "prior-valid-bundle"
+    assert not any(tmp_path.glob("drawio.next-*"))
+
+
+def test_keyboard_interrupt_refused_restore_names_backup(tmp_path, monkeypatch):
+    dest = tmp_path / "drawio"
+    stage = tmp_path / "stage"
+    dest.mkdir()
+    stage.mkdir()
+    (dest / "marker.txt").write_text("prior-valid-bundle")
+    (stage / "marker.txt").write_text("staged-replacement")
+    original_replace = Path.replace
+
+    def interrupting_replace(self, target):
+        if Path(self).name.startswith("drawio.next-") and Path(target) == dest:
+            raise KeyboardInterrupt("forced publication interrupt")
+        if Path(self).name.startswith("drawio.prev-") and Path(target) == dest:
+            raise OSError("forced restore refusal")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", interrupting_replace)
+    with pytest.raises(BaseExceptionGroup) as caught:
+        publish_bundle(stage, dest)
+    group = caught.value
+    assert any(isinstance(item, KeyboardInterrupt) for item in group.exceptions)
+    restore = next(item for item in group.exceptions if not isinstance(item, KeyboardInterrupt))
+    backups = list(tmp_path.glob("drawio.prev-*"))
+    assert backups, "refused restore did not retain a named backup"
+    assert backups[0].as_posix() in str(restore)
+    assert (backups[0] / "marker.txt").read_text() == "prior-valid-bundle"
+
+
 def test_backup_cleanup_failure_keeps_new_bytes(tmp_path, monkeypatch):
     dest = tmp_path / "drawio"
     stage = tmp_path / "stage"

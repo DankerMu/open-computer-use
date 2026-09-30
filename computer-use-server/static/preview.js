@@ -751,7 +751,6 @@ function configureDrawioBases() {
   window.DRAWIO_LIGHTBOX_URL = root;
   window.DRAWIO_VIEWER_URL = moduleAssetUrl('drawio/js/viewer-static.min.js');
   window.EXPORT_URL = '';
-  window.PROXY_URL = '';
   window.SAVE_URL = '';
   window.OPEN_FORM = '';
   window.VSS_CONVERT_URL = '';
@@ -785,12 +784,6 @@ function mxgraphShapeFromStyle(style) {
   return match ? match[1].trim().toLowerCase() : null;
 }
 
-function collectMxgraphShapes(root, names) {
-  if (!root || root.nodeType !== 1) return;
-  const name = mxgraphShapeFromStyle(root.getAttribute('style'));
-  if (name) names.add(name);
-  for (const child of root.children) collectMxgraphShapes(child, names);
-}
 
 function collectViewerMxgraphShapes(viewer, names) {
   try {
@@ -807,18 +800,20 @@ function collectViewerMxgraphShapes(viewer, names) {
 function installStencilLoadTracker() {
   const utils = window.mxUtils;
   const failures = [];
-  if (!utils) return { failures, restore() {} };
+  const attempted = [];
+  if (!utils) return { failures, attempted, restore() {}, invalidateUnresolved() {} };
   const previousLoad = utils.load;
   const previousGet = utils.get;
-  const note = (url, status) => {
+  const noteAttempt = (url, status) => {
     if (!String(url || '').includes('/stencils/')) return;
+    attempted.push(String(url));
     if (!(status >= 200 && status < 300)) failures.push(String(url));
   };
   if (typeof previousLoad === 'function') {
     utils.load = function(url) {
       const result = previousLoad.apply(this, arguments);
-      try { note(url, result && result.getStatus()); } catch {
-        note(url, 0);
+      try { noteAttempt(url, result && result.getStatus()); } catch {
+        noteAttempt(url, 0);
       }
       return result;
     };
@@ -826,49 +821,78 @@ function installStencilLoadTracker() {
   if (typeof previousGet === 'function') {
     utils.get = function(url, onload, onerror) {
       return previousGet.call(this, url, function(request) {
-        try { note(url, request && request.getStatus()); } catch {
-          note(url, 0);
+        try { noteAttempt(url, request && request.getStatus()); } catch {
+          noteAttempt(url, 0);
         }
         if (onload) onload(request);
       }, function(request) {
-        note(url, 0);
+        noteAttempt(url, 0);
         if (onerror) onerror(request);
       });
     };
   }
+  const invalidateUrl = (registry, url) => {
+    if (registry.packages) delete registry.packages[url];
+    if (registry.filesLoaded) delete registry.filesLoaded[url];
+    const libraries = registry.libraries || {};
+    for (const [name, members] of Object.entries(libraries)) {
+      if (!Array.isArray(members)) continue;
+      if (members.some((member) => String(member) === url || String(member).includes(url) ||
+          url.endsWith(String(member)) || url.includes(String(member)))) {
+        if (registry.packages) delete registry.packages[name];
+      }
+    }
+  };
+  const invalidateUnresolved = (names) => {
+    const registry = window.mxStencilRegistry;
+    if (!registry) return;
+    for (const name of names) {
+      if (shapeIsResolved(name)) continue;
+      const basename = typeof registry.getBasenameForStencil === 'function'
+        ? registry.getBasenameForStencil(name)
+        : null;
+      if (basename && registry.packages) delete registry.packages[basename];
+      const members = basename && registry.libraries ? registry.libraries[basename] : null;
+      if (Array.isArray(members)) {
+        for (const member of members) invalidateUrl(registry, String(member));
+      }
+      for (const url of attempted) {
+        if (basename && url.includes(basename)) invalidateUrl(registry, url);
+      }
+    }
+  };
   return {
     failures,
+    attempted,
+    invalidateUnresolved,
     restore() {
       utils.load = previousLoad;
       utils.get = previousGet;
       const registry = window.mxStencilRegistry;
       if (!registry) return;
       for (const url of failures) {
-        try {
-          if (registry.packages) delete registry.packages[url];
-          if (registry.filesLoaded) delete registry.filesLoaded[url];
-          const libraries = registry.libraries || {};
-          for (const [name, members] of Object.entries(libraries)) {
-            if (!Array.isArray(members)) continue;
-            if (members.some((member) => String(member) === url || String(member).includes(url) ||
-                url.endsWith(String(member)) || url.includes(String(member)))) {
-              if (registry.packages) delete registry.packages[name];
-            }
-          }
-        } catch {
-        }
+        try { invalidateUrl(registry, url); } catch {}
       }
     }
   };
 }
 
-function assertRequiredStencilsLoaded(names, failures) {
-  if (failures.length) throw new Error('Draw.io stencil fetch failed');
-  const registry = window.mxStencilRegistry && window.mxStencilRegistry.stencils;
-  for (const name of names) {
-    if (!registry || !Object.prototype.hasOwnProperty.call(registry, name) || !registry[name]) {
-      throw new Error('Draw.io required stencil unavailable');
-    }
+function shapeIsResolved(name) {
+  if (window.mxCellRenderer?.defaultShapes?.[name]) return true;
+  const stencils = window.mxStencilRegistry?.stencils;
+  return Boolean(stencils && Object.prototype.hasOwnProperty.call(stencils, name) && stencils[name]);
+}
+
+function assertRequiredStencilsLoaded(names, tracker) {
+  const failures = tracker?.failures || [];
+  if (failures.length) {
+    tracker?.invalidateUnresolved?.(names);
+    throw new Error('Draw.io stencil fetch failed');
+  }
+  const unresolved = [...names].filter((name) => !shapeIsResolved(name));
+  if (unresolved.length) {
+    tracker?.invalidateUnresolved?.(unresolved);
+    throw new Error('Draw.io required stencil unavailable');
   }
 }
 
@@ -899,6 +923,30 @@ function waitForDrawioRender(viewer, host) {
     viewer.addListener('render', () => finish());
     finish();
   });
+}
+
+function attachRenderedPageGuard(viewer, host, file, tracker) {
+  const check = () => {
+    if (!host.isConnected) return;
+    const required = new Set();
+    collectViewerMxgraphShapes(viewer, required);
+    try {
+      assertRequiredStencilsLoaded(required, tracker);
+    } catch (error) {
+      console.error('Draw.io render error:', error);
+      tracker.restore();
+      if (host.isConnected) renderDownloadFallback(host.parentNode || host, file, 'diagram', t('drawio_fail'));
+    }
+  };
+  if (typeof viewer.addListener === 'function') {
+    viewer.addListener('render', check);
+    viewer.addListener('graphChanged', check);
+    viewer.addListener('xmlNodeChanged', check);
+  }
+  const graph = viewer.graph;
+  if (graph && typeof graph.addListener === 'function') {
+    graph.addListener('render', check);
+  }
 }
 
 async function loadDrawioViewer() {
@@ -934,8 +982,6 @@ async function renderDrawioPreview(container, file) {
     if (!drawioResp.ok) throw new Error('Draw.io document fetch failed');
     const drawioXml = await drawioResp.text();
     const xmlRoot = parseDrawioDocument(drawioXml);
-    const required = new Set();
-    collectMxgraphShapes(xmlRoot, required);
     const Viewer = await loadDrawioViewer();
     const host = document.createElement('div');
     host.className = 'drawio-host';
@@ -946,18 +992,24 @@ async function renderDrawioPreview(container, file) {
     container.style.alignItems = 'flex-start';
     container.appendChild(host);
     Object.assign(tracker, installStencilLoadTracker());
-    const viewer = new Viewer(host, xmlRoot, { 'auto-fit': true, lightbox: false, nav: true });
+    const viewer = new Viewer(host, xmlRoot, {
+      'auto-fit': true,
+      nav: true,
+      lightbox: true,
+      toolbar: 'pages zoom lightbox',
+    });
     await waitForDrawioRender(viewer, host);
     if (!host.isConnected) return;
+    const required = new Set();
     collectViewerMxgraphShapes(viewer, required);
-    assertRequiredStencilsLoaded(required, tracker.failures);
+    assertRequiredStencilsLoaded(required, tracker);
+    attachRenderedPageGuard(viewer, host, file, tracker);
     const svg = host.querySelector('svg');
     if (!svg) throw new Error('Draw.io render produced no diagram');
   } catch (err) {
     if (!container.isConnected) return;
     console.error('Draw.io render error:', err);
     renderDownloadFallback(container, file, 'diagram', t('drawio_fail'));
-  } finally {
     tracker.restore();
   }
 }
