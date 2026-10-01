@@ -177,8 +177,7 @@ def _mounts(payload: dict) -> list[dict]:
 
 
 def _container_image(payload: dict) -> str:
-    config = payload.get("Config") if isinstance(payload.get("Config"), dict) else {}
-    return str(payload.get("Image") or config.get("Image") or "")
+    return str(payload.get("Image") or "")
 
 
 def _compose_labels(payload: dict) -> tuple[str, str]:
@@ -221,28 +220,31 @@ def discover_sandboxes() -> list[dict]:
 
 def _sandbox_attributed(sandbox: dict, identity: dict, expected_chats: set[str]) -> bool:
     chat_id = sandbox["chat_id"]
-    if chat_id not in expected_chats:
+    labels = _labels(sandbox["payload"])
+    if chat_id not in expected_chats or sandbox["name"] != recovery.sandbox_container_name(chat_id):
+        return False
+    required = {
+        "managed-by": "mcp-computer-use-orchestrator",
+        "chat-id": chat_id,
+        "tool": "computer-use-mcp",
+    }
+    if any(labels.get(key) != value for key, value in required.items()):
         return False
     mounts = _mounts(sandbox["payload"])
-    if not mounts:
-        return False
-    wanted_volume = recovery.workspace_volume_name(chat_id)
-    wanted_chat = str(identity["chat_dir"] / chat_id)
-    wanted_uploads = str(Path(wanted_chat) / "uploads")
-    wanted_outputs = str(Path(wanted_chat) / "outputs")
-    workspace = False
-    uploads = False
-    outputs = False
-    for mount in mounts:
-        source = str(mount.get("Name") or mount.get("Source") or "")
-        destination = str(mount.get("Destination") or "")
-        if source == wanted_volume and destination in {"/home/assistant", "/root"}:
-            workspace = True
-        if source == wanted_uploads and destination == "/mnt/user-data/uploads":
-            uploads = True
-        if source == wanted_outputs and destination == "/mnt/user-data/outputs":
-            outputs = True
-    return workspace and uploads and outputs
+    expected = {
+        "/home/assistant": ("volume", recovery.workspace_volume_name(chat_id), True),
+        "/mnt/user-data/uploads": ("bind", str(identity["chat_dir"] / chat_id / "uploads"), False),
+        "/mnt/user-data/outputs": ("bind", str(identity["chat_dir"] / chat_id / "outputs"), True),
+    }
+    for destination, (kind, source, writable) in expected.items():
+        matches = [mount for mount in mounts if mount.get("Destination") == destination]
+        if len(matches) != 1:
+            return False
+        mount = matches[0]
+        actual = mount.get("Name") if kind == "volume" else mount.get("Source")
+        if mount.get("Type") != kind or actual != source or mount.get("RW") is not writable:
+            return False
+    return True
 
 
 
@@ -277,18 +279,12 @@ def _stop_container(name: str) -> None:
 
 def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inventory: dict) -> None:
     expected_images = {
-        identity["server_container"]: runtime.get("COMPUTER_USE_SERVER_IMAGE")
-        or inventory["images"]["computer-use-server"]["reference"],
-        identity["retention_container"]: runtime.get("RETENTION_GUARD_IMAGE")
-        or inventory["images"]["retention-guard"]["reference"],
-        identity["init_container"]: runtime.get("OPENWEBUI_IMAGE")
-        or inventory["images"]["open-webui"]["reference"],
-        identity["webui_container"]: runtime.get("OPENWEBUI_IMAGE")
-        or inventory["images"]["open-webui"]["reference"],
-        identity["proxy_container"]: runtime.get("OCU_PROXY_IMAGE")
-        or inventory["images"]["proxy"]["reference"],
-        identity["postgres_container"]: runtime.get("POSTGRES_IMAGE")
-        or inventory["images"]["postgres"]["reference"],
+        identity["server_container"]: inventory["images"]["computer-use-server"]["configuration_digest"],
+        identity["retention_container"]: inventory["images"]["retention-guard"]["configuration_digest"],
+        identity["init_container"]: inventory["images"]["open-webui"]["configuration_digest"],
+        identity["webui_container"]: inventory["images"]["open-webui"]["configuration_digest"],
+        identity["proxy_container"]: inventory["images"]["proxy"]["configuration_digest"],
+        identity["postgres_container"]: inventory["images"]["postgres"]["configuration_digest"],
     }
     expected_services = {
         identity["server_container"]: "computer-use-server",
@@ -305,8 +301,8 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
             continue
         payload = inspect_container(name)
         inspected_any = True
-        image = _container_image(payload) or str(payload.get("Image") or "")
-        if expected and image and image != expected:
+        image = _container_image(payload)
+        if image != expected:
             raise RecoveryError(
                 f"{name} image {image} does not match selected release {expected}"
             )
@@ -336,6 +332,19 @@ def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dic
         identity["webui_container"],
         identity["proxy_container"],
     ]
+    host_chats = {
+        recovery.canonical_chat_id(child.name)
+        for child in identity["chat_dir"].iterdir()
+        if child.is_dir() and not child.is_symlink()
+    } if identity["chat_dir"].exists() else set()
+    initial = discover_sandboxes()
+    seen_chats = set()
+    for sandbox in initial:
+        if sandbox["chat_id"] in seen_chats or not _sandbox_attributed(sandbox, identity, host_chats):
+            raise RecoveryError(f"sandbox {sandbox['name']} cannot be attributed to the selected deployment")
+        seen_chats.add(sandbox["chat_id"])
+        if container_paused(sandbox["payload"]):
+            raise RecoveryError(f"{sandbox['name']} is paused and cannot be captured")
     for name in writers:
         result = docker("inspect", name)
         if result.returncode != 0:
@@ -357,6 +366,8 @@ def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dic
             if child.is_dir() and not child.is_symlink():
                 host_chats.add(recovery.canonical_chat_id(child.name))
     first = discover_sandboxes()
+    if len({item["chat_id"] for item in first}) != len(first):
+        raise RecoveryError("ambiguous sandbox ownership after admission shutdown")
     attributed = []
     for sandbox in first:
         if not _sandbox_attributed(sandbox, identity, host_chats):
@@ -381,6 +392,8 @@ def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dic
     attributed_ids = {item["id"] for item in attributed}
     for sandbox in second:
         payload = inspect_container(sandbox["id"])
+        if not _sandbox_attributed({**sandbox, "payload": payload}, identity, host_chats):
+            raise RecoveryError(f"sandbox {sandbox['name']} attribution changed during quiescence")
         if sandbox["id"] in attributed_ids and (container_running(payload) or container_paused(payload)):
             raise RecoveryError(f"{sandbox['name']} remained active at capture")
         if sandbox["id"] not in attributed_ids:
@@ -910,14 +923,8 @@ def stop_isolated_postgres(name: str) -> None:
         raise RecoveryError(f"cannot release isolated postgres {name}")
 
 
-def selected_release_identity(payload: dict) -> tuple[str, str, tuple[str, ...]]:
-    images = payload["images"]
-    references = tuple(images[role]["reference"] for role in release.ROLE_ORDER)
-    return payload["ocu_source_sha"], payload["webui_source_sha"], references
-
-
 def require_selected_release(existing: dict, requested: dict) -> None:
-    if selected_release_identity(existing) != selected_release_identity(requested):
+    if existing != requested:
         raise RecoveryError("requested retained delivery does not match the installed release identity")
 
 
@@ -925,28 +932,65 @@ def _selected_source_root(install_root: Path) -> Path:
     return install_root.parent / f"{install_root.name}.selected-source"
 
 
-def _owned_selected_root(source: Path, source_root: Path) -> Path | None:
-    wanted = source_root / "source"
-    if not source_root.is_dir() or not wanted.is_dir():
-        return None
-    if not source.is_symlink():
-        return None
+def _selection_receipt(install_root: Path, requested: dict, source_root: Path) -> dict:
+    receipt = install_root / "config" / "selected-source-owner.json"
+    target = install_root.stat()
+    binding = {
+        "target": str(install_root.resolve()),
+        "target_device": target.st_dev,
+        "target_inode": target.st_ino,
+        "source_root": str(source_root.absolute()),
+        "inventory": requested,
+    }
+    if receipt.exists() or receipt.is_symlink():
+        recovery.require_regular_file(receipt)
+        info = receipt.lstat()
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise RecoveryError("selected source ownership receipt must be private")
+        recorded = recovery.load_json_object(receipt)
+        if any(recorded.get(key) != value for key, value in binding.items()):
+            raise RecoveryError("selected source ownership does not match this target and delivery")
+        if not isinstance(recorded.get("token"), str) or len(recorded["token"]) != 64:
+            raise RecoveryError("selected source ownership token is invalid")
+        return recorded
+    if source_root.exists() or source_root.is_symlink():
+        raise RecoveryError("refusing unowned selected source root")
+    binding["token"] = os.urandom(32).hex()
+    staged = None
     try:
-        if source.resolve() == wanted.resolve():
-            return source_root
-    except OSError:
-        return None
-    return None
+        with release._blocked_signals():
+            staged = recovery.exclusive_private_file(receipt.parent, "selection-owner-", ".json")
+        with staged.open("w", encoding="utf-8") as stream:
+            json.dump(binding, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(staged, receipt, follow_symlinks=False)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+    return binding
 
 
-def _require_matching_selected_root(source_root: Path, requested: dict) -> dict:
-    try:
-        payload = release.load_inventory(source_root / "release.json")
-        require_selected_release(payload, requested)
-        release.verify_tracked_source(source_root / "source", requested["ocu_source_sha"])
-        release.require_supported_source_contract(source_root / "source")
-    except (OSError, KeyError, TypeError, RecoveryError, release.ReleaseError) as cop:
-        raise RecoveryError(f"selected source already exists: {source_root}") from cop
+def _require_matching_selected_root(source_root: Path, requested: dict, owner: dict) -> dict:
+    if source_root.is_symlink() or not source_root.is_dir():
+        raise RecoveryError("selected source root is not an owned directory")
+    for path in (source_root / "source", source_root / "source" / ".git"):
+        if path.is_symlink() or not path.is_dir():
+            raise RecoveryError("selected checkout is not an owned directory")
+    marker = source_root / ".recovery-owner.json"
+    recovery.require_regular_file(marker)
+    info = marker.lstat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise RecoveryError("selected source ownership marker must be private")
+    if recovery.load_json_object(marker) != owner:
+        raise RecoveryError("selected source ownership receipt mismatch")
+    manifest = source_root / "release.json"
+    recovery.require_regular_file(manifest)
+    payload = release.load_inventory(manifest)
+    require_selected_release(payload, requested)
+    release.verify_tracked_source(source_root / "source", requested["ocu_source_sha"])
+    release.require_supported_source_contract(source_root / "source")
+    release.verify_local_images(payload)
     return payload
 
 
@@ -964,31 +1008,21 @@ def import_selected_release(delivery: Path, install_root: Path) -> dict:
     source = install_root / "source"
     manifest = install_root / "release.json"
     source_root = _selected_source_root(install_root)
-    owned = _owned_selected_root(source, source_root)
-    if owned is not None:
-        payload = _require_matching_selected_root(owned, requested)
-        _publish_selected_inventory(manifest, owned)
-        return payload
-    if source.is_dir() and (source / ".git").exists():
-        release.verify_tracked_source(source, requested["ocu_source_sha"])
-        release.require_supported_source_contract(source)
-        if manifest.exists():
-            existing = release.load_inventory(manifest)
-            require_selected_release(existing, requested)
-        return requested
-    if source.exists() or source.is_symlink():
-        raise RecoveryError("restored source path is already occupied")
-    if recovery.destination_occupied(install_root):
-        if source_root.exists():
-            payload = _require_matching_selected_root(source_root, requested)
-        else:
-            payload = release.import_release(delivery=delivery, install_root=source_root)
-            require_selected_release(payload, requested)
+    if source.exists() and not source.is_symlink():
+        raise RecoveryError("restored source path is not an owned selected checkout")
+    if source.is_symlink() and os.readlink(source) != str(source_root / "source"):
+        raise RecoveryError("restored source points to an unowned checkout")
+    owner = _selection_receipt(install_root, requested, source_root)
+    if source_root.is_symlink():
+        raise RecoveryError("selected source root is a symlink")
+    if not source_root.exists():
+        if source.is_symlink():
+            raise RecoveryError("owned selected source is missing")
+        release.import_release(delivery=delivery, install_root=source_root, recovery_owner=owner)
+    payload = _require_matching_selected_root(source_root, requested, owner)
+    if not source.is_symlink():
         os.symlink(source_root / "source", source)
-        _publish_selected_inventory(manifest, source_root)
-        return payload
-    payload = release.import_release(delivery=delivery, install_root=install_root)
-    require_selected_release(payload, requested)
+    _publish_selected_inventory(manifest, source_root)
     return payload
 
 

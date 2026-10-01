@@ -1525,6 +1525,7 @@ def docker_run(state: Path, argv: list[str]) -> int:
             {
                 "Id": container_id,
                 "Name": name or container_id,
+                "Image": lookup_image(load_images(state), image)["Id"],
                 "State": {"Status": "running", "Running": True, "Paused": False},
                 "Config": {"Image": image, "Env": [f"{key}={value}" for key, value in env.items()]},
                 "Labels": {},

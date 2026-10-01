@@ -46,10 +46,12 @@ PROVIDER_B = "credential-B"
 
 
 def stack_container(name: str, *, running=True, paused=False, extra=None, image=None, service=None):
+    role = next((role for role, reference in DEFAULT_RELEASE_IMAGES.items() if reference == image), None)
+    image_id = "sha256:" + hashlib.sha256(config_payload(DEFAULT_RELEASE_DIGESTS[role])).hexdigest() if role else ""
     body = {
         "Id": hashlib.sha256(name.encode("utf-8")).hexdigest()[:12],
         "Name": name,
-        "Image": image or "",
+        "Image": image_id,
         "State": {
             "Status": "paused" if paused else ("running" if running else "exited"),
             "Running": running and not paused,
@@ -81,7 +83,7 @@ def stack_container(name: str, *, running=True, paused=False, extra=None, image=
             config = body.get("Config") or {}
             config["Image"] = image
             body["Config"] = config
-            body["Image"] = image
+            body["Image"] = image_id
     return body
 
 
@@ -105,15 +107,21 @@ def sandbox(name: str, chat_id: str, *, running=True, paused=False, chat_dir: Pa
             },
             "Mounts": [
                 {
+                    "Type": "volume",
+                    "RW": True,
                     "Name": f"chat-{chat_id}-workspace",
                     "Source": f"chat-{chat_id}-workspace",
                     "Destination": "/home/assistant",
                 },
                 {
+                    "Type": "bind",
+                    "RW": False,
                     "Source": f"{chat_root}/uploads",
                     "Destination": "/mnt/user-data/uploads",
                 },
                 {
+                    "Type": "bind",
+                    "RW": True,
                     "Source": f"{chat_root}/outputs",
                     "Destination": "/mnt/user-data/outputs",
                 },
@@ -427,6 +435,44 @@ class RecoveryCliTests(unittest.TestCase):
         write_inventory(delivery / "release.json", payload)
         return delivery, payload, source
 
+
+    def test_actual_image_id_mismatch_refuses_matching_launch_reference(self):
+        path = self.state / "containers.json"
+        containers = json.loads(path.read_text())
+        server = next(row for row in containers if row["Name"] == "ocu-test-computer-use-server")
+        self.assertEqual(server["Config"]["Image"], DEFAULT_RELEASE_IMAGES["computer-use-server"])
+        server["Image"] = "sha256:" + "0" * 64
+        path.write_text(json.dumps(containers))
+        before = path.read_bytes()
+        result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                               "--destination", str(self.root / "wrong-id"),
+                               "--runtime-file", str(self.runtime)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse((self.state / "stopped.log").exists())
+
+    def test_foreign_producer_identity_refuses_before_any_stop(self):
+        original = (self.state / "containers.json").read_bytes()
+        for defect in ("name", "tool", "type"):
+            with self.subTest(defect=defect):
+                containers = json.loads(original)
+                row = next(item for item in containers if item["Name"] == f"owui-chat-{CHAT_ID}")
+                if defect == "name":
+                    row["Name"] += "-foreign"
+                elif defect == "tool":
+                    row["Labels"]["tool"] = "other-producer"
+                    row["Config"]["Labels"]["tool"] = "other-producer"
+                else:
+                    row["Mounts"][0]["Type"] = "bind"
+                path = self.state / "containers.json"
+                path.write_text(json.dumps(containers))
+                before = path.read_bytes()
+                result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                                       "--destination", str(self.root / f"foreign-{defect}"),
+                                       "--runtime-file", str(self.runtime)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertFalse((self.state / "stopped.log").exists())
 
     def run_cli(self, args, extra=None, uid="0"):
         env = dict(self.env)
@@ -1268,6 +1314,42 @@ class RecoveryCliTests(unittest.TestCase):
         delivery, payload, _source = self._write_retained_delivery()
         captured = json.loads((dest / "release.json").read_text(encoding="utf-8"))
         self.assertNotEqual(captured["ocu_source_sha"], payload["ocu_source_sha"])
+        foreign_root = dest.parent / f"{dest.name}.selected-source"
+        independently_built = self.root / "foreign-selection"
+        independently_built.mkdir()
+        shutil.copytree(_source, independently_built / "source")
+        altered = json.loads(json.dumps(payload))
+        altered["images"]["workspace"]["configuration_digest"] = "sha256:" + "0" * 64
+        before_manifest = (dest / "release.json").read_bytes()
+        before_runtime = (dest / "config" / "runtime.env").read_bytes()
+        for linked, foreign_inventory in ((False, payload), (False, altered), (True, altered)):
+            write_inventory(independently_built / "release.json", foreign_inventory)
+            if linked:
+                foreign_root.symlink_to(independently_built, target_is_directory=True)
+            else:
+                shutil.copytree(independently_built, foreign_root)
+            refused = self.run_cli(["activate", "--destination-root", str(dest),
+                                    "--retained-delivery", str(delivery)], extra=extra)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertFalse((dest / "source").exists())
+            self.assertEqual((dest / "release.json").read_bytes(), before_manifest)
+            self.assertEqual((dest / "config" / "runtime.env").read_bytes(), before_runtime)
+            self.assertFalse((target_state / "starts.log").exists())
+            self.assertEqual(json.loads((foreign_root / "release.json").read_text()), foreign_inventory)
+            self.assertFalse((dest / "config" / "selected-source-owner.json").exists())
+            if linked:
+                foreign_root.unlink()
+            else:
+                shutil.rmtree(foreign_root)
+        (dest / "source").symlink_to(independently_built / "source", target_is_directory=True)
+        refused = self.run_cli(["activate", "--destination-root", str(dest),
+                                "--retained-delivery", str(delivery)], extra=extra)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual((dest / "release.json").read_bytes(), before_manifest)
+        self.assertEqual((dest / "config" / "runtime.env").read_bytes(), before_runtime)
+        self.assertFalse((dest / "config" / "selected-source-owner.json").exists())
+        self.assertEqual((dest / "source").resolve(), (independently_built / "source").resolve())
+        (dest / "source").unlink()
         activated = self.run_cli(
             [
                 "activate",
@@ -1512,10 +1594,11 @@ class RecoveryCliTests(unittest.TestCase):
         delivery, inventory, _source = self._write_retained_delivery("interrupt-delivery")
         package = self.recovery_pkg / "recovery_resources.py"
         original = package.read_text(encoding="utf-8")
-        after_import = '            payload = release.import_release(delivery=delivery, install_root=source_root)'
+        after_import = '        release.import_release(delivery=delivery, install_root=source_root, recovery_owner=owner)'
         after_symlink = '        os.symlink(source_root / "source", source)'
-        after_inventory = "        _publish_selected_inventory(manifest, source_root)"
-        after_runtime = "        published = persist_selected_runtime_identity("
+        after_inventory = "    _publish_selected_inventory(manifest, source_root)"
+        after_runtime = "        env = activation_env(published, inventory, destination_root, provider)"
+        after_version = '        record = destination_root / "DEPLOYED_VERSION.md"'
         foreign = dest.parent / "foreign-keep"
         foreign.mkdir()
         (foreign / "keep.txt").write_text("untouched\n", encoding="utf-8")
@@ -1523,10 +1606,11 @@ class RecoveryCliTests(unittest.TestCase):
         before_runtime = (dest / "config" / "runtime.env").read_bytes()
         selected_root = dest.parent / f"{dest.name}.selected-source"
         for needle, injection in (
-            (after_import, after_import + '\n            raise RecoveryError("injected interruption after source-root")'),
+            (after_import, after_import + '\n        raise RecoveryError("injected interruption after source-root")'),
             (after_symlink, after_symlink + '\n        raise RecoveryError("injected interruption after source publication")'),
-            (after_inventory, after_inventory + '\n        raise RecoveryError("injected interruption after inventory publication")'),
+            (after_inventory, after_inventory + '\n    raise RecoveryError("injected interruption after inventory publication")'),
             (after_runtime, '        raise RecoveryError("injected interruption after runtime publication")\n' + after_runtime),
+            (after_version, '        raise RecoveryError("injected interruption after version publication")\n' + after_version),
         ):
             self.assertIn(needle, original)
             if (dest / "source").exists() or (dest / "source").is_symlink():
@@ -1538,20 +1622,30 @@ class RecoveryCliTests(unittest.TestCase):
             (dest / "DEPLOYED_VERSION.md").unlink(missing_ok=True)
             (target_state / "starts.log").unlink(missing_ok=True)
             package.write_text(original.replace(needle, injection, 1), encoding="utf-8")
-            interrupted = self.run_cli(
-                [
-                    "activate",
-                    "--destination-root",
-                    str(dest),
-                    "--retained-delivery",
-                    str(delivery),
-                ],
-                extra=extra,
-            )
+            try:
+                interrupted = self.run_cli(
+                    ["activate", "--destination-root", str(dest),
+                     "--retained-delivery", str(delivery)],
+                    extra=extra,
+                )
+            finally:
+                package.write_text(original, encoding="utf-8")
             self.assertNotEqual(interrupted.returncode, 0, injection)
-            self.assertFalse((target_state / "starts.log").exists())
+            if needle != after_version:
+                self.assertFalse((target_state / "starts.log").exists())
             self.assertEqual((foreign / "keep.txt").read_text(encoding="utf-8"), "untouched\n")
-            package.write_text(original, encoding="utf-8")
+            original_inventory = (selected_root / "release.json").read_bytes()
+            tampered = json.loads(original_inventory)
+            tampered["images"]["workspace"]["configuration_digest"] = "sha256:" + "0" * 64
+            (selected_root / "release.json").write_text(json.dumps(tampered))
+            target_inventory = (dest / "release.json").read_bytes()
+            target_runtime = (dest / "config" / "runtime.env").read_bytes()
+            refused = self.run_cli(["activate", "--destination-root", str(dest),
+                                    "--retained-delivery", str(delivery)], extra=extra)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual((dest / "release.json").read_bytes(), target_inventory)
+            self.assertEqual((dest / "config" / "runtime.env").read_bytes(), target_runtime)
+            (selected_root / "release.json").write_bytes(original_inventory)
             retry = self.run_cli(
                 [
                     "activate",
@@ -1564,7 +1658,7 @@ class RecoveryCliTests(unittest.TestCase):
             )
             self.assertEqual(retry.returncode, 0, retry.stderr)
             installed = json.loads((dest / "release.json").read_text(encoding="utf-8"))
-            self.assertEqual(installed["ocu_source_sha"], inventory["ocu_source_sha"])
+            self.assertEqual(installed, inventory)
             persisted = {}
             for line in (dest / "config" / "runtime.env").read_text(encoding="utf-8").splitlines():
                 if "=" in line and not line.startswith("#"):
@@ -1572,6 +1666,11 @@ class RecoveryCliTests(unittest.TestCase):
                     persisted[name] = value
             self.assertEqual(persisted["SOURCE_SHA"], inventory["ocu_source_sha"])
             self.assertTrue((dest / "DEPLOYED_VERSION.md").is_file())
+            self.assertIn(inventory["ocu_source_sha"], (dest / "DEPLOYED_VERSION.md").read_text())
+            actual_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=dest / "source", text=True
+            ).strip()
+            self.assertEqual(actual_sha, inventory["ocu_source_sha"])
         self.assertEqual((foreign / "keep.txt").read_text(encoding="utf-8"), "untouched\n")
 
 

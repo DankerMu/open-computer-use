@@ -2320,7 +2320,7 @@ def verify_loaded_images(payload: dict) -> None:
             raise ReleaseError(f"{role}: loaded platform is {platform}")
 
 
-def import_release(*, delivery: Path, install_root: Path) -> dict:
+def import_release(*, delivery: Path, install_root: Path, recovery_owner: dict | None = None) -> dict:
     if destination_occupied(install_root):
         raise ReleaseError(f"install root already exists: {install_root}")
     inventory_path = delivery / "release.json"
@@ -2330,6 +2330,10 @@ def import_release(*, delivery: Path, install_root: Path) -> dict:
     try:
         session.acquire()
         stage = session.allocate_stage()
+        if recovery_owner is not None:
+            fd = os.open(stage / ".recovery-owner.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(recovery_owner, stream, sort_keys=True)
         staged_inventory = stage / "release.json"
         copy_regular(inventory_path, staged_inventory)
         staged_payload = load_inventory(staged_inventory)
@@ -2385,7 +2389,7 @@ def import_release(*, delivery: Path, install_root: Path) -> dict:
                 raise retained_cache_error(cop) from cop
         session.committed = True
         session.stage = None
-        return staged_payload
+        return payload
     except BaseException as cop:
         if attempted_load:
             message = str(cop)
