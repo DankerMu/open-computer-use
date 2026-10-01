@@ -1772,32 +1772,22 @@ class OfflineReleaseTests(unittest.TestCase):
         ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
         stage_fail = self.patched_release(
             (
-                "        try:\n"
-                "            self.stage = Path(\n"
-                "                tempfile.mkdtemp(\n"
-                "                    prefix=f\"{self.dest.name}.stage-\", dir=str(self.dest.parent)\n"
-                "                )\n"
-                "            )\n",
-                "        raise OSError(28, \"injected stage allocation failure\")\n"
-                "        try:\n"
-                "            self.stage = Path(\n"
-                "                tempfile.mkdtemp(\n"
-                "                    prefix=f\"{self.dest.name}.stage-\", dir=str(self.dest.parent)\n"
-                "                )\n"
-                "            )\n",
+                "def allocate_private_dir(*, prefix: str, parent: Path) -> Path:\n",
+                (
+                    "def allocate_private_dir(*, prefix: str, parent: Path) -> Path:\n"
+                    "    if prefix.endswith(\".stage-\"):\n"
+                    "        raise OSError(28, \"injected stage allocation failure\")\n"
+                ),
             )
         )
         snapshot_fail = self.patched_release(
             (
-                "        try:\n"
-                "            self.snapshots = Path(\n"
-                "                tempfile.mkdtemp(prefix=\"ocu-release-src-\", dir=str(self.dest.parent))\n"
-                "            )\n",
-                "        raise OSError(28, \"injected snapshot allocation failure\")\n"
-                "        try:\n"
-                "            self.snapshots = Path(\n"
-                "                tempfile.mkdtemp(prefix=\"ocu-release-src-\", dir=str(self.dest.parent))\n"
-                "            )\n",
+                "def allocate_private_dir(*, prefix: str, parent: Path) -> Path:\n",
+                (
+                    "def allocate_private_dir(*, prefix: str, parent: Path) -> Path:\n"
+                    "    if prefix == \"ocu-release-src-\":\n"
+                    "        raise OSError(28, \"injected snapshot allocation failure\")\n"
+                ),
             )
         )
         import_dest = self.root / "install-alloc"
@@ -1814,68 +1804,124 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertFalse((self.root / "build-alloc").exists())
         self.assertFalse(list(self.root.glob("build-alloc.publish.lock")))
 
+
     def test_cancellation_at_allocation_boundary_releases_reservation(self):
         delivery, _inventory, _sha = self.write_delivery()
-        marker = self.root / "entered-alloc"
-        hold = self.root / "hold-alloc"
-        hold.touch()
-        script = self.patched_release(
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        pending = (
+            "        path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))\n"
+            "        os.kill(os.getpid(), signal.SIGTERM)\n"
+        )
+        stage_script = self.patched_release(
             (
-                "        try:\n"
-                "            self.stage = Path(\n"
-                "                tempfile.mkdtemp(\n"
-                "                    prefix=f\"{self.dest.name}.stage-\", dir=str(self.dest.parent)\n"
-                "                )\n"
-                "            )\n",
-                (
-                    "        import time as _ocu_hold_time\n"
-                    "        Path(%r).write_text(\"1\")\n"
-                    "        while Path(%r).exists():\n"
-                    "            _ocu_hold_time.sleep(0.05)\n"
-                    "        try:\n"
-                    "            self.stage = Path(\n"
-                    "                tempfile.mkdtemp(\n"
-                    "                    prefix=f\"{self.dest.name}.stage-\", dir=str(self.dest.parent)\n"
-                    "                )\n"
-                    "            )\n"
-                )
-                % (str(marker), str(hold)),
+                "        path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))\n",
+                pending,
             )
         )
-        dest = self.root / "install-alloc-cancel"
-        process = subprocess.Popen(
+        snapshot_script = self.patched_release(
+            (
+                "def allocate_private_dir(*, prefix: str, parent: Path) -> Path:\n",
+                (
+                    "def allocate_private_dir(*, prefix: str, parent: Path) -> Path:\n"
+                    "    if prefix == \"ocu-release-src-\":\n"
+                    "        path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))\n"
+                    "        os.kill(os.getpid(), signal.SIGTERM)\n"
+                    "        try:\n"
+                    "            os.chmod(path, 0o700)\n"
+                    "        except OSError as cop:\n"
+                    "            shutil.rmtree(path, ignore_errors=True)\n"
+                    "            raise ReleaseError(f\"cannot protect private directory {path}: {cop}\") from cop\n"
+                    "        return path\n"
+                ),
+            )
+        )
+        verify_script = self.patched_release(
+            (
+                "def allocate_private_dir(*, prefix: str, parent: Path) -> Path:\n",
+                (
+                    "def allocate_private_dir(*, prefix: str, parent: Path) -> Path:\n"
+                    "    if prefix == \"ocu-source-verify-\":\n"
+                    "        path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))\n"
+                    "        os.kill(os.getpid(), signal.SIGTERM)\n"
+                    "        try:\n"
+                    "            os.chmod(path, 0o700)\n"
+                    "        except OSError as cop:\n"
+                    "            shutil.rmtree(path, ignore_errors=True)\n"
+                    "            raise ReleaseError(f\"cannot protect private directory {path}: {cop}\") from cop\n"
+                    "        return path\n"
+                ),
+            )
+        )
+        lock_script = self.patched_release(
+            (
+                "            self.lock_path = acquire_exclusive(self.dest)\n"
+                "            self._owns_lock = True\n",
+                "            self.lock_path = acquire_exclusive(self.dest)\n"
+                "            self._owns_lock = True\n"
+                "            os.kill(os.getpid(), signal.SIGTERM)\n",
+            )
+        )
+
+        import_dest = self.root / "install-alloc-cancel"
+        failed_import = self.import_with(stage_script, delivery, import_dest)
+        self.assertEqual(failed_import.returncode, 128 + signal.SIGTERM, failed_import.stderr)
+        self.assertFalse(import_dest.exists())
+        self.assertFalse(list(self.root.glob("install-alloc-cancel.publish.lock")))
+        self.assertFalse(list(self.root.glob("install-alloc-cancel.stage-*")))
+        retry = self.import_cmd(delivery, import_dest)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        failed_build = self.build_with(
+            snapshot_script, ocu, webui, self.root / "build-alloc-cancel"
+        )
+        self.assertEqual(failed_build.returncode, 128 + signal.SIGTERM, failed_build.stderr)
+        self.assertFalse((self.root / "build-alloc-cancel").exists())
+        self.assertFalse(list(self.root.glob("build-alloc-cancel.publish.lock")))
+        self.assertFalse(list(self.root.glob("ocu-release-src-*")))
+        verify_result = subprocess.run(
             [
-                sys.executable,
-                str(script),
-                "import",
+                "python3",
+                str(verify_script),
+                "verify",
+                "--inventory",
+                str(delivery / "release.json"),
+                "--mode",
+                "delivery",
                 "--delivery",
                 str(delivery),
-                "--install-root",
-                str(dest),
             ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
             env=self.env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            check=False,
+            timeout=20,
         )
+        self.assertEqual(verify_result.returncode, 128 + signal.SIGTERM, verify_result.stderr)
+        self.assertFalse(list(self.root.glob("ocu-source-verify-*")))
+        lock_dest = self.root / "install-lock-cancel"
+        failed_lock = self.import_with(lock_script, delivery, lock_dest)
+        self.assertEqual(failed_lock.returncode, 128 + signal.SIGTERM, failed_lock.stderr)
+        self.assertFalse(lock_dest.exists())
+        self.assertFalse(list(self.root.glob("install-lock-cancel.publish.lock")))
+
+    def test_rival_cleanup_does_not_delete_owner_stage(self):
+        destination = self.root / "release"
+        owner = release.PublicationSession(destination)
+        contender = release.PublicationSession(destination)
+        owner.acquire()
+        stage = owner.allocate_stage()
+        sentinel = stage / "owned-by-first-writer"
+        sentinel.write_bytes(b"keep active writer bytes")
         try:
-            deadline = time.monotonic() + 10
-            while not marker.exists():
-                self.assertIsNone(process.poll(), "import exited before allocation")
-                self.assertLess(time.monotonic(), deadline, "allocation barrier not reached")
-                time.sleep(0.02)
-            process.send_signal(signal.SIGTERM)
-            self.assertEqual(process.wait(timeout=10), 128 + signal.SIGTERM)
-            self.assertFalse(dest.exists())
-            self.assertFalse(list(self.root.glob("install-alloc-cancel.publish.lock")))
-            self.assertFalse(list(self.root.glob("install-alloc-cancel.stage-*")))
+            with self.assertRaises(release.ReleaseError):
+                contender.acquire()
+            contender.cleanup()
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual(sentinel.read_bytes(), b"keep active writer bytes")
+            self.assertTrue(owner.lock_path.is_file())
+            self.assertEqual(owner.stage, stage)
         finally:
-            hold.unlink(missing_ok=True)
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+            owner.cleanup()
 
     def test_partial_load_failure_discloses_retained_cache(self):
         delivery, inventory, _sha = self.write_delivery()

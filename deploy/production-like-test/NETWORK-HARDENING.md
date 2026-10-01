@@ -49,4 +49,4 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 4. 导入已校验的 `release.json` 与镜像归档；启动禁止 build/pull。断网后验证 WebUI、RAG 和 sandbox 工具，并同时检查全新与既有 WebUI 配置。
 
 5. 对话、embedding、rerank 连接内网 endpoint；模型 Key 只注入 WebUI，绝不传入 OCU 或 sandbox。
-6. 定期备份和受控恢复演练；监控 Docker data-root、PostgreSQL、WebUI volume 和 chat data 的磁盘用量。
+6. 定期用 `deploy/recovery.py` 与 `deploy/BACKUP-RESTORE.md` 做冷备份和独立空目标恢复演练；监控 Docker data-root、PostgreSQL、WebUI volume 和 chat data 的磁盘用量。未跟踪的本地草稿不是该入口。

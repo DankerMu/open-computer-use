@@ -127,8 +127,16 @@ class RetentionGuardTests(unittest.TestCase):
                 self.assert_sentinels()
 
     def test_unknown_and_destructive_commands_fail(self):
+        write_containers(
+            self.state,
+            [
+                container(cid="overage", name="owui-chat-old", age_hours=200),
+                container(cid="foreign", name="foreign", age_hours=200, managed=False),
+            ],
+        )
+        before_containers = (self.state / "containers.json").read_text(encoding="utf-8")
         result = subprocess.run(
-            ["docker", "rm", "-f", "overage"],
+            ["docker", "volume", "prune", "-f"],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
@@ -136,7 +144,19 @@ class RetentionGuardTests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unsupported", result.stderr)
+        self.assertEqual((self.state / "containers.json").read_text(encoding="utf-8"), before_containers)
+        self.assert_sentinels()
+        absent = subprocess.run(
+            ["docker", "rm", "-f", "overage"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            check=False,
+        )
+        self.assertNotEqual(absent.returncode, 0)
+        self.assertEqual((self.state / "containers.json").read_text(encoding="utf-8"), before_containers)
+        self.assert_sentinels()
         unknown = subprocess.run(
             ["docker", "totally-unknown"],
             cwd=str(ROOT),
@@ -147,6 +167,11 @@ class RetentionGuardTests(unittest.TestCase):
         )
         self.assertNotEqual(unknown.returncode, 0)
         self.assertIn("unsupported", unknown.stderr)
+        self.assertEqual((self.state / "containers.json").read_text(encoding="utf-8"), before_containers)
+        self.assert_sentinels()
+
+
+
 
     def test_label_selection_ignores_other_labels(self):
         write_containers(

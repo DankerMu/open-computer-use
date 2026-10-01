@@ -3,6 +3,25 @@
 ## Unreleased — `next/v1` branch
 
 ### Changed
+- **Cold backup and isolated restore.** `deploy/recovery.py` captures one
+  complete cold recovery set, restores it onto a distinct empty local
+  daemon/root, and activates a retained previous release through that
+  release's own `source/deploy/up.sh`. Workspace volumes, initializer
+  marker, orphan `ocu_chat_state` pruning, and migration/PostgreSQL
+  compatibility checks are included. Restore inspects the real
+  `ocu_chat_state` and per-key `config` columns, waits for the final
+  TCP-authenticated isolated server, binds each workspace archive to
+  its declared chat and volume, and refuses missing-mount sandbox
+  attribution. Backup binds running broker data mounts and environment
+  to captured roots. Activation validates retained source before selection;
+  schema compatibility recognizes ancestors of selected Alembic heads,
+  including merge parents. Filesystem archives preserve
+  literal POSIX names, stream Python extraction, and check ancestor
+  conflicts without an all-pairs scan. Real engine recovery remains
+  issue36.
+
+
+
 - **Offline image delivery.** `deploy/release.py` builds and imports a
   six-role linux/amd64 release from committed OCU and WebUI sources.
   `release.json` is the canonical inventory: both source SHAs, named
@@ -11,7 +30,12 @@
   require `OCU_RELEASE_MANIFEST`, verify local images and tracked source
   bytes before mutation, and start frozen snapshots with
   `--no-build --pull never`. The version record renders that inventory
-  without credentials. Engine import and WAN-free restart remain issue36.
+  without credentials. Publication allocates private staging through one
+  `allocate_private_dir` seam, records the path before unmasking, and
+  deletes only that session's allocated paths on cancellation.
+  Engine import and WAN-free restart remain issue36.
+
+
 
 - **Files-only preview embedding.** An explicit `?embed=files` iframe accepts
   strict same-origin, same-parent, same-chat, increasing-generation `file_id`

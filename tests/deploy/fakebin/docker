@@ -10,9 +10,14 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
+import stat
+
 import tarfile
 import time
+
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -313,7 +318,22 @@ def compose_up(state: Path, argv: list[str]) -> int:
     if remove_orphans(argv):
         keep = set(services_for(stack, profiles_active(argv)))
         running = {name: owner for name, owner in running.items() if name in keep or owner == stack}
+    project = os.environ.get("COMPOSE_PROJECT_NAME", "ocu-test")
     for name in services_for(stack, profiles_active(argv)):
+        container_name = f"{project}-{name}-1"
+        for container in load_containers(state):
+            if container.get("Name") == container_name:
+                labels = container.get("Labels") or {}
+                config = container.get("Config") or {}
+                if isinstance(config, dict) and isinstance(config.get("Labels"), dict):
+                    labels = {**labels, **config["Labels"]}
+                compose_project = labels.get("com.docker.compose.project")
+                compose_service = labels.get("com.docker.compose.service")
+                if compose_project != project or compose_service != name:
+                    sys.stderr.write(
+                        f"Error: Conflict. The container name /{container_name} is already in use\n"
+                    )
+                    return 1
         running[name] = stack
     save_running(state, running)
     starts = state / "starts.log"
@@ -326,6 +346,7 @@ def compose_up(state: Path, argv: list[str]) -> int:
         sys.stderr.write(f"compose up failed for {stack}\n")
         return 1
     return 0
+
 
 
 def docker_info(state: Path, argv: list[str] | None = None) -> int:
@@ -378,14 +399,15 @@ def docker_context_inspect(state: Path, argv: list[str]) -> int:
 
 
 DESTRUCTIVE_VERBS = {
-    "rm",
     "rmi",
     "kill",
     "prune",
-    "volume",
     "system",
     "container",
 }
+
+RESTORE_CONTAINER_RE = re.compile(r"-postgres-restore-")
+
 
 
 def containers_path(state: Path) -> Path:
@@ -403,13 +425,28 @@ def save_containers(state: Path, payload: list[dict]) -> None:
     write_json(containers_path(state), payload)
 
 
+def inspect_membership(network: str) -> tuple[dict, dict]:
+    mode = network or "default"
+    if mode == "none":
+        return {"NetworkMode": "none"}, {"Networks": {}}
+    if not mode or mode == "default":
+        return {"NetworkMode": "default"}, {"Networks": {}}
+    return (
+        {"NetworkMode": mode},
+        {"Networks": {mode: {"NetworkID": f"id-{mode}", "IPAddress": ""}}},
+    )
+
 def match_filters(container: dict, filters: list[str]) -> bool:
     for item in filters:
         if "=" not in item:
-            return False
+            sys.stderr.write("unsupported docker command\n")
+            raise SystemExit(1)
         key, value = item.split("=", 1)
         if key == "label":
             labels = container.get("Labels") or {}
+            config = container.get("Config") or {}
+            if isinstance(config, dict) and isinstance(config.get("Labels"), dict):
+                labels = {**labels, **config["Labels"]}
             if "=" in value:
                 name, expected = value.split("=", 1)
                 if labels.get(name) != expected:
@@ -417,10 +454,17 @@ def match_filters(container: dict, filters: list[str]) -> bool:
             elif value not in labels:
                 return False
         elif key == "status":
-            if container.get("State") != value:
+            state = container.get("State")
+            status = state.get("Status") if isinstance(state, dict) else state
+            if str(status) != value:
+                return False
+        elif key == "name":
+            name = str(container.get("Name") or "")
+            if value not in {name, "/" + name}:
                 return False
         else:
-            return False
+            sys.stderr.write("unsupported docker command\n")
+            raise SystemExit(1)
     return True
 
 
@@ -443,16 +487,128 @@ def docker_ps(state: Path, argv: list[str]) -> int:
     if not quiet:
         sys.stderr.write("unsupported docker command\n")
         return 1
-    selected = []
-    for container in load_containers(state):
-        if not include_all and container.get("State") != "running":
-            continue
-        if not match_filters(container, filters):
-            continue
-        selected.append(container)
+    try:
+        selected = []
+        for container in load_containers(state):
+            state_value = container.get("State")
+            status = state_value.get("Status") if isinstance(state_value, dict) else state_value
+            running = False
+            if isinstance(state_value, dict):
+                running = bool(state_value.get("Running")) or str(status).lower() == "running"
+            else:
+                running = str(status).lower() == "running"
+            if not include_all and not running:
+                continue
+            if not match_filters(container, filters):
+                continue
+            selected.append(container)
+    except SystemExit:
+        return 1
     for container in selected:
         sys.stdout.write(container["Id"] + "\n")
     return 0
+
+
+def docker_stop(state: Path, argv: list[str]) -> int:
+    time_limit = None
+    args = argv[:]
+    target = None
+    while args:
+        token = args.pop(0)
+        if token in {"--time", "-t"} and args:
+            time_limit = args.pop(0)
+        elif not token.startswith("-") and target is None:
+            target = token
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not target:
+        sys.stderr.write("docker stop requires a container\n")
+        return 1
+    if time_limit != "30":
+        sys.stderr.write("unsupported docker command\n")
+        return 1
+    fail = state / f"stop-fail-{target}"
+    prefix = os.environ.get("FAKE_DOCKER_STOP_FAIL_PREFIX", "")
+    if fail.exists() or (prefix and target.startswith(prefix)):
+        sys.stderr.write(f"cannot stop {target}\n")
+        return 1
+
+    containers = load_containers(state)
+    for container in containers:
+        if container["Id"] != target and container.get("Name") != target:
+            continue
+        if container.get("unstoppable"):
+            sys.stderr.write(f"cannot stop {target}\n")
+            return 1
+        state_value = container.get("State")
+        if isinstance(state_value, dict):
+            container["State"] = {
+                **state_value,
+                "Status": "exited",
+                "Running": False,
+                "Paused": False,
+            }
+        else:
+            container["State"] = "exited"
+        save_containers(state, containers)
+        with (state / "stopped.log").open("a", encoding="utf-8") as stream:
+            stream.write(container["Id"] + "\n")
+        sys.stdout.write(container["Id"] + "\n")
+        return 0
+    sys.stderr.write(f"Error: No such container: {target}\n")
+    return 1
+
+
+def docker_rm(state: Path, argv: list[str]) -> int:
+
+    force = False
+    args = argv[:]
+    target = None
+    while args:
+        token = args.pop(0)
+        if token in {"-f", "--force"}:
+            force = True
+        elif not token.startswith("-") and target is None:
+            target = token
+        else:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+    if not target:
+        sys.stderr.write("docker rm requires a container\n")
+        return 1
+    if not RESTORE_CONTAINER_RE.search(target):
+        sys.stderr.write("unsupported docker command\n")
+        return 1
+    containers = load_containers(state)
+    remaining = []
+    found = None
+    for container in containers:
+        name = str(container.get("Name") or "")
+        if container["Id"] == target or name == target:
+            found = container
+            continue
+        remaining.append(container)
+    if found is None:
+        sys.stderr.write(f"Error: No such container: {target}\n")
+        return 1
+    found_name = str(found.get("Name") or "")
+    if not RESTORE_CONTAINER_RE.search(found_name):
+        sys.stderr.write("unsupported docker command\n")
+        return 1
+    state_value = found.get("State")
+    running = False
+    if isinstance(state_value, dict):
+        running = bool(state_value.get("Running"))
+    else:
+        running = str(state_value).lower() == "running"
+    if running and not force:
+        sys.stderr.write(f"Error: You cannot remove a running container {target}\n")
+        return 1
+    save_containers(state, remaining)
+    sys.stdout.write((found.get("Id") or target) + "\n")
+    return 0
+
 
 
 def docker_inspect(state: Path, argv: list[str]) -> int:
@@ -484,45 +640,68 @@ def docker_inspect(state: Path, argv: list[str]) -> int:
         if fmt == "{{.Name}}":
             sys.stdout.write("/" + container.get("Name", target) + "\n")
             return 0
-        sys.stdout.write(json.dumps(container))
+        payload = dict(container)
+        sys.stdout.write(json.dumps([payload]))
         return 0
     sys.stderr.write(f"Error: No such container: {target}\n")
     return 1
 
 
-def docker_stop(state: Path, argv: list[str]) -> int:
-    time_limit = None
+def docker_exec(state: Path, argv: list[str]) -> int:
+    user = ""
+    interactive = False
     args = argv[:]
-    target = None
     while args:
-        token = args.pop(0)
-        if token in {"--time", "-t"} and args:
-            time_limit = args.pop(0)
-        elif not token.startswith("-") and target is None:
-            target = token
-        else:
-            sys.stderr.write("unsupported docker command\n")
-            return 1
-    if not target:
-        sys.stderr.write("docker stop requires a container\n")
-        return 1
-    if time_limit != "30":
-        sys.stderr.write("unsupported docker command\n")
-        return 1
-    containers = load_containers(state)
-    for container in containers:
-        if container["Id"] != target and container.get("Name") != target:
+        token = args[0]
+        if token in {"-u", "--user"} and len(args) > 1:
+            user = args[1]
+            args = args[2:]
             continue
-        container["State"] = "exited"
-        save_containers(state, containers)
-        (state / "stopped.log").write_text(
-            container["Id"] + "\n",
-            encoding="utf-8",
-        )
-        sys.stdout.write(container["Id"] + "\n")
-        return 0
-    sys.stderr.write(f"Error: No such container: {target}\n")
-    return 1
+        if token in {"-i", "-t", "-it", "-d"}:
+            if token in {"-i", "-it"}:
+                interactive = True
+            args = args[1:]
+            continue
+        break
+    if "tmux display-message" in " ".join(args):
+        hold_named(state, "FAKE_DOCKER_HOLD_EXEC", "entered-exec")
+    if not args:
+        sys.stderr.write("docker exec requires a container\n")
+        return 1
+    container = args[0]
+    command = args[1:]
+    running = False
+    for item in load_containers(state):
+        if item["Id"] == container or item.get("Name") == container:
+            state_value = item.get("State")
+            if isinstance(state_value, dict):
+                running = bool(state_value.get("Running"))
+            else:
+                running = str(state_value).lower() == "running"
+            break
+    if not running:
+        sys.stderr.write(f"Error: No such container: {container}\n")
+        return 1
+    fail_marker = state / "exec-fail"
+    if fail_marker.exists():
+        sys.stderr.write("exec failed\n")
+        return 1
+    for rule in load_exec_rules(state):
+        if match_exec_rule(rule, container, command):
+            sys.stdout.write(str(rule.get("stdout") or ""))
+            sys.stderr.write(str(rule.get("stderr") or ""))
+            return int(rule.get("code", 0))
+    handled = handle_postgres_command(state, container, command, user=user, interactive=interactive)
+    if handled is not None:
+        code, stdout, stderr = handled
+        sys.stdout.write(stdout)
+        sys.stderr.write(stderr)
+        return code
+    code, stdout, stderr = handle_sandbox_command(state, container, command)
+    sys.stdout.write(stdout)
+    sys.stderr.write(stderr)
+    return code
+
 
 
 def images_path(state: Path) -> Path:
@@ -1179,52 +1358,493 @@ def handle_sandbox_command(state: Path, container: str, command: list[str]) -> t
     return 1, "", "unsupported exec command"
 
 
-def docker_exec(state: Path, argv: list[str]) -> int:
-    user = ""
-    args = argv[:]
-    while args:
-        token = args[0]
-        if token in {"-u", "--user"} and len(args) > 1:
-            user = args[1]
-            args = args[2:]
-            continue
-        if token in {"-i", "-t", "-it", "-d"}:
-            args = args[1:]
-            continue
-        break
-    if "tmux display-message" in " ".join(args):
-        hold_named(state, "FAKE_DOCKER_HOLD_EXEC", "entered-exec")
-    if not args:
-        sys.stderr.write("docker exec requires a container\n")
+
+
+
+def volumes_path(state: Path) -> Path:
+    return state / "volumes.json"
+
+
+def load_volumes(state: Path) -> dict:
+    path = volumes_path(state)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_volumes(state: Path, payload: dict) -> None:
+    write_json(volumes_path(state), payload)
+
+
+def volume_root(state: Path, name: str) -> Path:
+    path = state / "volume-data" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def docker_volume(state: Path, argv: list[str]) -> int:
+    if not argv:
+        sys.stderr.write("unsupported docker command\n")
         return 1
-    container = args[0]
-    command = args[1:]
-    running = False
-    for item in load_containers(state):
-        if item["Id"] == container or item.get("Name") == container:
-            state_value = item.get("State")
-            if isinstance(state_value, dict):
-                running = bool(state_value.get("Running"))
+    if argv[0] == "ls":
+        fmt = ""
+        args = argv[1:]
+        while args:
+            token = args.pop(0)
+            if token in {"--format", "-f"} and args:
+                fmt = args.pop(0)
             else:
-                running = str(state_value).lower() == "running"
+                sys.stderr.write("unsupported docker command\n")
+                return 1
+        if fmt != "{{json .}}":
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+        records = []
+        for name, record in load_volumes(state).items():
+            records.append({"Name": name, "Mountpoint": record.get("Mountpoint")})
+        sys.stdout.write("\n".join(json.dumps(item) for item in records))
+        if records:
+            sys.stdout.write("\n")
+        return 0
+    if argv[0] == "inspect":
+        if len(argv) != 2:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+        name = argv[1]
+        record = load_volumes(state).get(name)
+        if not record:
+            sys.stderr.write(f"Error: No such volume: {name}\n")
+            return 1
+        sys.stdout.write(json.dumps([record]))
+        return 0
+    if argv[0] == "create":
+        if len(argv) != 2:
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+        name = argv[1]
+        volumes = load_volumes(state)
+        mount = str(volume_root(state, name))
+        volumes[name] = {"Name": name, "Mountpoint": mount}
+        save_volumes(state, volumes)
+        sys.stdout.write(name + "\n")
+        return 0
+    sys.stderr.write("unsupported docker command\n")
+    return 1
+
+
+def docker_run(state: Path, argv: list[str]) -> int:
+    detach = False
+    remove = False
+    network = ""
+    user = ""
+    entrypoint = None
+    pull = None
+    name = None
+    env_file = None
+    env: dict[str, str] = {}
+    mounts: list[str] = []
+    workdir = ""
+    args = argv[:]
+    positionals: list[str] = []
+    while args:
+        token = args.pop(0)
+        if token == "-d":
+            detach = True
+        elif token == "--rm":
+            remove = True
+        elif token == "--network" and args:
+            network = args.pop(0)
+        elif token in {"-u", "--user"} and args:
+            user = args.pop(0)
+        elif token == "--entrypoint" and args:
+            entrypoint = args.pop(0)
+        elif token == "--pull" and args:
+            pull = args.pop(0)
+        elif token == "--name" and args:
+            name = args.pop(0)
+        elif token == "--env-file" and args:
+            env_file = args.pop(0)
+        elif token == "--workdir" and args:
+            workdir = args.pop(0)
+        elif token == "-e" and args:
+            raw = args.pop(0)
+            key, _, value = raw.partition("=")
+            env[key] = value
+        elif token == "-v" and args:
+            mounts.append(args.pop(0))
+        elif token.startswith("-"):
+            sys.stderr.write("unsupported docker command\n")
+            return 1
+        else:
+            positionals.append(token)
+            positionals.extend(args)
             break
-    if not running:
-        sys.stderr.write(f"Error: No such container: {container}\n")
+    if not positionals:
+        sys.stderr.write("docker run requires an image\n")
         return 1
-    fail_marker = state / "exec-fail"
-    if fail_marker.exists():
-        sys.stderr.write("exec failed\n")
+    if pull not in {None, "never"}:
+        sys.stderr.write("unsupported docker command\n")
         return 1
-    for rule in load_exec_rules(state):
-        if match_exec_rule(rule, container, command):
-            sys.stdout.write(str(rule.get("stdout") or ""))
-            sys.stderr.write(str(rule.get("stderr") or ""))
-            return int(rule.get("code", 0))
-    code, stdout, stderr = handle_sandbox_command(state, container, command)
-    sys.stdout.write(stdout)
-    sys.stderr.write(stderr)
-    del user
-    return code
+    image = positionals[0]
+    command = positionals[1:]
+    if lookup_image(load_images(state), image) is None:
+        sys.stderr.write(f"Error: No such image: {image}\n")
+        return 1
+    record = {
+        "image": image,
+        "name": name,
+        "network": network,
+        "user": user,
+        "entrypoint": entrypoint,
+        "pull": pull,
+        "env": env,
+        "env_file": env_file,
+        "mounts": mounts,
+        "command": command,
+        "detach": detach,
+        "remove": remove,
+        "workdir": workdir,
+    }
+    append_json_list(state / "runs.json", record)
+    if detach:
+        containers = load_containers(state)
+        if name:
+            for container in containers:
+                if container.get("Name") == name:
+                    sys.stderr.write(
+                        f'docker: Error response from daemon: Conflict. The container name "/{name}" is already in use\n'
+                    )
+                    return 1
+        container_id = "run-" + hashlib.sha256(str(name or image).encode("utf-8")).hexdigest()[:12]
+        host, settings = inspect_membership(network)
+        ready_after = 0.0
+        delay = os.environ.get("FAKE_POSTGRES_READY_AFTER", "")
+        if delay:
+            ready_after = time.monotonic() + float(delay)
+        containers.append(
+            {
+                "Id": container_id,
+                "Name": name or container_id,
+                "Image": lookup_image(load_images(state), image)["Id"],
+                "State": {"Status": "running", "Running": True, "Paused": False},
+                "Config": {"Image": image, "Env": [f"{key}={value}" for key, value in env.items()]},
+                "Labels": {},
+                "HostConfig": host,
+                "NetworkSettings": settings,
+                "ReadyAfter": ready_after,
+            }
+        )
+        save_containers(state, containers)
+        db = load_database(state)
+        payload = empty_database()
+        if env_file:
+            payload["env_file"] = env_file
+            payload["env_file_mode"] = oct(stat.S_IMODE(Path(env_file).stat().st_mode))
+        payload["ready_after"] = ready_after
+        db.setdefault(name or container_id, payload)
+        save_database(state, db)
+        sys.stdout.write(container_id + "\n")
+        return 0
+    translated = translate_helper_mounts(state, mounts)
+    if entrypoint in {"/usr/local/bin/python3", "python3"} and "-c" in command:
+        script = command[command.index("-c") + 1]
+        if "ScriptDirectory" in script or "alembic.ini" in script:
+            graph_path = state / "migration-graph.json"
+            if graph_path.exists():
+                graph = json.loads(graph_path.read_text(encoding="utf-8"))
+                sys.stdout.write("HEADS=" + ",".join(graph["heads"]) + "\n")
+                for revision, parents in graph["revisions"].items():
+                    sys.stdout.write("REV=" + revision + "->" + ",".join(parents) + "\n")
+                return 0
+            heads = os.environ.get("FAKE_DOCKER_MIGRATION_HEADS", "e6f7a8b9c0d1")
+            if heads == "e6f7a8b9c0d1":
+                sys.stdout.write("HEADS=e6f7a8b9c0d1\nREV=e6f7a8b9c0d1->d4c1a8e37b62\nREV=d4c1a8e37b62->\n")
+            else:
+                sys.stdout.write(f"HEADS={heads}\nREV={heads}->\n")
+            return 0
+
+    if entrypoint in {"/usr/bin/python3", "/usr/local/bin/python3", "python3"} and command:
+        return execute_python_helper(command, translated, workdir=workdir, image=image)
+    if entrypoint in {"pg_dump", "pg_restore", "psql", "postgres"} and "--version" in command:
+        sys.stdout.write("postgres (PostgreSQL) 17.5\n")
+        return 0
+    sys.stderr.write("unsupported docker command\n")
+    return 1
+
+
+def translate_helper_mounts(state: Path, mounts: list[str]) -> dict[str, Path]:
+    mapping: dict[str, Path] = {}
+    volumes = load_volumes(state)
+    for item in mounts:
+        source, _, rest = item.partition(":")
+        target, _, _mode = rest.partition(":")
+        if source in volumes:
+            mapping[target] = Path(volumes[source]["Mountpoint"])
+        else:
+            mapping[target] = Path(source)
+    return mapping
+
+
+def remap_helper_arg(value: str, mounts: dict[str, Path]) -> str:
+    for prefix, mapped in sorted(mounts.items(), key=lambda item: len(item[0]), reverse=True):
+        if value == prefix or value.startswith(prefix + "/"):
+            return str(mapped) + value[len(prefix) :]
+    return value
+
+
+def execute_python_helper(
+    command: list[str],
+    mounts: dict[str, Path],
+    *,
+    workdir: str = "",
+    image: str = "",
+) -> int:
+    argv = [remap_helper_arg(item, mounts) for item in command]
+    env = os.environ.copy()
+    env.pop("DOCKER_HOST", None)
+    env.pop("DOCKER_CONTEXT", None)
+    cwd = None
+    app = Path(__file__).resolve().parents[3] / "computer-use-server"
+    if workdir == "/app" or "computer-use-server" in image:
+        env["PYTHONPATH"] = str(app) + os.pathsep + env.get("PYTHONPATH", "")
+        cwd = str(app)
+    result = subprocess.run([sys.executable, *argv], capture_output=True, env=env, cwd=cwd)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    return result.returncode
+
+
+def empty_database() -> dict:
+    return {
+        "alembic_revision": "e6f7a8b9c0d1",
+        "server_version": "17.5",
+        "extensions": ["plpgsql=1.0"],
+        "chats": [],
+        "chat_owners": {},
+        "chat_state": [],
+        "config": [],
+        "dump": b"",
+        "ready": True,
+        "ready_after": 0.0,
+        "phase": "final",
+    }
+
+
+
+
+def database_path(state: Path) -> Path:
+    return state / "postgres.json"
+
+
+def load_database(state: Path) -> dict:
+    path = database_path(state)
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for record in payload.values():
+        dump = record.get("dump")
+        if isinstance(dump, str):
+            record["dump"] = dump.encode("utf-8")
+    return payload
+
+
+def save_database(state: Path, payload: dict) -> None:
+    encoded = {}
+    for name, record in payload.items():
+        encoded[name] = dict(record)
+        dump = record.get("dump") or b""
+        if isinstance(dump, bytes):
+            encoded[name]["dump"] = dump.decode("latin1")
+    write_json(database_path(state), encoded)
+
+
+def handle_postgres_command(state: Path, container: str, command: list[str], *, user: str, interactive: bool):
+    db = load_database(state)
+    record = db.get(container)
+    if record is None:
+        return None
+    if user and user not in {"postgres", "0", "0:0"}:
+        sys.stderr.write("unsupported exec user\n")
+        return 1, "", "unsupported exec user"
+    if command[:1] == ["env"]:
+        command = command[1:]
+        while command and "=" in command[0]:
+            command = command[1:]
+    if command[:1] == ["pg_dump"] and "--version" in command:
+        return 0, "postgres (PostgreSQL) 17.5\n", ""
+    if command[:1] == ["pg_dump"]:
+        payload = json.dumps(
+            {
+                "chats": record.get("chats") or [],
+                "chat_owners": record.get("chat_owners") or {},
+                "chat_state": record.get("chat_state") or [],
+                "config": record.get("config") or [],
+                "alembic_revision": record.get("alembic_revision"),
+                "server_version": record.get("server_version"),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        record["dump"] = payload
+        save_database(state, db)
+        sys.stdout.buffer.write(payload)
+        return 0, "", ""
+    if command[:1] == ["pg_restore"]:
+        if "-l" in command:
+            return 0, "TOC\n", ""
+        incoming = sys.stdin.buffer.read()
+        if not incoming:
+            incoming = record.get("pending_dump") or record.get("dump") or b""
+        if incoming:
+            restored = json.loads(
+                incoming.decode("utf-8") if isinstance(incoming, bytes) else incoming
+            )
+            record["chats"] = restored.get("chats") or []
+            record["chat_owners"] = restored.get("chat_owners") or {}
+            record["chat_state"] = restored.get("chat_state") or []
+            record["config"] = restored.get("config") or []
+            record["alembic_revision"] = restored.get("alembic_revision") or record.get(
+                "alembic_revision"
+            )
+            record["server_version"] = restored.get("server_version") or record.get(
+                "server_version"
+            )
+            save_database(state, db)
+        return 0, "", ""
+    if command and command[0] in {"pg_dump", "pg_restore", "psql", "postgres"} and "--version" in command:
+        return 0, "postgres (PostgreSQL) 17.5\n", ""
+    if command[:1] == ["pg_isready"]:
+        return handle_pg_isready(record, state, container, command)
+    if command[:1] == ["psql"]:
+        sql = ""
+        if "-c" in command:
+            sql = command[command.index("-c") + 1]
+        return handle_psql(record, sql, state, container, command)
+
+    del interactive
+    return None
+
+
+def postgres_phase(record: dict, state: Path, container: str) -> str:
+    forever = state / f"postgres-unready-{container}"
+    if forever.exists():
+        return "starting"
+    delay = float(record.get("ready_after") or 0)
+    if delay and time.monotonic() < delay:
+        return "socket"
+    sequence = state / f"postgres-phase-{container}"
+    if sequence.exists():
+        return sequence.read_text(encoding="utf-8").strip() or "final"
+    return str(record.get("phase") or "final")
+
+
+def postgres_ready(record: dict, state: Path, container: str) -> bool:
+    return postgres_phase(record, state, container) == "final"
+
+
+def handle_pg_isready(record: dict, state: Path, container: str, argv: list[str]) -> tuple[int, str, str]:
+    host = "socket"
+    if "-h" in argv:
+        host = argv[argv.index("-h") + 1]
+    phase = postgres_phase(record, state, container)
+    if phase == "socket":
+        if host in {"127.0.0.1", "localhost", "0.0.0.0"}:
+            return 1, "", "the database system is starting up"
+        return 0, "/var/run/postgresql:5432 - accepting connections\n", ""
+    if phase == "shutdown":
+        return 1, "", "the database system is shutting down"
+    if phase == "final":
+        if host in {"127.0.0.1", "localhost", "0.0.0.0"}:
+            return 0, "127.0.0.1:5432 - accepting connections\n", ""
+        return 0, "openwebui:5432 - accepting connections\n", ""
+    return 1, "", "no response"
+
+
+def handle_psql(record: dict, sql: str, state: Path, container: str, argv: list[str]) -> tuple[int, str, str]:
+    text = " ".join(sql.split())
+    host = "socket"
+    if "-h" in argv:
+        host = argv[argv.index("-h") + 1]
+    phase = postgres_phase(record, state, container)
+    tcp = host in {"127.0.0.1", "localhost", "0.0.0.0"}
+    if phase != "final" or (phase == "final" and not tcp and "SELECT 1" in text):
+        if phase == "socket" and not tcp:
+            if text.strip() in {"SELECT 1;", "SELECT 1"}:
+                return 0, "1\n", ""
+            return 1, "", "the database system is starting up"
+        return 1, "", "the database system is starting up"
+    if not tcp:
+        return 1, "", "refusing occupancy on the temporary socket"
+    if text.strip() in {"SELECT 1;", "SELECT 1"}:
+        return 0, "1\n", ""
+    if "alembic_version" in text:
+        lines = [str(record.get("alembic_revision") or "e6f7a8b9c0d1")]
+        lines.extend(record.get("extensions") or ["plpgsql=1.0"])
+        lines.append(str(record.get("server_version") or "17.5"))
+        return 0, "\n".join(lines) + "\n", ""
+    if "NOT EXISTS" in text and "DELETE FROM ocu_chat_state" in text:
+        live = set(record.get("chats") or [])
+        record["chat_state"] = [
+            item for item in record.get("chat_state") or [] if item.get("chat_id") in live
+        ]
+        db = load_database(state)
+        db[container] = record
+        save_database(state, db)
+        return 0, "DELETE\n", ""
+    if "FROM ocu_chat_state" in text:
+        if any(token in text for token in ("preferences", "owner_id", "file_ids")):
+            return 1, "", 'column "preferences" does not exist'
+        rows = []
+        for item in record.get("chat_state") or []:
+            rows.append(
+                json.dumps(
+                    {
+                        "chat_id": item.get("chat_id") or "",
+                        "last_seen_revision": int(item.get("last_seen_revision") or 0),
+                        "prefs": item.get("prefs") if item.get("prefs") is not None else {},
+                        "updated_at": int(item.get("updated_at") or 0),
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        return 0, ("\n".join(rows) + ("\n" if rows else "")), ""
+    if "FROM chat" in text and "user_id" in text:
+        owners = record.get("chat_owners") or {}
+        rows = []
+        for chat_id in record.get("chats") or []:
+            rows.append(
+                json.dumps(
+                    {"id": chat_id, "user_id": owners.get(chat_id, "")},
+                    separators=(",", ":"),
+                )
+            )
+        return 0, ("\n".join(rows) + ("\n" if rows else "")), ""
+    if "FROM chat" in text:
+        ids = [str(item) for item in record.get("chats") or []]
+        return 0, ("\n".join(ids) + ("\n" if ids else "")), ""
+    if "to_regclass" in text:
+        return 0, "ocu_chat_state\n", ""
+    if "FROM pg_class" in text:
+        return 0, "0\n", ""
+    if "FROM config" in text:
+        if any(token in text for token in (" data", "ORDER BY id", "FROM config ORDER BY id")) and "json_build_object" not in text:
+            return 1, "", 'column "data" does not exist'
+        if "json_build_object" not in text or "key" not in text or "value" not in text:
+            return 1, "", 'column "data" does not exist'
+        rows = []
+        for item in record.get("config") or []:
+            if isinstance(item, dict) and "key" in item:
+                payload = {
+                    "key": item.get("key") or "",
+                    "value": item.get("value"),
+                    "updated_at": item.get("updated_at"),
+                }
+            else:
+                return 1, "", 'column "data" does not exist'
+            rows.append(json.dumps(payload, separators=(",", ":")))
+        return 0, ("\n".join(rows) + ("\n" if rows else "")), ""
+    sys.stderr.write("unsupported exec command\n")
+    return 1, "", "unsupported exec command"
+
 
 
 
@@ -1271,7 +1891,10 @@ def main(argv: list[str]) -> int:
         return docker_save(state, argv[1:])
     if argv and argv[0] == "load":
         return docker_load(state, argv[1:])
-
+    if argv and argv[0] == "volume":
+        return docker_volume(state, argv[1:])
+    if argv and argv[0] == "run":
+        return docker_run(state, argv[1:])
     if argv and argv[0] == "compose":
         rest = argv[1:]
         if "config" in rest:
@@ -1286,11 +1909,15 @@ def main(argv: list[str]) -> int:
         return 1
     if argv and argv[0] == "exec":
         return docker_exec(state, argv[1:])
+    if argv and argv[0] == "rm":
+        return docker_rm(state, argv[1:])
     if argv and argv[0] in DESTRUCTIVE_VERBS:
         sys.stderr.write("unsupported docker command\n")
         return 1
     sys.stderr.write("unsupported docker command\n")
     return 1
+
+
 
 
 if __name__ == "__main__":

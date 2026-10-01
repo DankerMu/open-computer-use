@@ -274,6 +274,21 @@ def _blocked_signals():
     yield
 
 
+def allocate_private_dir(*, prefix: str, parent: Path) -> Path:
+    try:
+        path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
+    except OSError as cop:
+        raise ReleaseError(f"cannot allocate private directory {prefix}: {cop}") from cop
+    try:
+        os.chmod(path, 0o700)
+    except OSError as cop:
+        shutil.rmtree(path, ignore_errors=True)
+        raise ReleaseError(f"cannot protect private directory {path}: {cop}") from cop
+    return path
+
+
+
+
 def _lstat(path: Path):
     try:
         return path.lstat()
@@ -481,28 +496,24 @@ class PublicationSession:
     def allocate_stage(self) -> Path:
         if self.lock_path is None:
             raise ReleaseError(f"publication reservation is missing for {self.dest}")
-        try:
-            self.stage = Path(
-                tempfile.mkdtemp(
-                    prefix=f"{self.dest.name}.stage-", dir=str(self.dest.parent)
-                )
+        with _blocked_signals():
+            allocated = allocate_private_dir(
+                prefix=f"{self.dest.name}.stage-", parent=self.dest.parent
             )
-        except OSError as cop:
-            raise ReleaseError(f"cannot allocate staging for {self.dest}: {cop}") from cop
+            self.stage = allocated
         return self.stage
 
     def allocate_snapshots(self) -> Path:
         if self.lock_path is None:
             raise ReleaseError(f"publication reservation is missing for {self.dest}")
-        try:
-            self.snapshots = Path(
-                tempfile.mkdtemp(prefix="ocu-release-src-", dir=str(self.dest.parent))
+        with _blocked_signals():
+            allocated = allocate_private_dir(
+                prefix="ocu-release-src-", parent=self.dest.parent
             )
-        except OSError as cop:
-            raise ReleaseError(
-                f"cannot allocate source snapshots for {self.dest}: {cop}"
-            ) from cop
+            self.snapshots = allocated
         return self.snapshots
+
+
 
     def cleanup(self) -> None:
         if not self.committed and self.stage is not None:
@@ -514,6 +525,8 @@ class PublicationSession:
         if self._owns_lock and self.lock_path is not None:
             release_lock(self.lock_path)
             self._owns_lock = False
+
+
 
 
 def normalize_docker_ref(reference: str) -> str:
@@ -1058,10 +1071,11 @@ def verify_source_bundle(
     if sha256_file(bundle) != payload["source_bundle"]["sha256"]:
         raise ReleaseError("source bundle checksum mismatch")
     owned = reconstruct_into is None
-    dest = reconstruct_into or Path(
-        tempfile.mkdtemp(prefix="ocu-source-verify-", dir=str(root.parent))
-    )
+    dest = reconstruct_into
     try:
+        if owned:
+            with _blocked_signals():
+                dest = allocate_private_dir(prefix="ocu-source-verify-", parent=root.parent)
         reconstructed = reconstruct_source(bundle, dest)
         if reconstructed != payload["ocu_source_sha"]:
             raise ReleaseError(
@@ -1073,8 +1087,9 @@ def verify_source_bundle(
         )
         return reconstructed
     finally:
-        if owned:
+        if owned and dest is not None:
             shutil.rmtree(dest, ignore_errors=True)
+
 
 
 def load_json_object(path: Path) -> dict:
@@ -2206,6 +2221,7 @@ def verify_tracked_source(root: Path, commit: str) -> None:
     actual = full_commit(root)
     if actual.lower() != commit.lower():
         raise ReleaseError(f"source checkout HEAD is {actual}, expected {commit}")
+    git("update-index", "-q", "--refresh", cwd=root)
     result = git("diff-index", "--name-only", commit, "--", cwd=root)
     require_command(result, "compare tracked source to the bundled commit")
     changed = [line for line in result.stdout.splitlines() if line]
@@ -2304,7 +2320,7 @@ def verify_loaded_images(payload: dict) -> None:
             raise ReleaseError(f"{role}: loaded platform is {platform}")
 
 
-def import_release(*, delivery: Path, install_root: Path) -> dict:
+def import_release(*, delivery: Path, install_root: Path, recovery_owner: dict | None = None) -> dict:
     if destination_occupied(install_root):
         raise ReleaseError(f"install root already exists: {install_root}")
     inventory_path = delivery / "release.json"
@@ -2314,6 +2330,10 @@ def import_release(*, delivery: Path, install_root: Path) -> dict:
     try:
         session.acquire()
         stage = session.allocate_stage()
+        if recovery_owner is not None:
+            fd = os.open(stage / ".recovery-owner.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(recovery_owner, stream, sort_keys=True)
         staged_inventory = stage / "release.json"
         copy_regular(inventory_path, staged_inventory)
         staged_payload = load_inventory(staged_inventory)
@@ -2369,7 +2389,7 @@ def import_release(*, delivery: Path, install_root: Path) -> dict:
                 raise retained_cache_error(cop) from cop
         session.committed = True
         session.stage = None
-        return staged_payload
+        return payload
     except BaseException as cop:
         if attempted_load:
             message = str(cop)

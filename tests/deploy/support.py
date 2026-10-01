@@ -89,6 +89,12 @@ ANNOTATION_REF_NAME = "org.opencontainers.image.ref.name"
 UP_FIXTURE_PATHS = (
     "deploy/up.sh",
     "deploy/release.py",
+    "deploy/recovery.py",
+    "deploy/recovery_fs.py",
+    "deploy/recovery_resources.py",
+    "deploy/recovery_db.py",
+    "deploy/recovery_helper.py",
+    "deploy/BACKUP-RESTORE.md",
     "deploy/__init__.py",
     "deploy/check-ports.sh",
 
