@@ -151,6 +151,9 @@ class FakeClient:
         self._sandbox_lookups = 0
         self.refuse_hostname = False
         self.inspect_dns_mismatch = None
+        self.defer_endpoints = False
+        self.placeholder_fields = {}
+        self.start_network_id = None
 
     def add_network(self, name=NETWORK_NAME, network_id=NETWORK_ID, driver="bridge", internal=False, gateway=GATEWAY):
         net = FakeNetwork(self, name, network_id, driver=driver, internal=internal, gateway=gateway)
@@ -169,6 +172,15 @@ class FakeClient:
     def inspect_membership(self, container):
         snapshot = {}
         for net_id, data in dict(self.engine_membership.get(container.id, {})).items():
+            if self.defer_endpoints and container.status in {"created", "exited"}:
+                snapshot[data["name"]] = {
+                    "NetworkID": "",
+                    "EndpointID": "",
+                    "Gateway": "",
+                    "IPAddress": "",
+                    **self.placeholder_fields,
+                }
+                continue
             snapshot[data["name"]] = {
                 "NetworkID": data["NetworkID"],
                 "IPAddress": data.get("IPAddress", "172.31.0.10"),
@@ -221,6 +233,9 @@ class FakeClient:
             started["n"] += 1
             _assign_published_ports(self, container)
             container.status = "running"
+            if self.start_network_id is not None:
+                for data in self.engine_membership.get(container.id, {}).values():
+                    data["NetworkID"] = self.start_network_id
 
         def unpause():
             unpaused["n"] += 1
@@ -436,6 +451,183 @@ def test_create_selects_sandbox_bridge_and_gateway_publications(world):
     assert _engine_nets(client, created)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
     assert client.ops == []
 
+
+@pytest.mark.parametrize("status", ["created", "exited"])
+def test_extra_foreign_endpoint_placeholder_cannot_bypass_repair(world, status):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    container = client.put(
+        _name(docker_manager), status=status,
+        networks={
+            NETWORK_NAME: {"NetworkID": NETWORK_ID},
+            COMPOSE_NAME: {"NetworkID": COMPOSE_ID},
+        },
+    )
+    container.attrs["HostConfig"]["NetworkMode"] = NETWORK_ID
+    client.networks.get(COMPOSE_ID).fail_disconnect = True
+    with pytest.raises(docker_manager.LaunchFailed):
+        docker_manager.launch_sandbox(CHAT)
+    assert container._started["n"] == 0
+    assert (COMPOSE_ID, "disconnect", container.id) in client.ops
+    assert COMPOSE_NAME in _engine_nets(client, container)
+    assert container._removed["value"] is False
+
+
+@pytest.mark.parametrize("status", ["created", "exited"])
+def test_extra_foreign_endpoint_placeholder_is_removed_before_start(world, status):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    container = client.put(
+        _name(docker_manager), status=status,
+        networks={
+            NETWORK_NAME: {"NetworkID": NETWORK_ID},
+            COMPOSE_NAME: {"NetworkID": COMPOSE_ID},
+        },
+    )
+    container.attrs["HostConfig"]["NetworkMode"] = NETWORK_ID
+    assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    assert _engine_nets(client, container) == {
+        NETWORK_NAME: {"NetworkID": NETWORK_ID, "IPAddress": "172.31.0.10"}
+    }
+    assert container._started["n"] == 1
+    assert container._removed["value"] is False
+
+
+@pytest.mark.parametrize("reconstruct", [False, True])
+def test_create_starts_bound_endpoint_placeholder(world, reconstruct):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    if reconstruct:
+        _meta(docker_manager)
+        assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    else:
+        docker_manager._get_or_create_container(CHAT)
+    created = client.created[0]
+    assert created.status == "running"
+    assert created.attrs["HostConfig"]["NetworkMode"] == NETWORK_ID
+    assert _membership(created)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
+    assert client.ops == []
+    assert created._removed["value"] is False
+
+
+@pytest.mark.parametrize("status", ["created", "exited"])
+@pytest.mark.parametrize("mode", [NETWORK_ID, NETWORK_NAME])
+def test_launch_starts_bound_endpoint_placeholder_without_repair(world, status, mode):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    container = client.put(_name(docker_manager), status=status)
+    container.attrs["HostConfig"]["NetworkMode"] = mode
+    assert _membership(container) == {
+        NETWORK_NAME: {"NetworkID": "", "EndpointID": "", "Gateway": "", "IPAddress": ""}
+    }
+    assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    assert _membership(container)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
+    assert client.ops == []
+    assert container._removed["value"] is False
+
+
+def test_repair_can_leave_bound_endpoint_placeholder_until_start(world):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    container = client.put(_name(docker_manager), status="created", networks={})
+    container.attrs["HostConfig"]["NetworkMode"] = NETWORK_ID
+    assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    assert client.ops == [(NETWORK_ID, "connect", container.id)]
+    assert _membership(container)[NETWORK_NAME]["NetworkID"] == NETWORK_ID
+
+
+@pytest.mark.parametrize("mode", [STALE_ID, COMPOSE_ID, "bridge", ""])
+def test_unbound_endpoint_placeholder_cannot_bypass_repair(world, mode):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    container = client.put(_name(docker_manager), status="created")
+    container.attrs["HostConfig"]["NetworkMode"] = mode
+    client.networks.get(NETWORK_ID).fail_disconnect = True
+    with pytest.raises(docker_manager.LaunchFailed):
+        docker_manager.launch_sandbox(CHAT)
+    assert container._started["n"] == 0
+    assert container.status == "created"
+    assert client.ops == [(NETWORK_ID, "disconnect", container.id)]
+    assert container._removed["value"] is False
+
+
+def test_foreign_endpoint_placeholder_cannot_bypass_repair(world):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    container = client.put(
+        _name(docker_manager), status="created",
+        networks={COMPOSE_NAME: {"NetworkID": COMPOSE_ID}},
+    )
+    container.attrs["HostConfig"]["NetworkMode"] = NETWORK_ID
+    client.networks.get(COMPOSE_ID).fail_disconnect = True
+    with pytest.raises(docker_manager.LaunchFailed):
+        docker_manager.launch_sandbox(CHAT)
+    assert container._started["n"] == 0
+    assert client.ops == [(COMPOSE_ID, "disconnect", container.id)]
+    assert container._removed["value"] is False
+
+
+@pytest.mark.parametrize("field", ["EndpointID", "Gateway", "IPAddress", "GlobalIPv6Address"])
+def test_partially_allocated_endpoint_is_not_a_bound_placeholder(world, field):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    client.placeholder_fields = {field: "unexpected"}
+    container = client.put(_name(docker_manager), status="created")
+    container.attrs["HostConfig"]["NetworkMode"] = NETWORK_ID
+    client.networks.get(NETWORK_ID).fail_disconnect = True
+    with pytest.raises(docker_manager.LaunchFailed):
+        docker_manager.launch_sandbox(CHAT)
+    assert container._started["n"] == 0
+    assert client.ops == [(NETWORK_ID, "disconnect", container.id)]
+
+
+@pytest.mark.parametrize("live_id", ["", STALE_ID])
+@pytest.mark.parametrize("path", ["create", "launch"])
+def test_start_rolls_back_when_live_network_id_is_not_desired(world, live_id, path):
+    docker_manager, client, _tmp = world
+    client.defer_endpoints = True
+    client.start_network_id = live_id
+    meta = _meta(docker_manager)
+    meta_before = meta.read_bytes()
+    if path == "launch":
+        container = client.put(_name(docker_manager), status="created")
+        container.attrs["HostConfig"]["NetworkMode"] = NETWORK_ID
+    with pytest.raises(docker_manager.LaunchFailed):
+        if path == "create":
+            docker_manager._create_container(CHAT, _name(docker_manager))
+        else:
+            docker_manager.launch_sandbox(CHAT)
+    if path == "create":
+        container = client.created[0]
+    assert container._started["n"] == 1
+    assert container.stop.call_count == 1
+    assert client.ops == []
+    assert container.status == "exited"
+    assert container._removed["value"] is False
+    assert meta.read_bytes() == meta_before
+    assert docker_manager.read_idle_state(CHAT) is None
+
+
+@pytest.mark.parametrize("status", ["running", "paused", "restarting"])
+@pytest.mark.parametrize("live_id", ["", STALE_ID])
+def test_live_desired_name_with_wrong_id_is_refused_without_mutation(world, status, live_id):
+    docker_manager, client, _tmp = world
+    container = client.put(
+        _name(docker_manager), status=status,
+        networks={NETWORK_NAME: {"NetworkID": live_id}},
+    )
+    container.attrs["HostConfig"]["NetworkMode"] = NETWORK_ID
+    if status == "paused":
+        docker_manager.mark_sleeper_retired(CHAT, container)
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager.launch_sandbox(CHAT)
+    assert caught.value.status_code == 409
+    assert container.status == status
+    assert container._started["n"] == 0
+    assert container._unpaused["n"] == 0
+    assert container.stop.call_count == 0
+    assert container._removed["value"] is False
+    assert client.ops == []
 
 def test_absent_container_reconstruction_uses_create_path(world):
     docker_manager, client, _tmp = world
