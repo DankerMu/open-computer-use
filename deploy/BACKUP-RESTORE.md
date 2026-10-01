@@ -25,6 +25,14 @@ An interrupted activation can resume only its recorded selected-source publicati
 
 An existing checkout without this publication's ownership receipt is not adopted, even if its commit and image references match. Retry requires the original complete delivery inventory, not merely matching tags.
 
+Before creating a selection receipt, activation verifies the complete retained source bundle, reconstructed commit, tracked tree, and supported consumer contract. Refusal during this preflight leaves no new receipt, so another valid delivery can be selected on the same restored target. Import repeats source validation before publication; a later import failure retains the receipt for retry of that same delivery.
+
+Backup requires broker chat/skills bind mounts and their four data-root environment assignments to match the runtime capture roots, even with no sandboxes. WebUI, initializer, and PostgreSQL data mounts must match their named volumes. Missing, duplicate, read-only, or wrongly typed required mounts are refused before writers stop.
+
+Schema compatibility follows Alembic `down_revision` edges from selected heads, including merge parents. Equal heads and recognized ancestors are accepted; unknown/unrelated revisions, unknown parents, and cyclic graphs are refused. This check does not run migrations or alter the restored schema.
+
+Retry evidence covers handled exceptions and completed publication boundaries. SIGKILL during import and host/power-loss durability are not established; do not remove reservations or foreign resources by name to force recovery.
+
 
 
 ## Failure recovery

@@ -114,6 +114,31 @@ class RecoveryDatabaseTests(unittest.TestCase):
         self.assertEqual(rows[0]["value"], "credential-A")
 
 
+    def test_selected_heads_admit_ancestors_and_merge_parents(self):
+        path = self.state / "migration-graph.json"
+        graph = {"heads": ["H"], "revisions": {
+            "H": ["L", "R"], "L": ["P"], "R": ["P"], "P": [], "unrelated": [],
+        }}
+        path.write_text(json.dumps(graph))
+        for revision in ("H", "L", "R", "P"):
+            recovery_db.require_compatible_revision(
+                {"alembic_revision": revision}, DEFAULT_RELEASE_IMAGES["open-webui"]
+            )
+        for revision in ("unrelated", "unknown"):
+            with self.assertRaises(recovery.RecoveryError):
+                recovery_db.require_compatible_revision(
+                    {"alembic_revision": revision}, DEFAULT_RELEASE_IMAGES["open-webui"]
+                )
+        for invalid in (
+            {"H": ["R"], "R": ["H"]},
+            {"H": ["missing"]},
+        ):
+            path.write_text(json.dumps({"heads": ["H"], "revisions": invalid}))
+            with self.assertRaises(recovery.RecoveryError):
+                recovery_db.require_compatible_revision(
+                    {"alembic_revision": "H"}, DEFAULT_RELEASE_IMAGES["open-webui"]
+                )
+
     def test_incompatible_revision_and_tools_reject(self):
         schema = {"alembic_revision": "deadbeefc0de", "server_version": "17.5"}
         with self.assertRaises(recovery.RecoveryError) as raised:

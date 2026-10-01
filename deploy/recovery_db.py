@@ -343,7 +343,9 @@ def inspect_migration_graph(image: str) -> dict:
             heads = [item for item in line.split("=", 1)[1].split(",") if item]
         elif line.startswith("REV="):
             payload = line.split("=", 1)[1]
-            revision, _, down = payload.partition("->")
+            revision, separator, down = payload.partition("->")
+            if not separator or not revision or revision in revisions:
+                raise RecoveryError("selected WebUI image reported a malformed migration graph")
             revisions[revision] = down
     if not revisions:
         raise RecoveryError("selected WebUI image did not report a migration graph")
@@ -400,19 +402,40 @@ def require_compatible_revision(source_schema: dict, webui_image: str) -> None:
         raise RecoveryError(
             f"selected WebUI image does not recognize restored revision {revision}"
         )
-    current = revision
-    seen: set[str] = set()
-    while current and current not in heads:
-        if current in seen:
-            raise RecoveryError(f"migration graph cycle at {current}")
-        seen.add(current)
-        nxt = revisions.get(current)
-        if not nxt:
-            raise RecoveryError(
-                f"restored revision {revision} is not an ancestor of selected heads"
-            )
-        current = nxt
-    if current not in heads:
+    if not heads or not heads.issubset(revisions):
+        raise RecoveryError("selected WebUI image reported unknown migration heads")
+    parents = {
+        node: tuple(parent for parent in down.split(",") if parent)
+        for node, down in revisions.items()
+    }
+    completed: set[str] = set()
+    active: set[str] = set()
+    for start in revisions:
+        pending = [(start, False)]
+        while pending:
+            node, leaving = pending.pop()
+            if leaving:
+                active.remove(node)
+                completed.add(node)
+                continue
+            if node in active:
+                raise RecoveryError(f"migration graph cycle at {node}")
+            if node in completed:
+                continue
+            if node not in parents:
+                raise RecoveryError("migration graph references an unknown parent")
+            active.add(node)
+            pending.append((node, True))
+            pending.extend((parent, False) for parent in parents[node])
+    reachable: set[str] = set()
+    pending = list(heads)
+    while pending:
+        node = pending.pop()
+        if node in reachable:
+            continue
+        reachable.add(node)
+        pending.extend(parents[node])
+    if revision not in reachable:
         raise RecoveryError(
             f"restored revision {revision} is not an ancestor of selected heads"
         )

@@ -12,8 +12,10 @@
   `ocu_chat_state` and per-key `config` columns, waits for the final
   TCP-authenticated isolated server, binds each workspace archive to
   its declared chat and volume, and refuses missing-mount sandbox
-  attribution. Activation preflights retained-delivery compatibility
-  before publishing selected identity. Filesystem archives preserve
+  attribution. Backup binds running broker data mounts and environment
+  to captured roots. Activation validates retained source before selection;
+  schema compatibility recognizes ancestors of selected Alembic heads,
+  including merge parents. Filesystem archives preserve
   literal POSIX names, stream Python extraction, and check ancestor
   conflicts without an all-pairs scan. Real engine recovery remains
   issue36.

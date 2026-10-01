@@ -294,33 +294,57 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
         identity["proxy_container"]: "proxy",
         identity["postgres_container"]: "postgres",
     }
-    inspected_any = False
+    inspected = set()
     for name, expected in expected_images.items():
         result = docker("inspect", name)
         if result.returncode != 0:
             continue
         payload = inspect_container(name)
-        inspected_any = True
+        inspected.add(name)
         image = _container_image(payload)
         if image != expected:
             raise RecoveryError(
                 f"{name} image {image} does not match selected release {expected}"
             )
         project, service = _compose_labels(payload)
-        if project and project != identity["project"]:
+        if project != identity["project"]:
             raise RecoveryError(f"{name} belongs to compose project {project}")
         wanted_service = expected_services.get(name)
-        if service and wanted_service and service != wanted_service:
+        if service != wanted_service:
             raise RecoveryError(f"{name} compose service is {service}")
-        for mount in _mounts(payload):
-            source = str(mount.get("Name") or mount.get("Source") or "")
-            destination = str(mount.get("Destination") or "")
-            if destination.endswith("/var/lib/postgresql/data") and source and source != identity["postgres_volume"]:
-                raise RecoveryError(f"{name} postgres mount {source} is not the selected volume")
-            if destination.endswith("/app/backend/data") and source and source != identity["webui_volume"]:
-                raise RecoveryError(f"{name} webui mount {source} is not the selected volume")
-    if not inspected_any:
-        raise RecoveryError("selected deployment stack could not be inspected")
+        required_mounts = {}
+        if name == identity["server_container"]:
+            required_mounts = {
+                str(identity["chat_dir"]): ("bind", str(identity["chat_dir"])),
+                str(identity["skills_dir"]): ("bind", str(identity["skills_dir"])),
+            }
+            expected_env = {
+                "USER_DATA_BASE_PATH": str(identity["chat_dir"]),
+                "BASE_DATA_DIR": str(identity["chat_dir"]),
+                "SKILLS_CACHE_DIR": str(identity["skills_dir"]),
+                "SKILLS_CACHE_HOST_PATH": str(identity["skills_dir"]),
+            }
+            entries = payload.get("Config", {}).get("Env") or []
+            for key, value in expected_env.items():
+                matching = [item.partition("=")[2] for item in entries
+                            if isinstance(item, str) and item.partition("=")[0] == key]
+                if matching != [value]:
+                    raise RecoveryError(f"{name} data environment {key} does not match runtime")
+        elif name == identity["postgres_container"]:
+            required_mounts = {"/var/lib/postgresql/data": ("volume", identity["postgres_volume"])}
+        elif name in (identity["webui_container"], identity["init_container"]):
+            required_mounts = {"/app/backend/data": ("volume", identity["webui_volume"])}
+        for destination, (kind, expected_source) in required_mounts.items():
+            matches = [mount for mount in _mounts(payload) if mount.get("Destination") == destination]
+            if len(matches) != 1:
+                raise RecoveryError(f"{name} required data mount is missing or ambiguous")
+            mount = matches[0]
+            actual_source = mount.get("Name") if kind == "volume" else mount.get("Source")
+            if mount.get("Type") != kind or actual_source != expected_source or mount.get("RW") is not True:
+                raise RecoveryError(f"{name} required data mount does not match runtime")
+    required = {identity["server_container"], identity["webui_container"], identity["postgres_container"]}
+    if not required.issubset(inspected):
+        raise RecoveryError("required deployment data services could not be inspected")
 
 
 def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dict) -> dict:
@@ -1005,6 +1029,7 @@ def _publish_selected_inventory(manifest: Path, source_root: Path) -> None:
 def import_selected_release(delivery: Path, install_root: Path) -> dict:
     requested = release.load_inventory(delivery / "release.json")
     release.verify_archive_set(delivery, requested)
+    release.verify_source_bundle(delivery, requested)
     source = install_root / "source"
     manifest = install_root / "release.json"
     source_root = _selected_source_root(install_root)

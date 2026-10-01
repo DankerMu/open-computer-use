@@ -1549,6 +1549,13 @@ def docker_run(state: Path, argv: list[str]) -> int:
     if entrypoint in {"/usr/local/bin/python3", "python3"} and "-c" in command:
         script = command[command.index("-c") + 1]
         if "ScriptDirectory" in script or "alembic.ini" in script:
+            graph_path = state / "migration-graph.json"
+            if graph_path.exists():
+                graph = json.loads(graph_path.read_text(encoding="utf-8"))
+                sys.stdout.write("HEADS=" + ",".join(graph["heads"]) + "\n")
+                for revision, parents in graph["revisions"].items():
+                    sys.stdout.write("REV=" + revision + "->" + ",".join(parents) + "\n")
+                return 0
             heads = os.environ.get("FAKE_DOCKER_MIGRATION_HEADS", "e6f7a8b9c0d1")
             if heads == "e6f7a8b9c0d1":
                 sys.stdout.write("HEADS=e6f7a8b9c0d1\nREV=e6f7a8b9c0d1->d4c1a8e37b62\nREV=d4c1a8e37b62->\n")

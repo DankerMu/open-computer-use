@@ -297,6 +297,24 @@ class RecoveryCliTests(unittest.TestCase):
             ),
 
         ]
+        for item in containers:
+            service = item["Config"]["Labels"].get("com.docker.compose.service")
+            if service == "computer-use-server":
+                item["Mounts"] = [
+                    {"Type": "bind", "Source": str(path), "Destination": str(path), "RW": True}
+                    for path in (self.chat_dir, self.skills_dir)
+                ]
+                item["Config"]["Env"] = [
+                    f"USER_DATA_BASE_PATH={self.chat_dir}", f"BASE_DATA_DIR={self.chat_dir}",
+                    f"SKILLS_CACHE_DIR={self.skills_dir}", f"SKILLS_CACHE_HOST_PATH={self.skills_dir}",
+                ]
+            elif service in ("open-webui", "open-webui-init", "postgres"):
+                is_pg = service == "postgres"
+                item["Mounts"] = [{
+                    "Type": "volume", "RW": True,
+                    "Name": "ocu-test_postgres-data" if is_pg else "ocu-test_open-webui-data",
+                    "Destination": "/var/lib/postgresql/data" if is_pg else "/app/backend/data",
+                }]
         if extra_containers:
             containers.extend(extra_containers)
         (self.state / "containers.json").write_text(json.dumps(containers), encoding="utf-8")
@@ -473,6 +491,62 @@ class RecoveryCliTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(path.read_bytes(), before)
                 self.assertFalse((self.state / "stopped.log").exists())
+
+    def test_stack_data_provenance_refuses_before_stopping(self):
+        path = self.state / "containers.json"
+        containers = [row for row in json.loads(path.read_text())
+                      if not row["Name"].startswith("owui-chat-")]
+        volumes_path = self.state / "volumes.json"
+        volumes = json.loads(volumes_path.read_text())
+        volumes.pop(f"chat-{CHAT_ID}-workspace")
+        volumes_path.write_text(json.dumps(volumes))
+        original_runtime = self.runtime.read_text()
+        wrong_chat = self.deploy_root / "data" / "inactive-chat"
+        wrong_skills = self.deploy_root / "data" / "inactive-skills"
+        wrong_chat.mkdir()
+        wrong_skills.mkdir()
+        for defect in ("stale-roots", "environment", "missing-chat", "duplicate-skills",
+                       "wrong-type", "read-only", "missing-webui", "missing-postgres"):
+            with self.subTest(defect=defect):
+                records = json.loads(json.dumps(containers))
+                server = next(row for row in records if row["Name"] == "ocu-test-computer-use-server")
+                self.runtime.write_text(original_runtime)
+                if defect == "stale-roots":
+                    self.runtime.write_text(original_runtime.replace(str(self.chat_dir), str(wrong_chat))
+                                            .replace(str(self.skills_dir), str(wrong_skills)))
+                    server["Config"]["Env"] = [
+                        value.replace(str(self.chat_dir), str(wrong_chat))
+                             .replace(str(self.skills_dir), str(wrong_skills))
+                        for value in server["Config"]["Env"]
+                    ]
+                elif defect == "environment":
+                    server["Config"]["Env"][0] = f"USER_DATA_BASE_PATH={wrong_chat}"
+                elif defect == "missing-chat":
+                    server["Mounts"].pop(0)
+                elif defect == "duplicate-skills":
+                    server["Mounts"].append(dict(server["Mounts"][1]))
+                elif defect == "wrong-type":
+                    server["Mounts"][0]["Type"] = "volume"
+                elif defect == "read-only":
+                    server["Mounts"][0]["RW"] = False
+                else:
+                    name = "ocu-test-open-webui-1" if defect == "missing-webui" else "ocu-test-postgres-1"
+                    next(row for row in records if row["Name"] == name)["Mounts"] = []
+                path.write_text(json.dumps(records))
+                before = path.read_bytes()
+                dest = self.root / f"bad-provenance-{defect}"
+                result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                                       "--destination", str(dest), "--runtime-file", str(self.runtime)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(dest.exists())
+                self.assertEqual(path.read_bytes(), before)
+                self.assertFalse((self.state / "stopped.log").exists())
+        self.runtime.write_text(original_runtime)
+        path.write_text(json.dumps(containers))
+        result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                               "--destination", str(self.root / "matching-data"),
+                               "--runtime-file", str(self.runtime)])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def run_cli(self, args, extra=None, uid="0"):
         env = dict(self.env)
@@ -1528,6 +1602,32 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertFalse((dest / "source").exists())
         self.assertEqual((dest / "release.json").read_bytes(), before_manifest)
         self.assertEqual((dest / "config" / "runtime.env").read_bytes(), before_runtime)
+        original_bundle = (other / "source.bundle").read_bytes()
+        original_inventory = (other / "release.json").read_bytes()
+        for invalid_kind in ("corrupt", "wrong-commit"):
+            if invalid_kind == "corrupt":
+                (other / "source.bundle").write_bytes(b"not a git bundle")
+            else:
+                (other / "source.bundle").write_bytes(original_bundle)
+                wrong = json.loads(original_inventory)
+                wrong["ocu_source_sha"] = matching_payload["ocu_source_sha"]
+                write_inventory(other / "release.json", wrong)
+            rejected = self.run_cli(
+                ["activate", "--destination-root", str(dest), "--retained-delivery", str(other)],
+                extra=extra,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse((dest / "config" / "selected-source-owner.json").exists())
+            self.assertFalse((dest / "source").exists())
+            self.assertFalse((target_state / "starts.log").exists())
+            self.assertEqual((dest / "release.json").read_bytes(), before_manifest)
+            self.assertEqual((dest / "config" / "runtime.env").read_bytes(), before_runtime)
+        (target_state / "migration-graph.json").write_text(json.dumps({
+            "heads": ["newhead"], "revisions": {
+                "newhead": ["e6f7a8b9c0d1"], "e6f7a8b9c0d1": ["d4c1a8e37b62"],
+                "d4c1a8e37b62": [],
+            },
+        }))
         activated = self.run_cli(
             [
                 "activate",
