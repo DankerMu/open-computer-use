@@ -702,6 +702,25 @@ def _membership_matches(container, network) -> bool:
     return bool(desired_name and desired_id and current_id) and name == desired_name and current_id == desired_id
 
 
+def _prestart_membership_matches(container, network) -> bool:
+    if _membership_matches(container, network):
+        return True
+    if (container.status or "").lower() not in {"created", "exited"}:
+        return False
+    membership = _current_membership(container)
+    desired_name, desired_id = _network_identity(network)
+    if not desired_name or not desired_id or set(membership) != {desired_name}:
+        return False
+    data = membership[desired_name] or {}
+    host = container.attrs.get("HostConfig") or {}
+    # Docker can defer endpoint allocation until start; the requested bridge must still be bound.
+    return (
+        host.get("NetworkMode") in {desired_name, desired_id}
+        and not _membership_entry_id(data)
+        and not any(data.get(field) for field in ("EndpointID", "Gateway", "IPAddress", "GlobalIPv6Address"))
+    )
+
+
 def _immutable_bindings(container) -> dict:
     host = (container.attrs.get("HostConfig") or {})
     bindings = host.get("PortBindings") or {}
@@ -772,7 +791,7 @@ def _repair_stopped_membership(client, container, network) -> None:
         network, gateway = _inspect_sandbox_network(client)
         if not _bindings_match_gateway(container, gateway):
             raise _incompatible_bindings_error()
-        if not _membership_matches(container, network):
+        if not _prestart_membership_matches(container, network):
             try:
                 network.connect(container)
             except docker.errors.APIError as exc:
@@ -781,7 +800,7 @@ def _repair_stopped_membership(client, container, network) -> None:
             network, gateway = _inspect_sandbox_network(client)
             if not _bindings_match_gateway(container, gateway):
                 raise _incompatible_bindings_error()
-        if not _membership_matches(container, network):
+        if not _prestart_membership_matches(container, network):
             raise LaunchFailed(500, "sandbox network repair did not reach the desired membership")
     except LaunchFailed:
         raise
@@ -832,7 +851,7 @@ def _prepare_existing_container(container, *, mutate: bool) -> None:
     network, gateway = _inspect_sandbox_network(client)
     live = (container.status or "").lower() in _LIVE_SANDBOX_STATUSES
     _require_enabled_compatibility(container, network, gateway, live=live)
-    if _membership_matches(container, network):
+    if _membership_matches(container, network) or (mutate and _prestart_membership_matches(container, network)):
         return
     if live or not mutate:
         raise LaunchFailed(
@@ -840,6 +859,22 @@ def _prepare_existing_container(container, *, mutate: bool) -> None:
             "live sandbox network membership is incompatible; stop the sandbox before migration",
         )
     _repair_stopped_membership(client, container, network)
+
+
+def _verify_started_container(container, *, pinned_network=None) -> None:
+    try:
+        if _reload_container(container) != "running":
+            raise LaunchFailed(500, "start did not reach running")
+        if pinned_network is not None and not _membership_matches(container, pinned_network):
+            raise LaunchFailed(500, "started sandbox is not on the inspected sandbox bridge")
+        _prepare_existing_container(container, mutate=False)
+    except (LaunchFailed, docker.errors.DockerException):
+        try:
+            container.stop(timeout=10)
+            _reload_container(container)
+        except docker.errors.DockerException as exc:
+            raise LaunchFailed(500, "sandbox verification failed and rollback stop failed") from exc
+        raise
 
 
 def _published_address(container, container_port: int) -> Optional[str]:
@@ -1101,9 +1136,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
             raise
     if pinned_network_id:
         _reload_container(container)
-        membership = _current_membership(container)
-        attached_ids = {_membership_entry_id(data) for data in membership.values()}
-        if len(membership) != 1 or attached_ids != {pinned_network_id}:
+        if not _prestart_membership_matches(container, network):
             raise LaunchFailed(500, "created sandbox is not on the inspected sandbox bridge")
         if expected_dns is not None:
             host = (getattr(container, "attrs", None) or {}).get("HostConfig")
@@ -1111,7 +1144,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
                 raise LaunchFailed(500, "created sandbox DNS does not match the configured policy")
     container.start()
 
-    _reload_container(container)
+    _verify_started_container(container, pinned_network=network if pinned_network_id else None)
 
     print(f"[MCP] Created and started new container: {container_name}")
 
@@ -1713,8 +1746,7 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
             container.start()
         except docker.errors.APIError as exc:
             raise LaunchFailed(500, f"engine refused start: {exc}") from exc
-        if _reload_container(container) != "running":
-            raise LaunchFailed(500, "start did not reach running")
+        _verify_started_container(container)
         mark_sleeper_retired(chat_id, container)
         return {"state": "running"}
     if status == "restarting":

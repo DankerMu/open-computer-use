@@ -888,14 +888,15 @@ def get(name):
         raise docker.errors.NotFound(name)
     container = MagicMock()
     container.name = name
-    container.id = data[name]
+    record = data[name]
+    container.id = record["id"]
     container.status = "running"
     container.attrs = {
         "Id": container.id,
         "State": {"Status": "running"},
-        "Config": {"NetworkDisabled": False},
-        "HostConfig": {"NetworkMode": "netid-ocu-sandbox-current"},
-        "NetworkSettings": {"Networks": {"ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}}},
+        "Config": {"NetworkDisabled": record["network_disabled"]},
+        "HostConfig": record["host_config"],
+        "NetworkSettings": {"Networks": {} if record["network_disabled"] else {"ocu-sandbox": {"NetworkID": record["host_config"]["NetworkMode"], "IPAddress": "172.31.0.10"}}},
     }
     def reload():
         container.attrs["State"]["Status"] = container.status
@@ -915,15 +916,29 @@ def create(**config):
     data = json.loads(store.read_text()) if store.exists() else {}
     if config["name"] in data:
         raise_conflict()
-    data[config["name"]] = "shared-cid"
+    bindings = {}
+    for key, value in (config.get("ports") or {}).items():
+        if value is None:
+            bindings[key] = [{"HostIp": "", "HostPort": ""}]
+        elif isinstance(value, tuple):
+            host_ip, host_port = value
+            bindings[key] = [{
+                "HostIp": host_ip or "",
+                "HostPort": "" if host_port is None else str(host_port),
+            }]
+    host = {
+        "NetworkMode": config.get("network") or ("none" if config.get("network_disabled") else "bridge"),
+        "PortBindings": bindings,
+    }
+    if "dns" in config:
+        host["Dns"] = list(config["dns"]) if config["dns"] is not None else None
+    data[config["name"]] = {
+        "id": "shared-cid",
+        "network_disabled": bool(config.get("network_disabled")),
+        "host_config": host,
+    }
     store.write_text(json.dumps(data))
     container = get(config["name"])
-    net_key = config.get("network")
-    if net_key:
-        container.attrs["HostConfig"]["NetworkMode"] = net_key
-        container.attrs["NetworkSettings"]["Networks"] = {
-            "ocu-sandbox": {"NetworkID": "netid-ocu-sandbox-current", "IPAddress": "172.31.0.10"}
-        }
     created.append(config["name"])
     return container
 client.containers.get.side_effect = get
@@ -948,7 +963,7 @@ while len(list(root.glob("ready-*"))) < 2:
 docker_manager._get_or_create_container(os.environ["OCU_CHAT"])
 print(json.dumps({
     "created": created,
-    "store": json.loads(store.read_text()) if store.exists() else {},
+    "store": {name: record["id"] for name, record in json.loads(store.read_text()).items()} if store.exists() else {},
 }))
 '''
     shared = tmp_path / "shared"

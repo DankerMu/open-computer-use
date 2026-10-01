@@ -103,6 +103,10 @@
   unused CDP address alias are removed. Incompatible immutable bindings or live
   membership fail without deleting or recreating the container; stopped
   containers may have membership repaired, and a partial repair is not success.
+  Created/stopped endpoint placeholders are accepted before start only when
+  their sole desired-network entry and `HostConfig.NetworkMode` bind the
+  inspected bridge. Start must resolve the actual desired network ID; failed
+  post-start verification stops the container without deleting retained data.
   `ENABLE_NETWORK=false` keeps disabled create/stop/launch with no network
   lookup. `SANDBOX_HOST_BIND_IP`, when set, must equal the inspected gateway.
 - **Workspace WebSocket session re-check.** CDP and ttyd relays capture the
