@@ -18,6 +18,17 @@
   Baseline no-overwrite real HTTP smoke passed; sandbox readability remains
   parent verification.
 
+- **Import-once attachment receipts.** An upload that carries
+  `X-OCU-Attachment-Id` records the attachment id, stored name, original size,
+  MD5 and import time in `{chat}/.ocu/imports.json` in the same locked section
+  as the file. A later request with that id is acknowledged from the receipt
+  and does not overwrite, rename, or recreate the stored file. Headerless
+  uploads still deduplicate names and leave receipts unchanged.
+  `GET /api/uploads/{chat_id}/imports` returns the persisted ids for the
+  internal token; an unknown chat answers `{ids: []}` without creating a
+  directory. Unsafe or corrupt `.ocu` / `imports.json` state, including a
+  dangling or live symlink, fails explicitly instead of reading as empty.
+
 - **Cold backup and isolated restore.** `deploy/recovery.py` captures one
   complete cold recovery set, restores it onto a distinct empty local
   daemon/root, and activates a retained previous release through that

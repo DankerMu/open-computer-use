@@ -49,6 +49,7 @@ CHAT_ROUTES = (
     ("GET", f"/api/outputs/{CHAT}"),
     ("GET", f"/api/uploads/{CHAT}/manifest"),
     ("GET", f"/api/uploads/{CHAT}/list"),
+    ("GET", f"/api/uploads/{CHAT}/imports"),
     ("GET", f"/files/{CHAT}/archive"),
     ("GET", f"/files/{CHAT}/test.txt"),
     ("GET", f"/browser/{CHAT}/status"),
@@ -107,6 +108,7 @@ def app_module(monkeypatch):
             "security",
             "system_prompt",
             "skill_manager",
+            "uploads",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)
     import app as loaded
@@ -127,8 +129,10 @@ def client(app_module, tmp_path, monkeypatch):
     (chat_uploads / "uploaded.txt").write_text("hello-upload")
     monkeypatch.setattr(app_module, "BASE_DATA_DIR", data)
     import docker_manager
+    import uploads
 
     monkeypatch.setattr(docker_manager, "BASE_DATA_DIR", data)
+    monkeypatch.setattr(uploads, "BASE_DATA_DIR", data)
     with TestClient(app_module.app) as http:
         yield http
 
@@ -598,6 +602,23 @@ class TestHttpAuthorization:
         assert allowed.status_code == 200
         assert allowed.json()["filename"] == "new.txt"
         assert (tmp_path / "data" / CHAT / "uploads" / "new.txt").read_bytes() == b"secret-bytes"
+
+    def test_authorized_imports_lists_persisted_ids_and_rejects_noncanonical(
+            self, client):
+        empty = client.get(f"/api/uploads/{CHAT}/imports", headers=_bearer())
+        assert empty.status_code == 200 and empty.json() == {"ids": []}
+        uploaded = client.post(
+            f"/api/uploads/{CHAT}/brief.docx",
+            headers={**_bearer(), "X-OCU-Attachment-Id": "F1"},
+            files={"file": ("brief.docx", b"one")},
+        )
+        assert uploaded.status_code == 200
+        listed = client.get(f"/api/uploads/{CHAT}/imports", headers=_bearer())
+        assert listed.status_code == 200 and listed.json() == {"ids": ["F1"]}
+        assert client.get("/api/uploads/default/imports",
+                          headers=_bearer()).status_code == 400
+        assert client.get("/api/uploads/..test../imports",
+                          headers=_bearer()).status_code == 400
 
     @pytest.mark.parametrize("path", IDENTITY_ROUTES)
     def test_identity_without_token_is_401(self, client, path):
