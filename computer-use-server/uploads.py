@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 """
-Shared helpers for listing + reading files under a chat's uploads directory.
+Shared helpers for publishing, listing and reading chat uploads.
 
 Used by:
   - GET /api/uploads/{chat_id}/list (existing HTTP endpoint).
   - sync_chat_resources / the @mcp.resource handler in mcp_resources.py
     (Tier 6 native MCP surface).
 
-Traversal protection reuses security.safe_path / security.sanitize_chat_id —
-no new security logic.
+Read traversal protection reuses security.safe_path / security.sanitize_chat_id.
 """
 
 import mimetypes
@@ -23,6 +22,26 @@ from security import safe_path, sanitize_chat_id
 
 # Module-level so tests can patch / so app.py re-uses the same value.
 BASE_DATA_DIR = Path(os.getenv("BASE_DATA_DIR", "/data"))
+
+
+def claim_file_no_replace(temporary: Path, requested: Path) -> Path:
+    """Hard-link complete bytes to the first free name; never follow a leaf.
+
+    The caller owns parent-path validation, locking and temporary-file cleanup.
+    Both paths must be on the same filesystem. Unlocked writers can win a name;
+    EEXIST advances to the next candidate without modifying the occupied entry.
+    """
+    candidate = requested
+    number = 2
+    while True:
+        try:
+            os.link(temporary, candidate)
+            return candidate
+        except FileExistsError:
+            candidate = requested.with_name(
+                f"{requested.stem} ({number}){requested.suffix}"
+            )
+            number += 1
 
 
 @dataclass(frozen=True)
