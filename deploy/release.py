@@ -2493,20 +2493,6 @@ def verify_runtime_binding(payload: dict, runtime: dict[str, str]) -> None:
     derive_runtime_images(payload, runtime)
 
 
-def verify_startup(
-    *,
-    source_root: Path,
-    payload: dict,
-    docs: dict,
-    runtime: dict[str, str] | None = None,
-) -> None:
-    values = dict(runtime or os.environ)
-    verify_runtime_binding(payload, values)
-    verify_tracked_source(source_root, payload["ocu_source_sha"])
-    verify_local_images(payload)
-    verify_service_images(payload, docs)
-
-
 def bootstrap_images(payload: dict, provided: dict[str, str]) -> dict[str, str]:
     values = derive_runtime_images(payload, provided)
     if not workspace_name_ok(values["DOCKER_IMAGE"]):
