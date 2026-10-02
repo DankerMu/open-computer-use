@@ -564,67 +564,6 @@ async def root():
     from docs_html import get_root_html
     return get_root_html()
 
-@app.get("/api/uploads/{chat_id}/manifest", tags=["Files"])
-async def get_uploads_manifest(chat_id: str) -> Dict[str, str]:
-    """
-    Get manifest of uploaded files with their MD5 checksums.
-
-    Args:
-        chat_id: Unique chat identifier
-
-    Returns:
-        Dictionary mapping filename to MD5 checksum
-        Example: {"file1.txt": "abc123def456", "doc.pdf": "789xyz"}
-    """
-    chat_id = sanitize_chat_id(chat_id)
-    uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
-
-    # Return empty dict if directory doesn't exist yet
-    if not uploads_dir.exists():
-        return {}
-
-    manifest = {}
-
-    # Scan all files in uploads directory
-    for file_path in uploads_dir.rglob("*"):
-        if file_path.is_file():
-            # Calculate MD5 checksum
-            md5_hash = hashlib.md5()
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(8192), b""):
-                    md5_hash.update(chunk)
-
-            # Use relative filename as key
-            relative_name = file_path.relative_to(uploads_dir)
-            manifest[str(relative_name)] = md5_hash.hexdigest()
-
-    return manifest
-
-
-@app.get("/api/uploads/{chat_id}/list", tags=["Files"])
-async def list_uploads(chat_id: str, response: Response):
-    """List all files in the uploads directory with metadata."""
-    chat_id = sanitize_chat_id(chat_id)
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
-    if not uploads_dir.exists():
-        return {"files": [], "total": 0}
-    files = []
-    for fp in uploads_dir.rglob("*"):
-        if not fp.is_file():
-            continue
-        rel = fp.relative_to(uploads_dir)
-        stat = fp.stat()
-        files.append({
-            "name": fp.name,
-            "path": str(rel),
-            "size": stat.st_size,
-            "modified": stat.st_mtime,
-            "container_path": f"/mnt/user-data/uploads/{rel}",
-        })
-    files.sort(key=lambda f: f["modified"], reverse=True)
-    return {"files": files, "total": len(files)}
-
 
 def _store_upload(
     chat_id: str, filename: str, content: bytes, attachment_id: str | None = None,
