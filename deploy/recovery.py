@@ -46,12 +46,6 @@ FIXED_CONTAINER_NAMES = (
     "ocu-test-open-webui-init",
     "ocu-test-proxy",
 )
-WRITER_SERVICES = (
-    "computer-use-server",
-    "open-webui",
-    "open-webui-init",
-    "retention-guard",
-)
 POSTGRES_SERVICE = "postgres"
 SANDBOX_LABEL = "managed-by=mcp-computer-use-orchestrator"
 WORKSPACE_VOLUME_RE = re.compile(r"^chat-(?P<chat_id>.+)-workspace$")
