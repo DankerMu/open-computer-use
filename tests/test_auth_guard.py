@@ -47,8 +47,6 @@ CHAT_B = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
 # would touch the filesystem or resolve a container when unguarded.
 CHAT_ROUTES = (
     ("GET", f"/api/outputs/{CHAT}"),
-    ("GET", f"/api/uploads/{CHAT}/manifest"),
-    ("GET", f"/api/uploads/{CHAT}/list"),
     ("GET", f"/api/uploads/{CHAT}/imports"),
     ("GET", f"/files/{CHAT}/archive"),
     ("GET", f"/files/{CHAT}/test.txt"),

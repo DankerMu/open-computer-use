@@ -20,7 +20,12 @@ from fastapi.testclient import TestClient
 
 
 VALID_CHAT_ID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+UNKNOWN_CHAT_ID = "c3d4e5f6-a7b8-9012-cdef-123456789012"
 INTERNAL_TOKEN = "ocu-test-internal-token"
+UPLOAD_READ_PATHS = ("manifest", "list")
+# MD5 of the seeded uploads/uploaded.txt bytes b"world".
+SEEDED_UPLOAD_MD5 = "7d793037a0760186574b0282f2f435e7"
+SEEDED_UPLOAD_NAME = "uploaded.txt"
 
 
 @pytest.fixture
@@ -110,19 +115,46 @@ class TestNormalOperations:
         resp = client.get(f"/api/outputs/{VALID_CHAT_ID}")
         assert resp.status_code == 200
 
-    def test_manifest_normal(self, client):
-        resp = client.get(f"/api/uploads/{VALID_CHAT_ID}/manifest")
-        assert resp.status_code == 200
-
-    def test_uploads_list_normal(self, client):
-        resp = client.get(f"/api/uploads/{VALID_CHAT_ID}/list")
-        assert resp.status_code == 200
-
     def test_default_chat_id_is_rejected(self, client, tmp_data):
         """A shared default sandbox is forbidden even in single-user mode."""
         (tmp_data / "default" / "outputs").mkdir(parents=True)
         resp = client.get("/api/outputs/default")
         assert resp.status_code == 400
+
+
+def _assert_no_upload_metadata(response):
+    assert response.status_code in (404, 405)
+    assert set(response.json()) == {"detail"}
+    body = response.text
+    assert SEEDED_UPLOAD_NAME not in body
+    assert SEEDED_UPLOAD_MD5 not in body
+
+
+class TestRemovedUploadReadEndpoints:
+    """Retired upload manifest and list GETs disclose no stored-file metadata."""
+
+    @pytest.mark.parametrize("suffix", UPLOAD_READ_PATHS)
+    def test_authenticated_canonical_get_returns_client_error_without_metadata(
+            self, client, suffix):
+        response = client.get(f"/api/uploads/{VALID_CHAT_ID}/{suffix}")
+        _assert_no_upload_metadata(response)
+
+    @pytest.mark.parametrize("suffix", UPLOAD_READ_PATHS)
+    def test_missing_token_is_401_before_routing(self, client, suffix):
+        client.headers.pop("Authorization", None)
+        response = client.get(f"/api/uploads/{VALID_CHAT_ID}/{suffix}")
+        assert response.status_code == 401
+        assert SEEDED_UPLOAD_NAME not in response.text
+        assert SEEDED_UPLOAD_MD5 not in response.text
+
+    @pytest.mark.parametrize("suffix", UPLOAD_READ_PATHS)
+    def test_unknown_chat_get_does_not_create_directory(
+            self, client, tmp_data, suffix):
+        chat_dir = tmp_data / UNKNOWN_CHAT_ID
+        assert not chat_dir.exists()
+        response = client.get(f"/api/uploads/{UNKNOWN_CHAT_ID}/{suffix}")
+        _assert_no_upload_metadata(response)
+        assert not chat_dir.exists()
 
 
 class TestSafePathDirectly:

@@ -41,6 +41,11 @@
   Files displays outputs only, so uploads remain absent until the workspace
   mount cutover.
 
+- **Upload reads use receipts.** The upload manifest and list GET paths have
+  no handlers. Authenticated canonical requests receive a routing error with
+  no file metadata; prefix authorization and chat-id validation still run
+  first. Upload POST, import receipts and MCP upload resources remain available.
+
 - **Cold backup and isolated restore.** `deploy/recovery.py` captures one
   complete cold recovery set, restores it onto a distinct empty local
   daemon/root, and activates a retained previous release through that

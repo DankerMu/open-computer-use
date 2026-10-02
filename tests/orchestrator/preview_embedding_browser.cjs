@@ -294,18 +294,6 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === `${prefix}/terminal/${CHAT}/processes`) return respond(res, 200, JSON.stringify({ processes: [] }));
     if (url.pathname === `${prefix}/terminal/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false }));
     if (url.pathname === `${prefix}/terminal/${CHAT}/sessions`) return respond(res, 200, JSON.stringify({ sessions: [] }));
-    if (url.pathname === `${prefix}/api/uploads/${CHAT}/list`) {
-      return respond(res, 200, JSON.stringify({
-        files: [{
-          name: 'retained-upload.txt',
-          path: 'retained-upload.txt',
-          size: 17,
-          modified: 1700000000,
-          container_path: '/mnt/user-data/uploads/retained-upload.txt',
-        }],
-        total: 1,
-      }));
-    }
     if (url.pathname === `${prefix}/api/uploads/${CHAT}/note.txt` && req.method === 'POST') {
       record.status = 200;
       return respond(res, 200, JSON.stringify({ status: 'success', filename: 'note.txt', size: 5, md5: '0' }));
