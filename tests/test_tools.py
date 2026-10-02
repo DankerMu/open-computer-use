@@ -917,7 +917,7 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
                 ),
                 __files__=[
                     _attachment("existing-id", "existing.txt", "existing-source"),
-                    _attachment("uploaded-id", "uploaded.txt", "uploaded-source"),
+                    {"id": "uploaded-id", "name": "uploaded.txt", "path": "uploaded-source"},
                 ],
             )
         )
@@ -929,6 +929,7 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
         health = _records(ocu, "/health")
         imports = _records(ocu, "/api/uploads/chat-one/imports")
         upload = _records(ocu, "/api/uploads/chat-one/uploaded.txt")
+        existing_upload = _records(ocu, "/api/uploads/chat-one/existing.txt")
         probe = _records(ocu, "/mcp", **{"x-chat-id": "preflight"})
         first_call = _records(ocu, "/mcp", **{"x-user-email": "first@example.test"})
         assert health and all(r["headers"].get("authorization") == f"Bearer {first_token}" for r in health)
@@ -939,7 +940,19 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
         assert all(r["headers"].get("authorization") == f"Bearer {MCP_API_KEY}" for r in probe + first_call)
         assert all(r["headers"].get("x-user-email") != "forged@example.test" for r in first_call)
         assert all(r["headers"].get("x-chat-id") == "chat-one" for r in first_call)
-        assert _records(ocu, "/api/uploads/chat-one/existing.txt")
+        assert existing_upload
+        assert upload[0]["method"] == "POST"
+        assert upload[0]["headers"].get("x-ocu-attachment-id") == "uploaded-id"
+        assert existing_upload[0]["method"] == "POST"
+        assert existing_upload[0]["headers"].get("x-ocu-attachment-id") == "existing-id"
+        assert ocu.uploads == [
+            {"filename": "existing.txt", "attachment_id": "existing-id"},
+            {"filename": "uploaded.txt", "attachment_id": "uploaded-id"},
+        ]
+        assert ocu.stored_files("chat-one") == {
+            "existing.txt": b"already uploaded",
+            "uploaded.txt": b"new upload",
+        }
         assert not _records(ocu, "/api/uploads/chat-one/manifest")
 
         mcp_headers = {
