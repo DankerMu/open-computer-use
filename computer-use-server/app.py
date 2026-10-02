@@ -19,6 +19,7 @@ import logging
 import mimetypes
 import re
 import secrets
+import tempfile
 import time
 import zipfile
 from io import BytesIO
@@ -58,8 +59,10 @@ from docker_manager import (
     validate_idle_configuration,
     validate_sandbox_dns_configuration,
     LifecycleError,
+    _combined_lock,
 )
 from security import sanitize_chat_id, safe_path
+from uploads import claim_file_no_replace
 from outputs_broker import (
     CursorError,
     DEFAULT_PAGE_LIMIT,
@@ -617,6 +620,35 @@ async def list_uploads(chat_id: str, response: Response):
     return {"files": files, "total": len(files)}
 
 
+def _store_upload(chat_id: str, filename: str, content: bytes) -> tuple[str, str]:
+    """Keep blocking lock and file operations on one worker thread."""
+    with _combined_lock(chat_id):
+        relative = Path(filename)
+        if (not filename or relative.is_absolute() or ".." in relative.parts
+                or relative.name in {"", ".", ".."} or "\x00" in filename):
+            raise HTTPException(status_code=403, detail="Invalid upload path")
+        uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
+        # Resolve only the parent: an occupied leaf symlink is a collision.
+        parent = safe_path(uploads_dir, str(relative.parent))
+        parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=".upload-", dir=parent, delete=False
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(content)
+            # Sandbox runs as assistant with a read-only uploads mount.
+            # NamedTemporaryFile creates 0600 owned by the server uid, so
+            # the published inode must be world-readable before the hard link.
+            temporary.chmod(0o644)
+            stored = claim_file_no_replace(temporary, parent / relative.name)
+            return str(stored.relative_to(uploads_dir)), hashlib.md5(content).hexdigest()
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
 @app.post("/api/uploads/{chat_id}/{filename:path}", tags=["Files"], response_model=UploadResponse)
 async def upload_file(chat_id: str, filename: str, file: UploadFile = File(...)):
     """
@@ -634,24 +666,11 @@ async def upload_file(chat_id: str, filename: str, file: UploadFile = File(...))
         400: Invalid filename or security violation
     """
     chat_id = sanitize_chat_id(chat_id)
-    # Create uploads directory if it doesn't exist
-    uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-
-    # Construct target path with traversal protection
-    file_path = safe_path(uploads_dir, filename)
-
-    # Create parent directories if needed
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Save file
     try:
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
-
-        # Calculate MD5 for confirmation
-        md5_hash = hashlib.md5(content).hexdigest()
+        content = await file.read()
+        stored_name, md5_hash = await asyncio.to_thread(
+            _store_upload, chat_id, filename, content
+        )
 
         # Tier 6 — refresh MCP resources for this chat so the new file
         # appears in resources/list without reconnecting. Swallow errors
@@ -665,10 +684,12 @@ async def upload_file(chat_id: str, filename: str, file: UploadFile = File(...))
 
         return {
             "status": "success",
-            "filename": filename,
+            "filename": stored_name,
             "size": len(content),
             "md5": md5_hash
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 

@@ -10,6 +10,14 @@
 
 
 ### Changed
+- **Upload name claim without replace.** `POST /api/uploads/{chat_id}/{path}`
+  writes a complete dot-prefixed temporary file under the per-chat lock, then
+  hard-links the first free name (`name (N).ext` on collision) without replacing
+  an occupied entry. Temporary bytes are set to 0644 before that link so a
+  sandbox assistant can read the published file on a read-only uploads mount.
+  Baseline no-overwrite real HTTP smoke passed; sandbox readability remains
+  parent verification.
+
 - **Cold backup and isolated restore.** `deploy/recovery.py` captures one
   complete cold recovery set, restores it onto a distinct empty local
   daemon/root, and activates a retained previous release through that
