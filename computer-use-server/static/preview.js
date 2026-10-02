@@ -1577,7 +1577,8 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
       for (const file of input.files) {
         const formData = new FormData();
         formData.append('file', file);
-        await ocuFetch(`/api/uploads/${chatId}/${encodeURIComponent(file.name)}`, { method: 'POST', body: formData });
+        const response = await ocuFetch(`/api/uploads/${chatId}/${encodeURIComponent(file.name)}`, { method: 'POST', body: formData });
+        await response.text();
       }
       input.remove();
       fetchData();
@@ -2364,6 +2365,7 @@ function App() {
       await checkTerminalStatus();
     };
     poll();
+    // freezePollingClock in preview_embedding_browser.cjs tracks these two delays.
     let timer = setInterval(poll, 3000);
 
     const visHandler = () => {

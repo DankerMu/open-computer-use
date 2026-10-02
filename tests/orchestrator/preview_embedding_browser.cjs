@@ -294,7 +294,18 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === `${prefix}/terminal/${CHAT}/processes`) return respond(res, 200, JSON.stringify({ processes: [] }));
     if (url.pathname === `${prefix}/terminal/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false }));
     if (url.pathname === `${prefix}/terminal/${CHAT}/sessions`) return respond(res, 200, JSON.stringify({ sessions: [] }));
-    if (url.pathname === `${prefix}/api/uploads/${CHAT}/list`) return respond(res, 200, JSON.stringify({ files: [], total: 0 }));
+    if (url.pathname === `${prefix}/api/uploads/${CHAT}/list`) {
+      return respond(res, 200, JSON.stringify({
+        files: [{
+          name: 'retained-upload.txt',
+          path: 'retained-upload.txt',
+          size: 17,
+          modified: 1700000000,
+          container_path: '/mnt/user-data/uploads/retained-upload.txt',
+        }],
+        total: 1,
+      }));
+    }
     if (url.pathname === `${prefix}/api/uploads/${CHAT}/note.txt` && req.method === 'POST') {
       record.status = 200;
       return respond(res, 200, JSON.stringify({ status: 'success', filename: 'note.txt', size: 5, md5: '0' }));
@@ -458,6 +469,7 @@ async function main() {
       window.setInterval = (callback, delay, ...args) => {
         const timer = start(callback, delay, ...args);
         if (delay === 120000) window.__heartbeatTimers.add(timer);
+        // App visible/hidden poll delays in preview.js (setInterval(poll, 3000/15000)).
         if (delay === 3000 || delay === 15000) window.__pollIntervals.add(timer);
         return timer;
       };
@@ -1168,6 +1180,31 @@ async function main() {
     assert.equal(requests.filter(row => /\/(restart-container|start-ttyd)$/.test(row.path)).length,
       launchBeforeRuntime, 'runtime embedding implicitly launched a sandbox');
     await page.screenshot({ path: path.join(artifacts, 'embedded-terminal-dashboard.png') });
+    const beforeEmbedUpload = requests.length;
+    const beforeEmbedUploadErrors = consoleErrors.length;
+    const embedChooserPromise = page.waitForEvent('filechooser');
+    await frame().locator('.dash-btn-secondary').click();
+    const embedChooser = await embedChooserPromise;
+    await embedChooser.setFiles({ name: 'note.txt', mimeType: 'text/plain', buffer: Buffer.from('hello') });
+    await waitUntil(() => requests.slice(beforeEmbedUpload).some(row =>
+      row.method === 'POST' && row.path === `/ocu/api/uploads/${CHAT}/note.txt`),
+      'terminal embed upload POST');
+    await waitUntil(() => requests.slice(beforeEmbedUpload).some(row =>
+      row.method === 'GET' && row.path === `/ocu/terminal/${CHAT}/status`),
+      'terminal embed upload dashboard refresh');
+    const afterEmbedUpload = requests.slice(beforeEmbedUpload);
+    assert.equal(await frame().locator('.dash-btn-secondary').count(), 1,
+      'terminal embed upload dropped the upload action');
+    assert.equal(await frame().locator('h4').filter({ hasText: 'Uploaded files' }).count(), 0,
+      'terminal embed upload rendered an uploaded-files section');
+    assert.equal(afterEmbedUpload.filter(row =>
+      row.path === `/ocu/api/uploads/${CHAT}/list` ||
+      row.path === `/ocu/api/uploads/${CHAT}/manifest`).length, 0,
+      'terminal embed upload issued an upload list or manifest request');
+    assert.equal(requests.filter(row => row.path === `/ocu/api/outputs/${CHAT}`).length,
+      listingBeforeRuntime, 'terminal embed upload listed Files');
+    assert.deepEqual(consoleErrors.slice(beforeEmbedUploadErrors), [],
+      'terminal embed upload produced unexpected console errors');
     await retireFrame();
     const runtimeCalls = () => requests.filter(row =>
       /\/(?:browser|terminal)\/|\/api\/uploads\//.test(row.path)).length;
@@ -1558,13 +1595,23 @@ async function main() {
         row.path === `/ocu/api/uploads/${CHAT}/list` ||
         row.path === `/ocu/api/uploads/${CHAT}/manifest`).length, 0,
         'standalone upload issued an upload list or manifest request');
+      // Frozen 3000ms App poll cannot satisfy this waitUntil (10s deadline) or the
+      // exactly-one GET count; only onFilesRefresh after the upload POST can.
       assert.equal(afterUpload.filter(row =>
         row.method === 'GET' && row.path === `/ocu/api/outputs/${CHAT}`).length, 1,
         'standalone upload Files refresh was not a single callback GET');
-      assert.equal(await panelSession.page.locator('.item-name').filter({ hasText: 'note.txt' }).count(), 0,
-        'standalone upload fabricated an uploaded file in Files before destination cut-over');
       await panelSession.page.locator('.dash-btn-secondary').waitFor();
       await panelSession.page.screenshot({ path: path.join(artifacts, 'standalone-terminal-panel.png') });
+      await panelSession.page.locator('.view-tab').filter({ hasText: 'Files' }).click();
+      await panelSession.page.locator('.file-selector-btn').waitFor();
+      await panelSession.page.locator('.file-selector-btn').click();
+      await panelSession.page.locator('.dropdown-menu.open').waitFor();
+      assert.equal(await panelSession.page.locator('.dropdown-menu.open .item-name')
+        .getByText('hostile.docx', { exact: true }).count(), 1,
+        'standalone Files listing omitted the retained outputs entry');
+      assert.equal(await panelSession.page.locator('.dropdown-menu.open .item-name')
+        .filter({ hasText: 'note.txt' }).count(), 0,
+        'standalone upload fabricated an uploaded file in Files before destination cut-over');
       assert.deepEqual(caseErrors(panelSession), [], 'standalone panel produced unexpected console errors');
     } catch (error) {
       await captureStandaloneFailure(panelSession, 'standalone-panel');
