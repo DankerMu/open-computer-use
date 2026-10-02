@@ -8,7 +8,7 @@ Run: python -m pytest tests/test_tools.py -v
 import sys
 import unittest
 import asyncio
-import hashlib
+import urllib.parse
 import json
 import socket
 import threading
@@ -212,20 +212,107 @@ def test_unusable_credentials_reject_before_upload_or_probe(
     assert _workspace_hints(events) == []
 
 
+APP_MODULES = {
+    "app", "auth_guard", "ws_recheck", "mcp_tools", "docker_manager",
+    "outputs_broker", "context_vars", "security", "system_prompt",
+    "skill_manager", "cli_runtime", "uploads", "docs_html",
+}
+
+
+def _guard_environment(data):
+    return {
+        "OCU_WEBUI_ORIGIN": "https://webui.example",
+        "SINGLE_USER_MODE": "true",
+        "OCU_SANDBOX_SUBNET": "10.90.0.0/24",
+        "PUBLIC_BASE_URL": "http://ocu.example",
+        "BASE_DATA_DIR": str(data),
+        "USER_DATA_BASE_PATH": str(data.parent / "user-data"),
+        "DOCKER_HOST": "unix:///tmp/ocu-acceptance-no-docker.sock",
+        "DOCKER_SOCKET": "unix:///tmp/ocu-acceptance-no-docker.sock",
+        "OCU_WEBUI_AUTH_URL": "http://127.0.0.1:9/api/v1/ocu/auth",
+    }
+
+
 class _GuardedOCU:
-    def __init__(self, remote_manifest):
+    def __init__(
+        self,
+        monkeypatch,
+        tmp_path,
+        *,
+        imports_mode="live",
+    ):
         import auth_guard
 
         self.requests = []
+        self.uploads = []
+        self.commands = []
+        self.calls = []
+        self.imports_mode = imports_mode
         self.server = None
         self.thread = None
+        self.data_dir = tmp_path / "ocu-data"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._snapshot = {
+            name: value
+            for name, value in sys.modules.items()
+            if name in APP_MODULES or name.startswith("mcp_resources")
+        }
+        for key, value in _guard_environment(self.data_dir).items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.delenv("OCU_PUBLIC_PREFIX", raising=False)
+        for name in self._snapshot:
+            sys.modules.pop(name, None)
+        import app as ocu_app
+
+        self.ocu_app = ocu_app
+        monkeypatch.setattr(ocu_app, "BASE_DATA_DIR", self.data_dir)
+        import docker_manager
+        import uploads
+
+        monkeypatch.setattr(docker_manager, "BASE_DATA_DIR", self.data_dir)
+        monkeypatch.setattr(uploads, "BASE_DATA_DIR", self.data_dir)
         self.mcp = FastMCP(
             "tool-auth-test", streamable_http_path="/", stateless_http=True
         )
 
         @self.mcp.tool()
         async def bash_tool(command: str, description: str) -> str:
+            self.commands.append({"command": command, "uploads": list(self.uploads)})
+            self.calls.append(("bash_tool", command))
             return f"ran:{command}"
+
+        @self.mcp.tool()
+        async def str_replace(
+            description: str, old_str: str, path: str, new_str: str = ""
+        ) -> str:
+            self.calls.append(("str_replace", path))
+            return f"edited:{path}"
+
+        @self.mcp.tool()
+        async def create_file(description: str, file_text: str, path: str) -> str:
+            self.calls.append(("create_file", path))
+            return f"created:{path}"
+
+        @self.mcp.tool()
+        async def view(
+            description: str, path: str, view_range: list | None = None
+        ) -> str:
+            self.calls.append(("view", path))
+            return f"viewed:{path}"
+
+        @self.mcp.tool()
+        async def sub_agent(
+            task: str,
+            description: str,
+            model: str = "sonnet",
+            max_turns: int = 25,
+            working_directory: str = "/home/assistant",
+            resume_session_id: str = "",
+        ) -> str:
+            self.calls.append(("sub_agent", task))
+            return f"delegated:{task}"
+
+
 
         mcp_app = self.mcp.streamable_http_app()
 
@@ -237,17 +324,50 @@ class _GuardedOCU:
         async def health(request):
             return PlainTextResponse("healthy")
 
-        async def manifest_endpoint(request):
-            return JSONResponse(remote_manifest)
+        async def imports_endpoint(request):
+            mode = self.imports_mode
+            if mode == "fail":
+                return JSONResponse({"detail": "imports unavailable"}, status_code=500)
+            if mode == "malformed":
+                return JSONResponse({"ids": "F1"})
+            if mode == "redirect":
+                return JSONResponse({}, status_code=302, headers={"Location": "/elsewhere"})
+            payload = await ocu_app.get_upload_imports(request.path_params["chat_id"])
+            return JSONResponse(payload)
 
         async def upload(request):
-            return JSONResponse({"status": "ok"})
+            from fastapi import HTTPException, UploadFile
+            from starlette.datastructures import UploadFile as StarletteUpload
+
+            form = await request.form()
+            uploaded = form["file"]
+            if not isinstance(uploaded, (UploadFile, StarletteUpload)):
+                raise RuntimeError("upload form missing file")
+            filename = request.path_params["filename"]
+            attachment_id = request.headers.get("x-ocu-attachment-id")
+            self.uploads.append(
+                {"filename": filename, "attachment_id": attachment_id}
+            )
+            try:
+                result = await ocu_app.upload_file(
+                    request.path_params["chat_id"],
+                    filename,
+                    uploaded,
+                    attachment_id,
+                )
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            return JSONResponse(result)
 
         app = Starlette(
             routes=[
                 Route("/health", health),
-                Route("/api/uploads/{chat_id}/manifest", manifest_endpoint),
-                Route("/api/uploads/{chat_id}/{filename}", upload, methods=["POST"]),
+                Route("/api/uploads/{chat_id}/imports", imports_endpoint),
+                Route(
+                    "/api/uploads/{chat_id}/{filename:path}",
+                    upload,
+                    methods=["POST"],
+                ),
             ],
             lifespan=lifespan,
         )
@@ -267,6 +387,7 @@ class _GuardedOCU:
                     {
                         "method": scope["method"],
                         "path": scope["path"],
+                        "raw_path": scope.get("raw_path"),
                         "headers": {
                             name.decode("latin-1").lower(): value.decode("latin-1")
                             for name, value in scope.get("headers", [])
@@ -296,18 +417,35 @@ class _GuardedOCU:
     def stop(self):
         self.server.should_exit = True
         self.thread.join(timeout=5)
+        for name in list(sys.modules):
+            if name in APP_MODULES or name.startswith("mcp_resources"):
+                sys.modules.pop(name, None)
+        sys.modules.update(self._snapshot)
+
+    def chat_uploads(self, chat_id):
+        return self.data_dir / chat_id / "uploads"
+
+    def stored_files(self, chat_id):
+        uploads = self.chat_uploads(chat_id)
+        if not uploads.is_dir():
+            return {}
+        return {
+            path.name: path.read_bytes()
+            for path in uploads.iterdir()
+            if path.is_file() and not path.name.startswith(".")
+        }
 
     @property
     def url(self):
         return f"http://127.0.0.1:{self.port}"
 
 
-
-
-def _with_guard(manifest):
+def _with_guard(monkeypatch, tmp_path, imports_mode="live"):
     class GuardContext:
         def __enter__(self):
-            self.server = _GuardedOCU(manifest)
+            self.server = _GuardedOCU(
+                monkeypatch, tmp_path, imports_mode=imports_mode
+            )
             self.server.start()
             return self.server
 
@@ -317,11 +455,49 @@ def _with_guard(manifest):
     return GuardContext()
 
 
-def _install_storage(monkeypatch, paths):
-    provider = types.ModuleType("open_webui.storage.provider")
-    provider.Storage = type(
-        "Storage", (), {"get_file": staticmethod(lambda source: str(paths[source]))}
+def _attachment(file_id, name, source):
+    return {"id": file_id, "name": name, "file": {"path": source}}
+
+
+def _invoke_public_tool(tools, method, chat_id, files, command="echo ready"):
+    metadata = {"chat_id": chat_id}
+    if method == "bash_tool":
+        return tools.bash_tool(
+            command, "start work", __metadata__=metadata, __files__=files
+        )
+    if method == "str_replace":
+        return tools.str_replace(
+            "edit", "before", "/home/assistant/a.txt", "after",
+            __metadata__=metadata, __files__=files,
+        )
+    if method == "create_file":
+        return tools.create_file(
+            "create", "contents", "/home/assistant/a.txt",
+            __metadata__=metadata, __files__=files,
+        )
+    if method == "view":
+        return tools.view(
+            "read", "/home/assistant/notes.txt",
+            __metadata__=metadata, __files__=files,
+        )
+    return tools.sub_agent(
+        "inspect attachment", "delegate",
+        __metadata__=metadata, __files__=files,
     )
+
+
+def _install_storage(monkeypatch, paths):
+    snapshots = {key: Path(path).read_bytes() for key, path in paths.items()}
+    destinations = {key: Path(path) for key, path in paths.items()}
+
+    def get_file(source):
+        destination = destinations[source]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(snapshots[source])
+        return str(destination)
+
+    provider = types.ModuleType("open_webui.storage.provider")
+    provider.Storage = type("Storage", (), {"get_file": staticmethod(get_file)})
     storage = types.ModuleType("open_webui.storage")
     storage.__path__ = []
     package = types.ModuleType("open_webui")
@@ -428,6 +604,292 @@ def _service_unavailable(request):
 
 
 
+def test_bash_imports_attachment_before_command_without_uploads_path(monkeypatch, tmp_path):
+    source = tmp_path / "attachment.tmp"
+    source.write_bytes(b"attachment original")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        result = asyncio.run(
+            tools.bash_tool(
+                "echo ready",
+                "start work",
+                __metadata__={"chat_id": "chat-attachment"},
+                __files__=[
+                    {"id": "F1", "name": "brief.docx", "file": {"path": "attachment-source"}}
+                ],
+            )
+        )
+
+        assert result == "ran:echo ready"
+        upload = _records(ocu, "/api/uploads/chat-attachment/brief.docx")
+        assert len(upload) == 1, "attachment must be uploaded even without an uploads path"
+        assert ocu.uploads == [{"filename": "brief.docx", "attachment_id": "F1"}]
+        assert ocu.commands == [
+            {
+                "command": "echo ready",
+                "uploads": [{"filename": "brief.docx", "attachment_id": "F1"}],
+            }
+        ]
+        imports = _records(ocu, "/api/uploads/chat-attachment/imports")
+        assert len(imports) == 1
+        assert imports[0]["method"] == "GET"
+        assert upload[0]["method"] == "POST"
+        assert upload[0]["headers"].get("x-ocu-attachment-id") == "F1"
+        assert all(
+            record["headers"].get("authorization") == f"Bearer {INTERNAL_TOKEN}"
+            for record in imports + upload + _records(ocu, "/health")
+        )
+        mcp = _records(ocu, "/mcp")
+        assert mcp
+        assert all(
+            record["headers"].get("x-ocu-internal-token") == INTERNAL_TOKEN
+            and record["headers"].get("authorization") == f"Bearer {MCP_API_KEY}"
+            for record in mcp
+        )
+        calls = _records(ocu, "/mcp", **{"x-chat-id": "chat-attachment"})
+        assert calls
+        assert ocu.requests.index(imports[0]) < ocu.requests.index(upload[0])
+        assert ocu.requests.index(upload[0]) < ocu.requests.index(calls[0])
+
+
+@pytest.mark.parametrize(
+    "method", ("bash_tool", "str_replace", "create_file", "view", "sub_agent")
+)
+def test_public_tools_sync_new_attachment_before_command(monkeypatch, tmp_path, method):
+    source = tmp_path / "brief.tmp"
+    source.write_bytes(b"attachment original")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+    chat_id = f"chat-{method.replace('_', '-')}"
+    files = [_attachment("F1", "brief.docx", "attachment-source")]
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        result = asyncio.run(_invoke_public_tool(tools, method, chat_id, files))
+
+        encoded = urllib.parse.quote("brief.docx", safe="")
+        upload = _records(ocu, f"/api/uploads/{chat_id}/{encoded}")
+        imports = _records(ocu, f"/api/uploads/{chat_id}/imports")
+        calls = _records(ocu, "/mcp", **{"x-chat-id": chat_id})
+        assert result
+        assert len(upload) == 1
+        assert upload[0]["method"] == "POST"
+        assert upload[0]["headers"].get("x-ocu-attachment-id") == "F1"
+        assert len(imports) == 1
+        assert imports[0]["method"] == "GET"
+        assert ocu.uploads == [{"filename": "brief.docx", "attachment_id": "F1"}]
+        assert ocu.stored_files(chat_id) == {"brief.docx": b"attachment original"}
+        assert calls
+        assert ocu.requests.index(imports[0]) < ocu.requests.index(upload[0])
+        assert ocu.requests.index(upload[0]) < ocu.requests.index(calls[0])
+        assert not _records(ocu, f"/api/uploads/{chat_id}/manifest")
+
+
+def test_imported_edited_attachment_is_not_posted_again(monkeypatch, tmp_path):
+    source = tmp_path / "brief.tmp"
+    source.write_bytes(b"attachment original")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+    files = [_attachment("F1", "brief.docx", "attachment-source")]
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        first = asyncio.run(
+            tools.bash_tool(
+                "echo first",
+                "import",
+                __metadata__={"chat_id": "chat-skip"},
+                __files__=files,
+            )
+        )
+        stored = ocu.chat_uploads("chat-skip") / "brief.docx"
+        stored.write_bytes(b"user edited bytes")
+        fetches = []
+
+        def counting_get_file(key):
+            fetches.append(key)
+            return str(source)
+
+        monkeypatch.setattr(
+            sys.modules["open_webui.storage.provider"].Storage,
+            "get_file",
+            staticmethod(counting_get_file),
+        )
+        ocu.uploads.clear()
+        second = asyncio.run(
+            tools.bash_tool(
+                "echo second",
+                "skip imported",
+                __metadata__={"chat_id": "chat-skip"},
+                __files__=files,
+            )
+        )
+
+        assert "ran:echo first" in first
+        assert "ran:echo second" in second
+        uploads = _records(ocu, "/api/uploads/chat-skip/brief.docx")
+        assert len(uploads) == 1
+        assert ocu.uploads == []
+        assert fetches == []
+        assert stored.read_bytes() == b"user edited bytes"
+        assert ocu.stored_files("chat-skip") == {"brief.docx": b"user edited bytes"}
+
+
+def test_two_consecutive_calls_store_one_file_for_the_same_id(monkeypatch, tmp_path):
+    source = tmp_path / "brief.tmp"
+    source.write_bytes(b"attachment original")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+    files = [_attachment("F1", "brief.docx", "attachment-source")]
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        asyncio.run(
+            tools.bash_tool(
+                "echo first",
+                "import",
+                __metadata__={"chat_id": "chat-once"},
+                __files__=files,
+            )
+        )
+        asyncio.run(
+            tools.bash_tool(
+                "echo second",
+                "repeat",
+                __metadata__={"chat_id": "chat-once"},
+                __files__=files,
+            )
+        )
+        assert ocu.stored_files("chat-once") == {"brief.docx": b"attachment original"}
+        assert len(_records(ocu, "/api/uploads/chat-once/brief.docx")) == 1
+
+
+@pytest.mark.parametrize("imports_mode", ("fail", "malformed", "redirect"))
+def test_failed_imports_read_posts_all_ids_and_server_writes_nothing(
+    monkeypatch, tmp_path, imports_mode
+):
+    source = tmp_path / "brief.tmp"
+    source.write_bytes(b"attachment original")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+    files = [_attachment("F1", "brief.docx", "attachment-source")]
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        asyncio.run(
+            tools.bash_tool(
+                "echo seed",
+                "import once",
+                __metadata__={"chat_id": "chat-failed-read"},
+                __files__=files,
+            )
+        )
+        stored = ocu.chat_uploads("chat-failed-read") / "brief.docx"
+        assert stored.read_bytes() == b"attachment original"
+        stored.write_bytes(b"user edited bytes")
+        ocu.imports_mode = imports_mode
+        ocu.uploads.clear()
+        result = asyncio.run(
+            tools.bash_tool(
+                "echo retry",
+                "failed read",
+                __metadata__={"chat_id": "chat-failed-read"},
+                __files__=files,
+            )
+        )
+
+        uploads_records = _records(ocu, "/api/uploads/chat-failed-read/brief.docx")
+        assert "ran:echo retry" in result
+        assert len(uploads_records) == 2
+        assert all(
+            record["headers"].get("x-ocu-attachment-id") == "F1"
+            for record in uploads_records
+        )
+        assert ocu.stored_files("chat-failed-read") == {
+            "brief.docx": b"user edited bytes"
+        }
+        assert not (ocu.chat_uploads("chat-failed-read") / "brief (2).docx").exists()
+
+
+def test_reserved_filename_is_url_encoded_and_storage_temp_is_cleaned(
+    monkeypatch, tmp_path
+):
+    downloaded = tmp_path / "downloaded.tmp"
+    downloaded.write_bytes(b"reserved name")
+    _install_storage(monkeypatch, {"attachment-source": downloaded})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+    filename = "hash#query?percent%文件.txt"
+    files = [_attachment("F-reserved", filename, "attachment-source")]
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        result = asyncio.run(
+            tools.bash_tool(
+                "echo reserved",
+                "encode name",
+                __metadata__={"chat_id": "chat-reserved"},
+                __files__=files,
+            )
+        )
+        upload = _records(ocu, f"/api/uploads/chat-reserved/{filename}")
+        encoded = urllib.parse.quote(filename, safe="")
+        expected_raw = f"/api/uploads/chat-reserved/{encoded}".encode("ascii")
+        assert "ran:echo reserved" in result
+        assert len(upload) == 1
+        assert upload[0]["path"] == f"/api/uploads/chat-reserved/{filename}"
+        assert upload[0]["raw_path"] == expected_raw
+        assert b"%23" in upload[0]["raw_path"]
+        assert b"%3F" in upload[0]["raw_path"]
+        assert b"%25" in upload[0]["raw_path"]
+        assert b"%E6%96%87%E4%BB%B6" in upload[0]["raw_path"]
+        assert b"#" not in upload[0]["raw_path"]
+        assert b"?" not in upload[0]["raw_path"]
+        assert ocu.stored_files("chat-reserved") == {filename: b"reserved name"}
+        assert not downloaded.exists()
+
+
+def test_missing_attachment_id_does_not_create_an_unstable_import(monkeypatch, tmp_path):
+    source = tmp_path / "brief.tmp"
+    source.write_bytes(b"no identity")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = computer_use_tools._sync_uploaded_files(
+            ocu.url,
+            "chat-missing-id",
+            [{"name": "brief.docx", "file": {"path": "attachment-source"}}],
+            INTERNAL_TOKEN,
+        )
+        assert result == {"synced": 0, "skipped": 0, "errors": 1}
+        assert ocu.uploads == []
+        assert ocu.stored_files("chat-missing-id") == {}
+        assert not _records(ocu, "/api/uploads/chat-missing-id/brief.docx")
+
+
 def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tmp_path):
     first_token, second_token = "test-internal-one", "test-internal-two"
     existing = tmp_path / "existing.tmp"
@@ -440,7 +902,7 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", first_token)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
-    with _with_guard({"existing.txt": hashlib.md5(existing.read_bytes()).hexdigest()}) as ocu:
+    with _with_guard(monkeypatch, tmp_path) as ocu:
         tools = computer_use_tools.Tools()
         tools.valves.ORCHESTRATOR_URL = ocu.url
         tools.valves.MCP_API_KEY = MCP_API_KEY
@@ -454,8 +916,8 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
                     headers={"X-User-Email": "forged@example.test"}
                 ),
                 __files__=[
-                    {"name": "existing.txt", "path": "existing-source"},
-                    {"name": "uploaded.txt", "path": "uploaded-source"},
+                    _attachment("existing-id", "existing.txt", "existing-source"),
+                    _attachment("uploaded-id", "uploaded.txt", "uploaded-source"),
                 ],
             )
         )
@@ -465,30 +927,31 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
         assert not uploaded.exists()
 
         health = _records(ocu, "/health")
-        manifest = _records(ocu, "/api/uploads/chat-one/manifest")
+        imports = _records(ocu, "/api/uploads/chat-one/imports")
         upload = _records(ocu, "/api/uploads/chat-one/uploaded.txt")
         probe = _records(ocu, "/mcp", **{"x-chat-id": "preflight"})
         first_call = _records(ocu, "/mcp", **{"x-user-email": "first@example.test"})
         assert health and all(r["headers"].get("authorization") == f"Bearer {first_token}" for r in health)
-        assert manifest and upload
-        assert all(r["headers"].get("authorization") == f"Bearer {first_token}" for r in manifest + upload)
+        assert imports and upload
+        assert all(r["headers"].get("authorization") == f"Bearer {first_token}" for r in imports + upload)
         assert probe and first_call
         assert all(r["headers"].get("x-ocu-internal-token") == first_token for r in probe + first_call)
         assert all(r["headers"].get("authorization") == f"Bearer {MCP_API_KEY}" for r in probe + first_call)
         assert all(r["headers"].get("x-user-email") != "forged@example.test" for r in first_call)
         assert all(r["headers"].get("x-chat-id") == "chat-one" for r in first_call)
-        assert not _records(ocu, "/api/uploads/chat-one/existing.txt")
+        assert _records(ocu, "/api/uploads/chat-one/existing.txt")
+        assert not _records(ocu, "/api/uploads/chat-one/manifest")
 
         mcp_headers = {
             name: value
             for name, value in first_call[0]["headers"].items()
             if name != "x-ocu-internal-token"
         }
-        manifest_headers = {
-            name: value for name, value in manifest[0]["headers"].items() if name != "authorization"
+        imports_headers = {
+            name: value for name, value in imports[0]["headers"].items() if name != "authorization"
         }
         assert requests.post(f"{ocu.url}/mcp", headers=mcp_headers, json={}).status_code == 401
-        assert requests.get(f"{ocu.url}{manifest[0]['path']}", headers=manifest_headers).status_code == 401
+        assert requests.get(f"{ocu.url}{imports[0]['path']}", headers=imports_headers).status_code == 401
 
         monkeypatch.setenv("OCU_INTERNAL_TOKEN", second_token)
         second = asyncio.run(
@@ -507,11 +970,11 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
         assert len(ocu.requests) > len(first_records)
 
 
-def test_tool_omits_optional_mcp_bearer_when_unconfigured(monkeypatch):
+def test_tool_omits_optional_mcp_bearer_when_unconfigured(monkeypatch, tmp_path):
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.delenv("MCP_API_KEY", raising=False)
     _disable_proxy_env(monkeypatch)
-    with _with_guard({}) as ocu:
+    with _with_guard(monkeypatch, tmp_path) as ocu:
         tools = computer_use_tools.Tools()
         tools.valves.ORCHESTRATOR_URL = ocu.url
         result = asyncio.run(
@@ -529,12 +992,12 @@ def test_tool_omits_optional_mcp_bearer_when_unconfigured(monkeypatch):
         assert all("authorization" not in r["headers"] for r in calls)
 
 
-def test_mcp_api_key_with_spaces_reaches_the_real_guard(monkeypatch):
+def test_mcp_api_key_with_spaces_reaches_the_real_guard(monkeypatch, tmp_path):
     spaced_key = "mcp key with spaces"
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", spaced_key)
     _disable_proxy_env(monkeypatch)
-    with _with_guard({}) as ocu:
+    with _with_guard(monkeypatch, tmp_path) as ocu:
         tools = computer_use_tools.Tools()
         tools.valves.ORCHESTRATOR_URL = ocu.url
         tools.valves.MCP_API_KEY = spaced_key
@@ -604,11 +1067,11 @@ def test_mcp_initialize_redirect_does_not_leave_the_configured_origin(monkeypatc
     assert "redirect" in result.lower()
 
 
-def test_mcp_sdk_redirect_does_not_leave_the_configured_origin(monkeypatch):
+def test_mcp_sdk_redirect_does_not_leave_the_configured_origin(monkeypatch, tmp_path):
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.delenv("MCP_API_KEY", raising=False)
-    with _with_guard({}) as target:
+    with _with_guard(monkeypatch, tmp_path) as target:
         def origin_response(request):
             if request["path"] == "/health":
                 return 200, {}, b"healthy"
@@ -645,7 +1108,7 @@ def test_upload_redirect_does_not_leave_the_configured_origin(monkeypatch, tmp_p
             result = computer_use_tools._sync_uploaded_files(
                 origin.url,
                 "chat-upload-redirect",
-                [{"name": "upload.txt", "path": "upload-source"}],
+                [_attachment("upload-id", "upload.txt", "upload-source")],
                 INTERNAL_TOKEN,
             )
 

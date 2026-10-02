@@ -29,6 +29,12 @@
   directory. Unsafe or corrupt `.ocu` / `imports.json` state, including a
   dangling or live symlink, fails explicitly instead of reading as empty.
 
+- **Receipt-based tool attachment sync.** All five tool methods synchronize
+  attachments before execution regardless of command or path text. Sync uses
+  WebUI file ids and import receipts, not manifest checksums; a failed receipt
+  read resends the original ids for server-side idempotence. Uploaded filenames
+  retain reserved URL characters, and already imported ids need no source read.
+
 - **Cold backup and isolated restore.** `deploy/recovery.py` captures one
   complete cold recovery set, restores it onto a distinct empty local
   daemon/root, and activates a retained previous release through that
