@@ -179,36 +179,6 @@ function parseCSV(text, delimiter) {
   return rows;
 }
 
-function showToast(text) {
-  const msg = document.createElement('div');
-  msg.className = 'toast';
-  msg.textContent = text;
-  document.body.appendChild(msg);
-  setTimeout(() => msg.remove(), 1500);
-}
-
-function copyText(text) {
-  // Try modern clipboard API first, fallback to execCommand for iframe sandbox
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    return navigator.clipboard.writeText(text).then(
-      () => true,
-      () => copyTextFallback(text)
-    );
-  }
-  return Promise.resolve(copyTextFallback(text));
-}
-
-function copyTextFallback(text) {
-  const ta = document.createElement('textarea');
-  ta.value = text;
-  ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
-  document.body.appendChild(ta);
-  ta.select();
-  try { document.execCommand('copy'); return true; }
-  catch { return false; }
-  finally { ta.remove(); }
-}
-
 // =============================================================================
 // Link interception for HTML previews and Markdown
 // =============================================================================
@@ -1555,7 +1525,7 @@ function BrowserView({ chatId, browserActive, onBrowserViewerRef }) {
   `;
 }
 
-function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSession, onResumeSession }) {
+function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSession, onResumeSession, onFilesRefresh }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const mountedRef = useRef(false);
@@ -1568,21 +1538,20 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
     requestRef.current = controller;
     setLoading(true);
     try {
-      const [sResp, sessResp, procResp, uplResp] = await Promise.all([
+      const [sResp, sessResp, procResp] = await Promise.all([
         ocuFetch(`/terminal/${chatId}/status?_t=${Date.now()}`, { signal: controller.signal }),
         ocuFetch(`/terminal/${chatId}/sessions?_t=${Date.now()}`, { signal: controller.signal }),
         ocuFetch(`/terminal/${chatId}/processes?_t=${Date.now()}`, { signal: controller.signal }),
-        ocuFetch(`/api/uploads/${chatId}/list?_t=${Date.now()}`, { signal: controller.signal }),
       ]);
-      const [status, sessions, processes, uploads] = await Promise.all([
-        sResp.json(), sessResp.json(), procResp.json(), uplResp.json()
+      const [status, sessions, processes] = await Promise.all([
+        sResp.json(), sessResp.json(), procResp.json()
       ]);
       if (mountedRef.current && !controller.signal.aborted)
-        setData({ status, sessions, processes, uploads });
+        setData({ status, sessions, processes });
     } catch(e) {
       if (mountedRef.current && !controller.signal.aborted)
         setData({ status: { active: false }, sessions: { sessions: [] },
-          processes: { processes: [] }, uploads: { files: [], total: 0 } });
+          processes: { processes: [] } });
     } finally {
       if (requestRef.current === controller) {
         requestRef.current = null;
@@ -1612,27 +1581,23 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
       }
       input.remove();
       fetchData();
+      if (onFilesRefresh) onFilesRefresh();
     });
     input.click();
-  }, [chatId]);
+  }, [chatId, fetchData, onFilesRefresh]);
 
   const killProcess = useCallback(async (pid) => {
     try { await ocuFetch(`/terminal/${chatId}/processes/${pid}/kill`, { method: 'POST' }); } catch(e) {}
     fetchData();
-  }, [chatId]);
-
-  const copyPath = useCallback((path) => {
-    copyText(path).then(() => showToast(t('copied')));
-  }, []);
+  }, [chatId, fetchData]);
 
   if (loading || !data) {
     return html`<div class="dash-scroll" style="display:flex;align-items:center;justify-content:center;height:100%"><div class="spinner"></div></div>`;
   }
 
-  const { status, sessions, processes, uploads } = data;
+  const { status, sessions, processes } = data;
   const hasProcesses = Boolean(processes && processes.processes && processes.processes.length);
   const hasSessions = Boolean(sessions && sessions.sessions && sessions.sessions.length);
-  const hasUploads = Boolean(uploads && uploads.files && uploads.files.length);
 
   return html`
     <div class="dash-scroll">
@@ -1676,26 +1641,6 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
               </div>
             `;
           })}
-        </div>
-      `}
-
-      ${hasUploads && html`
-        <div class="dash-card">
-          <h4><span class="icon-inline" dangerouslySetInnerHTML=${{ __html: icon('paperclip') }}></span> ${t('uploaded_files')}</h4>
-          <table class="dash-table">
-            <thead><tr><th>${t('th_file')}</th><th>${t('th_size')}</th><th></th></tr></thead>
-            <tbody>
-              ${uploads.files.map(f => html`
-                  <tr>
-                    <td>${f.name}</td>
-                    <td style="white-space:nowrap">${formatSize(f.size)}</td>
-                    <td><button class="action-btn" onClick=${() => copyPath(f.container_path)} title=${f.container_path}>
-                      <span class="icon-inline" dangerouslySetInnerHTML=${{ __html: icon('copy') }}></span> ${t('copy_path')}
-                    </button></td>
-                  </tr>
-              `)}
-            </tbody>
-          </table>
         </div>
       `}
 
@@ -2109,7 +2054,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
   `;
 }
 
-function TerminalView({ chatId }) {
+function TerminalView({ chatId, onFilesRefresh }) {
   const [mode, setMode] = useState('dashboard');
   const [resumeId, setResumeId] = useState(null);
   const [dangerousMode, setDangerousMode] = useState(() => {
@@ -2139,6 +2084,7 @@ function TerminalView({ chatId }) {
     onToggleDangerous=${toggleDangerous}
     onStartSession=${() => { setResumeId(null); setMode('terminal'); }}
     onResumeSession=${(id) => { setResumeId(id); setMode('terminal'); }}
+    onFilesRefresh=${onFilesRefresh}
   />`;
 }
 
@@ -2514,7 +2460,7 @@ function App() {
     </div>
 
     <div class="terminal-panel" style="display:${currentView === 'terminal' ? 'flex' : 'none'}">
-      <${TerminalView} chatId=${CHAT_ID} />
+      <${TerminalView} chatId=${CHAT_ID} onFilesRefresh=${fetchFiles} />
     </div>
   `;
 }
