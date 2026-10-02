@@ -62,7 +62,13 @@ from docker_manager import (
     _combined_lock,
 )
 from security import sanitize_chat_id, safe_path
-from uploads import claim_file_no_replace
+from uploads import (
+    CorruptReceiptsError,
+    claim_file_no_replace,
+    import_receipt,
+    read_import_receipts,
+    write_import_receipts,
+)
 from outputs_broker import (
     CursorError,
     DEFAULT_PAGE_LIMIT,
@@ -620,13 +626,20 @@ async def list_uploads(chat_id: str, response: Response):
     return {"files": files, "total": len(files)}
 
 
-def _store_upload(chat_id: str, filename: str, content: bytes) -> tuple[str, str]:
+def _store_upload(
+    chat_id: str, filename: str, content: bytes, attachment_id: str | None = None,
+) -> tuple[str, str, int]:
     """Keep blocking lock and file operations on one worker thread."""
     with _combined_lock(chat_id):
         relative = Path(filename)
         if (not filename or relative.is_absolute() or ".." in relative.parts
                 or relative.name in {"", ".", ".."} or "\x00" in filename):
             raise HTTPException(status_code=403, detail="Invalid upload path")
+        chat_dir = safe_path(BASE_DATA_DIR, chat_id)
+        receipts = read_import_receipts(chat_dir) if attachment_id else None
+        if attachment_id and attachment_id in receipts:
+            record = receipts[attachment_id]
+            return record["stored_name"], record["md5"], record["size"]
         uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
         # Resolve only the parent: an occupied leaf symlink is a collision.
         parent = safe_path(uploads_dir, str(relative.parent))
@@ -643,14 +656,42 @@ def _store_upload(chat_id: str, filename: str, content: bytes) -> tuple[str, str
             # the published inode must be world-readable before the hard link.
             temporary.chmod(0o644)
             stored = claim_file_no_replace(temporary, parent / relative.name)
-            return str(stored.relative_to(uploads_dir)), hashlib.md5(content).hexdigest()
+            stored_name = str(stored.relative_to(uploads_dir))
+            md5_hash = hashlib.md5(content).hexdigest()
+            if attachment_id:
+                receipts[attachment_id] = import_receipt(
+                    stored_name, len(content), md5_hash)
+                write_import_receipts(chat_dir, receipts)
+            return stored_name, md5_hash, len(content)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
 
+def _list_import_ids(chat_id: str) -> dict[str, list[str]]:
+    chat_dir = safe_path(BASE_DATA_DIR, chat_id)
+    if not chat_dir.is_dir():
+        return {"ids": []}
+    with _combined_lock(chat_id):
+        return {"ids": list(read_import_receipts(chat_dir))}
+
+
+@app.get("/api/uploads/{chat_id}/imports", tags=["Files"])
+async def get_upload_imports(chat_id: str):
+    chat_id = sanitize_chat_id(chat_id)
+    try:
+        return await asyncio.to_thread(_list_import_ids, chat_id)
+    except CorruptReceiptsError:
+        raise HTTPException(status_code=500, detail="import receipts are corrupt")
+
+
 @app.post("/api/uploads/{chat_id}/{filename:path}", tags=["Files"], response_model=UploadResponse)
-async def upload_file(chat_id: str, filename: str, file: UploadFile = File(...)):
+async def upload_file(
+    chat_id: str,
+    filename: str,
+    file: UploadFile = File(...),
+    x_ocu_attachment_id: Optional[str] = Header(default=None, alias="X-OCU-Attachment-Id"),
+):
     """
     Upload a file to chat uploads directory.
 
@@ -666,10 +707,11 @@ async def upload_file(chat_id: str, filename: str, file: UploadFile = File(...))
         400: Invalid filename or security violation
     """
     chat_id = sanitize_chat_id(chat_id)
+    attachment_id = (x_ocu_attachment_id or "").strip() or None
     try:
         content = await file.read()
-        stored_name, md5_hash = await asyncio.to_thread(
-            _store_upload, chat_id, filename, content
+        stored_name, md5_hash, size = await asyncio.to_thread(
+            _store_upload, chat_id, filename, content, attachment_id
         )
 
         # Tier 6 — refresh MCP resources for this chat so the new file
@@ -685,11 +727,13 @@ async def upload_file(chat_id: str, filename: str, file: UploadFile = File(...))
         return {
             "status": "success",
             "filename": stored_name,
-            "size": len(content),
+            "size": size,
             "md5": md5_hash
         }
     except HTTPException:
         raise
+    except CorruptReceiptsError:
+        raise HTTPException(status_code=500, detail="import receipts are corrupt")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
