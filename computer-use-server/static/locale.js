@@ -22,7 +22,6 @@ export const TRANSLATIONS = {
 
     // File selector
     no_file_selected: 'Файл не выбран',
-    copied: 'Скопировано',
 
     // Toolbar
     open_new_tab: 'Открыть в новой вкладке',
@@ -99,10 +98,6 @@ export const TRANSLATIONS = {
     browser_connect_fail: 'Не удалось подключиться к браузеру',
 
     // Dashboard tables
-    uploaded_files: 'Загруженные файлы',
-    th_file: 'Файл',
-    th_size: 'Размер',
-    copy_path: 'Копировать путь',
     prev_sessions: 'Предыдущие сессии',
     th_task: 'Задача',
     th_date: 'Дата',
@@ -125,7 +120,6 @@ export const TRANSLATIONS = {
 
     // File selector
     no_file_selected: 'No file selected',
-    copied: 'Copied',
 
     // Toolbar
     open_new_tab: 'Open in new tab',
@@ -202,10 +196,6 @@ export const TRANSLATIONS = {
     browser_connect_fail: 'Failed to connect to browser',
 
     // Dashboard tables
-    uploaded_files: 'Uploaded files',
-    th_file: 'File',
-    th_size: 'Size',
-    copy_path: 'Copy path',
     prev_sessions: 'Previous sessions',
     th_task: 'Task',
     th_date: 'Date',

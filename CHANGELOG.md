@@ -35,6 +35,12 @@
   read resends the original ids for server-side idempotence. Uploaded filenames
   retain reserved URL characters, and already imported ids need no source read.
 
+- **Standalone preview upload refresh.** The terminal panel keeps the upload
+  action without a separate uploaded-files list. Successful standalone uploads
+  immediately refresh the Files listing; terminal embeds do not request it.
+  Files displays outputs only, so uploads remain absent until the workspace
+  mount cutover.
+
 - **Cold backup and isolated restore.** `deploy/recovery.py` captures one
   complete cold recovery set, restores it onto a distinct empty local
   daemon/root, and activates a retained previous release through that
