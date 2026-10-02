@@ -682,26 +682,23 @@ class Tools:
                 pass
         return headers
 
-    async def _sync_files_if_needed(self, chat_id: str, command_or_path: str, __files__: list = None):
-        """Sync uploaded files to computer-use-orchestrator if command/path references uploads."""
-        uploads_path = "/mnt/user-data/uploads"
-        needs_files = uploads_path in command_or_path or "uploads/" in command_or_path
-        if not needs_files:
+    async def _sync_files_if_needed(self, chat_id: str, __files__: list = None):
+        """Sync attached files before the MCP command, independent of path text."""
+        if not __files__:
             return
-        if __files__:
-            try:
-                sync_result = await asyncio.to_thread(
-                    _sync_uploaded_files,
-                    self.valves.ORCHESTRATOR_URL,
-                    chat_id,
-                    __files__,
-                    os.environ.get("OCU_INTERNAL_TOKEN", ""),
-                    debug=self.valves.DEBUG_LOGGING,
-                )
-                if sync_result.get("synced", 0) > 0:
-                    print(f"Synced {sync_result['synced']} file(s)")
-            except Exception as e:
-                print(f"[SYNC] Error: {e}")
+        try:
+            sync_result = await asyncio.to_thread(
+                _sync_uploaded_files,
+                self.valves.ORCHESTRATOR_URL,
+                chat_id,
+                __files__,
+                os.environ.get("OCU_INTERNAL_TOKEN", ""),
+                debug=self.valves.DEBUG_LOGGING,
+            )
+            if sync_result.get("synced", 0) > 0:
+                print(f"Synced {sync_result['synced']} file(s)")
+        except Exception as e:
+            print(f"[SYNC] Error: {e}")
 
     async def _run_tool(
         self,
@@ -792,7 +789,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        await self._sync_files_if_needed(chat_id, command, __files__)
+        await self._sync_files_if_needed(chat_id, __files__)
         return await self._run_tool(
             "bash_tool", {"command": command, "description": description},
             chat_id, __event_emitter__, __request__, __user__,
@@ -826,6 +823,7 @@ class Tools:
             return error
         if old_str == new_str:
             return "Error: old_str and new_str are identical."
+        await self._sync_files_if_needed(chat_id, __files__)
         return await self._run_tool(
             "str_replace", {"description": description, "old_str": old_str, "path": path, "new_str": new_str},
             chat_id, __event_emitter__, __request__, __user__,
@@ -855,6 +853,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
+        await self._sync_files_if_needed(chat_id, __files__)
         return await self._run_tool(
             "create_file", {"description": description, "file_text": file_text, "path": path},
             chat_id, __event_emitter__, __request__, __user__,
@@ -884,7 +883,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        await self._sync_files_if_needed(chat_id, path, __files__)
+        await self._sync_files_if_needed(chat_id, __files__)
         args = {"description": description, "path": path}
         if view_range:
             args["view_range"] = view_range
@@ -925,8 +924,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        if __files__:
-            await self._sync_files_if_needed(chat_id, "/mnt/user-data/uploads", __files__)
+        await self._sync_files_if_needed(chat_id, __files__)
         args = {
             "task": task, "description": description, "model": model,
             "max_turns": max_turns, "working_directory": working_directory,
@@ -946,6 +944,41 @@ class Tools:
 # File sync helper (HTTP — no SSH needed)
 # ============================================================================
 
+def _attachment_source_path(file_info):
+    nested = file_info.get("file")
+    if isinstance(nested, dict) and nested.get("path"):
+        return nested.get("path")
+    return file_info.get("path")
+
+
+def _attachment_filename(file_info, source_path):
+    filename = file_info.get("name") or (
+        os.path.basename(source_path) if source_path else "unknown"
+    )
+    return os.path.basename(filename)
+
+
+def _imported_attachment_ids(orchestrator_url, chat_id, headers):
+    import requests
+
+    imports_url = f"{orchestrator_url}/api/uploads/{chat_id}/imports"
+    response = requests.get(
+        imports_url, headers=headers, timeout=5, allow_redirects=False
+    )
+    if 300 <= response.status_code < 400:
+        raise requests.HTTPError(
+            f"redirect blocked (HTTP {response.status_code})"
+        )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("malformed imports response")
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
+        raise ValueError("malformed imports response")
+    return set(ids)
+
+
 def _sync_uploaded_files(
     orchestrator_url: str,
     chat_id: str,
@@ -953,36 +986,37 @@ def _sync_uploaded_files(
     internal_token: str,
     debug: bool = False,
 ) -> dict:
-    """Sync uploaded files from OpenWebUI to computer-use-orchestrator via HTTP."""
+    """Sync attached files by WebUI id; skip receipted ids before Storage fetch."""
     import requests
-    import hashlib
 
     if not files:
         return {"synced": 0, "skipped": 0, "errors": 0}
 
     headers = {"Authorization": f"Bearer {internal_token}"}
     try:
-        manifest_url = f"{orchestrator_url}/api/uploads/{chat_id}/manifest"
-        response = requests.get(
-            manifest_url, headers=headers, timeout=5, allow_redirects=False
+        imported_ids = _imported_attachment_ids(
+            orchestrator_url, chat_id, headers
         )
-        if 300 <= response.status_code < 400:
-            raise requests.HTTPError(
-                f"redirect blocked (HTTP {response.status_code})"
-            )
-        response.raise_for_status()
-        remote_manifest = response.json()
+        imports_readable = True
     except Exception:
-        remote_manifest = {}
+        imported_ids = set()
+        imports_readable = False
 
     synced, skipped, errors = 0, 0, 0
 
     for file_info in files:
         temp_file_path = None
         try:
-            source_path = file_info.get("file", {}).get("path") if isinstance(file_info.get("file"), dict) else file_info.get("path")
-            filename = file_info.get("name") or (os.path.basename(source_path) if source_path else "unknown")
-            filename = os.path.basename(filename)
+            attachment_id = file_info.get("id")
+            if not isinstance(attachment_id, str) or not attachment_id:
+                errors += 1
+                continue
+            if imports_readable and attachment_id in imported_ids:
+                skipped += 1
+                continue
+
+            source_path = _attachment_source_path(file_info)
+            filename = _attachment_filename(file_info, source_path)
 
             if not source_path:
                 errors += 1
@@ -1002,23 +1036,20 @@ def _sync_uploaded_files(
                 errors += 1
                 continue
 
-            md5_hash = hashlib.md5()
-            with open(source_path, "rb") as f:
-                for chunk in iter(lambda: f.read(8192), b""):
-                    md5_hash.update(chunk)
-            local_md5 = md5_hash.hexdigest()
-
-            if remote_manifest.get(filename) == local_md5:
-                skipped += 1
-                continue
-
-            upload_url = f"{orchestrator_url}/api/uploads/{chat_id}/{filename}"
+            encoded_name = urllib.parse.quote(filename, safe="")
+            upload_url = (
+                f"{orchestrator_url}/api/uploads/{chat_id}/{encoded_name}"
+            )
+            upload_headers = {
+                **headers,
+                "X-OCU-Attachment-Id": attachment_id,
+            }
             with open(source_path, "rb") as f:
                 files_data = {"file": (filename, f, "application/octet-stream")}
                 resp = requests.post(
                     upload_url,
                     files=files_data,
-                    headers=headers,
+                    headers=upload_headers,
                     timeout=30,
                     allow_redirects=False,
                 )
