@@ -66,6 +66,10 @@ def _build_mock_docker_client():
     _create_container uses:
       - client.containers.create(...)  — for the actual sandbox container (the assertion target)
       - client.networks.get(...)       — to inspect the provisioned sandbox bridge
+
+    The fake starts in `created`, reaches `running` on start(), and copies
+    requested dns/ports onto HostConfig so production DNS and binding guards
+    observe inspect state consistent with the create request.
     """
     client = MagicMock()
     client.containers.run.return_value = None
@@ -76,7 +80,32 @@ def _build_mock_docker_client():
         }
     }
     created.status = "created"
-    client.containers.create.return_value = created
+
+    def start():
+        created.status = "running"
+
+    def create(**config):
+        host = created.attrs.setdefault("HostConfig", {})
+        if config.get("network"):
+            host["NetworkMode"] = config["network"]
+        bindings = {}
+        for key, value in (config.get("ports") or {}).items():
+            if isinstance(value, tuple):
+                host_ip, host_port = value
+                bindings[key] = [{
+                    "HostIp": host_ip or "",
+                    "HostPort": "" if host_port is None else str(host_port),
+                }]
+        if bindings:
+            host["PortBindings"] = bindings
+        if "dns" in config:
+            host["Dns"] = (
+                list(config["dns"]) if config["dns"] is not None else None
+            )
+        return created
+
+    created.start.side_effect = start
+    client.containers.create.side_effect = create
     client.networks.get.return_value = _sandbox_network()
     client.networks.list.return_value = []
     client.volumes.list.return_value = []
@@ -111,6 +140,7 @@ class TestDockerManagerEnvInjection(unittest.TestCase):
         patch.dict context manager that wraps this method.
         """
         _clear_gateway_env()
+        os.environ.pop("OCU_SANDBOX_DNS", None)
         for k, v in overrides.items():
             os.environ[k] = v
         os.environ.setdefault("BASE_DATA_DIR", os.path.join(os.environ.get("TMPDIR", "/tmp"), "ocu-docker-manager-tests"))
