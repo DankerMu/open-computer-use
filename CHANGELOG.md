@@ -2,6 +2,13 @@
 
 ## Unreleased — `next/v1` branch
 
+### Fixed
+- **Environment-injection Docker fixtures.** Credential-isolation and
+  CLI-passthrough Docker test doubles model create/start/reload to `running`
+  and apply requested DNS and port bindings to inspected `HostConfig`.
+  Production startup and DNS guards stay in force.
+
+
 ### Changed
 - **Cold backup and isolated restore.** `deploy/recovery.py` captures one
   complete cold recovery set, restores it onto a distinct empty local

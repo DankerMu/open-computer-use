@@ -45,7 +45,10 @@ def _build_mock_docker_client():
     MCP resource sync, defensive scrub) are all silently satisfied.
 
     The actual sandbox is created via `client.containers.create(**config)` — that
-    is the call we inspect for the `environment` kwarg.
+    is the call we inspect for the `environment` kwarg. The fake starts in
+    `created`, reaches `running` on start(), and copies requested dns/ports onto
+    HostConfig so production DNS and binding guards observe inspect state
+    consistent with the create request.
     """
     client = MagicMock()
     client.containers.run.return_value = None
@@ -57,7 +60,32 @@ def _build_mock_docker_client():
         }
     }
     fake_container.status = "created"
-    client.containers.create.return_value = fake_container
+
+    def start():
+        fake_container.status = "running"
+
+    def create(**config):
+        host = fake_container.attrs.setdefault("HostConfig", {})
+        if config.get("network"):
+            host["NetworkMode"] = config["network"]
+        bindings = {}
+        for key, value in (config.get("ports") or {}).items():
+            if isinstance(value, tuple):
+                host_ip, host_port = value
+                bindings[key] = [{
+                    "HostIp": host_ip or "",
+                    "HostPort": "" if host_port is None else str(host_port),
+                }]
+        if bindings:
+            host["PortBindings"] = bindings
+        if "dns" in config:
+            host["Dns"] = (
+                list(config["dns"]) if config["dns"] is not None else None
+            )
+        return fake_container
+
+    fake_container.start.side_effect = start
+    client.containers.create.side_effect = create
     network = MagicMock()
     network.name = "ocu-sandbox"
     network.id = "netid-ocu-sandbox-current"
@@ -150,6 +178,7 @@ def test_passthrough_isolation(
 
     with patch.dict(os.environ, {}, clear=False):
         _clear_phase6_auth_env()
+        os.environ.pop("OCU_SANDBOX_DNS", None)
         for k, v in overrides.items():
             os.environ[k] = v
 
