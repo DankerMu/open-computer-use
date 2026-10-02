@@ -1,10 +1,11 @@
 # AGENTS.md
 
-> Agent operating rules for Plan 1 work in this fork (`DankerMu/open-computer-use`).
-> The engineering control plane for Plan 1 lives in the sibling checkout
+> Agent operating rules for work in this fork (`DankerMu/open-computer-use`).
+> The engineering control plane lives in the sibling checkout
 > `../open-webui-ocu` (fork `DankerMu/open-webui`): its `AGENTS.md` is the full
-> rulebook, its epic `DankerMu/open-webui#2` is the schedule, and its acceptance
-> matrix is the definition of done. This file is the bridge: what carries over
+> rulebook, its epics are the schedule (Plan 1: `DankerMu/open-webui#2`, done;
+> Plan 2: `DankerMu/open-webui#107`, current), and the plan's acceptance matrix
+> is the definition of done. This file is the bridge: what carries over
 > unchanged, what is enforced here, and what is review-only here.
 > The upstream `CLAUDE.md` global rules (English only, SPDX headers, `linux/amd64`
 > builds) still apply to every file in this repository.
@@ -12,17 +13,19 @@
 ## Scope
 
 - Work here is driven by the `[ocu]` and `[deploy]` sub-issues of epic
-  `DankerMu/open-webui#2` (OpenSpec change `ocu-workspace-integration`, design
-  decision D2). The issue body is the contract; do not widen it.
-- Branch per issue: `codex/plan1-<slug>` off `main` at `7318b2e`. One issue, one
-  branch, one PR to this fork's `main` (protected: PR required, no force-push).
-- Files Plan 1 touches here: `computer-use-server/{app.py,docker_manager.py,mcp_tools.py}`,
-  `computer-use-server/static/{preview.js,browser-viewer.js}`, new modules
-  `computer-use-server/{auth_guard.py,outputs_broker.py}`, `openwebui/tools/computer_use_tools.py`,
-  `openwebui/functions/computer_link_filter.py`, and the `deploy/` overlay. The
-  untracked `deploy/` and `docs/decisions/` trees are kept as they are.
+  `DankerMu/open-webui#107` (OpenSpec change `ocu-office-editing`). The issue
+  body is the contract; do not widen it.
+- Branch per issue: `<tool>/plan2-<slug>` off the current `main`; the header of
+  `../open-webui-ocu/openspec/changes/ocu-office-editing/tasks.md` names the
+  commit the change was verified against. One issue, one branch, one PR to this
+  fork's `main` (protected: PR required, no force-push).
+- The fork's own code is the server modules and static assets under
+  `computer-use-server/`, `openwebui/tools/computer_use_tools.py`,
+  `openwebui/functions/computer_link_filter.py`, and the `deploy/` overlay with
+  its tests in `tests/deploy/` and `deploy/proxy/tests/`. Decision records are
+  not kept here: they live in `../open-webui-ocu/docs/decisions/`.
 - Done means: the issue's acceptance criteria pass with fresh command output in the
-  PR, a reviewer pass is attached, and the epic checkbox in `DankerMu/open-webui#2`
+  PR, a reviewer pass is attached, and the epic checkbox in `DankerMu/open-webui#107`
   is ticked. Cross-repo verification (proxy smoke, e2e) runs from `../open-webui-ocu`.
 
 ## Commands
@@ -31,11 +34,11 @@
 | --- | --- |
 | Unit tests (no Docker) | `uv run --no-project --with pytest --with-requirements computer-use-server/requirements.txt -- python -m pytest tests/ -q --import-mode=importlib --ignore=tests/integration` |
 | Integration tests (Docker daemon required) | same command without `--ignore=tests/integration` |
-| Structure check | `./tests/test-project-structure.sh` (`test-no-corporate.sh` named in `tests/README.md` does not exist at `7318b2e`) |
+| Structure check | `./tests/test-project-structure.sh` (`test-no-corporate.sh` named in `tests/README.md` does not exist) |
 | Docker image (always amd64) | `docker build --platform linux/amd64 -t open-computer-use:latest .` |
 | Install commit hooks (once per clone) | `uvx pre-commit install --hook-type pre-commit --hook-type commit-msg` |
 
-Baseline on `7318b2e`: the unit command passes; `tests/integration/` needs a Docker
+Baseline: the unit command passes; `tests/integration/` needs a Docker
 daemon; `--import-mode=importlib` is required because `tests/integration` and
 `tests/orchestrator` share test-file basenames. New tests go in `tests/` next to
 the existing ones (`tests/test_<module>.py`), paired with their production file in
@@ -62,8 +65,8 @@ the same PR (TDD rule below).
 - **Forbidden**: force-push, `--no-verify`, dependency upgrades without explicit
   confirmation, deploying to the LAN instance, reading or printing `.env` files,
   pasting secret values anywhere (reference secrets by variable name only).
-- **Decisions**: a non-trivial design choice not already covered by design D1–D19
-  in `../open-webui-ocu/openspec/changes/ocu-workspace-integration/design.md`
+- **Decisions**: a non-trivial design choice not already covered by design D1–D22
+  in `../open-webui-ocu/openspec/changes/ocu-office-editing/design.md`
   gets a decision record in `../open-webui-ocu/docs/decisions/` in the same
   milestone, not a silent deviation.
 - **Iteration gate**: at most 3 fix-and-recheck cycles per failing check, then stop
