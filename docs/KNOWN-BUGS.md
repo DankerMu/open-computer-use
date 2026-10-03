@@ -67,7 +67,7 @@ TypeError: 'NoneType' object is not callable
 
 **Impact:** Tools like Playwright (page screenshots) or bash (generated charts) cannot pass visual output directly to the model. The model never sees the image, so it can't reason about what's on screen.
 
-**Workaround:** The `describe-image` skill works around this by calling a separate vision model (e.g., GPT-4o, Qwen-VL) to describe the image as text, which is then returned to the main model. Playwright and other skills save images to `/mnt/user-data/outputs/` as HTTP links for the user to view in the file preview panel.
+**Workaround:** The `describe-image` skill works around this by calling a separate vision model (e.g., GPT-4o, Qwen-VL) to describe the image as text, which is then returned to the main model. Playwright and other skills save images to `/mnt/user-data/files/` as HTTP links for the user to view in the file preview panel.
 
 **Root cause:** Open WebUI's MCP integration only passes `text` content blocks from tool responses to the model. This is an upstream limitation — see [open-webui/open-webui](https://github.com/open-webui/open-webui) for progress on image tool result support.
 

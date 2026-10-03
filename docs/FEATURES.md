@@ -21,7 +21,7 @@ The user can enter sensitive information (passwords, 2FA codes, private data) di
 
 ### How files work
 
-1. **AI creates files** inside the sandbox container (`/mnt/user-data/outputs/`)
+1. **AI creates files** inside the sandbox container (`/mnt/user-data/files/`)
 2. **Computer Use Server** serves files via HTTP (`/files/{chat_id}/filename`)
 3. **Chat shows links** — the AI's response contains clickable HTTP URLs to the files
 4. **Side panel renders preview** — docx, pdf, xlsx, images, code are rendered inline
@@ -89,8 +89,8 @@ The side panel in Open WebUI serves three functions:
 
 ![Data Flow](data-flow.svg)
 
-- **Everything is on the server** — Docker volumes, not local filesystem
-- **Container sees volumes as mounts** — `/mnt/user-data/uploads/` (user uploads, read-only) and `/mnt/user-data/outputs/` (AI outputs, read-write)
+- **Everything is on the server** — a per-chat host data bind plus a private named workspace volume, not the local filesystem
+- **Container sees volumes as mounts** — `/mnt/user-data/files/` (uploaded and generated files, read-write) and `/home/assistant/` (Agent private working directory, not exported)
 - **Server serves files via HTTP** — no direct filesystem access from the browser
 - **Chat only has links** — lightweight, no file data in the conversation
 - **Volume persists** — survives container restarts, available until cleanup

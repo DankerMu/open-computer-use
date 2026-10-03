@@ -15,37 +15,39 @@
   <rect width="500" height="520" rx="12" fill="#fafbfc"/>
   <text x="250" y="24" text-anchor="middle" font-size="13" font-weight="700" fill="#1e293b">Data Flow: Volumes → Server → Chat</text>
 
-  <!-- Docker Volume -->
+  <!-- Per-chat storage -->
   <rect x="50" y="45" width="400" height="120" class="box" fill="#475569" stroke="#334155"/>
-  <text x="250" y="68" text-anchor="middle" class="label">Docker Volume: user-data-{chat_id}</text>
+  <text x="250" y="64" text-anchor="middle" class="label">Per-chat storage</text>
+  <text x="187" y="78" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.75)">host {BASE_DATA_DIR}/{chat_id}</text>
+  <text x="375" y="78" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.75)">chat-{chat_id}-workspace</text>
 
-  <!-- uploads -->
+  <!-- .ocu -->
   <rect x="75" y="85" width="100" height="55" rx="6" fill="rgba(255,255,255,0.15)" stroke="rgba(255,255,255,0.3)"/>
-  <text x="125" y="105" text-anchor="middle" font-size="10" font-weight="600" fill="#fff">uploads/</text>
-  <text x="125" y="120" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">read-only</text>
-  <text x="125" y="132" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">user files</text>
+  <text x="125" y="105" text-anchor="middle" font-size="10" font-weight="600" fill="#fff">.ocu/</text>
+  <text x="125" y="120" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">private control</text>
+  <text x="125" y="132" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">receipts · index</text>
 
   <!-- outputs -->
   <rect x="200" y="85" width="100" height="55" rx="6" fill="rgba(255,255,255,0.15)" stroke="rgba(255,255,255,0.3)"/>
   <text x="250" y="105" text-anchor="middle" font-size="10" font-weight="600" fill="#fff">outputs/</text>
-  <text x="250" y="120" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">read-write</text>
-  <text x="250" y="132" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">AI results</text>
+  <text x="250" y="120" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">shared (bind)</text>
+  <text x="250" y="132" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">user + AI files</text>
 
-  <!-- .claude -->
+  <!-- home/.claude named volume -->
   <rect x="325" y="85" width="100" height="55" rx="6" fill="rgba(255,255,255,0.15)" stroke="rgba(255,255,255,0.3)"/>
-  <text x="375" y="105" text-anchor="middle" font-size="10" font-weight="600" fill="#fff">.claude/</text>
-  <text x="375" y="120" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">sessions</text>
-  <text x="375" y="132" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">config</text>
+  <text x="375" y="105" text-anchor="middle" font-size="10" font-weight="600" fill="#fff">home/.claude</text>
+  <text x="375" y="120" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">private home</text>
+  <text x="375" y="132" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.7)">named volume</text>
 
-  <!-- Arrow: Volume → Container -->
-  <path d="M250,165 L250,205" class="arrow"/>
+  <!-- Arrow: outputs bind → Container -->
+  <path d="M250,140 L250,205" class="arrow"/>
   <text x="290" y="190" class="arrow-label">bind mount</text>
 
   <!-- Sandbox Container -->
   <rect x="100" y="205" width="300" height="70" class="box" fill="#0f766e" stroke="#0d9488"/>
   <text x="250" y="232" text-anchor="middle" class="label">Sandbox Container</text>
-  <text x="250" y="250" text-anchor="middle" class="sublabel">/mnt/user-data/uploads/ (RO) · /mnt/user-data/outputs/ (RW)</text>
-  <text x="250" y="263" text-anchor="middle" class="sublabel">AI writes files here → auto-served via HTTP</text>
+  <text x="250" y="250" text-anchor="middle" class="sublabel">/mnt/user-data/files/ (RW) · /home/assistant (private)</text>
+  <text x="250" y="263" text-anchor="middle" class="sublabel">uploaded + generated files → served via HTTP</text>
 
   <!-- Arrow: Container → Server -->
   <path d="M250,275 L250,315" class="arrow"/>
@@ -68,5 +70,5 @@
   <text x="250" y="483" text-anchor="middle" class="sublabel">Files do NOT upload back into chat</text>
 
   <!-- Side note -->
-  <text x="250" y="510" text-anchor="middle" font-size="9" fill="#64748b">Volume persists across container restarts · Cleaned up after idle timeout</text>
+  <text x="250" y="510" text-anchor="middle" font-size="9" fill="#64748b">Files persist across sandbox restarts</text>
 </svg>

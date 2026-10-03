@@ -92,7 +92,7 @@
     <div class="nav">
         <a href="/docs">Swagger UI</a>
         <a href="/redoc">ReDoc</a>
-        <a href="/mcp">MCP Info</a>
+        <a href="/mcp-info">MCP Info</a>
         <a href="/health">Health</a>
         <a href="/system-prompt">System Prompt</a>
         <a href="https://github.com/Wide-Moat/open-computer-use">GitHub</a>
@@ -159,25 +159,19 @@
         <div class="endpoint">
             <span class="method get">GET</span>
             <code>/files/{chat_id}/{filename}</code>
-            <p>Download a file from the container's outputs directory</p>
+            <p>Download a file from the workspace files directory</p>
         </div>
 
         <div class="endpoint">
             <span class="method get">GET</span>
             <code>/files/{chat_id}/archive</code>
-            <p>Download all output files as a ZIP archive</p>
+            <p>Download all workspace files as a ZIP archive</p>
         </div>
 
         <div class="endpoint">
             <span class="method post">POST</span>
             <code>/api/uploads/{chat_id}/{filename}</code>
-            <p>Upload a file to the container's uploads directory</p>
-        </div>
-
-        <div class="endpoint">
-            <span class="method get">GET</span>
-            <code>/api/uploads/{chat_id}/manifest</code>
-            <p>Manifest of uploaded files (filename → MD5)</p>
+            <p>Upload a file to the workspace files directory</p>
         </div>
     </div>
 

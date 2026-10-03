@@ -52,16 +52,16 @@
   <!-- Sandbox Container -->
   <rect x="350" y="215" width="220" height="110" class="box" fill="#0f766e" stroke="#0d9488"/>
   <text x="460" y="238" text-anchor="middle" class="label">Sandbox Container</text>
-  <text x="460" y="256" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.85)">/mnt/user-data/outputs/ (RW)</text>
-  <text x="460" y="272" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.85)">/mnt/user-data/uploads/ (RO)</text>
+  <text x="460" y="256" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.85)">/mnt/user-data/files/ (RW)</text>
+  <text x="460" y="272" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.85)">/home/assistant (private)</text>
   <text x="460" y="288" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.85)">/mnt/skills/ (RO)</text>
   <text x="460" y="304" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.7)">AI writes files here</text>
 
-  <!-- Docker Volume -->
+  <!-- Server storage -->
   <rect x="660" y="215" width="210" height="80" class="box" fill="#475569" stroke="#334155"/>
-  <text x="765" y="240" text-anchor="middle" class="label">Docker Volume</text>
-  <text x="765" y="258" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.85)">user-data-{chat_id}/</text>
-  <text x="765" y="274" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.7)">Persists across container restarts</text>
+  <text x="765" y="240" text-anchor="middle" class="label">Server storage</text>
+  <text x="765" y="258" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.85)">host outputs bind</text>
+  <text x="765" y="274" text-anchor="middle" font-size="9.5" fill="rgba(255,255,255,0.7)">private home volume</text>
 
   <!-- External Access -->
   <rect x="660" y="55" width="210" height="80" class="box" fill="#b45309" stroke="#a16207"/>
@@ -113,7 +113,7 @@
   <text x="95" y="419" class="note">Side panel renders previews via Computer Use Server — not a native file browser</text>
 
   <line x1="70" y1="435" x2="90" y2="435" stroke="#f59e0b" stroke-width="2"/>
-  <text x="95" y="439" class="note">User can open any file link in a new browser tab, download as zip, or work directly in the container terminal</text>
+  <text x="95" y="439" class="note">Open file in new tab, zip, or work in the terminal</text>
 
   <line x1="480" y1="395" x2="500" y2="395" stroke="#3b82f6" stroke-width="2"/>
   <text x="505" y="399" class="note">Everything syncs with remote server (Docker volumes), not local filesystem</text>
@@ -122,5 +122,5 @@
   <text x="505" y="419" class="note">Container terminal accessible independently — Claude Code CLI or manual work</text>
 
   <line x1="480" y1="435" x2="500" y2="435" stroke="#b45309" stroke-width="2"/>
-  <text x="505" y="439" class="note">User can leave chat and navigate to server URLs to interact with files directly</text>
+  <text x="505" y="439" class="note">Leave chat; interact with files via URLs</text>
 </svg>
