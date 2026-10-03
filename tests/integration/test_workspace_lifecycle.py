@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess
 
+import httpx
 import pytest
 
 from conftest import call_mcp
@@ -170,10 +171,12 @@ def test_sandbox_user_writes_files_and_legacy_paths_fail(client, chat_id, orches
     paths = {entry["path"] for entry in listed.json()["files"]}
     assert "report.docx" in paths
 
-    uploaded = client.post(
-        f"/api/uploads/{chat_id}/nested/brief.docx",
+    uploaded = httpx.post(
+        f"{orchestrator['url']}/api/uploads/{chat_id}/nested/brief.docx",
         headers=headers,
         files={"file": ("brief.docx", b"uploaded-bytes")},
+        timeout=120.0,
+        trust_env=False,
     )
     assert uploaded.status_code == 200, uploaded.text
     assert uploaded.json()["filename"] == "nested/brief.docx"
@@ -238,6 +241,7 @@ def test_sandbox_user_writes_files_and_legacy_paths_fail(client, chat_id, orches
         container_id,
         "find /mnt/user-data -name a.txt",
     )
+    assert leftover.returncode == 0, leftover.stderr
     assert leftover.stdout.strip() == "", leftover.stdout
     listed_again = client.get(f"/api/outputs/{chat_id}", headers=headers)
     listed_paths = {entry["path"] for entry in listed_again.json()["files"]}
