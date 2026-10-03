@@ -30,6 +30,7 @@ COPY ./auth_guard.py .
 COPY ./ws_recheck.py .
 COPY ./cli_runtime.py .
 COPY ./cli_adapters/ ./cli_adapters/
+COPY ./office/ ./office/
 COPY ./drawio/ ./drawio/
 COPY ./static/ ./static/
 RUN python3 drawio/prepare_drawio.py
