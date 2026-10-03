@@ -39,7 +39,6 @@ services:
       - DOCKER_IMAGE=open-computer-use:test
       # Same path the workspace container will see — bind mount paths must
       # resolve identically inside and outside the orchestrator pod/container.
-      - USER_DATA_BASE_PATH=/tmp/computer-use-data
       - BASE_DATA_DIR=/tmp/computer-use-data
       - PUBLIC_BASE_URL=http://ocu-test-server:8081
       - COMMAND_TIMEOUT=60

@@ -39,7 +39,7 @@ def _environment(data):
         "OCU_INTERNAL_TOKEN": TOKEN, "MCP_API_KEY": "ocu-upload-claim-mcp-key",
         "OCU_WEBUI_ORIGIN": "https://webui.example", "SINGLE_USER_MODE": "true",
         "OCU_SANDBOX_SUBNET": "10.90.0.0/24", "PUBLIC_BASE_URL": "http://ocu.example",
-        "BASE_DATA_DIR": str(data), "USER_DATA_BASE_PATH": str(data.parent / "user-data"),
+        "BASE_DATA_DIR": str(data),
         "DOCKER_HOST": "unix:///tmp/ocu-acceptance-no-docker.sock",
         "DOCKER_SOCKET": "unix:///tmp/ocu-acceptance-no-docker.sock",
     }
@@ -58,7 +58,8 @@ def upload_server(tmp_path, monkeypatch):
     try:
         import app
         with TestClient(app.app) as client:
-            yield client, data / CHAT / "uploads"
+            yield client, data / CHAT / "outputs"
+
     finally:
         for name in list(sys.modules):
             if name in APP_MODULES or name.startswith("mcp_resources"):
@@ -191,20 +192,106 @@ def test_receipts_live_outside_uploads_and_record_original_metadata(upload_serve
     assert (uploads.parent / ".ocu" / "imports.json").is_file()
 
 
-def test_published_upload_is_readable_by_sandbox_assistant(upload_server):
+def test_published_upload_is_writable_at_claim_and_preserves_no_overwrite(
+        upload_server, monkeypatch):
+    import app
+    import tempfile
+
     client, uploads = upload_server
-    payloads = (b"first", b"second")
-    expected_names = ("report.txt", "report (2).txt")
-    for payload, name in zip(payloads, expected_names):
-        response = _upload(client, "report.txt", payload)
+    previous_umask = os.umask(0o077)
+    try:
+        original_claim = app.claim_file_no_replace
+        claims = []
+
+        def recording_claim(temporary, requested):
+            info = temporary.stat()
+            claims.append({
+                "bytes": temporary.read_bytes(),
+                "mode": stat.S_IMODE(info.st_mode),
+                "ino": info.st_ino,
+                "requested": requested.name,
+            })
+            return original_claim(temporary, requested)
+
+        monkeypatch.setattr(app, "claim_file_no_replace", recording_claim)
+
+        create = tempfile.NamedTemporaryFile
+        staging_modes = []
+
+        class ObservingHandle:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def write(self, content):
+                if str(self._handle.name).startswith(str(uploads)):
+                    staging_modes.append(
+                        stat.S_IMODE(os.stat(self._handle.name).st_mode))
+                return self._handle.write(content)
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+        @contextmanager
+        def observing_write(*args, **kwargs):
+            with create(*args, **kwargs) as handle:
+                yield ObservingHandle(handle)
+
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", observing_write)
+
+        payloads = (b"first", b"second")
+        expected_names = ("report.txt", "report (2).txt")
+        for payload, name in zip(payloads, expected_names):
+            response = _upload(client, "report.txt", payload)
+            assert response.status_code == 200
+            assert response.json()["filename"] == name
+            path = uploads / name
+            published = path.stat()
+            assert path.read_bytes() == payload
+            assert stat.S_IMODE(published.st_mode) == 0o666
+            assert published.st_ino == claims[-1]["ino"]
+
+        assert [entry["bytes"] for entry in claims] == [b"first", b"second"]
+        assert [entry["mode"] for entry in claims] == [0o666, 0o666]
+        assert [entry["requested"] for entry in claims] == [
+            "report.txt", "report.txt",
+        ]
+        assert (uploads / "report.txt").read_bytes() == b"first"
+        assert (uploads / "report (2).txt").read_bytes() == b"second"
+        assert sorted(path.name for path in uploads.iterdir()) == [
+            "report (2).txt", "report.txt",
+        ]
+        assert staging_modes
+        assert all(mode & 0o077 == 0 for mode in staging_modes)
+    finally:
+        os.umask(previous_umask)
+
+
+def test_upload_creates_writable_parents_and_preserves_existing_directory_modes(
+        upload_server):
+    client, uploads = upload_server
+    previous_umask = os.umask(0o077)
+    try:
+        response = _upload(client, "nested/deep/notes.txt", b"nested")
         assert response.status_code == 200
-        assert response.json()["filename"] == name
-        path = uploads / name
-        assert path.read_bytes() == payload
-        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+        assert response.json()["filename"] == "nested/deep/notes.txt"
+        assert (uploads / "nested/deep/notes.txt").read_bytes() == b"nested"
+        assert stat.S_IMODE(uploads.stat().st_mode) == 0o777
+        assert stat.S_IMODE((uploads / "nested").stat().st_mode) == 0o777
+        assert stat.S_IMODE((uploads / "nested/deep").stat().st_mode) == 0o777
+
+        kept = uploads / "kept"
+        kept.mkdir()
+        os.chmod(kept, 0o750)
+        into_kept = _upload(client, "kept/file.txt", b"inside")
+        assert into_kept.status_code == 200
+        assert into_kept.json()["filename"] == "kept/file.txt"
+        assert (kept / "file.txt").read_bytes() == b"inside"
+        assert stat.S_IMODE(kept.stat().st_mode) == 0o750
+    finally:
+        os.umask(previous_umask)
 
 
-def test_free_name_preserves_response_fields_and_uploads_destination(upload_server):
+def test_free_name_preserves_response_fields_and_outputs_destination(upload_server):
     client, uploads = upload_server
     response = _upload(client, "brief.docx", b"new")
     assert response.status_code == 200
@@ -212,7 +299,54 @@ def test_free_name_preserves_response_fields_and_uploads_destination(upload_serv
                                "size": 3, "md5": "22af645d1859cb5ca6da0c484f1f37ea"}
     assert (uploads / "brief.docx").read_bytes() == b"new"
     assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx"]
-    assert not (uploads.parent / "outputs").exists()
+    assert not (uploads.parent / "uploads").exists()
+
+
+def test_uploaded_file_appears_in_outputs_listing_with_file_id(upload_server):
+    client, uploads = upload_server
+    body = b"PK\x03\x04brief"
+    response = _upload(client, "brief.docx", body)
+    assert response.status_code == 200
+    assert response.json()["filename"] == "brief.docx"
+    assert (uploads / "brief.docx").read_bytes() == body
+    listed = client.get(f"/api/outputs/{CHAT}", headers=HEADERS)
+    assert listed.status_code == 200
+    files = listed.json()["files"]
+    match = next(entry for entry in files if entry["path"] == "brief.docx")
+    assert match["file_id"]
+
+
+def test_colliding_uploads_have_distinct_listing_identities(upload_server):
+    client, uploads = upload_server
+    first = _upload(client, "report.docx", b"first-bytes")
+    second = _upload(client, "report.docx", b"second-bytes")
+    assert first.status_code == second.status_code == 200
+    assert first.json()["filename"] == "report.docx"
+    assert second.json()["filename"] == "report (2).docx"
+    assert (uploads / "report.docx").read_bytes() == b"first-bytes"
+    assert (uploads / "report (2).docx").read_bytes() == b"second-bytes"
+    listed = client.get(f"/api/outputs/{CHAT}", headers=HEADERS)
+    assert listed.status_code == 200
+    by_path = {entry["path"]: entry for entry in listed.json()["files"]}
+    assert by_path["report.docx"]["file_id"]
+    assert by_path["report (2).docx"]["file_id"]
+    assert by_path["report.docx"]["file_id"] != by_path["report (2).docx"]["file_id"]
+
+
+def test_uploaded_html_is_served_with_generated_content_isolation(upload_server):
+    client, uploads = upload_server
+    html = b"<script>window.active = true</script>"
+    response = _upload(client, "page.html", html)
+    assert response.status_code == 200
+    assert (uploads / "page.html").read_bytes() == html
+    served = client.get(f"/files/{CHAT}/page.html", headers=HEADERS)
+    assert served.status_code == 200
+    assert served.content == html
+    assert served.headers.get_list("content-security-policy") == [
+        "sandbox allow-scripts allow-forms",
+    ]
+    assert served.headers["x-content-type-options"] == "nosniff"
+
 
 
 @pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
@@ -389,7 +523,8 @@ def test_concurrent_server_processes_report_their_own_complete_files(tmp_path):
         assert [process.returncode for process in processes] == [0, 0], outputs
         results = [(json.loads(stdout.splitlines()[-1])["filename"], body * 100_000)
                    for (stdout, _), body in zip(outputs, [b"A", b"B"])]
-        _assert_concurrent_payloads(results, data / CHAT / "uploads")
+        _assert_concurrent_payloads(results, data / CHAT / "outputs")
+
     finally:
         for process in processes:
             if process.poll() is None:
@@ -419,7 +554,8 @@ def test_concurrent_server_processes_store_one_file_for_the_same_attachment_id(t
         names = [json.loads(stdout.splitlines()[-1])["filename"]
                  for stdout, _ in outputs]
         assert names == ["data.xlsx", "data.xlsx"]
-        uploads = data / CHAT / "uploads"
+        uploads = data / CHAT / "outputs"
+
         assert sorted(path.name for path in uploads.iterdir()) == ["data.xlsx"]
         assert (uploads / "data.xlsx").read_bytes() in {b"A" * 100_000, b"B" * 100_000}
         receipts = json.loads((data / CHAT / ".ocu" / "imports.json").read_text())

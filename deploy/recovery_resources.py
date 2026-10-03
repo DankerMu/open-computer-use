@@ -233,8 +233,7 @@ def _sandbox_attributed(sandbox: dict, identity: dict, expected_chats: set[str])
     mounts = _mounts(sandbox["payload"])
     expected = {
         "/home/assistant": ("volume", recovery.workspace_volume_name(chat_id), True),
-        "/mnt/user-data/uploads": ("bind", str(identity["chat_dir"] / chat_id / "uploads"), False),
-        "/mnt/user-data/outputs": ("bind", str(identity["chat_dir"] / chat_id / "outputs"), True),
+        "/mnt/user-data/files": ("bind", str(identity["chat_dir"] / chat_id / "outputs"), True),
     }
     for destination, (kind, source, writable) in expected.items():
         matches = [mount for mount in mounts if mount.get("Destination") == destination]
@@ -319,7 +318,6 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
                 str(identity["skills_dir"]): ("bind", str(identity["skills_dir"])),
             }
             expected_env = {
-                "USER_DATA_BASE_PATH": str(identity["chat_dir"]),
                 "BASE_DATA_DIR": str(identity["chat_dir"]),
                 "SKILLS_CACHE_DIR": str(identity["skills_dir"]),
                 "SKILLS_CACHE_HOST_PATH": str(identity["skills_dir"]),

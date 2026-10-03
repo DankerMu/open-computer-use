@@ -84,7 +84,6 @@ def _apply_env(monkeypatch, tmp_path):
     monkeypatch.setenv("OCU_WEBUI_ORIGIN", "https://webui.example")
     monkeypatch.setenv("PUBLIC_BASE_URL", "/ocu")
     monkeypatch.setenv("BASE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("USER_DATA_BASE_PATH", str(tmp_path / "user-data"))
     monkeypatch.setenv("CONTAINER_IDLE_TIMEOUT", "600")
     monkeypatch.setenv("OCU_IDLE_POLL_SECONDS", "30")
     monkeypatch.setenv("DOCKER_IMAGE", "python:3.12-slim")
@@ -267,7 +266,6 @@ def world(monkeypatch, tmp_path):
 
     _bind_outputs_broker(docker_manager)
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
-    docker_manager.USER_DATA_BASE_PATH = str(tmp_path / "user-data")
     monkeypatch.setattr(docker_manager, "DOCKER_IMAGE", os.environ["DOCKER_IMAGE"])
     monkeypatch.setattr(docker_manager, "SUBAGENT_CLI", "claude")
     docker_manager._docker_client = None
@@ -375,6 +373,57 @@ def _put(client, name, status, container_id="cid-existing", dns=None):
 
 def _env_of(container):
     return container._create_config["environment"]
+
+
+
+
+def _assert_unified_workspace_mounts(docker_manager, container, chat_id=CHAT):
+    volumes = container._create_config["volumes"]
+    files_dest = "/mnt/user-data/files"
+    expected_source = os.path.join(str(docker_manager.BASE_DATA_DIR), chat_id, "outputs")
+    user_data_dests = {
+        spec.get("bind")
+        for spec in volumes.values()
+        if spec.get("bind", "").startswith("/mnt/user-data/")
+    }
+    assert user_data_dests == {files_dest}, f"unexpected user-data mounts: {user_data_dests}"
+    source = next(
+        src for src, spec in volumes.items() if spec.get("bind") == files_dest
+    )
+    assert source == expected_source
+    assert volumes[source]["mode"] == "rw"
+    workspace = f"chat-{chat_id}-workspace"
+    assert volumes[workspace]["bind"] == "/home/assistant"
+    assert volumes[workspace]["mode"] == "rw"
+
+
+
+
+def test_created_sandbox_has_one_read_write_files_bind(world, monkeypatch):
+    docker_manager, client, _clock, tmp_path = world
+    monkeypatch.setattr(docker_manager, "DOCKER_IMAGE", "open-computer-use:test")
+    docker_manager._get_or_create_container(CHAT)
+    created = client._created[0]
+    _assert_unified_workspace_mounts(docker_manager, created)
+    chat_root = tmp_path / "data" / CHAT
+    assert (chat_root / "outputs").is_dir()
+    assert not (chat_root / "uploads").exists()
+    assert not (tmp_path / "user-data" / CHAT / "uploads").exists()
+
+
+def test_recreated_sandbox_keeps_the_same_files_mount_set(world, monkeypatch):
+    docker_manager, client, _clock, tmp_path = world
+    monkeypatch.setattr(docker_manager, "DOCKER_IMAGE", "open-computer-use:test")
+    _meta(docker_manager, CHAT, user_email="saved@example", user_name="Saved")
+    assert docker_manager.launch_sandbox(CHAT, credential_source="server") == {"state": "running"}
+    created = client._created[0]
+    _assert_unified_workspace_mounts(docker_manager, created)
+    chat_root = tmp_path / "data" / CHAT
+    assert (chat_root / "outputs").is_dir()
+    assert not (chat_root / "uploads").exists()
+
+
+
 
 
 def test_stopped_tool_call_does_not_start_or_recreate(world):
@@ -854,7 +903,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
 os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
-os.environ["USER_DATA_BASE_PATH"] = os.environ["OCU_USER"]
 os.environ["DOCKER_IMAGE"] = "python:3.12-slim"
 import docker
 import docker_manager
@@ -973,7 +1021,6 @@ print(json.dumps({
         {
             "OCU_SERVER_DIR": str(SERVER_DIR),
             "OCU_BASE": str(tmp_path / "data"),
-            "OCU_USER": str(tmp_path / "user"),
             "OCU_SHARED": str(shared),
             "OCU_CHAT": CHAT,
             "PUBLIC_BASE_URL": "/ocu",
@@ -1055,7 +1102,6 @@ def test_restart_alias_launches_compatible_stopped_sandbox(app_module, monkeypat
 
     _bind_outputs_broker(docker_manager)
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
-    docker_manager.USER_DATA_BASE_PATH = str(tmp_path / "user-data")
     docker_manager._docker_client = None
     docker_manager._chat_locks.clear()
     docker_manager._FLOCK_DEPTH.clear()
@@ -1230,7 +1276,6 @@ def test_lifespan_refuses_invalid_sandbox_dns_without_docker(tmp_path):
             "OCU_WEBUI_ORIGIN": "https://webui.example",
             "PUBLIC_BASE_URL": "/ocu",
             "BASE_DATA_DIR": str(tmp_path / "data"),
-            "USER_DATA_BASE_PATH": str(tmp_path / "user-data"),
             "CONTAINER_IDLE_TIMEOUT": "600",
             "OCU_IDLE_POLL_SECONDS": "30",
             "DOCKER_IMAGE": "python:3.12-slim",
@@ -1746,7 +1791,6 @@ def test_broken_flock_negative_control_allows_two_create_attempts(tmp_path):
         {
             "OCU_SERVER_DIR": str(SERVER_DIR),
             "OCU_BASE": str(tmp_path / "data"),
-            "OCU_USER": str(tmp_path / "user"),
             "OCU_SHARED": str(shared),
             "OCU_CHAT": CHAT,
             "PUBLIC_BASE_URL": "/ocu",

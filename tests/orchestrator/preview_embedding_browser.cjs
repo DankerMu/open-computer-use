@@ -141,7 +141,9 @@ const waitUntil = async (condition, label) => {
   }
 };
 let listMode = 'normal';
+let standaloneUploadedNote = false;
 let injectedListingFailure = false;
+
 let drawioMissingViewer = false;
 let drawioCorruptViewer = false;
 let drawioMissingLazy = false;
@@ -242,6 +244,9 @@ const server = http.createServer(async (req, res) => {
           'drawio-compressed', 'drawio-image', 'drawio-math', 'drawio-missing',
           'drawio-bpmn', 'drawio-er', 'drawio-pages', 'drawio-pages-missing', 'drawio-corrupt-lazy',
           'drawio-pages-image'].includes(f.file_id));
+        if (standaloneUploadedNote) {
+          listed.push({ file_id: 'note', path: 'note.txt', type: 'text', mime: 'text/plain' });
+        }
         return respond(res, 200, JSON.stringify({
           chat_id: CHAT, files: listed.map(f => ({
             name: f.path, size: 128, revision: 1,
@@ -260,6 +265,7 @@ const server = http.createServer(async (req, res) => {
         files: page.map(f => ({ name: f.path, size: 128, revision: 1,
           url: `/ocu/files/${CHAT}/${encodeURIComponent(f.path)}`, ...f })) }));
     }
+
     if ((prefix && url.pathname.startsWith(`${prefix}/files/${CHAT}/`)) ||
         (!prefix && url.pathname.startsWith(`/files/${CHAT}/`))) {
       const filesRoot = `${prefix || ''}/files/${CHAT}/`;
@@ -296,8 +302,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === `${prefix}/terminal/${CHAT}/sessions`) return respond(res, 200, JSON.stringify({ sessions: [] }));
     if (url.pathname === `${prefix}/api/uploads/${CHAT}/note.txt` && req.method === 'POST') {
       record.status = 200;
+      standaloneUploadedNote = true;
       return respond(res, 200, JSON.stringify({ status: 'success', filename: 'note.txt', size: 5, md5: '0' }));
     }
+
     if (url.pathname === `/api/v1/ocu/workspaces/${CHAT}`) return respond(res, 200, JSON.stringify({ cli_badge: null }));
     if (url.pathname === '/favicon.ico') return respond(res, 204, '', 'text/plain');
     if (url.pathname === '/parent') return respond(res, 200, `<!doctype html><html><body>
@@ -1598,15 +1606,18 @@ async function main() {
         .getByText('hostile.docx', { exact: true }).count(), 1,
         'standalone Files listing omitted the retained outputs entry');
       assert.equal(await panelSession.page.locator('.dropdown-menu.open .item-name')
-        .filter({ hasText: 'note.txt' }).count(), 0,
-        'standalone upload fabricated an uploaded file in Files before destination cut-over');
+        .filter({ hasText: 'note.txt' }).count(), 1,
+        'standalone upload did not appear in the Files dropdown');
+
       assert.deepEqual(caseErrors(panelSession), [], 'standalone panel produced unexpected console errors');
     } catch (error) {
       await captureStandaloneFailure(panelSession, 'standalone-panel');
       throw error;
     } finally {
+      standaloneUploadedNote = false;
       await closeStandalone(panelSession);
     }
+
 
     const officeSession = await openStandalone('/ocu');
     try {

@@ -247,6 +247,48 @@ def test_dispatch_routes_to_correct_adapter(
 
 
 # ===========================================================================
+# Test 2b — generated sub-agent prompt names only the workspace files path.
+# ===========================================================================
+
+def test_dispatch_system_prompt_names_only_workspace_files_path(monkeypatch):
+    """mcp_tools.sub_agent builds the prompt that dispatch receives.
+
+    Issue 113: that generated text names /mnt/user-data/files as the
+    writable workspace for uploaded and generated files, keeps
+    /home/assistant as private working storage, and names neither
+    legacy path.
+    """
+    _scrub_dev_env(monkeypatch)
+    monkeypatch.setenv("SUBAGENT_CLI", "claude")
+    _reload_runtime()
+    import mcp_tools
+
+    captured = {}
+
+    async def fake_dispatch(**kwargs):
+        captured.update(kwargs)
+        return (
+            _make_result(cost_usd=0.0042, text="hello world"),
+            "resolved-claude-model",
+            "sonnet",
+        )
+
+    _install_common_stubs(monkeypatch, mcp_tools, fake_dispatch)
+
+    fn = _unwrap_tool(mcp_tools.sub_agent)
+    asyncio.run(fn(
+        task="hello", description="d", ctx=_make_ctx(),
+    ))
+
+    prompt = captured.get("system_prompt")
+    assert prompt, "fake_dispatch was not invoked with system_prompt"
+    assert "/mnt/user-data/files" in prompt
+    assert "/mnt/user-data/uploads" not in prompt
+    assert "/mnt/user-data/outputs" not in prompt
+    assert "/home/assistant" in prompt
+
+
+# ===========================================================================
 # Test 3 — cost rendering: cost_usd=None must render "unavailable".
 # ===========================================================================
 

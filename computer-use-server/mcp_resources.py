@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 """
-Tier 6 — uploaded files exposed as native MCP resources.
+Native MCP resources for chat workspace files.
 
 Clients (Agents SDK, MCP Inspector, Claude Desktop) can call `resources/list`
-to see every uploaded file across every live chat, and `resources/read` to
-fetch content. Upload stays on the existing POST /api/uploads/* HTTP
+to see every visible workspace file across every live chat, and `resources/read`
+to fetch content. Upload stays on the existing POST /api/uploads/* HTTP
 endpoint (MCP has no upload primitive — community consensus).
 
 Design decisions:
@@ -28,11 +28,11 @@ Design decisions:
 
 - Called from two places:
     * docker_manager._create_container — initial sync when the chat's
-      container spins up, so any already-existing uploads are visible.
+      container spins up, so any already-existing workspace files are visible.
     * app.py:upload_file POST handler — after a new file is saved.
 
 Tenancy: `X-Chat-Id` is untrusted. Any caller holding MCP_API_KEY can guess
-URIs and read any chat's uploads — same model as today's /api/uploads/*
+URIs and read any chat's workspace files — same model as today's /api/uploads/*
 endpoints. Per-chat auth is out of scope.
 """
 
@@ -93,7 +93,7 @@ def _build_function_resource(chat_id: str, entry: UploadEntry) -> FunctionResour
     return FunctionResource(
         uri=uri,  # type: ignore[arg-type]  # FastMCP accepts str, validates internally
         name=f"{chat_id}/{entry.name}",
-        description=f"Uploaded file ({entry.size} bytes, {entry.mime_type})",
+        description=f"Workspace file ({entry.size} bytes, {entry.mime_type})",
         mime_type=entry.mime_type,
         fn=_reader,
     )
@@ -101,7 +101,7 @@ def _build_function_resource(chat_id: str, entry: UploadEntry) -> FunctionResour
 
 async def sync_chat_resources(chat_id: str) -> int:
     """
-    Clear previously-registered upload resources for `chat_id` and re-register
+    Clear previously-registered workspace-file resources for `chat_id` and re-register
     from the current filesystem state. Returns the count of registered entries.
 
     Holds _resource_lock so a concurrent list_resources() won't see a dict

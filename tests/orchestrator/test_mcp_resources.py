@@ -47,10 +47,13 @@ class McpResourcesContract(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
-    def _make_upload(self, chat_id: str, rel_path: str, content: str):
-        target = Path(self._tmp) / chat_id / "uploads" / rel_path
+    def _make_upload(self, chat_id: str, rel_path: str, content: str | bytes):
+        target = Path(self._tmp) / chat_id / "outputs" / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content)
 
     def test_flat_and_nested_list_read(self):
         self._make_upload("demoa", "hello.txt", "hi")
@@ -70,6 +73,34 @@ class McpResourcesContract(unittest.TestCase):
         nested = list(asyncio.run(self.mcp_tools.mcp.read_resource(
             AnyUrl("file://uploads/demoa/sub%2Fnested.json"))))
         self.assertEqual(nested[0].content, '{"k":1}')
+
+    def test_docx_resource_reads_workspace_outputs_bytes(self):
+        from pydantic import AnyUrl
+
+        docx_bytes = b"PK\x03\x04docx-fixture"
+        self._make_upload("demoe", "brief.docx", docx_bytes)
+        n = asyncio.run(self.mcp_resources.sync_chat_resources("demoe"))
+        self.assertEqual(n, 1)
+
+        listed = {str(r.uri) for r in asyncio.run(self.mcp_tools.mcp.list_resources())}
+        self.assertIn("file://uploads/demoe/brief.docx", listed)
+        chunks = list(asyncio.run(self.mcp_tools.mcp.read_resource(
+            AnyUrl("file://uploads/demoe/brief.docx"))))
+        payload = chunks[0]
+        self.assertEqual(payload.content, docx_bytes)
+
+    def test_hidden_names_and_ocu_paths_are_not_listed(self):
+        self._make_upload("demof", "visible.txt", "ok")
+        self._make_upload("demof", ".secret.txt", "hidden-file")
+        self._make_upload("demof", "nested/.hidden/notes.txt", "hidden-dir")
+        self._make_upload("demof", ".ocu/imports.json", '{"ids":[]}')
+        n = asyncio.run(self.mcp_resources.sync_chat_resources("demof"))
+        self.assertEqual(n, 1)
+
+        uris = {str(r.uri) for r in asyncio.run(self.mcp_tools.mcp.list_resources())
+                if "demof" in str(r.uri)}
+        self.assertEqual(uris, {"file://uploads/demof/visible.txt"})
+
 
     def test_tenancy_empty_for_unknown_chat(self):
         # Plant a real upload for tenant A so the global resource registry

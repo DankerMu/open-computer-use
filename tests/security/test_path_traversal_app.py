@@ -23,7 +23,8 @@ VALID_CHAT_ID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 UNKNOWN_CHAT_ID = "c3d4e5f6-a7b8-9012-cdef-123456789012"
 INTERNAL_TOKEN = "ocu-test-internal-token"
 UPLOAD_READ_PATHS = ("manifest", "list")
-# MD5 of the seeded uploads/uploaded.txt bytes b"world".
+# MD5 of the seeded outputs/uploaded.txt bytes b"world".
+
 SEEDED_UPLOAD_MD5 = "7d793037a0760186574b0282f2f435e7"
 SEEDED_UPLOAD_NAME = "uploaded.txt"
 
@@ -33,12 +34,11 @@ def tmp_data(tmp_path):
     """Create temporary data directory with test files."""
     chat_dir = tmp_path / VALID_CHAT_ID
     outputs = chat_dir / "outputs"
-    uploads = chat_dir / "uploads"
     outputs.mkdir(parents=True)
-    uploads.mkdir(parents=True)
     (outputs / "test.txt").write_text("hello")
-    (uploads / "uploaded.txt").write_text("world")
+    (outputs / "uploaded.txt").write_text("world")
     return tmp_path
+
 
 
 @pytest.fixture
@@ -94,12 +94,15 @@ class TestChatIdValidation:
 class TestNormalOperations:
     """Test that legitimate operations continue to work."""
 
-    def test_upload_normal(self, client):
+    def test_upload_normal(self, client, tmp_data):
         resp = client.post(
             f"/api/uploads/{VALID_CHAT_ID}/newfile.txt",
             files={"file": ("newfile.txt", b"content")},
         )
         assert resp.status_code == 200
+        assert (tmp_data / VALID_CHAT_ID / "outputs" / "newfile.txt").read_bytes() == b"content"
+        assert not (tmp_data / VALID_CHAT_ID / "uploads" / "newfile.txt").exists()
+
 
     def test_download_normal(self, client):
         resp = client.get(f"/files/{VALID_CHAT_ID}/test.txt")

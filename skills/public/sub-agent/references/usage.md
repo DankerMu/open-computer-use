@@ -69,7 +69,7 @@ Review [SCOPE] for [TYPE] issues and create report.
 4. Create detailed report
 
 ## OUTPUT
-- Create /mnt/user-data/outputs/security_review.md
+- Create /mnt/user-data/files/security_review.md
 - Group by severity (Critical/High/Medium)
 - Include file:line references
 """,
@@ -133,7 +133,7 @@ task="Create an analysis report"
 
 # GOOD
 ## OUTPUT
-- Save to /mnt/user-data/outputs/report.md
+- Save to /mnt/user-data/files/report.md
 ```
 
 ### No Verification
@@ -200,8 +200,7 @@ those. The table starts at the smallest size that is still in-scope for
 The sub-agent has access to:
 - `/home/assistant` - Working directory
 - `/home/assistant/task_plan.md` - Task saved here (re-read if context compacts)
-- `/mnt/user-data/uploads` - User files (read-only)
-- `/mnt/user-data/outputs` - Output files (accessible to user)
+- `/mnt/user-data/files` - Uploaded and generated files (read-write)
 - `/mnt/skills/` - All skills documentation
 - Full internet access
 - All installed tools (Python, Node.js, LibreOffice, etc.)

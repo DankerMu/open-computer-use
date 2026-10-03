@@ -14,7 +14,6 @@ import sys
 
 def _listing(chat_dir: Path, chat_id: str) -> dict:
     os.environ["BASE_DATA_DIR"] = str(chat_dir)
-    os.environ["USER_DATA_BASE_PATH"] = str(chat_dir)
     os.environ.pop("DOCKER_HOST", None)
     os.environ.pop("DOCKER_CONTEXT", None)
     for candidate in (Path("/app"), Path.cwd()):

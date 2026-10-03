@@ -98,7 +98,7 @@ curl -s http://localhost:3000 | head -1
 - Check Docker has enough resources: `docker system info | grep Memory`
 
 ### Files not appearing in preview
-- Verify `BASE_DATA_DIR` and `USER_DATA_BASE_PATH` match in docker-compose.yml
+- Verify `BASE_DATA_DIR` is the same path inside the server and at the Docker daemon
 - Check: `curl http://localhost:8081/api/outputs/{chat_id}`
 
 ### Connection refused from Open WebUI

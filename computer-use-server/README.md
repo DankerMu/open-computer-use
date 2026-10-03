@@ -159,8 +159,7 @@ All via environment variables:
 | `DOCKER_IMAGE` | `open-computer-use:latest` | Sandbox container image |
 | `COMMAND_TIMEOUT` | `120` | Bash command timeout (seconds) |
 | `SUB_AGENT_TIMEOUT` | `3600` | Sub-agent timeout (seconds) |
-| `USER_DATA_BASE_PATH` | `/tmp/computer-use-data` | Host path for file exchange |
-| `BASE_DATA_DIR` | `/data` | Server-side path to chat data |
+| `BASE_DATA_DIR` | `/data` | Server IO root and Docker bind source for chat data. The configured path must be identical inside the server and at the Docker daemon. |
 | `CONTAINER_MEM_LIMIT` | `2g` | Container memory limit |
 | `CONTAINER_CPU_LIMIT` | `1.0` | Container CPU limit |
 | `CONTAINER_IDLE_TIMEOUT` | `600` | Host-owned idle stop for a continuously observed running sandbox (seconds). Paused time and OCU downtime do not count. |

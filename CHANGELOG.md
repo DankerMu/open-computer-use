@@ -13,10 +13,10 @@
 - **Upload name claim without replace.** `POST /api/uploads/{chat_id}/{path}`
   writes a complete dot-prefixed temporary file under the per-chat lock, then
   hard-links the first free name (`name (N).ext` on collision) without replacing
-  an occupied entry. Temporary bytes are set to 0644 before that link so a
-  sandbox assistant can read the published file on a read-only uploads mount.
-  Baseline no-overwrite real HTTP smoke passed; sandbox readability remains
-  parent verification.
+  an occupied entry. Staging stays private while bytes are written; complete
+  bytes receive mode 0666 through the open descriptor before the link so the
+  sandbox user can edit the published file. Newly created upload directories
+  receive mode 0777 without changing existing directory modes.
 
 - **Import-once attachment receipts.** An upload that carries
   `X-OCU-Attachment-Id` records the attachment id, stored name, original size,
@@ -38,13 +38,20 @@
 - **Standalone preview upload refresh.** The terminal panel keeps the upload
   action without a separate uploaded-files list. Successful standalone uploads
   immediately refresh the Files listing; terminal embeds do not request it.
-  Files displays outputs only, so uploads remain absent until the workspace
-  mount cutover.
+  Uploaded and generated files share the same Files listing.
 
 - **Upload reads use receipts.** The upload manifest and list GET paths have
   no handlers. Authenticated canonical requests receive a routing error with
   no file metadata; prefix authorization and chat-id validation still run
   first. Upload POST, import receipts and MCP upload resources remain available.
+
+- **One writable workspace files root.** `BASE_DATA_DIR/{chat}/outputs` binds
+  read-write at `/mnt/user-data/files`; `/home/assistant` stays private on its
+  named volume. Uploads, MCP resources, recovery attribution, browser downloads
+  and agent guidance use that root. The image has no legacy user-data paths
+  and keeps their parent root-owned and non-writable by the sandbox user.
+  `BASE_DATA_DIR` is the sole server/bind root.
+  MCP keeps its `file://uploads` URI shape and excludes hidden path segments.
 
 - **Cold backup and isolated restore.** `deploy/recovery.py` captures one
   complete cold recovery set, restores it onto a distinct empty local

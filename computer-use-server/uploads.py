@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 """
-Shared helpers for publishing, listing and reading chat uploads.
+Shared helpers for publishing, listing and reading chat workspace files.
 
 Used by:
-  - GET /api/uploads/{chat_id}/list (existing HTTP endpoint).
+  - POST /api/uploads/{chat_id}/{path} (publication via claim_file_no_replace).
   - sync_chat_resources / the @mcp.resource handler in mcp_resources.py
-    (Tier 6 native MCP surface).
+    (native MCP surface over workspace files).
 
-Read traversal protection reuses security.safe_path / security.sanitize_chat_id.
+List and read use BASE_DATA_DIR/{chat_id}/outputs. Hidden names and any path
+under .ocu are skipped from MCP discovery. Traversal protection reuses
+security.safe_path / security.sanitize_chat_id.
 """
 
 import datetime
@@ -21,11 +23,67 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from fastapi import HTTPException
+
 from security import safe_path, sanitize_chat_id
 
 
 # Module-level so tests can patch / so app.py re-uses the same value.
 BASE_DATA_DIR = Path(os.getenv("BASE_DATA_DIR", "/data"))
+
+
+_NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_CLOSE_ON_EXEC = getattr(os, "O_CLOEXEC", 0)
+_DIRECTORY_FLAGS = os.O_RDONLY | _DIRECTORY | _NO_FOLLOW | _CLOSE_ON_EXEC
+_WORKSPACE_DIR_MODE = 0o777
+
+
+def ensure_workspace_directories(root: Path, destination: Path) -> Path:
+    """Create missing directories under root with mode 0777; leave existing modes.
+
+    ``root`` must already exist and stay within the files tree. Only components
+    this call newly creates are chmod'd. Existing directories, including a
+    pre-existing destination, keep their mode. Each created or opened directory
+    is opened with O_NOFOLLOW so a swapped leaf symlink is not chmod'd.
+    """
+    root = Path(root)
+    destination = Path(destination)
+    if destination == root:
+        return destination
+    try:
+        relative = destination.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=403, detail="Access denied: path traversal detected"
+        ) from exc
+    if relative == Path("."):
+        return destination
+    current = root
+    for part in relative.parts:
+        if part in {"", ".", ".."}:
+            raise HTTPException(
+                status_code=403, detail="Access denied: path traversal detected"
+            )
+        current = current / part
+        created = False
+        try:
+            os.mkdir(current, _WORKSPACE_DIR_MODE)
+            created = True
+        except FileExistsError:
+            pass
+        fd = os.open(current, _DIRECTORY_FLAGS)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISDIR(info.st_mode):
+                raise HTTPException(
+                    status_code=403, detail="Access denied: path traversal detected"
+                )
+            if created:
+                os.fchmod(fd, _WORKSPACE_DIR_MODE)
+        finally:
+            os.close(fd)
+    return current
 
 
 def claim_file_no_replace(temporary: Path, requested: Path) -> Path:
@@ -51,7 +109,7 @@ def claim_file_no_replace(temporary: Path, requested: Path) -> Path:
 @dataclass(frozen=True)
 class UploadEntry:
     name: str          # basename — display label
-    rel_path: str      # relative to the uploads dir; may contain "/"
+    rel_path: str      # relative to the workspace files dir; may contain "/"
     size: int
     modified: float    # st_mtime
     mime_type: str
@@ -62,22 +120,28 @@ def _guess_mime(path: Path) -> str:
     return mime or "application/octet-stream"
 
 
+def _is_hidden_relative(rel: Path) -> bool:
+    return any(part.startswith(".") for part in rel.parts)
+
+
 def list_chat_uploads(chat_id: str) -> list[UploadEntry]:
-    """List files under BASE_DATA_DIR/{chat_id}/uploads/ recursively.
+    """List visible files under BASE_DATA_DIR/{chat_id}/outputs/ recursively.
 
     Returns [] if the directory doesn't exist (newly-created chat).
-    Sorted by modification time, newest first — matches the HTTP endpoint's
-    existing behavior (app.py:404).
+    Hidden names, hidden directory segments, and anything under .ocu are
+    excluded. Sorted by modification time, newest first.
     """
     chat_id = sanitize_chat_id(chat_id)
-    uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
-    if not uploads_dir.exists():
+    outputs_dir = safe_path(BASE_DATA_DIR, chat_id, "outputs")
+    if not outputs_dir.exists():
         return []
     entries: list[UploadEntry] = []
-    for fp in uploads_dir.rglob("*"):
+    for fp in outputs_dir.rglob("*"):
         if not fp.is_file():
             continue
-        rel = fp.relative_to(uploads_dir)
+        rel = fp.relative_to(outputs_dir)
+        if _is_hidden_relative(rel):
+            continue
         st = fp.stat()
         entries.append(UploadEntry(
             name=fp.name,
@@ -91,15 +155,15 @@ def list_chat_uploads(chat_id: str) -> list[UploadEntry]:
 
 
 def read_chat_upload(chat_id: str, rel_path: str) -> tuple[bytes, str]:
-    """Read a single uploaded file. Returns (bytes, mime_type).
+    """Read a single workspace file. Returns (bytes, mime_type).
 
     rel_path is whatever list_chat_uploads reported (may contain "/").
     safe_path enforces traversal protection — no `..`, no absolute paths.
     """
     chat_id = sanitize_chat_id(chat_id)
-    uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
+    outputs_dir = safe_path(BASE_DATA_DIR, chat_id, "outputs")
     # safe_path handles multi-segment join with traversal protection.
-    file_path = safe_path(uploads_dir, rel_path)
+    file_path = safe_path(outputs_dir, rel_path)
     if not file_path.is_file():
         raise FileNotFoundError(f"No such upload: {chat_id}/{rel_path}")
     return file_path.read_bytes(), _guess_mime(file_path)

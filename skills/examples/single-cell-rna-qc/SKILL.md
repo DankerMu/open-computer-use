@@ -62,7 +62,7 @@ All files are saved to `<input_basename>_qc_results/` directory by default (or t
 - `<input_basename>_filtered.h5ad` - Clean, filtered dataset ready for downstream analysis
 - `<input_basename>_with_qc.h5ad` - Original data with QC annotations preserved
 
-If copying outputs to `/mnt/user-data/outputs/` for user access, copy individual files (not the entire directory) so users can preview them directly as Assistant.ai artifacts.
+If copying outputs to `/mnt/user-data/files/` for user access, copy individual files (not the entire directory) so users can preview them directly as Assistant.ai artifacts.
 
 ### Workflow Steps
 

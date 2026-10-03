@@ -87,7 +87,6 @@ orchestrator:
 
     # Path the inner engine creates owui-chat-* workspaces from. Must be mounted at the same
     # path in the orchestrator AND the engine container, or the bind mounts resolve to nothing.
-    USER_DATA_BASE_PATH: /tmp/computer-use-data
     BASE_DATA_DIR: /tmp/computer-use-data
 
     # Talks to the inner engine over a unix socket shared via emptyDir. Unchanged between runtimes

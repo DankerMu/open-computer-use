@@ -24,6 +24,7 @@ Note on capture: docker_manager.py uses `print(..., file=sys.stderr)` then
 import importlib
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -214,7 +215,7 @@ def test_extra_env_carries_subagent_cli_via_create_container(monkeypatch):
         volumes = type("V", (), {"list": staticmethod(lambda *a, **kw: [])})()
 
     monkeypatch.setattr(dm, "get_docker_client", lambda: _FakeClient())
-    monkeypatch.setattr(dm, "USER_DATA_BASE_PATH", "/tmp")
+    monkeypatch.setattr(dm, "BASE_DATA_DIR", Path("/tmp"))
 
     # Pin context vars to deterministic defaults.
     from context_vars import (

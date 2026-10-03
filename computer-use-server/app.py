@@ -65,6 +65,7 @@ from security import sanitize_chat_id, safe_path
 from uploads import (
     CorruptReceiptsError,
     claim_file_no_replace,
+    ensure_workspace_directories,
     import_receipt,
     read_import_receipts,
     write_import_receipts,
@@ -579,10 +580,11 @@ def _store_upload(
         if attachment_id and attachment_id in receipts:
             record = receipts[attachment_id]
             return record["stored_name"], record["md5"], record["size"]
-        uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
+        outputs_dir = safe_path(BASE_DATA_DIR, chat_id, "outputs")
         # Resolve only the parent: an occupied leaf symlink is a collision.
-        parent = safe_path(uploads_dir, str(relative.parent))
-        parent.mkdir(parents=True, exist_ok=True)
+        parent = safe_path(outputs_dir, str(relative.parent))
+        os.makedirs(chat_dir, exist_ok=True)
+        parent = ensure_workspace_directories(chat_dir, parent)
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -590,12 +592,12 @@ def _store_upload(
             ) as handle:
                 temporary = Path(handle.name)
                 handle.write(content)
-            # Sandbox runs as assistant with a read-only uploads mount.
-            # NamedTemporaryFile creates 0600 owned by the server uid, so
-            # the published inode must be world-readable before the hard link.
-            temporary.chmod(0o644)
+                handle.flush()
+                # NamedTemporaryFile creates 0600 owned by the server uid, so
+                # the published inode must be world-writable before the hard link.
+                os.fchmod(handle.fileno(), 0o666)
             stored = claim_file_no_replace(temporary, parent / relative.name)
-            stored_name = str(stored.relative_to(uploads_dir))
+            stored_name = str(stored.relative_to(outputs_dir))
             md5_hash = hashlib.md5(content).hexdigest()
             if attachment_id:
                 receipts[attachment_id] = import_receipt(
@@ -632,7 +634,7 @@ async def upload_file(
     x_ocu_attachment_id: Optional[str] = Header(default=None, alias="X-OCU-Attachment-Id"),
 ):
     """
-    Upload a file to chat uploads directory.
+    Upload a file to the chat workspace files directory.
 
     Args:
         chat_id: Unique chat identifier

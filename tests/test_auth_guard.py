@@ -120,11 +120,10 @@ def client(app_module, tmp_path, monkeypatch):
 
     data = tmp_path / "data"
     chat_outputs = data / CHAT / "outputs"
-    chat_uploads = data / CHAT / "uploads"
     chat_outputs.mkdir(parents=True)
-    chat_uploads.mkdir(parents=True)
     (chat_outputs / "test.txt").write_text("hello-output")
-    (chat_uploads / "uploaded.txt").write_text("hello-upload")
+    (chat_outputs / "uploaded.txt").write_text("hello-upload")
+
     monkeypatch.setattr(app_module, "BASE_DATA_DIR", data)
     import docker_manager
     import uploads
@@ -574,9 +573,14 @@ class TestHttpAuthorization:
         assert ok.status_code == 200
         body = ok.json()
         assert body["chat_id"] == CHAT
-        assert body["total"] == 1
-        assert body["files"][0]["name"] == "test.txt"
-        assert body["files"][0]["path"] == "test.txt"
+        listed = {entry["path"]: entry for entry in body["files"]}
+        assert body["total"] == 2
+        assert set(listed) == {"test.txt", "uploaded.txt"}
+        assert listed["test.txt"]["name"] == "test.txt"
+        assert listed["uploaded.txt"]["name"] == "uploaded.txt"
+        assert listed["test.txt"]["file_id"]
+        assert listed["uploaded.txt"]["file_id"]
+        assert listed["test.txt"]["file_id"] != listed["uploaded.txt"]["file_id"]
         denied = client.get("/api/outputs/..test..", headers=_bearer())
         assert denied.status_code == 400
 
@@ -591,7 +595,7 @@ class TestHttpAuthorization:
             files={"file": ("new.txt", b"secret-bytes")},
         )
         assert denied.status_code == 401
-        assert not (tmp_path / "data" / CHAT / "uploads" / "new.txt").exists()
+        assert not (tmp_path / "data" / CHAT / "outputs" / "new.txt").exists()
         allowed = client.post(
             f"/api/uploads/{CHAT}/new.txt",
             headers=_bearer(),
@@ -599,7 +603,9 @@ class TestHttpAuthorization:
         )
         assert allowed.status_code == 200
         assert allowed.json()["filename"] == "new.txt"
-        assert (tmp_path / "data" / CHAT / "uploads" / "new.txt").read_bytes() == b"secret-bytes"
+        assert (tmp_path / "data" / CHAT / "outputs" / "new.txt").read_bytes() == b"secret-bytes"
+
+
 
     def test_authorized_imports_lists_persisted_ids_and_rejects_noncanonical(
             self, client):

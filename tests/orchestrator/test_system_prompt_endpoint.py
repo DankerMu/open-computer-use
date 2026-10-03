@@ -190,6 +190,23 @@ class SystemPromptEndpointContract(unittest.TestCase):
         self.assertIsNotNone(header, "X-Public-Base-URL header missing")
         self.assertEqual(header, self.public_base_url)
 
+    def test_rendered_prompt_names_only_workspace_files_path(self):
+        resp = self.client.get("/system-prompt", params={"chat_id": "abc123"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertNotIn("/mnt/user-data/uploads", body)
+        self.assertNotIn("/mnt/user-data/outputs", body)
+        self.assertIn("/mnt/user-data/files", body)
+        self.assertIn("/home/assistant", body)
+        self.assertRegex(
+            body,
+            r"(?is)/mnt/user-data/files.{0,400}(uploaded|generated).{0,400}(uploaded|generated)",
+        )
+
+
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

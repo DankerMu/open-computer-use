@@ -115,17 +115,12 @@ def sandbox(name: str, chat_id: str, *, running=True, paused=False, chat_dir: Pa
                 },
                 {
                     "Type": "bind",
-                    "RW": False,
-                    "Source": f"{chat_root}/uploads",
-                    "Destination": "/mnt/user-data/uploads",
-                },
-                {
-                    "Type": "bind",
                     "RW": True,
                     "Source": f"{chat_root}/outputs",
-                    "Destination": "/mnt/user-data/outputs",
+                    "Destination": "/mnt/user-data/files",
                 },
             ],
+
         },
     )
 
@@ -305,7 +300,7 @@ class RecoveryCliTests(unittest.TestCase):
                     for path in (self.chat_dir, self.skills_dir)
                 ]
                 item["Config"]["Env"] = [
-                    f"USER_DATA_BASE_PATH={self.chat_dir}", f"BASE_DATA_DIR={self.chat_dir}",
+                    f"BASE_DATA_DIR={self.chat_dir}",
                     f"SKILLS_CACHE_DIR={self.skills_dir}", f"SKILLS_CACHE_HOST_PATH={self.skills_dir}",
                 ]
             elif service in ("open-webui", "open-webui-init", "postgres"):
@@ -520,7 +515,7 @@ class RecoveryCliTests(unittest.TestCase):
                         for value in server["Config"]["Env"]
                     ]
                 elif defect == "environment":
-                    server["Config"]["Env"][0] = f"USER_DATA_BASE_PATH={wrong_chat}"
+                    server["Config"]["Env"][0] = f"BASE_DATA_DIR={wrong_chat}"
                 elif defect == "missing-chat":
                     server["Mounts"].pop(0)
                 elif defect == "duplicate-skills":
@@ -917,10 +912,12 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertNotIn(foreign["Id"], stopped)
 
     def test_same_chat_without_mounts_is_not_attributed(self):
-        extra = sandbox(f"owui-chat-{CHAT_ID}-foreign", CHAT_ID, chat_dir=self.chat_dir)
-        extra["Mounts"] = []
-        extra["Id"] = "foreign-no-mounts"
-        self._seed_volumes_and_db(extra_containers=[extra])
+        self._seed_volumes_and_db()
+        path = self.state / "containers.json"
+        containers = json.loads(path.read_text(encoding="utf-8"))
+        canonical = next(item for item in containers if item["Name"] == f"owui-chat-{CHAT_ID}")
+        canonical["Mounts"] = []
+        path.write_text(json.dumps(containers), encoding="utf-8")
         dest = self.root / "backup-no-mounts"
         result = self.run_cli(
             [
@@ -936,10 +933,60 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(dest.exists())
         containers = json.loads((self.state / "containers.json").read_text(encoding="utf-8"))
-        foreign = next(item for item in containers if item["Name"] == extra["Name"])
-        self.assertTrue(foreign["State"]["Running"])
+        sandbox_row = next(item for item in containers if item["Name"] == f"owui-chat-{CHAT_ID}")
+        self.assertTrue(sandbox_row["State"]["Running"])
         stopped = (self.state / "stopped.log").read_text(encoding="utf-8") if (self.state / "stopped.log").exists() else ""
-        self.assertNotIn(foreign["Id"], stopped)
+        self.assertNotIn(sandbox_row["Id"], stopped)
+
+    def test_legacy_uploads_outputs_binds_are_not_attributed(self):
+        self._seed_volumes_and_db()
+        path = self.state / "containers.json"
+        containers = json.loads(path.read_text(encoding="utf-8"))
+        canonical = next(item for item in containers if item["Name"] == f"owui-chat-{CHAT_ID}")
+        chat_root = str(self.chat_dir / CHAT_ID)
+        canonical["Mounts"] = [
+            {
+                "Type": "volume",
+                "RW": True,
+                "Name": f"chat-{CHAT_ID}-workspace",
+                "Source": f"chat-{CHAT_ID}-workspace",
+                "Destination": "/home/assistant",
+            },
+            {
+                "Type": "bind",
+                "RW": False,
+                "Source": f"{chat_root}/uploads",
+                "Destination": "/mnt/user-data/uploads",
+            },
+            {
+                "Type": "bind",
+                "RW": True,
+                "Source": f"{chat_root}/outputs",
+                "Destination": "/mnt/user-data/outputs",
+            },
+        ]
+        path.write_text(json.dumps(containers), encoding="utf-8")
+        dest = self.root / "backup-legacy-binds"
+        result = self.run_cli(
+            [
+                "backup",
+                "--deploy-root",
+                str(self.deploy_root),
+                "--destination",
+                str(dest),
+                "--runtime-file",
+                str(self.runtime),
+            ]
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(dest.exists())
+        containers = json.loads((self.state / "containers.json").read_text(encoding="utf-8"))
+        sandbox_row = next(item for item in containers if item["Name"] == f"owui-chat-{CHAT_ID}")
+        self.assertTrue(sandbox_row["State"]["Running"])
+        stopped = (self.state / "stopped.log").read_text(encoding="utf-8") if (self.state / "stopped.log").exists() else ""
+        self.assertNotIn(sandbox_row["Id"], stopped)
+
+
 
     def test_swapped_workspace_archives_reject_before_allocation(self):
         other = "chat-other"

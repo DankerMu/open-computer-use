@@ -366,7 +366,6 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", "ocu-test-internal-token")
     monkeypatch.setenv("PUBLIC_BASE_URL", "/ocu")
     monkeypatch.setenv("BASE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("USER_DATA_BASE_PATH", str(tmp_path / "user-data"))
     monkeypatch.setenv("DOCKER_IMAGE", "python:3.12-slim")
     monkeypatch.delenv("OCU_SANDBOX_NO_AUTOSTART", raising=False)
     monkeypatch.delenv("SUBAGENT_CLI", raising=False)
@@ -374,7 +373,6 @@ def world(monkeypatch, tmp_path):
     import docker_manager
 
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
-    docker_manager.USER_DATA_BASE_PATH = str(tmp_path / "user-data")
     monkeypatch.setattr(docker_manager, "DOCKER_IMAGE", "python:3.12-slim")
     monkeypatch.setattr(docker_manager, "SUBAGENT_CLI", "claude")
     monkeypatch.setattr(docker_manager, "ENABLE_NETWORK", True)
@@ -864,7 +862,7 @@ def test_repair_revalidates_refreshed_gateway_before_start(world):
         networks={COMPOSE_NAME: {"NetworkID": COMPOSE_ID, "IPAddress": "172.18.0.9"}},
     )
     _meta(docker_manager)
-    workspace = Path(docker_manager.USER_DATA_BASE_PATH) / CHAT
+    workspace = Path(docker_manager.BASE_DATA_DIR) / CHAT
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "layer").write_text("keep")
     replacement = FakeNetwork(client, NETWORK_NAME, "netid-ocu-sandbox-g2", gateway="172.31.9.1")
@@ -997,7 +995,7 @@ def test_missing_mixed_and_wrong_bindings_fail_without_start(world):
     assert wrong.status == "exited"
     assert wrong._started["n"] == 0
     assert wrong._removed["value"] is False
-    workspace = Path(docker_manager.USER_DATA_BASE_PATH) / CHAT
+    workspace = Path(docker_manager.BASE_DATA_DIR) / CHAT
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "layer").write_text("keep")
     meta = _meta(docker_manager)
@@ -1161,7 +1159,7 @@ def test_missing_stale_network_object_fails_without_start_or_forged_inspect(worl
         networks={NETWORK_NAME: {"NetworkID": STALE_ID, "IPAddress": "172.31.0.10"}},
     )
     _meta(docker_manager)
-    workspace = Path(docker_manager.USER_DATA_BASE_PATH) / CHAT
+    workspace = Path(docker_manager.BASE_DATA_DIR) / CHAT
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "layer").write_text("keep")
     meta = docker_manager._get_meta_path(CHAT)
@@ -1358,7 +1356,7 @@ def test_launch_refuses_incompatible_dns_before_mutation(world, monkeypatch, sta
     docker_manager, client, tmp = world
     _policy(monkeypatch, docker_manager, "8.8.8.8")
     _meta(docker_manager)
-    workspace = Path(docker_manager.USER_DATA_BASE_PATH) / CHAT
+    workspace = Path(docker_manager.BASE_DATA_DIR) / CHAT
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "layer").write_text("keep")
     meta_bytes = docker_manager._get_meta_path(CHAT).read_bytes()
