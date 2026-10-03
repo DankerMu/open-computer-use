@@ -926,3 +926,257 @@ def test_deep_directory_tree_is_traversed_without_recursion_error(world):
     assert listing["entries"][0]["path"].endswith("/leaf.txt")
 
 
+_PROCESS_RESOLVE_WHILE_LOCKED = r'''
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+os.environ["DOCKER_HOST"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
+os.environ["DOCKER_SOCKET"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
+
+import outputs_broker
+
+started = Path(os.environ["OCU_STARTED"])
+started.write_text("1", encoding="utf-8")
+path = outputs_broker.OutputsBroker().resolve_file_id(os.environ["OCU_CHAT"], os.environ["OCU_FILE_ID"])
+Path(os.environ["OCU_RESULT"]).write_text(json.dumps({"path": path}), encoding="utf-8")
+print(json.dumps({"path": path}))
+'''
+
+
+def test_active_nested_file_id_resolves_without_mutating_index(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    _put(data, "docs/report.docx", b"nested-report")
+    listing = broker.reconcile(CHAT)
+    file_id = _entry_by_path(listing, "docs/report.docx")["file_id"]
+    before_bytes = _index(data).read_bytes()
+    before_counter = _read_index(data)["counter"]
+
+    assert broker.resolve_file_id(CHAT, file_id) == "docs/report.docx"
+    assert _index(data).read_bytes() == before_bytes
+    assert _read_index(data)["counter"] == before_counter
+    assert before_counter == listing["revision"]
+
+
+def test_recorded_rename_is_followed_and_unrecorded_rename_keeps_indexed_path(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    old = _put(data, "report.docx", b"rename-body")
+    listing = broker.reconcile(CHAT)
+    file_id = _entry_by_path(listing, "report.docx")["file_id"]
+
+    old.rename(_outputs(data) / "final.docx")
+    assert broker.resolve_file_id(CHAT, file_id) == "report.docx"
+
+    recorded = broker.reconcile(CHAT)
+    assert _entry_by_path(recorded, "final.docx")["file_id"] == file_id
+    before_bytes = _index(data).read_bytes()
+    assert broker.resolve_file_id(CHAT, file_id) == "final.docx"
+    assert _index(data).read_bytes() == before_bytes
+    assert _read_index(data)["counter"] == recorded["revision"]
+
+
+def test_tombstoned_id_fails_after_path_reuse(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    path = _put(data, "report.docx", b"original")
+    listing = broker.reconcile(CHAT)
+    old_id = _entry_by_path(listing, "report.docx")["file_id"]
+
+    path.unlink()
+    broker.reconcile(CHAT)
+    _put(data, "report.docx", b"replacement")
+    reused = broker.reconcile(CHAT)
+    new_id = _entry_by_path(reused, "report.docx")["file_id"]
+    before_bytes = _index(data).read_bytes()
+
+    assert new_id != old_id
+    assert old_id in _read_index(data)["tombstones"]
+    with pytest.raises(broker_module.FileIdNotFoundError):
+        broker.resolve_file_id(CHAT, old_id)
+    assert broker.resolve_file_id(CHAT, new_id) == "report.docx"
+    assert _index(data).read_bytes() == before_bytes
+
+
+def test_unknown_malformed_and_missing_index_fail_without_creating_index(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    unknown = "11111111-1111-4111-8111-111111111111"
+    malformed = "not-a-uuid"
+
+    with pytest.raises(broker_module.FileIdNotFoundError):
+        broker.resolve_file_id(CHAT, unknown)
+    with pytest.raises(broker_module.FileIdNotFoundError):
+        broker.resolve_file_id(CHAT, malformed)
+    assert not _index(data).exists()
+
+    _put(data, "report.docx", b"indexed")
+    listing = broker.reconcile(CHAT)
+    live_id = _entry_by_path(listing, "report.docx")["file_id"]
+    before_bytes = _index(data).read_bytes()
+    with pytest.raises(broker_module.FileIdNotFoundError):
+        broker.resolve_file_id(CHAT, unknown)
+    with pytest.raises(broker_module.FileIdNotFoundError):
+        broker.resolve_file_id(CHAT, malformed)
+    with pytest.raises(broker_module.FileIdNotFoundError):
+        broker.resolve_file_id(CHAT, live_id.upper())
+    assert _index(data).read_bytes() == before_bytes
+
+
+def test_corrupt_and_unreadable_indexes_retain_corruption_errors_without_mutation(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    _put(data, "report.docx", b"indexed")
+    listing = broker.reconcile(CHAT)
+    file_id = _entry_by_path(listing, "report.docx")["file_id"]
+    index_path = _index(data)
+    encoded_valid = index_path.read_bytes()
+
+    broken = b"{broken-json"
+    index_path.write_bytes(broken)
+    with pytest.raises(broker_module.CorruptIndexError):
+        broker.resolve_file_id(CHAT, file_id)
+    assert index_path.read_bytes() == broken
+
+    malformed = {
+        "schema_version": 1,
+        "counter": 1,
+        "active": {},
+        "fingerprints": {},
+        "tombstones": {"00000000-0000-4000-8000-000000000000": []},
+    }
+    encoded_malformed = json.dumps(malformed)
+    index_path.write_text(encoded_malformed, encoding="utf-8")
+    with pytest.raises(broker_module.CorruptIndexError):
+        broker.resolve_file_id(CHAT, file_id)
+    assert index_path.read_text(encoding="utf-8") == encoded_malformed
+
+    index_path.write_bytes(encoded_valid)
+    original_mode = index_path.stat().st_mode
+    os.chmod(index_path, 0)
+    try:
+        with pytest.raises(broker_module.UnstableReadError, match="cannot safely open broker index") as raised:
+            broker.resolve_file_id(CHAT, file_id)
+        assert not isinstance(raised.value, broker_module.FileIdNotFoundError)
+        assert not isinstance(raised.value, broker_module.CorruptIndexError)
+    finally:
+        os.chmod(index_path, original_mode)
+    assert index_path.read_bytes() == encoded_valid
+
+
+def test_resolution_opens_no_workspace_content_and_never_contacts_docker(world, monkeypatch):
+    """Resolution has one Docker-free path; sandbox stopped/paused/absent are not distinct branches."""
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    path = _put(data, "docs/report.docx", b"do-not-read")
+    listing = broker.reconcile(CHAT)
+    file_id = _entry_by_path(listing, "docs/report.docx")["file_id"]
+    identity = (path.stat().st_dev, path.stat().st_ino)
+    original_read = broker_module.os.read
+    original_scandir = broker_module.os.scandir
+    content_reads = {"count": 0}
+    workspace_scans = {"count": 0}
+    output_dir = _outputs(data)
+
+    def count_output_reads(fd, count):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == identity:
+            content_reads["count"] += 1
+        return original_read(fd, count)
+
+    def count_workspace_scans(target, *args, **kwargs):
+        if isinstance(target, int):
+            info = os.fstat(target)
+            directory = os.stat(output_dir)
+            if (info.st_dev, info.st_ino) == (directory.st_dev, directory.st_ino):
+                workspace_scans["count"] += 1
+        return original_scandir(target, *args, **kwargs)
+
+    def forbidden_docker(*_args, **_kwargs):
+        raise AssertionError("file-id resolution must not contact Docker")
+
+    monkeypatch.setattr(broker_module.os, "read", count_output_reads)
+    monkeypatch.setattr(broker_module.os, "scandir", count_workspace_scans)
+    monkeypatch.setattr(docker_manager, "get_docker_client", forbidden_docker)
+    monkeypatch.setattr(docker_manager.docker, "DockerClient", forbidden_docker)
+    os.chmod(path, 0)
+    try:
+        assert broker.resolve_file_id(CHAT, file_id) == "docs/report.docx"
+    finally:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+
+    assert content_reads["count"] == 0
+    assert workspace_scans["count"] == 0
+
+
+def test_resolution_returns_while_same_thread_already_holds_lock(world):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    _put(data, "docs/report.docx", b"locked")
+    listing = broker.reconcile(CHAT)
+    file_id = _entry_by_path(listing, "docs/report.docx")["file_id"]
+
+    with docker_manager._combined_lock(CHAT):
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+        assert broker.resolve_file_id(CHAT, file_id) == "docs/report.docx"
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+    assert CHAT not in docker_manager._FLOCK_DEPTH
+
+
+def test_cross_process_resolution_waits_for_writer_commit_then_observes_new_path(world):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    old = _put(data, "report.docx", b"locked-rename")
+    listing = broker.reconcile(CHAT)
+    file_id = _entry_by_path(listing, "report.docx")["file_id"]
+    started = data.parent / "resolve-started"
+    result = data.parent / "resolve-result.json"
+    environment = os.environ.copy()
+    pythonpath = environment.get("PYTHONPATH", "")
+    environment.update(
+        {
+            "OCU_SERVER_DIR": str(SERVER_DIR),
+            "OCU_BASE": str(data),
+            "OCU_CHAT": CHAT,
+            "OCU_FILE_ID": file_id,
+            "OCU_STARTED": str(started),
+            "OCU_RESULT": str(result),
+            "DOCKER_HOST": NO_DOCKER_SOCKET,
+            "DOCKER_SOCKET": NO_DOCKER_SOCKET,
+            "PYTHONPATH": str(SERVER_DIR) + (os.pathsep + pythonpath if pythonpath else ""),
+        }
+    )
+
+    with docker_manager._combined_lock(CHAT):
+        child = subprocess.Popen(
+            [sys.executable, "-c", _PROCESS_RESOLVE_WHILE_LOCKED],
+            cwd=str(SERVER_DIR),
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 5
+        while not started.exists():
+            if time.monotonic() >= deadline or child.poll() is not None:
+                stdout, stderr = child.communicate(timeout=5)
+                raise AssertionError((child.returncode, stdout, stderr))
+            time.sleep(0.005)
+        assert child.poll() is None
+        assert not result.exists()
+        old.rename(_outputs(data) / "final.docx")
+        committed = broker.reconcile(CHAT)
+        assert _entry_by_path(committed, "final.docx")["file_id"] == file_id
+        assert child.poll() is None
+        assert not result.exists()
+
+    stdout, stderr = child.communicate(timeout=10)
+    assert child.returncode == 0, (stdout, stderr)
+    assert json.loads(result.read_text(encoding="utf-8")) == {"path": "final.docx"}
+    assert json.loads(stdout.strip().splitlines()[-1]) == {"path": "final.docx"}
+
+

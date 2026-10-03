@@ -51,6 +51,10 @@ class CorruptIndexError(OutputsBrokerError):
     """A persisted index is malformed or violates its schema."""
 
 
+class FileIdNotFoundError(OutputsBrokerError):
+    """No active persisted entry carries the requested file_id."""
+
+
 class LimitExceededError(OutputsBrokerError):
     """A configured filesystem, page, or index bound was exceeded."""
 
@@ -124,6 +128,20 @@ class OutputsBroker:
             self._assert_chat_root_safe(chat, allow_missing=False)
             index = self._read_index(chat)
             return 0 if index is None else index["counter"]
+
+    def resolve_file_id(self, chat_id: str, file_id: str) -> str:
+        """Return the active relative path for an exact persisted file_id."""
+        chat = self._canonical_chat(chat_id)
+        self._assert_chat_root_safe(chat, allow_missing=True)
+        with docker_manager._combined_lock(chat):
+            self._assert_chat_root_safe(chat, allow_missing=False)
+            index = self._read_index(chat)
+            if index is None:
+                raise FileIdNotFoundError("file_id is not an active persisted identity")
+            for entry in index["active"].values():
+                if entry["file_id"] == file_id:
+                    return entry["path"]
+            raise FileIdNotFoundError("file_id is not an active persisted identity")
 
     def reconcile(self, chat_id: str, *, cursor: str | None = None, limit: int = DEFAULT_PAGE_LIMIT) -> dict[str, Any]:
         """Safely reconcile one chat and return a revision-bound sorted page."""
