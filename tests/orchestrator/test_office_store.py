@@ -75,6 +75,13 @@ elif op == "crash-before-replace":
 
     store_mod.os.replace = hold
     print(json.dumps(put("documents", "lost")))
+elif op == "hold-lock":
+    def hold_then_put(state):
+        state[os.environ["OCU_COLLECTION"]][os.environ["OCU_TOKEN"]] = {"id": os.environ["OCU_TOKEN"]}
+        Path(os.environ["OCU_ENTERED"]).write_text("1", encoding="utf-8")
+        fd = os.open(os.environ["OCU_HOLD"], os.O_RDONLY)
+        os.close(fd)
+    print(json.dumps(store.update(chat, hold_then_put)))
 elif op == "wait-lock":
     original_flock = fcntl.flock
 
@@ -179,6 +186,40 @@ def _stop_child(child) -> None:
         child.wait(timeout=5)
 
 
+def _start_child(data: Path, **extra: str):
+    return subprocess.Popen(
+        [sys.executable, "-c", _PROCESS],
+        cwd=str(SERVER_DIR),
+        env=_child_env(data, **extra),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _wait_marker(path: Path, child, label: str) -> None:
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        if time.monotonic() >= deadline or child.poll() is not None:
+            raise AssertionError((label, child.poll()))
+        time.sleep(0.005)
+
+
+def _inode(path: Path) -> tuple[int, int]:
+    info = path.stat()
+    return info.st_dev, info.st_ino
+
+
+def _role_inodes(data: Path) -> dict[str, tuple[int, int]]:
+    office = _state(data).parent
+    return {
+        "base": _inode(data),
+        "root": _inode(data / CHAT),
+        "ocu": _inode(data / CHAT / ".ocu"),
+        "office": _inode(office),
+    }
+
+
 def _seed(store_mod, token: str = "seed") -> dict:
     def mutate(state):
         state["documents"][token] = {"id": token}
@@ -222,12 +263,50 @@ def test_first_update_is_confined_to_own_chat_and_absent_from_workspace(world):
 def test_two_workers_retain_independent_updates_in_both_orders(world, order):
     store_mod, _docker_manager, data = world
     first, second = order
-    _run_child(data, OCU_CHILD_OP="update", OCU_COLLECTION=first, OCU_TOKEN="one")
-    _run_child(data, OCU_CHILD_OP="update", OCU_COLLECTION=second, OCU_TOKEN="two")
-    persisted = _run_child(data, OCU_CHILD_OP="read")
-    assert persisted[first]["one"] == {"id": "one"}
-    assert persisted[second]["two"] == {"id": "two"}
-    assert store_mod.OfficeStore().read(CHAT) == persisted
+    hold = data.parent / f"office-overlap-hold-{first}"
+    entered = data.parent / f"office-overlap-entered-{first}"
+    contended = data.parent / f"office-overlap-contended-{first}"
+    os.mkfifo(hold)
+    holder = waiter = None
+    try:
+        holder = _start_child(
+            data,
+            OCU_CHILD_OP="hold-lock",
+            OCU_COLLECTION=first,
+            OCU_TOKEN="one",
+            OCU_ENTERED=str(entered),
+            OCU_HOLD=str(hold),
+        )
+        _wait_marker(entered, holder, "holder did not enter the mutator under the lock")
+        waiter = _start_child(
+            data,
+            OCU_CHILD_OP="wait-lock",
+            OCU_COLLECTION=second,
+            OCU_TOKEN="two",
+            OCU_CONTENDED=str(contended),
+            OCU_LOCK_DENIAL="office lock was granted without contention",
+        )
+        _wait_marker(contended, waiter, "waiter did not observe LOCK_NB denial")
+        assert holder.poll() is None
+        assert waiter.poll() is None
+        os.close(os.open(hold, os.O_WRONLY))
+        holder_out, holder_err = holder.communicate(timeout=10)
+        waiter_out, waiter_err = waiter.communicate(timeout=10)
+        assert holder.returncode == 0, (holder_out, holder_err)
+        assert waiter.returncode == 0, (waiter_out, waiter_err)
+        first_state = json.loads(holder_out.strip().splitlines()[-1])
+        second_state = json.loads(waiter_out.strip().splitlines()[-1])
+        assert first_state[first]["one"] == {"id": "one"}
+        assert "two" not in first_state.get(second, {})
+        assert second_state[first]["one"] == {"id": "one"}
+        assert second_state[second]["two"] == {"id": "two"}
+        persisted = _run_child(data, OCU_CHILD_OP="read")
+        assert persisted[first]["one"] == {"id": "one"}
+        assert persisted[second]["two"] == {"id": "two"}
+        assert store_mod.OfficeStore().read(CHAT) == persisted
+    finally:
+        _stop_child(holder)
+        _stop_child(waiter)
 
 
 def test_fresh_process_reads_exact_committed_state(world):
@@ -257,28 +336,15 @@ def test_update_waits_for_canonical_lock_after_real_lock_nb_denial(world):
     child = None
     try:
         with docker_manager._combined_lock(CHAT):
-            child = subprocess.Popen(
-                [sys.executable, "-c", _PROCESS],
-                cwd=str(SERVER_DIR),
-                env=_child_env(
-                    data,
-                    OCU_CHILD_OP="wait-lock",
-                    OCU_COLLECTION="sessions",
-                    OCU_TOKEN="waiter",
-                    OCU_CONTENDED=str(contended),
-                    OCU_LOCK_DENIAL="office lock was granted without contention",
-                ),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            child = _start_child(
+                data,
+                OCU_CHILD_OP="wait-lock",
+                OCU_COLLECTION="sessions",
+                OCU_TOKEN="waiter",
+                OCU_CONTENDED=str(contended),
+                OCU_LOCK_DENIAL="office lock was granted without contention",
             )
-            deadline = time.monotonic() + 5
-            while not contended.exists():
-                if time.monotonic() >= deadline or child.poll() is not None:
-                    raise AssertionError(
-                        ("update did not contend for the lifecycle flock", child.poll())
-                    )
-                time.sleep(0.005)
+            _wait_marker(contended, child, "update did not contend for the lifecycle flock")
             assert child.poll() is None
             store_mod.OfficeStore().update(
                 CHAT, lambda state: state["receipts"].__setitem__("r1", {"ok": True})
@@ -351,6 +417,121 @@ def test_eacces_on_state_file_is_corrupt_for_read_and_update(world, monkeypatch)
     assert path.read_bytes() == before
 
 
+def _assert_storage_oserror_is_corrupt(store_mod, data, inject):
+    _seed(store_mod, "deny")
+    path = _state(data)
+    before = path.read_bytes()
+    inject()
+    store = store_mod.OfficeStore()
+    with pytest.raises(store_mod.StateCorruptError) as read_error:
+        store.read(CHAT)
+    assert isinstance(read_error.value.__cause__, OSError)
+    assert read_error.value.__cause__.errno == errno.EIO
+    with pytest.raises(store_mod.StateCorruptError) as update_error:
+        store.update(CHAT, lambda state: state["sessions"].__setitem__("lost", {"id": "lost"}))
+    assert isinstance(update_error.value.__cause__, OSError)
+    assert update_error.value.__cause__.errno == errno.EIO
+    assert path.read_bytes() == before
+    assert not list(path.parent.glob("*.tmp"))
+
+
+def test_eio_on_state_read_is_corrupt_for_read_and_update(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    path = _state(data)
+    original_read = store_mod.os.read
+
+    def fail_state_read(fd, n):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == (path.stat().st_dev, path.stat().st_ino):
+            raise OSError(errno.EIO, "injected state read fault")
+        return original_read(fd, n)
+
+    def inject():
+        monkeypatch.setattr(store_mod.os, "read", fail_state_read)
+
+    _assert_storage_oserror_is_corrupt(store_mod, data, inject)
+
+
+def test_eio_on_state_lstat_is_corrupt_for_read_and_update(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    path = _state(data)
+    original_lstat = store_mod.os.lstat
+
+    def fail_state_lstat(name, *args, dir_fd=None, **kwargs):
+        if dir_fd is not None and name == "state.json":
+            raise OSError(errno.EIO, "injected state lstat fault")
+        return original_lstat(name, *args, dir_fd=dir_fd, **kwargs)
+
+    def inject():
+        monkeypatch.setattr(store_mod.os, "lstat", fail_state_lstat)
+
+    _assert_storage_oserror_is_corrupt(store_mod, data, inject)
+
+
+def test_eio_on_state_fstat_is_corrupt_for_read_and_update(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    path = _state(data)
+    original_fstat = store_mod.os.fstat
+
+    def fail_state_fstat(fd):
+        info = original_fstat(fd)
+        if (info.st_dev, info.st_ino) == (path.stat().st_dev, path.stat().st_ino):
+            raise OSError(errno.EIO, "injected state fstat fault")
+        return info
+
+    def inject():
+        monkeypatch.setattr(store_mod.os, "fstat", fail_state_fstat)
+
+    _assert_storage_oserror_is_corrupt(store_mod, data, inject)
+
+
+def test_eio_on_root_lstat_is_corrupt_for_read_and_update(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    root = data / CHAT
+    original_lstat = store_mod.os.lstat
+
+    def fail_root_lstat(name, *args, dir_fd=None, **kwargs):
+        if dir_fd is None and Path(name) == root:
+            raise OSError(errno.EIO, "injected root lstat fault")
+        return original_lstat(name, *args, dir_fd=dir_fd, **kwargs)
+
+    def inject():
+        monkeypatch.setattr(store_mod.os, "lstat", fail_root_lstat)
+
+    _assert_storage_oserror_is_corrupt(store_mod, data, inject)
+
+
+def test_eio_on_control_lstat_is_corrupt_for_read_and_update(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    original_lstat = store_mod.os.lstat
+
+    def fail_control_lstat(name, *args, dir_fd=None, **kwargs):
+        if dir_fd is not None and name in {".ocu", "office"}:
+            raise OSError(errno.EIO, "injected control lstat fault")
+        return original_lstat(name, *args, dir_fd=dir_fd, **kwargs)
+
+    def inject():
+        monkeypatch.setattr(store_mod.os, "lstat", fail_control_lstat)
+
+    _assert_storage_oserror_is_corrupt(store_mod, data, inject)
+
+
+def test_eio_on_data_root_open_is_corrupt_for_read_and_update(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    original_open = store_mod.os.open
+
+    def fail_data_root_open(name, flags, *args, **kwargs):
+        if kwargs.get("dir_fd") is None and Path(name) == data:
+            raise OSError(errno.EIO, "injected data root open fault")
+        return original_open(name, flags, *args, **kwargs)
+
+    def inject():
+        monkeypatch.setattr(store_mod.os, "open", fail_data_root_open)
+
+    _assert_storage_oserror_is_corrupt(store_mod, data, inject)
+
+
+
 def test_invalid_and_raising_mutators_leave_predecessor_intact(world):
     store_mod, _docker_manager, data = world
     _seed(store_mod, "keep")
@@ -409,24 +590,13 @@ def test_killed_child_after_successor_fsync_before_replace_retains_predecessor(w
     seam = data.parent / "office-seam"
     child = None
     try:
-        child = subprocess.Popen(
-            [sys.executable, "-c", _PROCESS],
-            cwd=str(SERVER_DIR),
-            env=_child_env(
-                data,
-                OCU_CHILD_OP="crash-before-replace",
-                OCU_SEAM=str(seam),
-                OCU_HOLD=str(hold),
-            ),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        child = _start_child(
+            data,
+            OCU_CHILD_OP="crash-before-replace",
+            OCU_SEAM=str(seam),
+            OCU_HOLD=str(hold),
         )
-        deadline = time.monotonic() + 5
-        while not seam.exists():
-            if time.monotonic() >= deadline or child.poll() is not None:
-                raise AssertionError(("child did not reach pre-replace seam", child.poll()))
-            time.sleep(0.005)
+        _wait_marker(seam, child, "child did not reach pre-replace seam")
         assert child.poll() is None
         child.kill()
         child.wait(timeout=5)
@@ -441,15 +611,17 @@ def test_post_replace_directory_fsync_failure_reports_complete_successor(world, 
     store_mod, _docker_manager, data = world
     _seed(store_mod, "keep")
     before = _state(data).read_bytes()
+    office = _inode(_state(data).parent)
     original_fsync = store_mod.os.fsync
 
-    def fail_directory_sync(fd):
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
+    def fail_leaf_directory_sync(fd):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == office:
             raise OSError("controlled directory fsync failure")
         return original_fsync(fd)
 
     with monkeypatch.context() as patches:
-        patches.setattr(store_mod.os, "fsync", fail_directory_sync)
+        patches.setattr(store_mod.os, "fsync", fail_leaf_directory_sync)
         with pytest.raises(store_mod.StateDurabilityError, match="committed"):
             store_mod.OfficeStore().update(
                 CHAT, lambda state: state["sessions"].__setitem__("live", {"id": "live"})
@@ -489,3 +661,100 @@ def test_symlinked_state_and_control_paths_leave_external_sentinel_unchanged(wor
         store_mod.OfficeStore().update(dir_chat, lambda state: None)
     assert (outside / "secret.txt").read_bytes() == b"SECRET-DIR"
     assert list(outside.iterdir()) == [outside / "secret.txt"]
+
+
+def _record_fsync_roles(store_mod, data, original_fsync, fail_role=None):
+    observed = []
+
+    def spy(fd):
+        info = os.fstat(fd)
+        identity = (info.st_dev, info.st_ino)
+        if not stat.S_ISDIR(info.st_mode):
+            observed.append("temp")
+            return original_fsync(fd)
+        roles = _role_inodes(data)
+        for role, inode in roles.items():
+            if identity == inode:
+                observed.append(role)
+                if role == fail_role:
+                    raise OSError(errno.EIO, f"injected {role} fsync fault")
+                return original_fsync(fd)
+        raise AssertionError(("unexpected fsync descriptor", identity, roles))
+
+    return observed, spy
+
+
+def test_first_update_syncs_owned_directory_ancestry_before_success(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    data.mkdir(exist_ok=True)
+    original_fsync = store_mod.os.fsync
+    observed, spy = _record_fsync_roles(store_mod, data, original_fsync)
+    monkeypatch.setattr(store_mod.os, "fsync", spy)
+    store_mod.OfficeStore().update(CHAT, lambda state: state["documents"].__setitem__("first", {"id": "first"}))
+    assert observed == ["temp", "base", "root", "ocu", "office"]
+    persisted = _run_child(data, OCU_CHILD_OP="read")
+    assert persisted["documents"]["first"] == {"id": "first"}
+
+
+@pytest.mark.parametrize("role", ["base", "root", "ocu"])
+def test_pre_replace_ancestor_sync_failure_keeps_predecessor_and_retries_existing_dirs(world, monkeypatch, role):
+    store_mod, _docker_manager, data = world
+    _seed(store_mod, "keep")
+    before = _state(data).read_bytes()
+    original_fsync = store_mod.os.fsync
+    failed, fail_spy = _record_fsync_roles(store_mod, data, original_fsync, fail_role=role)
+    with monkeypatch.context() as patches:
+        patches.setattr(store_mod.os, "fsync", fail_spy)
+        with pytest.raises(OSError) as error:
+            store_mod.OfficeStore().update(
+                CHAT, lambda state: state["sessions"].__setitem__("lost", {"id": "lost"})
+            )
+    assert error.value.errno == errno.EIO
+    assert role in failed
+    assert "office" not in failed
+    assert _state(data).read_bytes() == before
+    assert not list(_state(data).parent.glob("*.tmp"))
+
+    retried, retry_spy = _record_fsync_roles(store_mod, data, original_fsync)
+    monkeypatch.setattr(store_mod.os, "fsync", retry_spy)
+    snapshot = store_mod.OfficeStore().update(
+        CHAT, lambda state: state["sessions"].__setitem__("kept", {"id": "kept"})
+    )
+    assert retried == ["temp", "base", "root", "ocu", "office"]
+    assert snapshot["documents"]["keep"] == {"id": "keep"}
+    assert snapshot["sessions"]["kept"] == {"id": "kept"}
+    assert _run_child(data, OCU_CHILD_OP="read") == snapshot
+
+
+def test_symlinked_and_regular_file_chat_roots_leave_outside_lock_and_sentinel_unchanged(world):
+    store_mod, _docker_manager, data = world
+    sentinel = data.parent / "root-sentinel"
+    sentinel.write_bytes(b"ROOT-SECRET")
+    outside = data.parent / "outside-chat-root"
+    outside.mkdir()
+    (outside / "secret.txt").write_bytes(b"ROOT-DIR")
+
+    linked_chat = "e5f6a7b8-c9d0-1234-efab-567890123456"
+    data.mkdir(exist_ok=True)
+    os.symlink(outside, data / linked_chat)
+    store = store_mod.OfficeStore()
+    with pytest.raises(store_mod.StateCorruptError):
+        store.read(linked_chat)
+    with pytest.raises(store_mod.StateCorruptError):
+        store.update(linked_chat, lambda state: None)
+    assert not (outside / ".lifecycle.lock").exists()
+    assert (outside / "secret.txt").read_bytes() == b"ROOT-DIR"
+    assert list(outside.iterdir()) == [outside / "secret.txt"]
+    assert sentinel.read_bytes() == b"ROOT-SECRET"
+
+    file_chat = "f6a7b8c9-d0e1-2345-fabc-678901234567"
+    target = data / file_chat
+    target.write_bytes(b"NOT-A-DIRECTORY")
+    with pytest.raises(store_mod.StateCorruptError):
+        store.read(file_chat)
+    with pytest.raises(store_mod.StateCorruptError):
+        store.update(file_chat, lambda state: None)
+    assert target.read_bytes() == b"NOT-A-DIRECTORY"
+    assert not target.is_dir()
+    assert not (data / ".lifecycle.lock").exists()
+    assert sentinel.read_bytes() == b"ROOT-SECRET"

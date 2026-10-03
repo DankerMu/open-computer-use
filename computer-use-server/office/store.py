@@ -21,6 +21,7 @@ _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _CLOSE_ON_EXEC = getattr(os, "O_CLOEXEC", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | _DIRECTORY | _NO_FOLLOW | _CLOSE_ON_EXEC
+_DATA_ROOT_FLAGS = os.O_RDONLY | _DIRECTORY | _CLOSE_ON_EXEC
 _FILE_FLAGS = os.O_RDONLY | _NO_FOLLOW | _NONBLOCK | _CLOSE_ON_EXEC
 _WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NO_FOLLOW | _CLOSE_ON_EXEC
 
@@ -71,62 +72,82 @@ class OfficeStore:
             if allow_missing:
                 return
             raise StateCorruptError(f"chat control root is missing: {root}") from None
+        except OSError as exc:
+            raise StateCorruptError(f"cannot safely inspect chat control root: {root}") from exc
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise StateCorruptError(f"chat control root is not a safe directory: {root}")
 
     def _load(self, chat: str, *, create: bool) -> dict[str, Any] | None:
-        office_fd = self._office_fd(chat, create=create)
-        if office_fd is None:
+        opened = self._open_tree(chat, create=create)
+        if opened is None:
             return None
+        base_fd, root_fd, ocu_fd, office_fd = opened
         try:
             try:
                 info = os.lstat("state.json", dir_fd=office_fd)
             except FileNotFoundError:
                 return None
+            except OSError as exc:
+                raise StateCorruptError("office state is unreadable") from exc
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                 raise StateCorruptError("office state is not a regular file")
             try:
                 state_fd = os.open("state.json", _FILE_FLAGS, dir_fd=office_fd)
-            except OSError as exc:
-                raise StateCorruptError("office state is unreadable") from exc
+            except OSError as extra:
+                raise StateCorruptError("office state is unreadable") from extra
             try:
-                opened = os.fstat(state_fd)
-                if not stat.S_ISREG(opened.st_mode):
-                    raise StateCorruptError("office state is not a regular file")
-                encoded = self._read_all(state_fd)
+                try:
+                    opened_info = os.fstat(state_fd)
+                    if not stat.S_ISREG(opened_info.st_mode):
+                        raise StateCorruptError("office state is not a regular file")
+                    encoded = self._read_all(state_fd)
+                except OSError as extra:
+                    raise StateCorruptError("office state is unreadable") from extra
             finally:
                 os.close(state_fd)
         finally:
             os.close(office_fd)
+            os.close(ocu_fd)
+            os.close(root_fd)
+            os.close(base_fd)
         try:
             parsed = json.loads(encoded.decode("utf-8"), parse_constant=_reject_constant)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            raise StateCorruptError("office state is not valid UTF-8 JSON") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as extra:
+            raise StateCorruptError("office state is not valid UTF-8 JSON") from extra
         try:
             self._validate(parsed)
-        except ValueError as exc:
-            raise StateCorruptError(str(exc)) from exc
+        except ValueError as extra:
+            raise StateCorruptError(str(extra)) from extra
         return parsed
 
-    def _office_fd(self, chat: str, *, create: bool) -> int | None:
-        root = self._chat_root(chat)
+    def _open_tree(self, chat: str, *, create: bool) -> tuple[int, int, int, int] | None:
+        base = str(docker_manager.BASE_DATA_DIR)
         try:
-            root_fd = os.open(root, _DIRECTORY_FLAGS)
-        except OSError as exc:
-            raise StateCorruptError(f"cannot safely open chat control root: {root}") from exc
+            base_fd = os.open(base, _DATA_ROOT_FLAGS)
+        except OSError as extra:
+            raise StateCorruptError(f"cannot safely open data root: {base}") from extra
+        root_fd = ocu_fd = office_fd = None
         try:
-            ocu_fd = self._open_dir(".ocu", dir_fd=root_fd, create=create, label="office control directory")
+            root_fd = self._open_dir(chat, dir_fd=base_fd, create=False, label="chat control root")
+            if root_fd is None:
+                raise StateCorruptError(f"chat control root is missing: {self._chat_root(chat)}") from None
+            ocu_fd = self._open_dir(
+                ".ocu", dir_fd=root_fd, create=create, label="office control directory"
+            )
             if ocu_fd is None:
                 return None
-            try:
-                office_fd = self._open_dir(
-                    "office", dir_fd=ocu_fd, create=create, label="office state directory"
-                )
-            finally:
-                os.close(ocu_fd)
-            return office_fd
+            office_fd = self._open_dir(
+                "office", dir_fd=ocu_fd, create=create, label="office state directory"
+            )
+            if office_fd is None:
+                return None
+            held = (base_fd, root_fd, ocu_fd, office_fd)
+            base_fd = root_fd = ocu_fd = office_fd = None
+            return held
         finally:
-            os.close(root_fd)
+            for fd in (office_fd, ocu_fd, root_fd, base_fd):
+                if fd is not None:
+                    os.close(fd)
 
     def _open_dir(self, name: str, *, dir_fd: int, create: bool, label: str) -> int | None:
         try:
@@ -138,17 +159,23 @@ class OfficeStore:
                 os.mkdir(name, 0o700, dir_fd=dir_fd)
             except FileExistsError:
                 pass
-            info = os.lstat(name, dir_fd=dir_fd)
+            try:
+                info = os.lstat(name, dir_fd=dir_fd)
+            except OSError as extra:
+                raise StateCorruptError(f"{label} is not a safe directory") from extra
+        except OSError as extra:
+            raise StateCorruptError(f"{label} is not a safe directory") from extra
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise StateCorruptError(f"{label} is not a safe directory")
         try:
             return os.open(name, _DIRECTORY_FLAGS, dir_fd=dir_fd)
-        except OSError as exc:
-            raise StateCorruptError(f"{label} is not a safe directory") from exc
+        except OSError as extra:
+            raise StateCorruptError(f"{label} is not a safe directory") from extra
 
     def _write_state(self, chat: str, encoded: bytes) -> None:
-        office_fd = self._office_fd(chat, create=True)
-        assert office_fd is not None
+        opened = self._open_tree(chat, create=True)
+        assert opened is not None
+        base_fd, root_fd, ocu_fd, office_fd = opened
         temporary = f".state.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         committed = False
         try:
@@ -156,6 +183,8 @@ class OfficeStore:
                 existing = os.lstat("state.json", dir_fd=office_fd)
             except FileNotFoundError:
                 existing = None
+            except OSError as extra:
+                raise StateCorruptError("office state is unreadable") from extra
             if existing is not None and (stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)):
                 raise StateCorruptError("office state is not a regular file")
             temporary_fd = os.open(temporary, _WRITE_FLAGS, 0o600, dir_fd=office_fd)
@@ -164,14 +193,17 @@ class OfficeStore:
                 os.fsync(temporary_fd)
             finally:
                 os.close(temporary_fd)
+            os.fsync(base_fd)
+            os.fsync(root_fd)
+            os.fsync(ocu_fd)
             os.replace(temporary, "state.json", src_dir_fd=office_fd, dst_dir_fd=office_fd)
             committed = True
             try:
                 os.fsync(office_fd)
-            except OSError as exc:
+            except OSError as extra:
                 raise StateDurabilityError(
                     "office state replacement committed but directory durability sync failed"
-                ) from exc
+                ) from extra
         except BaseException:
             if not committed:
                 try:
@@ -181,6 +213,9 @@ class OfficeStore:
             raise
         finally:
             os.close(office_fd)
+            os.close(ocu_fd)
+            os.close(root_fd)
+            os.close(base_fd)
 
     @staticmethod
     def _empty() -> dict[str, Any]:
