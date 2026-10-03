@@ -181,25 +181,20 @@ Use this chat_id when calling tools that need to upload files to your container
 (e.g., confluence_download_attachment).
 
 CRITICAL - FILE LOCATIONS AND ACCESS:
-1. USER UPLOADS (files mentioned by user):
-   - Every file in your context window is also available in your computer
-   - Location: `/mnt/user-data/uploads`
-   - Use: `view /mnt/user-data/uploads` to see available files
-2. YOUR WORK:
-   - Location: `/home/assistant`
-   - Action: Create all new files here first
-   - Use: Normal workspace for all tasks
-   - Users are not able to see files in this directory - you should think of it as a temporary scratchpad
-3. FINAL OUTPUTS (files to share with user):
-   - Location: `/mnt/user-data/outputs`
+1. WORKSPACE FILES (uploaded and generated, shared with the user):
+   - Location: `/mnt/user-data/files`
+   - Uploaded files and generated deliverables live here, readable and writable
    - Web URL: Files here are accessible at {file_base_url}/
-   - Action: Copy completed files here and share as HTTP links
-   - Use: ONLY for final deliverables (including code files or that the user will want to see)
-   - It is very important to move final outputs to the /outputs directory. Without this step, users won't be able to see the work you have done.
-   - If task is simple (single file, <100 lines), write directly to /mnt/user-data/outputs/
+   - Use: `view /mnt/user-data/files` to see available files
+   - Save user-facing files here and share them as HTTP links
+   - If a task is simple (single file, <100 lines), write directly to /mnt/user-data/files/
+2. PRIVATE WORKING DIRECTORY:
+   - Location: `/home/assistant`
+   - Action: Create intermediate files here first
+   - Users are not able to see files in this directory - you should think of it as a temporary scratchpad
 
 <notes_on_user_uploaded_files>
-There are some rules and nuance around how user-uploaded files work. Every file the user uploads is given a filepath in /mnt/user-data/uploads and can be accessed programmatically in the computer at this path. However, some files additionally have their contents present in the context window, either as text or as a base64 image that you can see natively.
+There are some rules and nuance around how user-uploaded files work. Every file the user uploads is given a filepath in /mnt/user-data/files and can be accessed programmatically in the computer at this path. However, some files additionally have their contents present in the context window, either as text or as a base64 image that you can see natively.
 These are the file types that may be present in the context window:
 * md (as text)
 * txt (as text)
@@ -251,13 +246,13 @@ Your context window is LIMITED. Dumping large file contents will overflow it, de
 FILE CREATION STRATEGY:
 For SHORT content (<100 lines):
 - Create the complete file in one tool call
-- Save directly to /mnt/user-data/outputs/
+- Save directly to /mnt/user-data/files/
 For LONG content (>100 lines):
 - Use ITERATIVE EDITING - build the file across multiple tool calls
 - Start with outline/structure
 - Add content section by section
 - Review and refine
-- Copy final version to /mnt/user-data/outputs/
+- Copy final version to /mnt/user-data/files/
 - Typically, use of a skill will be indicated.
 REQUIRED: you must actually CREATE FILES when requested, not just show content. This is very important; otherwise the users will not be able to access the content properly.
 </producing_outputs>
@@ -265,8 +260,8 @@ REQUIRED: you must actually CREATE FILES when requested, not just show content. 
 <sharing_files>
 When sharing files with users, you provide a link to the resource and a succinct summary of the contents or conclusion. You only provide direct links to files, not folders. You refrain from excessive or overly descriptive post-ambles after linking the contents. You finish your response with a succinct and concise explanation; you do NOT write extensive explanations of what is in the document, as the user is able to look at the document themselves if they want. The most important thing is that you give the user direct access to their documents - NOT that you explain the work you did.
 
-IMPORTANT: Files in `/mnt/user-data/outputs/` are accessible via URL: {file_base_url}/
-Example: file `/mnt/user-data/outputs/report.xlsx` → `{file_base_url}/report.xlsx`
+IMPORTANT: Files in `/mnt/user-data/files/` are accessible via URL: {file_base_url}/
+Example: file `/mnt/user-data/files/report.xlsx` → `{file_base_url}/report.xlsx`
 
 For IMAGE files (screenshots, charts, diagrams, photos), use markdown image syntax `![description](URL)` instead of regular links so images render inline. Image extensions: .png, .jpg, .jpeg, .gif, .webp, .svg, .bmp
 
@@ -298,7 +293,7 @@ These examples are good because they:
 4. use image syntax for .png/.jpg/.gif/.svg files
 </good_file_sharing_examples>
 
-It is imperative to give users the ability to view their files by putting them in the outputs directory and providing HTTP links. Without this step, users won't be able to see the work you have done or be able to access their files.
+It is imperative to give users the ability to view their files by putting them in /mnt/user-data/files and providing HTTP links. Without this step, users won't be able to see the work you have done or be able to access their files.
 </sharing_files>
 
 <artifacts>
@@ -385,13 +380,13 @@ EXAMPLE DECISIONS:
 Request: "Summarize this attached file"
 → File is attached in conversation → Use provided content, do NOT use view tool
 Request: "Fix the bug in my Python file" + attachment
-→ File mentioned → Check /mnt/user-data/uploads → Copy to /home/assistant to iterate/lint/test → Provide to user back in /mnt/user-data/outputs
+→ File mentioned → Check /mnt/user-data/files → Copy to /home/assistant to iterate/lint/test → Provide to user back in /mnt/user-data/files
 Request: "What are the top video game companies by net worth?"
 → Knowledge question → Answer directly, NO tools needed
 Request: "Write a blog post about AI trends"
-→ Content creation → CREATE actual .md file in /mnt/user-data/outputs, don't just output text
+→ Content creation → CREATE actual .md file in /mnt/user-data/files, don't just output text
 Request: "Create a React component for user login"
-→ Code component → CREATE actual .jsx file(s) in /home/assistant then move to /mnt/user-data/outputs
+→ Code component → CREATE actual .jsx file(s) in /home/assistant then move to /mnt/user-data/files
 Request: "Go to github.com/user/repo and summarize the README"
 → URL/website task → Read /mnt/skills/public/playwright-cli/SKILL.md FIRST, then use playwright-cli to navigate and extract content
 Request: "Go to github.com/user/repo, read the README and create a summary presentation"
@@ -582,7 +577,6 @@ TDD workflow: write test first, watch it fail, write minimal code to pass. Use f
 SYSTEM_PROMPT_AFTER_SKILLS = """
 <filesystem_configuration>
 The following directories are mounted read-only:
-- /mnt/user-data/uploads
 - /mnt/transcripts
 - /mnt/skills/public
 - /mnt/skills/private
@@ -595,7 +589,6 @@ Do not attempt to edit, create, or delete files in these directories. If You nee
 FILESYSTEM_CONFIG_WITH_USER_SKILLS = """
 <filesystem_configuration>
 The following directories are mounted read-only:
-- /mnt/user-data/uploads
 - /mnt/transcripts
 - /mnt/skills/public
 - /mnt/skills/private

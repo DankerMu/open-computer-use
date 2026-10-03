@@ -161,7 +161,7 @@ from docker_manager import (
     _fetch_gitlab_token, _ensure_gitlab_token,
     SandboxStopped, LifecycleError,
     DOCKER_SOCKET, DOCKER_IMAGE, CONTAINER_MEM_LIMIT, CONTAINER_CPU_LIMIT,
-    COMMAND_TIMEOUT, ENABLE_NETWORK, USER_DATA_BASE_PATH, PUBLIC_BASE_URL,
+    COMMAND_TIMEOUT, ENABLE_NETWORK, PUBLIC_BASE_URL,
     MCP_TOKENS_URL, MCP_TOKENS_API_KEY,
     SUB_AGENT_MAX_TURNS, SUB_AGENT_TIMEOUT,
     ANTHROPIC_DEFAULT_SONNET_MODEL,
@@ -1063,9 +1063,8 @@ Never forget: {plan_file} has your complete instructions.
 <environment>
 You are working in a Linux container (Ubuntu 24) as an autonomous sub-agent.
 FILE LOCATIONS:
-- User uploads: /mnt/user-data/uploads (read-only)
-- Workspace: /home/assistant
-- Outputs: /mnt/user-data/outputs (URL: {file_base_url}/)
+- Workspace files: /mnt/user-data/files (uploaded and generated files, read-write; URL: {file_base_url}/)
+- Private working directory: /home/assistant
 </environment>
 
 <available_skills>

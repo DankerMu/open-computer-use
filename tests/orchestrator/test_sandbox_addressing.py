@@ -13,7 +13,9 @@ Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_sandb
 import os
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
+
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'computer-use-server'))
 
@@ -160,7 +162,7 @@ class UserDataDirectoryTests(unittest.TestCase):
         # A brand-new chat: no container exists yet, which is the path that prepares directories.
         client.containers.get.side_effect = docker_sdk.errors.NotFound("absent")
         with tempfile.TemporaryDirectory() as base:
-            with patch.object(dm, "USER_DATA_BASE_PATH", base), \
+            with patch.object(dm, "BASE_DATA_DIR", Path(base)), \
                  patch.object(dm, "get_docker_client", return_value=client), \
                  patch.object(dm, "skill_manager", MagicMock(get_skill_mounts=lambda *a, **k: {})):
                 try:
@@ -171,8 +173,9 @@ class UserDataDirectoryTests(unittest.TestCase):
                     pass
 
             chat_dir = os.path.join(base, "chat-xyz")
-            self.assertTrue(os.path.isdir(os.path.join(chat_dir, "uploads")))
             self.assertTrue(os.path.isdir(os.path.join(chat_dir, "outputs")))
+            self.assertFalse(os.path.exists(os.path.join(chat_dir, "uploads")))
+
 
         # The root-container helper is the thing that cannot work rootless.
         for call in client.containers.run.call_args_list:

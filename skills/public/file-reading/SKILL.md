@@ -1,7 +1,7 @@
 ---
 name: file-reading
-description: "Use this skill when a file has been uploaded but its content is NOT in your context — only its path at /mnt/user-data/uploads/ is listed in an uploaded_files block. This skill is a router: it tells you which tool to use for each file type (pdf, docx, xlsx, csv, json, images, archives, ebooks) so you read the right amount the right way instead of blindly running cat on a binary. Triggers: any mention of /mnt/user-data/uploads/, an uploaded_files section, a file_path tag, or a user asking about an uploaded file you have not yet read. Do NOT use this skill if the file content is already visible in your context inside a documents block — you already have it."
-compatibility: "claude.ai, Claude Desktop, Cowork — any surface where uploads land at /mnt/user-data/uploads/"
+description: "Use this skill when a file has been uploaded but its content is NOT in your context — only its path at /mnt/user-data/files/ is listed in an uploaded_files block. This skill is a router: it tells you which tool to use for each file type (pdf, docx, xlsx, csv, json, images, archives, ebooks) so you read the right amount the right way instead of blindly running cat on a binary. Triggers: any mention of /mnt/user-data/files/, an uploaded_files section, a file_path tag, or a user asking about an uploaded file you have not yet read. Do NOT use this skill if the file content is already visible in your context inside a documents block — you already have it."
+compatibility: "claude.ai, Claude Desktop, Cowork — any surface where uploads land at /mnt/user-data/files/"
 license: Proprietary. LICENSE.txt has complete terms
 ---
 
@@ -10,11 +10,11 @@ license: Proprietary. LICENSE.txt has complete terms
 ## Why this skill exists
 
 When a user uploads a file in claude.ai, Claude Desktop, or Cowork,
-the file is written to `/mnt/user-data/uploads/<filename>` and you are told the path
+the file is written to `/mnt/user-data/files/<filename>` and you are told the path
 in an `<uploaded_files>` block. **The content is not in your context.**
 You must go read it.
 
-The naive thing — `cat /mnt/user-data/uploads/whatever` — is wrong for
+The naive thing — `cat /mnt/user-data/files/whatever` — is wrong for
 most files:
 
 - On a PDF it prints binary garbage.
@@ -30,8 +30,8 @@ hand off to a deeper skill.
 1. **Look at the extension.** That is your dispatch key.
 2. **Stat before you read.** Large files need sampling, not slurping.
    ```bash
-   stat -c '%s bytes, %y' /mnt/user-data/uploads/report.pdf
-   file /mnt/user-data/uploads/report.pdf
+   stat -c '%s bytes, %y' /mnt/user-data/files/report.pdf
+   file /mnt/user-data/files/report.pdf
    ```
 3. **Read just enough to answer the user's question.** If they asked
    "how many rows are in this CSV", don't load the whole thing into
@@ -87,15 +87,15 @@ Python-based approach (openpyxl / python-pptx).
 Quick first move — get the page count and check if text is extractable:
 
 ```bash
-pdfinfo /mnt/user-data/uploads/report.pdf
-pdftotext -f 1 -l 1 /mnt/user-data/uploads/report.pdf - | head -20
+pdfinfo /mnt/user-data/files/report.pdf
+pdftotext -f 1 -l 1 /mnt/user-data/files/report.pdf - | head -20
 ```
 
 Then peek at the text content:
 
 ```python
 from pypdf import PdfReader
-r = PdfReader("/mnt/user-data/uploads/report.pdf")
+r = PdfReader("/mnt/user-data/files/report.pdf")
 print(f"{len(r.pages)} pages")
 print(r.pages[0].extract_text()[:2000])
 ```
@@ -117,7 +117,7 @@ The `docx` skill covers editing, creating, tracked changes, images.
 Read it if you need any of those. For a quick look:
 
 ```bash
-extract-text /mnt/user-data/uploads/memo.docx | head -200
+extract-text /mnt/user-data/files/memo.docx | head -200
 ```
 
 Legacy `.doc` (not `.docx`) must be converted first — see the `docx`
@@ -131,7 +131,7 @@ The `xlsx` skill covers formulas, formatting, charts, creating. Read
 it if you need any of those. For a quick look at an `.xlsx`:
 
 ```bash
-extract-text /mnt/user-data/uploads/data.xlsx | head -100
+extract-text /mnt/user-data/files/data.xlsx | head -100
 ```
 
 For `.xlsm`, add `--format xlsx` (same zip structure; only the
@@ -139,7 +139,7 @@ extension differs). When you need a structured preview in Python:
 
 ```python
 from openpyxl import load_workbook
-wb = load_workbook("/mnt/user-data/uploads/data.xlsx", read_only=True)
+wb = load_workbook("/mnt/user-data/files/data.xlsx", read_only=True)
 print("Sheets:", wb.sheetnames)
 ws = wb.active
 for row in ws.iter_rows(max_row=5, values_only=True):
@@ -156,14 +156,14 @@ count, iterate or use pandas.
 
 ```python
 import pandas as pd
-df = pd.read_excel("/mnt/user-data/uploads/old.xls", engine="xlrd", nrows=5)
+df = pd.read_excel("/mnt/user-data/files/old.xls", engine="xlrd", nrows=5)
 ```
 
 **`.ods` (OpenDocument)** — openpyxl also rejects this. Use:
 
 ```python
 import pandas as pd
-df = pd.read_excel("/mnt/user-data/uploads/data.ods", engine="odf", nrows=5)
+df = pd.read_excel("/mnt/user-data/files/data.ods", engine="odf", nrows=5)
 ```
 
 ---
@@ -171,7 +171,7 @@ df = pd.read_excel("/mnt/user-data/uploads/data.ods", engine="odf", nrows=5)
 ## PPTX
 
 ```bash
-extract-text /mnt/user-data/uploads/deck.pptx | head -200
+extract-text /mnt/user-data/files/deck.pptx | head -200
 ```
 
 **Legacy `.ppt`** — convert to `.pptx` first via LibreOffice; see
@@ -191,7 +191,7 @@ in row 1 will wreck your `head -5`. Use pandas with `nrows`:
 
 ```python
 import pandas as pd
-df = pd.read_csv("/mnt/user-data/uploads/data.csv", nrows=5)
+df = pd.read_csv("/mnt/user-data/files/data.csv", nrows=5)
 print(df)
 print()
 print(df.dtypes)
@@ -202,13 +202,13 @@ RFC-4180 quoted newlines — the same quoted-cell case this section
 warned about above):
 
 ```bash
-wc -l /mnt/user-data/uploads/data.csv
+wc -l /mnt/user-data/files/data.csv
 ```
 
 Full analysis only after you know the shape:
 
 ```python
-df = pd.read_csv("/mnt/user-data/uploads/data.csv")
+df = pd.read_csv("/mnt/user-data/files/data.csv")
 print(df.describe())
 ```
 
@@ -221,8 +221,8 @@ TSV: same, with `sep="\t"`.
 Structure first, content second:
 
 ```bash
-jq 'type' /mnt/user-data/uploads/data.json
-jq 'if type == "array" then length elif type == "object" then keys else . end' /mnt/user-data/uploads/data.json
+jq 'type' /mnt/user-data/files/data.json
+jq 'if type == "array" then length elif type == "object" then keys else . end' /mnt/user-data/files/data.json
 ```
 
 (`keys` errors on scalar JSON roots — a bare `"hello"` or `42` is valid
@@ -234,8 +234,8 @@ JSONL (one object per line) — do **not** `jq` the whole file; work line
 by line:
 
 ```bash
-head -3 /mnt/user-data/uploads/data.jsonl | jq .
-wc -l /mnt/user-data/uploads/data.jsonl
+head -3 /mnt/user-data/files/data.jsonl | jq .
+wc -l /mnt/user-data/files/data.jsonl
 ```
 
 ---
@@ -251,7 +251,7 @@ programmatically:
 
 ```python
 from PIL import Image
-img = Image.open("/mnt/user-data/uploads/photo.jpg")
+img = Image.open("/mnt/user-data/files/photo.jpg")
 print(img.size, img.mode, img.format)
 ```
 
@@ -275,8 +275,8 @@ if the user is asking about original-resolution pixel data, flag it.
 Archives can be huge, contain path traversal, or nest forever.
 
 ```bash
-unzip -l /mnt/user-data/uploads/bundle.zip
-tar -tf /mnt/user-data/uploads/bundle.tar
+unzip -l /mnt/user-data/files/bundle.zip
+tar -tf /mnt/user-data/files/bundle.tar
 ```
 
 GNU tar auto-detects compression — `tar -tf` works on `.tar`,
@@ -285,14 +285,14 @@ GNU tar auto-detects compression — `tar -tf` works on `.tar`,
 If the user wants one file from inside, extract just that one:
 
 ```bash
-unzip -p /mnt/user-data/uploads/bundle.zip path/inside/file.txt
+unzip -p /mnt/user-data/files/bundle.zip path/inside/file.txt
 ```
 
 **Standalone `.gz`** (not a tar) compresses a single file — there is
 no manifest to list. Just peek at the decompressed content:
 
 ```bash
-zcat /mnt/user-data/uploads/data.json.gz | head -50
+zcat /mnt/user-data/files/data.json.gz | head -50
 ```
 
 ---
@@ -300,7 +300,7 @@ zcat /mnt/user-data/uploads/data.json.gz | head -50
 ## EPUB / ODT
 
 ```bash
-extract-text /mnt/user-data/uploads/book.epub | head -200
+extract-text /mnt/user-data/files/book.epub | head -200
 ```
 
 For long ebooks, pipe through `head` — you rarely need the whole thing
@@ -311,8 +311,8 @@ to answer a question.
 ## RTF / IPYNB
 
 ```bash
-extract-text /mnt/user-data/uploads/notes.rtf | head -200
-extract-text /mnt/user-data/uploads/notebook.ipynb | head -200
+extract-text /mnt/user-data/files/notes.rtf | head -200
+extract-text /mnt/user-data/files/notebook.ipynb | head -200
 ```
 
 ---
@@ -322,7 +322,7 @@ extract-text /mnt/user-data/uploads/notebook.ipynb | head -200
 Check the size first:
 
 ```bash
-wc -c /mnt/user-data/uploads/app.log
+wc -c /mnt/user-data/files/app.log
 ```
 
 - **Under ~20KB**: `cat` is fine.
@@ -333,7 +333,7 @@ wc -c /mnt/user-data/uploads/app.log
 For log files, the user almost always cares about the end:
 
 ```bash
-tail -200 /mnt/user-data/uploads/app.log
+tail -200 /mnt/user-data/files/app.log
 ```
 
 ---
@@ -341,8 +341,8 @@ tail -200 /mnt/user-data/uploads/app.log
 ## Unknown extension
 
 ```bash
-file /mnt/user-data/uploads/mystery.bin
-xxd /mnt/user-data/uploads/mystery.bin | head -5
+file /mnt/user-data/files/mystery.bin
+xxd /mnt/user-data/files/mystery.bin | head -5
 ```
 
 `file` identifies most things. `xxd` head shows magic bytes. If `file`

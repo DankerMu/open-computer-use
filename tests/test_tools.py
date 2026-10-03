@@ -123,13 +123,13 @@ def _call_with_empty_chat(tools, method, metadata, emitter):
         "__files__": [{"name": "input.txt", "path": "/unused/input.txt"}],
     }
     if method == "bash_tool":
-        return tools.bash_tool("/mnt/user-data/uploads/input.txt", "read upload", **kwargs)
+        return tools.bash_tool("/mnt/user-data/files/input.txt", "read upload", **kwargs)
     if method == "str_replace":
         return tools.str_replace("edit", "before", "/home/assistant/a.txt", "after", **kwargs)
     if method == "create_file":
         return tools.create_file("create", "contents", "/home/assistant/a.txt", **kwargs)
     if method == "view":
-        return tools.view("read", "/mnt/user-data/uploads/input.txt", **kwargs)
+        return tools.view("read", "/mnt/user-data/files/input.txt", **kwargs)
     return tools.sub_agent("inspect upload", "delegate", **kwargs)
 
 
@@ -194,7 +194,7 @@ def test_unusable_credentials_reject_before_upload_or_probe(
     tools.valves.MCP_API_KEY = mcp_key
     result = asyncio.run(
         tools.bash_tool(
-            "/mnt/user-data/uploads/input.txt",
+            "/mnt/user-data/files/input.txt",
             "read upload",
             __event_emitter__=lambda e: _collect(events, e),
             __metadata__={"chat_id": "chat-credentials"},
@@ -226,7 +226,6 @@ def _guard_environment(data):
         "OCU_SANDBOX_SUBNET": "10.90.0.0/24",
         "PUBLIC_BASE_URL": "http://ocu.example",
         "BASE_DATA_DIR": str(data),
-        "USER_DATA_BASE_PATH": str(data.parent / "user-data"),
         "DOCKER_HOST": "unix:///tmp/ocu-acceptance-no-docker.sock",
         "DOCKER_SOCKET": "unix:///tmp/ocu-acceptance-no-docker.sock",
         "OCU_WEBUI_AUTH_URL": "http://127.0.0.1:9/api/v1/ocu/auth",
@@ -423,7 +422,7 @@ class _GuardedOCU:
         sys.modules.update(self._snapshot)
 
     def chat_uploads(self, chat_id):
-        return self.data_dir / chat_id / "uploads"
+        return self.data_dir / chat_id / "outputs"
 
     def stored_files(self, chat_id):
         uploads = self.chat_uploads(chat_id)
@@ -908,7 +907,7 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
         tools.valves.MCP_API_KEY = MCP_API_KEY
         first = asyncio.run(
             tools.bash_tool(
-                "cat /mnt/user-data/uploads/uploaded.txt",
+                "cat /mnt/user-data/files/uploaded.txt",
                 "read upload",
                 __metadata__={"chat_id": "chat-one"},
                 __user__={"email": "first@example.test", "name": "First User"},
@@ -922,7 +921,7 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
             )
         )
         first_records = list(ocu.requests)
-        assert "ran:cat /mnt/user-data/uploads/uploaded.txt" in first
+        assert "ran:cat /mnt/user-data/files/uploaded.txt" in first
         assert not existing.exists()
         assert not uploaded.exists()
 

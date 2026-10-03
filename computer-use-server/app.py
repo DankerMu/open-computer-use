@@ -19,7 +19,6 @@ import logging
 import mimetypes
 import re
 import secrets
-import tempfile
 import time
 import zipfile
 from io import BytesIO
@@ -65,8 +64,14 @@ from security import sanitize_chat_id, safe_path
 from uploads import (
     CorruptReceiptsError,
     claim_file_no_replace,
+    close_fd,
+    ensure_workspace_directories,
     import_receipt,
+    open_control_directory,
+    open_directory_path,
     read_import_receipts,
+    stage_upload_bytes,
+    unlink_relative,
     write_import_receipts,
 )
 from outputs_broker import (
@@ -568,34 +573,46 @@ async def root():
 def _store_upload(
     chat_id: str, filename: str, content: bytes, attachment_id: str | None = None,
 ) -> tuple[str, str, int]:
-    """Keep blocking lock and file operations on one worker thread."""
+    """Keep blocking lock and file operations on one worker thread.
+
+    Ancestors stay pinned by directory fds from the chat root. Staging is a
+    private ``.ocu`` file; publication hard-links from that directory into
+    the destination directory fd. Every owned fd and the staging name are
+    released on success and on error.
+    """
     with _combined_lock(chat_id):
         relative = Path(filename)
         if (not filename or relative.is_absolute() or ".." in relative.parts
                 or relative.name in {"", ".", ".."} or "\x00" in filename):
             raise HTTPException(status_code=403, detail="Invalid upload path")
-        chat_dir = safe_path(BASE_DATA_DIR, chat_id)
+        chat_dir = BASE_DATA_DIR / chat_id
         receipts = read_import_receipts(chat_dir) if attachment_id else None
         if attachment_id and attachment_id in receipts:
             record = receipts[attachment_id]
             return record["stored_name"], record["md5"], record["size"]
-        uploads_dir = safe_path(BASE_DATA_DIR, chat_id, "uploads")
-        # Resolve only the parent: an occupied leaf symlink is a collision.
-        parent = safe_path(uploads_dir, str(relative.parent))
-        parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
+        parent_parts = () if relative.parent == Path(".") else relative.parent.parts
+        if any(part in {"", ".", ".."} for part in parent_parts):
+            raise HTTPException(status_code=403, detail="Invalid upload path")
+        os.makedirs(chat_dir, exist_ok=True)
+        chat_fd = None
+        outputs_fd = None
+        dest_fd = None
+        control_fd = None
+        staging_fd = None
+        staging_name = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb", prefix=".upload-", dir=parent, delete=False
-            ) as handle:
-                temporary = Path(handle.name)
-                handle.write(content)
-            # Sandbox runs as assistant with a read-only uploads mount.
-            # NamedTemporaryFile creates 0600 owned by the server uid, so
-            # the published inode must be world-readable before the hard link.
-            temporary.chmod(0o644)
-            stored = claim_file_no_replace(temporary, parent / relative.name)
-            stored_name = str(stored.relative_to(uploads_dir))
+            chat_fd = open_directory_path(chat_dir)
+            outputs_fd = ensure_workspace_directories(chat_fd, ("outputs",))
+            dest_fd = ensure_workspace_directories(outputs_fd, parent_parts)
+            control_fd = open_control_directory(chat_fd)
+            staging_fd, staging_name = stage_upload_bytes(control_fd, content)
+            stored_basename = claim_file_no_replace(
+                staging_name,
+                src_dir_fd=control_fd,
+                dst_dir_fd=dest_fd,
+                requested_name=relative.name,
+            )
+            stored_name = "/".join((*parent_parts, stored_basename))
             md5_hash = hashlib.md5(content).hexdigest()
             if attachment_id:
                 receipts[attachment_id] = import_receipt(
@@ -603,8 +620,13 @@ def _store_upload(
                 write_import_receipts(chat_dir, receipts)
             return stored_name, md5_hash, len(content)
         finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            close_fd(staging_fd)
+            if staging_name is not None and control_fd is not None:
+                unlink_relative(staging_name, control_fd)
+            close_fd(control_fd)
+            close_fd(dest_fd)
+            close_fd(outputs_fd)
+            close_fd(chat_fd)
 
 
 def _list_import_ids(chat_id: str) -> dict[str, list[str]]:
@@ -632,7 +654,7 @@ async def upload_file(
     x_ocu_attachment_id: Optional[str] = Header(default=None, alias="X-OCU-Attachment-Id"),
 ):
     """
-    Upload a file to chat uploads directory.
+    Upload a file to the chat workspace files directory.
 
     Args:
         chat_id: Unique chat identifier

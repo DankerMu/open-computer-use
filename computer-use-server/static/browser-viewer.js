@@ -138,7 +138,7 @@ export class BrowserViewer {
             this._send('Page.enable', {});
             this._send('Fetch.enable', { handleAuthRequests: true });
             this._send('Browser.setDownloadBehavior', {
-              behavior: 'allow', downloadPath: '/mnt/user-data/outputs'
+              behavior: 'allow', downloadPath: '/mnt/user-data/files'
             });
             this._startScreencast();
             this._resizeObserver = new ResizeObserver(() => {

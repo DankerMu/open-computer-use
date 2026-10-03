@@ -49,7 +49,6 @@ CONTAINER_MEM_LIMIT = os.getenv("CONTAINER_MEM_LIMIT", "2g")
 CONTAINER_CPU_LIMIT = float(os.getenv("CONTAINER_CPU_LIMIT", "1.0"))
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "120"))
 ENABLE_NETWORK = os.getenv("ENABLE_NETWORK", "true").lower() == "true"
-USER_DATA_BASE_PATH = os.getenv("USER_DATA_BASE_PATH", "/tmp/computer-use-data")
 # Public URL of the orchestrator — the single source of truth for browser-facing
 # preview/archive links. Baked into /system-prompt so the model writes correct
 # clickable URLs, and returned to the Open WebUI filter via the X-Public-Base-URL
@@ -1026,12 +1025,13 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
     # Workspace volume for this chat
     workspace_volume = f"chat-{chat_id}-workspace"
 
-    # Host paths for user data
-    chat_data_path = os.path.join(USER_DATA_BASE_PATH, chat_id)
-    uploads_path = os.path.join(chat_data_path, "uploads")
+    # Host path for the single workspace files directory. BASE_DATA_DIR is both
+    # the server IO root and the Docker bind source; the configured path must be
+    # identical inside the server and at the Docker daemon.
+    chat_data_path = str(BASE_DATA_DIR / chat_id)
     outputs_path = os.path.join(chat_data_path, "outputs")
 
-    # Create the per-chat upload/output directories.
+    # Create the per-chat workspace files directory.
     #
     # Done in-process. This used to spawn a throwaway root container to mkdir and chmod 777 on the
     # engine host, which cannot work under rootless Podman: the engine has no root to give, and the
@@ -1042,8 +1042,8 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
     # 0o777 mode is preserved: the sandbox runs as a different user (assistant) and has to write
     # here. os.chmod is used explicitly because mkdir's mode argument is masked by umask.
     try:
-        print(f"[MCP] Creating directories: {uploads_path}, {outputs_path}")
-        for path in (chat_data_path, uploads_path, outputs_path):
+        print(f"[MCP] Creating directories: {outputs_path}")
+        for path in (chat_data_path, outputs_path):
             os.makedirs(path, exist_ok=True)
             try:
                 os.chmod(path, 0o777)
@@ -1054,7 +1054,6 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
                     raise
     except Exception as e:
         print(f"[MCP] Warning: Failed to create directories: {e}")
-
     # Check if using custom image (has entrypoint) or standard image
     use_entrypoint = "computer-use" in DOCKER_IMAGE or "open-computer-use" in DOCKER_IMAGE
 
@@ -1083,8 +1082,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
         "environment": _build_container_env(extra_env),
         "volumes": {
             workspace_volume: {"bind": working_dir, "mode": "rw"},
-            uploads_path: {"bind": "/mnt/user-data/uploads", "mode": "ro"},
-            outputs_path: {"bind": "/mnt/user-data/outputs", "mode": "rw"},
+            outputs_path: {"bind": "/mnt/user-data/files", "mode": "rw"},
             **skill_manager.get_skill_mounts(
                 skill_manager.get_user_skills_sync(user_email)
             ),

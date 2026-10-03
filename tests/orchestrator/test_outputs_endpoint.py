@@ -63,7 +63,6 @@ def _subprocess_env(data: Path, prefix=PREFIX):
     env["OCU_SANDBOX_SUBNET"] = "10.90.0.0/24"
     env["SINGLE_USER_MODE"] = "true"
     env["BASE_DATA_DIR"] = str(data)
-    env["USER_DATA_BASE_PATH"] = str(data.parent / "user-data")
     if prefix is None:
         env.pop("OCU_PUBLIC_PREFIX", None)
     else:

@@ -197,14 +197,15 @@ COPY fonts/ /usr/share/fonts/truetype/custom/
 RUN fc-cache -f -v
 
 # Create directory structure with proper ownership
-RUN mkdir -p /mnt/user-data/uploads \
-             /mnt/user-data/outputs \
+RUN mkdir -p /mnt/user-data/files \
              /mnt/skills \
              /mnt/transcripts && \
-    chown -R root:root /mnt/user-data/uploads /mnt/skills && \
-    chown -R assistant:assistant /mnt/user-data/outputs /mnt/transcripts && \
-    chmod 755 /mnt/user-data/uploads /mnt/skills && \
-    chmod 755 /mnt/user-data/outputs /mnt/transcripts
+    chown root:root /mnt/user-data && \
+    chmod 755 /mnt/user-data && \
+    chown -R root:root /mnt/skills && \
+    chown -R assistant:assistant /mnt/user-data/files /mnt/transcripts && \
+    chmod 755 /mnt/skills && \
+    chmod 755 /mnt/user-data/files /mnt/transcripts
 
 # Install html2pptx from local .tgz file (required for PPTX skill)
 # Copy only the .tgz to avoid invalidating cache when other skills change
@@ -308,7 +309,7 @@ echo "Tip: plain bash with NO_AUTOSTART=1 bash  OR  touch /tmp/.no_autostart"\n\
 # Configure Playwright CLI for browser automation\n\
 cat > /home/assistant/playwright-cli.json << PCLIEOF\n\
 {\n\
-  "outputDir": "/mnt/user-data/outputs",\n\
+  "outputDir": "/mnt/user-data/files",\n\
   "browser": {\n\
     "launchOptions": {\n\
       "args": [\n\
@@ -344,14 +345,13 @@ cat > /home/assistant/.claude/CLAUDE.md << CLAUDEMDEOF\n\
 # Environment\n\
 \n\
 ## File Locations\n\
-- **Workspace**: /home/assistant (working directory)\n\
-- **User uploads**: /mnt/user-data/uploads (read-only, files from user)\n\
-- **Output files**: /mnt/user-data/outputs (save results here — auto-synced to preview)\n\
+- **Workspace**: /home/assistant (private working directory)\n\
+- **Workspace files**: /mnt/user-data/files (uploaded and generated files, read-write — auto-synced to preview)\n\
 - **Skills**: /mnt/skills/ (read-only, run: cat /mnt/skills/<name>/SKILL.md)\n\
 \n\
 ## Output Rules\n\
-- Save ALL user-facing files to /mnt/user-data/outputs/\n\
-- Files in outputs automatically appear in the preview UI under the Files tab\n\
+- Save ALL user-facing files to /mnt/user-data/files/\n\
+- Files in /mnt/user-data/files automatically appear in the preview UI under the Files tab\n\
 - When telling the user where to find files, say: open the Files tab in the artifacts panel\n\
 - Workspace /home/assistant is for intermediate files only, not synced\n\
 \n\
@@ -364,7 +364,7 @@ Plan must include: what files to create, architecture decisions, verification st
 \n\
 ## Verification\n\
 Before completing any task:\n\
-1. Verify output files exist in /mnt/user-data/outputs/\n\
+1. Verify output files exist in /mnt/user-data/files/\n\
 2. Run the code or check the result\n\
 3. If tests exist, run them\n\
 \n\
@@ -374,7 +374,7 @@ When you make a mistake, update this CLAUDE.md so you do not repeat it.\n\
 ## Useful Commands\n\
 - ls /mnt/skills/ — list available skills\n\
 - cat /mnt/skills/<name>/SKILL.md — skill instructions\n\
-- ls /mnt/user-data/uploads/ — user-uploaded files\n\
+- ls /mnt/user-data/files/ — uploaded and generated files\n\
 - GSD (Get Shit Done): /gsd:help in Claude Code for spec-driven workflow commands\n\
 - Superpowers skills: test-driven-development, brainstorming, systematic-debugging, etc.\n\
 \n\
@@ -384,11 +384,10 @@ cat > /home/assistant/.claude/settings.json << CCEOF\n\
   "permissions": {\n\
     "allow": [\n\
       "Bash(playwright-cli:*)",\n\
-      "Bash(*mnt/user-data/outputs*)",\n\
-      "Write(/mnt/user-data/outputs/**)",\n\
-      "Edit(/mnt/user-data/outputs/**)",\n\
-      "Read(/mnt/user-data/outputs/**)",\n\
-      "Read(/mnt/user-data/uploads/**)",\n\
+      "Bash(*mnt/user-data/files*)",\n\
+      "Write(/mnt/user-data/files/**)",\n\
+      "Edit(/mnt/user-data/files/**)",\n\
+      "Read(/mnt/user-data/files/**)",\n\
       "Read(/mnt/skills/**)",\n\
       "Read(/home/assistant/.claude/**)",\n\
       "Write(/home/assistant/.claude/CLAUDE.md)",\n\
@@ -563,7 +562,7 @@ done\n\
 # Mark volume as active (used by cleanup script to calculate TTL from last use, not creation)\n\
 touch /home/assistant/.last_active\n\
 \n\
-# Skill usage tracking: inotify watcher logs SKILL.md reads to outputs bind mount\n\
+# Skill usage tracking: inotify watcher logs SKILL.md reads to the files bind mount\n\
 if command -v inotifywait >/dev/null 2>&1 && [ -d /mnt/skills ]; then\n\
   (\n\
     inotifywait -q -e access -m -r /mnt/skills/ --format "%%w%%f" 2>/dev/null |\n\
@@ -571,8 +570,8 @@ if command -v inotifywait >/dev/null 2>&1 && [ -d /mnt/skills ]; then\n\
       if [[ "$filepath" == */SKILL.md ]]; then\n\
         skill=$(basename "$(dirname "$filepath")")\n\
         ts=$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\n\
-        if [ -w /mnt/user-data/outputs ]; then\n\
-          echo "{\"ts\":\"$ts\",\"skill\":\"$skill\",\"email\":\"${GIT_AUTHOR_EMAIL:-unknown}\",\"chat_id\":\"${CHAT_ID:-unknown}\"}" >> /mnt/user-data/outputs/.skill-usage.jsonl 2>/dev/null || true\n\
+        if [ -w /mnt/user-data/files ]; then\n\
+          echo "{\"ts\":\"$ts\",\"skill\":\"$skill\",\"email\":\"${GIT_AUTHOR_EMAIL:-unknown}\",\"chat_id\":\"${CHAT_ID:-unknown}\"}" >> /mnt/user-data/files/.skill-usage.jsonl 2>/dev/null || true\n\
         fi\n\
       fi\n\
     done\n\

@@ -11,7 +11,7 @@ End-to-end tests against a real `computer-use-server` container that spawns real
 | `tools/call bash_tool` end-to-end echo | `test_mcp_tools.py` | Catches workspace image misconfig, Docker socket missing, response wrapping regressions, sub-agent dispatch breakage. |
 | `/health` is unauthenticated and returns `healthy` | `test_mcp_tools.py` | Kubernetes probes break if either changes. |
 | Workspace container has the prod labels (managed-by, chat-id, tool) | `test_workspace_lifecycle.py` | Drift in any of these labels breaks the cleanup cron's filter in prod. |
-| `/mnt/user-data/{uploads,outputs}` bind mounts | `test_workspace_lifecycle.py` | Compose USER_DATA_BASE_PATH must round-trip into the spawned container. |
+| `/mnt/user-data/files` bind mount | `test_workspace_lifecycle.py` | Compose `BASE_DATA_DIR` must round-trip into the spawned container. |
 
 ## How to run
 

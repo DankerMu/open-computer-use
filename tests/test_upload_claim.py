@@ -4,17 +4,18 @@
 import asyncio
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -39,7 +40,7 @@ def _environment(data):
         "OCU_INTERNAL_TOKEN": TOKEN, "MCP_API_KEY": "ocu-upload-claim-mcp-key",
         "OCU_WEBUI_ORIGIN": "https://webui.example", "SINGLE_USER_MODE": "true",
         "OCU_SANDBOX_SUBNET": "10.90.0.0/24", "PUBLIC_BASE_URL": "http://ocu.example",
-        "BASE_DATA_DIR": str(data), "USER_DATA_BASE_PATH": str(data.parent / "user-data"),
+        "BASE_DATA_DIR": str(data),
         "DOCKER_HOST": "unix:///tmp/ocu-acceptance-no-docker.sock",
         "DOCKER_SOCKET": "unix:///tmp/ocu-acceptance-no-docker.sock",
     }
@@ -58,7 +59,8 @@ def upload_server(tmp_path, monkeypatch):
     try:
         import app
         with TestClient(app.app) as client:
-            yield client, data / CHAT / "uploads"
+            yield client, data / CHAT / "outputs"
+
     finally:
         for name in list(sys.modules):
             if name in APP_MODULES or name.startswith("mcp_resources"):
@@ -191,20 +193,102 @@ def test_receipts_live_outside_uploads_and_record_original_metadata(upload_serve
     assert (uploads.parent / ".ocu" / "imports.json").is_file()
 
 
-def test_published_upload_is_readable_by_sandbox_assistant(upload_server):
+def test_published_upload_is_writable_at_claim_and_preserves_no_overwrite(
+        upload_server, monkeypatch):
+    import app
+
     client, uploads = upload_server
-    payloads = (b"first", b"second")
-    expected_names = ("report.txt", "report (2).txt")
-    for payload, name in zip(payloads, expected_names):
-        response = _upload(client, "report.txt", payload)
+    previous_umask = os.umask(0o077)
+    try:
+        original_claim = app.claim_file_no_replace
+        claims = []
+        staging_modes = []
+        opened = os.open
+
+        def recording_claim(temporary, *, src_dir_fd, dst_dir_fd, requested_name):
+            info = os.stat(temporary, dir_fd=src_dir_fd)
+            reader = opened(temporary, os.O_RDONLY | os.O_CLOEXEC, dir_fd=src_dir_fd)
+            try:
+                payload = os.read(reader, info.st_size)
+            finally:
+                os.close(reader)
+            claims.append({
+                "bytes": payload,
+                "mode": stat.S_IMODE(info.st_mode),
+                "ino": info.st_ino,
+                "requested": requested_name,
+            })
+            return original_claim(
+                temporary,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                requested_name=requested_name,
+            )
+
+        def observing_open(path, flags, mode=0o777, *args, **kwargs):
+            fd = opened(path, flags, mode, *args, **kwargs)
+            name = os.path.basename(os.fspath(path))
+            if name.startswith(".upload-"):
+                staging_modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return fd
+
+        monkeypatch.setattr(app, "claim_file_no_replace", recording_claim)
+        monkeypatch.setattr(os, "open", observing_open)
+
+        payloads = (b"first", b"second")
+        expected_names = ("report.txt", "report (2).txt")
+        for payload, name in zip(payloads, expected_names):
+            response = _upload(client, "report.txt", payload)
+            assert response.status_code == 200
+            assert response.json()["filename"] == name
+            path = uploads / name
+            published = path.stat()
+            assert path.read_bytes() == payload
+            assert stat.S_IMODE(published.st_mode) == 0o666
+            assert published.st_ino == claims[-1]["ino"]
+
+        assert [entry["bytes"] for entry in claims] == [b"first", b"second"]
+        assert [entry["mode"] for entry in claims] == [0o666, 0o666]
+        assert [entry["requested"] for entry in claims] == [
+            "report.txt", "report.txt",
+        ]
+        assert (uploads / "report.txt").read_bytes() == b"first"
+        assert (uploads / "report (2).txt").read_bytes() == b"second"
+        assert sorted(path.name for path in uploads.iterdir()) == [
+            "report (2).txt", "report.txt",
+        ]
+        assert staging_modes
+        assert all(mode & 0o077 == 0 for mode in staging_modes)
+    finally:
+        os.umask(previous_umask)
+
+
+def test_upload_creates_writable_parents_and_preserves_existing_directory_modes(
+        upload_server):
+    client, uploads = upload_server
+    previous_umask = os.umask(0o077)
+    try:
+        response = _upload(client, "nested/deep/notes.txt", b"nested")
         assert response.status_code == 200
-        assert response.json()["filename"] == name
-        path = uploads / name
-        assert path.read_bytes() == payload
-        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+        assert response.json()["filename"] == "nested/deep/notes.txt"
+        assert (uploads / "nested/deep/notes.txt").read_bytes() == b"nested"
+        assert stat.S_IMODE(uploads.stat().st_mode) == 0o777
+        assert stat.S_IMODE((uploads / "nested").stat().st_mode) == 0o777
+        assert stat.S_IMODE((uploads / "nested/deep").stat().st_mode) == 0o777
+
+        kept = uploads / "kept"
+        kept.mkdir()
+        os.chmod(kept, 0o750)
+        into_kept = _upload(client, "kept/file.txt", b"inside")
+        assert into_kept.status_code == 200
+        assert into_kept.json()["filename"] == "kept/file.txt"
+        assert (kept / "file.txt").read_bytes() == b"inside"
+        assert stat.S_IMODE(kept.stat().st_mode) == 0o750
+    finally:
+        os.umask(previous_umask)
 
 
-def test_free_name_preserves_response_fields_and_uploads_destination(upload_server):
+def test_free_name_preserves_response_fields_and_outputs_destination(upload_server):
     client, uploads = upload_server
     response = _upload(client, "brief.docx", b"new")
     assert response.status_code == 200
@@ -212,7 +296,54 @@ def test_free_name_preserves_response_fields_and_uploads_destination(upload_serv
                                "size": 3, "md5": "22af645d1859cb5ca6da0c484f1f37ea"}
     assert (uploads / "brief.docx").read_bytes() == b"new"
     assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx"]
-    assert not (uploads.parent / "outputs").exists()
+    assert not (uploads.parent / "uploads").exists()
+
+
+def test_uploaded_file_appears_in_outputs_listing_with_file_id(upload_server):
+    client, uploads = upload_server
+    body = b"PK\x03\x04brief"
+    response = _upload(client, "brief.docx", body)
+    assert response.status_code == 200
+    assert response.json()["filename"] == "brief.docx"
+    assert (uploads / "brief.docx").read_bytes() == body
+    listed = client.get(f"/api/outputs/{CHAT}", headers=HEADERS)
+    assert listed.status_code == 200
+    files = listed.json()["files"]
+    match = next(entry for entry in files if entry["path"] == "brief.docx")
+    assert match["file_id"]
+
+
+def test_colliding_uploads_have_distinct_listing_identities(upload_server):
+    client, uploads = upload_server
+    first = _upload(client, "report.docx", b"first-bytes")
+    second = _upload(client, "report.docx", b"second-bytes")
+    assert first.status_code == second.status_code == 200
+    assert first.json()["filename"] == "report.docx"
+    assert second.json()["filename"] == "report (2).docx"
+    assert (uploads / "report.docx").read_bytes() == b"first-bytes"
+    assert (uploads / "report (2).docx").read_bytes() == b"second-bytes"
+    listed = client.get(f"/api/outputs/{CHAT}", headers=HEADERS)
+    assert listed.status_code == 200
+    by_path = {entry["path"]: entry for entry in listed.json()["files"]}
+    assert by_path["report.docx"]["file_id"]
+    assert by_path["report (2).docx"]["file_id"]
+    assert by_path["report.docx"]["file_id"] != by_path["report (2).docx"]["file_id"]
+
+
+def test_uploaded_html_is_served_with_generated_content_isolation(upload_server):
+    client, uploads = upload_server
+    html = b"<script>window.active = true</script>"
+    response = _upload(client, "page.html", html)
+    assert response.status_code == 200
+    assert (uploads / "page.html").read_bytes() == html
+    served = client.get(f"/files/{CHAT}/page.html", headers=HEADERS)
+    assert served.status_code == 200
+    assert served.content == html
+    assert served.headers.get_list("content-security-policy") == [
+        "sandbox allow-scripts allow-forms",
+    ]
+    assert served.headers["x-content-type-options"] == "nosniff"
+
 
 
 @pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
@@ -254,16 +385,41 @@ def test_unlocked_writer_wins_claim_without_losing_either_payload(upload_server,
     attempted = []
 
     def competing_link(source, destination, *args, **kwargs):
-        source, destination = Path(source), Path(destination)
-        assert source.name.startswith(".") and source.parent == destination.parent
-        assert source.read_bytes() == b"new"
+        src_dir_fd = kwargs.get("src_dir_fd")
+        dst_dir_fd = kwargs.get("dst_dir_fd")
+        source_name = os.path.basename(os.fspath(source))
+        dest_name = os.path.basename(os.fspath(destination))
+        assert source_name.startswith(".upload-")
+        if src_dir_fd is not None:
+            info = os.stat(source, dir_fd=src_dir_fd)
+            reader = os.open(source, os.O_RDONLY | os.O_CLOEXEC, dir_fd=src_dir_fd)
+            try:
+                payload = os.read(reader, info.st_size)
+            finally:
+                os.close(reader)
+            assert payload == b"new"
+        else:
+            assert Path(source).read_bytes() == b"new"
         with (uploads.parent / ".lifecycle.lock").open("a+") as lock_file:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        attempted.append(destination.name)
-        if destination.name == "report.txt":
-            assert not destination.exists()
-            destination.write_bytes(b"unlocked writer")
+        attempted.append(dest_name)
+        if dest_name == "report.txt":
+            if dst_dir_fd is not None:
+                competitor = os.open(
+                    dest_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                    0o666,
+                    dir_fd=dst_dir_fd,
+                )
+                try:
+                    os.write(competitor, b"unlocked writer")
+                finally:
+                    os.close(competitor)
+            else:
+                destination_path = Path(destination)
+                assert not destination_path.exists()
+                destination_path.write_bytes(b"unlocked writer")
         return link(source, destination, *args, **kwargs)
 
     monkeypatch.setattr(os, "link", competing_link)
@@ -292,8 +448,6 @@ def test_traversal_and_external_directory_symlink_write_nothing(upload_server, n
 
 @pytest.mark.parametrize("failure", ["write", "claim"])
 def test_failed_upload_removes_partial_temporary_and_preserves_original(upload_server, monkeypatch, failure):
-    import tempfile
-
     client, uploads = upload_server
     uploads.mkdir(parents=True)
     (uploads / "report.txt").write_bytes(b"original")
@@ -302,20 +456,26 @@ def test_failed_upload_removes_partial_temporary_and_preserves_original(upload_s
             raise PermissionError("injected claim failure")
         monkeypatch.setattr(os, "link", failed_link)
     else:
-        create = tempfile.NamedTemporaryFile
+        written = os.write
 
-        @contextmanager
-        def failed_write(*args, **kwargs):
-            with create(*args, **kwargs) as handle:
-                def write(content):
-                    handle.write(content[:1])
-                    raise OSError("injected partial write failure")
-                yield SimpleNamespace(name=handle.name, write=write)
+        def failed_write(fd, data):
+            written(fd, data[:1])
+            raise OSError("injected partial write failure")
 
-        monkeypatch.setattr(tempfile, "NamedTemporaryFile", failed_write)
+        monkeypatch.setattr(os, "write", failed_write)
     response = _upload(client, "report.txt", b"new")
     assert response.status_code == 500
     assert (uploads / "report.txt").read_bytes() == b"original"
+    leftover = [
+        path.name for path in uploads.iterdir() if path.name.startswith(".upload-")
+    ]
+    assert leftover == []
+    control = uploads.parent / ".ocu"
+    if control.is_dir():
+        leftover_control = [
+            path.name for path in control.iterdir() if path.name.startswith(".upload-")
+        ]
+        assert leftover_control == []
     assert sorted(path.name for path in uploads.iterdir()) == ["report.txt"]
 
 
@@ -389,7 +549,8 @@ def test_concurrent_server_processes_report_their_own_complete_files(tmp_path):
         assert [process.returncode for process in processes] == [0, 0], outputs
         results = [(json.loads(stdout.splitlines()[-1])["filename"], body * 100_000)
                    for (stdout, _), body in zip(outputs, [b"A", b"B"])]
-        _assert_concurrent_payloads(results, data / CHAT / "uploads")
+        _assert_concurrent_payloads(results, data / CHAT / "outputs")
+
     finally:
         for process in processes:
             if process.poll() is None:
@@ -419,7 +580,8 @@ def test_concurrent_server_processes_store_one_file_for_the_same_attachment_id(t
         names = [json.loads(stdout.splitlines()[-1])["filename"]
                  for stdout, _ in outputs]
         assert names == ["data.xlsx", "data.xlsx"]
-        uploads = data / CHAT / "uploads"
+        uploads = data / CHAT / "outputs"
+
         assert sorted(path.name for path in uploads.iterdir()) == ["data.xlsx"]
         assert (uploads / "data.xlsx").read_bytes() in {b"A" * 100_000, b"B" * 100_000}
         receipts = json.loads((data / CHAT / ".ocu" / "imports.json").read_text())
@@ -596,3 +758,281 @@ def test_waiting_for_chat_lock_keeps_health_requests_responsive(upload_server):
         finally:
             release.set()
             holder.result(timeout=5)
+
+
+def _same_inode(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _matches_path(target, args, kwargs, *, directory_keys=("dir_fd",)):
+    try:
+        expected = os.lstat(target)
+    except FileNotFoundError:
+        expected = None
+    for key in directory_keys:
+        dir_fd = kwargs.get(key)
+        if dir_fd is None:
+            continue
+        try:
+            observed = os.fstat(dir_fd)
+        except OSError:
+            continue
+        if expected is not None and _same_inode(observed, expected):
+            return True
+    if not args:
+        return False
+    candidate = args[0]
+    if not isinstance(candidate, (str, bytes, os.PathLike)):
+        return False
+    text = os.fspath(candidate)
+    if os.path.isabs(text):
+        try:
+            return os.path.realpath(text) == os.path.realpath(str(target))
+        except OSError:
+            return False
+    for key in directory_keys:
+        dir_fd = kwargs.get(key)
+        if dir_fd is None:
+            continue
+        try:
+            parent = os.fstat(dir_fd)
+            ancestor = os.lstat(Path(target).parent)
+        except OSError:
+            continue
+        if _same_inode(parent, ancestor) and os.path.basename(text) == Path(target).name:
+            return True
+        if expected is not None and _same_inode(parent, expected):
+            return True
+    return False
+
+
+def _swap_directory_for_outside(directory, backup, outside):
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    directory.rename(backup)
+    directory.symlink_to(outside, target_is_directory=True)
+    return True
+
+
+def _is_regular_file(path):
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(mode)
+
+
+def test_upload_directory_walk_ancestor_swap_never_creates_outside_chat(
+        upload_server, monkeypatch):
+    client, uploads = upload_server
+    outside = uploads.parent.parent / "outside-walk-tree"
+    outside.mkdir(parents=True)
+    sentinel = outside / "keep.txt"
+    sentinel.write_bytes(b"OUTSIDE-WALK-UNTOUCHED")
+    nested = uploads / "nested"
+    nested.mkdir(parents=True)
+    outside_realpath = os.path.realpath(str(outside))
+    backup = uploads / "nested.aside"
+
+    mkdir = os.mkdir
+    opened = os.open
+    swapped = {"done": False}
+
+    def swap_nested():
+        if swapped["done"]:
+            return
+        if _swap_directory_for_outside(nested, backup, outside_realpath):
+            swapped["done"] = True
+
+    def swapping_mkdir(*args, **kwargs):
+        if not swapped["done"] and _matches_path(nested / "deep", args, kwargs):
+            swap_nested()
+        return mkdir(*args, **kwargs)
+
+    def swapping_open(*args, **kwargs):
+        fd = opened(*args, **kwargs)
+        if not swapped["done"] and _matches_path(nested, args, kwargs):
+            swap_nested()
+        return fd
+
+    monkeypatch.setattr(os, "mkdir", swapping_mkdir)
+    monkeypatch.setattr(os, "open", swapping_open)
+    response = _upload(client, "nested/deep/notes.txt", b"walk-payload")
+    assert swapped["done"]
+    assert not (outside / "deep").exists()
+    assert not (outside / "deep" / "notes.txt").exists()
+    assert sentinel.read_bytes() == b"OUTSIDE-WALK-UNTOUCHED"
+    if response.status_code == 200:
+        published = None
+        if backup.exists() and not backup.is_symlink():
+            candidate = backup / "deep" / "notes.txt"
+            if _is_regular_file(candidate):
+                published = candidate
+        if published is None and nested.exists() and not nested.is_symlink():
+            candidate = nested / "deep" / "notes.txt"
+            if _is_regular_file(candidate):
+                published = candidate
+        assert published is not None
+        assert published.read_bytes() == b"walk-payload"
+        assert os.path.realpath(str(published)).startswith(
+            os.path.realpath(str(uploads)) + os.sep)
+    else:
+        assert response.status_code == 403
+        assert not (backup / "deep" / "notes.txt").exists()
+
+
+def test_upload_publication_ancestor_swap_never_writes_outside_chat(
+        upload_server, monkeypatch):
+    client, uploads = upload_server
+    outside = uploads.parent.parent / "outside-publish-tree"
+    outside.mkdir(parents=True)
+    sentinel = outside / "keep.txt"
+    sentinel.write_bytes(b"OUTSIDE-PUBLISH-UNTOUCHED")
+    nested = uploads / "nested"
+    nested.mkdir(parents=True)
+    outside_realpath = os.path.realpath(str(outside))
+    backup = uploads / "nested.aside"
+    original = b"publish-payload"
+
+    create = tempfile.NamedTemporaryFile
+    link = os.link
+    swapped = {"done": False}
+
+    def swap_nested():
+        if swapped["done"]:
+            return
+        if _swap_directory_for_outside(nested, backup, outside_realpath):
+            swapped["done"] = True
+
+    @contextmanager
+    def swapping_named_temporary(*args, **kwargs):
+        directory = kwargs.get("dir")
+        if not swapped["done"] and directory is not None:
+            if _matches_path(nested, (directory,), {}):
+                swap_nested()
+        with create(*args, **kwargs) as handle:
+            yield handle
+
+    def swapping_link(source, destination, *args, **kwargs):
+        if not swapped["done"] and (
+            _matches_path(nested, (destination,), kwargs, directory_keys=("dst_dir_fd", "dir_fd"))
+            or _matches_path(nested / "brief.docx", (destination,), kwargs, directory_keys=("dst_dir_fd", "dir_fd"))
+        ):
+            swap_nested()
+        return link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", swapping_named_temporary)
+    monkeypatch.setattr(os, "link", swapping_link)
+    response = _upload(client, "nested/brief.docx", original, attachment_id="F-pub")
+    assert swapped["done"]
+    assert not (outside / "brief.docx").exists()
+    assert sentinel.read_bytes() == b"OUTSIDE-PUBLISH-UNTOUCHED"
+    if response.status_code == 200:
+        body = response.json()
+        stored = body["filename"]
+        published = None
+        stored_name = Path(stored).name
+        if backup.exists() and not backup.is_symlink():
+            candidate = backup / stored_name
+            if _is_regular_file(candidate):
+                published = candidate
+        if published is None and nested.exists() and not nested.is_symlink():
+            candidate = nested / stored_name
+            if _is_regular_file(candidate):
+                published = candidate
+        assert published is not None
+        assert published.read_bytes() == original
+        assert os.path.realpath(str(published)).startswith(
+            os.path.realpath(str(uploads)) + os.sep)
+        assert body["md5"] == hashlib.md5(original).hexdigest()
+        assert body["size"] == len(original)
+        receipts = _receipts(uploads)
+        assert receipts["F-pub"]["stored_name"] == stored
+        assert receipts["F-pub"]["size"] == len(original)
+        assert receipts["F-pub"]["md5"] == body["md5"]
+    else:
+        assert response.status_code == 403
+        assert not (backup / "brief.docx").exists()
+
+
+def test_sandbox_visible_staging_replacement_cannot_substitute_uploaded_bytes(
+        upload_server, monkeypatch):
+    client, uploads = upload_server
+    original = b"original-upload-bytes"
+    substitute = b"SANDBOX-SUBSTITUTED-BYTES"
+    workspace = uploads.parent
+    visible_staging = []
+    uploads_stat = None
+    link = os.link
+    written = os.write
+
+    def visible_upload_names():
+        names = []
+        if not uploads.exists():
+            return names
+        for root, dirs, files in os.walk(uploads, followlinks=False):
+            dirs[:] = [name for name in dirs if not name.startswith(".")]
+            for name in files:
+                if name.startswith(".upload-"):
+                    names.append(name)
+        return names
+
+    def record_visible_staging():
+        visible_staging.extend(visible_upload_names())
+
+    def observing_write(fd, data):
+        record_visible_staging()
+        return written(fd, data)
+
+    def swapping_link(source, destination, *args, **kwargs):
+        nonlocal uploads_stat
+        record_visible_staging()
+        if uploads_stat is None and uploads.exists():
+            uploads_stat = os.lstat(uploads)
+        source_name = os.path.basename(os.fspath(source))
+        src_dir_fd = kwargs.get("src_dir_fd")
+        if (
+            source_name.startswith(".upload-")
+            and src_dir_fd is None
+            and kwargs.get("dir_fd") is None
+        ):
+            source_path = Path(source)
+            try:
+                parent_stat = os.lstat(source_path.parent)
+            except OSError:
+                parent_stat = None
+            if parent_stat is not None and uploads_stat is not None and _same_inode(parent_stat, uploads_stat):
+                source_path.write_bytes(substitute)
+        return link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "write", observing_write)
+    monkeypatch.setattr(os, "link", swapping_link)
+    response = _upload(client, "brief.docx", original, attachment_id="F-stage")
+    record_visible_staging()
+    assert response.status_code == 200
+    body = response.json()
+    published = uploads / body["filename"]
+    assert published.is_file()
+    assert published.read_bytes() == original
+    assert body["filename"] == "brief.docx"
+    assert body["size"] == len(original)
+    assert body["md5"] == hashlib.md5(original).hexdigest()
+    receipts = _receipts(uploads)
+    assert receipts["F-stage"]["stored_name"] == "brief.docx"
+    assert receipts["F-stage"]["size"] == len(original)
+    assert receipts["F-stage"]["md5"] == body["md5"]
+    assert visible_staging == []
+    leftover = [
+        path.name for path in uploads.iterdir() if path.name.startswith(".upload-")
+    ]
+    assert leftover == []
+    control = workspace / ".ocu"
+    assert control.is_dir()
+    assert stat.S_IMODE(os.lstat(control).st_mode) == 0o700
+    leftover_control = [
+        path.name for path in control.iterdir() if path.name.startswith(".upload-")
+    ]
+    assert leftover_control == []
+    published.write_bytes(b"post-publication-edit")
+    assert published.read_bytes() == b"post-publication-edit"
+
