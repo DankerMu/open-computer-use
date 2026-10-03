@@ -9,10 +9,9 @@ Technical documentation for the AI Computer Use Docker environment.
 See also: [architecture.svg](architecture.svg) for the full system diagram.
 
 **Volume Mounts:**
-- `uploads` → `/mnt/user-data/uploads` (read-only)
-- `outputs` → `/mnt/user-data/outputs` (read-write, served via HTTP)
+- `{BASE_DATA_DIR}/{chat_id}/outputs` → `/mnt/user-data/files` (read-write, served via HTTP)
 - `skills` → `/mnt/skills` (read-only)
-- `workspace` → `/home/assistant` (read-write, per-chat Docker volume)
+- `workspace` → `/home/assistant` (read-write, per-chat named volume, private, not exported)
 
 ## Dockerfile Structure
 
@@ -70,29 +69,18 @@ The Dockerfile uses a multi-stage build approach for optimal layer caching:
 
 ## Mount Points
 
-### 1. User Data Uploads (Read-Only)
+### 1. Workspace Files (Read-Write)
 
 ```
-Host: ./data/uploads
-Container: /mnt/user-data/uploads
-Mode: ro (read-only)
-```
-
-**Purpose**: Input files for processing
-**Usage**: Place files here from host, read from container
-
-### 2. User Data Outputs (Read-Write)
-
-```
-Host: ./data/outputs
-Container: /mnt/user-data/outputs
+Host: {BASE_DATA_DIR}/{chat_id}/outputs
+Container: /mnt/user-data/files
 Mode: rw (read-write)
 ```
 
-**Purpose**: Generated files and results
-**Usage**: Write from container, read from host
+**Purpose**: Uploaded and generated files in one directory. The host directory keeps the name `outputs`; the container mount is `/mnt/user-data/files`.
+**Usage**: Read and write from the container; served via HTTP from the host.
 
-### 3. Skills System (Read-Only)
+### 2. Skills System (Read-Only)
 
 ```
 Host: ./skills
@@ -105,16 +93,16 @@ Mode: ro (read-only)
 - /mnt/skills/public/ - Core skills
 - /mnt/skills/examples/ - Example implementations
 
-### 4. Workspace (Ephemeral)
+### 3. Workspace (Private)
 
 ```
-Volume: ai-workspace
+Volume: chat-{chat_id}-workspace
 Container: /home/assistant
 Mode: rw (read-write)
 ```
 
-**Purpose**: Temporary working directory
-**Lifecycle**: Data cleared when volume is removed
+**Purpose**: Agent's private working directory
+**Lifecycle**: Persistent per-chat named volume; not listed or served
 **Usage**: Temporary files, intermediate processing
 
 ## Resource Management
@@ -172,7 +160,7 @@ dns:
 ### Enabled Features
 
 1. **no-new-privileges**: Prevents privilege escalation
-2. **Read-only mounts**: Skills and uploads are read-only
+2. **Read-only mounts**: Skills are read-only
 3. **Network isolation**: Bridge network mode
 4. **Resource limits**: CPU and memory constraints (configurable, see examples above)
 5. **Standard Docker runtime (runc)**: Containers share the host kernel. For stronger isolation, consider [gVisor (runsc)](https://gvisor.dev/) which intercepts syscalls in userspace — this is what Claude.ai uses. gVisor support is on the roadmap. On Kubernetes, the [Helm chart](kubernetes.md) runs the sandboxes under rootless Podman by default, and can opt into hypervisor-grade isolation via [Kata Containers](kata-runtime.md).
@@ -244,7 +232,7 @@ echo $?  # Should output 0
 
 1. **Volume Mounts**: Fast I/O for data directories
 2. **Resource Limits**: Prevent resource exhaustion
-3. **Ephemeral Workspace**: Named volume for fast disk access
+3. **Private Workspace**: Named volume for fast disk access
 
 ## Troubleshooting
 

@@ -187,23 +187,21 @@
 
   <!-- Working dir -->
   <text x="32" y="572" class="item-bold">/home/assistant/</text>
-  <text x="180" y="572" class="version">Working directory (Docker volume, persists per chat)</text>
+  <text x="180" y="572" class="version">Private working directory (per-chat volume, not exported)</text>
   <text x="32" y="590" class="item-bold">/home/node_modules/</text>
   <text x="200" y="590" class="version">Shared npm packages (image layer, not per-container)</text>
   <text x="32" y="608" class="item-bold">/usr/local/lib/node_modules_global/</text>
   <text x="280" y="608" class="version">Global CLI tools: mmdc, tsc, tsx, claude</text>
 
   <!-- Mount points -->
-  <text x="500" y="572" class="item-bold">/mnt/user-data/uploads/</text>
-  <text x="690" y="572" class="version">User files (read-only)</text>
-  <text x="500" y="590" class="item-bold">/mnt/user-data/outputs/</text>
-  <text x="690" y="590" class="version">Output files (served via API)</text>
-  <text x="500" y="608" class="item-bold">/mnt/skills/public/</text>
-  <text x="690" y="608" class="version">Built-in skills (16)</text>
-  <text x="500" y="626" class="item-bold">/mnt/skills/examples/</text>
-  <text x="690" y="626" class="version">Example skills (8)</text>
-  <text x="500" y="644" class="item-bold">/mnt/skills/user/</text>
-  <text x="690" y="644" class="version">User-uploaded skills</text>
+  <text x="500" y="572" class="item-bold">/mnt/user-data/files/</text>
+  <text x="660" y="572" class="version">Workspace files (read-write, served via API)</text>
+  <text x="500" y="590" class="item-bold">/mnt/skills/public/</text>
+  <text x="690" y="590" class="version">Built-in skills (16)</text>
+  <text x="500" y="608" class="item-bold">/mnt/skills/examples/</text>
+  <text x="690" y="608" class="version">Example skills (8)</text>
+  <text x="500" y="626" class="item-bold">/mnt/skills/user/</text>
+  <text x="690" y="626" class="version">User-uploaded skills</text>
 
   <text x="32" y="626" class="item-bold">/opt/pw-browsers/</text>
   <text x="200" y="626" class="version">Playwright Chromium cache</text>

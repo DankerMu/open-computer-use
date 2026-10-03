@@ -99,7 +99,7 @@
 
   <!-- Row 2: Mounts -->
   <text x="80" y="425" font-size="9" font-weight="600" fill="rgba(255,255,255,0.9)">Mounts:</text>
-  <text x="135" y="425" font-size="9" fill="rgba(255,255,255,0.65)">/mnt/skills (read-only) · /mnt/user-data/uploads (read-only) · /mnt/user-data/outputs (read-write → served via HTTP)</text>
+  <text x="135" y="425" font-size="9" fill="rgba(255,255,255,0.65)">/mnt/skills (read-only) · /mnt/user-data/files (read-write → served via HTTP) · /home/assistant (private)</text>
 
   <!-- Row 3: Features -->
   <text x="80" y="445" font-size="9" font-weight="600" fill="rgba(255,255,255,0.9)">Limits:</text>

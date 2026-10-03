@@ -51,7 +51,7 @@ from docx import Document
 doc = Document()
 doc.add_heading('Report', 0)
 doc.add_paragraph('Content here...')
-doc.save('/mnt/user-data/outputs/report.docx')
+doc.save('/mnt/user-data/files/report.docx')
 ```
 
 ### 2. pdf - PDF Processing
@@ -74,8 +74,8 @@ doc.save('/mnt/user-data/outputs/report.docx')
 ```bash
 # Fill PDF form
 python3 /mnt/skills/public/pdf/scripts/fill_pdf_form_with_annotations.py \
-  /mnt/user-data/uploads/form.pdf \
-  /mnt/user-data/outputs/filled.pdf
+  /mnt/user-data/files/form.pdf \
+  /mnt/user-data/files/filled.pdf
 ```
 
 ### 3. pptx - PowerPoint Presentations
@@ -103,7 +103,7 @@ prs = Presentation()
 slide = prs.slides.add_slide(prs.slide_layouts[0])
 title = slide.shapes.title
 title.text = "My Presentation"
-prs.save('/mnt/user-data/outputs/presentation.pptx')
+prs.save('/mnt/user-data/files/presentation.pptx')
 ```
 
 ### 4. xlsx - Excel Spreadsheets
@@ -124,7 +124,7 @@ wb = Workbook()
 ws = wb.active
 ws['A1'] = 'Hello'
 ws['B1'] = 123
-wb.save('/mnt/user-data/outputs/data.xlsx')
+wb.save('/mnt/user-data/files/data.xlsx')
 ```
 
 ### 5. skill-creator - Create New Skills
@@ -191,7 +191,7 @@ Create a 12-slide presentation on AI trends.
 4. Add speaker notes
 
 ## OUTPUT
-- Save to /mnt/user-data/outputs/ai_trends.pptx
+- Save to /mnt/user-data/files/ai_trends.pptx
 """,
     description="AI presentation for board meeting",
     max_turns=25
@@ -278,7 +278,7 @@ cat /mnt/skills/public/docx/SKILL.md
 
 # Use skill script
 python3 /mnt/skills/public/pdf/scripts/extract_form_field_info.py \
-  /mnt/user-data/uploads/form.pdf
+  /mnt/user-data/files/form.pdf
 ```
 
 ### From Host (via MCP)
@@ -429,8 +429,8 @@ docker-compose build --no-cache
 
 ### 1. Read-Only Skills
 Skills are mounted read-only. For modifications:
-- Copy to `/home/assistant/` (ephemeral workspace)
-- Or write outputs to `/mnt/user-data/outputs/`
+- Copy to `/home/assistant/` (private working directory)
+- Or write outputs to `/mnt/user-data/files/`
 
 ### 2. File Paths
 Always use absolute paths:
@@ -470,9 +470,9 @@ To contribute new skills or improvements:
 
 ## References
 
-- [MCP Best Practices](/mnt/skills/examples/mcp-builder/reference/mcp_best_practices.md)
-- [Output Patterns](/mnt/skills/public/skill-creator/references/output-patterns.md)
-- [Workflow Guide](/mnt/skills/public/skill-creator/references/workflows.md)
+- [MCP Best Practices](../skills/examples/mcp-builder/reference/mcp_best_practices.md)
+- [Output Patterns](../skills/public/skill-creator/references/output-patterns.md)
+- [Workflow Guide](../skills/public/skill-creator/references/workflows.md)
 
 ## Support
 
