@@ -929,7 +929,9 @@ def test_deep_directory_tree_is_traversed_without_recursion_error(world):
 
 # Child instruments stdlib fcntl.flock only. LOCK_EX must observe a real
 # LOCK_NB denial before blocking; the parent waits for that contention marker.
-_PROCESS_RESOLVE_WHILE_LOCKED = r'''
+# OCU_CHILD_OP selects the locked payload; OCU_LOCK_DENIAL is the in-child
+# negative control when the exclusive lock is granted without contention.
+_PROCESS_WHILE_LOCKED = r'''
 import fcntl
 import json
 import os
@@ -955,13 +957,19 @@ def contend_then_block(fd, operation):
         try:
             original_flock(fd, fcntl.LOCK_UN)
         finally:
-            raise AssertionError("resolver lock was granted without contention")
+            raise AssertionError(os.environ["OCU_LOCK_DENIAL"])
     return original_flock(fd, operation)
 
 fcntl.flock = contend_then_block
-path = outputs_broker.OutputsBroker().resolve_file_id(os.environ["OCU_CHAT"], os.environ["OCU_FILE_ID"])
-Path(os.environ["OCU_RESULT"]).write_text(json.dumps({"path": path}), encoding="utf-8")
-print(json.dumps({"path": path}))
+broker = outputs_broker.OutputsBroker()
+if os.environ["OCU_CHILD_OP"] == "resolve":
+    payload = {"path": broker.resolve_file_id(os.environ["OCU_CHAT"], os.environ["OCU_FILE_ID"])}
+else:
+    listing = broker.reconcile(os.environ["OCU_CHAT"])
+    entry = next(item for item in listing["entries"] if item["path"] == os.environ["OCU_PATH"])
+    payload = {"file_id": entry["file_id"], "revision": entry["revision"], "hash": entry["hash"]}
+Path(os.environ["OCU_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
+print(json.dumps(payload))
 '''
 
 
@@ -1178,27 +1186,20 @@ def test_cross_process_resolution_waits_for_writer_commit_then_observes_new_path
     file_id = _entry_by_path(listing, "report.docx")["file_id"]
     contended = data.parent / "resolve-contended"
     result = data.parent / "resolve-result.json"
-    environment = os.environ.copy()
-    pythonpath = environment.get("PYTHONPATH", "")
-    environment.update(
-        {
-            "OCU_SERVER_DIR": str(SERVER_DIR),
-            "OCU_BASE": str(data),
-            "OCU_CHAT": CHAT,
-            "OCU_FILE_ID": file_id,
-            "OCU_CONTENDED": str(contended),
-            "OCU_RESULT": str(result),
-            "DOCKER_HOST": NO_DOCKER_SOCKET,
-            "DOCKER_SOCKET": NO_DOCKER_SOCKET,
-            "PYTHONPATH": str(SERVER_DIR) + (os.pathsep + pythonpath if pythonpath else ""),
-        }
+    environment = _broker_child_env(
+        data,
+        OCU_FILE_ID=file_id,
+        OCU_CONTENDED=str(contended),
+        OCU_RESULT=str(result),
+        OCU_CHILD_OP="resolve",
+        OCU_LOCK_DENIAL="resolver lock was granted without contention",
     )
 
     child = None
     try:
         with docker_manager._combined_lock(CHAT):
             child = subprocess.Popen(
-                [sys.executable, "-c", _PROCESS_RESOLVE_WHILE_LOCKED],
+                [sys.executable, "-c", _PROCESS_WHILE_LOCKED],
                 cwd=str(SERVER_DIR),
                 env=environment,
                 text=True,
@@ -1225,56 +1226,7 @@ def test_cross_process_resolution_waits_for_writer_commit_then_observes_new_path
         assert json.loads(result.read_text(encoding="utf-8")) == {"path": "final.docx"}
         assert json.loads(stdout.strip().splitlines()[-1]) == {"path": "final.docx"}
     finally:
-        if child is not None:
-            if child.poll() is None:
-                child.terminate()
-                try:
-                    child.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-            try:
-                child.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(timeout=5)
-
-
-_PROCESS_RECONCILE_WHILE_LOCKED = r'''
-import fcntl
-import json
-import os
-import sys
-from pathlib import Path
-
-sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
-os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
-os.environ["DOCKER_HOST"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
-os.environ["DOCKER_SOCKET"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
-
-import outputs_broker
-
-original_flock = fcntl.flock
-
-def contend_then_block(fd, operation):
-    if operation == fcntl.LOCK_EX:
-        try:
-            original_flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            Path(os.environ["OCU_CONTENDED"]).write_text("1", encoding="utf-8")
-            return original_flock(fd, fcntl.LOCK_EX)
-        try:
-            original_flock(fd, fcntl.LOCK_UN)
-        finally:
-            raise AssertionError("reconcile lock was granted without contention")
-    return original_flock(fd, operation)
-
-fcntl.flock = contend_then_block
-listing = outputs_broker.OutputsBroker().reconcile(os.environ["OCU_CHAT"])
-entry = next(item for item in listing["entries"] if item["path"] == os.environ["OCU_PATH"])
-payload = {"file_id": entry["file_id"], "revision": entry["revision"], "hash": entry["hash"]}
-Path(os.environ["OCU_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
-print(json.dumps(payload))
-'''
+        _stop_child(child)
 
 
 _PROCESS_READ_REGISTERED = r'''
@@ -1319,15 +1271,13 @@ def _seed_report_revision_seven(broker, data, body: bytes) -> dict:
 def _forbid_inode_open(broker_module, monkeypatch, *paths: Path) -> None:
     identities = {(path.lstat().st_dev, path.lstat().st_ino) for path in paths}
     original_open = broker_module.os.open
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
 
     def guarded(target, flags, *args, **kwargs):
         dir_fd = kwargs.get("dir_fd")
+        follow_symlinks = not (flags & nofollow)
         try:
-            info = (
-                os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
-                if dir_fd is not None
-                else os.lstat(target)
-            )
+            info = os.stat(target, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
         except (OSError, TypeError, ValueError):
             info = None
         if info is not None and (info.st_dev, info.st_ino) in identities:
@@ -1378,9 +1328,12 @@ def test_same_size_host_write_advances_revision_and_hash(world):
     assert len(old_body) == len(new_body)
     seeded = _seed_report_revision_seven(broker, data, old_body)
     path = _outputs(data) / "report.docx"
+    stored_mtime = seeded["mtime_ns"]
 
     with docker_manager._combined_lock(CHAT):
         path.write_bytes(new_body)
+        os.utime(path, ns=(path.stat().st_atime_ns, stored_mtime + 1_000_000))
+        fresh_mtime = path.stat().st_mtime_ns
         registered = broker.register_host_write(CHAT, "report.docx")
 
     expected_hash = hashlib.sha256(new_body).hexdigest()
@@ -1394,6 +1347,9 @@ def test_same_size_host_write_advances_revision_and_hash(world):
     assert entry["revision"] == 10
     assert entry["hash"] == expected_hash
     assert entry["size"] == len(new_body)
+    assert registered["mtime_ns"] == fresh_mtime
+    assert entry["mtime_ns"] == fresh_mtime
+    assert fresh_mtime != stored_mtime
     assert persisted["fingerprints"][f"{entry['size']}:{expected_hash}"] == [seeded["file_id"]]
 
 
@@ -1417,7 +1373,7 @@ def test_registered_size_change_is_not_counted_again_by_reconcile(world):
     assert entry["hash"] == hashlib.sha256(b"CCCCCCCCC").hexdigest()
 
 
-def test_registering_one_path_leaves_sibling_entry_bytes_unchanged(world):
+def test_registering_one_path_leaves_sibling_entry_bytes_unchanged(world, monkeypatch):
     broker_module, docker_manager, data = world
     broker = broker_module.OutputsBroker()
     _put(data, "a.docx", b"aaa")
@@ -1425,17 +1381,27 @@ def test_registering_one_path_leaves_sibling_entry_bytes_unchanged(world):
     broker.reconcile(CHAT)
     before = _read_index(data)
     sibling = dict(before["active"]["b.docx"])
+    scans = {"count": 0}
 
+    def forbid_register_scandir(target, *args, **kwargs):
+        scans["count"] += 1
+        raise AssertionError("register_host_write must not scan the outputs tree")
+
+    (_outputs(data) / "b.docx").write_bytes(b"BBB-DIRTY-SIBLING")
     with docker_manager._combined_lock(CHAT):
         (_outputs(data) / "a.docx").write_bytes(b"AAA")
-        registered = broker.register_host_write(CHAT, "a.docx")
+        with monkeypatch.context() as patches:
+            patches.setattr(broker_module.os, "scandir", forbid_register_scandir)
+            registered = broker.register_host_write(CHAT, "a.docx")
 
     persisted = _read_index(data)
     assert persisted["active"]["b.docx"] == sibling
     assert persisted["tombstones"] == before["tombstones"]
     assert registered["file_id"] == before["active"]["a.docx"]["file_id"]
     assert registered["revision"] == before["counter"] + 1
+    assert persisted["counter"] == before["counter"] + 1
     assert persisted["active"]["a.docx"]["revision"] != sibling["revision"]
+    assert scans["count"] == 0
 
 
 def test_unindexed_path_gets_fresh_id_not_borrowed_from_tombstone(world):
@@ -1567,13 +1533,15 @@ def test_writer_lock_excludes_reconcile_until_registration_commits(world):
         OCU_PATH="report.docx",
         OCU_CONTENDED=str(contended),
         OCU_RESULT=str(result),
+        OCU_CHILD_OP="reconcile",
+        OCU_LOCK_DENIAL="reconcile lock was granted without contention",
     )
     child = None
     try:
         with docker_manager._combined_lock(CHAT):
             path.write_bytes(b"BBBBBBBB")
             child = subprocess.Popen(
-                [sys.executable, "-c", _PROCESS_RECONCILE_WHILE_LOCKED],
+                [sys.executable, "-c", _PROCESS_WHILE_LOCKED],
                 cwd=str(SERVER_DIR),
                 env=environment,
                 text=True,
@@ -1606,6 +1574,82 @@ def test_writer_lock_excludes_reconcile_until_registration_commits(world):
         assert registered["revision"] == listing["revision"] + 1
     finally:
         _stop_child(child)
+
+
+def test_nested_host_write_retains_identity_and_is_unchanged_on_reconcile(world):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    old_body = b"nested-old"
+    new_body = b"nested-new"
+    path = _put(data, "a/b/c.docx", old_body)
+    listing = broker.reconcile(CHAT)
+    seeded = _entry_by_path(listing, "a/b/c.docx")
+    prior_counter = listing["revision"]
+
+    with docker_manager._combined_lock(CHAT):
+        path.write_bytes(new_body)
+        registered = broker.register_host_write(CHAT, "a/b/c.docx")
+
+    expected_hash = hashlib.sha256(new_body).hexdigest()
+    persisted = _read_index(data)
+    entry = persisted["active"]["a/b/c.docx"]
+    fresh = path.stat()
+    assert registered["file_id"] == seeded["file_id"]
+    assert registered["path"] == "a/b/c.docx"
+    assert registered["name"] == "c.docx"
+    assert registered["size"] == len(new_body)
+    assert registered["hash"] == expected_hash
+    assert registered["revision"] == prior_counter + 1
+    assert registered["mtime_ns"] == fresh.st_mtime_ns
+    assert entry == registered
+    assert persisted["counter"] == prior_counter + 1
+    listing = broker.reconcile(CHAT)
+    assert listing["unchanged"] is True
+    assert listing["revision"] == prior_counter + 1
+    assert _entry_by_path(listing, "a/b/c.docx")["file_id"] == seeded["file_id"]
+    assert _read_index(data)["counter"] == prior_counter + 1
+
+
+def test_register_corrupt_index_fails_closed_without_reset(world):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    _put(data, "keep.docx", b"k")
+    broker.reconcile(CHAT)
+    index_path = _index(data)
+    broken = b"{broken-json"
+    index_path.write_bytes(broken)
+    _put(data, "keep.docx", b"K")
+
+    with docker_manager._combined_lock(CHAT):
+        with pytest.raises(broker_module.CorruptIndexError):
+            broker.register_host_write(CHAT, "keep.docx")
+
+    assert index_path.read_bytes() == broken
+
+
+def test_existing_file_registers_at_active_file_limit(world):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker(max_active_files=1)
+    _put(data, "keep.docx", b"k")
+    listing = broker.reconcile(CHAT)
+    seeded = _entry_by_path(listing, "keep.docx")
+    before_counter = _read_index(data)["counter"]
+
+    with docker_manager._combined_lock(CHAT):
+        (_outputs(data) / "keep.docx").write_bytes(b"K")
+        registered = broker.register_host_write(CHAT, "keep.docx")
+
+    persisted = _read_index(data)
+    assert registered["file_id"] == seeded["file_id"]
+    assert registered["revision"] == before_counter + 1
+    assert persisted["counter"] == before_counter + 1
+    assert list(persisted["active"]) == ["keep.docx"]
+
+    _put(data, "extra.docx", b"x")
+    after_existing = _index(data).read_bytes()
+    with pytest.raises(broker_module.LimitExceededError):
+        broker.register_host_write(CHAT, "extra.docx")
+    assert _index(data).read_bytes() == after_existing
 
 
 def _prepare_register_rejection(world, name: str):
