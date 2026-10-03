@@ -2,8 +2,6 @@
   "version": 1,
   "rows": [
     {"path": "api/outputs/{chat}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
-    {"path": "api/uploads/{chat}/manifest", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
-    {"path": "api/uploads/{chat}/list", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
     {"path": "files/{chat}/archive", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
     {"path": "files/{chat}/{path}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "file"},
     {"path": "preview/{chat}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},

@@ -88,8 +88,6 @@ class NativeProxyTests(unittest.TestCase):
     def test_canonical_rows_forward_only_allowed_methods_and_preserve_prefix(self):
         rows = (
             ("/ocu/api/outputs/{c}", "/api/outputs/{c}", "GET"),
-            ("/ocu/api/uploads/{c}/manifest", "/api/uploads/{c}/manifest", "GET"),
-            ("/ocu/api/uploads/{c}/list", "/api/uploads/{c}/list", "GET"),
             ("/ocu/files/{c}/archive", "/files/{c}/archive", "GET"),
             ("/ocu/files/{c}/sub/report.bin", "/files/{c}/sub/report.bin", "GET"),
             ("/ocu/preview/{c}", "/preview/{c}", "GET"),
@@ -130,9 +128,6 @@ class NativeProxyTests(unittest.TestCase):
                 path = "/ocu/api/uploads/" + CHAT + "/" + filename
                 self.check_forward(path, "/api/uploads/" + CHAT + "/" + filename,
                                    method="POST", extra=MUTATION, body=payload)
-        self.check_forward("/ocu/api/uploads/" + CHAT + "/man%69fest",
-                           "/api/uploads/" + CHAT + "/man%69fest",
-                           method="GET")
         path = "/ocu/api/uploads/" + CHAT + "/manifest"
         before = self.snapshot()
         status, _, _ = self.request(
@@ -167,6 +162,22 @@ class NativeProxyTests(unittest.TestCase):
         ocu = self.since("ocu", before)
         self.assertEqual(len(ocu), 1)
         self.assertEqual(ocu[0]["target"], "/api/outputs/" + CHAT)
+
+    def test_retired_upload_reads_never_contact_ocu(self):
+        spellings = ("manifest", "list", "%6danifest", "%6cist", "man%69fest")
+        callers = (
+            ("owner", self.owner()),
+            ("foreign", {"Cookie": "session=foreign"}),
+            ("anonymous", None),
+        )
+        for filename in spellings:
+            path = "/ocu/api/uploads/" + CHAT + "/" + filename
+            for caller, headers in callers:
+                with self.subTest(path=path, caller=caller):
+                    before = self.snapshot()
+                    status, _, _ = self.request(path, headers=headers)
+                    self.assertEqual(status, 404, path)
+                    self.assertEqual(self.since("ocu", before), [], path)
 
     def test_unknown_paths_methods_and_ambiguous_targets_never_contact_ocu(self):
         targets = (
