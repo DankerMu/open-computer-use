@@ -11,12 +11,13 @@
 
 ### Changed
 - **Upload name claim without replace.** `POST /api/uploads/{chat_id}/{path}`
-  writes a complete dot-prefixed temporary file under the per-chat lock, then
+  stages complete bytes in the server-private `{chat}/.ocu` directory, then
   hard-links the first free name (`name (N).ext` on collision) without replacing
-  an occupied entry. Staging stays private while bytes are written; complete
+  an occupied entry. Staging stays unreachable from the sandbox bind; complete
   bytes receive mode 0666 through the open descriptor before the link so the
   sandbox user can edit the published file. Newly created upload directories
-  receive mode 0777 without changing existing directory modes.
+  receive mode 0777 without changing existing directory modes. Publication
+  walks and links through O_NOFOLLOW descriptors from the chat root.
 
 - **Import-once attachment receipts.** An upload that carries
   `X-OCU-Attachment-Id` records the attachment id, stored name, original size,
@@ -52,6 +53,8 @@
   and keeps their parent root-owned and non-writable by the sandbox user.
   `BASE_DATA_DIR` is the sole server/bind root.
   MCP keeps its `file://uploads` URI shape and excludes hidden path segments.
+  MCP listing and read walk the workspace tree through O_NOFOLLOW descriptors
+  and skip symlink and non-regular entries.
 
 - **Cold backup and isolated restore.** `deploy/recovery.py` captures one
   complete cold recovery set, restores it onto a distinct empty local
