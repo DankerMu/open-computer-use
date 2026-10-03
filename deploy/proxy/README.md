@@ -84,6 +84,10 @@ parameters preserve the query/disposition but do not disable the sandbox.
 Binary/download policy otherwise remains upstream-owned. Upload size remains
 OCU-owned rather than nginx's 1 MiB default.
 
+`GET /ocu/api/uploads/{chat}/manifest` and `GET /ocu/api/uploads/{chat}/list`
+return 404 without contacting OCU. `POST /ocu/api/uploads/{chat}/{path}`
+forwards guarded uploads, including files whose names are `manifest` or `list`.
+
 ## Focused native proof and limits
 
 `python3 -m unittest discover -s deploy/proxy/tests -p 'test_render.py' -v`

@@ -22,7 +22,7 @@ DEFAULTS = {
     "OCU_PROXY_UPSTREAM": "http://127.0.0.1:8090",
     "OCU_PROXY_LISTEN": "127.0.0.1:8082",
 }
-REVIEWED_TABLE_SHA256 = "3b64eb4e55adb688b60903ff84b4af78b8b13cf1b132b33f191204182b6ec534"
+REVIEWED_TABLE_SHA256 = "a066ccbe97e9e1d29bf395a3aacd0c2d2f5d67c409c314071d2e0913d3584bb8"
 FIELDS = {"path", "methods", "auth", "mutating", "prefix", "kind"}
 SEGMENT = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\Z")
 PLACEHOLDER = {"chat", "path", "pid", "page"}
@@ -92,8 +92,8 @@ def _table(table: Path) -> list[dict]:
             or not isinstance(source["rows"], list)):
         raise RenderError("route table schema is invalid")
     rows = source["rows"]
-    if not rows or len(rows) != 22:
-        raise RenderError("route table must contain 22 reviewed rows")
+    if not rows or len(rows) != 20:
+        raise RenderError("route table must contain 20 reviewed rows")
     seen = set()
     for row in rows:
         if not isinstance(row, dict) or set(row) != FIELDS:
@@ -176,8 +176,7 @@ def _route_regex(path: str, *, raw: bool = False) -> str:
     return "/ocu/" + "/".join(pieces)
 
 
-def _location(row: dict, ocu: str, bearer: str, *, named: str | None = None,
-              shadow: tuple[str, list[str]] | None = None) -> str:
+def _location(row: dict, ocu: str, bearer: str) -> str:
     pattern = _route_regex(row["path"])
     # nginx selects locations by normalized URI; validate the original request
     # against the same table row and compare the chat before forwarding it raw.
@@ -186,17 +185,8 @@ def _location(row: dict, ocu: str, bearer: str, *, named: str | None = None,
     raw = raw + r"(?:\?[^#]*)?$"
     auth = "_ocu_chat_auth" if row["auth"] == "chat" else "_ocu_session_auth"
     method = "|".join(row["methods"])
-    selector = (f"~ ^{named}/(?<ocu_route_chat>{URI_PART['chat']})$"
-                if named else "~ ^" + pattern + "$")
+    selector = "~ ^" + pattern + "$"
     lines = [f"        location {selector} {{"]
-    if named:
-        lines.append("            internal;")
-    if shadow:
-        target, methods = shadow
-        lines.append(
-            f"            if ($request_method ~ ^(?:{'|'.join(methods)})$) "
-            f"{{ rewrite ^ {target}/$ocu_route_chat last; }}"
-        )
     lines += [f'            if ($request_uri !~ "^{raw}") {{ return 404; }}']
     if row["auth"] == "chat":
         lines += [
@@ -267,27 +257,7 @@ def _location(row: dict, ocu: str, bearer: str, *, named: str | None = None,
 
 
 def _locations(rows: list[dict], ocu: str, bearer: str) -> str:
-    # A literal read row can overlap a path-catchall write row. Dispatch by
-    # method before rejecting a valid upload under that more-specific location.
-    shadows = {}
-    named = []
-    for index, generic in enumerate(rows):
-        if generic["path"].endswith("/{path}") and generic["methods"] == ["POST"]:
-            prefix = generic["path"][:-len("{path}")]
-            target = f"/_ocu_method_{index}"
-            for row in rows:
-                suffix = row["path"][len(prefix):]
-                if (row is not generic and row["path"].startswith(prefix)
-                        and suffix and "{" not in suffix
-                        and set(row["methods"]).isdisjoint(generic["methods"])
-                        and row["auth"] == generic["auth"]):
-                    if row["path"] in shadows:
-                        raise RenderError("route methods overlap ambiguously")
-                    shadows[row["path"]] = (target, generic["methods"])
-            if any(shadow[0] == target for shadow in shadows.values()):
-                named.append(_location(generic, ocu, bearer, named=target))
-    return "\n".join([*(_location(row, ocu, bearer, shadow=shadows.get(row["path"]))
-                        for row in rows), *named])
+    return "\n".join(_location(row, ocu, bearer) for row in rows)
 
 
 def render(*, table: Path = ROOT / "routes.json", output: Path = ROOT / "nginx.conf",

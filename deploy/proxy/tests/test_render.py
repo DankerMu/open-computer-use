@@ -118,7 +118,7 @@ class RenderTests(unittest.TestCase):
             ("no auth", lambda rows: rows[0].update(auth="none"), "auth"),
             ("unknown row", lambda rows: rows[0].update(path="internal/launch/{chat}"), "path"),
             ("ambiguous parameter", lambda rows: rows[0].update(path="api/outputs/{unknown}"), "path"),
-            ("nonmutating POST", lambda rows: rows[13].update(mutating=False), "mutation"),
+            ("nonmutating POST", lambda rows: next(row for row in rows if row["path"] == "api/uploads/{chat}/{path}").update(mutating=False), "mutation"),
             ("wrong static prefix", lambda rows: rows[-1].update(prefix="strip"), "prefix"),
         ):
             with self.subTest(label=label):
