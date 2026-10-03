@@ -143,6 +143,50 @@ class OutputsBroker:
                     return entry["path"]
             raise FileIdNotFoundError("file_id is not an active persisted identity")
 
+    def register_host_write(self, chat_id: str, path: str) -> dict[str, Any]:
+        """Register one host write under the caller's locked transaction."""
+        chat = self._canonical_chat(chat_id)
+        self._assert_chat_root_safe(chat, allow_missing=True)
+        with docker_manager._combined_lock(chat):
+            self._assert_chat_root_safe(chat, allow_missing=False)
+            if type(path) is not str:
+                raise UnsupportedNameError("unsupported output name")
+            self._require_representable_name(path.rsplit("/", 1)[-1], path)
+            index = self._read_index(chat)
+            if index is None:
+                index = self._empty_index()
+            observation = self._observe_registered_path(chat, path)
+            digest = self._hash_observation(chat, observation)
+            active = {item_path: dict(entry) for item_path, entry in index["active"].items()}
+            tombstones = {file_id: dict(entry) for file_id, entry in index["tombstones"].items()}
+            if path in active:
+                file_id = active[path]["file_id"]
+            else:
+                if len(active) >= self.max_active_files:
+                    raise LimitExceededError("output file count exceeds configured active-file limit")
+                file_id = str(uuid.uuid4())
+            counter = index["counter"] + 1
+            entry = {
+                "file_id": file_id,
+                "path": path,
+                "name": observation.name,
+                "size": observation.size,
+                "mtime_ns": observation.mtime_ns,
+                "revision": counter,
+                "hash": digest,
+            }
+            active[path] = entry
+            successor = {
+                "schema_version": SCHEMA_VERSION,
+                "counter": counter,
+                "active": active,
+                "fingerprints": self._fingerprints(active),
+                "tombstones": tombstones,
+            }
+            self._validate_index(successor)
+            self._write_index(chat, successor)
+            return dict(entry)
+
     def reconcile(self, chat_id: str, *, cursor: str | None = None, limit: int = DEFAULT_PAGE_LIMIT) -> dict[str, Any]:
         """Safely reconcile one chat and return a revision-bound sorted page."""
         page_limit = self._page_limit(limit)
@@ -494,6 +538,54 @@ class OutputsBroker:
                 if owned:
                     os.close(directory_fd)
             raise
+
+    def _observe_registered_path(self, chat: str, relative_path: str) -> _Observation:
+        output_root = self._chat_root(chat) / "outputs"
+        try:
+            output_stat = os.lstat(output_root)
+        except FileNotFoundError as exc:
+            raise UnstableReadError(f"outputs root is missing: {output_root}") from exc
+        if stat.S_ISLNK(output_stat.st_mode):
+            raise UnsafePathError(f"outputs root is a symlink: {output_root}")
+        if not stat.S_ISDIR(output_stat.st_mode):
+            raise UnsafePathError(f"outputs root is not a directory: {output_root}")
+        root_fd = self._open_directory_path(output_root, "outputs root")
+        parent_fd = root_fd
+        try:
+            components = relative_path.split("/")
+            for component in components[:-1]:
+                next_fd = self._open_child_directory(parent_fd, component)
+                if parent_fd != root_fd:
+                    os.close(parent_fd)
+                parent_fd = next_fd
+            name = components[-1]
+            try:
+                item_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise UnstableReadError(f"output is missing: {relative_path}") from exc
+            except OSError as exc:
+                if self._is_nofollow_error(exc):
+                    raise UnsafePathError(f"output path is a symlink: {relative_path}") from exc
+                if self._is_missing(exc):
+                    raise UnstableReadError(f"output is missing: {relative_path}") from exc
+                raise UnstableReadError(f"cannot inspect output: {relative_path}") from exc
+            if stat.S_ISLNK(item_stat.st_mode):
+                raise UnsafePathError(f"output path is a symlink: {relative_path}")
+            if not stat.S_ISREG(item_stat.st_mode):
+                raise UnstableReadError(f"{relative_path} is not a stable regular file")
+            if item_stat.st_size > self.max_file_size:
+                raise LimitExceededError(f"output file exceeds configured size limit: {relative_path}")
+            return _Observation(
+                path=relative_path,
+                name=name,
+                size=item_stat.st_size,
+                mtime_ns=item_stat.st_mtime_ns,
+                signature=self._signature(item_stat),
+            )
+        finally:
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            os.close(root_fd)
 
     def _hash_observation(self, chat: str, observation: _Observation) -> str:
         output_root = self._chat_root(chat) / "outputs"
