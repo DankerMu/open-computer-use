@@ -13,9 +13,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
+import socket
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -29,19 +32,47 @@ INTERNAL = "ocu-test-internal-token"
 MCP_KEY = "ocu-test-mcp-api-key"
 OTHER = "not-the-configured-secret"
 ORIGIN = "https://webui.example"
-
-
-def _subprocess_env():
-    env = os.environ.copy()
-    env["PUBLIC_BASE_URL"] = "/ocu"
-    return env
-
-
 SUBNET = "10.90.0.0/24"
 SANDBOX_PEER = "10.90.0.8"
 OUTSIDE_PEER = "10.90.1.8"
 CHAT = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 CHAT_B = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+OFFICE_ENV = {
+    "OCU_OFFICE_DOCSERVER_URL": "http://documentserver",
+    "OCU_OFFICE_DOCSERVER_ORIGIN": "https://docs.example",
+    "OCU_OFFICE_SELF_URL": "http://ocu:8081",
+    "OCU_OFFICE_JWT_SECRET": "office-startup-secret-canary",
+}
+
+
+@pytest.fixture(autouse=True)
+def isolated_office_env(monkeypatch):
+    for name in OFFICE_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def office_preflight(monkeypatch):
+    _apply_env(monkeypatch)
+    monkeypatch.delenv("OCU_SANDBOX_DNS", raising=False)
+    import auth_guard
+
+    return auth_guard.startup_preflight
+
+
+def _subprocess_env():
+    env = os.environ.copy()
+    env["PUBLIC_BASE_URL"] = "/ocu"
+    env["OCU_INTERNAL_TOKEN"] = INTERNAL
+    env["OCU_SANDBOX_SUBNET"] = SUBNET
+    env["OCU_WEBUI_ORIGIN"] = ORIGIN
+    env["MCP_API_KEY"] = MCP_KEY
+    env["OCU_WEBUI_AUTH_URL"] = "http://127.0.0.1:9/api/v1/ocu/auth"
+    env.pop("OCU_SANDBOX_DNS", None)
+    for name in OFFICE_ENV:
+        env.pop(name, None)
+    return env
+
 
 # Representative chat-bound surfaces. One mutating upload plus reads that
 # would touch the filesystem or resolve a container when unguarded.
@@ -217,6 +248,123 @@ def _raw_http_response(app, path, headers, method="GET"):
 
 
 class TestStartupFailClosed:
+    @pytest.mark.parametrize("address", [None, "", " \t\r\n"])
+    @pytest.mark.parametrize("dependents", ["absent", "blank", "partial", "configured"])
+    def test_unconfigured_office_needs_no_other_settings(
+        self, office_preflight, monkeypatch, capsys, address, dependents
+    ):
+        if address is not None:
+            monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", address)
+        for name, value in OFFICE_ENV.items():
+            if name == "OCU_OFFICE_DOCSERVER_URL":
+                continue
+            if dependents == "configured":
+                monkeypatch.setenv(name, value)
+            elif dependents == "blank":
+                monkeypatch.setenv(name, " \t\n")
+            elif dependents == "partial" and name == "OCU_OFFICE_JWT_SECRET":
+                monkeypatch.setenv(name, value)
+        assert office_preflight() == 0
+        captured = capsys.readouterr()
+        assert OFFICE_ENV["OCU_OFFICE_JWT_SECRET"] not in captured.out + captured.err
+
+    def test_configured_office_starts_without_disclosing_secret(
+        self, office_preflight, monkeypatch, capsys
+    ):
+        for name, value in OFFICE_ENV.items():
+            monkeypatch.setenv(name, value)
+        assert office_preflight() == 0
+        captured = capsys.readouterr()
+        assert OFFICE_ENV["OCU_OFFICE_JWT_SECRET"] not in captured.out + captured.err
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["OCU_OFFICE_JWT_SECRET", "OCU_OFFICE_DOCSERVER_ORIGIN", "OCU_OFFICE_SELF_URL"],
+    )
+    @pytest.mark.parametrize("blank", [None, "", " \t\r\n"])
+    def test_configured_office_rejects_each_missing_or_blank_dependency(
+        self, office_preflight, monkeypatch, capsys, missing, blank
+    ):
+        for name, value in OFFICE_ENV.items():
+            monkeypatch.setenv(name, value)
+        if blank is None:
+            monkeypatch.delenv(missing)
+        else:
+            monkeypatch.setenv(missing, blank)
+        assert office_preflight() == 1
+        captured = capsys.readouterr()
+        assert missing in captured.err
+        assert OFFICE_ENV["OCU_OFFICE_JWT_SECRET"] not in captured.out + captured.err
+        for name, value in OFFICE_ENV.items():
+            if name != missing:
+                assert value not in captured.out + captured.err
+
+    @pytest.mark.parametrize(
+        "name,value",
+        [
+            ("PUBLIC_BASE_URL", "https://webui.example/ocu/"),
+            ("OCU_INTERNAL_TOKEN", ""),
+            ("OCU_SANDBOX_SUBNET", "not-a-network"),
+            ("OCU_WEBUI_ORIGIN", "not-an-origin"),
+            ("OCU_WEBUI_AUTH_URL", "not-an-auth-url"),
+            ("OCU_SANDBOX_DNS", "not-an-ip"),
+        ],
+    )
+    def test_existing_preflight_failures_take_precedence_over_office(
+        self, office_preflight, monkeypatch, capsys, name, value
+    ):
+        monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://documentserver")
+        monkeypatch.setenv(name, value)
+        assert office_preflight() == 1
+        captured = capsys.readouterr()
+        assert name in captured.out + captured.err
+        assert "OCU_OFFICE_" not in captured.out + captured.err
+
+    def test_packaged_command_without_office_secret_exits_before_listening(self):
+        env = _subprocess_env()
+        env.update(OFFICE_ENV)
+        env.pop("OCU_OFFICE_JWT_SECRET", None)
+        env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+        cmd_line = next(
+            line for line in (SERVER_DIR / "Dockerfile").read_text().splitlines()
+            if line.startswith("CMD ")
+        )
+        command = json.loads(cmd_line.removeprefix("CMD "))
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        rewritten = command[-1].replace("--port 8081", f"--port {port}")
+        assert rewritten != command[-1]
+        command[-1] = rewritten
+        proc = subprocess.Popen(
+            command, cwd=SERVER_DIR, env=env, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while proc.poll() is None:
+                with socket.socket() as probe:
+                    probe.settimeout(0.1)
+                    assert probe.connect_ex(("127.0.0.1", port)) != 0
+                assert time.monotonic() < deadline, "packaged parent did not exit"
+                time.sleep(0.02)
+            stdout, stderr = proc.communicate(timeout=2)
+            assert proc.returncode != 0
+            assert "OCU_OFFICE_JWT_SECRET" in stderr
+            combined = stdout + stderr
+            assert OFFICE_ENV["OCU_OFFICE_JWT_SECRET"] not in combined
+            with socket.socket() as probe:
+                probe.settimeout(0.1)
+                assert probe.connect_ex(("127.0.0.1", port)) != 0
+            with pytest.raises(ProcessLookupError):
+                os.killpg(proc.pid, 0)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate(timeout=3)
+
     def test_packaged_command_without_token_parent_exits_nonzero(self):
         """The production multi-worker command itself must fail, not a child."""
         env = _subprocess_env()

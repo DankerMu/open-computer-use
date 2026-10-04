@@ -95,6 +95,12 @@ def startup_preflight() -> int:
     except SandboxDnsConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    from office.config import validation_error
+
+    missing = validation_error()
+    if missing:
+        print(missing, file=sys.stderr)
+        return 1
     return 0
 
 
