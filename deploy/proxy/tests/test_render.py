@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 RENDERER = Path(__file__).resolve().parents[1] / "render.py"
 spec = importlib.util.spec_from_file_location("ocu_proxy_renderer", RENDERER)
@@ -115,6 +117,8 @@ class RenderTests(unittest.TestCase):
         fixture = json.loads((RENDERER.parent / "routes.json").read_text())
         for label, change, reason in (
             ("unknown method", lambda rows: rows[0].update(methods=["DELETE"]), "methods"),
+            ("missing row", lambda rows: rows.pop(), "reviewed rows"),
+            ("extra row", lambda rows: rows.append({**rows[0], "path": "api/office/{chat}/extra"}), "reviewed rows"),
             ("no auth", lambda rows: rows[0].update(auth="none"), "auth"),
             ("unknown row", lambda rows: rows[0].update(path="internal/launch/{chat}"), "path"),
             ("ambiguous parameter", lambda rows: rows[0].update(path="api/outputs/{unknown}"), "path"),
@@ -139,6 +143,25 @@ class RenderTests(unittest.TestCase):
         with self.assertRaises(render_module.RenderError):
             self.render(table=table)
         self.assertEqual(self.output.read_bytes(), original)
+
+    def test_office_parameters_require_chat_even_with_matching_inventory_pin(self):
+        self.render()
+        original = self.output.read_bytes()
+        fixture = json.loads((RENDERER.parent / "routes.json").read_text())
+        for parameter in ("file", "session"):
+            with self.subTest(parameter=parameter):
+                candidate = json.loads(json.dumps(fixture))
+                candidate["rows"][0].update(
+                    path=f"api/office/documents/{{{parameter}}}",
+                    auth="session", prefix="preserve")
+                table = Path(self.sandbox.name) / "routes.json"
+                raw = json.dumps(candidate).encode()
+                table.write_bytes(raw)
+                with patch.object(render_module, "REVIEWED_TABLE_SHA256",
+                                  hashlib.sha256(raw).hexdigest()):
+                    with self.assertRaises(render_module.RenderError):
+                        self.render(table=table)
+                self.assertEqual(self.output.read_bytes(), original)
 
 
 if __name__ == "__main__":

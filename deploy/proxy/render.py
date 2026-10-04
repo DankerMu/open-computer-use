@@ -22,15 +22,17 @@ DEFAULTS = {
     "OCU_PROXY_UPSTREAM": "http://127.0.0.1:8090",
     "OCU_PROXY_LISTEN": "127.0.0.1:8082",
 }
-REVIEWED_TABLE_SHA256 = "a066ccbe97e9e1d29bf395a3aacd0c2d2f5d67c409c314071d2e0913d3584bb8"
+REVIEWED_TABLE_SHA256 = "a94f730ea2ff0185ff576fd4f1c48681a17c0b216ada49f31953c66a26233b1d"
 FIELDS = {"path", "methods", "auth", "mutating", "prefix", "kind"}
 SEGMENT = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\Z")
-PLACEHOLDER = {"chat", "path", "pid", "page"}
+PLACEHOLDER = {"chat", "path", "pid", "page", "file", "session"}
 URI_PART = {
     "chat": r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*",
     "path": r"[^/?#]+(?:/[^/?#]+)*",
     "pid": r"[0-9]+",
     "page": r"[A-Za-z0-9._~-]+",
+    "file": r"[^/?#]+",
+    "session": r"[^/?#]+",
 }
 LOCATION_PART = dict(URI_PART, path=r".+")
 
@@ -92,8 +94,8 @@ def _table(table: Path) -> list[dict]:
             or not isinstance(source["rows"], list)):
         raise RenderError("route table schema is invalid")
     rows = source["rows"]
-    if not rows or len(rows) != 20:
-        raise RenderError("route table must contain 20 reviewed rows")
+    if not rows or len(rows) != 27:
+        raise RenderError("route table must contain 27 reviewed rows")
     seen = set()
     for row in rows:
         if not isinstance(row, dict) or set(row) != FIELDS:
@@ -105,11 +107,12 @@ def _table(table: Path) -> list[dict]:
         parts = path.split("/")
         parameters = [part[1:-1] for part in parts if part.startswith("{") and part.endswith("}")]
         if (parts[0] not in {"api", "files", "preview", "browser", "terminal", "static"}
-                or any(not (SEGMENT.fullmatch(part) or part in {"{chat}", "{path}", "{pid}", "{page}"}) for part in parts)
+                or any(not (SEGMENT.fullmatch(part) or part in {"{chat}", "{path}", "{pid}", "{page}", "{file}", "{session}"}) for part in parts)
                 or any(part.startswith("{") and part.endswith("}") and part[1:-1] not in PLACEHOLDER for part in parts)
                 or parameters.count("chat") > 1 or parameters.count("path") > 1
                 or ("path" in parameters and parts[-1] != "{path}")
                 or ("pid" in parameters and "{chat}" not in parts)
+                or any(name in parameters and "{chat}" not in parts for name in ("file", "session"))
                 or ("page" in parameters and "{chat}" not in parts)):
             raise RenderError("route path has an invalid segment")
         methods = row["methods"]

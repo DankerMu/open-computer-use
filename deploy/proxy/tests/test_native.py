@@ -20,6 +20,15 @@ TOKEN = ("".join(chr(n) for n in range(0x21, 0x7F)) + "$http_host${x}@@LOCATIONS
 MUTATION = {"X-Requested-With": "ocu-workspace", "Origin": ORIGIN}
 RECORD = Path(os.environ.get("OCU_TEST_RECORD", "/tmp/ocu-proxy-native-record/requests.jsonl"))
 PROXY_PORT = int(os.environ.get("OCU_TEST_PROXY_PORT", "18782"))
+OFFICE_ROWS = (
+    ("documents/file-123/sessions", "POST"),
+    ("sessions/session-123", "GET"),
+    ("sessions/session-123/save", "POST"),
+    ("sessions/session-123/close", "POST"),
+    ("sessions/session-123/resolve", "POST"),
+    ("documents/file-123/versions", "GET"),
+    ("documents/file-123/restore", "POST"),
+)
 
 
 class NativeProxyTests(unittest.TestCase):
@@ -84,6 +93,73 @@ class NativeProxyTests(unittest.TestCase):
             self.assertEqual(seen.get("body_sha256"), hashlib.sha256(body).hexdigest())
             self.assertEqual(seen.get("body_length"), len(body))
         return seen
+
+    def test_office_rows_forward_with_path_chat_and_internal_auth(self):
+        for suffix, method in OFFICE_ROWS:
+            with self.subTest(suffix=suffix):
+                upstream = f"/api/office/{CHAT}/{suffix}"
+                seen = self.check_forward("/ocu" + upstream, upstream, method,
+                                          MUTATION if method == "POST" else None)
+                self.assertEqual(seen["headers"].get("authorization"), "Bearer " + TOKEN)
+
+    def test_office_authorization_and_mutation_denials_never_reach_ocu(self):
+        for suffix, method in OFFICE_ROWS:
+            cases = [({}, 401), ({"Cookie": "session=foreign"}, 404)]
+            for credentials, expected in cases:
+                with self.subTest(suffix=suffix, status=expected):
+                    before = self.snapshot()
+                    headers = {**(MUTATION if method == "POST" else {}), **credentials}
+                    status, _, _ = self.request(f"/ocu/api/office/{CHAT}/{suffix}", method, headers)
+                    self.assertEqual(status, expected)
+                    self.assertEqual(self.since("ocu", before), [])
+            if method == "POST":
+                for headers in ({"Origin": ORIGIN}, {**MUTATION, "Origin": "null"}):
+                    with self.subTest(suffix=suffix, headers=headers):
+                        before = self.snapshot()
+                        status, _, _ = self.request(f"/ocu/api/office/{CHAT}/{suffix}",
+                                                    method, self.owner(headers))
+                        self.assertEqual(status, 403)
+                        self.assertEqual(self.since("ocu", before), [])
+
+    def test_office_unknown_methods_and_ambiguous_identifiers_never_reach_ocu(self):
+        for suffix, allowed in OFFICE_ROWS:
+            path = f"/ocu/api/office/{CHAT}/{suffix}"
+            for method in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+                if method == allowed:
+                    continue
+                with self.subTest(path=path, method=method):
+                    before = self.snapshot()
+                    self.assertEqual(self.request(path, method, self.owner(MUTATION))[0], 404)
+                    self.assertEqual(self.since("ocu", before), [])
+            identifier = "file-123" if suffix.startswith("documents/") else "session-123"
+            for invalid in ("", "a/b", "a%2fb", "a%5cb", ".", "..", "%2e",
+                            "a%252fb", "a%255cb", "%252e%252e"):
+                with self.subTest(suffix=suffix, identifier=invalid):
+                    before = self.snapshot()
+                    self.assertEqual(self.request(path.replace(identifier, invalid),
+                                                  allowed, self.owner(MUTATION))[0], 404)
+                    self.assertEqual(self.since("ocu", before), [])
+        for suffix in ("", "documents/file-123", "sessions/session-123/unknown"):
+            with self.subTest(unknown=suffix):
+                before = self.snapshot()
+                self.assertEqual(self.request(f"/ocu/api/office/{CHAT}/{suffix}",
+                                              headers=self.owner())[0], 404)
+                self.assertEqual(self.since("ocu", before), [])
+
+    def test_office_control_plane_and_import_reads_are_not_public_routes(self):
+        control = ("/office/source/ticket-123", f"/office/callback/{CHAT}/session-123")
+        paths = [(path, method) for path in control
+                 for method in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")]
+        paths.append((f"/api/uploads/{CHAT}/imports", "GET"))
+        for path, method in paths:
+            for credentials in ({}, {"Cookie": "session=owner"}, {"Cookie": "session=foreign"}):
+                for prefix in ("/ocu", ""):
+                    with self.subTest(path=prefix + path, method=method, credentials=credentials):
+                        before = self.snapshot()
+                        status, _, _ = self.request(prefix + path, method, {**MUTATION, **credentials})
+                        if prefix:
+                            self.assertEqual(status, 404)
+                        self.assertEqual(self.since("ocu", before), [])
 
     def test_canonical_rows_forward_only_allowed_methods_and_preserve_prefix(self):
         rows = (
