@@ -682,3 +682,104 @@ def test_key_lookup_timeout_is_bounded_and_preserves_existing_session(office_wor
             release.set()
     assert _snapshot(data) == before
     assert recording.hits == 0
+
+
+def test_join_below_storage_floor_still_joins_while_creation_is_refused(office_world, monkeypatch):
+    from office import config
+    http, data, origin, _docker, broker = office_world
+    file_id, first = _created(office_world)
+    monkeypatch.setattr(config, "MIN_FREE_BYTES", 10**30)
+    _put(data, "new-document.docx", intact_docx())
+    new_id = _index_file(broker, data, "new-document.docx")
+    before = _snapshot(data)
+
+    response = _create(http, file_id)
+    assert response.status_code == 200
+    joined = response.json()
+    assert {
+        field: joined[field]
+        for field in ("session_id", "file_id", "document_key", "state")
+    } == {
+        "session_id": first["session_id"],
+        "file_id": file_id,
+        "document_key": first["document_key"],
+        "state": "opening",
+    }
+    assert joined["joined"] is True
+    assert _ticket(joined) != _ticket(first)
+    _verify_config(joined, file_id, 1)
+    _assert_no_secrets(response, INTERNAL, MCP_KEY, JWT_SECRET)
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
+    _assert_refusal(_create(http, new_id), 503, "storage_low")
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("receipt_status", (6, 7))
+@pytest.mark.parametrize("known", (True, False))
+def test_non_final_receipt_does_not_suppress_reopen_key_check(
+    office_world, monkeypatch, receipt_status, known
+):
+    from office.store import OfficeStore
+    http, data, recording, _docker, _broker = office_world
+    file_id, first = _created(office_world, "conflict")
+    latest = _unpublished(file_id, "conflict")
+    _change(
+        first["session_id"], save_seq=1,
+        last_committed_seq=1 if receipt_status == 6 else 0,
+        reason="baseline_mismatch",
+    )
+    store = OfficeStore()
+    store.record_receipt(CHAT, first["session_id"], 1, {
+        "status": receipt_status,
+        "sha256": latest["sha256"] if receipt_status == 6 else None,
+        "version": latest["number"] if receipt_status == 6 else None,
+        "answer": {"error": 0},
+    })
+    before = store.read(CHAT)
+    before_files = _snapshot(data)
+    with _info(monkeypatch, first["document_key"], code=0 if known else 1) as origin:
+        response = _create(http, file_id)
+        if known:
+            assert response.status_code == 200
+            joined = response.json()
+            assert joined["editor_config"] is not None
+            assert joined["joined"] is True
+            assert {
+                field: joined[field]
+                for field in ("session_id", "file_id", "document_key", "state")
+            } == {
+                "session_id": first["session_id"],
+                "file_id": file_id,
+                "document_key": first["document_key"],
+                "state": "conflict",
+            }
+            assert _ticket(joined) != _ticket(first)
+            _verify_config(joined, file_id, 2)
+            assert store.read(CHAT) == before
+            assert _snapshot(data) == before_files
+        else:
+            _assert_refusal(response, 409, "unpublished_version")
+            after = store.read(CHAT)
+            assert after == {**before, "sessions": {
+                first["session_id"]: {
+                    **before["sessions"][first["session_id"]],
+                    "state": "orphaned",
+                    "reason": "editor_state_lost",
+                },
+            }}
+            # The orphan state is the only changed file; unpublished content,
+            # receipts, immutable blobs and the workspace retain their bytes.
+            after_files = _snapshot(data)
+            state_path = str(_state(data).relative_to(data))
+            assert {
+                path: value for path, value in after_files.items() if path != state_path
+            } == {
+                path: value for path, value in before_files.items() if path != state_path
+            }
+            assert after["documents"][file_id]["versions"][-1] == latest
+            assert latest["published"] is False
+        assert len(origin.requests) == 1
+    assert recording.hits == 0
