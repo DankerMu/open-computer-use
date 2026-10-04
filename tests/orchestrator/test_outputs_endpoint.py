@@ -59,6 +59,7 @@ _APP_MODULES = (
     "office.tokens",
     "office.commands",
     "office.sessions",
+    "office.notice",
     "office.ooxml",
 )
 

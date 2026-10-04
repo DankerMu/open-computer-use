@@ -16,7 +16,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from outputs_broker import CorruptIndexError, FileIdNotFoundError, OutputsBroker, OutputsBrokerError
 
-from . import commands, config, epoch, ooxml, tokens, versions
+from . import commands, config, epoch, notice, ooxml, tokens, versions
 from .epoch import RestoreEpochError
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
 from .versions import StorageLowError
@@ -347,7 +347,7 @@ def session_status(request: Request) -> JSONResponse:
         status = _session_status(request.scope["ocu_chat_id"], request.path_params["session_id"])
     except UnknownSessionError:
         return _error(404, "unknown_session")
-    except (RestoreEpochError, StateCorruptError):
+    except (RestoreEpochError, StateCorruptError, OutputsBrokerError):
         return _error(500, "state_corrupt")
     except StateDurabilityError:
         return _error(500, "state_durability")
@@ -372,6 +372,8 @@ def _session_status(chat_id, session_id):
         if record["state"] in OPEN_STATES and record["restore_epoch"] != current_epoch:
             state = _orphan_session(store, chat, session_id, "restore_epoch_changed")
             status = _status_projection(state["sessions"][session_id])
+        elif record["state"] in OPEN_STATES:
+            status = notice.refresh_workspace_notice(store, chat, session_id, record)
         return status
 
 

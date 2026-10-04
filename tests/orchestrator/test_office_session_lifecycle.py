@@ -262,15 +262,22 @@ def test_status_epoch_matrix_projects_persisted_fields_without_workspace_or_look
     http, data, origin, _docker, _broker = office_world
     from office.store import OfficeStore
     import office.sessions as sessions
+    import office.notice as notice
     file_id, first = _created(office_world, state)
+    path = data / CHAT / "outputs" / "brief.docx"
+    size, mtime_ns = path.stat().st_size, path.stat().st_mtime_ns
     _change(first["session_id"], reason="stored_reason", save_seq=7, last_committed_seq=5,
-            last_published_seq=3, workspace_changed=True, saved_as={"file_id": "saved-id", "path": "saved.docx"})
+            last_published_seq=3, workspace_changed=True, saved_as={"file_id": "saved-id", "path": "saved.docx"},
+            last_checked_size=size, last_checked_mtime_ns=mtime_ns)
     before = OfficeStore().read(CHAT)
     if changed:
         (data / ".office-restore-epoch").write_text("epoch-B\n")
     encoded = _state(data).read_bytes()
+    inspect = changed or state in FINAL_STATES
     with monkeypatch.context() as trap:
-        _forbid_inode_open(sessions, trap, data / CHAT / "outputs", data / CHAT / "outputs" / "brief.docx")
+        if inspect:
+            _forbid_inode_open(sessions, trap, data / CHAT / "outputs", data / CHAT / "outputs" / "brief.docx")
+            _forbid_inode_open(notice, trap, data / CHAT / "outputs", data / CHAT / "outputs" / "brief.docx")
         response = _status(http, first["session_id"])
     assert response.status_code == 200
     orphaned = changed and state in OPEN_STATES
@@ -284,12 +291,22 @@ def test_status_epoch_matrix_projects_persisted_fields_without_workspace_or_look
     after = OfficeStore().read(CHAT)
     assert after["documents"] == before["documents"]
     assert after["receipts"] == before["receipts"]
-    if not orphaned:
-        assert _state(data).read_bytes() == encoded
+    if inspect:
+        if not orphaned:
+            assert _state(data).read_bytes() == encoded
+        else:
+            assert after["sessions"][first["session_id"]] == {
+                **before["sessions"][first["session_id"]], "state": "orphaned", "reason": "restore_epoch_changed",
+            }
     else:
-        assert after["sessions"][first["session_id"]] == {
-            **before["sessions"][first["session_id"]], "state": "orphaned", "reason": "restore_epoch_changed",
+        record = after["sessions"][first["session_id"]]
+        assert {key: record[key] for key in before["sessions"][first["session_id"]] if key not in ("workspace_changed", "last_checked_size", "last_checked_mtime_ns")} == {
+            key: value for key, value in before["sessions"][first["session_id"]].items()
+            if key not in ("workspace_changed", "last_checked_size", "last_checked_mtime_ns")
         }
+        assert record["workspace_changed"] is True
+        assert record["last_checked_size"] == size
+        assert record["last_checked_mtime_ns"] == mtime_ns
     assert origin.hits == 0
 
 
@@ -351,7 +368,18 @@ def test_absent_empty_and_equal_opaque_epochs_are_distinct(office_world):
     before = _state(data).read_bytes()
     marker.write_text("\t\n")
     assert _status(http, second.json()["session_id"]).json()["state"] == "opening"
-    assert _state(data).read_bytes() == before
+    after = json.loads(_state(data).read_text(encoding="utf-8"))
+    before_state = json.loads(before.decode("utf-8"))
+    session_id = second.json()["session_id"]
+    before_record = before_state["sessions"][session_id]
+    after_record = after["sessions"][session_id]
+    bookkeeping = ("workspace_changed", "last_checked_size", "last_checked_mtime_ns")
+    assert {key: value for key, value in after_record.items() if key not in bookkeeping} == {
+        key: value for key, value in before_record.items() if key not in bookkeeping
+    }
+    assert after["documents"] == before_state["documents"]
+    assert after["receipts"] == before_state["receipts"]
+    assert after["journal"] == before_state["journal"]
     assert origin.hits == 0
 
 
@@ -385,12 +413,16 @@ def test_legacy_record_projects_initial_bookkeeping_without_rewrite(office_world
             if field != "save_seq":
                 state["sessions"][first["session_id"]].pop(field)
     OfficeStore().update(CHAT, strip)
-    before = _snapshot(data)
     response = _status(http, first["session_id"])
     assert response.status_code == 200
     assert response.json() == {"session_id": first["session_id"], "file_id": file_id,
         "document_key": first["document_key"], "state": "opening", **INITIAL}
-    assert _snapshot(data) == before
+    after = OfficeStore().read(CHAT)
+    record = after["sessions"][first["session_id"]]
+    assert record["workspace_changed"] is False
+    assert type(record["last_checked_size"]) is int
+    assert type(record["last_checked_mtime_ns"]) is int
+    assert record["save_seq"] == 0
     assert origin.hits == 0
 
 
@@ -485,8 +517,11 @@ def test_unknown_foreign_and_missing_chat_status_have_no_foreign_opens(office_wo
 def test_status_is_read_from_another_process_with_exact_persisted_fields(office_world):
     http, data, origin, _docker, _broker = office_world
     file_id, first = _created(office_world, "editing")
+    path = data / CHAT / "outputs" / "brief.docx"
+    size, mtime_ns = path.stat().st_size, path.stat().st_mtime_ns
     _change(first["session_id"], save_seq=8, last_committed_seq=6, last_published_seq=4,
-            reason="persisted", workspace_changed=True, saved_as={"file_id": "new-id", "path": "copy.docx"})
+            reason="persisted", workspace_changed=True, saved_as={"file_id": "new-id", "path": "copy.docx"},
+            last_checked_size=size, last_checked_mtime_ns=mtime_ns)
     expected = {"session_id": first["session_id"], "file_id": file_id, "document_key": first["document_key"],
         "state": "editing", "save_seq": 8, "last_committed_seq": 6, "last_published_seq": 4,
         "reason": "persisted", "workspace_changed": True, "saved_as": {"file_id": "new-id", "path": "copy.docx"}}
@@ -500,13 +535,19 @@ print(json.dumps({"status": response.status_code, "body": response.json()}))
 '''
     env = {**os.environ, "PYTHONPATH": str(SERVER_DIR), "BASE_DATA_DIR": str(data),
         "STATUS_URL": f"/api/office/{CHAT}/sessions/{first['session_id']}"}
-    before = _snapshot(data)
     child = subprocess.run([sys.executable, "-c", source], env=env, cwd=SERVER_DIR,
                            capture_output=True, text=True, timeout=30)
     assert child.returncode == 0, child.stderr
     assert json.loads(child.stdout.strip().splitlines()[-1]) == {"status": 200, "body": expected}
     assert _status(http, first["session_id"]).json() == expected
-    assert _snapshot(data) == before
+    from office.store import OfficeStore
+    record = OfficeStore().read(CHAT)["sessions"][first["session_id"]]
+    assert record["workspace_changed"] is True
+    assert record["save_seq"] == 8
+    assert record["last_committed_seq"] == 6
+    assert record["last_published_seq"] == 4
+    assert record["reason"] == "persisted"
+    assert record["saved_as"] == {"file_id": "new-id", "path": "copy.docx"}
     assert origin.hits == 0
 
 
