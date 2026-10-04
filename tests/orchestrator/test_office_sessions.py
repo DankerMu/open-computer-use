@@ -387,6 +387,11 @@ def test_three_formats_and_uppercase_create_opening_session(office_world, name, 
         "restore_epoch": None,
         "state": "opening",
         "save_seq": 0,
+        "reason": None,
+        "last_committed_seq": 0,
+        "last_published_seq": 0,
+        "workspace_changed": False,
+        "saved_as": None,
     }
     assert _versions(data).joinpath(_sha(body)).read_bytes() == body
     other_after = _snapshot(data / CHAT_B)
@@ -555,21 +560,29 @@ def test_foreign_file_id_is_unknown_and_does_not_touch_the_other_chat(office_wor
 
 
 @pytest.mark.parametrize("state", OPEN_STATES)
-def test_existing_nonfinal_session_is_already_open_without_mutation(office_world, state):
+def test_existing_nonfinal_session_joins_or_preserves_unavailable_state(office_world, state):
     http, data, origin, _docker_manager, broker_module = office_world
     import office.store as store_mod
 
     body = intact_docx()
     _put(data, "brief.docx", body)
     file_id = _index_file(broker_module, data, "brief.docx")
-    store_mod.OfficeStore().store_version(
-        CHAT, file_id, body, source="workspace", parent=None, published=True, min_free_bytes=0
-    )
-    _seed_session(store_mod, file_id, state, key=f"key-{state}")
+    first = _create(http, file_id)
+    assert first.status_code == 201
+    def change_state(working):
+        working["sessions"][first.json()["session_id"]]["state"] = state
+    store_mod.OfficeStore().update(CHAT, change_state)
     before = _snapshot(data)
-    _assert_refusal(_create(http, file_id), 409, "session_already_open")
+    response = _create(http, file_id)
+    if state == "opening":
+        assert response.status_code == 200
+        assert response.json()["joined"] is True
+        assert response.json()["session_id"] == first.json()["session_id"]
+        assert response.json()["document_key"] == first.json()["document_key"]
+    else:
+        _assert_refusal(response, 502, "documentserver_unavailable")
     assert _snapshot(data) == before
-    assert origin.hits == 0
+    assert origin.hits == (0 if state == "opening" else 1)
 
 
 @pytest.mark.parametrize("bad_state", ("edting", None, [], {}))
@@ -978,6 +991,8 @@ def test_mutator_collision_leaves_no_capture(office_world, monkeypatch):
 
 def test_two_processes_create_at_most_one_open_session(office_world):
     http, data, origin, _docker_manager, broker_module = office_world
+    from tests.orchestrator._office_store import _wait_marker
+    ready = data.parent / "join-worker-ready"
     body = intact_docx()
     _put(data, "brief.docx", body)
     file_id = _index_file(broker_module, data, "brief.docx")
@@ -989,6 +1004,7 @@ def test_two_processes_create_at_most_one_open_session(office_world):
             "BASE_DATA_DIR": str(data),
             "OCU_CHAT": CHAT,
             "OCU_FILE_ID": file_id,
+            "READY": str(ready),
             "OCU_INTERNAL_TOKEN": INTERNAL,
             "OCU_OFFICE_JWT_SECRET": JWT_SECRET,
             "OCU_OFFICE_SELF_URL": SELF_URL,
@@ -1000,37 +1016,41 @@ def test_two_processes_create_at_most_one_open_session(office_world):
     )
     child_src = r"""
 import json, os, sys
-sys.path.insert(0, os.environ.get("PYTHONPATH", "").split(os.pathsep)[0])
-from office.sessions import _create_session
-from office.sessions import SessionAlreadyOpenError
-try:
-    created = _create_session(os.environ["OCU_CHAT"], os.environ["OCU_FILE_ID"])
-    print(json.dumps({"ok": True, "session_id": created["session_id"]}))
-except SessionAlreadyOpenError:
-    print(json.dumps({"ok": False, "reason": "session_already_open"}))
+from pathlib import Path
+from fastapi.testclient import TestClient
+import app
+with TestClient(app.app) as client:
+    Path(os.environ["READY"]).write_text("ready")
+    sys.stdin.readline()
+    response = client.post(
+        f'/api/office/{os.environ["OCU_CHAT"]}/documents/{os.environ["OCU_FILE_ID"]}/sessions',
+        headers={"Authorization": "Bearer " + os.environ["OCU_INTERNAL_TOKEN"]},
+    )
+print(json.dumps({"status": response.status_code, "body": response.json()}))
 """
     child = subprocess.Popen(
         [sys.executable, "-c", child_src],
         cwd=str(SERVER_DIR),
         env=env,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+    _wait_marker(ready, child, "second worker did not load the actual app")
+    child.stdin.write("go\n")
+    child.stdin.flush()
     parent = _create(http, file_id)
-    stdout, stderr = child.communicate(timeout=10)
+    stdout, stderr = child.communicate(timeout=30)
     assert child.returncode == 0, stderr
-    child_payload = json.loads(stdout.strip().splitlines()[-1])
-    outcomes = []
-    if parent.status_code == 201:
-        outcomes.append("created")
-    else:
-        assert parent.status_code == 409
-        assert parent.json()["reason"] == "session_already_open"
-        outcomes.append("conflict")
-    outcomes.append("created" if child_payload["ok"] else "conflict")
-    assert outcomes.count("created") == 1
-    assert outcomes.count("conflict") == 1
+    child_response = json.loads(stdout.strip().splitlines()[-1])
+    assert sorted([parent.status_code, child_response["status"]]) == [200, 201]
+    child_payload = child_response["body"]
+    assert parent.json()["session_id"] == child_payload["session_id"]
+    assert parent.json()["document_key"] == child_payload["document_key"]
+    assert sorted([parent.json()["joined"], child_payload["joined"]]) == [False, True]
+    assert parent.status_code == (200 if parent.json()["joined"] else 201)
+    assert parent.json()["editor_config"]["document"]["url"] != child_payload["editor_config"]["document"]["url"]
     persisted = json.loads(_state(data).read_text(encoding="utf-8"))
     opening = [
         record
@@ -1161,4 +1181,11 @@ def test_twenty_one_documents_create_without_connection_cap_or_network(office_wo
                 assert current["documents"][document_id] == document
     assert len(current["sessions"]) == 21
     assert len({session["document_key"] for session in current["sessions"].values()}) == 21
+    before_join = _snapshot(data)
+    joined = _create(http, file_id)
+    assert joined.status_code == 200
+    assert joined.json()["session_id"] == response.json()["session_id"]
+    assert joined.json()["document_key"] == response.json()["document_key"]
+    assert joined.json()["joined"] is True
+    assert _snapshot(data) == before_join
     assert origin.hits == 0

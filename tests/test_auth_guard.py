@@ -149,6 +149,7 @@ def app_module(monkeypatch):
             "office.workspace",
             "office.epoch",
             "office.tokens",
+            "office.commands",
             "office.sessions",
             "office.ooxml",
         } or name.startswith("mcp_resources"):
