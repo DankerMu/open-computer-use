@@ -34,6 +34,9 @@ class StateDurabilityError(RuntimeError):
     """The atomic successor is visible but its containing directory was not synced."""
 
 
+
+
+
 class OfficeStore:
     """Read and replace one chat's Office ``state.json`` under ``_combined_lock``."""
 
@@ -60,6 +63,63 @@ class OfficeStore:
             encoded = self._encode(working)
             self._write_state(chat, encoded)
             return json.loads(encoded.decode("utf-8"))
+
+    def store_version(
+        self,
+        chat_id: str,
+        file_id: str,
+        content: bytes,
+        *,
+        source: str,
+        parent: int | None,
+        published: bool,
+        min_free_bytes: int,
+        receipt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from . import versions
+        return versions.store_version(
+            self,
+            chat_id,
+            file_id,
+            content,
+            source=source,
+            parent=parent,
+            published=published,
+            min_free_bytes=min_free_bytes,
+            receipt=receipt,
+        )
+
+    def mark_published(self, chat_id: str, file_id: str, number: int) -> dict[str, Any]:
+        from . import versions
+        return versions.mark_published(self, chat_id, file_id, number)
+
+    def record_receipt(
+        self,
+        chat_id: str,
+        session_id: str,
+        save_seq: int,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        from . import versions
+        return versions.record_receipt(self, chat_id, session_id, save_seq, receipt)
+
+    def get_receipt(
+        self,
+        chat_id: str,
+        session_id: str,
+        save_seq: int,
+        expected_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        from . import versions
+        return versions.get_receipt(self, chat_id, session_id, save_seq, expected_hash)
+
+    def check_free_space(self, chat_id: str, min_free_bytes: int) -> None:
+        from . import versions
+        versions.check_free_space(self, chat_id, min_free_bytes)
+
+    def read_workspace_file(self, chat_id: str, relative_path: str) -> tuple[bytes, str]:
+        from . import workspace
+        return workspace.read_workspace_file(self, chat_id, relative_path)
 
     def _chat_root(self, chat: str) -> str:
         return os.path.join(str(docker_manager.BASE_DATA_DIR), chat)
