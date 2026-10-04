@@ -231,14 +231,16 @@ def get_receipt(
 
 
 def check_free_space(store: OfficeStore, chat_id: str, min_free_bytes: int) -> None:
-    docker_manager.canonical_lock_chat_id(chat_id)
+    chat = docker_manager.canonical_lock_chat_id(chat_id)
     _require_floor(min_free_bytes)
-    base = str(docker_manager.BASE_DATA_DIR)
-    os.makedirs(base, exist_ok=True)
-    try:
-        fd = os.open(base, _DATA_ROOT_FLAGS)
-    except OSError as extra:
-        raise StateCorruptError(f"cannot safely open data root: {base}") from extra
+    store._assert_chat_root_safe(chat, allow_missing=True)
+    with docker_manager._combined_lock(chat):
+        store._assert_chat_root_safe(chat, allow_missing=False)
+        _require_free_space(store, chat, min_free_bytes)
+
+
+def _require_free_space(store: OfficeStore, chat: str, min_free_bytes: int) -> None:
+    fd = _probe_free_space_fd(store, chat)
     try:
         available = _available_bytes(fd)
     finally:
@@ -249,31 +251,30 @@ def check_free_space(store: OfficeStore, chat_id: str, min_free_bytes: int) -> N
         )
 
 
-def _require_free_space(store: OfficeStore, chat: str, min_free_bytes: int) -> None:
-    opened = store._open_tree(chat, create=False)
-    if opened is None:
-        base = str(docker_manager.BASE_DATA_DIR)
-        try:
-            fd = os.open(base, _DATA_ROOT_FLAGS)
-        except OSError as extra:
-            raise StateCorruptError(f"cannot safely open data root: {base}") from extra
-        try:
-            available = _available_bytes(fd)
-        finally:
-            os.close(fd)
-    else:
-        base_fd, root_fd, ocu_fd, office_fd = opened
-        try:
-            available = _available_bytes(office_fd)
-        finally:
-            os.close(office_fd)
-            os.close(ocu_fd)
-            os.close(root_fd)
-            os.close(base_fd)
-    if available < min_free_bytes:
-        raise StorageLowError(
-            f"free space {available} is below the floor {min_free_bytes}"
-        )
+def _probe_free_space_fd(store: OfficeStore, chat: str) -> int:
+    base = str(docker_manager.BASE_DATA_DIR)
+    try:
+        base_fd = os.open(base, _DATA_ROOT_FLAGS)
+    except OSError as extra:
+        raise StateCorruptError(f"cannot safely open data root: {base}") from extra
+    held: list[int] = [base_fd]
+    try:
+        for name, label in (
+            (chat, "chat control root"),
+            (".ocu", "office control directory"),
+            ("office", "office state directory"),
+        ):
+            child = store._open_dir(name, dir_fd=held[-1], create=False, label=label)
+            if child is None:
+                break
+            held.append(child)
+        probe = held[-1]
+        held[-1] = -1
+        return probe
+    finally:
+        for fd in reversed(held):
+            if fd >= 0:
+                os.close(fd)
 
 
 def _publish_blob(store: OfficeStore, chat: str, digest: str, content: bytes) -> bool:
@@ -408,11 +409,11 @@ def _document_versions(state: dict[str, Any], file_id: str) -> list[dict[str, An
     documents = state["documents"]
     if not isinstance(documents, dict):
         raise StateCorruptError("office documents collection is invalid")
-    document = documents.get(file_id)
-    if document is None:
+    if file_id not in documents:
         document = {"versions": []}
         documents[file_id] = document
         return document["versions"]
+    document = documents[file_id]
     if not isinstance(document, dict):
         raise StateCorruptError(f"office document {file_id} is invalid")
     if "versions" not in document:
@@ -464,13 +465,13 @@ def _session_receipts(state: dict[str, Any], session_id: str, *, create: bool) -
     receipts = state["receipts"]
     if not isinstance(receipts, dict):
         raise StateCorruptError("office receipts collection is invalid")
-    slot = receipts.get(session_id)
-    if slot is None:
+    if session_id not in receipts:
         if not create:
             return None
         slot = {}
         receipts[session_id] = slot
         return slot
+    slot = receipts[session_id]
     if not isinstance(slot, dict):
         raise StateCorruptError(f"office receipts for session {session_id} are invalid")
     return slot

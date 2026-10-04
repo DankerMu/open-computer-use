@@ -45,9 +45,9 @@ def _forbid_inode_open(module, monkeypatch, *paths: Path) -> None:
         dir_fd = kwargs.get("dir_fd")
         try:
             info = (
-                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                os.stat(name, dir_fd=dir_fd, follow_symlinks=True)
                 if dir_fd is not None
-                else os.lstat(name)
+                else os.stat(name)
             )
         except (OSError, TypeError, ValueError):
             info = None
@@ -107,3 +107,73 @@ def test_leaf_parent_symlink_traversal_and_nonregular_reads_refuse_before_extern
     assert not _staging(data).exists()
     names = _office_names(data)
     assert all("external-secret" not in name for name in names)
+
+
+def test_workspace_mutating_during_read_refuses_unstable_bytes(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    import office.workspace as workspace_mod
+    target = _outputs(data) / "live.docx"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(WORKSPACE)
+    identity = target.stat()
+    original_read = os.read
+    changed = []
+
+    def mutate_read(fd, size):
+        chunk = original_read(fd, size)
+        info = os.fstat(fd)
+        if not changed and (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            target.write_bytes(WORKSPACE + b"-changed-during-read")
+            changed.append(True)
+        return chunk
+
+    monkeypatch.setattr(workspace_mod.os, "read", mutate_read)
+    with pytest.raises(workspace_mod.UnsafePathError, match="changed while reading") as error:
+        store_mod.OfficeStore().read_workspace_file(CHAT, "live.docx")
+    assert error.value.reason == "unsafe_path"
+    assert changed == [True]
+    assert not _versions_dir(data).exists()
+    assert not _staging(data).exists()
+
+
+def test_missing_workspace_file_preserves_file_not_found_cause(world):
+    store_mod, _docker_manager, data = world
+    import office.workspace as workspace_mod
+    _outputs(data).mkdir(parents=True)
+    with pytest.raises(workspace_mod.UnsafePathError) as error:
+        store_mod.OfficeStore().read_workspace_file(CHAT, "missing.docx")
+    assert error.value.reason == "unsafe_path"
+    assert isinstance(error.value.__cause__, FileNotFoundError)
+    assert not _versions_dir(data).exists()
+    assert not _staging(data).exists()
+
+
+@pytest.mark.parametrize("tier", ["outputs", "chat"])
+def test_outputs_and_chat_root_symlinks_refuse_external_bytes_and_lock(world, monkeypatch, tier):
+    store_mod, _docker_manager, data = world
+    import office.workspace as workspace_mod
+    outside = data.parent / "external-root"
+    external_file = outside / "secret.docx"
+    external_file.parent.mkdir()
+    external_file.write_bytes(b"EXTERNAL-ROOT-BYTES")
+    lock = outside / ".lifecycle.lock"
+    lock.write_bytes(b"EXTERNAL-LOCK")
+    before_lock = lock.stat()
+    if tier == "outputs":
+        (data / CHAT).mkdir(parents=True)
+        os.symlink(outside, _outputs(data))
+        expected = workspace_mod.UnsafePathError
+    else:
+        data.mkdir()
+        os.symlink(outside, data / CHAT)
+        expected = store_mod.StateCorruptError
+    _forbid_inode_open(workspace_mod, monkeypatch, outside, external_file, lock)
+    with pytest.raises(expected):
+        store_mod.OfficeStore().read_workspace_file(CHAT, "secret.docx")
+    assert external_file.read_bytes() == b"EXTERNAL-ROOT-BYTES"
+    assert lock.read_bytes() == b"EXTERNAL-LOCK"
+    after_lock = lock.stat()
+    assert (after_lock.st_dev, after_lock.st_ino) == (before_lock.st_dev, before_lock.st_ino)
+    assert {path.name for path in outside.iterdir()} == {"secret.docx", ".lifecycle.lock"}
+    assert not _versions_dir(data).exists()
+    assert not _staging(data).exists()
