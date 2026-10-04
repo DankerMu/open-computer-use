@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Create, join, reopen, and project sessions under the canonical chat lock."""
+"""Create, join, reopen, save, close, and project sessions under the canonical chat lock."""
 from __future__ import annotations
 
 import asyncio
+import errno
+import json
 import os
 import uuid
 from typing import Any
@@ -24,6 +26,8 @@ OPEN_STATES = frozenset({"opening", "editing", "saving", "closing", "conflict"})
 FINAL_STATES = frozenset({"closed", "error", "orphaned"})
 KNOWN_STATES = OPEN_STATES | FINAL_STATES
 DOCUMENT_TYPES = {"docx": "word", "xlsx": "cell", "pptx": "slide"}
+_SAVE_INTENTS = frozenset({"publish", "persist"})
+_PENDING_FIELDS = ("pending_save_seq", "pending_close_seq")
 
 
 class UnpublishedVersionError(RuntimeError):
@@ -52,6 +56,18 @@ class UnsupportedTypeError(ValueError):
         super().__init__("file name is not a supported Office type")
 
 
+class SessionNotEditingError(RuntimeError):
+    reason = "session_not_editing"
+
+
+class SessionNotOpenError(RuntimeError):
+    reason = "session_not_open"
+
+
+class InvalidRequestError(ValueError):
+    reason = "invalid_request"
+
+
 def create_session(request: Request) -> JSONResponse:
     try:
         created = _create_session(request.scope["ocu_chat_id"], request.path_params["file_id"])
@@ -78,6 +94,57 @@ def create_session(request: Request) -> JSONResponse:
     except (CreationFailedError, tokens.MissingSigningKeyError, OutputsBrokerError, OSError):
         return _error(500, "creation_failed")
     return JSONResponse(status_code=200 if created["joined"] else 201, content=created)
+
+
+
+async def save_session(request: Request) -> JSONResponse:
+    try:
+        intent = _save_intent(await request.body())
+        saved = await asyncio.to_thread(
+            _save_session,
+            request.scope["ocu_chat_id"],
+            request.path_params["session_id"],
+            intent,
+        )
+    except InvalidRequestError:
+        return _error(422, "invalid_request")
+    except UnknownSessionError:
+        return _error(404, "unknown_session")
+    except SessionNotEditingError:
+        return _error(409, "session_not_editing")
+    except DocumentServerUnavailableError:
+        return _error(502, "documentserver_unavailable")
+    except StorageLowError:
+        return _error(503, "storage_low")
+    except (RestoreEpochError, StateCorruptError):
+        return _error(500, "state_corrupt")
+    except StateDurabilityError:
+        return _error(500, "state_durability")
+    except OSError as extra:
+        if extra.errno == errno.ENOSPC:
+            return _error(503, "storage_low")
+        return _error(500, "state_corrupt")
+    return JSONResponse(status_code=202, content=saved)
+
+
+def close_session(request: Request) -> JSONResponse:
+    try:
+        closed = _close_session(
+            request.scope["ocu_chat_id"], request.path_params["session_id"]
+        )
+    except UnknownSessionError:
+        return _error(404, "unknown_session")
+    except SessionNotOpenError:
+        return _error(409, "session_not_open")
+    except (RestoreEpochError, StateCorruptError):
+        return _error(500, "state_corrupt")
+    except StateDurabilityError:
+        return _error(500, "state_durability")
+    except OSError as extra:
+        if extra.errno == errno.ENOSPC:
+            return _error(503, "storage_low")
+        return _error(500, "state_corrupt")
+    return JSONResponse(status_code=202, content=closed)
 
 
 def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
@@ -216,6 +283,7 @@ def _persisted_session(session_id, record) -> dict[str, Any]:
         raise StateCorruptError("office session restore epoch is invalid")
     if type(record.get("save_seq")) is not int or record["save_seq"] < 0:
         raise StateCorruptError("office session save sequence is invalid")
+    _allocation_metadata(record)
     return record
 
 
@@ -308,6 +376,7 @@ def _session_status(chat_id, session_id):
 
 
 def _status_projection(record):
+    _allocation_metadata(record)
     reason = record.get("reason")
     if reason is not None and (type(reason) is not str or not reason):
         raise StateCorruptError("office session reason is invalid")
@@ -369,12 +438,255 @@ def _signed_editor_config(chat_id, file_id, relative_path, document_type, docume
             "editorConfig": {
                 "callbackUrl": f"{self_url}/office/callback/{quote(chat_id, safe='')}/{quote(session_id, safe='')}",
                 "mode": "edit",
+                "customization": {"forcesave": False},
             },
         }
         token = tokens.sign_jwt(payload)
     except (KeyError, ValueError, RuntimeError, OSError):
         raise CreationFailedError() from None
     return {**payload, "token": token}
+
+
+def _save_intent(body: bytes) -> str:
+    if not body:
+        raise InvalidRequestError()
+    try:
+        parsed = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+        raise InvalidRequestError() from None
+    if not isinstance(parsed, dict):
+        raise InvalidRequestError()
+    intent = parsed.get("intent")
+    if type(intent) is not str or intent not in _SAVE_INTENTS:
+        raise InvalidRequestError()
+    return intent
+
+
+def _require_session(state, session_id) -> dict[str, Any]:
+    if session_id not in state["sessions"]:
+        raise UnknownSessionError()
+    return _persisted_session(session_id, state["sessions"][session_id])
+
+
+def _allocation_metadata(record) -> None:
+    if "save_intents" in record and record["save_intents"] is None:
+        raise StateCorruptError("office session save intents are invalid")
+    intents = record.get("save_intents")
+    if intents is not None:
+        if not isinstance(intents, dict):
+            raise StateCorruptError("office session save intents are invalid")
+        for key, intent in intents.items():
+            if type(key) is not str or not key.isascii() or not key.isdigit() or key.startswith("0"):
+                raise StateCorruptError("office session save intent sequence is invalid")
+            if type(intent) is not str or intent not in _SAVE_INTENTS:
+                raise StateCorruptError("office session save intent is invalid")
+            sequence = int(key)
+            if sequence < 1 or sequence > record["save_seq"]:
+                raise StateCorruptError("office session save intent sequence is invalid")
+    for field in _PENDING_FIELDS:
+        if field not in record:
+            continue
+        value = record[field]
+        if value is None:
+            continue
+        if type(value) is not int or value < 1 or value > record["save_seq"]:
+            raise StateCorruptError("office session pending allocation is invalid")
+        if field == "pending_save_seq":
+            mapping = record.get("save_intents")
+            if not isinstance(mapping, dict) or mapping.get(str(value)) not in _SAVE_INTENTS:
+                raise StateCorruptError("office session pending save allocation is invalid")
+
+
+def _allocate_sequence(record) -> int:
+    current = record["save_seq"]
+    if type(current) is not int or current < 0:
+        raise StateCorruptError("office session save sequence is invalid")
+    allocated = current + 1
+    record["save_seq"] = allocated
+    return allocated
+
+
+def _record_save_intent(record, save_seq, intent) -> None:
+    mapping = record.get("save_intents")
+    if mapping is None:
+        if "save_intents" in record:
+            raise StateCorruptError("office session save intents are invalid")
+        mapping = {}
+        record["save_intents"] = mapping
+    mapping[str(save_seq)] = intent
+
+
+def _load_session(chat_id, session_id):
+    chat = docker_manager.canonical_lock_chat_id(chat_id)
+    if not isinstance(session_id, str) or not session_id or "\x00" in session_id:
+        raise UnknownSessionError()
+    store = OfficeStore()
+    store._assert_chat_root_safe(chat, allow_missing=False)
+    return chat, store
+
+
+def _maybe_orphan_epoch(store, chat, record, session_id):
+    current_epoch = epoch.current_epoch()
+    if record["state"] in OPEN_STATES and record["restore_epoch"] != current_epoch:
+        return _orphan_session(store, chat, session_id, "restore_epoch_changed")
+    return None
+
+
+def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
+    chat, store = _load_session(chat_id, session_id)
+    prepared = None
+    with docker_manager._combined_lock(chat):
+        state = store.read(chat)
+        record = _require_session(state, session_id)
+        _status_projection(record)
+        orphaned = _maybe_orphan_epoch(store, chat, record, session_id)
+        if orphaned is not None:
+            raise SessionNotEditingError()
+        if record["state"] != "editing":
+            raise SessionNotEditingError()
+        document_key = record["document_key"]
+
+        def mutate(working):
+            current = _require_session(working, session_id)
+            _status_projection(current)
+            if current["state"] != "editing":
+                raise SessionNotEditingError()
+            allocated = _allocate_sequence(current)
+            _record_save_intent(current, allocated, intent)
+            current["pending_save_seq"] = allocated
+            current["state"] = "saving"
+            prepared["save_seq"] = allocated
+            prepared["document_key"] = current["document_key"]
+
+        prepared = {}
+        store.update(chat, mutate)
+    outcome = asyncio.run(commands.forcesave(prepared["document_key"], prepared["save_seq"], intent))
+    return _reconcile_save(store, chat, session_id, prepared["save_seq"], intent, document_key, outcome)
+
+
+def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, outcome) -> dict[str, Any]:
+    accepted = {"session_id": session_id, "save_seq": save_seq, "intent": intent}
+    if outcome is commands.ForceSaveOutcome.ACCEPTED:
+        return accepted
+    changed = {"value": False}
+
+    def mutate(working):
+        current = _require_session(working, session_id)
+        _status_projection(current)
+        if current["document_key"] != document_key:
+            return
+        if current.get("pending_save_seq") != save_seq:
+            return
+        if current["state"] in FINAL_STATES:
+            return
+        ended_conflict = current["state"] == "conflict" and _has_final_receipt(working, session_id)
+        if ended_conflict:
+            return
+        current["pending_save_seq"] = None
+        changed["value"] = True
+        if outcome is commands.ForceSaveOutcome.KEY_UNKNOWN:
+            current["state"] = "orphaned"
+            current["reason"] = "editor_state_lost"
+            return
+        if outcome is commands.ForceSaveOutcome.NOTHING_TO_SAVE:
+            committed = current.get("last_committed_seq", 0)
+            if type(committed) is not int or committed < 0:
+                raise StateCorruptError("office session sequence is invalid")
+            if committed < save_seq:
+                current["last_committed_seq"] = save_seq
+            if current["state"] == "saving":
+                current["state"] = "editing"
+            return
+        if current["state"] == "saving":
+            current["state"] = "editing"
+
+    with docker_manager._combined_lock(chat):
+        preview = store.read(chat)
+        mutate(preview)
+        if changed["value"]:
+            store.update(chat, mutate)
+    if outcome is commands.ForceSaveOutcome.NOTHING_TO_SAVE:
+        return accepted
+    if outcome is commands.ForceSaveOutcome.KEY_UNKNOWN:
+        raise SessionNotEditingError()
+    raise DocumentServerUnavailableError()
+
+
+def _close_session(chat_id, session_id) -> dict[str, Any]:
+    chat, store = _load_session(chat_id, session_id)
+    with docker_manager._combined_lock(chat):
+        state = store.read(chat)
+        record = _require_session(state, session_id)
+        _status_projection(record)
+        orphaned = _maybe_orphan_epoch(store, chat, record, session_id)
+        if orphaned is not None:
+            raise SessionNotOpenError()
+        if record["state"] in FINAL_STATES:
+            raise SessionNotOpenError()
+        if record["state"] == "opening":
+            return _commit_opening_close(store, chat, session_id)
+        if record["state"] == "closing":
+            pending = record.get("pending_close_seq")
+            if type(pending) is not int:
+                raise StateCorruptError("office session pending allocation is invalid")
+            return {"session_id": session_id, "save_seq": pending, "state": "closing"}
+        ended_conflict = record["state"] == "conflict" and _has_final_receipt(state, session_id)
+        if ended_conflict:
+            return {
+                "session_id": session_id,
+                "save_seq": record["save_seq"],
+                "state": "conflict",
+            }
+        if record["state"] in ("editing", "saving"):
+            outcome = asyncio.run(commands.lookup_key(record["document_key"]))
+            if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
+                _orphan_session(store, chat, session_id, "editor_state_lost")
+                raise SessionNotOpenError()
+        return _commit_close_allocation(store, chat, session_id, record["state"])
+
+
+def _commit_opening_close(store, chat, session_id) -> dict[str, Any]:
+    allocated = {"save_seq": None}
+
+    def mutate(working):
+        current = _require_session(working, session_id)
+        _status_projection(current)
+        if current["state"] != "opening":
+            raise StateCorruptError("office session close admission raced")
+        allocated["save_seq"] = _allocate_sequence(current)
+        current["state"] = "closed"
+
+    store.update(chat, mutate)
+    return {"session_id": session_id, "save_seq": allocated["save_seq"], "state": "closed"}
+
+
+def _commit_close_allocation(store, chat, session_id, expected_state) -> dict[str, Any]:
+    allocated = {"save_seq": None, "state": expected_state}
+
+    def mutate(working):
+        current = _require_session(working, session_id)
+        _status_projection(current)
+        pending = current.get("pending_close_seq")
+        if type(pending) is int:
+            allocated["save_seq"] = pending
+            allocated["state"] = current["state"]
+            return
+        if current["state"] != expected_state:
+            raise StateCorruptError("office session close admission raced")
+        allocated["save_seq"] = _allocate_sequence(current)
+        current["pending_close_seq"] = allocated["save_seq"]
+        if current["state"] in ("editing", "saving"):
+            current["state"] = "closing"
+            allocated["state"] = "closing"
+        else:
+            allocated["state"] = current["state"]
+
+    store.update(chat, mutate)
+    return {
+        "session_id": session_id,
+        "save_seq": allocated["save_seq"],
+        "state": allocated["state"],
+    }
 
 
 def _error(status: int, reason: str) -> JSONResponse:

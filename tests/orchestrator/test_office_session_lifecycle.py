@@ -76,6 +76,8 @@ def _verify_config(payload, file_id, number):
     assert config["document"]["key"] == payload["document_key"]
     assert config["document"]["url"].startswith(SELF_URL + "/office/source/")
     assert config["editorConfig"]["callbackUrl"] == f"{SELF_URL}/office/callback/{CHAT}/{payload['session_id']}"
+    assert config["editorConfig"]["customization"]["forcesave"] is False
+    assert signed["editorConfig"]["customization"]["forcesave"] is False
     expected = {"chat_id": CHAT, "file_id": file_id, "version": number, "session_id": payload["session_id"]}
     assert tokens.verify_source_ticket(_ticket(payload)) == expected
     claims = _oracle_verify(_ticket(payload), _ticket_key(INTERNAL))
@@ -398,6 +400,7 @@ def test_legacy_record_projects_initial_bookkeeping_without_rewrite(office_world
     ("last_published_seq", 1), ("workspace_changed", 0), ("saved_as", []),
     ("saved_as", {}), ("saved_as", {"file_id": "id", "path": 0}), ("restore_epoch", []),
     ("state", "edting"), ("session_id", "other"), ("file_id", ""), ("document_key", None),
+    ("save_intents", None),
 ))
 @pytest.mark.parametrize("method", ("GET", "POST"))
 def test_corrupted_consumed_session_fields_fail_closed(office_world, field, bad, method):

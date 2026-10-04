@@ -96,6 +96,8 @@ CHAT_ROUTES = (
     ("GET", f"/preview/{CHAT}"),
     ("POST", f"/api/office/{CHAT}/documents/file/sessions"),
     ("GET", f"/api/office/{CHAT}/sessions/session"),
+    ("POST", f"/api/office/{CHAT}/sessions/session/save"),
+    ("POST", f"/api/office/{CHAT}/sessions/session/close"),
     ("GET", f"/api/office/{CHAT}/unknown"),
 )
 
@@ -897,6 +899,8 @@ class TestHttpAuthorization:
         (
             ("POST", f"/api/office/{CHAT}/documents/file/sessions"),
             ("GET", f"/api/office/{CHAT}/sessions/session"),
+            ("POST", f"/api/office/{CHAT}/sessions/session/save"),
+            ("POST", f"/api/office/{CHAT}/sessions/session/close"),
             ("GET", f"/api/office/{CHAT}/unknown"),
         ),
     )

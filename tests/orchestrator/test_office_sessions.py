@@ -469,6 +469,7 @@ def test_editor_config_and_ticket_verify_independently(office_world):
     assert config_payload == {key: value for key, value in editor_config.items() if key != "token"}
     document = editor_config["document"]
     editor = editor_config["editorConfig"]
+    assert editor["customization"]["forcesave"] is False
     assert document["key"] == payload["document_key"]
     assert document["fileType"] == "docx"
     source = urlsplit(document["url"])

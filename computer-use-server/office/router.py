@@ -12,7 +12,7 @@ import docker_manager
 from auth_guard import OFFICE_PREFIX
 
 from . import config
-from .sessions import create_session, session_status
+from .sessions import close_session, create_session, save_session, session_status
 
 _SUFFIX_CONVERTOR = "ocu_office_suffix"
 
@@ -82,6 +82,18 @@ def create_office_router() -> APIRouter:
         f"{OFFICE_PREFIX}{{chat_id}}/sessions/{{session_id}}",
         session_status,
         methods=["GET"],
+        include_in_schema=False,
+    )
+    router.add_api_route(
+        f"{OFFICE_PREFIX}{{chat_id}}/sessions/{{session_id}}/save",
+        save_session,
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    router.add_api_route(
+        f"{OFFICE_PREFIX}{{chat_id}}/sessions/{{session_id}}/close",
+        close_session,
+        methods=["POST"],
         include_in_schema=False,
     )
     # Concrete Office routes must be registered above this fallback.
