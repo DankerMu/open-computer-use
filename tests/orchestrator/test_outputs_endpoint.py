@@ -52,6 +52,13 @@ _APP_MODULES = (
     "office",
     "office.config",
     "office.router",
+    "office.store",
+    "office.versions",
+    "office.workspace",
+    "office.epoch",
+    "office.tokens",
+    "office.sessions",
+    "office.ooxml",
 )
 
 

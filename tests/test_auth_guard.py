@@ -144,6 +144,13 @@ def app_module(monkeypatch):
             "office",
             "office.config",
             "office.router",
+            "office.store",
+            "office.versions",
+            "office.workspace",
+            "office.epoch",
+            "office.tokens",
+            "office.sessions",
+            "office.ooxml",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)
     import app as loaded
