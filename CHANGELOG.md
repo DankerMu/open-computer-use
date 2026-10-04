@@ -10,6 +10,18 @@
 
 
 ### Changed
+- **Office session join and persisted status.** Repeated document opens
+  join the existing session with its stable key and a freshly signed source
+  ticket, including within one clock tick. Reopen checks use the existing
+  bounded DocumentServer key lookup under the shared chat lock. Forgotten
+  editors and changed restore epochs durably orphan open sessions; unpublished
+  history is retained with a one-request `unpublished_version` refusal before
+  replacement. The status GET returns persisted bookkeeping from any worker,
+  with initial-value projection for older records and no workspace hash or
+  DocumentServer read. Pending conflicts with final receipts return no editor
+  configuration. Save/close, workspace-change computation and callback serving
+  remain separate lifecycle operations.
+
 - **Upload name claim without replace.** `POST /api/uploads/{chat_id}/{path}`
   stages complete bytes in the server-private `{chat}/.ocu` directory, then
   hard-links the first free name (`name (N).ext` on collision) without replacing

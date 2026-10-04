@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import secrets
 import time
 from typing import Any
 
@@ -54,6 +55,7 @@ def sign_source_ticket(chat_id: str, file_id: str, version: int, session_id: str
         "version": version,
         "session_id": session_id,
         "exp": int(time.time()) + config.SOURCE_TICKET_TTL_SECONDS,
+        "jti": secrets.token_hex(16),
     }
     return _encode(payload, _ticket_secret())
 

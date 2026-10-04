@@ -290,6 +290,19 @@ def test_source_ticket_returns_exactly_four_bindings_and_honours_ttl():
     assert oracle["exp"] == NOW + config.SOURCE_TICKET_TTL_SECONDS
 
 
+def test_same_clock_tickets_are_distinct_and_keep_the_same_verified_bindings():
+    first = tokens.sign_source_ticket(CHAT, FILE, VERSION, SESSION)
+    second = tokens.sign_source_ticket(CHAT, FILE, VERSION, SESSION)
+    expected = {"chat_id": CHAT, "file_id": FILE, "version": VERSION, "session_id": SESSION}
+    assert first != second
+    assert tokens.verify_source_ticket(first) == expected
+    assert tokens.verify_source_ticket(second) == expected
+    one = _oracle_verify(first, _ticket_key(INTERNAL_TOKEN))
+    two = _oracle_verify(second, _ticket_key(INTERNAL_TOKEN))
+    assert one["exp"] == two["exp"] == NOW + config.SOURCE_TICKET_TTL_SECONDS
+    assert one["jti"] != two["jti"]
+
+
 @pytest.mark.parametrize("field", ("chat_id", "file_id", "version", "session_id"))
 def test_each_ticket_binding_tamper_is_rejected(field):
     ticket = tokens.sign_source_ticket(CHAT, FILE, VERSION, SESSION)

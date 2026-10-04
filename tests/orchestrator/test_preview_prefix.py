@@ -54,6 +54,7 @@ _APP_MODULES = (
     "office.workspace",
     "office.epoch",
     "office.tokens",
+    "office.commands",
     "office.sessions",
     "office.ooxml",
 )
