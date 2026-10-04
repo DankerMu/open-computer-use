@@ -129,17 +129,49 @@ def test_first_status_hashes_then_equal_pair_repeats_false_without_reading(offic
     _file_id, first = _created(office_world, "opening")
     path = _workspace(data)
     original = path.read_bytes()
+    reads = _count_workspace_reads(notice, monkeypatch, path)
     first_status = _status_fields(http, first["session_id"])
     assert first_status["workspace_changed"] is False
     assert first_status["state"] == "opening"
     record = _record(first["session_id"])
     assert (record["last_checked_size"], record["last_checked_mtime_ns"]) == _sample(path)
-    reads = _count_workspace_reads(notice, monkeypatch, path)
+    assert reads["count"] > 0
+    reads["count"] = 0
     second = _status_fields(http, first["session_id"])
     assert second["workspace_changed"] is False
     assert second["state"] == "opening"
     assert reads["count"] == 0
     assert path.read_bytes() == original
+    assert origin.hits == 0
+
+
+def test_first_status_detects_edit_since_creation(office_world, monkeypatch):
+    http, data, origin, _docker, _broker = office_world
+    import office.notice as notice
+    from office.store import OfficeStore
+    _file_id, first = _created(office_world, "opening")
+    session_id = first["session_id"]
+    before = OfficeStore().read(CHAT)
+    record = before["sessions"][session_id]
+    assert not any(key in record for key in ("last_checked_size", "last_checked_mtime_ns"))
+    path = _workspace(data)
+    path.write_bytes(_same_size_bytes(path.read_bytes()))
+    reads = _count_workspace_reads(notice, monkeypatch, path)
+    changed = _status_fields(http, session_id)
+    assert changed["workspace_changed"] is True
+    assert changed["state"] == "opening"
+    assert reads["count"] > 0
+    after = OfficeStore().read(CHAT)
+    assert _unrelated(after["sessions"][session_id], record)
+    for key in ("documents", "receipts", "journal"):
+        assert after[key] == before[key]
+    assert (
+        after["sessions"][session_id]["last_checked_size"],
+        after["sessions"][session_id]["last_checked_mtime_ns"],
+    ) == _sample(path)
+    reads["count"] = 0
+    assert _status_fields(http, session_id) == changed
+    assert reads["count"] == 0
     assert origin.hits == 0
 
 
