@@ -3,6 +3,7 @@
 """Office route availability: disabled, unknown chat, and unknown-route fallback."""
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import threading
@@ -201,6 +202,52 @@ def _office_headers():
     }
 
 
+SANDBOX_PEER = "10.90.0.8"
+NEWLINE_ENCODED = f"/api/office/{CHAT}/unknown%0Asegment"
+NEWLINE_DECODED = f"/api/office/{CHAT}/unknown\nsegment"
+
+
+def _raw_office(app, path, headers, method="GET", client=("testclient", 50000)):
+    messages = []
+    received = False
+
+    async def receive():
+        nonlocal received
+        if received:
+            return {"type": "http.disconnect"}
+        received = True
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": b"",
+        "headers": headers,
+        "client": client,
+        "server": ("testserver", 80),
+        "root_path": "",
+    }
+    asyncio.run(app(scope, receive, send))
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    body = b"".join(
+        message.get("body") or b""
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+    return start["status"], json.loads(body) if body else {}
+
+
+
+
+
 @pytest.mark.parametrize("method,path", DISABLED_ROUTES)
 def test_disabled_office_routes_are_404_without_work(
     tmp_path, monkeypatch, method, path
@@ -261,6 +308,116 @@ def test_enabled_existing_unknown_path_is_unknown_route(tmp_path, monkeypatch):
         _assert_reason(custom, "unknown_route")
         _assert_reason(options, "unknown_route")
         assert origin.hits == 0
+
+
+def test_enabled_existing_chat_newline_suffix_is_unknown_route(tmp_path, monkeypatch):
+    with _office_app(tmp_path, monkeypatch, enabled=True) as (
+        http,
+        data,
+        origin,
+        docker_manager,
+    ):
+        (data / CHAT).mkdir()
+        before = _inventory(data)
+        with _trap_lock_and_state(docker_manager):
+            encoded = http.get(NEWLINE_ENCODED, headers=_auth())
+            status, parsed = _raw_office(
+                http.app,
+                NEWLINE_DECODED,
+                [(b"authorization", f"Bearer {INTERNAL}".encode("ascii"))],
+            )
+        _assert_reason(encoded, "unknown_route")
+        assert status == 404
+        assert parsed["reason"] == "unknown_route"
+        assert _inventory(data) == before
+        assert origin.hits == 0
+
+
+def test_disabled_and_missing_chat_newline_suffix_keep_availability_reasons(
+    tmp_path, monkeypatch
+):
+    with _office_app(tmp_path, monkeypatch, enabled=False) as (
+        http,
+        data,
+        origin,
+        docker_manager,
+    ):
+        before = _inventory(data)
+        with _trap_lock_and_state(docker_manager), _trap_chat_fs(data, CHAT):
+            disabled = http.get(NEWLINE_ENCODED, headers=_auth())
+        _assert_reason(disabled, "office_disabled")
+        assert _inventory(data) == before
+        assert origin.hits == 0
+    with _office_app(tmp_path / "missing", monkeypatch, enabled=True) as (
+        http,
+        data,
+        origin,
+        docker_manager,
+    ):
+        before = _inventory(data)
+        with _trap_lock_and_state(docker_manager):
+            missing = http.get(
+                f"/api/office/{MISSING}/unknown%0Asegment",
+                headers=_auth(),
+            )
+            unauth = http.get(NEWLINE_ENCODED)
+        _assert_reason(missing, "unknown_chat")
+        assert unauth.status_code == 401
+        assert json.loads(unauth.content)["reason"] == "unauthorized"
+        assert _inventory(data) == before
+        assert not (data / MISSING).exists()
+        assert origin.hits == 0
+
+
+def test_enabled_existing_chat_denials_do_no_office_work(tmp_path, monkeypatch):
+    with _office_app(tmp_path, monkeypatch, enabled=True) as (
+        http,
+        data,
+        origin,
+        docker_manager,
+    ):
+        (data / CHAT).mkdir()
+        before = _inventory(data)
+        with _trap_lock_and_state(docker_manager), _trap_chat_fs(data, CHAT):
+            missing = http.get(f"/api/office/{CHAT}/unknown")
+            wrong = http.get(
+                f"/api/office/{CHAT}/unknown",
+                headers=_auth("not-the-configured-secret"),
+            )
+            preflight = http.options(
+                f"/api/office/{CHAT}/sessions/{SESSION_ID}",
+                headers={
+                    "Origin": "https://webui.example",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "Authorization",
+                },
+            )
+            invalid = http.get(
+                "/api/office/default/sessions/session",
+                headers={**_auth(), "X-Chat-Id": CHAT},
+                params={"chat_id": CHAT},
+            )
+        assert missing.status_code == 401
+        assert json.loads(missing.content)["reason"] == "unauthorized"
+        assert wrong.status_code == 401
+        assert json.loads(wrong.content)["reason"] == "unauthorized"
+        assert preflight.status_code == 401
+        assert json.loads(preflight.content)["reason"] == "unauthorized"
+        assert invalid.status_code == 400
+        assert json.loads(invalid.content)["reason"] == "invalid_chat_id"
+        with _trap_lock_and_state(docker_manager), _trap_chat_fs(data, CHAT):
+            sandbox_status, sandbox_body = _raw_office(
+                http.app,
+                f"/api/office/{CHAT}/sessions/{SESSION_ID}",
+                [(b"authorization", f"Bearer {INTERNAL}".encode("ascii"))],
+                client=(SANDBOX_PEER, 40020),
+            )
+        assert sandbox_status == 403
+        assert sandbox_body["reason"] == "forbidden"
+        assert _inventory(data) == before
+        assert origin.hits == 0
+        assert not (data / CHAT / ".ocu" / "office").exists()
+
 
 
 def test_availability_uses_canonical_chat_identity(tmp_path, monkeypatch):

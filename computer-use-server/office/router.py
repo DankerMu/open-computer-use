@@ -6,13 +6,20 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter
+from starlette.convertors import PathConvertor, register_url_convertor
 
 import docker_manager
 from auth_guard import OFFICE_PREFIX
 
 from . import config
 
-router = APIRouter()
+_SUFFIX_CONVERTOR = "ocu_office_suffix"
+
+
+class OfficeSuffixConvertor(PathConvertor):
+    """Match every remaining Office suffix character, including newlines."""
+
+    regex = r"[\s\S]*"
 
 
 class OfficeAvailabilityMiddleware:
@@ -61,10 +68,14 @@ async def _json_404(send, reason: str) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-# Concrete Office routes must be registered above this fallback.
-router.add_route(
-    f"{OFFICE_PREFIX}{{rest:path}}",
-    UnknownRoute(),
-    methods=None,
-    include_in_schema=False,
-)
+def create_office_router() -> APIRouter:
+    register_url_convertor(_SUFFIX_CONVERTOR, OfficeSuffixConvertor())
+    router = APIRouter()
+    # Concrete Office routes must be registered above this fallback.
+    router.add_route(
+        f"{OFFICE_PREFIX}{{rest:{_SUFFIX_CONVERTOR}}}",
+        UnknownRoute(),
+        methods=None,
+        include_in_schema=False,
+    )
+    return router
