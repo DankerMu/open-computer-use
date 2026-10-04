@@ -15,6 +15,7 @@ PACKAGE_RELS_NAME = "_rels/.rels"
 MAX_MEMBER_NAME_BYTES = 1024
 MAX_INSPECTED_BYTES = MAX_FILE_SIZE
 _READ_CHUNK = 64 * 1024
+_ALLOWED_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 _NS_CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 _NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 _OFFICE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
@@ -53,6 +54,8 @@ def validate_ooxml(content: bytes, document_type: str) -> None:
             for info in archive.infolist():
                 name = info.filename
                 if name in seen or not _safe_member_name(name) or info.flag_bits & 1:
+                    raise CorruptDocumentError()
+                if info.compress_type not in _ALLOWED_COMPRESSION:
                     raise CorruptDocumentError()
                 seen.add(name)
                 if name.rstrip("/").rsplit("/", 1)[-1].lower() in {"encryptioninfo", "encryptedpackage"}:

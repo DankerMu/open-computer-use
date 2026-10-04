@@ -20,6 +20,8 @@ from .versions import StorageLowError
 from .workspace import FileTooLargeError, UnsafePathError
 
 OPEN_STATES = frozenset({"opening", "editing", "saving", "closing", "conflict"})
+FINAL_STATES = frozenset({"closed", "error", "orphaned"})
+KNOWN_STATES = OPEN_STATES | FINAL_STATES
 DOCUMENT_TYPES = {"docx": "word", "xlsx": "cell", "pptx": "slide"}
 
 
@@ -80,8 +82,8 @@ def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
     with docker_manager._combined_lock(chat):
         store._assert_chat_root_safe(chat, allow_missing=False)
         relative_path = broker.resolve_file_id(chat, file_id)
-        document_type = relative_path.rsplit(".", 1)[-1].lower()
-        if document_type not in DOCUMENT_TYPES:
+        document_type = _document_type(relative_path)
+        if document_type is None:
             raise UnsupportedTypeError()
         state = store.read(chat)
         _refuse_open_session(state, file_id)
@@ -138,22 +140,56 @@ def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
         }
 
 
+def _persisted_session(session_id, record) -> dict[str, Any]:
+    if not isinstance(session_id, str) or not session_id:
+        raise StateCorruptError("office session identity is invalid")
+    if not isinstance(record, dict):
+        raise StateCorruptError("office session record is invalid")
+    session_id_field = record.get("session_id")
+    file_id = record.get("file_id")
+    document_key = record.get("document_key")
+    state = record.get("state")
+    if session_id_field != session_id:
+        raise StateCorruptError("office session identity is invalid")
+    if not isinstance(file_id, str) or not file_id:
+        raise StateCorruptError("office session file_id is invalid")
+    if not isinstance(document_key, str) or not document_key:
+        raise StateCorruptError("office session document_key is invalid")
+    if type(state) is not str or state not in KNOWN_STATES:
+        raise StateCorruptError("office session state is invalid")
+    return record
+
+
 def _refuse_open_session(state, file_id) -> None:
-    for record in state["sessions"].values():
-        if not isinstance(record, dict):
-            raise StateCorruptError("office session record is invalid")
-        if record.get("file_id") == file_id and record.get("state") in OPEN_STATES:
+    sessions = state["sessions"]
+    if not isinstance(sessions, dict):
+        raise StateCorruptError("office sessions collection is invalid")
+    for session_id, record in sessions.items():
+        persisted = _persisted_session(session_id, record)
+        if persisted["file_id"] == file_id and persisted["state"] in OPEN_STATES:
             raise SessionAlreadyOpenError()
 
 
 def _require_unique_session_identity(state, session_id, document_key) -> None:
-    if session_id in state["sessions"]:
+    sessions = state["sessions"]
+    if not isinstance(sessions, dict):
+        raise StateCorruptError("office sessions collection is invalid")
+    if session_id in sessions:
         raise CreationFailedError()
-    for record in state["sessions"].values():
-        if not isinstance(record, dict):
-            raise StateCorruptError("office session record is invalid")
-        if record.get("document_key") == document_key:
+    for persisted_id, record in sessions.items():
+        persisted = _persisted_session(persisted_id, record)
+        if persisted["document_key"] == document_key:
             raise CreationFailedError()
+
+
+def _document_type(relative_path: str) -> str | None:
+    name = relative_path.rsplit("/", 1)[-1]
+    if "." not in name:
+        return None
+    suffix = name.rsplit(".", 1)[-1].lower()
+    if suffix in DOCUMENT_TYPES:
+        return suffix
+    return None
 
 
 def _signed_editor_config(chat_id, file_id, relative_path, document_type, document_key,

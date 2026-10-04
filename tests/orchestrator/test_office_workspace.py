@@ -226,6 +226,7 @@ def test_growth_past_limit_during_read_refuses_after_one_excess_byte(world, monk
     original_fstat = workspace_mod.os.fstat
     original_read = workspace_mod.os.read
     grew = []
+    returned = []
 
     def lie_then_grow(fd):
         info = original_fstat(fd)
@@ -242,9 +243,12 @@ def test_growth_past_limit_during_read_refuses_after_one_excess_byte(world, monk
     def grow_on_read(fd, size):
         info = original_fstat(fd)
         if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino) and not grew:
-            target.write_bytes(WORKSPACE + b"X")
+            target.write_bytes(WORKSPACE + b"X" * 64)
             grew.append(True)
-        return original_read(fd, size)
+        chunk = original_read(fd, size)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            returned.append(len(chunk))
+        return chunk
 
     monkeypatch.setattr(workspace_mod.os, "fstat", lie_then_grow)
     monkeypatch.setattr(workspace_mod.os, "read", grow_on_read)
@@ -254,6 +258,8 @@ def test_growth_past_limit_during_read_refuses_after_one_excess_byte(world, monk
         )
     assert error.value.reason == "file_too_large"
     assert grew == [True]
+    assert sum(returned) <= len(WORKSPACE) + 1
+    assert not _versions_dir(data).exists()
 
 
 def test_unsafe_paths_are_not_read_when_a_byte_limit_is_supplied(world, monkeypatch):

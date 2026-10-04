@@ -11,12 +11,26 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 import pytest
 
-from tests.orchestrator.test_office_ooxml import intact_docx, intact_pptx, intact_xlsx
+from tests.orchestrator.test_office_ooxml import (
+    WORD_NS,
+    WORD_TYPE,
+    _content_types,
+    _main,
+    _member_utf8_name,
+    _package,
+    _rels,
+    _unsupported_codec_package,
+    intact_docx,
+    intact_pptx,
+    intact_xlsx,
+    many_member_pptx,
+)
 from tests.orchestrator.test_office_router import OFFICE_SETTINGS, _office_app
 from tests.orchestrator.test_office_workspace import _forbid_inode_open
 from tests.orchestrator.test_outputs_endpoint import CHAT, CHAT_B, INTERNAL, MCP_KEY, _auth
@@ -36,6 +50,7 @@ UNSUPPORTED = (
     ("plain.txt", b"plain"),
 )
 OPEN_STATES = ("opening", "editing", "saving", "closing", "conflict")
+FINAL_STATES = ("closed", "error", "orphaned")
 
 
 def _sha(body: bytes) -> str:
@@ -491,21 +506,51 @@ def test_absent_epoch_is_stored_and_present_epoch_is_copied(office_world):
     assert origin.hits == 0
 
 
-def test_foreign_file_id_is_unknown_and_does_not_touch_the_other_chat(office_world):
+def test_foreign_file_id_is_unknown_and_does_not_touch_the_other_chat(office_world, monkeypatch):
     http, data, origin, _docker_manager, broker_module = office_world
-    _put(data, "brief.docx", intact_docx(), chat=CHAT_B)
+    import office.sessions as sessions_mod
+    import office.store as store_mod
+
+    body = intact_docx()
+    _put(data, "brief.docx", body, chat=CHAT_B)
     foreign_id = _index_file(broker_module, data, "brief.docx", chat=CHAT_B)
+
+    def seed_foreign(working):
+        working["documents"][foreign_id] = {
+            "file_id": foreign_id,
+            "published_sha256": _sha(body),
+            "latest_version": _sha(body),
+        }
+        working["sessions"]["foreign-sess"] = {
+            "session_id": "foreign-sess",
+            "file_id": foreign_id,
+            "document_key": "foreign-key",
+            "baseline_sha256": _sha(body),
+            "restore_epoch": None,
+            "state": "closed",
+            "save_seq": 0,
+        }
+
+    store_mod.OfficeStore().update(CHAT_B, seed_foreign)
     other_before = _snapshot(data / CHAT_B)
     _seed_refusal_history()
     own_before = _snapshot(data / CHAT)
-    _assert_refusal(_create(http, foreign_id), 404, "unknown_file")
+    foreign_root = data / CHAT_B
+    foreign_paths = [foreign_root, *foreign_root.rglob("*")]
+    with monkeypatch.context() as nested:
+        _forbid_inode_open(sessions_mod, nested, *foreign_paths)
+        _assert_refusal(_create(http, foreign_id), 404, "unknown_file")
     assert _snapshot(data / CHAT_B) == other_before
     assert _snapshot(data / CHAT) == own_before
     assert set(json.loads(_state(data).read_bytes())["documents"]) == {"history-document"}
+    assert json.loads(_state(data, CHAT_B).read_bytes())["sessions"]["foreign-sess"]["file_id"] == foreign_id
     assert origin.hits == 0
     downloaded = http.get(f"/files/{CHAT_B}/brief.docx", headers=_auth())
     assert downloaded.status_code == 200
-    assert downloaded.content == intact_docx()
+    assert downloaded.content == body
+
+
+
 
 
 @pytest.mark.parametrize("state", OPEN_STATES)
@@ -526,6 +571,90 @@ def test_existing_nonfinal_session_is_already_open_without_mutation(office_world
     assert origin.hits == 0
 
 
+@pytest.mark.parametrize("bad_state", ("edting", None, [], {}))
+def test_malformed_retained_session_state_is_state_corrupt_without_mutation(office_world, bad_state):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = intact_docx()
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    created = _create(http, file_id)
+    assert created.status_code == 201
+    payload = json.loads(_state(data).read_text(encoding="utf-8"))
+    payload["sessions"][created.json()["session_id"]]["state"] = bad_state
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    _state(data).write_bytes(encoded)
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 500, "state_corrupt")
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
+
+def test_missing_session_state_field_is_state_corrupt(office_world):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = intact_docx()
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    created = _create(http, file_id)
+    payload = json.loads(_state(data).read_text(encoding="utf-8"))
+    payload["sessions"][created.json()["session_id"]].pop("state")
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    _state(data).write_bytes(encoded)
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 500, "state_corrupt")
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
+
+def test_mismatched_session_map_key_is_state_corrupt(office_world):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = intact_docx()
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    created = _create(http, file_id)
+    payload = json.loads(_state(data).read_text(encoding="utf-8"))
+    payload["sessions"][created.json()["session_id"]]["session_id"] = "other-session"
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    _state(data).write_bytes(encoded)
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 500, "state_corrupt")
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("state", FINAL_STATES)
+def test_recognized_final_sessions_allow_a_new_opening_session(office_world, state):
+    http, data, origin, _docker_manager, broker_module = office_world
+    import office.store as store_mod
+
+    body = intact_docx()
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    _seed_session(store_mod, file_id, state, key=f"used-{state}")
+    response = _create(http, file_id)
+    assert response.status_code == 201
+    persisted = json.loads(_state(data).read_text(encoding="utf-8"))
+    keys = {record["document_key"] for record in persisted["sessions"].values()}
+    assert f"used-{state}" in keys
+    assert response.json()["document_key"] != f"used-{state}"
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("name,factory", (("docx", intact_docx), ("xlsx", intact_xlsx), ("pptx", intact_pptx)))
+def test_extensionless_supported_type_names_are_unsupported(office_world, name, factory):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = factory()
+    _put(data, name, body)
+    file_id = _index_file(broker_module, data, name)
+    _seed_refusal_history()
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 415, "unsupported_type")
+    assert _snapshot(data) == before
+    downloaded = http.get(f"/files/{CHAT}/{name}", headers=_auth())
+    assert downloaded.status_code == 200
+    assert downloaded.content == body
+    assert origin.hits == 0
+
+
 def test_closed_session_gets_a_new_unused_key(office_world):
     http, data, origin, _docker_manager, broker_module = office_world
     import office.store as store_mod
@@ -541,6 +670,157 @@ def test_closed_session_gets_a_new_unused_key(office_world):
     keys = {record["document_key"] for record in persisted["sessions"].values()}
     assert keys == {"used-key", response.json()["document_key"]}
     assert origin.hits == 0
+
+
+def test_invalid_json_and_unsupported_schema_are_state_corrupt(office_world):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = intact_docx()
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    created = _create(http, file_id)
+    assert created.status_code == 201
+    state_path = _state(data)
+    workspace = (_outputs(data) / "brief.docx").read_bytes()
+    blobs = {path.name: path.read_bytes() for path in _versions(data).iterdir()}
+    for encoded in (
+        b"{broken-json",
+        json.dumps(
+            {"schema_version": 99, "documents": {}, "sessions": {}, "receipts": {}, "journal": {}},
+            separators=(",", ":"),
+        ).encode("utf-8"),
+    ):
+        state_path.write_bytes(encoded)
+        before_state = state_path.read_bytes()
+        _assert_refusal(_create(http, file_id), 500, "state_corrupt")
+        assert state_path.read_bytes() == before_state
+        assert (_outputs(data) / "brief.docx").read_bytes() == workspace
+        assert {path.name: path.read_bytes() for path in _versions(data).iterdir()} == blobs
+        assert origin.hits == 0
+
+
+def test_corrupt_index_is_state_corrupt_without_mutation(office_world):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = intact_docx()
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    index = data / CHAT / ".ocu" / "index.json"
+    broken = b"{broken-json"
+    index.write_bytes(broken)
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 500, "state_corrupt")
+    assert _snapshot(data) == before
+    assert index.read_bytes() == broken
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("kind", ("utf8", "directory"))
+def test_unreadable_restore_epoch_marker_is_state_corrupt(office_world, kind):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = intact_docx()
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    marker = data / ".office-restore-epoch"
+    if kind == "utf8":
+        marker.write_bytes(b"\xff\xfe")
+    else:
+        marker.mkdir()
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 500, "state_corrupt")
+    assert _snapshot(data) == before
+    if kind == "utf8":
+        assert marker.read_bytes() == b"\xff\xfe"
+    else:
+        assert marker.is_dir()
+    assert origin.hits == 0
+
+
+
+def test_deflated_document_still_creates_a_session(office_world):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = _package(
+        {
+            "[Content_Types].xml": _content_types("word/document.xml", WORD_TYPE),
+            "_rels/.rels": _rels("word/document.xml"),
+            "word/document.xml": _main("document", WORD_NS),
+        },
+        compress_type=zipfile.ZIP_DEFLATED,
+    )
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    response = _create(http, file_id)
+    assert response.status_code == 201
+    digest = _sha(body)
+    persisted = json.loads(_state(data).read_text(encoding="utf-8"))
+    assert persisted["documents"][file_id]["published_sha256"] == digest
+    assert (_versions(data) / digest).read_bytes() == body
+    assert origin.hits == 0
+
+
+def test_many_member_presentation_creates_matching_persisted_content(office_world):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = many_member_pptx()
+    _put(data, "deck.pptx", body)
+    file_id = _index_file(broker_module, data, "deck.pptx")
+    response = _create(http, file_id)
+    assert response.status_code == 201
+    digest = _sha(body)
+    persisted = json.loads(_state(data).read_text(encoding="utf-8"))
+    assert persisted["documents"][file_id]["published_sha256"] == digest
+    assert (_versions(data) / digest).read_bytes() == body
+    assert origin.hits == 0
+
+
+def test_utf8_member_name_at_limit_creates_matching_persisted_content(office_world):
+    http, data, origin, _docker_manager, broker_module = office_world
+    accepted = _member_utf8_name()
+    assert len(accepted.encode("utf-8")) == 1024
+    body = _package(
+        {
+            "[Content_Types].xml": _content_types("word/document.xml", WORD_TYPE),
+            "_rels/.rels": _rels("word/document.xml"),
+            "word/document.xml": _main("document", WORD_NS),
+            accepted: b"<a/>",
+        }
+    )
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    response = _create(http, file_id)
+    assert response.status_code == 201
+    digest = _sha(body)
+    persisted = json.loads(_state(data).read_text(encoding="utf-8"))
+    assert persisted["documents"][file_id]["published_sha256"] == digest
+    assert (_versions(data) / digest).read_bytes() == body
+    assert origin.hits == 0
+
+
+
+@pytest.mark.parametrize("codec", (zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA))
+@pytest.mark.parametrize("member", ("[Content_Types].xml", "_rels/.rels", "word/document.xml"))
+@pytest.mark.parametrize("forge", (False, True))
+def test_unsupported_zip_codecs_are_corrupt_before_decoder_entry(
+    office_world, monkeypatch, codec, member, forge
+):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = _unsupported_codec_package(codec, member, forge)
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    entered = []
+    original = zipfile._get_decompressor
+
+    def observed(method):
+        if method == codec:
+            entered.append(method)
+        return original(method)
+
+    monkeypatch.setattr(zipfile, "_get_decompressor", observed)
+    _seed_refusal_history()
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 422, "corrupt_document")
+    assert entered == []
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
+
 
 
 def test_signing_failure_leaves_no_capture(office_world, monkeypatch):

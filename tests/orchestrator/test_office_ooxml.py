@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import struct
 import sys
 import zipfile
 from pathlib import Path
@@ -38,12 +39,80 @@ def _xml(tag, ns, text=None, attrib=None, children=()):
     return node
 
 
-def _package(members: dict[str, bytes]) -> bytes:
+def _package(members: dict[str, bytes], compress_type=zipfile.ZIP_STORED) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         for name, body in members.items():
-            archive.writestr(name, body)
+            info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = compress_type
+            archive.writestr(info, body)
     return buffer.getvalue()
+
+
+def _member_utf8_name(extra_ascii: str = "") -> str:
+    # Complete ZIP member name, including directory prefix and suffix.
+    # "word/" (5) + 507 * "é" (1014) + "x" (1) + extra + ".xml" (4) => 1024 + len(extra).
+    return "word/" + ("é" * 507) + "x" + extra_ascii + ".xml"
+
+
+def _central_entry_offset(archive, encoded: bytes, name: str) -> int:
+    encoded_name = name.encode("utf-8")
+    cursor = archive.start_dir
+    while True:
+        header = encoded[cursor:cursor + 46]
+        assert header[:4] == b"PK\x01\x02"
+        name_len = int.from_bytes(header[28:30], "little")
+        extra_len = int.from_bytes(header[30:32], "little")
+        comment_len = int.from_bytes(header[32:34], "little")
+        if encoded[cursor + 46:cursor + 46 + name_len] == encoded_name:
+            return cursor
+        cursor += 46 + name_len + extra_len + comment_len
+
+
+def _forge_uncompressed_size(encoded: bytearray, name: str, size: int = 8) -> bytes:
+    with zipfile.ZipFile(io.BytesIO(encoded)) as archive:
+        info = archive.getinfo(name)
+        extra = int.from_bytes(encoded[info.header_offset + 28:info.header_offset + 30], "little")
+        name_len = int.from_bytes(encoded[info.header_offset + 26:info.header_offset + 28], "little")
+        assert encoded[info.header_offset:info.header_offset + 4] == b"PK\x03\x04"
+        assert extra == 0
+        assert encoded[info.header_offset + 30:info.header_offset + 30 + name_len] == name.encode("utf-8")
+        encoded[info.header_offset + 22:info.header_offset + 26] = struct.pack("<I", size)
+        central = _central_entry_offset(archive, encoded, name)
+        encoded[central + 24:central + 28] = struct.pack("<I", size)
+    return bytes(encoded)
+
+
+def _unsupported_codec_package(codec, member: str, forge: bool) -> bytes:
+    comment = "<!--" + ("x" * (1024 * 1024)) + "-->"
+    members = {
+        "[Content_Types].xml": _content_types("word/document.xml", WORD_TYPE),
+        "_rels/.rels": _rels("word/document.xml"),
+        "word/document.xml": _main("document", WORD_NS),
+    }
+    if member == "[Content_Types].xml":
+        members[member] = _content_types("word/document.xml", WORD_TYPE).replace(
+            b"?>", b"?>" + comment.encode("ascii"), 1
+        )
+    elif member == "_rels/.rels":
+        members[member] = _rels("word/document.xml").replace(
+            b"?>", b"?>" + comment.encode("ascii"), 1
+        )
+    else:
+        members[member] = _main("document", WORD_NS).replace(
+            b"?>", b"?>" + comment.encode("ascii"), 1
+        )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, body in members.items():
+            info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = codec if name == member else zipfile.ZIP_STORED
+            archive.writestr(info, body)
+    encoded = bytearray(buffer.getvalue())
+    if forge:
+        return _forge_uncompressed_size(encoded, member)
+    return bytes(encoded)
+
 
 
 def _content_types(part: str, content_type: str) -> bytes:
@@ -104,10 +173,15 @@ def intact_pptx() -> bytes:
     )
 
 
-def test_intact_three_formats_are_accepted():
-    ooxml.validate_ooxml(intact_docx(), "docx")
-    ooxml.validate_ooxml(intact_xlsx(), "xlsx")
-    ooxml.validate_ooxml(intact_pptx(), "pptx")
+def many_member_pptx() -> bytes:
+    presentation = {
+        "[Content_Types].xml": _content_types("ppt/presentation.xml", SLIDE_TYPE),
+        "_rels/.rels": _rels("ppt/presentation.xml"),
+        "ppt/presentation.xml": _main("presentation", SLIDE_NS),
+    }
+    for index in range(2000):
+        presentation[f"ppt/slides/part{index}.xml"] = b"<a/>"
+    return _package(presentation)
 
 
 @pytest.mark.parametrize(
@@ -160,24 +234,39 @@ def test_encrypted_flag_and_encrypted_member_are_corrupt():
     assert error.value.reason == "corrupt_document"
 
 
-def test_large_main_and_many_presentation_members_are_accepted():
+def test_oversized_utf8_member_name_is_corrupt():
+    accepted = _member_utf8_name()
+    rejected = _member_utf8_name("x")
+    assert len(accepted.encode("utf-8")) == 1024
+    assert len(rejected.encode("utf-8")) == 1025
+    with pytest.raises(ooxml.CorruptDocumentError):
+        ooxml.validate_ooxml(
+            _package(
+                {
+                    "[Content_Types].xml": _content_types("word/document.xml", WORD_TYPE),
+                    "_rels/.rels": _rels("word/document.xml"),
+                    "word/document.xml": _main("document", WORD_NS),
+                    rejected: b"<a/>",
+                }
+            ),
+            "docx",
+        )
+
+
+def test_aggregate_inspected_budget_rejects_when_parts_fit_individually(monkeypatch):
     members = {
         "[Content_Types].xml": _content_types("word/document.xml", WORD_TYPE),
         "_rels/.rels": _rels("word/document.xml"),
-        "word/document.xml": (
-            f'<w:document xmlns:w="{WORD_NS}"><w:body><w:p><w:r><w:t>'
-            + "a" * 70000 + "</w:t></w:r></w:p></w:body></w:document>"
-        ).encode(),
+        "word/document.xml": _main("document", WORD_NS),
     }
-    ooxml.validate_ooxml(_package(members), "docx")
-    presentation = {
-        "[Content_Types].xml": _content_types("ppt/presentation.xml", SLIDE_TYPE),
-        "_rels/.rels": _rels("ppt/presentation.xml"),
-        "ppt/presentation.xml": _main("presentation", SLIDE_NS),
-    }
-    for index in range(2000):
-        presentation[f"ppt/slides/part{index}.xml"] = b"<a/>"
-    ooxml.validate_ooxml(_package(presentation), "pptx")
+    lengths = [len(body) for body in members.values()]
+    budget = max(lengths)
+    assert all(length <= budget for length in lengths)
+    assert sum(lengths) > budget
+    monkeypatch.setattr(ooxml, "MAX_INSPECTED_BYTES", budget)
+    with pytest.raises(ooxml.CorruptDocumentError):
+        ooxml.validate_ooxml(_package(members, compress_type=zipfile.ZIP_DEFLATED), "docx")
+
 
 
 def test_doctype_entity_and_absolute_member_names_are_corrupt():
@@ -266,15 +355,3 @@ def test_truncated_main_and_bad_crc_are_corrupt():
         ooxml.validate_ooxml(bytes(encoded), "docx")
 
 
-def test_compressed_main_exceeding_inspected_budget_is_corrupt():
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", _content_types("word/document.xml", WORD_TYPE))
-        archive.writestr("_rels/.rels", _rels("word/document.xml"))
-        with archive.open("word/document.xml", "w") as main:
-            main.write(f'<w:document xmlns:w="{WORD_NS}"><w:body>'.encode())
-            for _ in range(1601):
-                main.write(b"x" * 65536)
-            main.write(b"</w:body></w:document>")
-    with pytest.raises(ooxml.CorruptDocumentError):
-        ooxml.validate_ooxml(buffer.getvalue(), "docx")
