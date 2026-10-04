@@ -30,6 +30,7 @@ import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from office.router import OfficeAvailabilityMiddleware, create_office_router
+from office.sweep import sweep_office_sessions
 from ws_recheck import (
     admit,
     forward_cdp_backend,
@@ -390,6 +391,12 @@ async def _idle_reaper(stop_idle: asyncio.Event):
                 raise
             except Exception as exc:
                 print(f"[IDLE] reap tick failed: {exc}")
+            try:
+                await asyncio.to_thread(sweep_office_sessions)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                print("[OFFICE] session sweep tick failed")
 
 
 

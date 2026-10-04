@@ -23,6 +23,7 @@ from tests.orchestrator.test_office_sessions import (
     FINAL_STATES, OPEN_STATES, JWT_SECRET, SELF_URL, SERVER_DIR,
     _assert_no_secrets, _assert_refusal, _create, _index_file, _office,
     _oracle_verify, _put, _sha, _snapshot, _state, _ticket_key, _versions,
+    _assert_activity_only,
     office_world,
 )
 from tests.orchestrator.test_office_workspace import _forbid_inode_open
@@ -133,7 +134,7 @@ def test_known_open_session_joins_without_changing_history_or_baseline(office_wo
     assert _ticket(joined) != _ticket(first)
     _verify_config(joined, file_id, 1 if published else 2)
     _assert_no_secrets(response, INTERNAL, MCP_KEY, JWT_SECRET)
-    assert _snapshot(data) == before
+    _assert_activity_only(before, _snapshot(data), first["session_id"])
     assert recording.hits == 0
 
 
@@ -156,7 +157,7 @@ def test_expired_opening_ticket_is_replaced_and_same_clock_join_is_fresh(office_
         assert refreshed.status_code == 200
         _verify_config(refreshed.json(), file_id, 1)
         assert _ticket(refreshed.json()) != _ticket(first)
-    assert _snapshot(data) == before
+    _assert_activity_only(before, _snapshot(data), first["session_id"])
     assert origin.hits == 0
 
 
@@ -212,8 +213,9 @@ def test_conflict_with_final_receipt_returns_null_configuration_without_lookup(o
         "status": callback_status, "sha256": None, "version": None, "answer": {"error": 0},
     })
     before = _snapshot(data)
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-    response = _create(http, file_id)
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
+        response = _create(http, file_id)
     assert response.status_code == 200
     assert response.json() == {
         "session_id": first["session_id"], "file_id": file_id,
@@ -245,8 +247,9 @@ def test_unavailable_lookup_preserves_every_persisted_byte(office_world, monkeyp
     if failure == "connection":
         with socket.socket() as holder:
             holder.bind(("127.0.0.1", 0))
-            monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", f"http://127.0.0.1:{holder.getsockname()[1]}")
-            response = _create(http, file_id)
+            with monkeypatch.context() as env:
+                env.setenv("OCU_OFFICE_DOCSERVER_URL", f"http://127.0.0.1:{holder.getsockname()[1]}")
+                response = _create(http, file_id)
     else:
         with _info(monkeypatch, first["document_key"], code=1 if failure == "http" else True, status=503 if failure == "http" else 200) as origin:
             response = _create(http, file_id)
@@ -300,9 +303,9 @@ def test_status_epoch_matrix_projects_persisted_fields_without_workspace_or_look
             }
     else:
         record = after["sessions"][first["session_id"]]
-        assert {key: record[key] for key in before["sessions"][first["session_id"]] if key not in ("workspace_changed", "last_checked_size", "last_checked_mtime_ns")} == {
+        assert {key: value for key, value in record.items() if key not in ("workspace_changed", "last_checked_size", "last_checked_mtime_ns", "last_activity_at")} == {
             key: value for key, value in before["sessions"][first["session_id"]].items()
-            if key not in ("workspace_changed", "last_checked_size", "last_checked_mtime_ns")
+            if key not in ("workspace_changed", "last_checked_size", "last_checked_mtime_ns", "last_activity_at")
         }
         assert record["workspace_changed"] is True
         assert record["last_checked_size"] == size
@@ -320,20 +323,21 @@ def test_post_epoch_change_skips_lookup_and_limits_unpublished_refusal_to_this_r
         _unpublished(file_id)
     before = OfficeStore().read(CHAT)
     (data / ".office-restore-epoch").write_text("epoch-B\n")
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-    response = _create(http, file_id)
-    assert OfficeStore().read(CHAT)["sessions"][first["session_id"]] == {
-        **before["sessions"][first["session_id"]], "state": "orphaned", "reason": "restore_epoch_changed",
-    }
-    if published:
-        assert response.status_code == 201
-    else:
-        _assert_refusal(response, 409, "unpublished_version")
-        assert OfficeStore().read(CHAT)["documents"] == before["documents"]
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
         response = _create(http, file_id)
-        assert response.status_code == 201
-    assert response.json()["document_key"] != first["document_key"]
-    assert OfficeStore().read(CHAT)["sessions"][response.json()["session_id"]]["restore_epoch"] == "epoch-B"
+        assert OfficeStore().read(CHAT)["sessions"][first["session_id"]] == {
+            **before["sessions"][first["session_id"]], "state": "orphaned", "reason": "restore_epoch_changed",
+        }
+        if published:
+            assert response.status_code == 201
+        else:
+            _assert_refusal(response, 409, "unpublished_version")
+            assert OfficeStore().read(CHAT)["documents"] == before["documents"]
+            response = _create(http, file_id)
+            assert response.status_code == 201
+        assert response.json()["document_key"] != first["document_key"]
+        assert OfficeStore().read(CHAT)["sessions"][response.json()["session_id"]]["restore_epoch"] == "epoch-B"
     assert origin.hits == 0
 
 
@@ -373,7 +377,7 @@ def test_absent_empty_and_equal_opaque_epochs_are_distinct(office_world):
     session_id = second.json()["session_id"]
     before_record = before_state["sessions"][session_id]
     after_record = after["sessions"][session_id]
-    bookkeeping = ("workspace_changed", "last_checked_size", "last_checked_mtime_ns")
+    bookkeeping = ("workspace_changed", "last_checked_size", "last_checked_mtime_ns", "last_activity_at")
     assert {key: value for key, value in after_record.items() if key not in bookkeeping} == {
         key: value for key, value in before_record.items() if key not in bookkeeping
     }
@@ -483,9 +487,10 @@ def test_failed_replacement_keeps_orphan_and_has_no_partial_capture(office_world
     (data / ".office-restore-epoch").write_text("B")
     if failure == "floor":
         monkeypatch.setattr(config, "MIN_FREE_BYTES", 10**30)
-    elif failure == "signing":
-        monkeypatch.delenv("OCU_OFFICE_SELF_URL")
-    response = _create(http, file_id)
+    with monkeypatch.context() as env:
+        if failure == "signing":
+            env.delenv("OCU_OFFICE_SELF_URL")
+        response = _create(http, file_id)
     _assert_refusal(response, {"floor": 503, "signing": 500, "validation": 422}[failure],
                     {"floor": "storage_low", "signing": "creation_failed", "validation": "corrupt_document"}[failure])
     after = OfficeStore().read(CHAT)
@@ -601,7 +606,7 @@ def test_delayed_lookup_serializes_same_chat_without_blocking_health(office_worl
                 release.set()
                 await one
         asyncio.run(scenario())
-    assert _snapshot(data) == before
+    _assert_activity_only(before, _snapshot(data), first["session_id"])
     assert recording.hits == 0
 
 
@@ -617,10 +622,11 @@ def test_join_admission_and_signing_refusals_preserve_session_and_history(office
         path.symlink_to(target)
     elif failure == "corrupt_document":
         path.write_bytes(b"not-ooxml")
-    else:
-        monkeypatch.delenv("OCU_OFFICE_SELF_URL")
     before = _snapshot(data)
-    response = _create(http, file_id)
+    with monkeypatch.context() as env:
+        if failure == "signing":
+            env.delenv("OCU_OFFICE_SELF_URL")
+        response = _create(http, file_id)
     status = {"unsafe_path": 422, "corrupt_document": 422, "signing": 500}[failure]
     reason = "creation_failed" if failure == "signing" else failure
     _assert_refusal(response, status, reason)
@@ -753,8 +759,9 @@ def test_join_below_storage_floor_still_joins_while_creation_is_refused(office_w
     assert _ticket(joined) != _ticket(first)
     _verify_config(joined, file_id, 1)
     _assert_no_secrets(response, INTERNAL, MCP_KEY, JWT_SECRET)
-    assert _snapshot(data) == before
+    _assert_activity_only(before, _snapshot(data), first["session_id"])
     assert origin.hits == 0
+    before = _snapshot(data)
 
     _assert_refusal(_create(http, new_id), 503, "storage_low")
     assert _snapshot(data) == before
@@ -802,8 +809,14 @@ def test_non_final_receipt_does_not_suppress_reopen_key_check(
             }
             assert _ticket(joined) != _ticket(first)
             _verify_config(joined, file_id, 2)
-            assert store.read(CHAT) == before
-            assert _snapshot(data) == before_files
+            after = store.read(CHAT)
+            assert after == {**before, "sessions": {
+                **before["sessions"], first["session_id"]: {
+                    **before["sessions"][first["session_id"]],
+                    "last_activity_at": after["sessions"][first["session_id"]]["last_activity_at"],
+                },
+            }}
+            _assert_activity_only(before_files, _snapshot(data), first["session_id"])
         else:
             _assert_refusal(response, 409, "unpublished_version")
             after = store.read(CHAT)

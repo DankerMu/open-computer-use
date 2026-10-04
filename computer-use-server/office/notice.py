@@ -17,8 +17,10 @@ _CACHE_FIELDS = ("last_checked_size", "last_checked_mtime_ns")
 _UNAVAILABLE = object()
 
 
-def refresh_workspace_notice(store: OfficeStore, chat: str, session_id: str, record: dict[str, Any]) -> dict[str, Any]:
-    """Observe the edited workspace file and persist only notice bookkeeping."""
+def refresh_workspace_notice(
+    store: OfficeStore, chat: str, session_id: str, record: dict[str, Any], *, activity_at: float | None,
+) -> dict[str, Any]:
+    """Persist notice and request activity together; None preserves the activity clock."""
     from .sessions import _status_projection
 
     prior = _status_projection(record)
@@ -33,6 +35,7 @@ def refresh_workspace_notice(store: OfficeStore, chat: str, session_id: str, rec
         changed is prior["workspace_changed"]
         and size == record.get("last_checked_size")
         and mtime_ns == record.get("last_checked_mtime_ns")
+        and (activity_at is None or activity_at == record.get("last_activity_at"))
     ):
         return prior
 
@@ -43,6 +46,8 @@ def refresh_workspace_notice(store: OfficeStore, chat: str, session_id: str, rec
         current["workspace_changed"] = changed
         current["last_checked_size"] = size
         current["last_checked_mtime_ns"] = mtime_ns
+        if activity_at is not None:
+            current["last_activity_at"] = activity_at
 
     updated = store.update(chat, mutate)
     return _status_projection(updated["sessions"][session_id])

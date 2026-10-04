@@ -52,7 +52,8 @@ def _forbid_inode_open(module, monkeypatch, *paths: Path) -> None:
         except (OSError, TypeError, ValueError):
             info = None
         if info is not None and (info.st_dev, info.st_ino) in identities:
-            raise AssertionError(("external target opened", name))
+            # The oracle must escape production's per-chat Exception isolation.
+            pytest.fail(f"external target opened: {name}")
         return original(name, flags, *args, **kwargs)
 
     monkeypatch.setattr(module.os, "open", guarded)

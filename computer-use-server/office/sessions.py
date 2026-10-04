@@ -6,8 +6,10 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import math
 import os
 import uuid
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -191,6 +193,8 @@ def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
                     chat, file_id, relative_path, document_type, active["document_key"],
                     active["session_id"], latest["number"],
                 )
+                if not ended:
+                    _refresh_activity(store, chat, active["session_id"])
                 return {
                     "session_id": active["session_id"],
                     "file_id": file_id,
@@ -244,6 +248,7 @@ def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
                 "last_published_seq": 0,
                 "workspace_changed": False,
                 "saved_as": None,
+                "last_activity_at": time.time(),
             }
 
         store.store_version(
@@ -284,6 +289,13 @@ def _persisted_session(session_id, record) -> dict[str, Any]:
     if type(record.get("save_seq")) is not int or record["save_seq"] < 0:
         raise StateCorruptError("office session save sequence is invalid")
     _allocation_metadata(record)
+    for field in ("last_activity_at", "saving_started_at"):
+        if field in record:
+            value = record[field]
+            if type(value) not in (int, float) or value < 0 or (
+                type(value) is float and not math.isfinite(value)
+            ):
+                raise StateCorruptError("office session timestamp is invalid")
     return record
 
 
@@ -373,7 +385,10 @@ def _session_status(chat_id, session_id):
             state = _orphan_session(store, chat, session_id, "restore_epoch_changed")
             status = _status_projection(state["sessions"][session_id])
         elif record["state"] in OPEN_STATES:
-            status = notice.refresh_workspace_notice(store, chat, session_id, record)
+            ended = record["state"] == "conflict" and _has_final_receipt(state, session_id)
+            status = notice.refresh_workspace_notice(
+                store, chat, session_id, record, activity_at=None if ended else time.time(),
+            )
         return status
 
 
@@ -499,6 +514,16 @@ def _allocation_metadata(record) -> None:
                 raise StateCorruptError("office session pending save allocation is invalid")
 
 
+def _refresh_activity(store, chat, session_id) -> None:
+    def mutate(working):
+        current = _require_session(working, session_id)
+        if current["state"] in OPEN_STATES and not (
+            current["state"] == "conflict" and _has_final_receipt(working, session_id)
+        ):
+            current["last_activity_at"] = time.time()
+    store.update(chat, mutate)
+
+
 def _allocate_sequence(record) -> int:
     current = record["save_seq"]
     if type(current) is not int or current < 0:
@@ -557,6 +582,7 @@ def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
             _record_save_intent(current, allocated, intent)
             current["pending_save_seq"] = allocated
             current["state"] = "saving"
+            current["last_activity_at"] = current["saving_started_at"] = time.time()
             prepared["save_seq"] = allocated
             prepared["document_key"] = current["document_key"]
 
@@ -631,6 +657,7 @@ def _close_session(chat_id, session_id) -> dict[str, Any]:
             pending = record.get("pending_close_seq")
             if type(pending) is not int:
                 raise StateCorruptError("office session pending allocation is invalid")
+            _refresh_activity(store, chat, session_id)
             return {"session_id": session_id, "save_seq": pending, "state": "closing"}
         ended_conflict = record["state"] == "conflict" and _has_final_receipt(state, session_id)
         if ended_conflict:
@@ -657,6 +684,7 @@ def _commit_opening_close(store, chat, session_id) -> dict[str, Any]:
             raise StateCorruptError("office session close admission raced")
         allocated["save_seq"] = _allocate_sequence(current)
         current["state"] = "closed"
+        current["last_activity_at"] = time.time()
 
     store.update(chat, mutate)
     return {"session_id": session_id, "save_seq": allocated["save_seq"], "state": "closed"}
@@ -668,6 +696,7 @@ def _commit_close_allocation(store, chat, session_id, expected_state) -> dict[st
     def mutate(working):
         current = _require_session(working, session_id)
         _status_projection(current)
+        current["last_activity_at"] = time.time()
         pending = current.get("pending_close_seq")
         if type(pending) is int:
             allocated["save_seq"] = pending

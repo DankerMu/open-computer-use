@@ -155,6 +155,7 @@ def app_module(monkeypatch):
             "office.sessions",
             "office.notice",
             "office.ooxml",
+            "office.sweep",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)
     import app as loaded

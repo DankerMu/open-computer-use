@@ -100,6 +100,20 @@ def _snapshot(root: Path) -> dict:
     return files
 
 
+def _assert_activity_only(before: dict, after: dict, session_id: str) -> None:
+    def normalized(snapshot):
+        result = dict(snapshot)
+        for path, content in snapshot.items():
+            if path.endswith("/.ocu/office/state.json"):
+                state = json.loads(content)
+                record = state["sessions"].get(session_id)
+                if record is not None:
+                    record.pop("last_activity_at", None)
+                result[path] = state
+        return result
+    assert normalized(after) == normalized(before)
+
+
 def _create(http, file_id: str, chat: str = CHAT):
     return http.post(
         f"/api/office/{chat}/documents/{quote(file_id, safe='')}/sessions", headers=_auth()
@@ -379,6 +393,8 @@ def test_three_formats_and_uppercase_create_opening_session(office_world, name, 
     assert document["published_sha256"] == _sha(body)
     assert document["versions"][0]["source"] == "workspace"
     assert document["versions"][0]["published"] is True
+    assert type(session["last_activity_at"]) in (int, float)
+    assert session["last_activity_at"] >= 0
     assert session == {
         "session_id": payload["session_id"],
         "file_id": file_id,
@@ -392,6 +408,7 @@ def test_three_formats_and_uppercase_create_opening_session(office_world, name, 
         "last_published_seq": 0,
         "workspace_changed": False,
         "saved_as": None,
+        "last_activity_at": session["last_activity_at"],
     }
     assert _versions(data).joinpath(_sha(body)).read_bytes() == body
     other_after = _snapshot(data / CHAT_B)
@@ -582,7 +599,10 @@ def test_existing_nonfinal_session_joins_or_preserves_unavailable_state(office_w
         assert response.json()["document_key"] == first.json()["document_key"]
     else:
         _assert_refusal(response, 502, "documentserver_unavailable")
-    assert _snapshot(data) == before
+    if state == "opening":
+        _assert_activity_only(before, _snapshot(data), first.json()["session_id"])
+    else:
+        assert _snapshot(data) == before
     assert origin.hits == (0 if state == "opening" else 1)
 
 
@@ -1188,5 +1208,5 @@ def test_twenty_one_documents_create_without_connection_cap_or_network(office_wo
     assert joined.json()["session_id"] == response.json()["session_id"]
     assert joined.json()["document_key"] == response.json()["document_key"]
     assert joined.json()["joined"] is True
-    assert _snapshot(data) == before_join
+    _assert_activity_only(before_join, _snapshot(data), joined.json()["session_id"])
     assert origin.hits == 0

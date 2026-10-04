@@ -58,6 +58,7 @@ _APP_MODULES = (
     "office.sessions",
     "office.notice",
     "office.ooxml",
+    "office.sweep",
 )
 
 _BASELINE_ASSETS = (
