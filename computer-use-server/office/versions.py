@@ -10,7 +10,7 @@ import os
 import re
 import stat
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import docker_manager
 
@@ -89,6 +89,7 @@ def store_version(
     published: bool,
     min_free_bytes: int,
     receipt: dict[str, Any] | None = None,
+    mutate_state: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
 ) -> dict[str, Any]:
     chat = docker_manager.canonical_lock_chat_id(chat_id)
     _require_file_id(file_id)
@@ -151,6 +152,10 @@ def store_version(
                 listed.append(selected)
             if bound is not None:
                 _put_receipt(working, bound["session_id"], bound["save_seq"], bound["value"])
+            if mutate_state is not None:
+                extra = mutate_state(working, selected)
+                if extra is not None:
+                    raise ValueError("office state mutator must return None")
 
         try:
             store.update(chat, mutate)

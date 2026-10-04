@@ -177,3 +177,112 @@ def test_outputs_and_chat_root_symlinks_refuse_external_bytes_and_lock(world, mo
     assert {path.name for path in outside.iterdir()} == {"secret.docx", ".lifecycle.lock"}
     assert not _versions_dir(data).exists()
     assert not _staging(data).exists()
+
+
+def test_exact_limit_read_returns_bytes_and_oversize_refuses_before_content(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    import office.workspace as workspace_mod
+    target = _outputs(data) / "brief.docx"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(WORKSPACE)
+    body, digest = store_mod.OfficeStore().read_workspace_file(
+        CHAT, "brief.docx", max_bytes=len(WORKSPACE)
+    )
+    assert body == WORKSPACE
+    assert digest == _sha(WORKSPACE)
+    reads = {"count": 0}
+    original_read = workspace_mod.os.read
+
+    def count_read(fd, size):
+        reads["count"] += 1
+        return original_read(fd, size)
+
+    monkeypatch.setattr(workspace_mod.os, "read", count_read)
+    with pytest.raises(workspace_mod.FileTooLargeError) as error:
+        store_mod.OfficeStore().read_workspace_file(
+            CHAT, "brief.docx", max_bytes=len(WORKSPACE) - 1
+        )
+    assert error.value.reason == "file_too_large"
+    assert reads["count"] == 0
+    unlimited, unlimited_digest = store_mod.OfficeStore().read_workspace_file(CHAT, "brief.docx")
+    assert unlimited == WORKSPACE
+    assert unlimited_digest == _sha(WORKSPACE)
+    empty = _outputs(data) / "empty.docx"
+    empty.write_bytes(b"")
+    empty_body, empty_digest = store_mod.OfficeStore().read_workspace_file(
+        CHAT, "empty.docx", max_bytes=0
+    )
+    assert empty_body == b""
+    assert empty_digest == _sha(b"")
+
+
+def test_growth_past_limit_during_read_refuses_after_one_excess_byte(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    import office.workspace as workspace_mod
+    target = _outputs(data) / "live.docx"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(WORKSPACE)
+    identity = target.stat()
+    original_fstat = workspace_mod.os.fstat
+    original_read = workspace_mod.os.read
+    grew = []
+    returned = []
+
+    def lie_then_grow(fd):
+        info = original_fstat(fd)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino) and not grew:
+            class Small:
+                st_mode = info.st_mode
+                st_size = len(WORKSPACE)
+                st_mtime_ns = info.st_mtime_ns
+                st_ino = info.st_ino
+                st_dev = info.st_dev
+            return Small()
+        return info
+
+    def grow_on_read(fd, size):
+        info = original_fstat(fd)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino) and not grew:
+            target.write_bytes(WORKSPACE + b"X" * 64)
+            grew.append(True)
+        chunk = original_read(fd, size)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            returned.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(workspace_mod.os, "fstat", lie_then_grow)
+    monkeypatch.setattr(workspace_mod.os, "read", grow_on_read)
+    with pytest.raises(workspace_mod.FileTooLargeError) as error:
+        store_mod.OfficeStore().read_workspace_file(
+            CHAT, "live.docx", max_bytes=len(WORKSPACE)
+        )
+    assert error.value.reason == "file_too_large"
+    assert grew == [True]
+    assert sum(returned) <= len(WORKSPACE) + 1
+    assert not _versions_dir(data).exists()
+
+
+def test_unsafe_paths_are_not_read_when_a_byte_limit_is_supplied(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    import office.workspace as workspace_mod
+    outside = data.parent / "external-secret.bin"
+    outside.write_bytes(b"EXTERNAL-TARGET-BYTES")
+    workspace = _outputs(data)
+    workspace.mkdir(parents=True)
+    os.symlink(outside, workspace / "link.docx")
+    _forbid_inode_open(workspace_mod, monkeypatch, outside)
+    with pytest.raises(workspace_mod.UnsafePathError) as error:
+        store_mod.OfficeStore().read_workspace_file(CHAT, "link.docx", max_bytes=8)
+    assert error.value.reason == "unsafe_path"
+    assert outside.read_bytes() == b"EXTERNAL-TARGET-BYTES"
+
+
+
+def test_boolean_max_bytes_is_rejected_before_opening_the_file(world):
+    store_mod, _docker_manager, data = world
+    target = _outputs(data) / "brief.docx"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(WORKSPACE)
+    with pytest.raises(ValueError, match="max_bytes"):
+        store_mod.OfficeStore().read_workspace_file(CHAT, "brief.docx", max_bytes=True)
+

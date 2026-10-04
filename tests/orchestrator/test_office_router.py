@@ -18,7 +18,6 @@ SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from office.store import OfficeStore
 from tests.orchestrator.test_outputs_endpoint import (
     CHAT,
     INTERNAL,
@@ -116,6 +115,8 @@ def _forbidden(*args, **kwargs):
 
 @contextmanager
 def _trap_lock_and_state(docker_manager):
+    from office.store import OfficeStore
+
     original_lock = docker_manager._combined_lock
     original_read = OfficeStore.read
     original_update = OfficeStore.update
@@ -284,6 +285,27 @@ def test_enabled_missing_chat_is_404_without_creating_directory(tmp_path, monkey
         _assert_reason(response, "unknown_chat")
         assert _inventory(data) == before
         assert not (data / MISSING).exists()
+        assert origin.hits == 0
+
+
+def test_enabled_existing_chat_unknown_file_is_not_unknown_route(tmp_path, monkeypatch):
+    with _office_app(tmp_path, monkeypatch, enabled=True) as (
+        http,
+        data,
+        origin,
+        docker_manager,
+    ):
+        (data / CHAT).mkdir()
+        with docker_manager._combined_lock(CHAT):
+            pass
+        before = _inventory(data)
+        response = http.post(
+            f"/api/office/{CHAT}/documents/{FILE_ID}/sessions",
+            headers=_auth(),
+        )
+        assert response.status_code == 404
+        assert json.loads(response.content) == {"reason": "unknown_file"}
+        assert _inventory(data) == before
         assert origin.hits == 0
 
 
@@ -467,3 +489,18 @@ def test_fresh_enabled_and_disabled_imports_in_one_run(tmp_path, monkeypatch):
         assert origin.hits == 0
         assert not (data / MISSING).exists()
 
+
+
+@pytest.mark.parametrize("method", ("GET", "OPTIONS"))
+def test_non_post_creation_path_keeps_unknown_route_fallback(tmp_path, monkeypatch, method):
+    with _office_app(tmp_path, monkeypatch, enabled=True) as (http, data, origin, docker_manager):
+        (data / CHAT).mkdir()
+        before = _inventory(data)
+        with _trap_lock_and_state(docker_manager):
+            response = http.request(
+                method, f"/api/office/{CHAT}/documents/{FILE_ID}/sessions",
+                headers=_office_headers() if method == "OPTIONS" else _auth(),
+            )
+        _assert_reason(response, "unknown_route")
+        assert _inventory(data) == before
+        assert origin.hits == 0

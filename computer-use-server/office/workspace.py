@@ -26,15 +26,33 @@ class UnsafePathError(RuntimeError):
         self.reason = "unsafe_path"
 
 
-def read_workspace_file(store: OfficeStore, chat_id: str, relative_path: str) -> tuple[bytes, str]:
+class FileTooLargeError(RuntimeError):
+    """Workspace file exceeds the caller-supplied byte limit and was not fully read."""
+
+    reason = "file_too_large"
+
+    def __init__(self, message: str = "workspace file exceeds the size limit") -> None:
+        super().__init__(message)
+        self.reason = "file_too_large"
+
+
+def read_workspace_file(
+    store: OfficeStore,
+    chat_id: str,
+    relative_path: str,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[bytes, str]:
     chat = docker_manager.canonical_lock_chat_id(chat_id)
     path_parts = _parts(relative_path)
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+        raise ValueError("max_bytes must be a nonnegative integer")
     store._assert_chat_root_safe(chat, allow_missing=True)
     with docker_manager._combined_lock(chat):
         store._assert_chat_root_safe(chat, allow_missing=False)
         file_fd = _open_file(chat, path_parts)
         try:
-            return _hash_regular(file_fd, "/".join(path_parts))
+            return _hash_regular(file_fd, "/".join(path_parts), max_bytes=max_bytes)
         finally:
             os.close(file_fd)
 
@@ -126,26 +144,36 @@ def _open_regular_relative(root_fd: int, path_parts: tuple[str, ...]) -> int:
         os.close(parent_fd)
 
 
-def _hash_regular(file_fd: int, label: str) -> tuple[bytes, str]:
+def _hash_regular(
+    file_fd: int, label: str, *, max_bytes: int | None = None
+) -> tuple[bytes, str]:
     try:
         before = os.fstat(file_fd)
     except OSError as extra:
         raise UnsafePathError(f"workspace file is unreadable: {label}") from extra
     if not stat.S_ISREG(before.st_mode):
         raise UnsafePathError("workspace path is unsafe")
+    if max_bytes is not None and before.st_size > max_bytes:
+        raise FileTooLargeError("workspace file exceeds the size limit")
     digest = hashlib.sha256()
     chunks: list[bytes] = []
+    remaining = None if max_bytes is None else max_bytes + 1
     try:
-        while True:
-            chunk = os.read(file_fd, _CHUNK)
+        while remaining is None or remaining > 0:
+            chunk_size = _CHUNK if remaining is None else min(_CHUNK, remaining)
+            chunk = os.read(file_fd, chunk_size)
             if not chunk:
                 break
             chunks.append(chunk)
             digest.update(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
         after = os.fstat(file_fd)
     except OSError as extra:
         raise UnsafePathError(f"workspace file is unreadable: {label}") from extra
     body = b"".join(chunks)
+    if max_bytes is not None and len(body) > max_bytes:
+        raise FileTooLargeError("workspace file exceeds the size limit")
     if (
         not stat.S_ISREG(after.st_mode)
         or after.st_size != before.st_size

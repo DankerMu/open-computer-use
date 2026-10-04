@@ -75,6 +75,7 @@ class OfficeStore:
         published: bool,
         min_free_bytes: int,
         receipt: dict[str, Any] | None = None,
+        mutate_state: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
         from . import versions
         return versions.store_version(
@@ -87,6 +88,7 @@ class OfficeStore:
             published=published,
             min_free_bytes=min_free_bytes,
             receipt=receipt,
+            mutate_state=mutate_state,
         )
 
     def mark_published(self, chat_id: str, file_id: str, number: int) -> dict[str, Any]:
@@ -117,9 +119,17 @@ class OfficeStore:
         from . import versions
         versions.check_free_space(self, chat_id, min_free_bytes)
 
-    def read_workspace_file(self, chat_id: str, relative_path: str) -> tuple[bytes, str]:
+    def read_workspace_file(
+        self,
+        chat_id: str,
+        relative_path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, str]:
         from . import workspace
-        return workspace.read_workspace_file(self, chat_id, relative_path)
+        return workspace.read_workspace_file(
+            self, chat_id, relative_path, max_bytes=max_bytes
+        )
 
     def _chat_root(self, chat: str) -> str:
         return os.path.join(str(docker_manager.BASE_DATA_DIR), chat)

@@ -12,6 +12,7 @@ import docker_manager
 from auth_guard import OFFICE_PREFIX
 
 from . import config
+from .sessions import create_session
 
 _SUFFIX_CONVERTOR = "ocu_office_suffix"
 
@@ -71,6 +72,12 @@ async def _json_404(send, reason: str) -> None:
 def create_office_router() -> APIRouter:
     register_url_convertor(_SUFFIX_CONVERTOR, OfficeSuffixConvertor())
     router = APIRouter()
+    router.add_api_route(
+        f"{OFFICE_PREFIX}{{chat_id}}/documents/{{file_id}}/sessions",
+        create_session,
+        methods=["POST"],
+        include_in_schema=False,
+    )
     # Concrete Office routes must be registered above this fallback.
     router.add_route(
         f"{OFFICE_PREFIX}{{rest:{_SUFFIX_CONVERTOR}}}",

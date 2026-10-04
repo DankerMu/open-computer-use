@@ -767,3 +767,146 @@ def test_floor_rejects_symlinked_control_ancestry_without_external_probe(world, 
     assert seen == []
     assert sentinel.read_bytes() == b"FLOOR-SECRET"
     assert {path.name for path in outside.iterdir()} == {"keep.bin"}
+
+
+def test_state_mutator_sees_selected_version_and_commits_with_it(world):
+    store_mod, _docker_manager, data = world
+    seen = {}
+
+    def mutate_state(working, selected):
+        seen["number"] = selected["number"]
+        seen["sha256"] = selected["sha256"]
+        working["sessions"]["sess-create"] = {
+            "session_id": "sess-create",
+            "file_id": FILE_A,
+            "state": "opening",
+        }
+
+    record = store_mod.OfficeStore().store_version(
+        CHAT,
+        FILE_A,
+        WORKSPACE,
+        source="workspace",
+        parent=None,
+        published=True,
+        min_free_bytes=0,
+        mutate_state=mutate_state,
+    )
+    persisted = store_mod.OfficeStore().read(CHAT)
+    assert seen["number"] == 1
+    assert seen["sha256"] == record["sha256"] == _sha(WORKSPACE)
+    assert persisted["sessions"]["sess-create"]["file_id"] == FILE_A
+    assert persisted["documents"][FILE_A]["versions"][0]["number"] == 1
+    assert _blob(data, WORKSPACE).read_bytes() == WORKSPACE
+
+
+def test_mutator_failure_cleans_owned_blob_and_leaves_no_record(world):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    before_state = _state(data).read_bytes()
+    shared = _blob(data, WORKSPACE)
+    shared_bytes = shared.read_bytes()
+
+    def boom(_working, _selected):
+        raise RuntimeError("mutator exploded")
+
+    with pytest.raises(RuntimeError, match="mutator exploded"):
+        store_mod.OfficeStore().store_version(
+            CHAT,
+            FILE_A,
+            SAVE,
+            source="save",
+            parent=1,
+            published=True,
+            min_free_bytes=0,
+            mutate_state=boom,
+        )
+    assert _state(data).read_bytes() == before_state
+    assert shared.read_bytes() == shared_bytes
+    assert not _blob(data, SAVE).exists()
+    leftovers = [path for path in _office(data).rglob("*") if path.is_file() and path.suffix == ".tmp"]
+    assert leftovers == []
+
+
+def test_precommit_enospc_after_mutator_cleans_owned_blob(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    import office.versions as versions_mod
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    shared = _blob(data, WORKSPACE)
+    shared_bytes = shared.read_bytes()
+    before_state = _state(data).read_bytes()
+    original_write = store_mod.os.write
+
+    def fail_state_write(fd, payload):
+        if payload[:1] == b"{":
+            raise OSError(errno.ENOSPC, "injected state write fault")
+        return original_write(fd, payload)
+
+    def stamp(working, selected):
+        working["sessions"]["lost"] = {"session_id": "lost", "file_id": FILE_A}
+
+    monkeypatch.setattr(store_mod.os, "write", fail_state_write)
+    with pytest.raises(versions_mod.StorageLowError) as error:
+        store_mod.OfficeStore().store_version(
+            CHAT,
+            FILE_A,
+            SAVE,
+            source="save",
+            parent=1,
+            published=True,
+            min_free_bytes=0,
+            mutate_state=stamp,
+        )
+    assert error.value.reason == "storage_low"
+    assert _state(data).read_bytes() == before_state
+    assert shared.read_bytes() == shared_bytes
+    assert not _blob(data, SAVE).exists()
+    assert "lost" not in store_mod.OfficeStore().read(CHAT)["sessions"]
+
+
+def test_postreplace_durability_failure_keeps_mutator_successor_and_blob(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    original_replace = store_mod.os.replace
+    original_fsync = store_mod.os.fsync
+    replaced = {"done": False}
+
+    def watch_state_replace(src, dst, *args, **kwargs):
+        result = original_replace(src, dst, *args, **kwargs)
+        if dst == "state.json" or (isinstance(dst, str) and dst.endswith("state.json")):
+            replaced["done"] = True
+        return result
+
+    def fail_after_state_replace(fd):
+        if replaced["done"]:
+            replaced["done"] = False
+            raise OSError("controlled directory fsync failure")
+        return original_fsync(fd)
+
+    def stamp(working, selected):
+        working["sessions"]["live"] = {
+            "session_id": "live",
+            "file_id": FILE_A,
+            "state": "opening",
+        }
+
+    with monkeypatch.context() as patches:
+        patches.setattr(store_mod.os, "replace", watch_state_replace)
+        patches.setattr(store_mod.os, "fsync", fail_after_state_replace)
+        with pytest.raises(store_mod.StateDurabilityError, match="committed"):
+            store_mod.OfficeStore().store_version(
+                CHAT,
+                FILE_A,
+                SAVE,
+                source="save",
+                parent=1,
+                published=True,
+                min_free_bytes=0,
+                mutate_state=stamp,
+            )
+    persisted = store_mod.OfficeStore().read(CHAT)
+    assert persisted["documents"][FILE_A]["versions"][-1]["sha256"] == _sha(SAVE)
+    assert persisted["sessions"]["live"]["state"] == "opening"
+    assert _blob(data, SAVE).read_bytes() == SAVE
+    assert _blob(data, WORKSPACE).read_bytes() == WORKSPACE
+
