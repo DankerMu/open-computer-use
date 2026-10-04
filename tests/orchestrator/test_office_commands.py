@@ -22,7 +22,7 @@ SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from office import commands, tokens
+from office import commands
 
 JWT_SECRET = "ds-jwt-secret-canary"
 INTERNAL_TOKEN = "internal-token-canary"
@@ -104,7 +104,14 @@ class _CommandOrigin:
                 for name, value in headers.items():
                     self.send_header(name, value)
                 self.end_headers()
-                self.wfile.write(payload)
+                if isinstance(payload, tuple):
+                    for index, chunk in enumerate(payload):
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        if index + 1 < len(payload):
+                            time.sleep(0.05)
+                else:
+                    self.wfile.write(payload)
 
             def do_GET(self):
                 with parent._lock:
@@ -266,6 +273,33 @@ def test_timeout_is_unreachable_and_does_not_follow_redirects(monkeypatch):
         monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
         assert _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT)) is commands.ForceSaveOutcome.REJECTED
         assert origin.trap_hits == 0
+
+
+def test_fragmented_bodies_wait_for_eof_and_reject_trailing_garbage(monkeypatch):
+    first, rest = b'{"error":0}', b" invalid trailing body"
+
+    def trailing(_handler, _body, _parent):
+        return 200, {"Content-Type": "application/json"}, (first, rest)
+
+    def valid_chunks(_handler, _body, _parent):
+        return 200, {"Content-Type": "application/json"}, (b'{"error":', b"0}")
+
+    def oversized_chunks(_handler, _body, _parent):
+        return (
+            200,
+            {"Content-Type": "application/json"},
+            (b'{"error":0}', b"x" * commands.MAX_RESPONSE_BYTES),
+        )
+
+    with _command_origin(trailing) as origin:
+        monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+        assert _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT)) is commands.ForceSaveOutcome.REJECTED
+    with _command_origin(valid_chunks) as origin:
+        monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+        assert _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT)) is commands.ForceSaveOutcome.ACCEPTED
+    with _command_origin(oversized_chunks) as origin:
+        monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+        assert _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT)) is commands.ForceSaveOutcome.REJECTED
 
 
 def test_oversized_body_is_rejected_and_local_validation_happens_before_io(monkeypatch):

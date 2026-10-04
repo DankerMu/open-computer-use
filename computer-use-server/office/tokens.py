@@ -9,6 +9,7 @@ import hmac
 import json
 import math
 import os
+import re
 import time
 from typing import Any
 
@@ -16,6 +17,7 @@ from . import config
 
 _HEADER = {"alg": "HS256", "typ": "JWT"}
 _TICKET_PURPOSE = b"ocu-office-source-ticket"
+_B64URL_ALPHABET = re.compile(r"^[A-Za-z0-9_-]*\Z")
 
 
 class InvalidTokenError(ValueError):
@@ -96,12 +98,15 @@ def _decode(token: str | None, secret: bytes, *, require_exp: bool) -> dict[str,
         raise InvalidTokenError()
     header_b64, payload_b64, signature_b64 = token.split(".")
     try:
+        signing = f"{header_b64}.{payload_b64}".encode("ascii")
+    except UnicodeEncodeError:
+        raise InvalidTokenError() from None
+    try:
         header = json.loads(_b64url_decode(header_b64))
     except (ValueError, json.JSONDecodeError):
         raise InvalidTokenError() from None
     if not isinstance(header, dict) or header.get("alg") != "HS256":
         raise InvalidTokenError()
-    signing = f"{header_b64}.{payload_b64}".encode("ascii")
     expected = hmac.new(secret, signing, hashlib.sha256).digest()
     try:
         presented = _b64url_decode(signature_b64)
@@ -117,10 +122,10 @@ def _decode(token: str | None, secret: bytes, *, require_exp: bool) -> dict[str,
         raise InvalidTokenError()
     now = time.time()
     if "exp" in payload or require_exp:
-        if "exp" not in payload or not _finite_number(payload["exp"]) or now >= payload["exp"]:
+        if "exp" not in payload or not _usable_numeric_date(payload["exp"]) or now >= payload["exp"]:
             raise InvalidTokenError()
     if "nbf" in payload:
-        if not _finite_number(payload["nbf"]) or now < payload["nbf"]:
+        if not _usable_numeric_date(payload["nbf"]) or now < payload["nbf"]:
             raise InvalidTokenError()
     return payload
 
@@ -146,8 +151,13 @@ def _require_identity(name: str, value: Any) -> None:
         raise ValueError(f"{name} must be a nonempty string")
 
 
-def _finite_number(value: Any) -> bool:
-    return type(value) in (int, float) and math.isfinite(value)
+def _usable_numeric_date(value: Any) -> bool:
+    if type(value) is bool or type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _b64url(raw: bytes) -> str:
@@ -155,8 +165,13 @@ def _b64url(raw: bytes) -> str:
 
 
 def _b64url_decode(segment: str) -> bytes:
+    if not isinstance(segment, str) or not _B64URL_ALPHABET.fullmatch(segment):
+        raise ValueError("invalid token encoding")
     padding = "=" * ((4 - len(segment) % 4) % 4)
     try:
-        return base64.urlsafe_b64decode(segment + padding)
+        decoded = base64.urlsafe_b64decode(segment + padding)
     except (ValueError, TypeError) as extra:
         raise ValueError("invalid token encoding") from extra
+    if _b64url(decoded) != segment:
+        raise ValueError("invalid token encoding")
+    return decoded

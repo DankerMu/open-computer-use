@@ -81,12 +81,23 @@ async def _post(payload: dict[str, Any]) -> tuple[int | None, bytes | None]:
                 json={"token": token},
                 allow_redirects=False,
             ) as response:
-                body = await response.content.read(MAX_RESPONSE_BYTES + 1)
-                if len(body) > MAX_RESPONSE_BYTES:
-                    return response.status, None
+                body = await _read_limited(response.content)
                 return response.status, body
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return None, None
+
+
+async def _read_limited(stream: aiohttp.StreamReader) -> bytes | None:
+    chunks: list[bytes] = []
+    total = 0
+    limit = MAX_RESPONSE_BYTES + 1
+    while total < limit:
+        chunk = await stream.read(limit - total)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+    return None
 
 
 def _integer_error(body: bytes | None) -> int | None:

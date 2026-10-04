@@ -65,8 +65,8 @@ def _secret_bytes(secret: str | bytes) -> bytes:
     return secret.encode("utf-8") if isinstance(secret, str) else secret
 
 
-def _oracle_sign(payload: dict, secret: str | bytes) -> str:
-    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
+def _oracle_sign(payload: dict, secret: str | bytes, *, alg: str = "HS256") -> str:
+    header = _b64url(json.dumps({"alg": alg, "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
     body = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signing = f"{header}.{body}".encode("ascii")
     digest = hmac.new(_secret_bytes(secret), signing, hashlib.sha256).digest()
@@ -120,10 +120,8 @@ def test_missing_tampered_wrong_key_and_bad_alg_fail_without_payload(capsys, cap
     tampered_payload = json.loads(_b64url_decode(body))
     tampered_payload["document"] = "forged-doc"
     tampered = f"{header}.{_b64url(json.dumps(tampered_payload, separators=(',', ':')).encode('utf-8'))}.{signature}"
-    none_header = _b64url(json.dumps({"alg": "none", "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
-    none_token = f"{none_header}.{body}.{signature}"
     wrong = _oracle_sign({"document": "secret-doc", "exp": NOW + 10}, ALT_SECRET)
-    for token in (None, "", "not-a-jwt", tampered, none_token, wrong):
+    for token in (None, "", "not-a-jwt", tampered, wrong):
         with pytest.raises(tokens.InvalidTokenError) as excinfo:
             tokens.verify_jwt(token)
         _assert_generic(excinfo, JWT_SECRET, "secret-doc", "forged-doc", valid, wrong)
@@ -180,6 +178,66 @@ def test_missing_or_blank_signing_key_fails_explicitly_without_blank_signing(mon
         tokens.sign_jwt({"a": 1})
 
 
+def test_only_hs256_is_accepted_even_when_the_mac_matches_the_declared_alg():
+    payload = {"document": "key-1", "exp": NOW + 300}
+    ticket_payload = {
+        "chat_id": CHAT,
+        "file_id": FILE,
+        "version": VERSION,
+        "session_id": SESSION,
+        "exp": NOW + 300,
+    }
+    unsigned_none = _oracle_sign(payload, JWT_SECRET, alg="none").rsplit(".", 1)[0] + "."
+    cases = (
+        tokens.verify_jwt,
+        JWT_SECRET,
+        (
+            _oracle_sign(payload, JWT_SECRET, alg="none"),
+            _oracle_sign(payload, JWT_SECRET, alg="HS512"),
+            unsigned_none,
+        ),
+    ), (
+        tokens.verify_source_ticket,
+        _ticket_key(INTERNAL_TOKEN),
+        (
+            _oracle_sign(ticket_payload, _ticket_key(INTERNAL_TOKEN), alg="none"),
+            _oracle_sign(ticket_payload, _ticket_key(INTERNAL_TOKEN), alg="HS512"),
+        ),
+    )
+    for verify, secret, tokens_under_test in cases:
+        for token in tokens_under_test:
+            with pytest.raises(tokens.InvalidTokenError) as excinfo:
+                verify(token)
+            _assert_generic(excinfo, JWT_SECRET, INTERNAL_TOKEN, token)
+            assert getattr(excinfo.value, "__cause__", None) is None
+
+
+def test_non_ascii_and_non_alphabet_segments_are_invalid_tokens_without_leaking():
+    valid = tokens.sign_jwt({"document": "secret-doc", "exp": NOW + 10})
+    header, body, signature = valid.split(".")
+    snowman = f"{header}.☃.{signature}"
+    bang = f"{header}.{body}.{signature}!"
+    plus = f"{header}.{body}+.{signature}"
+    for token in (snowman, bang, plus):
+        with pytest.raises(tokens.InvalidTokenError) as excinfo:
+            tokens.verify_jwt(token)
+        _assert_generic(excinfo, JWT_SECRET, token, "☃", "secret-doc")
+        assert getattr(excinfo.value, "__cause__", None) is None
+
+
+def test_oversized_numeric_date_is_an_invalid_token_not_an_overflow():
+    huge = tokens.sign_jwt({"exp": 10**1000})
+    with pytest.raises(tokens.InvalidTokenError) as exp_info:
+        tokens.verify_jwt(huge)
+    _assert_generic(exp_info, JWT_SECRET, huge)
+    assert getattr(exp_info.value, "__cause__", None) is None
+    nbf_huge = tokens.sign_jwt({"nbf": 10**1000})
+    with pytest.raises(tokens.InvalidTokenError) as nbf_info:
+        tokens.verify_jwt(nbf_huge)
+    _assert_generic(nbf_info, JWT_SECRET, nbf_huge)
+    assert getattr(nbf_info.value, "__cause__", None) is None
+
+
 def test_source_ticket_returns_exactly_four_bindings_and_honours_ttl():
     ticket = tokens.sign_source_ticket(CHAT, FILE, VERSION, SESSION)
     bindings = tokens.verify_source_ticket(ticket)
@@ -189,10 +247,8 @@ def test_source_ticket_returns_exactly_four_bindings_and_honours_ttl():
         "version": VERSION,
         "session_id": SESSION,
     }
-    assert set(bindings) == {"chat_id", "file_id", "version", "session_id"}
     oracle = _oracle_verify(ticket, _ticket_key(INTERNAL_TOKEN))
     assert oracle["exp"] == NOW + config.SOURCE_TICKET_TTL_SECONDS
-    assert oracle["exp"] == NOW + 300
 
 
 @pytest.mark.parametrize("field", ("chat_id", "file_id", "version", "session_id"))
