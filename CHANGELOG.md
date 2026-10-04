@@ -10,6 +10,15 @@
 
 
 ### Changed
+- **Office save and close requests.** `POST .../save` takes
+  `{"intent":"publish"|"persist"}`, allocates the next `save_seq`, records
+  that intent, and sends one forcesave command after the allocation is
+  durable. `POST .../close` records a pending close without force-save;
+  a never-opened session ends `closed` immediately. Create and join sign
+  `editorConfig.customization.forcesave` false. Callbacks, publish,
+  `last_published_seq` advancement, sweep and host auto-save remain later
+  operations.
+
 - **Office session join and persisted status.** Repeated document opens
   join the existing session with its stable key and a freshly signed source
   ticket, including within one clock tick. Reopen checks use the existing
@@ -19,8 +28,7 @@
   replacement. The status GET returns persisted bookkeeping from any worker,
   with initial-value projection for older records and no workspace hash or
   DocumentServer read. Pending conflicts with final receipts return no editor
-  configuration. Save/close, workspace-change computation and callback serving
-  remain separate lifecycle operations.
+  configuration.
 
 - **Upload name claim without replace.** `POST /api/uploads/{chat_id}/{path}`
   stages complete bytes in the server-private `{chat}/.ocu` directory, then
