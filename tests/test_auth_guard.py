@@ -153,6 +153,7 @@ def app_module(monkeypatch):
             "office.tokens",
             "office.commands",
             "office.sessions",
+            "office.notice",
             "office.ooxml",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)

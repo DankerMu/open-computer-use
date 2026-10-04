@@ -26,9 +26,14 @@
   editors and changed restore epochs durably orphan open sessions; unpublished
   history is retained with a one-request `unpublished_version` refusal before
   replacement. The status GET returns persisted bookkeeping from any worker,
-  with initial-value projection for older records and no workspace hash or
-  DocumentServer read. Pending conflicts with final receipts return no editor
-  configuration.
+  with initial-value projection for older records. Open sessions inspect only
+  the edited workspace file through the existing no-follow reader: size and
+  mtime first, hash against the creation baseline only when either changed.
+  Missing, unsafe or unreadable files report `workspace_changed` true without
+  reading content; final and epoch-orphaned records skip that observation.
+  The notice never changes lifecycle, pending allocations or save admission,
+  and never contacts DocumentServer. Pending conflicts with final receipts
+  return no editor configuration.
 
 - **Upload name claim without replace.** `POST /api/uploads/{chat_id}/{path}`
   stages complete bytes in the server-private `{chat}/.ocu` directory, then
