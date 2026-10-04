@@ -55,6 +55,39 @@ def _member_utf8_name(extra_ascii: str = "") -> str:
     return "word/" + ("é" * 507) + "x" + extra_ascii + ".xml"
 
 
+def _nul_unused_member_package(suffix: str) -> bytes:
+    placeholder = "pad.xmlX" + suffix
+    malformed = "pad.xml\x00" + suffix
+    encoded_placeholder = placeholder.encode("utf-8")
+    encoded_malformed = malformed.encode("utf-8")
+    assert len(encoded_placeholder) == len(encoded_malformed)
+    encoded = bytearray(
+        _package(
+            {
+                "[Content_Types].xml": _content_types("word/document.xml", WORD_TYPE),
+                "_rels/.rels": _rels("word/document.xml"),
+                "word/document.xml": _main("document", WORD_NS),
+                placeholder: b"not inspected",
+            }
+        )
+    )
+    with zipfile.ZipFile(io.BytesIO(encoded)) as archive:
+        info = archive.getinfo(placeholder)
+        extra = int.from_bytes(encoded[info.header_offset + 28:info.header_offset + 30], "little")
+        name_len = int.from_bytes(encoded[info.header_offset + 26:info.header_offset + 28], "little")
+        assert extra == 0
+        assert name_len == len(encoded_placeholder)
+        assert encoded[info.header_offset:info.header_offset + 4] == b"PK\x03\x04"
+        local_name = info.header_offset + 30
+        assert encoded[local_name:local_name + name_len] == encoded_placeholder
+        central = _central_entry_offset(archive, encoded, placeholder)
+        central_name = central + 46
+        assert encoded[central_name:central_name + name_len] == encoded_placeholder
+    encoded[local_name:local_name + name_len] = encoded_malformed
+    encoded[central_name:central_name + name_len] = encoded_malformed
+    return bytes(encoded)
+
+
 def _central_entry_offset(archive, encoded: bytes, name: str) -> int:
     encoded_name = name.encode("utf-8")
     cursor = archive.start_dir

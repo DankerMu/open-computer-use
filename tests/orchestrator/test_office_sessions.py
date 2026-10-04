@@ -23,6 +23,7 @@ from tests.orchestrator.test_office_ooxml import (
     _content_types,
     _main,
     _member_utf8_name,
+    _nul_unused_member_package,
     _package,
     _rels,
     _unsupported_codec_package,
@@ -621,6 +622,31 @@ def test_mismatched_session_map_key_is_state_corrupt(office_world):
     assert origin.hits == 0
 
 
+@pytest.mark.parametrize("field", ("file_id", "document_key"))
+@pytest.mark.parametrize("bad_value", ("", None, [], 1, "missing"))
+def test_malformed_retained_identity_fields_are_state_corrupt(office_world, field, bad_value):
+    http, data, origin, _docker_manager, broker_module = office_world
+    import office.store as store_mod
+
+    body = intact_docx()
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    _seed_session(store_mod, file_id, "closed", key="used-key")
+    payload = json.loads(_state(data).read_text(encoding="utf-8"))
+    record = payload["sessions"]["sess-closed"]
+    if bad_value == "missing":
+        record.pop(field)
+    else:
+        record[field] = bad_value
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    _state(data).write_bytes(encoded)
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 500, "state_corrupt")
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
+
+
 @pytest.mark.parametrize("state", FINAL_STATES)
 def test_recognized_final_sessions_allow_a_new_opening_session(office_world, state):
     http, data, origin, _docker_manager, broker_module = office_world
@@ -791,6 +817,20 @@ def test_utf8_member_name_at_limit_creates_matching_persisted_content(office_wor
     assert persisted["documents"][file_id]["published_sha256"] == digest
     assert (_versions(data) / digest).read_bytes() == body
     assert origin.hits == 0
+
+
+@pytest.mark.parametrize("suffix", ("short", "x" * 1024))
+def test_nul_original_member_names_are_corrupt_document(office_world, suffix):
+    http, data, origin, _docker_manager, broker_module = office_world
+    body = _nul_unused_member_package(suffix)
+    _put(data, "brief.docx", body)
+    file_id = _index_file(broker_module, data, "brief.docx")
+    _seed_refusal_history()
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 422, "corrupt_document")
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
 
 
 

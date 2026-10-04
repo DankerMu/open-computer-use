@@ -53,7 +53,11 @@ def validate_ooxml(content: bytes, document_type: str) -> None:
             seen = set()
             for info in archive.infolist():
                 name = info.filename
-                if name in seen or not _safe_member_name(name) or info.flag_bits & 1:
+                if (
+                    not _safe_member_name(info.orig_filename)
+                    or name in seen
+                    or info.flag_bits & 1
+                ):
                     raise CorruptDocumentError()
                 if info.compress_type not in _ALLOWED_COMPRESSION:
                     raise CorruptDocumentError()
