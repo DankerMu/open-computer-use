@@ -20,6 +20,13 @@
     {"path": "terminal/{chat}/processes/{pid}/kill", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
     {"path": "terminal/{chat}/ws", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "ws"},
     {"path": "browser/{chat}/devtools/page/{page}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "ws"},
+    {"path": "api/office/{chat}/documents/{file}/sessions", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "api/office/{chat}/sessions/{session}", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "api/office/{chat}/sessions/{session}/save", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "api/office/{chat}/sessions/{session}/close", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "api/office/{chat}/sessions/{session}/resolve", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
+    {"path": "api/office/{chat}/documents/{file}/versions", "methods": ["GET"], "auth": "chat", "mutating": false, "prefix": "strip", "kind": "http"},
+    {"path": "api/office/{chat}/documents/{file}/restore", "methods": ["POST"], "auth": "chat", "mutating": true, "prefix": "strip", "kind": "http"},
     {"path": "static/{path}", "methods": ["GET", "HEAD"], "auth": "session", "mutating": false, "prefix": "preserve", "kind": "http"}
   ]
 }

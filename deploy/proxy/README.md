@@ -88,6 +88,18 @@ OCU-owned rather than nginx's 1 MiB default.
 return 404 without contacting OCU. `POST /ocu/api/uploads/{chat}/{path}`
 forwards guarded uploads, including files whose names are `manifest` or `list`.
 
+The reviewed inventory has 27 rows. Office broker routes under
+`/ocu/api/office/{chat}/` use chat-owner authentication and strip `/ocu`;
+the five POST rows also require the mutation guard. The session-status and
+version-list GET rows do not require the custom header. `{file}` and `{session}`
+each match one nonempty segment and require a `{chat}` parameter in the table.
+Change the route table, reviewed row count and raw-byte SHA pin together.
+
+`/ocu/office/source/{ticket}`, `/ocu/office/callback/{chat}/{session}` and
+`GET /ocu/api/uploads/{chat}/imports` return 404 without contacting OCU.
+Their unprefixed forms are not OCU gateway routes either. The proxy does not
+implement the Office broker or expose its control-plane listener.
+
 ## Focused native proof and limits
 
 `python3 -m unittest discover -s deploy/proxy/tests -p 'test_render.py' -v`
