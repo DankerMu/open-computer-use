@@ -45,7 +45,7 @@ from tests.orchestrator.test_office_sessions import (
 from tests.orchestrator.test_office_workspace import _forbid_inode_open
 from tests.orchestrator.test_outputs_endpoint import CHAT, _auth
 
-BOOKKEEPING = ("workspace_changed", "last_checked_size", "last_checked_mtime_ns")
+BOOKKEEPING = ("workspace_changed", "last_checked_size", "last_checked_mtime_ns", "last_activity_at")
 
 
 def _same_size_bytes(original: bytes) -> bytes:
@@ -816,4 +816,52 @@ print(json.dumps({"ok": True}))
         if parent is not None and parent.is_alive():
             parent.join(timeout=10)
         _stop_child(child)
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("activity_present", (True, False))
+def test_ended_conflict_status_refreshes_notice_without_activity_or_other_mutation(
+    office_world, monkeypatch, activity_present,
+):
+    from office.store import OfficeStore
+    import office.notice as notice
+    http, data, origin, _docker, _broker = office_world
+    monkeypatch.setattr("time.time", lambda: 100)
+    _file_id, created = _created(office_world, "conflict")
+    session_id = created["session_id"]
+    _change(session_id, save_seq=3, pending_save_seq=2, pending_close_seq=3,
+            save_intents={"2": "persist"}, saving_started_at=50,
+            last_committed_seq=1, last_published_seq=1, reason="baseline_mismatch")
+    store = OfficeStore()
+    store.record_receipt(CHAT, session_id, 3, {
+        "status": 2, "sha256": None, "version": None, "answer": {"error": 0},
+    })
+    if not activity_present:
+        def strip(working):
+            working["sessions"][session_id].pop("last_activity_at")
+        store.update(CHAT, strip)
+    before = store.read(CHAT)
+    path = _workspace(data)
+    path.write_bytes(path.read_bytes() + b"external edit")
+    monkeypatch.setattr("time.time", lambda: 200)
+    response = _status_fields(http, session_id)
+    assert response["state"] == "conflict"
+    assert response["workspace_changed"] is True
+    after = store.read(CHAT)
+    size, mtime_ns = _sample(path)
+    assert after == {**before, "sessions": {
+        **before["sessions"], session_id: {
+            **before["sessions"][session_id], "workspace_changed": True,
+            "last_checked_size": size, "last_checked_mtime_ns": mtime_ns,
+        },
+    }}
+    assert after["sessions"][session_id].get("last_activity_at") == (
+        100 if activity_present else None
+    )
+    unchanged = _snapshot(data), _state(data).stat().st_ino
+    reads = _count_workspace_reads(notice, monkeypatch, path)
+    monkeypatch.setattr("time.time", lambda: 201)
+    assert _status_fields(http, session_id) == response
+    assert reads["count"] == 0
+    assert (_snapshot(data), _state(data).stat().st_ino) == unchanged
     assert origin.hits == 0

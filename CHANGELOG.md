@@ -10,14 +10,22 @@
 
 
 ### Changed
+- **Office periodic session recovery.** The existing idle poll discovers Office
+  state independently of sandbox metadata. Under the shared chat lock it checks
+  idle live sessions and overdue saves with one bounded DocumentServer lookup.
+  Forgotten keys become `orphaned` / `editor_state_lost`; a known overdue save
+  returns to `editing` / `save_timeout`, retaining its allocation and intent for
+  a late callback. Successful live requests persist activity without resetting
+  the save-start deadline. Disabled Office does no discovery or network work;
+  unavailable keys and excluded states retain their persisted bytes.
+
 - **Office save and close requests.** `POST .../save` takes
   `{"intent":"publish"|"persist"}`, allocates the next `save_seq`, records
   that intent, and sends one forcesave command after the allocation is
   durable. `POST .../close` records a pending close without force-save;
   a never-opened session ends `closed` immediately. Create and join sign
   `editorConfig.customization.forcesave` false. Callbacks, publish,
-  `last_published_seq` advancement, sweep and host auto-save remain later
-  operations.
+  `last_published_seq` advancement and host auto-save remain later operations.
 
 - **Office session join and persisted status.** Repeated document opens
   join the existing session with its stable key and a freshly signed source

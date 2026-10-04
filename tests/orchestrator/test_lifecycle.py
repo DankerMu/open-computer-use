@@ -304,7 +304,6 @@ def app_module():
     os.environ["OCU_INTERNAL_TOKEN"] = INTERNAL
     os.environ["PUBLIC_BASE_URL"] = "/ocu"
     os.environ["MCP_API_KEY"] = MCP_KEY
-    import app as loaded
     from fastapi.testclient import TestClient
 
     # Neighbor suites reload docker_manager after this process has already
@@ -313,40 +312,57 @@ def app_module():
     # class from the one tests (and launch_sandbox) raise. Rebind once,
     # while this client is the only user of the loaded app, so except
     # clauses see the class identity the rest of the suite is using.
-    import docker_manager
-
-    saved = {
-        "LifecycleError": loaded.LifecycleError,
-        "startup_idle_sweep": loaded.startup_idle_sweep,
-        "reap_known_sandboxes": loaded.reap_known_sandboxes,
-        "validate_idle_configuration": loaded.validate_idle_configuration,
-        "validate_sandbox_dns_configuration": loaded.validate_sandbox_dns_configuration,
+    # mcp_tools.mcp is a process-wide FastMCP singleton whose
+    # StreamableHTTPSessionManager.run() is single-use; a prior TestClient
+    # lifespan spends it. Reload app/mcp_tools/mcp_resources so this module
+    # owns a fresh manager without replacing docker_manager.
+    snapshot = {
+        name: sys.modules[name]
+        for name in list(sys.modules)
+        if name in {"app", "mcp_tools"} or name.startswith("mcp_resources")
     }
-    saved_client = getattr(loaded, "_lifecycle_client", None)
-    loaded.LifecycleError = docker_manager.LifecycleError
-    loaded.startup_idle_sweep = lambda now=None: None
-    loaded.reap_known_sandboxes = lambda now=None: None
-    loaded.validate_idle_configuration = lambda *args, **kwargs: (600, 30)
-    loaded.validate_sandbox_dns_configuration = lambda: None
-    with TestClient(loaded.app) as client:
-        loaded._lifecycle_client = client
-        try:
-            yield loaded
-        finally:
-            for key, value in saved.items():
-                setattr(loaded, key, value)
-            if saved_client is None:
-                loaded._lifecycle_client = None
-            else:
-                loaded._lifecycle_client = saved_client
-            for key in ("OCU_INTERNAL_TOKEN", "PUBLIC_BASE_URL", "MCP_API_KEY"):
-                os.environ.pop(key, None)
-            assert loaded.startup_idle_sweep is saved["startup_idle_sweep"]
-            assert loaded.reap_known_sandboxes is saved["reap_known_sandboxes"]
-            assert loaded.validate_idle_configuration is saved["validate_idle_configuration"]
-            assert loaded.validate_sandbox_dns_configuration is saved["validate_sandbox_dns_configuration"]
-            assert loaded.LifecycleError is saved["LifecycleError"]
+    for name in list(snapshot):
+        sys.modules.pop(name, None)
+    try:
+        import app as loaded
+        import docker_manager
 
+        saved = {
+            "LifecycleError": loaded.LifecycleError,
+            "startup_idle_sweep": loaded.startup_idle_sweep,
+            "reap_known_sandboxes": loaded.reap_known_sandboxes,
+            "validate_idle_configuration": loaded.validate_idle_configuration,
+            "validate_sandbox_dns_configuration": loaded.validate_sandbox_dns_configuration,
+        }
+        saved_client = getattr(loaded, "_lifecycle_client", None)
+        loaded.LifecycleError = docker_manager.LifecycleError
+        loaded.startup_idle_sweep = lambda now=None: None
+        loaded.reap_known_sandboxes = lambda now=None: None
+        loaded.validate_idle_configuration = lambda *args, **kwargs: (600, 30)
+        loaded.validate_sandbox_dns_configuration = lambda: None
+        with TestClient(loaded.app) as client:
+            loaded._lifecycle_client = client
+            try:
+                yield loaded
+            finally:
+                for key, value in saved.items():
+                    setattr(loaded, key, value)
+                if saved_client is None:
+                    loaded._lifecycle_client = None
+                else:
+                    loaded._lifecycle_client = saved_client
+                assert loaded.startup_idle_sweep is saved["startup_idle_sweep"]
+                assert loaded.reap_known_sandboxes is saved["reap_known_sandboxes"]
+                assert loaded.validate_idle_configuration is saved["validate_idle_configuration"]
+                assert loaded.validate_sandbox_dns_configuration is saved["validate_sandbox_dns_configuration"]
+                assert loaded.LifecycleError is saved["LifecycleError"]
+    finally:
+        for name in list(sys.modules):
+            if name in {"app", "mcp_tools"} or name.startswith("mcp_resources"):
+                sys.modules.pop(name, None)
+        sys.modules.update(snapshot)
+        for key in ("OCU_INTERNAL_TOKEN", "PUBLIC_BASE_URL", "MCP_API_KEY"):
+            os.environ.pop(key, None)
 
 
 

@@ -31,6 +31,7 @@ from tests.orchestrator.test_office_sessions import (
     JWT_SECRET,
     OPEN_STATES,
     SERVER_DIR,
+    _assert_activity_only,
     _assert_no_secrets,
     _assert_refusal,
     _create,
@@ -363,8 +364,9 @@ def test_rejected_or_unreachable_save_retains_seq_and_returns_editing(office_wor
     document, receipts, journal = _history(data, file_id)
     code, status = failure
     if status is None:
-        monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-        response = _save(http, first["session_id"], "publish")
+        with monkeypatch.context() as env:
+            env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
+            response = _save(http, first["session_id"], "publish")
         hits = 0
     else:
         with _forcesave(monkeypatch, first["document_key"], code=code, status=status) as (origin, _seen):
@@ -413,8 +415,9 @@ def test_save_outside_editing_allocates_nothing(office_world, monkeypatch, state
             save_intents={"2": "persist"}, last_committed_seq=1, last_published_seq=1,
         )
     before = _snapshot(data)
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-    _assert_refusal(_save(http, first["session_id"], "publish"), 409, "session_not_editing")
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
+        _assert_refusal(_save(http, first["session_id"], "publish"), 409, "session_not_editing")
     assert _snapshot(data) == before
     assert recording.hits == 0
 
@@ -482,15 +485,16 @@ def test_changed_epoch_orphans_save_and_close_without_command(office_world, monk
     if state == "saving":
         _change(first["session_id"], save_seq=3, pending_save_seq=3, save_intents={"3": "publish"})
     (data / ".office-restore-epoch").write_text("epoch-B\n")
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-    before_seq = _record(first["session_id"])["save_seq"]
-    _assert_refusal(_save(http, first["session_id"], "publish"), 409, "session_not_editing")
-    record = _record(first["session_id"])
-    assert record["state"] == "orphaned"
-    assert record["reason"] == "restore_epoch_changed"
-    assert record["save_seq"] == before_seq
-    _assert_refusal(_close(http, first["session_id"]), 409, "session_not_open")
-    assert _record(first["session_id"])["save_seq"] == before_seq
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
+        before_seq = _record(first["session_id"])["save_seq"]
+        _assert_refusal(_save(http, first["session_id"], "publish"), 409, "session_not_editing")
+        record = _record(first["session_id"])
+        assert record["state"] == "orphaned"
+        assert record["reason"] == "restore_epoch_changed"
+        assert record["save_seq"] == before_seq
+        _assert_refusal(_close(http, first["session_id"]), 409, "session_not_open")
+        assert _record(first["session_id"])["save_seq"] == before_seq
     assert origin.hits == 0
 
 
@@ -547,8 +551,9 @@ def test_precommit_enospc_sends_no_command(office_world, monkeypatch):
         return original_write(fd, payload)
 
     monkeypatch.setattr(store_mod.os, "write", fail_state_write)
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
-    _assert_refusal(_save(http, first["session_id"], "publish"), 503, "storage_low")
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+        _assert_refusal(_save(http, first["session_id"], "publish"), 503, "storage_low")
     assert _snapshot(data) == before
     assert origin.hits == 0
 
@@ -577,8 +582,9 @@ def test_postreplace_durability_failure_keeps_visible_successor_and_sends_no_com
 
     monkeypatch.setattr(store_mod.os, "replace", watch_state_replace)
     monkeypatch.setattr(store_mod.os, "fsync", fail_after_state_replace)
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
-    _assert_refusal(_save(http, first["session_id"], "publish"), 500, "state_durability")
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+        _assert_refusal(_save(http, first["session_id"], "publish"), 500, "state_durability")
     record = _record(first["session_id"])
     assert record["state"] == "saving"
     assert record["save_seq"] == 1
@@ -590,8 +596,9 @@ def test_postreplace_durability_failure_keeps_visible_successor_and_sends_no_com
 def test_failed_save_never_recycles_sequence(office_world, monkeypatch):
     http, data, recording, _docker, _broker = office_world
     _file_id, first = _created(office_world, "editing")
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-    _assert_refusal(_save(http, first["session_id"], "publish"), 502, "documentserver_unavailable")
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
+        _assert_refusal(_save(http, first["session_id"], "publish"), 502, "documentserver_unavailable")
     assert _record(first["session_id"])["save_seq"] == 1
     with _forcesave(monkeypatch, first["document_key"]) as (origin, seen):
         response = _save(http, first["session_id"], "persist")
@@ -663,14 +670,15 @@ def test_repeated_closing_reuses_pending_seq_without_lookup(office_world, monkey
     _file_id, first = _created(office_world, "closing")
     _change(first["session_id"], save_seq=6, pending_close_seq=6)
     before = _snapshot(data)
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-    first_close = _close(http, first["session_id"])
-    second_close = _close(http, first["session_id"])
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
+        first_close = _close(http, first["session_id"])
+        second_close = _close(http, first["session_id"])
     assert first_close.status_code == second_close.status_code == 202
     assert first_close.json() == second_close.json() == {
         "session_id": first["session_id"], "save_seq": 6, "state": "closing",
     }
-    assert _snapshot(data) == before
+    _assert_activity_only(before, _snapshot(data), first["session_id"])
     assert origin.hits == 0
 
 
@@ -742,8 +750,9 @@ def test_close_unknown_key_orphans_editing_session(office_world, monkeypatch):
 def test_unreachable_close_lookup_still_records_closing(office_world, monkeypatch):
     http, data, recording, _docker, _broker = office_world
     _file_id, first = _created(office_world, "editing")
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-    response = _close(http, first["session_id"])
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
+        response = _close(http, first["session_id"])
     assert response.status_code == 202
     assert response.json()["state"] == "closing"
     record = _record(first["session_id"])
