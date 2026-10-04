@@ -104,6 +104,16 @@ def _copy_record(record):
     return json.loads(json.dumps(record))
 
 
+def _persisted_inventory(data):
+    from office.store import OfficeStore
+    return OfficeStore().read(CHAT), _snapshot(data)
+
+
+def _raise_first(errors):
+    if errors:
+        raise errors[0]
+
+
 def _hold_save(http, monkeypatch, first, *, forcesave_code=0, info_code=0):
     entered, release = threading.Event(), threading.Event()
     box = _command_box(
@@ -148,40 +158,48 @@ def _command_box(
 ):
     seen = []
     infos = []
+    origin_errors = []
 
     def responder(handler, body, _parent):
-        assert handler.path == "/command"
-        payload = json.loads(body)
-        token = _independent_verify(payload["token"], JWT_SECRET)
-        assert token["key"] == key
-        if token["c"] == "info":
-            assert set(token) == {"c", "key"}
-            infos.append(token)
+        try:
+            assert handler.path == "/command"
+            payload = json.loads(body)
+            token = _independent_verify(payload["token"], JWT_SECRET)
+            assert token["key"] == key
+            if token["c"] == "info":
+                assert set(token) == {"c", "key"}
+                infos.append(token)
+                return (
+                    info_status,
+                    {"Content-Type": "application/json"},
+                    json.dumps({"error": info_code}).encode(),
+                )
+            if token["c"] != "forcesave":
+                raise AssertionError(("unexpected command", token))
+            userdata = json.loads(token["userdata"])
+            seen.append(userdata)
+            if observe is not None:
+                observe(userdata)
+            if entered is not None:
+                entered.set()
+            if release is not None:
+                assert release.wait(5), "save test did not release its HTTP responder"
             return (
-                info_status,
+                forcesave_status,
                 {"Content-Type": "application/json"},
-                json.dumps({"error": info_code}).encode(),
+                json.dumps({"error": forcesave_code}).encode(),
             )
-        if token["c"] != "forcesave":
-            raise AssertionError(("unexpected command", token))
-        userdata = json.loads(token["userdata"])
-        seen.append(userdata)
-        if observe is not None:
-            observe(userdata)
-        if entered is not None:
-            entered.set()
-        if release is not None:
-            assert release.wait(5), "save test did not release its HTTP responder"
-        return (
-            forcesave_status,
-            {"Content-Type": "application/json"},
-            json.dumps({"error": forcesave_code}).encode(),
-        )
+        except Exception as extra:
+            origin_errors.append(extra)
+            raise
 
     with _command_origin(responder) as origin:
         with monkeypatch.context() as env:
             env.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
-            yield origin, seen, infos
+            try:
+                yield origin, seen, infos
+            finally:
+                _raise_first(origin_errors)
 
 
 @contextmanager
@@ -201,21 +219,30 @@ def _forcesave(monkeypatch, key, *, code=0, status=200, entered=None, release=No
 
 @contextmanager
 def _lookup(monkeypatch, key, *, code=0, status=200, entered=None, release=None):
+    origin_errors = []
+
     def responder(handler, body, _parent):
-        assert handler.path == "/command"
-        payload = json.loads(body)
-        token = _independent_verify(payload["token"], JWT_SECRET)
-        assert token == {"c": "info", "key": key}
-        if entered is not None:
-            entered.set()
-        if release is not None:
-            assert release.wait(5), "close test did not release its HTTP responder"
-        return status, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode()
+        try:
+            assert handler.path == "/command"
+            payload = json.loads(body)
+            token = _independent_verify(payload["token"], JWT_SECRET)
+            assert token == {"c": "info", "key": key}
+            if entered is not None:
+                entered.set()
+            if release is not None:
+                assert release.wait(5), "close test did not release its HTTP responder"
+            return status, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode()
+        except Exception as extra:
+            origin_errors.append(extra)
+            raise
 
     with _command_origin(responder) as origin:
         with monkeypatch.context() as env:
             env.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
-            yield origin
+            try:
+                yield origin
+            finally:
+                _raise_first(origin_errors)
 
 
 def _child_env(data, origin_url, **extra):
@@ -808,9 +835,11 @@ def test_two_processes_close_reuse_one_allocation(office_world, monkeypatch):
     _file_id, first = _created(office_world, "editing")
     entered, release = threading.Event(), threading.Event()
     ready = data.parent / "close-worker-ready"
+    dispatched = data.parent / "close-worker-dispatched"
     with _lookup(monkeypatch, first["document_key"], entered=entered, release=release) as origin:
         env = _child_env(
             data, origin.url, OCU_SESSION=first["session_id"], READY=str(ready),
+            DISPATCHED=str(dispatched),
         )
         child_src = r"""
 import json, os, sys
@@ -820,6 +849,7 @@ import app
 with TestClient(app.app) as client:
     Path(os.environ["READY"]).write_text("ready")
     sys.stdin.readline()
+    Path(os.environ["DISPATCHED"]).write_text("dispatched")
     response = client.post(
         f'/api/office/{os.environ["OCU_CHAT"]}/sessions/{os.environ["OCU_SESSION"]}/close',
         headers={"Authorization": "Bearer " + os.environ["OCU_INTERNAL_TOKEN"]},
@@ -830,28 +860,46 @@ print(json.dumps({"status": response.status_code, "body": response.json()}))
             [sys.executable, "-c", child_src], cwd=str(SERVER_DIR), env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
+        parent = None
         try:
             _wait_marker(ready, child, "second worker did not load the actual app")
             parent = threading.Thread(
                 target=lambda: setattr(parent, "response", _close(http, first["session_id"]))
             )
             parent.start()
-            assert entered.wait(5)
+            assert entered.wait(5), "parent close INFO command did not arrive"
             child.stdin.write("go\n")
             child.stdin.flush()
-            stdout, stderr = child.communicate(timeout=30)
+            _wait_marker(dispatched, child, "child close was not dispatched while INFO was held")
+            assert parent.is_alive()
+            assert child.poll() is None
+            assert len(origin.requests) == 1
+            payload = _independent_verify(
+                json.loads(origin.requests[0]["body"].decode("utf-8"))["token"], JWT_SECRET
+            )
+            assert payload == {"c": "info", "key": first["document_key"]}
             release.set()
+            stdout, stderr = child.communicate(timeout=30)
             parent.join(timeout=10)
-            child_response = json.loads(stdout.strip().splitlines()[-1])
+            assert parent.is_alive() is False
             assert child.returncode == 0, stderr
-            assert parent.response.status_code == child_response["status"] == 202
-            assert parent.response.json() == child_response["body"] == {
+            child_response = json.loads(stdout.strip().splitlines()[-1])
+            expected = {
                 "session_id": first["session_id"], "save_seq": 1, "state": "closing",
             }
+            assert parent.response.status_code == 202
+            assert parent.response.json() == expected
+            assert child_response == {"status": 202, "body": expected}
             assert _record(first["session_id"])["pending_close_seq"] == 1
+            assert _record(first["session_id"])["save_seq"] == 1
             assert len(origin.requests) == 1
+            assert _independent_verify(
+                json.loads(origin.requests[0]["body"].decode("utf-8"))["token"], JWT_SECRET
+            ) == {"c": "info", "key": first["document_key"]}
         finally:
             release.set()
+            if parent is not None:
+                parent.join(timeout=10)
             _stop_child(child)
     assert recording.hits == 0
 
@@ -913,6 +961,8 @@ def test_delayed_accepted_save_keeps_concurrent_close(office_world, monkeypatch)
         assert len(origin.requests) == 2
     finally:
         release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
         box.__exit__(None, None, None)
     assert recording.hits == 0
 
@@ -963,6 +1013,80 @@ def test_delayed_ordinary_save_failure_preserves_concurrent_close(
     assert recording.hits == 0
 
 
+@pytest.mark.parametrize("code,status,http_status", (
+    (4, 200, 202),
+    (5, 200, 502),
+    (0, 500, 502),
+))
+def test_delayed_ordinary_save_failure_preserves_live_conflict(
+    office_world, monkeypatch, code, status, http_status
+):
+    http, data, recording, _docker, _broker = office_world
+    from office.store import OfficeStore
+    file_id, first = _created(office_world, "editing")
+    entered, release = threading.Event(), threading.Event()
+    with _command_box(
+        monkeypatch, first["document_key"], forcesave_code=code, forcesave_status=status,
+        entered=entered, release=release,
+    ) as (origin, seen, infos):
+        saver = threading.Thread(
+            target=lambda: setattr(saver, "response", _save(http, first["session_id"], "publish"))
+        )
+        saver.start()
+        try:
+            assert entered.wait(5)
+            def conflict(state):
+                record = state["sessions"][first["session_id"]]
+                record["state"] = "conflict"
+                record["reason"] = "baseline_mismatch"
+            OfficeStore().update(CHAT, conflict)
+            owned = _copy_record(_record(first["session_id"]))
+            assert owned["state"] == "conflict"
+            assert owned["reason"] == "baseline_mismatch"
+            assert owned["pending_save_seq"] == 1
+            documents, receipts, journal = _history(data, file_id)
+            files = _snapshot(data)
+            release.set()
+            saver.join(timeout=10)
+            assert saver.response.status_code == http_status
+            if http_status == 202:
+                assert saver.response.json() == {
+                    "session_id": first["session_id"], "save_seq": 1, "intent": "publish",
+                }
+            else:
+                assert json.loads(saver.response.content) == {"reason": "documentserver_unavailable"}
+            after = _record(first["session_id"])
+            expected = dict(owned)
+            expected["pending_save_seq"] = None
+            if code == 4:
+                expected["last_committed_seq"] = 1
+            assert after == expected
+            assert after["state"] == "conflict"
+            assert after["reason"] == "baseline_mismatch"
+            assert after["pending_save_seq"] is None
+            assert after["save_intents"] == {"1": "publish"}
+            assert after["last_published_seq"] == 0
+            if code == 4:
+                assert after["last_committed_seq"] == 1
+            else:
+                assert after["last_committed_seq"] == owned["last_committed_seq"]
+            _assert_history_untouched(data, file_id, documents, receipts, journal)
+            after_files = _snapshot(data)
+            state_path = str(_state(data).relative_to(data))
+            assert {path: value for path, value in after_files.items() if path != state_path} == {
+                path: value for path, value in files.items() if path != state_path
+            }
+            assert seen == [{"save_seq": 1, "intent": "publish"}]
+            assert infos == []
+            assert len(origin.requests) == 1
+        finally:
+            release.set()
+            if saver.is_alive():
+                saver.join(timeout=10)
+    assert recording.hits == 0
+
+
+
 def test_delayed_unknown_key_orphans_live_close_and_conflict(office_world, monkeypatch):
     http, data, recording, _docker, _broker = office_world
     from office.store import OfficeStore
@@ -988,6 +1112,8 @@ def test_delayed_unknown_key_orphans_live_close_and_conflict(office_world, monke
         assert infos == [{"c": "info", "key": first["document_key"]}]
     finally:
         release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
         box.__exit__(None, None, None)
 
     _file_id, live = _created(office_world, "editing", name="live.docx")
@@ -1011,6 +1137,8 @@ def test_delayed_unknown_key_orphans_live_close_and_conflict(office_world, monke
         assert after["save_intents"] == {"1": "publish"}
     finally:
         release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
         box.__exit__(None, None, None)
     assert recording.hits == 0
 
@@ -1045,6 +1173,8 @@ def test_delayed_unknown_key_does_not_orphan_ended_conflict(office_world, monkey
         assert infos == []
     finally:
         release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
         box.__exit__(None, None, None)
     assert recording.hits == 0
 
@@ -1072,6 +1202,8 @@ def test_delayed_nothing_new_does_not_touch_completed_callback(office_world, mon
         assert infos == []
     finally:
         release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
         box.__exit__(None, None, None)
     assert recording.hits == 0
 
@@ -1083,6 +1215,7 @@ def test_delayed_stale_save_does_not_touch_newer_real_save(office_world, monkeyp
     origin, seen, infos, saver, release, box = _hold_save(
         http, monkeypatch, first, forcesave_code=4,
     )
+    second_release = threading.Event()
     try:
         def complete(state):
             record = state["sessions"][first["session_id"]]
@@ -1090,7 +1223,7 @@ def test_delayed_stale_save_does_not_touch_newer_real_save(office_world, monkeyp
             record["pending_save_seq"] = None
             record["last_committed_seq"] = 1
         OfficeStore().update(CHAT, complete)
-        second_entered, second_release = threading.Event(), threading.Event()
+        second_entered = threading.Event()
         with _command_box(
             monkeypatch, first["document_key"], entered=second_entered, release=second_release,
         ) as (_second_origin, second_seen, second_infos):
@@ -1116,6 +1249,9 @@ def test_delayed_stale_save_does_not_touch_newer_real_save(office_world, monkeyp
             assert infos == []
     finally:
         release.set()
+        second_release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
         box.__exit__(None, None, None)
     assert recording.hits == 0
 
@@ -1126,7 +1262,9 @@ def test_delayed_stale_save_does_not_touch_newer_real_save(office_world, monkeyp
     ("orphaned", "restore_epoch_changed"),
     ("orphaned", "editor_state_lost"),
 ))
-def test_delayed_save_does_not_touch_terminal_sessions(office_world, monkeypatch, state, reason):
+def test_delayed_save_does_not_touch_completed_terminal_sessions(
+    office_world, monkeypatch, state, reason
+):
     http, data, recording, _docker, _broker = office_world
     from office.store import OfficeStore
     _file_id, first = _created(office_world, "editing")
@@ -1149,6 +1287,97 @@ def test_delayed_save_does_not_touch_terminal_sessions(office_world, monkeypatch
         assert infos == []
     finally:
         release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
+        box.__exit__(None, None, None)
+    assert recording.hits == 0
+
+
+@pytest.mark.parametrize("state,reason", (
+    ("closed", None),
+    ("error", "publish_timeout"),
+    ("orphaned", "restore_epoch_changed"),
+    ("orphaned", "editor_state_lost"),
+))
+@pytest.mark.parametrize("forcesave_code,http_status", ((4, 202), (1, 409)))
+def test_delayed_save_does_not_touch_terminal_sessions_with_matching_pending(
+    office_world, monkeypatch, state, reason, forcesave_code, http_status
+):
+    http, data, recording, _docker, _broker = office_world
+    from office.store import OfficeStore
+    file_id, first = _created(office_world, "editing")
+    origin, seen, infos, saver, release, box = _hold_save(
+        http, monkeypatch, first, forcesave_code=forcesave_code,
+    )
+    try:
+        def finish(working):
+            record = working["sessions"][first["session_id"]]
+            record["state"] = state
+            record["reason"] = reason
+        OfficeStore().update(CHAT, finish)
+        expected_state, expected_files = _persisted_inventory(data)
+        assert expected_state["sessions"][first["session_id"]]["pending_save_seq"] == 1
+        release.set()
+        saver.join(timeout=10)
+        assert saver.response.status_code == http_status
+        after_state, after_files = _persisted_inventory(data)
+        assert after_state == expected_state
+        assert after_files == expected_files
+        record = after_state["sessions"][first["session_id"]]
+        assert record["state"] == state
+        assert record["reason"] == reason
+        assert record["pending_save_seq"] == 1
+        assert record["last_committed_seq"] == 0
+        assert seen == [{"save_seq": 1, "intent": "publish"}]
+        assert infos == []
+    finally:
+        release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
+        box.__exit__(None, None, None)
+    assert recording.hits == 0
+
+
+@pytest.mark.parametrize("forcesave_code,http_status", ((4, 202), (1, 409)))
+def test_delayed_save_does_not_touch_status_epoch_orphan_with_matching_pending(
+    office_world, monkeypatch, forcesave_code, http_status
+):
+    http, data, recording, _docker, _broker = office_world
+    file_id, first = _created(office_world, "editing")
+    origin, seen, infos, saver, release, box = _hold_save(
+        http, monkeypatch, first, forcesave_code=forcesave_code,
+    )
+    try:
+        assert _record(first["session_id"])["pending_save_seq"] == 1
+        (data / ".office-restore-epoch").write_text("epoch-B\n")
+        status = _status(http, first["session_id"])
+        assert status.status_code == 200
+        assert status.json()["state"] == "orphaned"
+        assert status.json()["reason"] == "restore_epoch_changed"
+        orphaned = _record(first["session_id"])
+        assert orphaned["state"] == "orphaned"
+        assert orphaned["reason"] == "restore_epoch_changed"
+        assert orphaned["pending_save_seq"] == 1
+        assert orphaned["save_intents"] == {"1": "publish"}
+        expected_state, expected_files = _persisted_inventory(data)
+        release.set()
+        saver.join(timeout=10)
+        assert saver.response.status_code == http_status
+        after_state, after_files = _persisted_inventory(data)
+        assert after_state == expected_state
+        assert after_files == expected_files
+        record = after_state["sessions"][first["session_id"]]
+        assert record["state"] == "orphaned"
+        assert record["reason"] == "restore_epoch_changed"
+        assert record["pending_save_seq"] == 1
+        assert record["last_committed_seq"] == 0
+        assert record["last_published_seq"] == 0
+        assert seen == [{"save_seq": 1, "intent": "publish"}]
+        assert infos == []
+    finally:
+        release.set()
+        if saver.is_alive():
+            saver.join(timeout=10)
         box.__exit__(None, None, None)
     assert recording.hits == 0
 
