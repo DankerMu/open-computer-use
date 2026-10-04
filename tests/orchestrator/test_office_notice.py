@@ -455,7 +455,9 @@ def test_final_and_epoch_orphan_status_do_no_workspace_io(office_world, monkeypa
     {"last_checked_size": 12, "last_checked_mtime_ns": True},
     {"last_checked_size": -1, "last_checked_mtime_ns": 1},
     {"last_checked_size": 12, "last_checked_mtime_ns": None},
+    {"last_checked_size": None, "last_checked_mtime_ns": 1},
     {"last_checked_size": 12},
+    {"last_checked_mtime_ns": 1},
 ))
 def test_corrupt_baseline_or_partial_cache_is_state_corrupt(office_world, updates):
     http, data, origin, _docker, _broker = office_world
