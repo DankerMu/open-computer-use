@@ -68,6 +68,10 @@ def _secret_bytes(secret: str | bytes) -> bytes:
 def _oracle_sign(payload: dict, secret: str | bytes, *, alg: str = "HS256") -> str:
     header = _b64url(json.dumps({"alg": alg, "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
     body = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    return _oracle_sign_raw(header, body, secret)
+
+
+def _oracle_sign_raw(header: str, body: str, secret: str | bytes) -> str:
     signing = f"{header}.{body}".encode("ascii")
     digest = hmac.new(_secret_bytes(secret), signing, hashlib.sha256).digest()
     return f"{header}.{body}.{_b64url(digest)}"
@@ -210,6 +214,41 @@ def test_only_hs256_is_accepted_even_when_the_mac_matches_the_declared_alg():
                 verify(token)
             _assert_generic(excinfo, JWT_SECRET, INTERNAL_TOKEN, token)
             assert getattr(excinfo.value, "__cause__", None) is None
+
+
+def test_deeply_nested_json_segments_are_invalid_tokens_not_recursion_errors():
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
+    deep_header = _b64url(("[" * 30000 + "]" * 30000).encode("ascii"))
+    payload_body = _b64url(json.dumps({"document": "key-1", "exp": NOW + 300}, separators=(",", ":")).encode("utf-8"))
+    malformed_header = _oracle_sign_raw(deep_header, payload_body, JWT_SECRET)
+    with pytest.raises(tokens.InvalidTokenError) as jwt_header:
+        tokens.verify_jwt(malformed_header)
+    _assert_generic(jwt_header, JWT_SECRET, malformed_header)
+    assert jwt_header.value.__cause__ is None
+    with pytest.raises(tokens.InvalidTokenError) as ticket_header:
+        tokens.verify_source_ticket(_oracle_sign_raw(deep_header, payload_body, _ticket_key(INTERNAL_TOKEN)))
+    _assert_generic(ticket_header, INTERNAL_TOKEN)
+    assert ticket_header.value.__cause__ is None
+    deep_payload = _b64url(("[" * 30000 + "]" * 30000).encode("ascii"))
+    signed_deep_payload = _oracle_sign_raw(header, deep_payload, JWT_SECRET)
+    with pytest.raises(tokens.InvalidTokenError) as jwt_payload:
+        tokens.verify_jwt(signed_deep_payload)
+    _assert_generic(jwt_payload, JWT_SECRET, signed_deep_payload)
+    assert jwt_payload.value.__cause__ is None
+
+
+def test_signed_ticket_without_exp_is_invalid():
+    payload = {
+        "chat_id": CHAT,
+        "file_id": FILE,
+        "version": VERSION,
+        "session_id": SESSION,
+    }
+    token = _oracle_sign(payload, _ticket_key(INTERNAL_TOKEN))
+    with pytest.raises(tokens.InvalidTokenError) as excinfo:
+        tokens.verify_source_ticket(token)
+    _assert_generic(excinfo, INTERNAL_TOKEN, token)
+    assert excinfo.value.__cause__ is None
 
 
 def test_non_ascii_and_non_alphabet_segments_are_invalid_tokens_without_leaking():

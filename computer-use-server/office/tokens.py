@@ -103,7 +103,7 @@ def _decode(token: str | None, secret: bytes, *, require_exp: bool) -> dict[str,
         raise InvalidTokenError() from None
     try:
         header = json.loads(_b64url_decode(header_b64))
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
         raise InvalidTokenError() from None
     if not isinstance(header, dict) or header.get("alg") != "HS256":
         raise InvalidTokenError()
@@ -116,7 +116,7 @@ def _decode(token: str | None, secret: bytes, *, require_exp: bool) -> dict[str,
         raise InvalidTokenError()
     try:
         payload = json.loads(_b64url_decode(payload_b64))
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
         raise InvalidTokenError() from None
     if not isinstance(payload, dict):
         raise InvalidTokenError()

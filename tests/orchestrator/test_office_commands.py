@@ -153,15 +153,14 @@ def _json_error(code):
     return responder
 
 
-def _verified_forcesave(body: bytes) -> dict:
+def _verified_forcesave(body: bytes, intent: str) -> dict:
     envelope = json.loads(body.decode("utf-8"))
     assert set(envelope) == {"token"}
     payload = _independent_verify(envelope["token"], JWT_SECRET)
     assert payload["c"] == "forcesave"
     assert payload["key"] == DOCUMENT_KEY
     userdata = json.loads(payload["userdata"])
-    assert userdata == {"save_seq": SAVE_SEQ, "intent": INTENT}
-    assert payload["userdata"] == json.dumps(userdata, separators=(",", ":"))
+    assert userdata == {"save_seq": SAVE_SEQ, "intent": intent}
     return payload
 
 
@@ -169,15 +168,16 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_forcesave_accepted_round_trip_verifies_token_and_userdata(monkeypatch, capsys, caplog):
+@pytest.mark.parametrize("intent", ("publish", "persist"))
+def test_forcesave_accepted_round_trip_verifies_token_and_userdata(monkeypatch, capsys, caplog, intent):
     def responder(handler, body, parent):
         assert handler.path == "/command"
-        _verified_forcesave(body)
+        _verified_forcesave(body, intent)
         return 200, {"Content-Type": "application/json"}, b'{"error":0}'
 
     with _command_origin(responder) as origin:
         monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url + "/")
-        outcome = _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT))
+        outcome = _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, intent))
         assert outcome is commands.ForceSaveOutcome.ACCEPTED
         assert origin.trap_hits == 0
         assert origin.requests[0]["path"] == "/command"
@@ -237,6 +237,14 @@ def test_lookup_known_unknown_and_never_orphans_on_unavailability(monkeypatch):
         monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
         assert _run(commands.lookup_key(DOCUMENT_KEY)) is commands.KeyLookupOutcome.KEY_UNKNOWN
     for responder in (_json_error(4), _json_error(True), _json_error("1")):
+        with _command_origin(responder) as origin:
+            monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+            assert _run(commands.lookup_key(DOCUMENT_KEY)) is commands.KeyLookupOutcome.UNREACHABLE
+    def http_error(code, status):
+        def responder(_handler, _body, _parent):
+            return status, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode("utf-8")
+        return responder
+    for responder in (http_error(1, 500), http_error(0, 404), http_error(1, 404)):
         with _command_origin(responder) as origin:
             monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
             assert _run(commands.lookup_key(DOCUMENT_KEY)) is commands.KeyLookupOutcome.UNREACHABLE
@@ -318,6 +326,39 @@ def test_oversized_body_is_rejected_and_local_validation_happens_before_io(monke
             with pytest.raises(ValueError):
                 _run(commands.forcesave(DOCUMENT_KEY, seq, intent))
         assert origin.requests == []
+
+
+
+
+def test_missing_documentserver_url_fails_before_io(monkeypatch):
+    with _command_origin(_json_error(0)) as origin:
+        for raw in (None, "", " \t\n"):
+            if raw is None:
+                monkeypatch.delenv("OCU_OFFICE_DOCSERVER_URL", raising=False)
+            else:
+                monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", raw)
+            with pytest.raises(ValueError):
+                _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT))
+            with pytest.raises(ValueError):
+                _run(commands.lookup_key(DOCUMENT_KEY))
+        assert origin.requests == []
+
+
+def test_deeply_nested_command_body_is_rejected_or_unreachable(monkeypatch):
+    deep = ("[" * 30000 + "]" * 30000).encode("ascii")
+
+    def deep_ok(_handler, _body, _parent):
+        return 200, {"Content-Type": "application/json"}, deep
+
+    def deep_lookup(_handler, _body, _parent):
+        return 200, {"Content-Type": "application/json"}, deep
+
+    with _command_origin(deep_ok) as origin:
+        monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+        assert _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT)) is commands.ForceSaveOutcome.REJECTED
+    with _command_origin(deep_lookup) as origin:
+        monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+        assert _run(commands.lookup_key(DOCUMENT_KEY)) is commands.KeyLookupOutcome.UNREACHABLE
 
 
 def test_cancellation_propagates_and_secrets_stay_out_of_errors(monkeypatch, capsys, caplog):

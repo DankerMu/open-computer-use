@@ -105,7 +105,7 @@ def _integer_error(body: bytes | None) -> int | None:
         return None
     try:
         parsed = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(parsed, dict):
         return None
