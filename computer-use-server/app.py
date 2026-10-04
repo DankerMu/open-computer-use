@@ -29,6 +29,7 @@ from urllib.parse import quote
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
+from office.router import OfficeAvailabilityMiddleware, create_office_router
 from ws_recheck import (
     admit,
     forward_cdp_backend,
@@ -465,7 +466,12 @@ async def normalize_chat_id_case(request, call_next):
     if normalized != path:
         request.scope["path"] = normalized
     return await call_next(request)
+# D7: add_middleware last is outermost. Availability runs inside AuthGuard.
+app.add_middleware(OfficeAvailabilityMiddleware)
 app.add_middleware(AuthGuardMiddleware)
+app.include_router(create_office_router())
+
+
 
 # Static files (bundled JS/CSS libraries)
 _static_dir = Path(__file__).parent / "static"

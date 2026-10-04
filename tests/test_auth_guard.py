@@ -94,6 +94,9 @@ CHAT_ROUTES = (
     ("POST", f"/terminal/{CHAT}/processes/1/kill"),
     ("GET", f"/terminal/{CHAT}/heartbeat"),
     ("GET", f"/preview/{CHAT}"),
+    ("POST", f"/api/office/{CHAT}/documents/file/sessions"),
+    ("GET", f"/api/office/{CHAT}/sessions/session"),
+    ("GET", f"/api/office/{CHAT}/unknown"),
 )
 
 IDENTITY_ROUTES = ("/system-prompt", "/skill-list", "/skill-mounts")
@@ -138,6 +141,9 @@ def app_module(monkeypatch):
             "system_prompt",
             "skill_manager",
             "uploads",
+            "office",
+            "office.config",
+            "office.router",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)
     import app as loaded
@@ -167,6 +173,19 @@ def client(app_module, tmp_path, monkeypatch):
 
 def _bearer(token=INTERNAL):
     return {"Authorization": f"Bearer {token}"}
+
+
+def _assert_office_guard(response, status, reason, detail):
+    assert response.status_code == status
+    body = json.loads(response.content)
+    assert body["reason"] == reason
+    assert body["detail"] == detail
+    assert INTERNAL not in response.text
+
+
+
+def _office_inventory(root):
+    return {path.relative_to(root) for path in root.rglob("*")}
 
 
 def _ws_session_headers(token=INTERNAL):
@@ -209,7 +228,7 @@ def _peer_client(app, host, port):
     return TestClient(_app)
 
 
-def _raw_http_response(app, path, headers, method="GET"):
+def _raw_http_response(app, path, headers, method="GET", query_string=b""):
     """Exercise the ASGI boundary with raw header bytes TestClient cannot send."""
     messages = []
     received = False
@@ -232,19 +251,24 @@ def _raw_http_response(app, path, headers, method="GET"):
         "scheme": "http",
         "path": path,
         "raw_path": path.encode("ascii"),
-        "query_string": b"",
+        "query_string": query_string,
         "headers": headers,
         "client": ("testclient", 50000),
         "server": ("testserver", 80),
         "root_path": "",
     }
+
     asyncio.run(app(scope, receive, send))
     start = next(message for message in messages if message["type"] == "http.response.start")
     response_headers = {
         name.lower(): value for name, value in start.get("headers") or []
     }
-    return start["status"], response_headers
-
+    body = b"".join(
+        message.get("body") or b""
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+    return start["status"], response_headers, body
 
 
 class TestStartupFailClosed:
@@ -860,6 +884,150 @@ class TestHttpAuthorization:
         response = client.put(f"/api/outputs/{CHAT}")
         assert response.status_code == 401
 
+    @pytest.mark.parametrize(
+        "method,path",
+        (
+            ("POST", f"/api/office/{CHAT}/documents/file/sessions"),
+            ("GET", f"/api/office/{CHAT}/sessions/session"),
+            ("GET", f"/api/office/{CHAT}/unknown"),
+        ),
+    )
+    def test_office_route_wrong_token_is_401_before_work(
+        self, client, tmp_path, method, path
+    ):
+        before = _office_inventory(tmp_path)
+        response = client.request(method, path, headers=_bearer(OTHER))
+        _assert_office_guard(response, 401, "unauthorized", "Unauthorized")
+        assert response.headers.get("www-authenticate") == "Bearer"
+        assert _office_inventory(tmp_path) == before
+
+    def test_office_empty_segment_is_invalid_chat_and_ignores_header_query(
+        self, client, app_module, tmp_path
+    ):
+        before = _office_inventory(tmp_path)
+        headers = {**_bearer(), "X-Chat-Id": CHAT, "X-OpenWebUI-Chat-Id": CHAT}
+        response = client.get(
+            "/api/office//sessions/session",
+            headers=headers,
+            params={"chat_id": CHAT},
+        )
+        _assert_office_guard(response, 400, "invalid_chat_id", "Invalid chat_id")
+        status, _, body = _raw_http_response(
+            app_module.app,
+            "/api/office//sessions/session",
+            [
+                (b"authorization", f"Bearer {INTERNAL}".encode("ascii")),
+                (b"x-chat-id", CHAT.encode("ascii")),
+                (b"x-openwebui-chat-id", CHAT.encode("ascii")),
+            ],
+            query_string=f"chat_id={CHAT}".encode("ascii"),
+        )
+        parsed = json.loads(body)
+        assert status == 400
+        assert parsed["reason"] == "invalid_chat_id"
+        assert parsed["detail"] == "Invalid chat_id"
+        assert INTERNAL not in body.decode("ascii")
+        wrong = client.get(
+            "/api/office//sessions/session",
+            headers={**_bearer(OTHER), "X-Chat-Id": CHAT},
+            params={"chat_id": CHAT},
+        )
+        _assert_office_guard(wrong, 401, "unauthorized", "Unauthorized")
+        assert _office_inventory(tmp_path) == before
+
+    @pytest.mark.parametrize(
+        "chat_id",
+        (
+            "default",
+            "DEFAULT",
+            quote("default", safe=""),
+            " temporary:abc ",
+            "Temporary:ABC",
+            "local:abc",
+            "LOCAL:abc",
+            "channel:abc",
+            "channel:ABC",
+            quote("temporary:abc", safe=""),
+            quote("local:abc", safe=""),
+            quote("channel:abc", safe=""),
+            quote(" ", safe=""),
+        ),
+    )
+    @pytest.mark.parametrize(
+        "token,status,reason,detail",
+        (
+            (INTERNAL, 400, "invalid_chat_id", "Invalid chat_id"),
+            (OTHER, 401, "unauthorized", "Unauthorized"),
+        ),
+    )
+    def test_office_rejects_normalized_invalid_ids(
+        self, client, tmp_path, chat_id, token, status, reason, detail
+    ):
+        before = _office_inventory(tmp_path)
+        response = client.get(
+            f"/api/office/{chat_id}/sessions/session",
+            headers={**_bearer(token), "X-Chat-Id": CHAT},
+            params={"chat_id": CHAT},
+        )
+        _assert_office_guard(response, status, reason, detail)
+        assert _office_inventory(tmp_path) == before
+
+
+    def test_office_sandbox_peer_is_403_before_handler(self, app_module, tmp_path):
+        before = _office_inventory(tmp_path)
+        with _peer_client(app_module.app, SANDBOX_PEER, 40010) as http:
+            response = http.get(
+                f"/api/office/{CHAT}/sessions/session",
+                headers={
+                    **_bearer(),
+                    "X-Forwarded-For": "203.0.113.9",
+                    "X-Chat-Id": CHAT,
+                },
+            )
+        _assert_office_guard(response, 403, "forbidden", "Forbidden")
+        assert _office_inventory(tmp_path) == before
+
+    def test_office_preflight_requires_token_and_legacy_cors_is_unchanged(
+        self, client, tmp_path
+    ):
+        before = _office_inventory(tmp_path)
+        missing = client.options(
+            f"/api/office/{CHAT}/sessions/session",
+            headers={
+                "Origin": ORIGIN,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
+        wrong = client.options(
+            f"/api/office/{CHAT}/sessions/session",
+            headers={
+                **_bearer(OTHER),
+                "Origin": ORIGIN,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
+        legacy = client.options(
+            f"/api/outputs/{CHAT}",
+            headers={
+                "Origin": ORIGIN,
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
+        _assert_office_guard(missing, 401, "unauthorized", "Unauthorized")
+        _assert_office_guard(wrong, 401, "unauthorized", "Unauthorized")
+        assert missing.headers.get("www-authenticate") == "Bearer"
+        assert wrong.headers.get("www-authenticate") == "Bearer"
+        assert legacy.status_code == 204
+        assert legacy.headers.get("access-control-allow-origin") == ORIGIN
+        assert "authorization" in legacy.headers.get(
+            "access-control-allow-headers", ""
+        ).lower()
+        assert _office_inventory(tmp_path) == before
+
+
     def test_missing_origin_grants_no_cross_origin_header(self, client, monkeypatch):
         monkeypatch.delenv("OCU_WEBUI_ORIGIN", raising=False)
         response = client.get(
@@ -904,7 +1072,7 @@ class TestHttpAuthorization:
 
 class TestMalformedHeaderBytes:
     def test_non_ascii_bearer_bytes_are_401(self, app_module):
-        status, _ = _raw_http_response(
+        status, _, _ = _raw_http_response(
             app_module.app,
             f"/api/outputs/{CHAT}",
             [(b"authorization", b"Bearer \xff")],
@@ -912,7 +1080,7 @@ class TestMalformedHeaderBytes:
         assert status == 401
 
     def test_non_ascii_internal_header_bytes_are_401(self, app_module):
-        status, _ = _raw_http_response(
+        status, _, _ = _raw_http_response(
             app_module.app,
             "/mcp",
             [(b"x-ocu-internal-token", b"\xff")],
@@ -944,7 +1112,7 @@ class TestMalformedHeaderBytes:
     def test_non_ascii_origin_never_grants_cors(
         self, app_module, path, headers, method, expected_status
     ):
-        status, response_headers = _raw_http_response(
+        status, response_headers, _ = _raw_http_response(
             app_module.app,
             path,
             headers,

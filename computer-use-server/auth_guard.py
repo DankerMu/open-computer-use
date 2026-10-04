@@ -23,6 +23,7 @@ from security import sanitize_chat_id
 
 INTERNAL_HEADER = "x-ocu-internal-token"
 _TRANSIENT_PREFIXES = ("temporary:", "local:", "channel:")
+OFFICE_PREFIX = "/api/office/"
 
 # Chat-bound route prefixes and exact identity routes are separate policies.
 # Health, runtime-cli, docs and static stay outside both lists; the sandbox-peer
@@ -35,8 +36,10 @@ _GUARDED_PREFIXES = (
     "/terminal/",
     "/preview/",
     "/internal/",
+    OFFICE_PREFIX,
 )
 _IDENTITY_PATHS = frozenset(("/system-prompt", "/skill-list", "/skill-mounts"))
+_OFFICE_REASONS = {401: "unauthorized", 403: "forbidden", 400: "invalid_chat_id"}
 
 
 class AuthGuardError(Exception):
@@ -202,6 +205,9 @@ def canonical_chat_id(value: str) -> str:
 
 
 def _chat_id_from_path(path: str) -> str | None:
+    if path.startswith(OFFICE_PREFIX):
+        remainder = path[len(OFFICE_PREFIX) :]
+        return remainder.split("/", 1)[0]
     parts = [part for part in path.split("/") if part]
     if len(parts) < 2:
         return None
@@ -212,6 +218,8 @@ def _chat_id_from_path(path: str) -> str | None:
     if parts[0] == "api" and len(parts) >= 3 and parts[1] in {"uploads", "outputs"}:
         return parts[2]
     return None
+
+
 def _header_chat_id(headers: dict[str, str]) -> str | None:
     if "x-chat-id" in headers:
         return headers["x-chat-id"]
@@ -231,8 +239,6 @@ def _query_chat_id(scope) -> str | None:
 
 def _is_identity_path(path: str) -> bool:
     return path in _IDENTITY_PATHS
-
-
 
 
 def _guarded(path: str) -> bool:
@@ -257,7 +263,9 @@ def authorize_http(scope) -> None:
         if raw is None:
             raw = _query_chat_id(scope)
     if raw is not None:
-        canonical_chat_id(raw)
+        canonical = canonical_chat_id(raw)
+        if path.startswith(OFFICE_PREFIX):
+            scope["ocu_chat_id"] = canonical
 
 
 def authorize_websocket(scope) -> None:
@@ -306,12 +314,14 @@ class AuthGuardMiddleware:
             return
         if scope["type"] == "http":
             headers = _headers(scope)
-            if _is_cors_preflight(scope, headers):
+            path = scope.get("path") or ""
+            if _is_cors_preflight(scope, headers) and not path.startswith(OFFICE_PREFIX):
                 if peer_denied(scope):
                     await _reject_http(send, 403, "Forbidden", scope)
                 else:
                     await _preflight(send, headers)
                 return
+
         try:
             if scope["type"] == "websocket":
                 authorize_websocket(scope)
@@ -382,7 +392,15 @@ def _cors_sender(scope, send):
 
 
 async def _reject_http(send, status: int, detail: str, scope) -> None:
-    body = f'{{"detail":"{detail}"}}'.encode("ascii")
+    path = scope.get("path") or ""
+    if path.startswith(OFFICE_PREFIX) and status in _OFFICE_REASONS:
+        body = (
+            f'{{"reason":"{_OFFICE_REASONS[status]}","detail":"{detail}"}}'.encode(
+                "ascii"
+            )
+        )
+    else:
+        body = f'{{"detail":"{detail}"}}'.encode("ascii")
     headers = [
         (b"content-type", b"application/json"),
         (b"content-length", str(len(body)).encode("ascii")),

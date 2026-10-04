@@ -49,6 +49,9 @@ _APP_MODULES = (
     "cli_runtime",
     "uploads",
     "docs_html",
+    "office",
+    "office.config",
+    "office.router",
 )
 
 
