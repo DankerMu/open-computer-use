@@ -122,9 +122,13 @@ def test_valid_source_ticket_returns_bound_bytes_after_workspace_mutation(office
         headers={"Authorization": "Bearer " + signed},
         json={"key": "unsigned-foreign", "status": 2},
     )
-    assert callback.status_code == 503
-    assert callback.json() == {"reason": "callback_processing_unavailable"}
-    assert OfficeStore().read(CHAT) == before
+    assert callback.status_code == 200
+    assert callback.json() == {"error": 0}
+    after = OfficeStore().read(CHAT)
+    assert after["sessions"][session["session_id"]]["state"] == "editing"
+    assert after["sessions"][session["session_id"]]["document_key"] == session["document_key"]
+    assert after["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+    assert after["receipts"] == {}
     assert origin.hits == 0
 
 
@@ -296,8 +300,12 @@ def test_callback_body_token_admits_and_unsigned_fields_are_ignored(office_world
             "url": "http://127.0.0.1:1/never-fetch",
         },
     )
-    _assert_refusal(response, 503, "callback_processing_unavailable")
-    assert OfficeStore().read(CHAT) == before
+    assert response.status_code == 200
+    assert response.json() == {"error": 0}
+    after = OfficeStore().read(CHAT)
+    assert after["sessions"][session["session_id"]]["state"] == "editing"
+    assert after["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+    assert after["receipts"] == {}
     assert origin.hits == 0
 
 

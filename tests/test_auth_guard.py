@@ -157,6 +157,8 @@ def app_module(monkeypatch):
             "office.ooxml",
             "office.sweep",
             "office.control_plane",
+            "office.download",
+            "office.callback",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)
     import app as loaded

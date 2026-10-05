@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Office callback persistence errors.** Ordinary filesystem failures during
+  content and no-content callback persistence return HTTP 500 with JSON reason
+  `state_corrupt`, without error-time state writes. Disk-full failures remain
+  503 `storage_low`; post-replacement durability failures remain
+  500 `state_durability`.
+
 - **Environment-injection Docker fixtures.** Credential-isolation and
   CLI-passthrough Docker test doubles model create/start/reload to `running`
   and apply requested DNS and port bindings to inspected `HostConfig`.
@@ -14,16 +20,20 @@
   authenticates by a short-lived source ticket and returns the bound immutable
   version bytes, including after the workspace file changes. `POST
   /office/callback/{chat}/{session}` authenticates only a verified DocumentServer
-  JWT whose key matches the named session, then answers 503
-  `callback_processing_unavailable` without mutation until callback processing
-  lands. Authenticated callback lock, root recheck and state read run off the
-  event loop. Both routes reject sandbox-subnet peers with 403 `forbidden`, return 404 when
+  JWT whose key matches the named session, then handles status, receipts and
+  confined persist under the existing no-create chat lock. Authenticated
+  callback lock, root recheck and state commit run on Starlette's AnyIO
+  threadpool, not the loop default executor; confined download is submitted
+  onto the captured request loop with a bounded wait. Callback fetches request
+  identity encoding and never wait for a per-call resolver executor shutdown.
+  Both routes reject sandbox-subnet peers with 403 `forbidden`, return 404 when
   Office is disabled, and never accept the internal token as a substitute.
   Source tickets, including encoded newlines, authenticate as `invalid_ticket`.
   A chat directory that disappears before the non-creating canonical lock is
   admitted as source 401 / callback 404 without recreation. Source tickets are
   redacted in Uvicorn access logs; rejected callbacks log
-  chat, session and reason without the token.
+  chat, session and reason without the token. Publish, journal and workspace
+  replacement remain later work.
 
 - **Office periodic session recovery.** The existing idle poll discovers Office
   state independently of sandbox metadata. Under the shared chat lock it checks
@@ -38,8 +48,10 @@
   `{"intent":"publish"|"persist"}`, allocates the next `save_seq`, records
   that intent, and sends one forcesave command after the allocation is
   durable. `POST .../close` records a pending close without force-save;
-  a never-opened session ends `closed` immediately. Create and join sign
-  `editorConfig.customization.forcesave` false. Callbacks, publish,
+  a never-opened session ends `closed` immediately. A later close while the
+  session is still closing reuses the pending allocation, or the consumed
+  final-receipt sequence when that marker is gone, without a new command.
+  Create and join sign `editorConfig.customization.forcesave` false. Publish,
   `last_published_seq` advancement and host auto-save remain later operations.
 
 - **Office session join and persisted status.** Repeated document opens

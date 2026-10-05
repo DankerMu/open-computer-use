@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""DocumentServer source delivery and callback admission without processing."""
+"""DocumentServer source delivery and authenticated callback persist."""
 from __future__ import annotations
 
 import asyncio
@@ -13,11 +13,12 @@ from urllib.parse import unquote
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 import docker_manager
 from auth_guard import AuthGuardError, canonical_chat_id
 
-from . import sessions, tokens, versions
+from . import callback, sessions, tokens, versions
 from .store import OfficeStore, StateCorruptError
 
 _LOG = logging.getLogger("ocu.office")
@@ -26,6 +27,10 @@ _BEARER = "bearer "
 
 class InvalidTicketError(ValueError):
     reason = "invalid_ticket"
+
+
+class UnknownCallbackSessionError(ValueError):
+    reason = "unknown_session"
 
 
 class InvalidCallbackTokenError(ValueError):
@@ -97,10 +102,18 @@ async def admit_callback(request: Request) -> JSONResponse:
     if payload is None:
         _log_callback_rejection(chat, presented_session, reason)
         return _error(401, "invalid_token")
-    return await asyncio.to_thread(_admit_authenticated_callback, chat, presented_session, payload)
+    loop = asyncio.get_running_loop()
+    return await run_in_threadpool(
+        _admit_authenticated_callback, chat, presented_session, payload, loop
+    )
 
 
-def _admit_authenticated_callback(chat: str, presented_session: str, payload: dict[str, Any]) -> JSONResponse:
+def _admit_authenticated_callback(
+    chat: str,
+    presented_session: str,
+    payload: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
+) -> JSONResponse:
     if not _chat_directory_exists(chat):
         _log_callback_rejection(chat, presented_session, "unknown_session")
         return _error(404, "unknown_session")
@@ -113,13 +126,18 @@ def _admit_authenticated_callback(chat: str, presented_session: str, payload: di
             store._assert_chat_root_safe(chat, allow_missing=False)
             state = store._snapshot(store._load(chat, create=False))
             _require_callback_binding(state, presented_session, payload)
+            return callback.process_authenticated_callback(
+                store, chat, presented_session, payload, loop
+            )
+        except UnknownCallbackSessionError:
+            _log_callback_rejection(chat, presented_session, "unknown_session")
+            return _error(404, "unknown_session")
         except InvalidCallbackTokenError:
             _log_callback_rejection(chat, presented_session, "invalid_token")
             return _error(401, "invalid_token")
         except StateCorruptError:
             _log_callback_rejection(chat, presented_session, "state_corrupt")
             return _error(500, "state_corrupt")
-    return _error(503, "callback_processing_unavailable")
 
 
 
@@ -156,7 +174,7 @@ def _bound_version_bytes(store: OfficeStore, chat: str, state: dict[str, Any], b
 def _require_callback_binding(state: dict[str, Any], session_id: str, payload: dict[str, Any]) -> None:
     sessions_map = state.get("sessions")
     if not isinstance(sessions_map, dict) or session_id not in sessions_map:
-        raise InvalidCallbackTokenError()
+        raise UnknownCallbackSessionError()
     session = sessions._persisted_session(session_id, sessions_map[session_id])
     key = payload.get("key")
     if not isinstance(key, str) or not key or key != session["document_key"]:
