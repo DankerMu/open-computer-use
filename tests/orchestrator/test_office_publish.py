@@ -676,3 +676,85 @@ def test_workspace_permission_failure_retains_obligation_before_replace(world, m
     assert stat.S_IMODE(fixture.target.stat().st_mode) == 0o644
     assert _index(fixture).read_bytes() == before_index
     assert not list(fixture.target.parent.glob(".office-publish.*"))
+
+
+def test_grown_workspace_conflict_bounds_actual_target_reads(world, monkeypatch):
+    import office.publish as publisher
+    import outputs_broker
+
+    fixture = _prepared(world)
+    limit = 32
+    broker = outputs_broker.OutputsBroker(max_file_size=limit)
+    assert broker.reconcile(CHAT)["entries"][0]["size"] == len(BASELINE)
+    before_index = _index(fixture).read_bytes()
+    grown = b"agent-expanded-content-" * 3
+    fixture.target.write_bytes(grown)
+    target_identity = fixture.target.stat()
+    read_bytes = 0
+    original_read = os.read
+
+    def observed_read(fd, count):
+        nonlocal read_bytes
+        body = original_read(fd, count)
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (target_identity.st_dev, target_identity.st_ino):
+            read_bytes += len(body)
+        return body
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(publisher, "OutputsBroker", lambda: broker)
+        boundary.setattr(os, "read", observed_read)
+        result = _publish()
+    assert (result.outcome, result.reason) == ("conflict", "baseline_mismatch")
+    assert read_bytes <= limit + 1
+    assert fixture.target.read_bytes() == grown
+    assert fixture.target.stat().st_ino == target_identity.st_ino
+    assert fixture.target.stat().st_size == len(grown)
+    assert _index(fixture).read_bytes() == before_index
+    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    blob = fixture.data / CHAT / ".ocu" / "office" / "versions" / _sha(SAVED)
+    assert blob.read_bytes() == SAVED
+
+
+def test_exact_limit_baseline_is_hashed_and_published(world, monkeypatch):
+    import office.publish as publisher
+    import outputs_broker
+
+    fixture = _prepared(world)
+    limit = len(BASELINE)
+    broker = outputs_broker.OutputsBroker(max_file_size=limit)
+    before_index = _index(fixture).read_bytes()
+    original_read = os.read
+    target_identity = fixture.target.stat()
+    read_bytes = 0
+
+    def observed_read(fd, count):
+        nonlocal read_bytes
+        body = original_read(fd, count)
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (target_identity.st_dev, target_identity.st_ino):
+            read_bytes += len(body)
+        return body
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(publisher, "OutputsBroker", lambda: broker)
+        boundary.setattr(os, "read", observed_read)
+        result = _publish()
+    assert read_bytes == limit
+    assert (result.outcome, result.reason) == ("published", None)
+    assert fixture.target.read_bytes() == SAVED
+    after = fixture.store.read(CHAT)
+    expected = copy.deepcopy(fixture.before)
+    document = expected["documents"][fixture.file_id]
+    document["versions"][1]["published"] = True
+    document["published_version"] = 2
+    document["published_sha256"] = _sha(SAVED)
+    expected["sessions"][SESSION]["baseline_sha256"] = _sha(SAVED)
+    del expected["journal"][OBLIGATION]
+    assert after == expected
+    before_counter = json.loads(before_index)["counter"]
+    persisted = json.loads(_index(fixture).read_bytes())
+    assert persisted["counter"] == before_counter + 1
+    assert persisted["active"]["report.docx"]["hash"] == _sha(SAVED)
+    assert broker.reconcile(CHAT)["revision"] == before_counter + 1
+    assert broker.reconcile(CHAT)["revision"] == before_counter + 1

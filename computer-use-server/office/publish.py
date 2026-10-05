@@ -169,7 +169,10 @@ def publish_stopped(chat_id: str, journal_id: str) -> PublishResult:
             try:
                 held = _parents(chat, parts)
                 target = os.lstat(parts[-1], dir_fd=held[-1])
-                _body, digest = store.read_workspace_file(chat, path)
+                _body, digest = store.read_workspace_file(chat, path, max_bytes=broker.max_file_size)
+                del _body
+            except workspace.FileTooLargeError:
+                result = PublishResult("conflict", "baseline_mismatch")
             except workspace.UnsafePathError as exc:
                 cause = exc.__cause__
                 if isinstance(cause, OSError) and cause.errno not in _PATH_ERRORS:

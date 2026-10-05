@@ -18,8 +18,10 @@
 ### Changed
 - **Standalone stopped Office publication.** A persisted publish obligation can
   replace an indexed workspace file when the sandbox is confirmed absent or
-  exited, under the shared chat lock. Publication hashes the baseline on every
-  attempt, stages exclusively without following links, atomically replaces with
+  exited, under the shared chat lock. Publication hashes supported-size current
+  files on every attempt; growth beyond the existing per-file limit completes as
+  a baseline conflict without an unbounded read. It stages exclusively without
+  following links and atomically replaces with
   shared workspace permissions, registers one broker revision, and commits the
   version, document publication metadata and bound baseline together. Conflicts
   preserve workspace bytes; interrupted IO retains recovery responsibility.
