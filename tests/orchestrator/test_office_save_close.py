@@ -36,6 +36,7 @@ from tests.orchestrator.test_office_sessions import (
     _assert_refusal,
     _create,
     _office,
+    _outputs,
     _snapshot,
     _state,
     _versions,
@@ -679,6 +680,133 @@ def test_repeated_closing_reuses_pending_seq_without_lookup(office_world, monkey
         "session_id": first["session_id"], "save_seq": 6, "state": "closing",
     }
     _assert_activity_only(before, _snapshot(data), first["session_id"])
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("kind", ("status2", "status4_unpublished"))
+def test_repeat_close_after_consumed_pending_reuses_final_receipt_seq(office_world, monkeypatch, kind):
+    from office.store import OfficeStore
+    from tests.orchestrator._office_recorded_callbacks import (
+        recorded_status_1_payload,
+        recorded_status_2_payload,
+        recorded_status_4_payload,
+    )
+    from tests.orchestrator.test_office_callback_processing import (
+        CHANGED,
+        _bind_internal,
+        _content_origin,
+        _post,
+    )
+    from tests.orchestrator.test_office_control_plane import _open_session
+
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    opened = _post(http, session, recorded_status_1_payload(document_key=session["document_key"]))
+    assert opened.status_code == 200
+    with _content_origin({"/close.docx": CHANGED}) as server:
+        _bind_internal(monkeypatch, server.url)
+        first = _close(http, session["session_id"])
+        assert first.status_code == 202
+        allocated = first.json()["save_seq"]
+        assert first.json() == {
+            "session_id": session["session_id"], "save_seq": allocated, "state": "closing",
+        }
+        if kind == "status2":
+            payload = recorded_status_2_payload(
+                document_key=session["document_key"],
+                url=server.url + "/close.docx",
+            )
+            final = _post(http, session, payload)
+            assert final.status_code == 200
+            assert final.json() == {"error": 0}
+        else:
+            unpublished = OfficeStore().store_version(
+                CHAT, session["file_id"], CHANGED, source="autosave", parent=1,
+                published=False, min_free_bytes=0,
+            )
+            payload = recorded_status_4_payload(document_key=session["document_key"])
+            final = _post(http, session, payload)
+            assert final.status_code == 200
+            assert final.json() == {"error": 0}
+            listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
+            assert listed[-1]["number"] == unpublished["number"]
+            assert listed[-1]["published"] is False
+        record = _record(session["session_id"])
+        assert record["state"] == "closing"
+        assert record.get("pending_close_seq") in (None,)
+        receipts = json.loads(_state(data).read_bytes())["receipts"][session["session_id"]]
+        assert str(allocated) in receipts
+        hits = server.hits
+        before_store, before_files = _persisted_inventory(data)
+        workspace = _outputs(data) / "report.docx"
+        before_workspace = workspace.read_bytes()
+        before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
+        state_path = _state(data)
+        before_state_stat = state_path.stat()
+        repeat = _close(http, session["session_id"])
+        assert repeat.status_code == 202
+        assert repeat.json() == {
+            "session_id": session["session_id"], "save_seq": allocated, "state": "closing",
+        }
+        after_store, after_files = _persisted_inventory(data)
+        assert after_store == before_store
+        assert after_files == before_files
+        after_state_stat = state_path.stat()
+        assert (after_state_stat.st_ino, after_state_stat.st_mtime_ns) == (
+            before_state_stat.st_ino, before_state_stat.st_mtime_ns,
+        )
+        assert server.hits == hits
+        assert workspace.read_bytes() == before_workspace
+        assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+        after = _record(session["session_id"])
+        assert after["state"] == "closing"
+        assert after.get("pending_close_seq") in (None,)
+        assert json.loads(_state(data).read_bytes())["receipts"][session["session_id"]] == receipts
+    assert origin.hits == 0
+
+
+def test_pending_close_allocation_precedes_older_final_receipt(office_world, monkeypatch):
+    from office.store import OfficeStore
+
+    http, data, origin, _docker, _broker = office_world
+    _file_id, first = _created(office_world, "closing")
+    _change(first["session_id"], save_seq=6, pending_close_seq=6)
+    OfficeStore().record_receipt(CHAT, first["session_id"], 2, {
+        "status": 2, "sha256": None, "version": None, "answer": {"error": 0},
+    })
+    before = _snapshot(data)
+    with monkeypatch.context() as env:
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
+        response = _close(http, first["session_id"])
+    assert response.status_code == 202
+    assert response.json() == {
+        "session_id": first["session_id"], "save_seq": 6, "state": "closing",
+    }
+    _assert_activity_only(before, _snapshot(data), first["session_id"])
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("kind", ("missing", "malformed", "ambiguous"))
+def test_consumed_pending_close_without_valid_final_receipt_is_state_corrupt(office_world, kind):
+    from office.store import OfficeStore
+
+    http, data, origin, _docker, _broker = office_world
+    _file_id, first = _created(office_world, "closing")
+    _change(first["session_id"], save_seq=4, pending_close_seq=None, last_committed_seq=4)
+    if kind == "malformed":
+        OfficeStore().record_receipt(CHAT, first["session_id"], 4, {
+            "status": 2, "sha256": None, "version": None, "answer": "not-an-object",
+        })
+    elif kind == "ambiguous":
+        OfficeStore().record_receipt(CHAT, first["session_id"], 3, {
+            "status": 2, "sha256": None, "version": None, "answer": {"error": 0},
+        })
+        OfficeStore().record_receipt(CHAT, first["session_id"], 4, {
+            "status": 4, "sha256": None, "version": None, "answer": {"error": 0},
+        })
+    before = _snapshot(data)
+    response = _close(http, first["session_id"])
+    _assert_refusal(response, 500, "state_corrupt")
+    assert _snapshot(data) == before
     assert origin.hits == 0
 
 

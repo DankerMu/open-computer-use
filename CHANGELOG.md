@@ -42,8 +42,10 @@
   `{"intent":"publish"|"persist"}`, allocates the next `save_seq`, records
   that intent, and sends one forcesave command after the allocation is
   durable. `POST .../close` records a pending close without force-save;
-  a never-opened session ends `closed` immediately. Create and join sign
-  `editorConfig.customization.forcesave` false. Callbacks, publish,
+  a never-opened session ends `closed` immediately. A later close while the
+  session is still closing reuses the pending allocation, or the consumed
+  final-receipt sequence when that marker is gone, without a new command.
+  Create and join sign `editorConfig.customization.forcesave` false. Publish,
   `last_published_seq` advancement and host auto-save remain later operations.
 
 - **Office session join and persisted status.** Repeated document opens

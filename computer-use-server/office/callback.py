@@ -86,9 +86,10 @@ def _process(
             raise CallbackRefusal(409, "session_not_open")
         raise CallbackRefusal(422, "unknown_status", reported=status)
     if status in _FINAL:
-        final = _final_receipt(state, session_id)
-        if final is not None:
-            answer = _successful_answer(final)
+        found = sessions._final_receipt(state, session_id)
+        if found is not None:
+            _sequence, final = found
+            answer = sessions._successful_answer(final)
             _replay_barrier(store, chat)
             return JSONResponse(status_code=200, content=answer)
     userdata = _forcesave_userdata(payload) if status in _FORCESAVE else None
@@ -201,7 +202,7 @@ def _replay_forcesave(
 ) -> JSONResponse:
     if existing["status"] != status:
         raise CallbackRefusal(409, "stale_save_seq")
-    answer = _successful_answer(existing)
+    answer = sessions._successful_answer(existing)
     _replay_barrier(store, chat)
     if status == 7 or existing["sha256"] is None:
         return JSONResponse(status_code=200, content=answer)
@@ -397,20 +398,6 @@ def _replay_barrier(store: OfficeStore, chat: str) -> None:
         os.close(base_fd)
 
 
-def _final_receipt(state: dict[str, Any], session_id: str) -> dict[str, Any] | None:
-    slot = versions._session_receipts(state, session_id, create=False)
-    found = None
-    for sequence, record in (slot or {}).items():
-        if not isinstance(sequence, str) or not sequence.isascii() or not sequence.isdigit():
-            raise StateCorruptError("office receipt sequence is invalid")
-        if sequence.startswith("0"):
-            raise StateCorruptError("office receipt sequence is invalid")
-        receipt = versions._persisted_receipt(record)
-        if receipt["status"] in _FINAL:
-            found = receipt
-    return found
-
-
 def _receipt_at(state: dict[str, Any], session_id: str, save_seq: int) -> dict[str, Any] | None:
     slot = versions._session_receipts(state, session_id, create=False)
     if slot is None:
@@ -419,15 +406,6 @@ def _receipt_at(state: dict[str, Any], session_id: str, save_seq: int) -> dict[s
     if key not in slot:
         return None
     return versions._persisted_receipt(slot[key])
-
-
-def _successful_answer(receipt: dict[str, Any]) -> dict[str, Any]:
-    answer = receipt.get("answer")
-    if not isinstance(answer, dict) or set(answer) != {"error"}:
-        raise StateCorruptError("office callback receipt answer is invalid")
-    if type(answer.get("error")) is not int or answer.get("error") != 0:
-        raise StateCorruptError("office callback receipt answer is invalid")
-    return {"error": 0}
 
 
 def _forcesave_userdata(payload: dict[str, Any]) -> tuple[int, str] | None:

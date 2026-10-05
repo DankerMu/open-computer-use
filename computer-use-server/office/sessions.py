@@ -169,7 +169,7 @@ def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
         if active is not None:
             _status_projection(active)
             latest = _active_versions(state, file_id)[-1]
-            ended = active["state"] == "conflict" and _has_final_receipt(state, active["session_id"])
+            ended = active["state"] == "conflict" and _final_receipt(state, active["session_id"]) is not None
             reason = None
             if active["restore_epoch"] != restore_epoch:
                 reason = "restore_epoch_changed"
@@ -332,17 +332,37 @@ def _active_versions(state, file_id):
     return versions._document_versions(state, file_id)
 
 
-def _has_final_receipt(state, session_id) -> bool:
+def _successful_answer(receipt: dict[str, Any]) -> dict[str, Any]:
+    answer = receipt.get("answer")
+    if not isinstance(answer, dict) or set(answer) != {"error"}:
+        raise StateCorruptError("office callback receipt answer is invalid")
+    if type(answer.get("error")) is not int or answer.get("error") != 0:
+        raise StateCorruptError("office callback receipt answer is invalid")
+    return {"error": 0}
+
+
+def _final_receipt(state, session_id) -> tuple[int, dict[str, Any]] | None:
     slot = versions._session_receipts(state, session_id, create=False)
-    ended = False
+    found = None
     for sequence, record in (slot or {}).items():
         if not isinstance(sequence, str) or not sequence.isascii() or not sequence.isdigit():
             raise StateCorruptError("office receipt sequence is invalid")
         if sequence.startswith("0"):
             raise StateCorruptError("office receipt sequence is invalid")
         receipt = versions._persisted_receipt(record)
-        ended = ended or receipt["status"] in (2, 3, 4)
-    return ended
+        if receipt["status"] in (2, 3, 4):
+            if found is not None:
+                raise StateCorruptError("office session has more than one final receipt")
+            try:
+                key = int(sequence)
+            except ValueError as extra:
+                raise StateCorruptError("office receipt sequence is invalid") from extra
+            if type(key) is not int or key < 1:
+                raise StateCorruptError("office receipt sequence is invalid")
+            found = (key, receipt)
+    if found is not None:
+        _successful_answer(found[1])
+    return found
 
 
 def _orphan_session(store, chat, session_id, reason):
@@ -385,7 +405,7 @@ def _session_status(chat_id, session_id):
             state = _orphan_session(store, chat, session_id, "restore_epoch_changed")
             status = _status_projection(state["sessions"][session_id])
         elif record["state"] in OPEN_STATES:
-            ended = record["state"] == "conflict" and _has_final_receipt(state, session_id)
+            ended = record["state"] == "conflict" and _final_receipt(state, session_id) is not None
             status = notice.refresh_workspace_notice(
                 store, chat, session_id, record, activity_at=None if ended else time.time(),
             )
@@ -518,7 +538,7 @@ def _refresh_activity(store, chat, session_id) -> None:
     def mutate(working):
         current = _require_session(working, session_id)
         if current["state"] in OPEN_STATES and not (
-            current["state"] == "conflict" and _has_final_receipt(working, session_id)
+            current["state"] == "conflict" and _final_receipt(working, session_id) is not None
         ):
             current["last_activity_at"] = time.time()
     store.update(chat, mutate)
@@ -607,7 +627,7 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
             return
         if current["state"] in FINAL_STATES:
             return
-        ended_conflict = current["state"] == "conflict" and _has_final_receipt(working, session_id)
+        ended_conflict = current["state"] == "conflict" and _final_receipt(working, session_id) is not None
         if ended_conflict:
             return
         current["pending_save_seq"] = None
@@ -655,11 +675,19 @@ def _close_session(chat_id, session_id) -> dict[str, Any]:
             return _commit_opening_close(store, chat, session_id)
         if record["state"] == "closing":
             pending = record.get("pending_close_seq")
-            if type(pending) is not int:
+            if type(pending) is int:
+                if pending < 1:
+                    raise StateCorruptError("office session pending allocation is invalid")
+                _refresh_activity(store, chat, session_id)
+                return {"session_id": session_id, "save_seq": pending, "state": "closing"}
+            if pending is not None:
                 raise StateCorruptError("office session pending allocation is invalid")
-            _refresh_activity(store, chat, session_id)
-            return {"session_id": session_id, "save_seq": pending, "state": "closing"}
-        ended_conflict = record["state"] == "conflict" and _has_final_receipt(state, session_id)
+            found = _final_receipt(state, session_id)
+            if found is None:
+                raise StateCorruptError("office session pending allocation is invalid")
+            sequence, _receipt = found
+            return {"session_id": session_id, "save_seq": sequence, "state": "closing"}
+        ended_conflict = record["state"] == "conflict" and _final_receipt(state, session_id) is not None
         if ended_conflict:
             return {
                 "session_id": session_id,
