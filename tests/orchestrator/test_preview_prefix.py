@@ -60,6 +60,8 @@ _APP_MODULES = (
     "office.ooxml",
     "office.sweep",
     "office.control_plane",
+    "office.download",
+    "office.callback",
 )
 
 _BASELINE_ASSETS = (

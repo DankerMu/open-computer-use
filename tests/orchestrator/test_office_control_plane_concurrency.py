@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tests.orchestrator.test_office_control_plane import _callback_path, _header_jwt, _open_session
-from tests.orchestrator.test_office_sessions import SERVER_DIR, _snapshot, office_world
+from tests.orchestrator.test_office_sessions import SERVER_DIR, office_world
 from tests.orchestrator.test_outputs_endpoint import CHAT
 
 
@@ -28,7 +29,6 @@ def test_callback_lock_keeps_same_loop_health_responsive(office_world):
 
     http, data, origin, docker, _broker, _content, session = _open_session(office_world)
     token = _header_jwt(session)
-    before = _snapshot(data)
     held = threading.Event()
     release = threading.Event()
     expired = threading.Event()
@@ -75,8 +75,8 @@ def test_callback_lock_keeps_same_loop_health_responsive(office_world):
             assert not expired.is_set()
             release.set()
             callback = await pending
-            assert callback.status_code == 503
-            assert callback.json() == {"reason": "callback_processing_unavailable"}
+            assert callback.status_code == 200
+            assert callback.json() == {"error": 0}
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         holder = pool.submit(_hold_chat_lock, docker, CHAT, held, release, expired)
@@ -88,7 +88,8 @@ def test_callback_lock_keeps_same_loop_health_responsive(office_world):
             holder.result(timeout=5)
             docker._combined_lock = original_lock
     assert not expired.is_set()
-    assert _snapshot(data) == before
+    state = json.loads((data / CHAT / ".ocu" / "office" / "state.json").read_bytes())
+    assert state["sessions"][session["session_id"]]["state"] == "editing"
     assert origin.hits == 0
 
 
@@ -98,7 +99,6 @@ def test_callback_waits_for_ordinary_process_holder_while_health_progresses(offi
 
     http, data, origin, docker, _broker, _content, session = _open_session(office_world)
     token = _header_jwt(session)
-    before = _snapshot(data)
     entered = data.parent / "callback-process-entered"
     contended = data.parent / "callback-process-contended"
     release_path = data.parent / "callback-process-release"
@@ -226,8 +226,8 @@ print("released")
                 assert not pending.done()
                 release_holder()
                 callback = await pending
-                assert callback.status_code == 503
-                assert callback.json() == {"reason": "callback_processing_unavailable"}
+                assert callback.status_code == 200
+                assert callback.json() == {"error": 0}
 
         asyncio.run(exercise())
         stdout, stderr = holder.communicate(timeout=10)
@@ -240,6 +240,7 @@ print("released")
         _stop_child(holder)
         watching.join(timeout=2)
     assert not watchdog_released.is_set()
-    assert _snapshot(data) == before
+    state = json.loads((data / CHAT / ".ocu" / "office" / "state.json").read_bytes())
+    assert state["sessions"][session["session_id"]]["state"] == "editing"
     assert origin.hits == 0
 
