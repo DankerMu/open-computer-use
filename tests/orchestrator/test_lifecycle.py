@@ -1515,6 +1515,211 @@ def test_lock_open_failure_releases_thread_lock_for_other_thread(world, monkeypa
     assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
 
 
+def test_non_creating_lock_returns_none_then_same_chat_can_acquire(world):
+    docker_manager, _client, _clock, tmp_path = world
+    root = tmp_path / "data" / CHAT
+    assert not root.exists()
+    with docker_manager._combined_lock(CHAT, create=False) as held:
+        assert held is None
+    assert not root.exists()
+    assert CHAT not in docker_manager._FLOCK_DEPTH
+    acquired = {"ok": False}
+
+    def other():
+        with docker_manager._combined_lock(CHAT) as lock:
+            assert lock is not None
+            acquired["ok"] = True
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    thread.join(timeout=2)
+    assert thread.is_alive() is False
+    assert acquired["ok"] is True
+    assert root.is_dir()
+    assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
+
+
+def test_nested_existing_and_ordinary_lock_modes_share_one_flock(world):
+    docker_manager, _client, _clock, tmp_path = world
+    root = tmp_path / "data" / CHAT
+    root.mkdir(parents=True)
+    with docker_manager._combined_lock(CHAT) as outer:
+        assert outer is not None
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+        with docker_manager._combined_lock(CHAT, create=False) as inner:
+            assert inner is not None
+            assert docker_manager._FLOCK_DEPTH[CHAT] == 2
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+    assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
+    with docker_manager._combined_lock(CHAT, create=False) as outer:
+        assert outer is not None
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+        with docker_manager._combined_lock(CHAT) as inner:
+            assert inner is not None
+            assert docker_manager._FLOCK_DEPTH[CHAT] == 2
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+    assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
+    assert list(root.iterdir()) == [root / ".lifecycle.lock"]
+
+
+def test_non_creating_lock_serializes_two_processes_without_creating(tmp_path):
+    holder_script = r'''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+import docker_manager
+from office.store import OfficeStore
+
+chat = os.environ["OCU_CHAT"]
+hold = os.environ["OCU_HOLD"]
+entered = Path(os.environ["OCU_ENTERED"])
+with docker_manager._combined_lock(chat, create=False) as held:
+    assert held is not None
+    def mutate(state):
+        state["documents"]["held"] = {"id": "held"}
+    snapshot = OfficeStore().update(chat, mutate)
+    entered.write_text("1", encoding="utf-8")
+    fd = os.open(hold, os.O_RDONLY)
+    os.close(fd)
+print(json.dumps({"documents": snapshot["documents"]}))
+'''
+    waiter_script = r'''
+import fcntl, json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+import docker_manager
+from office.store import OfficeStore
+
+original = fcntl.flock
+
+def contend_then_block(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        try:
+            original(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            Path(os.environ["OCU_OBSERVED"]).write_text("denied", encoding="utf-8")
+            return original(fd, fcntl.LOCK_EX)
+        original(fd, fcntl.LOCK_UN)
+        Path(os.environ["OCU_OBSERVED"]).write_text("acquired", encoding="utf-8")
+        raise AssertionError("non-creating lock was granted without contention")
+    return original(fd, operation)
+
+fcntl.flock = contend_then_block
+chat = os.environ["OCU_CHAT"]
+with docker_manager._combined_lock(chat) as held:
+    assert held is not None
+    def mutate(state):
+        state["documents"]["waiter"] = {"id": "waiter"}
+    snapshot = OfficeStore().update(chat, mutate)
+print(json.dumps({"documents": snapshot["documents"]}))
+'''
+    data = tmp_path / "data"
+    chat_root = data / CHAT
+    chat_root.mkdir(parents=True)
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH", "")
+    hold = tmp_path / "hold"
+    os.mkfifo(hold)
+    entered = tmp_path / "entered"
+    observed = tmp_path / "observed"
+    env.update(
+        {
+            "OCU_SERVER_DIR": str(SERVER_DIR),
+            "OCU_BASE": str(data),
+            "OCU_CHAT": CHAT,
+            "OCU_HOLD": str(hold),
+            "OCU_ENTERED": str(entered),
+            "OCU_OBSERVED": str(observed),
+            "PUBLIC_BASE_URL": "/ocu",
+            "PYTHONPATH": str(SERVER_DIR) + (os.pathsep + pythonpath if pythonpath else ""),
+        }
+    )
+    holder = waiter = None
+    released = {"fifo": False}
+
+    def release_holder():
+        if released["fifo"]:
+            return
+        released["fifo"] = True
+        try:
+            fd = os.open(hold, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        os.close(fd)
+
+    def reap(child):
+        if child is None:
+            return
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.communicate(timeout=2)
+                return
+            except subprocess.TimeoutExpired:
+                child.kill()
+        try:
+            child.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            try:
+                child.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    try:
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            cwd=str(SERVER_DIR),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 5
+        while not entered.exists():
+            if time.monotonic() >= deadline or holder.poll() is not None:
+                raise AssertionError(("holder did not acquire create=False lock", holder.poll(), holder.communicate(timeout=2) if holder.poll() is not None else None))
+            time.sleep(0.005)
+        waiter = subprocess.Popen(
+            [sys.executable, "-c", waiter_script],
+            cwd=str(SERVER_DIR),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 5
+        while not observed.exists():
+            if time.monotonic() >= deadline or waiter.poll() is not None:
+                waiter_out = waiter.communicate(timeout=2) if waiter.poll() is not None else (None, None)
+                raise AssertionError(("ordinary writer did not publish flock observation", waiter.poll(), waiter_out))
+            time.sleep(0.005)
+        assert observed.read_text(encoding="utf-8") == "denied"
+        assert waiter.poll() is None
+        assert holder.poll() is None
+        release_holder()
+        holder_out, holder_err = holder.communicate(timeout=10)
+        waiter_out, waiter_err = waiter.communicate(timeout=10)
+        assert holder.returncode == 0, (holder_out, holder_err)
+        assert waiter.returncode == 0, (waiter_out, waiter_err)
+        holder_state = json.loads(holder_out.strip().splitlines()[-1])
+        waiter_state = json.loads(waiter_out.strip().splitlines()[-1])
+        assert holder_state["documents"]["held"] == {"id": "held"}
+        assert "waiter" not in holder_state["documents"]
+        assert waiter_state["documents"]["held"] == {"id": "held"}
+        assert waiter_state["documents"]["waiter"] == {"id": "waiter"}
+        assert chat_root.is_dir()
+    finally:
+        release_holder()
+        reap(holder)
+        reap(waiter)
+
+
+
+
+
 def test_bad_chat_does_not_starve_reaper_or_next_tick(world, monkeypatch):
     docker_manager, client, clock, _tmp = world
     first = _put(client, f"owui-chat-{CHAT}", "running", container_id="bad")

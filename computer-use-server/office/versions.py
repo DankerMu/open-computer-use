@@ -193,6 +193,31 @@ def mark_published(store: OfficeStore, chat_id: str, file_id: str, number: int) 
     return marked
 
 
+def read_version_bytes(store: OfficeStore, chat_id: str, digest: str) -> bytes:
+    chat = docker_manager.canonical_lock_chat_id(chat_id)
+    if not isinstance(digest, str) or not _HASH.fullmatch(digest):
+        raise StateCorruptError("version blob name is invalid")
+    opened = store._open_tree(chat, create=False)
+    if opened is None:
+        raise StateCorruptError("version blob is missing after an exclusive claim")
+    base_fd, root_fd, ocu_fd, office_fd = opened
+    versions_fd = None
+    try:
+        versions_fd = store._open_dir(
+            "versions", dir_fd=office_fd, create=False, label="office versions directory"
+        )
+        if versions_fd is None:
+            raise StateCorruptError("version blob is missing after an exclusive claim")
+        return _verify_blob(store, versions_fd, digest, _blob_stat(versions_fd, digest))
+    finally:
+        if versions_fd is not None:
+            os.close(versions_fd)
+        os.close(office_fd)
+        os.close(ocu_fd)
+        os.close(root_fd)
+        os.close(base_fd)
+
+
 def record_receipt(
     store: OfficeStore,
     chat_id: str,
@@ -388,7 +413,7 @@ def _blob_stat(versions_fd: int, digest: str) -> os.stat_result | None:
         raise StateCorruptError("version blob is unreadable") from extra
 
 
-def _verify_blob(store: OfficeStore, versions_fd: int, digest: str, info: os.stat_result | None) -> None:
+def _verify_blob(store: OfficeStore, versions_fd: int, digest: str, info: os.stat_result | None) -> bytes:
     if info is None:
         raise StateCorruptError("version blob is missing after an exclusive claim")
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
@@ -408,6 +433,7 @@ def _verify_blob(store: OfficeStore, versions_fd: int, digest: str, info: os.sta
         os.close(blob_fd)
     if hashlib.sha256(body).hexdigest() != digest:
         raise StateCorruptError("version blob does not hash to its name")
+    return body
 
 
 def _document_versions(state: dict[str, Any], file_id: str) -> list[dict[str, Any]]:

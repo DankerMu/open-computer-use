@@ -62,6 +62,7 @@ _APP_MODULES = (
     "office.notice",
     "office.ooxml",
     "office.sweep",
+    "office.control_plane",
 )
 
 
