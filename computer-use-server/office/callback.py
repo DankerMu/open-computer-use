@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -66,6 +67,10 @@ def process_authenticated_callback(
         return JSONResponse(status_code=502, content={"reason": "download_failed"})
     except ooxml.CorruptDocumentError:
         return JSONResponse(status_code=422, content={"reason": "invalid_content"})
+    except OSError as extra:
+        if extra.errno == errno.ENOSPC:
+            return JSONResponse(status_code=503, content={"reason": "storage_low"})
+        return JSONResponse(status_code=500, content={"reason": "state_corrupt"})
 
 
 def _process(

@@ -1280,3 +1280,150 @@ def test_equal_latest_content_adds_no_version(office_world, monkeypatch):
         assert receipt["version"] == after[-1]["number"]
         assert receipt["sha256"] == after[-1]["sha256"]
     assert origin.hits == 0
+
+
+def test_status2_precommit_state_write_eio_is_structured_then_retry_commits(
+    office_world, monkeypatch
+):
+    import errno
+    from office.store import OfficeStore
+
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    monkeypatch.setattr(http._transport, "raise_server_exceptions", False)
+    original = OfficeStore._write_all
+    fired = []
+    office = data / CHAT / ".ocu" / "office"
+    digest = _sha(CHANGED)
+
+    def fail_state_write(fd, encoded):
+        if not fired and encoded.startswith(b'{"documents":'):
+            blob = office / "versions" / digest
+            assert blob.is_file()
+            assert blob.read_bytes() == CHANGED
+            fired.append(True)
+            raise OSError(errno.EIO, "injected precommit state write failure")
+        return original(fd, encoded)
+
+    with _content_origin({"/close.docx": CHANGED}) as server:
+        _bind_internal(monkeypatch, server.url)
+        payload = recorded_status_2_payload(
+            document_key=session["document_key"],
+            url=server.url + "/close.docx",
+        )
+        before = _snapshot(data)
+        before_state = json.loads(_state(data).read_bytes())
+        before_record = dict(before_state["sessions"][session["session_id"]])
+        before_versions = list(before_state["documents"][session["file_id"]]["versions"])
+        before_workspace = (_outputs(data) / "report.docx").read_bytes()
+        before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
+        monkeypatch.setattr(OfficeStore, "_write_all", staticmethod(fail_state_write))
+        response = _post(http, session, payload)
+        after = _snapshot(data)
+        assert fired == [True]
+        assert after == before
+        staging = office / "staging"
+        if staging.exists():
+            assert list(staging.iterdir()) == []
+        assert not (office / "versions" / digest).exists()
+        assert response.headers["content-type"].startswith("application/json")
+        _assert_refusal(response, 500, "state_corrupt")
+        assert len(server.requests) == 1
+        retry = _post(http, session, payload)
+        assert retry.status_code == 200
+        assert retry.json() == {"error": 0}
+        assert fired == [True]
+        listed, receipts, journal = _history(data, session["file_id"])
+        record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
+        assert len(listed) == len(before_versions) + 1
+        assert listed[-1]["sha256"] == digest
+        assert listed[-1]["source"] == "close"
+        assert listed[-1]["published"] is False
+        assert receipts == {
+            session["session_id"]: {
+                "1": {
+                    "status": 2,
+                    "sha256": digest,
+                    "version": listed[-1]["number"],
+                    "answer": {"error": 0},
+                }
+            }
+        }
+        assert journal == {}
+        assert record["state"] == before_record["state"] == "opening"
+        assert record["last_committed_seq"] == 1
+        assert record["save_seq"] == 1
+        assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
+        assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+        replay = _post(http, session, payload)
+        assert replay.status_code == 200
+        assert replay.json() == {"error": 0}
+        replay_listed, replay_receipts, replay_journal = _history(
+            data, session["file_id"]
+        )
+        assert replay_listed == listed
+        assert replay_receipts == receipts
+        assert replay_journal == journal
+        assert len(server.requests) == 2
+    assert origin.hits == 0
+
+
+def test_status1_precommit_state_write_eio_is_structured_then_retry_commits(
+    office_world, monkeypatch
+):
+    import errno
+    from office.store import OfficeStore
+
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    monkeypatch.setattr(http._transport, "raise_server_exceptions", False)
+    original = OfficeStore._write_all
+    fired = []
+
+    def fail_state_write(fd, encoded):
+        if not fired and encoded.startswith(b'{"documents":'):
+            fired.append(True)
+            raise OSError(errno.EIO, "injected precommit state write failure")
+        return original(fd, encoded)
+
+    payload = recorded_status_1_payload(document_key=session["document_key"])
+    before = _snapshot(data)
+    before_state = json.loads(_state(data).read_bytes())
+    before_versions = list(before_state["documents"][session["file_id"]]["versions"])
+    before_workspace = (_outputs(data) / "report.docx").read_bytes()
+    before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    monkeypatch.setattr(OfficeStore, "_write_all", staticmethod(fail_state_write))
+    response = _post(http, session, payload)
+    after = _snapshot(data)
+    assert fired == [True]
+    assert after == before
+    office = data / CHAT / ".ocu" / "office"
+    staging = office / "staging"
+    if staging.exists():
+        assert list(staging.iterdir()) == []
+    assert response.headers["content-type"].startswith("application/json")
+    _assert_refusal(response, 500, "state_corrupt")
+    retry = _post(http, session, payload)
+    assert retry.status_code == 200
+    assert retry.json() == {"error": 0}
+    assert fired == [True]
+    listed, receipts, journal = _history(data, session["file_id"])
+    record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
+    assert listed == before_versions
+    assert receipts == {}
+    assert journal == {}
+    assert record["state"] == "editing"
+    assert record["participants"] == RECORDED_STATUS_1_USERS
+    assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+    replay = _post(http, session, payload)
+    assert replay.status_code == 200
+    replay_listed, replay_receipts, replay_journal = _history(data, session["file_id"])
+    replay_record = json.loads(_state(data).read_bytes())["sessions"][
+        session["session_id"]
+    ]
+    assert replay_listed == listed
+    assert replay_receipts == receipts
+    assert replay_journal == journal
+    assert replay_record["state"] == "editing"
+    assert origin.hits == 0
+
+

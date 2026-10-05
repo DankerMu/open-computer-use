@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Office callback persistence errors.** Ordinary filesystem failures during
+  content and no-content callback persistence return HTTP 500 with JSON reason
+  `state_corrupt`, without error-time state writes. Disk-full failures remain
+  503 `storage_low`; post-replacement durability failures remain
+  500 `state_durability`.
+
 - **Environment-injection Docker fixtures.** Credential-isolation and
   CLI-passthrough Docker test doubles model create/start/reload to `running`
   and apply requested DNS and port bindings to inspected `HostConfig`.
