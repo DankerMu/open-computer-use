@@ -16,16 +16,19 @@
 
 
 ### Changed
-- **Standalone stopped Office publication.** A persisted publish obligation can
-  replace an indexed workspace file when the sandbox is confirmed absent or
-  exited, under the shared chat lock. Publication hashes supported-size current
-  files on every attempt; growth beyond the existing per-file limit completes as
-  a baseline conflict without an unbounded read. It stages exclusively without
-  following links and atomically replaces with
-  shared workspace permissions, registers one broker revision, and commits the
-  version, document publication metadata and bound baseline together. Conflicts
-  preserve workspace bytes; interrupted IO retains recovery responsibility.
-  Running/paused publication, recovery driving and callback wiring are excluded.
+- **Standalone fenced Office publication.** `office.publish.publish` consumes a
+  persisted obligation under the shared chat lock. A running sandbox is paused
+  and freshly observed paused before hashing or replacing workspace bytes;
+  stopped/absent sandboxes need no pause, and externally paused sandboxes stay
+  paused. Publication retains bounded baseline reads, exclusive no-follow staging,
+  atomic shared-permission replacement and one broker revision. Only the owned
+  container and marker are released; uncertain release keeps the marker without
+  changing an established outcome. A monotonic five-second safe-boundary budget
+  stops new publication phases, not an in-flight blocking operation: pre-replace
+  timeout preserves the old file, while incomplete postreplace timeout returns
+  `interrupted` / `publish_timeout` with complete successor bytes and journal
+  retained. Pause-request elapsed time is logged without a hard release guarantee.
+  Recovery driving and caller/lifecycle integration are excluded.
 
 - **Office DocumentServer control-plane routes.** `GET /office/source/{ticket}`
   authenticates by a short-lived source ticket and returns the bound immutable
