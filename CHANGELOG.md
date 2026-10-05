@@ -16,7 +16,8 @@
   /office/callback/{chat}/{session}` authenticates only a verified DocumentServer
   JWT whose key matches the named session, then answers 503
   `callback_processing_unavailable` without mutation until callback processing
-  lands. Both routes reject sandbox-subnet peers with 403 `forbidden`, return 404 when
+  lands. Authenticated callback lock, root recheck and state read run off the
+  event loop. Both routes reject sandbox-subnet peers with 403 `forbidden`, return 404 when
   Office is disabled, and never accept the internal token as a substitute.
   Source tickets, including encoded newlines, authenticate as `invalid_ticket`.
   A chat directory that disappears before the non-creating canonical lock is

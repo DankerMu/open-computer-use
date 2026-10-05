@@ -344,6 +344,29 @@ def test_callback_credential_failures_are_invalid_token_without_mutation(office_
     assert origin.hits == 0
 
 
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        b"{not-json",
+        b"[1]",
+        json.dumps({"token": 1}).encode("utf-8"),
+    ),
+)
+def test_malformed_callback_envelope_is_invalid_token_without_work(office_world, monkeypatch, body):
+    http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
+    before = _snapshot(data)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("malformed callback envelope made an outbound request")
+
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    response = http.post(_callback_path(session), content=body)
+    _assert_refusal(response, 401, "invalid_token")
+    assert _snapshot(data) == before
+    assert origin.hits == 0
+
+
 def test_wrong_key_does_not_change_either_session(office_world):
     http, data, origin, _docker, broker = office_world
     first_content = intact_docx()
@@ -557,3 +580,4 @@ def test_other_chat_bound_office_routes_still_require_internal_token(office_worl
     response = http.get(f"/api/office/{CHAT}/sessions/{session['session_id']}")
     assert response.status_code == 401
     assert origin.hits == 0
+

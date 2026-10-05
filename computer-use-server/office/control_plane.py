@@ -3,6 +3,7 @@
 """DocumentServer source delivery and callback admission without processing."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -96,6 +97,10 @@ async def admit_callback(request: Request) -> JSONResponse:
     if payload is None:
         _log_callback_rejection(chat, presented_session, reason)
         return _error(401, "invalid_token")
+    return await asyncio.to_thread(_admit_authenticated_callback, chat, presented_session, payload)
+
+
+def _admit_authenticated_callback(chat: str, presented_session: str, payload: dict[str, Any]) -> JSONResponse:
     if not _chat_directory_exists(chat):
         _log_callback_rejection(chat, presented_session, "unknown_session")
         return _error(404, "unknown_session")
@@ -115,6 +120,7 @@ async def admit_callback(request: Request) -> JSONResponse:
             _log_callback_rejection(chat, presented_session, "state_corrupt")
             return _error(500, "state_corrupt")
     return _error(503, "callback_processing_unavailable")
+
 
 
 def _bound_version_bytes(store: OfficeStore, chat: str, state: dict[str, Any], binding: dict[str, Any]) -> bytes:
