@@ -92,9 +92,9 @@ def test_stopped_publish_commits_workspace_index_and_office_together(world, sand
     store, broker, target = fixture.store, fixture.broker, fixture.target
     before, indexed, file_id = fixture.before, fixture.indexed, fixture.file_id
     container, engine, data = fixture.container, fixture.engine, fixture.data
-    from office.publish import publish_stopped
+    from office.publish import publish
 
-    result = publish_stopped(CHAT, OBLIGATION)
+    result = publish(CHAT, OBLIGATION)
 
     assert result.outcome == "published"
     assert result.reason is None
@@ -124,8 +124,8 @@ def test_stopped_publish_commits_workspace_index_and_office_together(world, sand
 
 
 def _publish():
-    from office.publish import publish_stopped
-    return publish_stopped(CHAT, OBLIGATION)
+    from office.publish import publish
+    return publish(CHAT, OBLIGATION)
 
 
 def _without_obligation(fixture):
@@ -348,7 +348,7 @@ def test_second_publish_uses_updated_bound_baseline(world):
     assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 2
 
 
-@pytest.mark.parametrize("status", ["running", "paused", "created", "restarting", "removing", "dead", "unknown", ""])
+@pytest.mark.parametrize("status", ["created", "restarting", "removing", "dead", "unknown", ""])
 def test_unsupported_actual_sandbox_state_preserves_obligation(world, status):
     from office.publish import SandboxStateError
     fixture = _prepared(world)
@@ -403,10 +403,10 @@ def test_sessionless_restore_uses_document_baseline_without_touching_sessions(wo
 
 
 def test_missing_chat_is_not_recreated(world):
-    from office.publish import publish_stopped
+    from office.publish import publish
     store_mod, _manager, data = world
     with pytest.raises(store_mod.StateCorruptError):
-        publish_stopped(CHAT, OBLIGATION)
+        publish(CHAT, OBLIGATION)
     assert not (data / CHAT).exists()
 
 
