@@ -149,6 +149,7 @@ def app_module(monkeypatch):
             "office.store",
             "office.versions",
             "office.workspace",
+            "office.publish",
             "office.epoch",
             "office.tokens",
             "office.commands",

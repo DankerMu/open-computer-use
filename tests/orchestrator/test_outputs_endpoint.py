@@ -55,6 +55,7 @@ _APP_MODULES = (
     "office.store",
     "office.versions",
     "office.workspace",
+    "office.publish",
     "office.epoch",
     "office.tokens",
     "office.commands",

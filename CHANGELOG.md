@@ -16,6 +16,15 @@
 
 
 ### Changed
+- **Standalone stopped Office publication.** A persisted publish obligation can
+  replace an indexed workspace file when the sandbox is confirmed absent or
+  exited, under the shared chat lock. Publication hashes the baseline on every
+  attempt, stages exclusively without following links, atomically replaces with
+  shared workspace permissions, registers one broker revision, and commits the
+  version, document publication metadata and bound baseline together. Conflicts
+  preserve workspace bytes; interrupted IO retains recovery responsibility.
+  Running/paused publication, recovery driving and callback wiring are excluded.
+
 - **Office DocumentServer control-plane routes.** `GET /office/source/{ticket}`
   authenticates by a short-lived source ticket and returns the bound immutable
   version bytes, including after the workspace file changes. `POST
