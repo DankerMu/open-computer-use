@@ -3,6 +3,7 @@
 """Persist an authenticated DocumentServer callback under the chat lock."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -40,9 +41,10 @@ def process_authenticated_callback(
     chat: str,
     session_id: str,
     payload: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
 ) -> JSONResponse:
     try:
-        return _process(store, chat, session_id, payload)
+        return _process(store, chat, session_id, payload, loop)
     except CallbackRefusal as extra:
         _reject(chat, session_id, extra.reason, extra.reported)
         return JSONResponse(status_code=extra.status, content={"reason": extra.reason})
@@ -71,6 +73,7 @@ def _process(
     chat: str,
     session_id: str,
     payload: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
 ) -> JSONResponse:
     state = store._snapshot(store._load(chat, create=False))
     record = sessions._persisted_session(session_id, state["sessions"][session_id])
@@ -85,11 +88,12 @@ def _process(
     if status in _FINAL:
         final = _final_receipt(state, session_id)
         if final is not None:
+            answer = _successful_answer(final)
             _replay_barrier(store, chat)
-            return JSONResponse(status_code=200, content=final["answer"])
+            return JSONResponse(status_code=200, content=answer)
     userdata = _forcesave_userdata(payload) if status in _FORCESAVE else None
     if status in _FORCESAVE:
-        response = _forcesave_order(store, chat, session_id, record, status, userdata, payload)
+        response = _forcesave_order(store, chat, session_id, record, status, userdata, payload, loop)
         if response is not None:
             return response
     if record["state"] in _ENDED:
@@ -109,7 +113,7 @@ def _process(
     if status == 4:
         _apply_no_content(store, chat, session_id, 4, _apply_status_4)
         return JSONResponse(status_code=200, content=_SUCCESS)
-    _persist_content(store, chat, session_id, record, status, payload, userdata)
+    _persist_content(store, chat, session_id, record, status, payload, userdata, loop)
     return JSONResponse(status_code=200, content=_SUCCESS)
 
 
@@ -121,6 +125,7 @@ def _forcesave_order(
     status: int,
     userdata: tuple[int, str] | None,
     payload: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
 ) -> JSONResponse | None:
     if userdata is None:
         if record["state"] in _ENDED:
@@ -129,7 +134,7 @@ def _forcesave_order(
     save_seq, presented_intent = userdata
     existing = _receipt_at(store._snapshot(store._load(chat, create=False)), session_id, save_seq)
     if existing is not None:
-        return _replay_forcesave(store, chat, status, existing, payload)
+        return _replay_forcesave(store, chat, status, existing, payload, loop)
     issued = _issued_intent(record, save_seq)
     if issued is None or save_seq > record["save_seq"] or presented_intent != issued:
         if record["state"] in _ENDED:
@@ -153,11 +158,12 @@ def _persist_content(
     status: int,
     payload: dict[str, Any],
     userdata: tuple[int, str] | None,
+    loop: asyncio.AbstractEventLoop,
 ) -> None:
     save_seq = userdata[0] if userdata is not None else None
     intent = userdata[1] if userdata is not None else None
     try:
-        body = download.fetch_callback_content(payload.get("url"))
+        body = download.fetch_callback_content(payload.get("url"), loop)
         _validate_content(store, chat, session_id, body)
         if status == 6:
             assert save_seq is not None and intent is not None
@@ -191,17 +197,19 @@ def _replay_forcesave(
     status: int,
     existing: dict[str, Any],
     payload: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
 ) -> JSONResponse:
     if existing["status"] != status:
         raise CallbackRefusal(409, "stale_save_seq")
+    answer = _successful_answer(existing)
     _replay_barrier(store, chat)
     if status == 7 or existing["sha256"] is None:
-        return JSONResponse(status_code=200, content=existing["answer"])
-    body = download.fetch_callback_content(payload.get("url"))
+        return JSONResponse(status_code=200, content=answer)
+    body = download.fetch_callback_content(payload.get("url"), loop)
     digest = hashlib.sha256(body).hexdigest()
     if existing["sha256"] != digest:
         raise CallbackRefusal(409, "stale_save_seq")
-    return JSONResponse(status_code=200, content=existing["answer"])
+    return JSONResponse(status_code=200, content=answer)
 
 
 def _validate_content(store: OfficeStore, chat: str, session_id: str, body: bytes) -> None:
@@ -411,6 +419,15 @@ def _receipt_at(state: dict[str, Any], session_id: str, save_seq: int) -> dict[s
     if key not in slot:
         return None
     return versions._persisted_receipt(slot[key])
+
+
+def _successful_answer(receipt: dict[str, Any]) -> dict[str, Any]:
+    answer = receipt.get("answer")
+    if not isinstance(answer, dict) or set(answer) != {"error"}:
+        raise StateCorruptError("office callback receipt answer is invalid")
+    if type(answer.get("error")) is not int or answer.get("error") != 0:
+        raise StateCorruptError("office callback receipt answer is invalid")
+    return {"error": 0}
 
 
 def _forcesave_userdata(payload: dict[str, Any]) -> tuple[int, str] | None:

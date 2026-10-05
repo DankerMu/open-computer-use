@@ -16,8 +16,11 @@
   /office/callback/{chat}/{session}` authenticates only a verified DocumentServer
   JWT whose key matches the named session, then handles status, receipts and
   confined persist under the existing no-create chat lock. Authenticated
-  callback lock, root recheck, download and state commit run off the event
-  loop. Both routes reject sandbox-subnet peers with 403 `forbidden`, return 404 when
+  callback lock, root recheck and state commit run on Starlette's AnyIO
+  threadpool, not the loop default executor; confined download is submitted
+  onto the captured request loop with a bounded wait. Callback fetches request
+  identity encoding and never wait for a per-call resolver executor shutdown.
+  Both routes reject sandbox-subnet peers with 403 `forbidden`, return 404 when
   Office is disabled, and never accept the internal token as a substitute.
   Source tickets, including encoded newlines, authenticate as `invalid_ticket`.
   A chat directory that disappears before the non-creating canonical lock is

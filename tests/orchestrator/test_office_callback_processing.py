@@ -824,6 +824,384 @@ def test_oversized_download_leaves_no_staging(office_world, monkeypatch):
     assert origin.hits == 0
 
 
+def test_callback_dns_stall_returns_before_resolver_executor_shutdown(office_world, monkeypatch):
+    import socket
+    import time
+
+    import office.commands as commands
+
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    _change(
+        session["session_id"],
+        state="saving",
+        save_seq=1,
+        pending_save_seq=1,
+        save_intents={"1": "persist"},
+    )
+    before = json.loads(_state(data).read_bytes())
+    before_versions = list(before["documents"][session["file_id"]]["versions"])
+    before_receipts = json.loads(json.dumps(before["receipts"]))
+    monkeypatch.setattr(commands, "HTTP_TIMEOUT_SECONDS", 0.05)
+    original = socket.getaddrinfo
+    calls = []
+    release = threading.Event()
+
+    def delayed(host, port, *args, **kwargs):
+        if str(host) == "slow-resolution.example":
+            calls.append(str(host))
+            release.wait(0.3)
+            return original("127.0.0.1", port, *args, **kwargs)
+        return original(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", delayed)
+    try:
+        with _content_origin({"/cache/ok.docx": CHANGED}) as server:
+            host_url = f"http://slow-resolution.example:{urlsplit(server.url).port}"
+            _bind_internal(monkeypatch, host_url)
+            payload = recorded_status_6_payload(
+                document_key=session["document_key"],
+                url=host_url + "/cache/ok.docx",
+                save_seq=1,
+                intent="persist",
+            )
+            started = time.monotonic()
+            response = _post(http, session, payload)
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.2
+            _assert_refusal(response, 502, "download_failed")
+            assert calls == ["slow-resolution.example"]
+            after = json.loads(_state(data).read_bytes())
+            record = after["sessions"][session["session_id"]]
+            assert record["state"] == "editing"
+            assert record["reason"] == "download_failed"
+            assert after["receipts"] == before_receipts
+            assert after["documents"][session["file_id"]]["versions"] == before_versions
+            assert (_outputs(data) / "report.docx").read_bytes() == content
+            assert server.hits == 0
+    finally:
+        release.set()
+    assert origin.hits == 0
+
+
+def test_callback_persists_when_default_executor_has_one_worker(office_world, monkeypatch):
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    _change(
+        session["session_id"],
+        state="saving",
+        save_seq=1,
+        pending_save_seq=1,
+        save_intents={"1": "persist"},
+    )
+    limited = ThreadPoolExecutor(max_workers=1)
+
+    def limit_executor():
+        asyncio.get_running_loop().set_default_executor(limited)
+
+    http.portal.call(limit_executor)
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
+        host_url = f"http://localhost:{urlsplit(server.url).port}"
+        _bind_internal(monkeypatch, host_url)
+        payload = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=host_url + "/cache/ok.docx",
+            save_seq=1,
+            intent="persist",
+        )
+        first = _post(http, session, payload)
+        assert first.status_code == 200
+        assert first.json() == {"error": 0}
+        listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
+        receipt = _receipt(data, session["session_id"], 1)
+        assert receipt["sha256"] == _sha(CHANGED)
+        assert listed[-1]["sha256"] == _sha(CHANGED)
+        hits = server.hits
+        replay = _post(http, session, payload)
+        assert replay.status_code == 200
+        assert replay.json() == {"error": 0}
+        assert server.hits == hits + 1
+        after = json.loads(_state(data).read_bytes())
+        assert after["receipts"][session["session_id"]]["1"]["sha256"] == _sha(CHANGED)
+        assert after["sessions"][session["session_id"]]["save_seq"] == 1
+        assert (_outputs(data) / "report.docx").read_bytes() == content
+    assert origin.hits == 0
+
+
+def test_committed_seq3_then_seq4_replay_same_bytes_and_reject_different(office_world, monkeypatch):
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    first = CHANGED
+    second = CHANGED + b"2"
+    _change(
+        session["session_id"],
+        state="saving",
+        save_seq=4,
+        pending_save_seq=3,
+        save_intents={"3": "persist", "4": "persist"},
+        last_committed_seq=0,
+    )
+    with _content_origin({"/cache/3.docx": first, "/cache/4.docx": second}) as server:
+        _bind_internal(monkeypatch, server.url)
+        three = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/3.docx",
+            save_seq=3,
+            intent="persist",
+        )
+        assert _post(http, session, three).status_code == 200
+        after_three = json.loads(_state(data).read_bytes())
+        listed_three = after_three["documents"][session["file_id"]]["versions"]
+        assert listed_three[-1]["sha256"] == _sha(first)
+        assert after_three["sessions"][session["session_id"]]["last_committed_seq"] == 3
+        _change(session["session_id"], pending_save_seq=4)
+        four = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/4.docx",
+            save_seq=4,
+            intent="persist",
+        )
+        assert _post(http, session, four).status_code == 200
+        after_four = json.loads(_state(data).read_bytes())
+        listed = after_four["documents"][session["file_id"]]["versions"]
+        assert listed[-1]["sha256"] == _sha(second)
+        assert after_four["sessions"][session["session_id"]]["last_committed_seq"] == 4
+        receipts = after_four["receipts"][session["session_id"]]
+        assert set(receipts) == {"3", "4"}
+        index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+        hits = server.hits
+        same = _post(http, session, three)
+        assert same.status_code == 200
+        assert same.json() == {"error": 0}
+        assert server.hits == hits + 1
+        different = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/4.docx",
+            save_seq=3,
+            intent="persist",
+        )
+        response = _post(http, session, different)
+        _assert_refusal(response, 409, "stale_save_seq")
+        assert server.hits == hits + 2
+        after = json.loads(_state(data).read_bytes())
+        assert after["documents"][session["file_id"]]["versions"] == listed
+        assert after["receipts"][session["session_id"]] == receipts
+        assert after["sessions"][session["session_id"]]["save_seq"] == 4
+        assert after["sessions"][session["session_id"]]["last_committed_seq"] == 4
+        assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert origin.hits == 0
+
+
+def test_route_timeout_returns_editing_then_same_signed_retry_commits(office_world, monkeypatch):
+    import office.commands as commands
+
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    _change(
+        session["session_id"],
+        state="saving",
+        save_seq=1,
+        pending_save_seq=1,
+        save_intents={"1": "persist"},
+    )
+    monkeypatch.setattr(commands, "HTTP_TIMEOUT_SECONDS", 0.05)
+    with _content_origin({"/cache/ok.docx": CHANGED}, delay=0.3) as server:
+        _bind_internal(monkeypatch, server.url)
+        payload = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/ok.docx",
+            save_seq=1,
+            intent="persist",
+        )
+        before = json.loads(_state(data).read_bytes())
+        first = _post(http, session, payload)
+        _assert_refusal(first, 502, "download_failed")
+        after_fail = json.loads(_state(data).read_bytes())
+        record = after_fail["sessions"][session["session_id"]]
+        assert record["state"] == "editing"
+        assert record["reason"] == "download_failed"
+        assert record["save_seq"] == 1
+        assert record["pending_save_seq"] is None
+        assert after_fail["receipts"] == before["receipts"]
+        listed = after_fail["documents"][session["file_id"]]["versions"]
+        assert all(item["sha256"] != _sha(CHANGED) for item in listed)
+        office = data / CHAT / ".ocu" / "office"
+        staging = office / "staging"
+        if staging.exists():
+            assert list(staging.iterdir()) == []
+        monkeypatch.setattr(commands, "HTTP_TIMEOUT_SECONDS", 10)
+        retry = _post(http, session, payload)
+        assert retry.status_code == 200
+        after = json.loads(_state(data).read_bytes())
+        committed = after["sessions"][session["session_id"]]
+        assert committed["last_committed_seq"] == 1
+        assert committed["save_seq"] == 1
+        assert after["receipts"][session["session_id"]]["1"]["sha256"] == _sha(CHANGED)
+        assert (_outputs(data) / "report.docx").read_bytes() == content
+    assert origin.hits == 0
+
+
+def test_epoch_change_after_open_final_receipt_orphans_without_fetch(office_world, monkeypatch):
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    opened = _post(http, session, recorded_status_1_payload(document_key=session["document_key"]))
+    assert opened.status_code == 200
+    with _content_origin({"/cache/close.docx": CHANGED}) as server:
+        _bind_internal(monkeypatch, server.url)
+        payload = recorded_status_2_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/close.docx",
+        )
+        first = _post(http, session, payload)
+        assert first.status_code == 200
+        before = json.loads(_state(data).read_bytes())
+        record = before["sessions"][session["session_id"]]
+        assert record["state"] == "editing"
+        receipts = before["receipts"][session["session_id"]]
+        listed = before["documents"][session["file_id"]]["versions"]
+        workspace = (_outputs(data) / "report.docx").read_bytes()
+        index = (data / CHAT / ".ocu" / "index.json").read_bytes()
+        hits = server.hits
+        (data / ".office-restore-epoch").write_text("new-epoch", encoding="utf-8")
+        replay = _post(http, session, payload)
+        _assert_refusal(replay, 409, "session_not_open")
+        assert server.hits == hits
+        after = json.loads(_state(data).read_bytes())
+        assert after["sessions"][session["session_id"]]["state"] == "orphaned"
+        assert after["sessions"][session["session_id"]]["reason"] == "restore_epoch_changed"
+        assert after["receipts"][session["session_id"]] == receipts
+        assert after["documents"][session["file_id"]]["versions"] == listed
+        assert (_outputs(data) / "report.docx").read_bytes() == workspace
+        assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index
+    assert origin.hits == 0
+
+
+def test_gzip_negotiating_origin_persists_identity_ooxml(office_world, monkeypatch):
+    import gzip
+
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    packed = gzip.compress(CHANGED)
+    _change(
+        session["session_id"],
+        state="saving",
+        save_seq=1,
+        pending_save_seq=1,
+        save_intents={"1": "persist"},
+    )
+
+    class EncodingOrigin(_ContentOrigin):
+        def __init__(self):
+            self.requests = []
+            self.hits = 0
+            parent = self
+
+            class Handler(BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
+                def log_message(self, format, *args):
+                    return
+
+                def do_GET(self):
+                    parent.hits += 1
+                    headers = {key.lower(): value for key, value in self.headers.items()}
+                    parent.requests.append({"path": self.path, "headers": headers})
+                    accept = headers.get("accept-encoding", "")
+                    if "gzip" in accept.lower() and "identity" not in accept.lower():
+                        body = packed
+                        encoding = "gzip"
+                    else:
+                        body = CHANGED
+                        encoding = "identity"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Encoding", encoding)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+            self._thread.start()
+
+    server = EncodingOrigin()
+    try:
+        _bind_internal(monkeypatch, server.url)
+        payload = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/ok.docx",
+            save_seq=1,
+            intent="persist",
+        )
+        response = _post(http, session, payload)
+        assert response.status_code == 200
+        listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
+        assert listed[-1]["sha256"] == _sha(CHANGED)
+        assert listed[-1]["sha256"] != _sha(packed)
+        assert server.requests[0]["headers"].get("accept-encoding") == "identity"
+    finally:
+        server.close()
+    assert origin.hits == 0
+
+
+def test_malformed_receipt_answer_is_state_corrupt_without_fetch(office_world, monkeypatch):
+    from office.store import OfficeStore
+
+    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+
+    def plant_final(working):
+        working["receipts"][session["session_id"]] = {
+            "1": {
+                "status": 2,
+                "sha256": "a" * 64,
+                "version": 1,
+                "answer": "not-an-object",
+            }
+        }
+
+    OfficeStore().update(CHAT, plant_final)
+    with _content_origin({"/cache/close.docx": CHANGED}) as server:
+        _bind_internal(monkeypatch, server.url)
+        payload = recorded_status_2_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/close.docx",
+        )
+        before = json.loads(_state(data).read_bytes())
+        response = _post(http, session, payload)
+        _assert_refusal(response, 500, "state_corrupt")
+        assert server.requests == []
+        after = json.loads(_state(data).read_bytes())
+        assert after == before
+
+    def plant_forcesave(working):
+        working["sessions"][session["session_id"]]["state"] = "saving"
+        working["sessions"][session["session_id"]]["save_seq"] = 1
+        working["sessions"][session["session_id"]]["pending_save_seq"] = 1
+        working["sessions"][session["session_id"]]["save_intents"] = {"1": "persist"}
+        working["receipts"][session["session_id"]] = {
+            "1": {
+                "status": 6,
+                "sha256": "b" * 64,
+                "version": 1,
+                "answer": {"error": True},
+            }
+        }
+
+    OfficeStore().update(CHAT, plant_forcesave)
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
+        _bind_internal(monkeypatch, server.url)
+        payload = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/ok.docx",
+            save_seq=1,
+            intent="persist",
+        )
+        before = json.loads(_state(data).read_bytes())
+        response = _post(http, session, payload)
+        _assert_refusal(response, 500, "state_corrupt")
+        assert server.requests == []
+        after = json.loads(_state(data).read_bytes())
+        assert after == before
+    assert origin.hits == 0
+
+
 def test_storage_low_returns_session_to_editing_and_retry_commits(office_world, monkeypatch):
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
     import office.versions as versions_mod
@@ -859,17 +1237,15 @@ def test_storage_low_returns_session_to_editing_and_retry_commits(office_world, 
         assert record["state"] == "editing"
         assert record["reason"] == "storage_low"
         assert record["last_committed_seq"] == 0
+        assert record["save_seq"] == 1
+        assert record["pending_save_seq"] is None
+        assert record["save_intents"] == {"1": "persist"}
         assert json.loads(_state(data).read_bytes())["receipts"] == {}
-        _change(
-            session["session_id"],
-            state="saving",
-            pending_save_seq=1,
-            reason=None,
-        )
         retry = _post(http, session, payload)
         assert retry.status_code == 200
         record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
         assert record["last_committed_seq"] == 1
+        assert record["save_seq"] == 1
         listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
         assert listed[-1]["sha256"] == _sha(CHANGED)
     assert origin.hits == 0

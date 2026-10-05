@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -15,6 +17,7 @@ from . import commands, config
 
 MAX_REDIRECTS = 5
 _REDIRECTS = frozenset({301, 302, 303, 307, 308})
+_IDENTITY = {"Accept-Encoding": "identity"}
 
 
 class DownloadRejected(ValueError):
@@ -32,9 +35,18 @@ class FileTooLarge(ValueError):
     reason = "file_too_large"
 
 
-def fetch_callback_content(url: str) -> bytes:
+def fetch_callback_content(url: str, loop: asyncio.AbstractEventLoop) -> bytes:
     target = confined_internal_url(url)
-    return asyncio.run(_download(target))
+    if loop.is_closed() or loop.is_running() is False:
+        raise DownloadFailed("callback download loop is unavailable")
+    future = asyncio.run_coroutine_threadsafe(_download(target), loop)
+    try:
+        return future.result(timeout=commands.HTTP_TIMEOUT_SECONDS)
+    except FutureTimeoutError as extra:
+        future.cancel()
+        raise DownloadFailed("callback download transfer failed") from extra
+    except FutureCancelledError as extra:
+        raise DownloadFailed("callback download transfer failed") from extra
 
 
 def confined_internal_url(url: str) -> str:
@@ -139,6 +151,7 @@ async def _download(url: str) -> bytes:
             trust_env=False,
             cookie_jar=aiohttp.DummyCookieJar(),
             auto_decompress=False,
+            headers=_IDENTITY,
         ) as session:
             async with asyncio.timeout(commands.HTTP_TIMEOUT_SECONDS):
                 for _hop in range(MAX_REDIRECTS + 1):
@@ -146,6 +159,7 @@ async def _download(url: str) -> bytes:
                         current,
                         allow_redirects=False,
                         timeout=timeout,
+                        headers=_IDENTITY,
                     ) as response:
                         if response.status in _REDIRECTS:
                             current = _redirect_target(current, response.headers.get("Location"))

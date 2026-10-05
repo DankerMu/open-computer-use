@@ -13,6 +13,7 @@ from urllib.parse import unquote
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 import docker_manager
 from auth_guard import AuthGuardError, canonical_chat_id
@@ -101,10 +102,18 @@ async def admit_callback(request: Request) -> JSONResponse:
     if payload is None:
         _log_callback_rejection(chat, presented_session, reason)
         return _error(401, "invalid_token")
-    return await asyncio.to_thread(_admit_authenticated_callback, chat, presented_session, payload)
+    loop = asyncio.get_running_loop()
+    return await run_in_threadpool(
+        _admit_authenticated_callback, chat, presented_session, payload, loop
+    )
 
 
-def _admit_authenticated_callback(chat: str, presented_session: str, payload: dict[str, Any]) -> JSONResponse:
+def _admit_authenticated_callback(
+    chat: str,
+    presented_session: str,
+    payload: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
+) -> JSONResponse:
     if not _chat_directory_exists(chat):
         _log_callback_rejection(chat, presented_session, "unknown_session")
         return _error(404, "unknown_session")
@@ -117,7 +126,9 @@ def _admit_authenticated_callback(chat: str, presented_session: str, payload: di
             store._assert_chat_root_safe(chat, allow_missing=False)
             state = store._snapshot(store._load(chat, create=False))
             _require_callback_binding(state, presented_session, payload)
-            return callback.process_authenticated_callback(store, chat, presented_session, payload)
+            return callback.process_authenticated_callback(
+                store, chat, presented_session, payload, loop
+            )
         except UnknownCallbackSessionError:
             _log_callback_rejection(chat, presented_session, "unknown_session")
             return _error(404, "unknown_session")

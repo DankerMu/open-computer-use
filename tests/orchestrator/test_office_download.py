@@ -3,6 +3,8 @@
 """Public-seam tests for confined DocumentServer callback downloads."""
 from __future__ import annotations
 
+import asyncio
+import gzip
 import sys
 import threading
 import time
@@ -11,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from anyio.from_thread import start_blocking_portal
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
@@ -58,6 +61,7 @@ class _DownloadOrigin:
     def close(self):
         self._server.shutdown()
         self._thread.join(timeout=2)
+        self._server.server_close()
 
 
 @contextmanager
@@ -67,6 +71,17 @@ def _origin(responder):
         yield server
     finally:
         server.close()
+
+
+@contextmanager
+def _running_loop():
+    with start_blocking_portal() as portal:
+        yield portal.call(asyncio.get_running_loop)
+
+
+def _fetch(url: str) -> bytes:
+    with _running_loop() as loop:
+        return download.fetch_callback_content(url, loop)
 
 
 @pytest.fixture
@@ -85,7 +100,7 @@ def test_browser_origin_is_rewritten_to_internal_path_and_query(office_env):
     with _origin(responder) as server:
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
         presented = OFFICE_SETTINGS["OCU_OFFICE_DOCSERVER_ORIGIN"] + "/cache/output.docx?filename=out.docx"
-        assert download.fetch_callback_content(presented) == body
+        assert _fetch(presented) == body
         assert [item["path"] for item in server.requests] == ["/cache/output.docx?filename=out.docx"]
         assert "authorization" not in server.requests[0]["headers"]
         assert "cookie" not in server.requests[0]["headers"]
@@ -99,7 +114,7 @@ def test_internal_origin_is_fetched_directly(office_env):
 
     with _origin(responder) as server:
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
-        assert download.fetch_callback_content(server.url + "/kept.docx") == body
+        assert _fetch(server.url + "/kept.docx") == body
         assert [item["path"] for item in server.requests] == ["/kept.docx"]
 
 
@@ -107,7 +122,7 @@ def test_foreign_origin_makes_no_request(office_env):
     with _origin(lambda _handler: (200, {}, b"secret")) as server:
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
         with pytest.raises(download.DownloadRejected) as error:
-            download.fetch_callback_content("http://127.0.0.1:9/secret")
+            _fetch("http://127.0.0.1:9/secret")
         assert error.value.reason == "download_url_rejected"
         assert server.requests == []
 
@@ -127,7 +142,7 @@ def test_malformed_addresses_are_rejected_without_fetch(office_env, url):
     with _origin(lambda _handler: (200, {}, b"no")) as server:
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
         with pytest.raises(download.DownloadRejected) as error:
-            download.fetch_callback_content(url)
+            _fetch(url)
         assert error.value.reason == "download_url_rejected"
         assert server.requests == []
 
@@ -139,7 +154,7 @@ def test_foreign_redirect_is_not_followed(office_env):
     with _origin(responder) as server:
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
         with pytest.raises(download.DownloadFailed) as error:
-            download.fetch_callback_content(server.url + "/start")
+            _fetch(server.url + "/start")
         assert error.value.reason == "download_failed"
         assert [item["path"] for item in server.requests] == ["/start"]
 
@@ -153,7 +168,7 @@ def test_oversized_stream_is_file_too_large(office_env, monkeypatch):
     with _origin(responder) as server:
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
         with pytest.raises(download.FileTooLarge) as error:
-            download.fetch_callback_content(server.url + "/big")
+            _fetch(server.url + "/big")
         assert error.value.reason == "file_too_large"
 
 
@@ -167,8 +182,46 @@ def test_timeout_is_download_failed(office_env, monkeypatch):
     with _origin(responder) as server:
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
         with pytest.raises(download.DownloadFailed) as error:
-            download.fetch_callback_content(server.url + "/slow")
+            _fetch(server.url + "/slow")
         assert error.value.reason == "download_failed"
+
+
+def test_cancelled_submitted_download_future_is_download_failed(office_env, monkeypatch):
+    submitted = []
+    original = asyncio.run_coroutine_threadsafe
+
+    def track(coro, loop):
+        future = original(coro, loop)
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", track)
+
+    def responder(_handler):
+        time.sleep(2)
+        return 200, {}, intact_docx()
+
+    with _origin(responder) as server:
+        office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
+        with _running_loop() as loop:
+            def cancel_submitted():
+                deadline = time.monotonic() + 2
+                while not submitted:
+                    if time.monotonic() >= deadline:
+                        return
+                    time.sleep(0.005)
+                submitted[0].cancel()
+
+            canceller = threading.Thread(target=cancel_submitted)
+            canceller.start()
+            try:
+                with pytest.raises(download.DownloadFailed) as error:
+                    download.fetch_callback_content(server.url + "/slow", loop)
+                assert error.value.reason == "download_failed"
+                assert submitted
+                assert submitted[0].cancelled()
+            finally:
+                canceller.join(timeout=2)
 
 
 def test_confined_rebuild_rejects_protocol_relative_path(office_env):
@@ -178,6 +231,7 @@ def test_confined_rebuild_rejects_protocol_relative_path(office_env):
             OFFICE_SETTINGS["OCU_OFFICE_DOCSERVER_ORIGIN"] + "//evil.test/steal"
         )
 
+
 def test_malformed_redirect_location_is_download_failed(office_env):
     def responder(_handler):
         return 302, {"Location": "http://[::1/bad"}, b""
@@ -185,7 +239,7 @@ def test_malformed_redirect_location_is_download_failed(office_env):
     with _origin(responder) as server:
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
         with pytest.raises(download.DownloadFailed) as error:
-            download.fetch_callback_content(server.url + "/start")
+            _fetch(server.url + "/start")
         assert error.value.reason == "download_failed"
         assert [item["path"] for item in server.requests] == ["/start"]
 
@@ -205,7 +259,7 @@ def test_redirect_chain_obeys_single_total_deadline(office_env, monkeypatch):
         office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
         started = time.monotonic()
         with pytest.raises(download.DownloadFailed) as error:
-            download.fetch_callback_content(server.url + "/one")
+            _fetch(server.url + "/one")
         elapsed = time.monotonic() - started
         assert error.value.reason == "download_failed"
         assert elapsed < 0.3
@@ -214,3 +268,25 @@ def test_redirect_chain_obeys_single_total_deadline(office_env, monkeypatch):
         for item in server.requests:
             assert "authorization" not in item["headers"]
             assert "cookie" not in item["headers"]
+
+
+def test_identity_encoding_is_requested_and_gzip_offer_is_not_accepted(office_env):
+    body = intact_docx()
+    packed = gzip.compress(body)
+
+    def responder(handler):
+        accept = handler.headers.get("Accept-Encoding", "")
+        if "gzip" in accept.lower() and "identity" not in accept.lower():
+            return 200, {"Content-Encoding": "gzip"}, packed
+        return 200, {"Content-Encoding": "identity"}, body
+
+    with _origin(responder) as server:
+        office_env.setenv("OCU_OFFICE_DOCSERVER_URL", server.url)
+        fetched = _fetch(server.url + "/encoded.docx")
+        assert fetched == body
+        assert fetched != packed
+        headers = server.requests[0]["headers"]
+        assert headers.get("accept-encoding") == "identity"
+        assert "authorization" not in headers
+        assert "cookie" not in headers
+

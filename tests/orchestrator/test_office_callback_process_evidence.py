@@ -70,8 +70,8 @@ if os.environ.get("OCU_CRASH") == "1":
     def explode(*args, **kwargs):
         os.kill(os.getpid(), 9)
     versions_mod.store_version = explode
-    def fetch_then_mark(url):
-        body = original_fetch(url)
+    def fetch_then_mark(url, loop):
+        body = original_fetch(url, loop)
         Path(os.environ["OCU_DOWNLOADED"]).write_text("downloaded", encoding="utf-8")
         return body
     download_mod.fetch_callback_content = fetch_then_mark
