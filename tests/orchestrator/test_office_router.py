@@ -208,7 +208,7 @@ NEWLINE_ENCODED = f"/api/office/{CHAT}/unknown%0Asegment"
 NEWLINE_DECODED = f"/api/office/{CHAT}/unknown\nsegment"
 
 
-def _raw_office(app, path, headers, method="GET", client=("testclient", 50000)):
+def _raw_office(app, path, headers, method="GET", client=("testclient", 50000), body=b""):
     messages = []
     received = False
 
@@ -217,7 +217,7 @@ def _raw_office(app, path, headers, method="GET", client=("testclient", 50000)):
         if received:
             return {"type": "http.disconnect"}
         received = True
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": body, "more_body": False}
 
     async def send(message):
         messages.append(message)
@@ -238,12 +238,12 @@ def _raw_office(app, path, headers, method="GET", client=("testclient", 50000)):
     }
     asyncio.run(app(scope, receive, send))
     start = next(message for message in messages if message["type"] == "http.response.start")
-    body = b"".join(
+    payload = b"".join(
         message.get("body") or b""
         for message in messages
         if message["type"] == "http.response.body"
     )
-    return start["status"], json.loads(body) if body else {}
+    return start["status"], json.loads(payload) if payload else {}
 
 
 

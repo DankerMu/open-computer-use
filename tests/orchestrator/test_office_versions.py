@@ -168,6 +168,8 @@ def test_identical_content_shares_one_blob_across_documents_and_nonconsecutive_r
     assert _blob(data, AUTOSAVE).read_bytes() == AUTOSAVE
     assert [record["number"] for record in _doc_versions(store_mod)] == [1, 2, 3]
     assert [record["number"] for record in _doc_versions(store_mod, FILE_B)] == [1]
+    import office.versions as versions_mod
+    assert versions_mod.read_version_bytes(store_mod.OfficeStore(), CHAT, _sha(SHARED)) == SHARED
 
 
 def test_workspace_autosave_save_numbers_are_one_two_three_and_later_stores_reuse_none(world):

@@ -30,6 +30,7 @@ import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from office.router import OfficeAvailabilityMiddleware, create_office_router
+from office.control_plane import install_source_access_log_filter
 from office.sweep import sweep_office_sessions
 from ws_recheck import (
     admit,
@@ -477,6 +478,7 @@ async def normalize_chat_id_case(request, call_next):
 app.add_middleware(OfficeAvailabilityMiddleware)
 app.add_middleware(AuthGuardMiddleware)
 app.include_router(create_office_router())
+install_source_access_log_filter()
 
 
 

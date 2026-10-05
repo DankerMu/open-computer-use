@@ -10,6 +10,20 @@
 
 
 ### Changed
+- **Office DocumentServer control-plane routes.** `GET /office/source/{ticket}`
+  authenticates by a short-lived source ticket and returns the bound immutable
+  version bytes, including after the workspace file changes. `POST
+  /office/callback/{chat}/{session}` authenticates only a verified DocumentServer
+  JWT whose key matches the named session, then answers 503
+  `callback_processing_unavailable` without mutation until callback processing
+  lands. Both routes reject sandbox-subnet peers with 403 `forbidden`, return 404 when
+  Office is disabled, and never accept the internal token as a substitute.
+  Source tickets, including encoded newlines, authenticate as `invalid_ticket`.
+  A chat directory that disappears before the non-creating canonical lock is
+  admitted as source 401 / callback 404 without recreation. Source tickets are
+  redacted in Uvicorn access logs; rejected callbacks log
+  chat, session and reason without the token.
+
 - **Office periodic session recovery.** The existing idle poll discovers Office
   state independently of sandbox metadata. Under the shared chat lock it checks
   idle live sessions and overdue saves with one bounded DocumentServer lookup.

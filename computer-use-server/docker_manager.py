@@ -23,6 +23,7 @@ import time
 import datetime
 import fcntl
 import threading
+import stat
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
@@ -174,29 +175,50 @@ def _control_dir(chat_id: str) -> Path:
     key = canonical_lock_chat_id(chat_id)
     return BASE_DATA_DIR / key
 
+
 class _CombinedLock:
     """Process lock first, then one shared flock. Reentrant on the owner thread.
 
     threading.RLock replaces a plain Lock so a lifecycle transaction can call
     another locked helper without deadlocking. Flock depth is per chat and is
     mutated only while that RLock is held, so two threads cannot interleave it.
+    create=False returns None when the chat directory is absent and never
+    creates it.
     """
 
-    def __init__(self, chat_id: str):
+    def __init__(self, chat_id: str, *, create: bool = True):
         self.chat_id = canonical_lock_chat_id(chat_id)
         self._thread_lock = get_chat_lock(self.chat_id)
         self._file = None
+        self._create = create
+        self._acquired = False
 
     def __enter__(self):
+        self._acquired = False
         self._thread_lock.acquire()
         try:
             depth = _FLOCK_DEPTH.get(self.chat_id, 0)
             if depth:
                 _FLOCK_DEPTH[self.chat_id] = depth + 1
+                self._acquired = True
                 return self
-            path = _control_dir(self.chat_id) / ".lifecycle.lock"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            handle = path.open("a+")
+            root = _control_dir(self.chat_id)
+            if not self._create:
+                try:
+                    info = os.lstat(root)
+                except FileNotFoundError:
+                    return None
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    return None
+            path = root / ".lifecycle.lock"
+            if self._create:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                handle = path.open("a+")
+            except FileNotFoundError:
+                if not self._create:
+                    return None
+                raise
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             except BaseException:
@@ -204,12 +226,16 @@ class _CombinedLock:
                 raise
             self._file = handle
             _FLOCK_DEPTH[self.chat_id] = 1
+            self._acquired = True
             return self
         except BaseException:
             self._thread_lock.release()
             raise
 
     def __exit__(self, exc_type, exc, tb):
+        if not self._acquired:
+            self._thread_lock.release()
+            return False
         try:
             depth = _FLOCK_DEPTH.get(self.chat_id, 1)
             if depth > 1:
@@ -225,8 +251,10 @@ class _CombinedLock:
         return False
 
 
-def _combined_lock(chat_id: str) -> _CombinedLock:
-    return _CombinedLock(chat_id)
+def _combined_lock(chat_id: str, *, create: bool = True) -> _CombinedLock:
+    return _CombinedLock(chat_id, create=create)
+
+
 OCU_SANDBOX_NETWORK = os.getenv("OCU_SANDBOX_NETWORK", "ocu-sandbox").strip() or "ocu-sandbox"
 SANDBOX_HOST_BIND_IP = os.getenv("SANDBOX_HOST_BIND_IP", "").strip()
 _RESERVED_SANDBOX_NETWORKS = frozenset({"bridge", "host", "none"})

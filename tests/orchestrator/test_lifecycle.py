@@ -1515,6 +1515,116 @@ def test_lock_open_failure_releases_thread_lock_for_other_thread(world, monkeypa
     assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
 
 
+def test_non_creating_lock_returns_none_then_same_chat_can_acquire(world):
+    docker_manager, _client, _clock, tmp_path = world
+    root = tmp_path / "data" / CHAT
+    assert not root.exists()
+    with docker_manager._combined_lock(CHAT, create=False) as held:
+        assert held is None
+    assert not root.exists()
+    assert CHAT not in docker_manager._FLOCK_DEPTH
+    acquired = {"ok": False}
+
+    def other():
+        with docker_manager._combined_lock(CHAT) as lock:
+            assert lock is not None
+            acquired["ok"] = True
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    thread.join(timeout=2)
+    assert thread.is_alive() is False
+    assert acquired["ok"] is True
+    assert root.is_dir()
+    assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
+
+
+def test_nested_existing_and_ordinary_lock_modes_share_one_flock(world):
+    docker_manager, _client, _clock, tmp_path = world
+    root = tmp_path / "data" / CHAT
+    root.mkdir(parents=True)
+    with docker_manager._combined_lock(CHAT) as outer:
+        assert outer is not None
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+        with docker_manager._combined_lock(CHAT, create=False) as inner:
+            assert inner is not None
+            assert docker_manager._FLOCK_DEPTH[CHAT] == 2
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+    assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
+    with docker_manager._combined_lock(CHAT, create=False) as outer:
+        assert outer is not None
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+        with docker_manager._combined_lock(CHAT) as inner:
+            assert inner is not None
+            assert docker_manager._FLOCK_DEPTH[CHAT] == 2
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+    assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
+    assert list(root.iterdir()) == [root / ".lifecycle.lock"]
+
+
+def test_non_creating_lock_serializes_two_processes_without_creating(tmp_path):
+    script = r'''
+import json, os, sys, time
+from pathlib import Path
+sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+import docker_manager
+
+root = Path(os.environ["OCU_SHARED"])
+ready = root / f"ready-{os.getpid()}"
+ready.write_text("1")
+while len(list(root.glob("ready-*"))) < 2:
+    time.sleep(0.01)
+chat = os.environ["OCU_CHAT"]
+marker = Path(os.environ["OCU_BASE"]) / chat / "order.jsonl"
+with docker_manager._combined_lock(chat, create=False) as held:
+    assert held is not None
+    with marker.open("a") as handle:
+        handle.write(json.dumps({"pid": os.getpid(), "depth": docker_manager._FLOCK_DEPTH[chat]}) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    time.sleep(0.05)
+print(json.dumps({"depth": docker_manager._FLOCK_DEPTH.get(chat, 0)}))
+'''
+    data = tmp_path / "data"
+    chat_root = data / CHAT
+    chat_root.mkdir(parents=True)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "OCU_SERVER_DIR": str(SERVER_DIR),
+            "OCU_BASE": str(data),
+            "OCU_SHARED": str(shared),
+            "OCU_CHAT": CHAT,
+            "PUBLIC_BASE_URL": "/ocu",
+        }
+    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(2)
+    ]
+    outputs = [proc.communicate(timeout=30) for proc in procs]
+    assert [proc.returncode for proc in procs] == [0, 0], [(item[0], item[1]) for item in outputs]
+    payloads = [json.loads(item[0].strip().splitlines()[-1]) for item in outputs]
+    assert payloads[0]["depth"] == 0
+    assert payloads[1]["depth"] == 0
+    lines = (chat_root / "order.jsonl").read_text().strip().splitlines()
+    assert len(lines) == 2
+    depths = [json.loads(line)["depth"] for line in lines]
+    assert depths == [1, 1]
+    assert chat_root.is_dir()
+    leftover = {path.name for path in chat_root.iterdir()}
+    assert leftover == {".lifecycle.lock", "order.jsonl"}
+
+
 def test_bad_chat_does_not_starve_reaper_or_next_tick(world, monkeypatch):
     docker_manager, client, clock, _tmp = world
     first = _put(client, f"owui-chat-{CHAT}", "running", container_id="bad")

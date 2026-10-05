@@ -24,7 +24,7 @@ from security import sanitize_chat_id
 INTERNAL_HEADER = "x-ocu-internal-token"
 _TRANSIENT_PREFIXES = ("temporary:", "local:", "channel:")
 OFFICE_PREFIX = "/api/office/"
-
+_CONTROL_PLANE_PREFIXES = ("/office/source/", "/office/callback/")
 # Chat-bound route prefixes and exact identity routes are separate policies.
 # Health, runtime-cli, docs and static stay outside both lists; the sandbox-peer
 # deny rule still applies to every HTTP and WebSocket scope.
@@ -315,7 +315,7 @@ class AuthGuardMiddleware:
         if scope["type"] == "http":
             headers = _headers(scope)
             path = scope.get("path") or ""
-            if _is_cors_preflight(scope, headers) and not path.startswith(OFFICE_PREFIX):
+            if _is_cors_preflight(scope, headers) and not path.startswith(OFFICE_PREFIX) and not path.startswith(_CONTROL_PLANE_PREFIXES):
                 if peer_denied(scope):
                     await _reject_http(send, 403, "Forbidden", scope)
                 else:
@@ -393,7 +393,10 @@ def _cors_sender(scope, send):
 
 async def _reject_http(send, status: int, detail: str, scope) -> None:
     path = scope.get("path") or ""
-    if path.startswith(OFFICE_PREFIX) and status in _OFFICE_REASONS:
+    office_reason = path.startswith(OFFICE_PREFIX) or path.startswith(
+        _CONTROL_PLANE_PREFIXES
+    )
+    if office_reason and status in _OFFICE_REASONS:
         body = (
             f'{{"reason":"{_OFFICE_REASONS[status]}","detail":"{detail}"}}'.encode(
                 "ascii"
