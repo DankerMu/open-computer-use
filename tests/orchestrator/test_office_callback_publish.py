@@ -15,6 +15,7 @@ from tests.orchestrator._office_recorded_callbacks import (
     recorded_status_1_payload,
     recorded_status_2_payload,
     recorded_status_6_payload,
+    recorded_status_4_payload,
     synthetic_status_7_payload,
 )
 from tests.orchestrator.test_lifecycle import _container, _docker
@@ -23,7 +24,7 @@ from tests.orchestrator.test_office_callback_processing import (
 )
 from tests.orchestrator.test_office_control_plane import _open_session
 from tests.orchestrator.test_office_publish import _on_staging_sync
-from tests.orchestrator.test_office_save_close import _close, _forcesave, _lookup, _save
+from tests.orchestrator.test_office_save_close import _close, _forcesave, _hold_save, _lookup, _save
 from tests.orchestrator.test_office_session_lifecycle import _change, _status
 from tests.orchestrator.test_office_sessions import (
     _assert_refusal, _create, _outputs, _snapshot, _state, _versions, office_world,
@@ -42,6 +43,35 @@ def _opened(office_world):
     assert response.status_code == 200
     assert response.json() == {"error": 0}
     return world
+
+
+def _autosaved(office_world, monkeypatch):
+    world = _opened(office_world)
+    http, data, _origin, _manager, _broker, content, session = world
+    with _forcesave(monkeypatch, session["document_key"]) as (_origin, issued):
+        accepted = _save(http, session["session_id"], "persist")
+    assert accepted.status_code == 202
+    assert accepted.json()["save_seq"] == 1
+    assert issued == [{"save_seq": 1, "intent": "persist"}]
+    with _content_origin({"/autosave.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        response = _post(http, session, recorded_status_6_payload(
+            document_key=session["document_key"], url=server.url + "/autosave.docx",
+            save_seq=issued[0]["save_seq"], intent=issued[0]["intent"],
+        ))
+    assert response.status_code == 200
+    assert response.json() == {"error": 0}
+    assert (_outputs(data) / "report.docx").read_bytes() == content
+    assert _read(data)["documents"][session["file_id"]]["versions"][-1]["published"] is False
+    return world
+
+
+def _nothing_new(http, session, monkeypatch, trigger):
+    if trigger == "final":
+        return _post(http, session, recorded_status_4_payload(
+            document_key=session["document_key"],
+        ))
+    with _forcesave(monkeypatch, session["document_key"], code=4):
+        return _save(http, session["session_id"], "publish")
 
 
 def _allocate(http, session, monkeypatch):
@@ -117,6 +147,442 @@ def _unsafe_replacement(monkeypatch, workspace, content):
         replacement.write_bytes(content)
         replacement.replace(workspace)
     _on_staging_sync(monkeypatch, change)
+
+
+def test_nothing_new_persist_keeps_autosave_unpublished_without_deferred_work(office_world, monkeypatch):
+    from office.publish import recover_publications
+
+    http, data, _origin, _manager, broker, content, session = _autosaved(office_world, monkeypatch)
+    before = _read(data)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    blobs = _snapshot(_versions(data))
+    with _forcesave(monkeypatch, session["document_key"], code=4):
+        response = _save(http, session["session_id"], "persist")
+    assert response.status_code == 202
+    assert response.json()["save_seq"] == 2
+    persisted = _read(data)
+    record = persisted["sessions"][session["session_id"]]
+    assert (record["state"], record["pending_save_seq"]) == ("editing", None)
+    assert (record["last_committed_seq"], record["last_published_seq"]) == (2, 0)
+    assert record["baseline_sha256"] == _sha(content)
+    assert persisted["documents"] == before["documents"]
+    assert persisted["receipts"] == before["receipts"]
+    assert persisted["journal"] == {}
+    assert _snapshot(_versions(data)) == blobs
+    before_recovery = _snapshot(data)
+    recover_publications(CHAT)
+    assert _snapshot(data) == before_recovery
+    assert (_outputs(data) / "report.docx").read_bytes() == content
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+
+
+@pytest.mark.parametrize("conflict", (False, True), ids=("published", "conflict"))
+def test_status4_after_autosave_reaches_final_outcome_and_complete_replay_is_inert(office_world, monkeypatch, conflict):
+    http, data, _origin, _manager, broker, content, session = _autosaved(office_world, monkeypatch)
+    with _lookup(monkeypatch, session["document_key"]):
+        closed = _close(http, session["session_id"])
+    assert closed.status_code == 202
+    assert closed.json()["save_seq"] == 2
+    before = _read(data)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    workspace = _outputs(data) / "report.docx"
+    if conflict:
+        workspace.write_bytes(content + b"agent")
+    response = _nothing_new(http, session, monkeypatch, "final")
+    assert response.status_code == 200
+    assert response.json() == {"error": 0}
+    persisted = _read(data)
+    record = persisted["sessions"][session["session_id"]]
+    assert record["state"] == ("conflict" if conflict else "closed")
+    assert record["reason"] == ("baseline_mismatch" if conflict else None)
+    assert record["pending_close_seq"] is None
+    assert (record["last_committed_seq"], record["last_published_seq"]) == (2, 0 if conflict else 2)
+    assert record["baseline_sha256"] == _sha(content if conflict else CHANGED)
+    document = persisted["documents"][session["file_id"]]
+    assert document["versions"] == [
+        before["documents"][session["file_id"]]["versions"][0],
+        {**before["documents"][session["file_id"]]["versions"][1], "published": not conflict},
+    ]
+    assert document["published_version"] == (1 if conflict else 2)
+    assert document["published_sha256"] == _sha(content if conflict else CHANGED)
+    assert workspace.read_bytes() == (content + b"agent" if conflict else CHANGED)
+    assert persisted["receipts"][session["session_id"]]["2"] == {
+        "status": 4, "sha256": None, "version": None, "answer": {"error": 0},
+    }
+    assert persisted["journal"] == {}
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + (0 if conflict else 1)
+    before_replay = _snapshot(data)
+    assert _nothing_new(http, session, monkeypatch, "final").json() == {"error": 0}
+    assert _snapshot(data) == before_replay
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + (0 if conflict else 1)
+
+
+def test_nothing_new_save_retries_retained_version_after_pause_failed(office_world, monkeypatch):
+    http, data, _origin, manager, broker, content, session = _opened(office_world)
+    _allocate(http, session, monkeypatch)
+    container = _running(manager)
+    container.pause.side_effect = RuntimeError("external engine refused pause")
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    with _content_origin({"/save.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        response = _post(http, session, _payload(session, server.url + "/save.docx"))
+    assert response.status_code == 200
+    assert response.json() == {"error": 0}
+    failed = _read(data)
+    record = failed["sessions"][session["session_id"]]
+    assert (record["state"], record["reason"]) == ("editing", "pause_failed")
+    assert (record["last_committed_seq"], record["last_published_seq"]) == (1, 0)
+    assert failed["journal"] == {}
+    assert failed["documents"][session["file_id"]]["versions"][1]["published"] is False
+    assert (_outputs(data) / "report.docx").read_bytes() == content
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+    _running(manager)
+    retried = _nothing_new(http, session, monkeypatch, "save")
+    assert retried.status_code == 202
+    assert retried.json()["save_seq"] == 2
+    completed = _read(data)
+    assert completed["documents"][session["file_id"]]["versions"] == [
+        failed["documents"][session["file_id"]]["versions"][0],
+        {**failed["documents"][session["file_id"]]["versions"][1], "published": True},
+    ]
+    assert completed["receipts"] == failed["receipts"]
+    assert completed["journal"] == {}
+    record = completed["sessions"][session["session_id"]]
+    assert (record["state"], record["reason"], record["pending_save_seq"]) == ("editing", None, None)
+    assert (record["last_committed_seq"], record["last_published_seq"]) == (2, 2)
+    assert record["baseline_sha256"] == _sha(CHANGED)
+    assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+
+
+@pytest.mark.parametrize("trigger", ("save", "final"))
+def test_no_change_commit_retains_bound_obligation_for_startup_recovery(office_world, monkeypatch, trigger):
+    from office.sweep import sweep_office_publications
+
+    http, data, _origin, _manager, broker, content, session = _autosaved(office_world, monkeypatch)
+    before = _read(data)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    with _persist_cut(monkeypatch, data, session):
+        response = _nothing_new(http, session, monkeypatch, trigger)
+    _assert_refusal(response, 500, "state_durability")
+    committed = _read(data)
+    assert committed["documents"] == before["documents"]
+    assert list(committed["journal"].values()) == [{
+        "file_id": session["file_id"], "version": 2, "session_id": session["session_id"],
+        "save_seq": 2, "requester": trigger,
+    }]
+    record = committed["sessions"][session["session_id"]]
+    assert (record["last_committed_seq"], record["last_published_seq"]) == (2, 0)
+    assert record["pending_save_seq"] == (2 if trigger == "save" else None)
+    assert record["state"] == ("saving" if trigger == "save" else "editing")
+    if trigger == "final":
+        assert committed["receipts"][session["session_id"]]["2"] == {
+            "status": 4, "sha256": None, "version": None, "answer": {"error": 0},
+        }
+    else:
+        assert committed["receipts"] == before["receipts"]
+    assert (_outputs(data) / "report.docx").read_bytes() == content
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+    sweep_office_publications()
+    completed = _read(data)
+    record = completed["sessions"][session["session_id"]]
+    assert record["state"] == ("editing" if trigger == "save" else "closed")
+    assert record["pending_save_seq"] is None
+    assert (record["last_committed_seq"], record["last_published_seq"]) == (2, 2)
+    assert record["baseline_sha256"] == _sha(CHANGED)
+    assert completed["documents"][session["file_id"]]["versions"] == [
+        before["documents"][session["file_id"]]["versions"][0],
+        {**before["documents"][session["file_id"]]["versions"][1], "published": True},
+    ]
+    assert completed["receipts"] == committed["receipts"]
+    assert completed["journal"] == {}
+    assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+    before_recovery = _snapshot(data)
+    sweep_office_publications()
+    assert _snapshot(data) == before_recovery
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+
+
+def test_status4_duplicate_recovers_committed_version_not_newer_latest(office_world, monkeypatch):
+    from office.store import OfficeStore
+
+    http, data, _origin, _manager, broker, content, session = _autosaved(office_world, monkeypatch)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    with _persist_cut(monkeypatch, data, session):
+        response = _nothing_new(http, session, monkeypatch, "final")
+    _assert_refusal(response, 500, "state_durability")
+    committed = _read(data)
+    newer = OfficeStore().store_version(
+        CHAT, session["file_id"], CHANGED + b"newer", source="autosave", parent=2,
+        published=False, min_free_bytes=0,
+    )
+    assert newer["number"] == 3
+    response = _nothing_new(http, session, monkeypatch, "final")
+    assert response.status_code == 200
+    assert response.json() == {"error": 0}
+    completed = _read(data)
+    document = completed["documents"][session["file_id"]]
+    assert [version["published"] for version in document["versions"]] == [True, True, False]
+    assert document["published_version"] == 2
+    assert document["published_sha256"] == _sha(CHANGED)
+    assert completed["receipts"] == committed["receipts"]
+    assert completed["sessions"][session["session_id"]]["save_seq"] == 2
+    assert completed["sessions"][session["session_id"]]["state"] == "closed"
+    assert completed["sessions"][session["session_id"]]["last_published_seq"] == 2
+    assert completed["journal"] == {}
+    assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+    before_replay = _snapshot(data)
+    assert _nothing_new(http, session, monkeypatch, "final").json() == {"error": 0}
+    assert _snapshot(data) == before_replay
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+
+
+@pytest.mark.parametrize("trigger", ("save", "final"))
+def test_no_change_unresolved_publication_retains_ownership_until_recovery(office_world, monkeypatch, trigger):
+    from office.publish import recover_publications
+
+    http, data, _origin, manager, broker, content, session = _autosaved(office_world, monkeypatch)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    manager._docker_client = _docker([_container(manager._container_name(CHAT), status="restarting")])
+    response = _nothing_new(http, session, monkeypatch, trigger)
+    assert response.status_code == (202 if trigger == "save" else 200)
+    if trigger == "final":
+        assert response.json() == {"error": 0}
+    else:
+        assert response.json() == {
+            "session_id": session["session_id"], "save_seq": 2, "intent": "publish",
+        }
+    pending = _read(data)
+    assert list(pending["journal"].values()) == [{
+        "file_id": session["file_id"], "version": 2, "session_id": session["session_id"],
+        "save_seq": 2, "requester": trigger,
+    }]
+    record = pending["sessions"][session["session_id"]]
+    assert (record["last_committed_seq"], record["last_published_seq"]) == (2, 0)
+    assert record["pending_save_seq"] == (2 if trigger == "save" else None)
+    assert record["state"] == ("saving" if trigger == "save" else "editing")
+    assert (_outputs(data) / "report.docx").read_bytes() == content
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+    manager._docker_client = _docker()
+    recover_publications(CHAT)
+    completed = _read(data)
+    record = completed["sessions"][session["session_id"]]
+    assert record["state"] == ("editing" if trigger == "save" else "closed")
+    assert record["pending_save_seq"] is None
+    assert (record["last_committed_seq"], record["last_published_seq"]) == (2, 2)
+    assert record["baseline_sha256"] == _sha(CHANGED)
+    assert completed["documents"][session["file_id"]]["versions"][1]["published"] is True
+    assert completed["journal"] == {}
+    assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+
+
+@pytest.mark.parametrize("trigger", ("save", "final"))
+def test_no_change_unexpected_publication_fault_is_visible_and_recoverable(office_world, monkeypatch, trigger):
+    from office.publish import recover_publications
+
+    http, data, _origin, _manager, broker, content, session = _autosaved(office_world, monkeypatch)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    replaced = os.replace
+
+    def fail_workspace_replace(source, target, *args, **kwargs):
+        if target == "report.docx":
+            raise RuntimeError("unexpected host replacement failure")
+        return replaced(source, target, *args, **kwargs)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(os, "replace", fail_workspace_replace)
+        with pytest.raises(RuntimeError, match="unexpected host replacement failure"):
+            _nothing_new(http, session, monkeypatch, trigger)
+    pending = _read(data)
+    assert len(pending["journal"]) == 1
+    obligation = next(iter(pending["journal"].values()))
+    assert (obligation["version"], obligation["save_seq"], obligation["requester"]) == (2, 2, trigger)
+    assert pending["documents"][session["file_id"]]["versions"][1]["published"] is False
+    assert pending["sessions"][session["session_id"]]["last_published_seq"] == 0
+    assert (_outputs(data) / "report.docx").read_bytes() == content
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+    recover_publications(CHAT)
+    completed = _read(data)
+    assert completed["journal"] == {}
+    assert completed["sessions"][session["session_id"]]["state"] == (
+        "editing" if trigger == "save" else "closed"
+    )
+    assert completed["sessions"][session["session_id"]]["last_published_seq"] == 2
+    assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+
+
+@pytest.mark.parametrize("interruption", ("closing", "closed", "ended-conflict", "callback", "newer", "key"))
+def test_delayed_nothing_new_save_preserves_live_ownership_and_final_outcomes(office_world, monkeypatch, interruption):
+    http, data, _origin, _manager, broker, content, session = _autosaved(office_world, monkeypatch)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    _origin, seen, _infos, saver, release, box = _hold_save(
+        http, monkeypatch, session, forcesave_code=4,
+    )
+    try:
+        if interruption == "closing":
+            response = _close(http, session["session_id"])
+            assert response.status_code == 202
+            assert response.json()["save_seq"] == 3
+        elif interruption in ("closed", "ended-conflict"):
+            if interruption == "ended-conflict":
+                (_outputs(data) / "report.docx").write_bytes(content + b"agent")
+            response = _nothing_new(http, session, monkeypatch, "final")
+            assert response.status_code == 200
+        elif interruption in ("callback", "newer"):
+            with _content_origin({"/save.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+                response = _post(http, session, _payload(session, server.url + "/save.docx", save_seq=2))
+            assert response.status_code == 200
+            if interruption == "newer":
+                with _forcesave(monkeypatch, session["document_key"]):
+                    response = _save(http, session["session_id"], "persist")
+                assert response.status_code == 202
+                assert response.json()["save_seq"] == 3
+        else:
+            _change(session["session_id"], document_key="replacement-editor-key")
+        before = _snapshot(data)
+        before_revision = broker.OutputsBroker().current_revision(CHAT)
+        release.set()
+        saver.join(timeout=10)
+        assert not saver.is_alive()
+        assert saver.response.status_code == 202
+        assert saver.response.json()["save_seq"] == 2
+        assert seen == [{"save_seq": 2, "intent": "publish"}]
+        if interruption == "closing":
+            completed = _read(data)
+            record = completed["sessions"][session["session_id"]]
+            assert (record["state"], record["pending_save_seq"], record["pending_close_seq"]) == (
+                "closing", None, 3,
+            )
+            assert (record["last_committed_seq"], record["last_published_seq"]) == (2, 2)
+            assert record["baseline_sha256"] == _sha(CHANGED)
+            assert completed["journal"] == {}
+            assert completed["documents"][session["file_id"]]["versions"][1]["published"] is True
+            assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+            assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+        else:
+            assert _snapshot(data) == before
+            assert broker.OutputsBroker().current_revision(CHAT) == before_revision
+    finally:
+        release.set()
+        saver.join(timeout=10)
+        box.__exit__(None, None, None)
+
+
+def test_nothing_new_publish_save_publishes_retained_autosave(office_world, monkeypatch):
+    http, data, recording, _manager, broker, content, session = _opened(office_world)
+    session_id = session["session_id"]
+    file_id = session["file_id"]
+    workspace = _outputs(data) / "report.docx"
+    before_revision = broker.OutputsBroker().current_revision(CHAT)
+    assert workspace.read_bytes() == content
+    assert CHANGED != content
+
+    with _forcesave(monkeypatch, session["document_key"]) as (_command, issued):
+        accepted = _save(http, session_id, "persist")
+    assert accepted.status_code == 202
+    assert accepted.json() == {
+        "session_id": session_id, "save_seq": 1, "intent": "persist",
+    }
+    assert issued == [{"save_seq": 1, "intent": "persist"}]
+
+    with (
+        _content_origin({"/autosave.docx": CHANGED}) as server,
+        _bind_internal(monkeypatch, server.url),
+    ):
+        payload = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/autosave.docx",
+            save_seq=issued[0]["save_seq"],
+            intent=issued[0]["intent"],
+        )
+        response = _post(http, session, payload)
+        assert response.status_code == 200
+        assert response.json() == {"error": 0}
+        assert [request["path"] for request in server.requests] == ["/autosave.docx"]
+
+    persisted = _read(data)
+    document = persisted["documents"][file_id]
+    assert [version["number"] for version in document["versions"]] == [1, 2]
+    autosave = document["versions"][-1]
+    assert autosave["source"] == "autosave"
+    assert autosave["published"] is False
+    assert autosave["sha256"] == _sha(CHANGED)
+    assert (_versions(data) / autosave["sha256"]).read_bytes() == CHANGED
+    assert document["published_version"] == 1
+    assert document["published_sha256"] == _sha(content)
+    record = persisted["sessions"][session_id]
+    assert record["state"] == "editing"
+    assert record["pending_save_seq"] is None
+    assert record["last_committed_seq"] == 1
+    assert record["last_published_seq"] == 0
+    assert record["baseline_sha256"] == _sha(content)
+    assert persisted["receipts"][session_id] == {
+        "1": {
+            "status": 6, "version": 2, "sha256": _sha(CHANGED),
+            "answer": {"error": 0},
+        },
+    }
+    assert persisted["journal"] == {}
+    assert workspace.read_bytes() == content
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision
+    stored_blobs = _snapshot(_versions(data))
+
+    with _forcesave(monkeypatch, session["document_key"], code=4) as (command, issued):
+        published = _save(http, session_id, "publish")
+    assert published.status_code == 202
+    assert published.json() == {
+        "session_id": session_id, "save_seq": 2, "intent": "publish",
+    }
+    assert issued == [{"save_seq": 2, "intent": "publish"}]
+    assert len(command.requests) == 1
+
+    completed = _read(data)
+    latest = completed["documents"][file_id]
+    assert [version["number"] for version in latest["versions"]] == [1, 2]
+    assert _snapshot(_versions(data)) == stored_blobs
+    assert completed["receipts"] == persisted["receipts"]
+    record = completed["sessions"][session_id]
+    assert record["state"] == "editing"
+    assert record["pending_save_seq"] is None
+    assert record["save_seq"] == published.json()["save_seq"]
+    assert record["last_committed_seq"] == published.json()["save_seq"]
+
+    assert workspace.read_bytes() == CHANGED
+    assert latest["versions"] == [
+        document["versions"][0], {**autosave, "published": True},
+    ]
+    assert latest["published_version"] == autosave["number"]
+    assert latest["published_sha256"] == _sha(CHANGED)
+    assert record["last_published_seq"] == published.json()["save_seq"]
+    assert record["baseline_sha256"] == _sha(CHANGED)
+    assert record["reason"] is None
+    assert completed["journal"] == {}
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision + 1
+    status = _status(http, session_id)
+    assert status.status_code == 200
+    assert status.json()["state"] == "editing"
+    assert status.json()["last_committed_seq"] == published.json()["save_seq"]
+    assert status.json()["last_published_seq"] == published.json()["save_seq"]
+    assert status.json()["workspace_changed"] is False
+
+    with _forcesave(monkeypatch, session["document_key"], code=4):
+        repeated = _save(http, session_id, "publish")
+    assert repeated.status_code == 202
+    assert repeated.json()["save_seq"] == 3
+    after_repeat = _read(data)
+    assert after_repeat["documents"] == completed["documents"]
+    assert after_repeat["receipts"] == completed["receipts"]
+    assert after_repeat["journal"] == {}
+    assert _snapshot(_versions(data)) == stored_blobs
+    assert workspace.read_bytes() == CHANGED
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision + 1
+    assert after_repeat["sessions"][session_id]["state"] == "editing"
+    assert after_repeat["sessions"][session_id]["last_committed_seq"] == 3
+    assert after_repeat["sessions"][session_id]["last_published_seq"] == 3
+    assert recording.hits == 0
 
 
 @pytest.mark.parametrize("final", (False, True), ids=("save", "final"))

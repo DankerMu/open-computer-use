@@ -119,7 +119,9 @@ def _process(
         _apply_no_content(store, chat, session_id, 7, _apply_status_7, save_seq=userdata[0])
         return JSONResponse(status_code=200, content=_SUCCESS)
     if status == 4:
-        _apply_no_content(store, chat, session_id, 4, _apply_status_4)
+        journal_id = _apply_no_content(store, chat, session_id, 4, _apply_status_4)
+        if journal_id is not None:
+            publish.drive_obligation(chat, journal_id)
         return JSONResponse(status_code=200, content=_SUCCESS)
     _persist_content(store, chat, session_id, record, status, payload, userdata, loop)
     return JSONResponse(status_code=200, content=_SUCCESS)
@@ -200,7 +202,7 @@ def _persist_content(
             _recover_outstanding(store, chat, session_id, save_seq, reason)
         raise
     if journal_id is not None:
-        _publish_callback_obligation(chat, journal_id)
+        publish.drive_obligation(chat, journal_id)
 
 
 def _replay_forcesave(
@@ -224,34 +226,26 @@ def _replay_forcesave(
     return JSONResponse(status_code=200, content=answer)
 
 
-def _publish_callback_obligation(chat, journal_id):
-    try:
-        publish.publish(chat, journal_id)
-    except (publish.SandboxStateError, publish.RecoveryRequiredError) as extra:
-        _LOG.warning(
-            "Office callback publication remains pending",
-            extra={"chat_id": chat, "publication_refusal": type(extra).__name__},
-        )
-
-
 def _drive_receipt_publication(store, chat, session_id, save_seq, receipt):
-    if receipt["status"] not in (2, 6) or receipt["version"] is None:
+    if receipt["status"] not in (2, 4, 6) or (
+        receipt["status"] != 4 and receipt["version"] is None
+    ):
         return
     state = store.read(chat)
     record = sessions._persisted_session(session_id, state["sessions"][session_id])
-    requester = "final" if receipt["status"] == 2 else "save"
+    requester = "save" if receipt["status"] == 6 else "final"
     matching = [
         journal_id for journal_id, entry in state["journal"].items()
         if entry.get("session_id") == session_id
         and entry.get("save_seq") == save_seq
         and entry.get("file_id") == record["file_id"]
-        and entry.get("version") == receipt["version"]
+        and (receipt["status"] == 4 or entry.get("version") == receipt["version"])
         and entry.get("requester") == requester
     ]
     if len(matching) > 1:
         raise StateCorruptError("callback receipt owns more than one publication")
     if matching:
-        _publish_callback_obligation(chat, matching[0])
+        publish.drive_obligation(chat, matching[0])
 
 
 def _validate_content(store: OfficeStore, chat: str, session_id: str, body: bytes) -> None:
@@ -286,14 +280,13 @@ def _store_content(
         if save_seq is None:
             _commit_final_seq(current, allocated)
         if journal_id is not None:
-            working["journal"][journal_id] = {
-                "file_id": file_id, "version": selected["number"],
-                "session_id": session_id, "save_seq": allocated,
-                "requester": "final" if status == 2 else "save",
-            }
+            publish.add_obligation(
+                working, journal_id, current, selected, allocated,
+                "final" if status == 2 else "save",
+            )
         else:
             _apply_status_6(working, current, allocated, selected)
-        _advance_committed(current, allocated, selected)
+        sessions._advance_committed(current, allocated, selected)
 
     receipt = {
         "session_id": session_id,
@@ -317,13 +310,23 @@ def _store_content(
     return journal_id
 
 
-def _apply_no_content(store: OfficeStore, chat: str, session_id: str, status: int, apply, save_seq=None) -> None:
+def _apply_no_content(store: OfficeStore, chat: str, session_id: str, status: int, apply, save_seq=None) -> str | None:
+    journal_id = None
+    if status == 4:
+        state = store.read(chat)
+        record = sessions._require_session(state, session_id)
+        if not sessions._active_versions(state, record["file_id"])[-1]["published"]:
+            journal_id = uuid.uuid4().hex
+
     def mutate(working: dict[str, Any]) -> None:
         current = sessions._persisted_session(session_id, working["sessions"][session_id])
         allocated = save_seq if save_seq is not None else _next_final_seq(current)
         if save_seq is None:
             _commit_final_seq(current, allocated)
         apply(working, current, allocated)
+        if journal_id is not None:
+            selected = sessions._active_versions(working, current["file_id"])[-1]
+            publish.add_obligation(working, journal_id, current, selected, allocated, "final")
         versions._put_receipt(
             working,
             session_id,
@@ -337,6 +340,7 @@ def _apply_no_content(store: OfficeStore, chat: str, session_id: str, status: in
         )
 
     store.update(chat, mutate)
+    return journal_id
 
 
 def _apply_status_1(store: OfficeStore, chat: str, session_id: str, payload: dict[str, Any]) -> None:
@@ -381,23 +385,8 @@ def _apply_status_4(working: dict[str, Any], record: dict[str, Any], save_seq: i
     if listed[-1]["published"]:
         record["state"] = "closed"
         record["pending_close_seq"] = None
-    _advance_committed(record, save_seq, None)
+    sessions._advance_committed(record, save_seq, None)
 
-
-
-def _advance_committed(record: dict[str, Any], save_seq: int, selected: dict[str, Any] | None) -> None:
-    committed = record.get("last_committed_seq", 0)
-    if type(committed) is not int or committed < 0:
-        raise StateCorruptError("office session sequence is invalid")
-    if save_seq > committed:
-        record["last_committed_seq"] = save_seq
-    if selected is None:
-        return
-    published = record.get("last_published_seq", 0)
-    if type(published) is not int or published < 0:
-        raise StateCorruptError("office session sequence is invalid")
-    if selected.get("published") is True and save_seq > published:
-        record["last_published_seq"] = save_seq
 
 
 def _next_final_seq(record: dict[str, Any]) -> int:

@@ -273,12 +273,13 @@ def test_status7_returns_matching_saving_session_to_editing(office_world):
 
 
 def test_status4_closes_when_latest_version_is_published(office_world):
-    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    http, data, origin, _docker, broker, content, session = _open_session(office_world)
     _change(session["session_id"], state="closing", save_seq=1, pending_close_seq=1)
     payload = recorded_status_4_payload(document_key=session["document_key"])
     before_workspace = (_outputs(data) / "report.docx").read_bytes()
     before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
     versions, _receipts, journal = _history(data, session["file_id"])
+    revision = broker.OutputsBroker().current_revision(CHAT)
     response = _post(http, session, payload)
     assert response.status_code == 200
     record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
@@ -287,14 +288,19 @@ def test_status4_closes_when_latest_version_is_published(office_world):
     assert _receipt(data, session["session_id"], 1)["status"] == 4
     after_versions, _, after_journal = _history(data, session["file_id"])
     assert after_versions == versions
-    assert after_journal == journal
+    assert after_journal == journal == {}
     assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
     assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+    from office.publish import recover_publications
+    before_recovery = _snapshot(data)
+    recover_publications(CHAT)
+    assert _snapshot(data) == before_recovery
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
     assert origin.hits == 0
 
 
-def test_status4_leaves_unpublished_latest_without_closing(office_world):
-    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+def test_status4_publishes_unpublished_latest_and_closes(office_world):
+    http, data, origin, _docker, broker, content, session = _open_session(office_world)
     from office.store import OfficeStore
 
     unpublished = OfficeStore().store_version(
@@ -303,14 +309,25 @@ def test_status4_leaves_unpublished_latest_without_closing(office_world):
     )
     _change(session["session_id"], state="closing", save_seq=2, pending_close_seq=2, last_committed_seq=1)
     payload = recorded_status_4_payload(document_key=session["document_key"])
+    revision = broker.OutputsBroker().current_revision(CHAT)
     response = _post(http, session, payload)
     assert response.status_code == 200
     record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
-    assert record["state"] == "closing"
+    assert record["state"] == "closed"
     assert record["last_committed_seq"] == 2
+    assert record["last_published_seq"] == 2
+    assert record["baseline_sha256"] == _sha(CHANGED)
+    assert record["pending_close_seq"] is None
     listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
     assert listed[-1]["number"] == unpublished["number"]
-    assert listed[-1]["published"] is False
+    assert listed[-1]["published"] is True
+    assert len(listed) == 2
+    assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+    assert _receipt(data, session["session_id"], 2) == {
+        "status": 4, "sha256": None, "version": None, "answer": {"error": 0},
+    }
+    assert json.loads(_state(data).read_bytes())["journal"] == {}
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
     assert origin.hits == 0
 
 
@@ -1338,32 +1355,38 @@ def test_storage_low_returns_session_to_editing_and_retry_commits(office_world, 
 
 
 def test_equal_latest_content_adds_no_version(office_world, monkeypatch):
-    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
-    _change(
-        session["session_id"],
-        state="saving",
-        save_seq=1,
-        pending_save_seq=1,
-        save_intents={"1": "persist"},
-    )
+    http, data, origin, _docker, broker, content, session = _open_session(office_world)
+    opened = _post(http, session, recorded_status_1_payload(document_key=session["document_key"]))
+    assert opened.status_code == 200
+    with _forcesave(monkeypatch, session["document_key"]) as (_origin, issued):
+        accepted = _save(http, session["session_id"], "persist")
+    assert accepted.status_code == 202
+    assert issued == [{"save_seq": 1, "intent": "persist"}]
+    revision = broker.OutputsBroker().current_revision(CHAT)
     with _content_origin({"/cache/same.docx": content}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/same.docx",
-            save_seq=1,
-            intent="persist",
+            save_seq=issued[0]["save_seq"],
+            intent=issued[0]["intent"],
         )
         before = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
         assert _post(http, session, payload).status_code == 200
         after = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
-        assert len(after) == len(before)
+        assert after == before
         assert after[-1]["published"] is True
         record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
         assert record["last_committed_seq"] == 1
         assert record["last_published_seq"] == 1
+        assert record["state"] == "editing"
+        assert record["pending_save_seq"] is None
+        assert record["baseline_sha256"] == _sha(content)
         receipt = _receipt(data, session["session_id"], 1)
         assert receipt["version"] == after[-1]["number"]
         assert receipt["sha256"] == after[-1]["sha256"]
+        assert json.loads(_state(data).read_bytes())["journal"] == {}
+        assert (_outputs(data) / "report.docx").read_bytes() == content
+        assert broker.OutputsBroker().current_revision(CHAT) == revision
     assert origin.hits == 0
 
 

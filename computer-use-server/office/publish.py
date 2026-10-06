@@ -703,6 +703,24 @@ def _finish(store, chat, journal_id, result, entry, selected):
     return result
 
 
+def add_obligation(state, journal_id, record, selected, save_seq, requester):
+    state["journal"][journal_id] = {
+        "file_id": record["file_id"], "version": selected["number"],
+        "session_id": record["session_id"], "save_seq": save_seq,
+        "requester": requester,
+    }
+
+
+def drive_obligation(chat, journal_id):
+    try:
+        publish(chat, journal_id)
+    except (SandboxStateError, RecoveryRequiredError) as extra:
+        _LOG.warning(
+            "Office publication remains pending",
+            extra={"chat_id": chat, "publication_refusal": type(extra).__name__},
+        )
+
+
 def publish(chat_id: str, journal_id: str) -> PublishResult:
     """Recover older obligations before consuming the requested publication."""
     chat = docker_manager.canonical_lock_chat_id(chat_id)
