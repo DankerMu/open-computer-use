@@ -42,7 +42,7 @@ exist, reconciliation fails retryably and preserves the index. Live names that
 cannot be persisted as relative POSIX paths fail explicitly rather than being
 rewritten as a corrupt index.
 
-### Office callback publication
+### Office save and callback publication
 
 Authenticated status 6 callbacks with recorded `publish` intent and status 2
 callbacks commit their version, receipt and publish obligation together. The
@@ -51,7 +51,20 @@ still acknowledges durable content with `{"error": 0}`. Classified sandbox or
 recovery admission refusals also acknowledge it while retaining the obligation
 and session ownership for recovery. Unexpected publication errors retain their
 error behavior, and unresolved pre-orphan recovery still blocks orphaning.
-Persist-intent saves store unpublished content without a publication obligation.
+Persist-intent callbacks store content without a publication obligation.
+
+A publish-intent save for which DocumentServer reports nothing new commits an
+obligation bound to the latest unpublished stored version alongside the save
+completion. Status 4 commits a final obligation with its contentless receipt
+(null hash/version). Neither path adds a version or blob; the save needs no
+callback receipt. Final receipt replay drives its persisted journal binding
+without downloading or selecting a newer version.
+
+Nothing-new saves of either intent advance both sequence values when the latest
+version is already published, without writing the workspace or advancing its
+revision. With an unpublished latest version, persist-only nothing-new saves
+advance only `last_committed_seq` and leave no deferred publication. Equal-content
+autosaves reuse the latest version and advance both counters if it is published.
 
 Publication completion removes its obligation in the same state update that
 records the session outcome, published version, baseline and monotonic
@@ -64,8 +77,7 @@ preserves a final conflict only in the request that recovered its surviving
 final obligation. A pre-existing final conflict without an obligation still
 obeys the epoch policy. An epoch-invalid callback refuses without downloading
 or processing new content; pre-orphan recovery drives only prior durable
-obligations. Status 4/no-change publication and automatic copies for missing
-final paths are separate behavior outside this callback-content path.
+obligations.
 
 Successful publication invalidates the cached notice size/mtime sample when its
 session baseline changes; the next status observation determines `workspace_changed`.

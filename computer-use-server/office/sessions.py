@@ -568,6 +568,21 @@ def _refresh_activity(store, chat, session_id) -> None:
     store.update(chat, mutate)
 
 
+def _advance_committed(record, save_seq, selected):
+    committed = record.get("last_committed_seq", 0)
+    if type(committed) is not int or committed < 0:
+        raise StateCorruptError("office session sequence is invalid")
+    if save_seq > committed:
+        record["last_committed_seq"] = save_seq
+    if selected is None:
+        return
+    published = record.get("last_published_seq", 0)
+    if type(published) is not int or published < 0:
+        raise StateCorruptError("office session sequence is invalid")
+    if selected.get("published") is True and save_seq > published:
+        record["last_published_seq"] = save_seq
+
+
 def _allocate_sequence(record) -> int:
     current = record["save_seq"]
     if type(current) is not int or current < 0:
@@ -640,12 +655,17 @@ def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
 
 
 def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, outcome) -> dict[str, Any]:
+    from . import publish
+
     accepted = {"session_id": session_id, "save_seq": save_seq, "intent": intent}
     if outcome is commands.ForceSaveOutcome.ACCEPTED:
         return accepted
     changed = {"value": False}
+    journal_id = None
+    obligation = {"selected": None}
 
     def mutate(working):
+        obligation["selected"] = None
         current = _require_session(working, session_id)
         _status_projection(current)
         if current["document_key"] != document_key:
@@ -657,20 +677,24 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
         ended_conflict = current["state"] == "conflict" and _final_receipt(working, session_id) is not None
         if ended_conflict:
             return
-        current["pending_save_seq"] = None
+        if outcome is not commands.ForceSaveOutcome.NOTHING_TO_SAVE:
+            current["pending_save_seq"] = None
         changed["value"] = True
         if outcome is commands.ForceSaveOutcome.KEY_UNKNOWN:
             current["state"] = "orphaned"
             current["reason"] = "editor_state_lost"
             return
         if outcome is commands.ForceSaveOutcome.NOTHING_TO_SAVE:
-            committed = current.get("last_committed_seq", 0)
-            if type(committed) is not int or committed < 0:
-                raise StateCorruptError("office session sequence is invalid")
-            if committed < save_seq:
-                current["last_committed_seq"] = save_seq
-            if current["state"] == "saving":
-                current["state"] = "editing"
+            selected = _active_versions(working, current["file_id"])[-1]
+            _advance_committed(current, save_seq, selected)
+            if intent == "publish" and not selected["published"]:
+                obligation["selected"] = selected
+                if journal_id is not None:
+                    publish.add_obligation(working, journal_id, current, selected, save_seq, "save")
+            else:
+                current["pending_save_seq"] = None
+                if current["state"] == "saving":
+                    current["state"] = "editing"
             return
         if current["state"] == "saving":
             current["state"] = "editing"
@@ -697,7 +721,11 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
             else:
                 mutate(recovered)
         if changed["value"]:
+            if obligation["selected"] is not None:
+                journal_id = uuid.uuid4().hex
             store.update(chat, mutate)
+        if journal_id is not None and obligation["selected"] is not None:
+            publish.drive_obligation(chat, journal_id)
     if outcome is commands.ForceSaveOutcome.NOTHING_TO_SAVE:
         return accepted
     if outcome is commands.ForceSaveOutcome.KEY_UNKNOWN:

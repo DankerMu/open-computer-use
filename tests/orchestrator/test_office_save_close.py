@@ -334,27 +334,36 @@ def test_accepted_save_allocates_and_sends_one_signed_forcesave(office_world, mo
     assert recording.hits == 0
 
 
-def test_nothing_new_returns_editing_and_advances_only_committed_seq(office_world, monkeypatch):
-    http, data, recording, _docker, _broker = office_world
+@pytest.mark.parametrize("intent", ("publish", "persist"))
+def test_nothing_new_published_latest_advances_both_sequences_without_publication(office_world, monkeypatch, intent):
+    http, data, recording, _docker, broker = office_world
     file_id, first = _created(office_world, "editing")
     _change(first["session_id"], last_committed_seq=0, last_published_seq=0)
     document, receipts, journal = _history(data, file_id)
+    before_revision = broker.OutputsBroker().current_revision(CHAT)
     with _forcesave(monkeypatch, first["document_key"], code=4) as (origin, seen):
-        response = _save(http, first["session_id"], "persist")
+        response = _save(http, first["session_id"], intent)
     assert response.status_code == 202
     assert response.json() == {
-        "session_id": first["session_id"], "save_seq": 1, "intent": "persist",
+        "session_id": first["session_id"], "save_seq": 1, "intent": intent,
     }
     record = _record(first["session_id"])
     assert record["state"] == "editing"
     assert record["save_seq"] == 1
     assert record["pending_save_seq"] is None
-    assert record["save_intents"] == {"1": "persist"}
+    assert record["save_intents"] == {"1": intent}
     assert record["last_committed_seq"] == 1
-    assert record["last_published_seq"] == 0
-    assert seen == [{"save_seq": 1, "intent": "persist"}]
+    assert record["last_published_seq"] == 1
+    assert seen == [{"save_seq": 1, "intent": intent}]
     assert len(origin.requests) == 1
     _assert_history_untouched(data, file_id, document, receipts, journal)
+    assert journal == {}
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision
+    from office.publish import recover_publications
+    before_recovery = _snapshot(data)
+    recover_publications(CHAT)
+    assert _snapshot(data) == before_recovery
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision
     assert recording.hits == 0
 
 
@@ -684,7 +693,7 @@ def test_repeated_closing_reuses_pending_seq_without_lookup(office_world, monkey
 
 
 @pytest.mark.parametrize("kind", ("status2", "status4_unpublished"))
-def test_repeat_close_after_consumed_pending_reuses_final_receipt_seq(office_world, monkeypatch, kind):
+def test_repeat_close_after_final_publication_is_refused_without_mutation(office_world, monkeypatch, kind):
     from office.store import OfficeStore
     from tests.orchestrator._office_recorded_callbacks import (
         recorded_status_1_payload,
@@ -728,9 +737,10 @@ def test_repeat_close_after_consumed_pending_reuses_final_receipt_seq(office_wor
             assert final.json() == {"error": 0}
             listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
             assert listed[-1]["number"] == unpublished["number"]
-            assert listed[-1]["published"] is False
+            assert listed[-1]["published"] is True
+            assert listed[-1]["source"] == "autosave"
         record = _record(session["session_id"])
-        terminal_state = "closed" if kind == "status2" else "closing"
+        terminal_state = "closed"
         assert record["state"] == terminal_state
         assert record.get("pending_close_seq") in (None,)
         receipts = json.loads(_state(data).read_bytes())["receipts"][session["session_id"]]
@@ -739,17 +749,12 @@ def test_repeat_close_after_consumed_pending_reuses_final_receipt_seq(office_wor
         before_store, before_files = _persisted_inventory(data)
         workspace = _outputs(data) / "report.docx"
         before_workspace = workspace.read_bytes()
+        assert before_workspace == CHANGED
         before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
         state_path = _state(data)
         before_state_stat = state_path.stat()
         repeat = _close(http, session["session_id"])
-        if kind == "status2":
-            _assert_refusal(repeat, 409, "session_not_open")
-        else:
-            assert repeat.status_code == 202
-            assert repeat.json() == {
-                "session_id": session["session_id"], "save_seq": allocated, "state": "closing",
-            }
+        _assert_refusal(repeat, 409, "session_not_open")
         after_store, after_files = _persisted_inventory(data)
         assert after_store == before_store
         assert after_files == before_files
@@ -1139,7 +1144,7 @@ def test_delayed_ordinary_save_failure_preserves_concurrent_close(
             assert after["pending_close_seq"] == 2
             assert after["pending_save_seq"] is None
             assert after["last_committed_seq"] == 1
-            assert after["last_published_seq"] == 0
+            assert after["last_published_seq"] == 1
             assert after["save_intents"] == {"1": "publish"}
         else:
             expected["pending_save_seq"] = None
@@ -1200,12 +1205,13 @@ def test_delayed_ordinary_save_failure_preserves_live_conflict(
             expected["pending_save_seq"] = None
             if code == 4:
                 expected["last_committed_seq"] = 1
+                expected["last_published_seq"] = 1
             assert after == expected
             assert after["state"] == "conflict"
             assert after["reason"] == "baseline_mismatch"
             assert after["pending_save_seq"] is None
             assert after["save_intents"] == {"1": "publish"}
-            assert after["last_published_seq"] == 0
+            assert after["last_published_seq"] == (1 if code == 4 else 0)
             if code == 4:
                 assert after["last_committed_seq"] == 1
             else:
