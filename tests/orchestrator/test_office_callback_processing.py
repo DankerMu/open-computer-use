@@ -315,7 +315,7 @@ def test_status4_leaves_unpublished_latest_without_closing(office_world):
 
 
 def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
-    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    http, data, origin, _docker, broker, content, session = _open_session(office_world)
     _change(
         session["session_id"],
         state="saving",
@@ -325,6 +325,7 @@ def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
     )
     before_workspace = (_outputs(data) / "report.docx").read_bytes()
     before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    before_revision = broker.OutputsBroker().current_revision(CHAT)
     with _content_origin({"/cache/output.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
@@ -334,6 +335,7 @@ def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
         )
         response = _post(http, session, payload)
         assert response.status_code == 200
+        assert response.json() == {"error": 0}
         assert [item["path"] for item in server.requests] == ["/cache/output.docx"]
         assert urlsplit(server.url).hostname == "127.0.0.1"
     record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
@@ -343,12 +345,29 @@ def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
     assert listed[-1]["source"] == "autosave"
     assert listed[-1]["published"] is False
     assert listed[-1]["sha256"] == _sha(CHANGED)
+    persisted = json.loads(_state(data).read_bytes())
+    document = persisted["documents"][session["file_id"]]
+    assert persisted["journal"] == {}
+    assert document["published_version"] == 1
+    assert document["published_sha256"] == _sha(content)
+    assert record["baseline_sha256"] == _sha(content)
+    assert record["last_published_seq"] == 0
+    assert (_versions(data) / _sha(CHANGED)).read_bytes() == CHANGED
     receipt = _receipt(data, session["session_id"], 1)
     assert receipt["status"] == 6
     assert receipt["sha256"] == _sha(CHANGED)
     assert receipt["version"] == listed[-1]["number"]
     assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
     assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision
+    persisted_bytes = _state(data).read_bytes()
+    from office.publish import recover_publications
+    recover_publications(CHAT)
+    assert _state(data).read_bytes() == persisted_bytes
+    assert json.loads(_state(data).read_bytes()) == persisted
+    assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision
     assert origin.hits == 0
 
 

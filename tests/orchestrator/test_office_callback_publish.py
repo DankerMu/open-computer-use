@@ -589,10 +589,15 @@ def test_unknown_key_command_finishes_owned_obligation_before_orphaning(office_w
     assert workspace.read_bytes() == (CHANGED if outcome == "published" else content + b"agent" if outcome == "conflict" else content)
 
 
-def test_interrupted_visible_publication_retains_session_ownership_until_recovery(office_world, monkeypatch):
-    http, data, _origin, manager, _broker, content, session = _opened(office_world)
+@pytest.mark.parametrize("recovery", ("direct", "duplicate", "startup"))
+def test_interrupted_visible_publication_retains_session_ownership_until_recovery(office_world, monkeypatch, recovery):
+    from tests.orchestrator.test_office_notice import _count_workspace_reads
+
+    http, data, _origin, manager, broker, content, session = _opened(office_world)
     _allocate(http, session, monkeypatch)
     _running(manager)
+    workspace = _outputs(data) / "report.docx"
+    revision = broker.OutputsBroker().current_revision(CHAT)
     monotonic, replace = time.monotonic, os.replace
     elapsed = [0.0]
 
@@ -605,28 +610,93 @@ def test_interrupted_visible_publication_retains_session_ownership_until_recover
     with (
         _content_origin({"/save.docx": CHANGED}) as server,
         _bind_internal(monkeypatch, server.url),
-        monkeypatch.context() as boundary,
     ):
-        boundary.setattr(time, "monotonic", lambda: monotonic() + elapsed[0])
-        boundary.setattr(os, "replace", replaced)
-        response = _post(http, session, _payload(session, server.url + "/save.docx"))
-    assert response.status_code == 200
-    assert response.json() == {"error": 0}
-    interrupted = _read(data)
-    record = interrupted["sessions"][session["session_id"]]
-    assert (record["state"], record["pending_save_seq"], record["reason"]) == ("saving", 1, None)
-    assert record["last_published_seq"] == 0
-    assert record["baseline_sha256"] == _sha(content)
-    assert interrupted["documents"][session["file_id"]]["versions"][-1]["published"] is False
-    assert len(interrupted["journal"]) == 1
-    assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
-    from office.publish import recover_publications
-    recover_publications(CHAT)
-    completed = _read(data)
-    assert completed["journal"] == {}
-    assert completed["sessions"][session["session_id"]]["state"] == "editing"
-    assert completed["sessions"][session["session_id"]]["last_published_seq"] == 1
-    assert completed["documents"][session["file_id"]]["versions"][-1]["published"] is True
+        payload = _payload(session, server.url + "/save.docx")
+        with monkeypatch.context() as boundary:
+            boundary.setattr(time, "monotonic", lambda: monotonic() + elapsed[0])
+            boundary.setattr(os, "replace", replaced)
+            response = _post(http, session, payload)
+        assert response.status_code == 200
+        assert response.json() == {"error": 0}
+        interrupted = _read(data)
+        record = interrupted["sessions"][session["session_id"]]
+        assert (record["state"], record["pending_save_seq"], record["reason"]) == ("saving", 1, None)
+        assert record["last_published_seq"] == 0
+        assert record["baseline_sha256"] == _sha(content)
+        assert interrupted["documents"][session["file_id"]]["versions"][-1]["published"] is False
+        assert len(interrupted["journal"]) == 1
+        assert workspace.read_bytes() == CHANGED
+        assert (_versions(data) / _sha(CHANGED)).read_bytes() == CHANGED
+        assert broker.OutputsBroker().current_revision(CHAT) == revision
+        before_recovery_status = _status(http, session["session_id"])
+        assert before_recovery_status.status_code == 200
+        assert before_recovery_status.json()["workspace_changed"] is True
+        assert before_recovery_status.json()["state"] == "saving"
+        info = workspace.stat()
+        sample = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        hits = server.hits
+        if recovery == "direct":
+            from office.publish import recover_publications
+            recover_publications(CHAT)
+        elif recovery == "duplicate":
+            response = _post(http, session, payload)
+            assert response.status_code == 200
+            assert response.json() == {"error": 0}
+        else:
+            from office.sweep import sweep_office_publications
+            sweep_office_publications()
+        assert server.hits == hits + (1 if recovery == "duplicate" else 0)
+        completed = _read(data)
+        assert completed["journal"] == {}
+        record = completed["sessions"][session["session_id"]]
+        assert record["state"] == "editing"
+        assert record["reason"] is None
+        assert record["pending_save_seq"] is None
+        assert record["save_seq"] == 1
+        assert record["last_committed_seq"] == 1
+        assert record["last_published_seq"] == 1
+        assert record["baseline_sha256"] == _sha(CHANGED)
+        document = completed["documents"][session["file_id"]]
+        saved = dict(interrupted["documents"][session["file_id"]]["versions"][-1])
+        saved["published"] = True
+        assert document["versions"][-1] == saved
+        assert document["versions"][:-1] == interrupted["documents"][session["file_id"]]["versions"][:-1]
+        assert document["published_version"] == 2
+        assert document["published_sha256"] == _sha(CHANGED)
+        assert completed["receipts"] == interrupted["receipts"]
+        assert workspace.read_bytes() == CHANGED
+        assert (_versions(data) / _sha(CHANGED)).read_bytes() == CHANGED
+        after = workspace.stat()
+        assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == sample
+        assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+
+        import office.notice as notice
+        with monkeypatch.context() as boundary:
+            reads = _count_workspace_reads(notice, boundary, workspace)
+            reconciled = _status(http, session["session_id"])
+            assert reconciled.status_code == 200
+            assert reconciled.json()["workspace_changed"] is False
+            assert reconciled.json()["state"] == "editing"
+            assert reconciled.json()["last_published_seq"] == 1
+            assert reads["count"] > 0
+            reads["count"] = 0
+            cached = _status(http, session["session_id"])
+            assert cached.status_code == 200
+            assert cached.json()["workspace_changed"] is False
+            assert reads["count"] == 0
+            workspace.write_bytes(CHANGED + b"agent")
+            changed = _status(http, session["session_id"])
+            assert changed.status_code == 200
+            assert changed.json()["workspace_changed"] is True
+            assert changed.json()["state"] == "editing"
+            assert changed.json()["last_published_seq"] == 1
+            assert reads["count"] > 0
+        after_notice = _read(data)
+        assert after_notice["documents"] == completed["documents"]
+        assert after_notice["receipts"] == completed["receipts"]
+        assert after_notice["journal"] == {}
+        assert after_notice["sessions"][session["session_id"]]["baseline_sha256"] == _sha(CHANGED)
+        assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
 
 
 def test_late_failed_save_preserves_newer_outstanding_allocation(office_world, monkeypatch):

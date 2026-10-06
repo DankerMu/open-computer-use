@@ -67,6 +67,9 @@ or processing new content; pre-orphan recovery drives only prior durable
 obligations. Status 4/no-change publication and automatic copies for missing
 final paths are separate behavior outside this callback-content path.
 
+Successful publication invalidates the cached notice size/mtime sample when its
+session baseline changes; the next status observation determines `workspace_changed`.
+
 ## API Endpoints
 
 ### MCP

@@ -675,6 +675,9 @@ def _finish(store, chat, journal_id, result, entry, selected):
             document["published_version"] = selected["number"]
             document["published_sha256"] = selected["sha256"]
             if record is not None:
+                if record["baseline_sha256"] != selected["sha256"]:
+                    record.pop("last_checked_size", None)
+                    record.pop("last_checked_mtime_ns", None)
                 record["baseline_sha256"] = selected["sha256"]
                 record["last_published_seq"] = max(record.get("last_published_seq", 0), entry["save_seq"])
         if record is not None and entry["requester"] in ("save", "final"):
