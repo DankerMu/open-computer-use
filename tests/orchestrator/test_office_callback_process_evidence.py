@@ -87,6 +87,14 @@ if os.environ.get("OCU_TRAP_REPLACE") == "1":
         raise AssertionError("replay rewrote office state")
     store_mod.os.replace = refuse
 import app
+import docker_manager
+from docker.errors import NotFound
+class Containers:
+    def get(self, name):
+        raise NotFound(name)
+class Engine:
+    containers = Containers()
+docker_manager._docker_client = Engine()
 from office.tokens import sign_jwt
 session = {"session_id": os.environ["OCU_SESSION"], "document_key": os.environ["OCU_KEY"]}
 status = int(os.environ.get("OCU_STATUS", "6"))
@@ -217,7 +225,7 @@ def test_crash_after_download_before_store_retries_once(office_world, monkeypatc
     assert origin.hits == 0
 
 
-def test_postreplace_durability_failure_replays_without_rewrite(office_world, monkeypatch):
+def test_postreplace_durability_failure_replays_and_publishes_in_fresh_worker(office_world, monkeypatch):
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
     import office.store as store_mod
 
@@ -261,8 +269,6 @@ def test_postreplace_durability_failure_replays_without_rewrite(office_world, mo
         index_path = data / CHAT / ".ocu" / "index.json"
         before_state = state_path.read_bytes()
         before_index = index_path.read_bytes()
-        before_state_stat = state_path.stat()
-        before_index_stat = index_path.stat()
         hits = server.hits
         replaced_marker = data.parent / "callback-replaced"
         env = _callback_child_env(
@@ -290,6 +296,7 @@ def test_postreplace_durability_failure_replays_without_rewrite(office_world, mo
             failed = json.loads(out_fail.strip().splitlines()[-1])
             assert failed["status"] == 500
             env["OCU_FAIL_BARRIER"] = "0"
+            env["OCU_TRAP_REPLACE"] = "0"
             recovered = subprocess.Popen(
                 [sys.executable, "-c", _CALLBACK_CHILD],
                 cwd=str(SERVER_DIR),
@@ -306,20 +313,38 @@ def test_postreplace_durability_failure_replays_without_rewrite(office_world, mo
             _stop_child(failing)
             _stop_child(recovered)
         assert not replaced_marker.exists()
-        assert state_path.read_bytes() == before_state
-        assert index_path.read_bytes() == before_index
-        after_state_stat = state_path.stat()
-        after_index_stat = index_path.stat()
-        assert (after_state_stat.st_ino, after_state_stat.st_mtime_ns) == (
-            before_state_stat.st_ino, before_state_stat.st_mtime_ns,
-        )
-        assert (after_index_stat.st_ino, after_index_stat.st_mtime_ns) == (
-            before_index_stat.st_ino, before_index_stat.st_mtime_ns,
-        )
-        after = json.loads(before_state)
+        after = json.loads(state_path.read_bytes())
         assert len(after["documents"][session["file_id"]]["versions"]) == len(listed)
-        assert set(after["receipts"][session["session_id"]]) == {"1"}
-        assert after["sessions"][session["session_id"]]["save_seq"] == 1
+        assert after["documents"][session["file_id"]]["versions"][-1]["published"] is True
+        assert after["documents"][session["file_id"]]["published_sha256"] == _sha(CHANGED)
+        assert after["journal"] == {}
+        assert after["receipts"] == json.loads(before_state)["receipts"]
+        record = after["sessions"][session["session_id"]]
+        assert (record["state"], record["save_seq"], record["last_published_seq"]) == ("closed", 1, 1)
+        assert record["baseline_sha256"] == _sha(CHANGED)
+        assert json.loads(index_path.read_bytes())["counter"] == json.loads(before_index)["counter"] + 1
+        completed_state = state_path.read_bytes()
+        completed_index = index_path.read_bytes()
+        completed_state_stat = state_path.stat()
+        completed_index_stat = index_path.stat()
+        env["OCU_TRAP_REPLACE"] = "1"
+        replayed = subprocess.run(
+            [sys.executable, "-c", _CALLBACK_CHILD], cwd=str(SERVER_DIR), env=env,
+            text=True, capture_output=True, timeout=15,
+        )
+        assert replayed.returncode == 0, (replayed.stdout, replayed.stderr)
+        assert json.loads(replayed.stdout.strip().splitlines()[-1]) == {
+            "status": 200, "body": {"error": 0},
+        }
+        assert not replaced_marker.exists()
+        assert state_path.read_bytes() == completed_state
+        assert index_path.read_bytes() == completed_index
+        assert (state_path.stat().st_ino, state_path.stat().st_mtime_ns) == (
+            completed_state_stat.st_ino, completed_state_stat.st_mtime_ns,
+        )
+        assert (index_path.stat().st_ino, index_path.stat().st_mtime_ns) == (
+            completed_index_stat.st_ino, completed_index_stat.st_mtime_ns,
+        )
         assert server.hits == hits
-        assert (_outputs(data) / "report.docx").read_bytes() == content
+        assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
     assert origin.hits == 0

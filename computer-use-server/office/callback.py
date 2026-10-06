@@ -9,11 +9,12 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from typing import Any
 
 from fastapi.responses import JSONResponse
 
-from . import config, download, epoch, ooxml, sessions, store as store_module, versions
+from . import config, download, epoch, ooxml, publish, sessions, store as store_module, versions
 from .download import DownloadFailed, DownloadRejected, FileTooLarge
 from .epoch import RestoreEpochError
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
@@ -93,9 +94,10 @@ def _process(
     if status in _FINAL:
         found = sessions._final_receipt(state, session_id)
         if found is not None:
-            _sequence, final = found
+            sequence, final = found
             answer = sessions._successful_answer(final)
             _replay_barrier(store, chat)
+            _drive_receipt_publication(store, chat, session_id, sequence, final)
             return JSONResponse(status_code=200, content=answer)
     userdata = _forcesave_userdata(payload) if status in _FORCESAVE else None
     if status in _FORCESAVE:
@@ -140,7 +142,9 @@ def _forcesave_order(
     save_seq, presented_intent = userdata
     existing = _receipt_at(store._snapshot(store._load(chat, create=False)), session_id, save_seq)
     if existing is not None:
-        return _replay_forcesave(store, chat, status, existing, payload, loop)
+        response = _replay_forcesave(store, chat, status, existing, payload, loop)
+        _drive_receipt_publication(store, chat, session_id, save_seq, existing)
+        return response
     issued = _issued_intent(record, save_seq)
     if issued is None or save_seq > record["save_seq"] or presented_intent != issued:
         if record["state"] in _ENDED:
@@ -174,9 +178,9 @@ def _persist_content(
         if status == 6:
             assert save_seq is not None and intent is not None
             source = "save" if intent == "publish" else "autosave"
-            _store_content(store, chat, session_id, status, save_seq, source, body, _apply_status_6)
+            journal_id = _store_content(store, chat, session_id, status, save_seq, source, body)
         else:
-            _store_content(store, chat, session_id, status, None, "close", body, _persist_close)
+            journal_id = _store_content(store, chat, session_id, status, None, "close", body)
     except StateDurabilityError:
         raise
     except (
@@ -195,6 +199,8 @@ def _persist_content(
         if status == 6 and save_seq is not None:
             _recover_outstanding(store, chat, session_id, save_seq, reason)
         raise
+    if journal_id is not None:
+        _publish_callback_obligation(chat, journal_id)
 
 
 def _replay_forcesave(
@@ -218,6 +224,36 @@ def _replay_forcesave(
     return JSONResponse(status_code=200, content=answer)
 
 
+def _publish_callback_obligation(chat, journal_id):
+    try:
+        publish.publish(chat, journal_id)
+    except (publish.SandboxStateError, publish.RecoveryRequiredError) as extra:
+        _LOG.warning(
+            "Office callback publication remains pending",
+            extra={"chat_id": chat, "publication_refusal": type(extra).__name__},
+        )
+
+
+def _drive_receipt_publication(store, chat, session_id, save_seq, receipt):
+    if receipt["status"] not in (2, 6) or receipt["version"] is None:
+        return
+    state = store.read(chat)
+    record = sessions._persisted_session(session_id, state["sessions"][session_id])
+    requester = "final" if receipt["status"] == 2 else "save"
+    matching = [
+        journal_id for journal_id, entry in state["journal"].items()
+        if entry.get("session_id") == session_id
+        and entry.get("save_seq") == save_seq
+        and entry.get("file_id") == record["file_id"]
+        and entry.get("version") == receipt["version"]
+        and entry.get("requester") == requester
+    ]
+    if len(matching) > 1:
+        raise StateCorruptError("callback receipt owns more than one publication")
+    if matching:
+        _publish_callback_obligation(chat, matching[0])
+
+
 def _validate_content(store: OfficeStore, chat: str, session_id: str, body: bytes) -> None:
     state = store._snapshot(store._load(chat, create=False))
     record = sessions._persisted_session(session_id, state["sessions"][session_id])
@@ -236,20 +272,27 @@ def _store_content(
     save_seq: int | None,
     source: str,
     body: bytes,
-    apply,
-) -> None:
+) -> str | None:
     state = store._snapshot(store._load(chat, create=False))
     record = sessions._persisted_session(session_id, state["sessions"][session_id])
     file_id = record["file_id"]
     listed = sessions._active_versions(state, file_id)
     parent = listed[-1]["number"]
     allocated = save_seq if save_seq is not None else _next_final_seq(record)
+    journal_id = uuid.uuid4().hex if source in ("save", "close") else None
 
     def mutate_state(working: dict[str, Any], selected: dict[str, Any]) -> None:
         current = sessions._persisted_session(session_id, working["sessions"][session_id])
         if save_seq is None:
             _commit_final_seq(current, allocated)
-        apply(working, current, allocated, selected)
+        if journal_id is not None:
+            working["journal"][journal_id] = {
+                "file_id": file_id, "version": selected["number"],
+                "session_id": session_id, "save_seq": allocated,
+                "requester": "final" if status == 2 else "save",
+            }
+        else:
+            _apply_status_6(working, current, allocated, selected)
         _advance_committed(current, allocated, selected)
 
     receipt = {
@@ -271,6 +314,7 @@ def _store_content(
         receipt=receipt,
         mutate_state=mutate_state,
     )
+    return journal_id
 
 
 def _apply_no_content(store: OfficeStore, chat: str, session_id: str, status: int, apply, save_seq=None) -> None:
@@ -338,10 +382,6 @@ def _apply_status_4(working: dict[str, Any], record: dict[str, Any], save_seq: i
         record["state"] = "closed"
         record["pending_close_seq"] = None
     _advance_committed(record, save_seq, None)
-
-
-def _persist_close(_working, record: dict[str, Any], _save_seq: int, _selected) -> None:
-    record["pending_close_seq"] = None
 
 
 

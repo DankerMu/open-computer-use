@@ -92,6 +92,7 @@ def test_sweep_publishes_unstarted_obligation_in_office_only_chat(world, monkeyp
     expected["documents"][file_id]["published_version"] = 2
     expected["documents"][file_id]["published_sha256"] = saved_hash
     expected["sessions"][session_id]["baseline_sha256"] = saved_hash
+    expected["sessions"][session_id]["last_published_seq"] = 1
     del expected["journal"][journal_id]
     assert store.read(CHAT) == expected
     assert read_version_bytes(store, CHAT, saved_hash) == b"published-v2"
@@ -119,6 +120,7 @@ def _published(fixture):
     assert state["documents"][fixture.file_id]["published_sha256"] == _sha(SAVED)
     assert state["documents"][fixture.file_id]["versions"][1]["published"] is True
     assert state["sessions"][SESSION]["baseline_sha256"] == _sha(SAVED)
+    assert state["sessions"][SESSION]["last_published_seq"] == 3
     assert state["receipts"] == fixture.before["receipts"]
     listing = fixture.broker.reconcile(CHAT)
     assert listing["entries"][0]["file_id"] == fixture.file_id
@@ -170,7 +172,9 @@ def test_recovery_preserves_baseline_conflict_and_completes_the_obligation(world
     assert fixture.target.read_bytes() == b"agent-change"
     assert state["journal"] == {}
     assert state["documents"] == fixture.before["documents"]
-    assert state["sessions"] == fixture.before["sessions"]
+    expected_sessions = copy.deepcopy(fixture.before["sessions"])
+    expected_sessions[SESSION].update(state="conflict", reason="baseline_mismatch")
+    assert state["sessions"] == expected_sessions
     assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"]
 
 
@@ -1164,6 +1168,7 @@ def test_verified_missing_prepared_parent_completes_path_missing_without_recreat
     _recover()
     after = fixture.store.read(CHAT)
     expected = copy.deepcopy(fixture.before)
+    expected["sessions"][SESSION].update(state="conflict", reason="path_missing")
     del expected["journal"][OBLIGATION]
     assert after == expected
     assert not fixture.target.parent.exists()

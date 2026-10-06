@@ -19,7 +19,7 @@ import docker_manager
 from docker.errors import NotFound
 from outputs_broker import FileIdNotFoundError, OutputsBroker, OutputsBrokerError
 
-from . import versions, workspace
+from . import sessions, versions, workspace
 from .store import OfficeStore, StateCorruptError, StateDurabilityError, _DATA_ROOT_FLAGS, _DIRECTORY_FLAGS, _FILE_FLAGS, _WRITE_FLAGS
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -665,13 +665,39 @@ def recover_publications(chat_id: str, now: float | None = None) -> None:
 
 def _finish(store, chat, journal_id, result, entry, selected):
     def complete(state):
+        session_id = entry.get("session_id")
+        record = sessions._require_session(state, session_id) if session_id is not None else None
+        if record is not None:
+            sessions._status_projection(record)
         if result.outcome == "published":
             document = state["documents"][entry["file_id"]]
             document["versions"][selected["number"] - 1]["published"] = True
             document["published_version"] = selected["number"]
             document["published_sha256"] = selected["sha256"]
-            if entry.get("session_id") is not None:
-                state["sessions"][entry["session_id"]]["baseline_sha256"] = selected["sha256"]
+            if record is not None:
+                if record["baseline_sha256"] != selected["sha256"]:
+                    record.pop("last_checked_size", None)
+                    record.pop("last_checked_mtime_ns", None)
+                record["baseline_sha256"] = selected["sha256"]
+                record["last_published_seq"] = max(record.get("last_published_seq", 0), entry["save_seq"])
+        if record is not None and entry["requester"] in ("save", "final"):
+            owns_save = record.get("pending_save_seq") == entry["save_seq"]
+            if entry["requester"] == "final":
+                record["state"] = {
+                    "published": "closed", "conflict": "conflict", "failed": "error",
+                }[result.outcome]
+                record["reason"] = result.reason
+                record["pending_close_seq"] = None
+            elif record["state"] not in sessions.FINAL_STATES and record["state"] != "closing":
+                if result.outcome == "conflict":
+                    record["state"] = "conflict"
+                    record["reason"] = result.reason
+                elif record["state"] != "conflict":
+                    record["reason"] = result.reason
+                    if owns_save:
+                        record["state"] = "editing"
+            if owns_save:
+                record["pending_save_seq"] = None
         del state["journal"][journal_id]
     store.update(chat, complete)
     return result

@@ -27,6 +27,7 @@ from tests.orchestrator.test_office_control_plane import (
 )
 from tests.orchestrator.test_office_ooxml import intact_docx, intact_xlsx
 from tests.orchestrator.test_office_router import OFFICE_SETTINGS
+from tests.orchestrator.test_office_save_close import _forcesave, _save
 from tests.orchestrator.test_office_session_lifecycle import _change, _status
 from tests.orchestrator.test_office_sessions import (
     JWT_SECRET,
@@ -37,6 +38,7 @@ from tests.orchestrator.test_office_sessions import (
     _versions,
     office_world,
 )
+from tests.orchestrator.test_lifecycle import _docker as _docker_engine
 from tests.orchestrator.test_outputs_endpoint import CHAT
 
 RECORDED_STATUS_1_USERS = ["user-1"]
@@ -313,7 +315,7 @@ def test_status4_leaves_unpublished_latest_without_closing(office_world):
 
 
 def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
-    http, data, origin, _docker, _broker, content, session = _open_session(office_world)
+    http, data, origin, _docker, broker, content, session = _open_session(office_world)
     _change(
         session["session_id"],
         state="saving",
@@ -323,6 +325,7 @@ def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
     )
     before_workspace = (_outputs(data) / "report.docx").read_bytes()
     before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    before_revision = broker.OutputsBroker().current_revision(CHAT)
     with _content_origin({"/cache/output.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
@@ -332,6 +335,7 @@ def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
         )
         response = _post(http, session, payload)
         assert response.status_code == 200
+        assert response.json() == {"error": 0}
         assert [item["path"] for item in server.requests] == ["/cache/output.docx"]
         assert urlsplit(server.url).hostname == "127.0.0.1"
     record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
@@ -341,16 +345,101 @@ def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
     assert listed[-1]["source"] == "autosave"
     assert listed[-1]["published"] is False
     assert listed[-1]["sha256"] == _sha(CHANGED)
+    persisted = json.loads(_state(data).read_bytes())
+    document = persisted["documents"][session["file_id"]]
+    assert persisted["journal"] == {}
+    assert document["published_version"] == 1
+    assert document["published_sha256"] == _sha(content)
+    assert record["baseline_sha256"] == _sha(content)
+    assert record["last_published_seq"] == 0
+    assert (_versions(data) / _sha(CHANGED)).read_bytes() == CHANGED
     receipt = _receipt(data, session["session_id"], 1)
     assert receipt["status"] == 6
     assert receipt["sha256"] == _sha(CHANGED)
     assert receipt["version"] == listed[-1]["number"]
     assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
     assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision
+    persisted_bytes = _state(data).read_bytes()
+    from office.publish import recover_publications
+    recover_publications(CHAT)
+    assert _state(data).read_bytes() == persisted_bytes
+    assert json.loads(_state(data).read_bytes()) == persisted
+    assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision
     assert origin.hits == 0
 
 
-def test_status6_publish_and_status2_store_unpublished_versions(office_world, monkeypatch):
+def test_status6_publish_intent_publishes_workspace_and_completes_save(office_world, monkeypatch):
+    http, data, origin, docker, broker, content, session = _open_session(office_world)
+    session_id = session["session_id"]
+    file_id = session["file_id"]
+    workspace = _outputs(data) / "report.docx"
+    assert workspace.read_bytes() == content
+    assert CHANGED != content
+    before_revision = broker.OutputsBroker().current_revision(CHAT)
+    docker._docker_client = _docker_engine()
+
+    opened = _post(
+        http, session, recorded_status_1_payload(document_key=session["document_key"])
+    )
+    assert opened.status_code == 200
+    assert opened.json() == {"error": 0}
+    with _forcesave(monkeypatch, session["document_key"]) as (_server, issued):
+        accepted = _save(http, session_id, "publish")
+    assert accepted.status_code == 202
+    assert accepted.json() == {
+        "session_id": session_id, "save_seq": 1, "intent": "publish",
+    }
+    assert issued == [{"save_seq": 1, "intent": "publish"}]
+
+    with (
+        _content_origin({"/cache/save.docx": CHANGED}) as server,
+        _bind_internal(monkeypatch, server.url),
+    ):
+        payload = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=OFFICE_SETTINGS["OCU_OFFICE_DOCSERVER_ORIGIN"] + "/cache/save.docx",
+            save_seq=issued[0]["save_seq"],
+            intent=issued[0]["intent"],
+        )
+        response = _post(http, session, payload)
+        assert response.status_code == 200
+        assert response.json() == {"error": 0}
+        assert [item["path"] for item in server.requests] == ["/cache/save.docx"]
+
+    persisted = json.loads(_state(data).read_bytes())
+    document = persisted["documents"][file_id]
+    assert len(document["versions"]) == 2
+    saved = document["versions"][-1]
+    assert saved["source"] == "save"
+    assert saved["number"] == 2
+    assert saved["sha256"] == _sha(CHANGED)
+    assert (_versions(data) / _sha(CHANGED)).read_bytes() == CHANGED
+    receipt = persisted["receipts"][session_id]["1"]
+    assert receipt["status"] == 6
+    assert receipt["sha256"] == _sha(CHANGED)
+    assert receipt["version"] == 2
+    assert receipt["answer"] == {"error": 0}
+
+    assert workspace.read_bytes() == CHANGED
+    assert saved["published"] is True
+    assert document["published_version"] == 2
+    assert document["published_sha256"] == _sha(CHANGED)
+    record = persisted["sessions"][session_id]
+    assert record["state"] == "editing"
+    assert record["reason"] is None
+    assert record["save_seq"] == 1
+    assert record["last_committed_seq"] == 1
+    assert record["last_published_seq"] == 1
+    assert record["baseline_sha256"] == _sha(CHANGED)
+    assert persisted["journal"] == {}
+    assert broker.OutputsBroker().current_revision(CHAT) == before_revision + 1
+    assert origin.hits == 0
+
+
+def test_status6_publish_and_status2_publish_save_and_close_versions(office_world, monkeypatch):
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
     _change(
         session["session_id"],
@@ -359,7 +448,6 @@ def test_status6_publish_and_status2_store_unpublished_versions(office_world, mo
         pending_save_seq=1,
         save_intents={"1": "publish"},
     )
-    before_workspace = (_outputs(data) / "report.docx").read_bytes()
     with (
         _content_origin({"/cache/save.docx": CHANGED, "/cache/close.docx": CHANGED + b"x"}) as server,
         _bind_internal(monkeypatch, server.url),
@@ -374,9 +462,11 @@ def test_status6_publish_and_status2_store_unpublished_versions(office_world, mo
         assert response.status_code == 200
         listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
         assert listed[-1]["source"] == "save"
-        assert listed[-1]["published"] is False
+        assert listed[-1]["published"] is True
         record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
         assert record["state"] == "editing"
+        assert record["last_published_seq"] == 1
+        assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
         payload2 = recorded_status_2_payload(
             document_key=session["document_key"],
             url=OFFICE_SETTINGS["OCU_OFFICE_DOCSERVER_ORIGIN"] + "/cache/close.docx",
@@ -386,11 +476,13 @@ def test_status6_publish_and_status2_store_unpublished_versions(office_world, mo
         listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
         record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
         assert listed[-1]["source"] == "close"
-        assert listed[-1]["published"] is False
-        assert record["state"] == "editing"
+        assert listed[-1]["published"] is True
+        assert record["state"] == "closed"
         assert record["last_committed_seq"] == 2
+        assert record["last_published_seq"] == 2
+        assert record["baseline_sha256"] == _sha(CHANGED + b"x")
         assert json.loads(_state(data).read_bytes())["journal"] == {}
-        assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
+        assert (_outputs(data) / "report.docx").read_bytes() == CHANGED + b"x"
         hosts = {item["host"] for item in server.requests}
         assert all(host.startswith("127.0.0.1") for host in hosts)
     assert origin.hits == 0
@@ -575,7 +667,9 @@ def test_forcesave_while_closing_or_conflict_keeps_state(office_world, monkeypat
             assert _post(http, session, payload).status_code == 200
             listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
             assert listed[-1]["source"] == "save"
-            assert listed[-1]["published"] is False
+            assert listed[-1]["published"] is True
+            assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+            assert json.loads(_state(data).read_bytes())["journal"] == {}
         else:
             payload = synthetic_status_7_payload(
                 document_key=session["document_key"], save_seq=1, intent="publish",
@@ -1035,7 +1129,7 @@ def test_route_timeout_returns_editing_then_same_signed_retry_commits(office_wor
     assert origin.hits == 0
 
 
-def test_epoch_change_after_open_final_receipt_orphans_without_fetch(office_world, monkeypatch):
+def test_epoch_change_after_published_final_receipt_preserves_closed_without_fetch(office_world, monkeypatch):
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
     opened = _post(http, session, recorded_status_1_payload(document_key=session["document_key"]))
     assert opened.status_code == 200
@@ -1048,7 +1142,7 @@ def test_epoch_change_after_open_final_receipt_orphans_without_fetch(office_worl
         assert first.status_code == 200
         before = json.loads(_state(data).read_bytes())
         record = before["sessions"][session["session_id"]]
-        assert record["state"] == "editing"
+        assert record["state"] == "closed"
         receipts = before["receipts"][session["session_id"]]
         listed = before["documents"][session["file_id"]]["versions"]
         workspace = (_outputs(data) / "report.docx").read_bytes()
@@ -1056,11 +1150,12 @@ def test_epoch_change_after_open_final_receipt_orphans_without_fetch(office_worl
         hits = server.hits
         (data / ".office-restore-epoch").write_text("new-epoch", encoding="utf-8")
         replay = _post(http, session, payload)
-        _assert_refusal(replay, 409, "session_not_open")
+        assert replay.status_code == 200
+        assert replay.json() == {"error": 0}
         assert server.hits == hits
         after = json.loads(_state(data).read_bytes())
-        assert after["sessions"][session["session_id"]]["state"] == "orphaned"
-        assert after["sessions"][session["session_id"]]["reason"] == "restore_epoch_changed"
+        assert after["sessions"][session["session_id"]]["state"] == "closed"
+        assert after["sessions"][session["session_id"]]["reason"] is None
         assert after["receipts"][session["session_id"]] == receipts
         assert after["documents"][session["file_id"]]["versions"] == listed
         assert (_outputs(data) / "report.docx").read_bytes() == workspace
@@ -1301,7 +1396,6 @@ def test_status2_precommit_state_write_eio_is_structured_then_retry_commits(
         )
         before = _snapshot(data)
         before_state = json.loads(_state(data).read_bytes())
-        before_record = dict(before_state["sessions"][session["session_id"]])
         before_versions = list(before_state["documents"][session["file_id"]]["versions"])
         before_workspace = (_outputs(data) / "report.docx").read_bytes()
         before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
@@ -1326,7 +1420,7 @@ def test_status2_precommit_state_write_eio_is_structured_then_retry_commits(
         assert len(listed) == len(before_versions) + 1
         assert listed[-1]["sha256"] == digest
         assert listed[-1]["source"] == "close"
-        assert listed[-1]["published"] is False
+        assert listed[-1]["published"] is True
         assert receipts == {
             session["session_id"]: {
                 "1": {
@@ -1338,11 +1432,16 @@ def test_status2_precommit_state_write_eio_is_structured_then_retry_commits(
             }
         }
         assert journal == {}
-        assert record["state"] == before_record["state"] == "opening"
+        assert record["state"] == "closed"
+        assert record["last_published_seq"] == 1
+        assert record["baseline_sha256"] == digest
         assert record["last_committed_seq"] == 1
         assert record["save_seq"] == 1
-        assert (_outputs(data) / "report.docx").read_bytes() == before_workspace
-        assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
+        assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+        assert (_outputs(data) / "report.docx").read_bytes() != before_workspace
+        published_index = json.loads((data / CHAT / ".ocu" / "index.json").read_bytes())
+        assert published_index["counter"] == json.loads(before_index)["counter"] + 1
+        assert published_index["active"]["report.docx"]["hash"] == digest
         replay = _post(http, session, payload)
         assert replay.status_code == 200
         assert replay.json() == {"error": 0}

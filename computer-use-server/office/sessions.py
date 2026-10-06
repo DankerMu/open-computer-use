@@ -183,8 +183,11 @@ def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
                     reason = "editor_state_lost"
             if reason is not None:
                 state = _orphan_session(store, chat, active["session_id"], reason)
-                orphaned_here = True
-            else:
+                active = _require_session(state, active["session_id"])
+                orphaned_here = active["state"] == "orphaned"
+            if active["state"] in OPEN_STATES:
+                latest = _active_versions(state, file_id)[-1]
+                ended = active["state"] == "conflict" and _final_receipt(state, active["session_id"]) is not None
                 content, _digest = store.read_workspace_file(
                     chat, relative_path, max_bytes=broker.max_file_size
                 )
@@ -365,10 +368,31 @@ def _final_receipt(state, session_id) -> tuple[int, dict[str, Any]] | None:
     return found
 
 
+def _recover_session_publications(store, chat, session_id):
+    state = store.read(chat)
+    if any(entry.get("session_id") == session_id for entry in state["journal"].values()):
+        from .publish import recover_publications
+        recover_publications(chat)
+        state = store.read(chat)
+    return state
+
+
 def _orphan_session(store, chat, session_id, reason):
+    before = store.read(chat)
+    recovering_final = any(
+        entry.get("session_id") == session_id and entry.get("requester") == "final"
+        for entry in before["journal"].values()
+    )
+    protect_final_conflict = reason != "restore_epoch_changed" or recovering_final
+    state = _recover_session_publications(store, chat, session_id)
+    record = _require_session(state, session_id)
+    ended = record["state"] == "conflict" and _final_receipt(state, session_id) is not None
+    if record["state"] not in OPEN_STATES or ended and protect_final_conflict:
+        return state
     def mutate(working):
         record = _persisted_session(session_id, working["sessions"].get(session_id))
-        if record["state"] in OPEN_STATES:
+        ended = record["state"] == "conflict" and _final_receipt(working, session_id) is not None
+        if record["state"] in OPEN_STATES and not (ended and protect_final_conflict):
             record["state"] = "orphaned"
             record["reason"] = reason
     return store.update(chat, mutate)
@@ -589,6 +613,9 @@ def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
         orphaned = _maybe_orphan_epoch(store, chat, record, session_id)
         if orphaned is not None:
             raise SessionNotEditingError()
+        state = _recover_session_publications(store, chat, session_id)
+        record = _require_session(state, session_id)
+        _status_projection(record)
         if record["state"] != "editing":
             raise SessionNotEditingError()
         document_key = record["document_key"]
@@ -651,6 +678,24 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
     with docker_manager._combined_lock(chat):
         preview = store.read(chat)
         mutate(preview)
+        if changed["value"] and outcome is commands.ForceSaveOutcome.KEY_UNKNOWN:
+            allocation = preview["sessions"][session_id]["save_seq"]
+            survived = any(
+                entry.get("session_id") == session_id
+                and entry.get("save_seq") == save_seq and entry.get("requester") == "save"
+                and entry.get("file_id") == preview["sessions"][session_id]["file_id"]
+                for entry in preview["journal"].values()
+            )
+            recovered = _recover_session_publications(store, chat, session_id)
+            live = _require_session(recovered, session_id)
+            changed["value"] = False
+            if (
+                survived and live["document_key"] == document_key
+                and live["save_seq"] == allocation and live.get("pending_save_seq") is None
+            ):
+                _orphan_session(store, chat, session_id, "editor_state_lost")
+            else:
+                mutate(recovered)
         if changed["value"]:
             store.update(chat, mutate)
     if outcome is commands.ForceSaveOutcome.NOTHING_TO_SAVE:
@@ -669,6 +714,9 @@ def _close_session(chat_id, session_id) -> dict[str, Any]:
         orphaned = _maybe_orphan_epoch(store, chat, record, session_id)
         if orphaned is not None:
             raise SessionNotOpenError()
+        state = _recover_session_publications(store, chat, session_id)
+        record = _require_session(state, session_id)
+        _status_projection(record)
         if record["state"] in FINAL_STATES:
             raise SessionNotOpenError()
         if record["state"] == "opening":

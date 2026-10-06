@@ -730,7 +730,8 @@ def test_repeat_close_after_consumed_pending_reuses_final_receipt_seq(office_wor
             assert listed[-1]["number"] == unpublished["number"]
             assert listed[-1]["published"] is False
         record = _record(session["session_id"])
-        assert record["state"] == "closing"
+        terminal_state = "closed" if kind == "status2" else "closing"
+        assert record["state"] == terminal_state
         assert record.get("pending_close_seq") in (None,)
         receipts = json.loads(_state(data).read_bytes())["receipts"][session["session_id"]]
         assert str(allocated) in receipts
@@ -742,10 +743,13 @@ def test_repeat_close_after_consumed_pending_reuses_final_receipt_seq(office_wor
         state_path = _state(data)
         before_state_stat = state_path.stat()
         repeat = _close(http, session["session_id"])
-        assert repeat.status_code == 202
-        assert repeat.json() == {
-            "session_id": session["session_id"], "save_seq": allocated, "state": "closing",
-        }
+        if kind == "status2":
+            _assert_refusal(repeat, 409, "session_not_open")
+        else:
+            assert repeat.status_code == 202
+            assert repeat.json() == {
+                "session_id": session["session_id"], "save_seq": allocated, "state": "closing",
+            }
         after_store, after_files = _persisted_inventory(data)
         assert after_store == before_store
         assert after_files == before_files
@@ -757,7 +761,7 @@ def test_repeat_close_after_consumed_pending_reuses_final_receipt_seq(office_wor
         assert workspace.read_bytes() == before_workspace
         assert (data / CHAT / ".ocu" / "index.json").read_bytes() == before_index
         after = _record(session["session_id"])
-        assert after["state"] == "closing"
+        assert after["state"] == terminal_state
         assert after.get("pending_close_seq") in (None,)
         assert json.loads(_state(data).read_bytes())["receipts"][session["session_id"]] == receipts
     assert origin.hits == 0

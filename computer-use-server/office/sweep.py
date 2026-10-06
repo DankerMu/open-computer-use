@@ -11,7 +11,7 @@ import time
 import docker_manager
 
 from . import commands, config
-from .sessions import _persisted_session, _status_projection
+from .sessions import _final_receipt, _orphan_session, _persisted_session, _status_projection
 from .publish import recover_publications
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
 
@@ -88,9 +88,9 @@ def _sweep_chat(store: OfficeStore, chat: str, current: float) -> None:
     with docker_manager._combined_lock(chat, create=False) as lock:
         if lock is None or not _has_state(store, chat):
             return
-        recover_publications(chat, now=current)
-        state = store.read(chat)
-        for session_id, stored in state["sessions"].items():
+        before = store.read(chat)
+        due = {}
+        for session_id, stored in before["sessions"].items():
             record = _persisted_session(session_id, stored)
             _status_projection(record)
             if record["state"] not in _ELIGIBLE:
@@ -98,21 +98,34 @@ def _sweep_chat(store: OfficeStore, chat: str, current: float) -> None:
             overdue_save = record["state"] == "saving" and _expired(
                 record, "saving_started_at", current, config.SAVE_CALLBACK_TIMEOUT_SECONDS,
             )
-            if not overdue_save and not _expired(
+            if overdue_save or _expired(
                 record, "last_activity_at", current, config.SESSION_LIVENESS_INTERVAL_SECONDS,
             ):
+                due[session_id] = overdue_save
+        recovering_saves = {
+            entry.get("session_id") for entry in before["journal"].values()
+            if entry.get("requester") == "save"
+        }
+        recover_publications(chat, now=current)
+        state = store.read(chat)
+        for session_id, overdue_save in due.items():
+            record = _persisted_session(session_id, state["sessions"].get(session_id))
+            _status_projection(record)
+            recovered_conflict = (
+                session_id in recovering_saves and record["state"] == "conflict"
+                and _final_receipt(state, session_id) is None
+            )
+            if record["state"] not in _ELIGIBLE and not recovered_conflict:
                 continue
             outcome = asyncio.run(commands.lookup_key(record["document_key"]))
             if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
-                next_state, reason = "orphaned", "editor_state_lost"
-            elif outcome is commands.KeyLookupOutcome.KNOWN and overdue_save:
-                next_state, reason = "editing", "save_timeout"
-            else:
-                continue
-
-            def mutate(working):
-                live = _persisted_session(session_id, working["sessions"].get(session_id))
-                live["state"] = next_state
-                live["reason"] = reason
-
-            store.update(chat, mutate)
+                _orphan_session(store, chat, session_id, "editor_state_lost")
+            elif (
+                outcome is commands.KeyLookupOutcome.KNOWN
+                and overdue_save and record["state"] == "saving"
+            ):
+                def mutate(working):
+                    live = _persisted_session(session_id, working["sessions"].get(session_id))
+                    live["state"] = "editing"
+                    live["reason"] = "save_timeout"
+                store.update(chat, mutate)
