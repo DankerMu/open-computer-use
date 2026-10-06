@@ -82,6 +82,15 @@ obligations.
 Successful publication invalidates the cached notice size/mtime sample when its
 session baseline changes; the next status observation determines `workspace_changed`.
 
+A final callback that finds the original path gone, or an original parent below
+the workspace root replaced by a symlink, publishes retained content as a new
+document under a numbered no-replace name and closes the session with `saved_as`.
+The new identity is distinct; source history, receipts and `document_key` stay
+on the original document. Ordinary saves and a leaf symlink keep
+`baseline_mismatch` for the next create. A missing or unsafe outputs root
+creates nothing and ends `error` / `workspace_missing` without recreating
+directories. Crash recovery of an owned copy remains the publisher's.
+
 ## API Endpoints
 
 ### MCP

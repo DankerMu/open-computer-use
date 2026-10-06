@@ -19,7 +19,7 @@ import docker_manager
 from docker.errors import NotFound
 from outputs_broker import FileIdNotFoundError, OutputsBroker, OutputsBrokerError
 
-from . import sessions, versions, workspace
+from . import save_as as save_as_mod, sessions, versions, workspace
 from .store import OfficeStore, StateCorruptError, StateDurabilityError, _DATA_ROOT_FLAGS, _DIRECTORY_FLAGS, _FILE_FLAGS, _WRITE_FLAGS
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -32,6 +32,7 @@ _PAUSE_BUDGET_SECONDS = 5
 class PublishResult:
     outcome: str
     reason: str | None = None
+    saved_as: dict | None = None
 
 
 class SandboxStateError(RuntimeError):
@@ -256,6 +257,18 @@ def _identity(info):
     return info.st_dev, info.st_ino
 
 
+def _document_path(state, file_id):
+    document = state["documents"].get(file_id)
+    path = document.get("path") if isinstance(document, dict) else None
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        workspace._parts(path)
+    except workspace.UnsafePathError:
+        return None
+    return path
+
+
 def _parents(chat, parts):
     """Keep the original parent alive even if its pathname is renamed."""
     return _open_parents((chat, "outputs", *parts[:-1]))
@@ -348,15 +361,20 @@ def _remove_owned(parent_fd, name, identity):
 
 
 def _prepared_fields(entry):
-    prepared = "target_path" in entry or "temporary_name" in entry
-    if not prepared:
-        if "staging" in entry:
-            raise StateCorruptError("publish staging has no target binding")
-        return
-    try:
-        workspace._parts(entry["target_path"])
-    except (KeyError, ValueError, TypeError, workspace.UnsafePathError) as exc:
-        raise StateCorruptError("publish target binding is invalid") from exc
+    if "copy" in entry:
+        if entry.get("requester") != "final" or entry.get("session_id") is None or "target_path" in entry:
+            raise StateCorruptError("publish copy requester binding is invalid")
+        save_as_mod.validate_intent(entry["copy"])
+    else:
+        prepared = "target_path" in entry or "temporary_name" in entry
+        if not prepared:
+            if "staging" in entry:
+                raise StateCorruptError("publish staging has no target binding")
+            return
+        try:
+            workspace._parts(entry["target_path"])
+        except (KeyError, ValueError, TypeError, workspace.UnsafePathError) as exc:
+            raise StateCorruptError("publish target binding is invalid") from exc
     if not isinstance(entry.get("temporary_name"), str) or not re.fullmatch(
         r"\.office-publish\.[0-9a-f]{32}\.tmp", entry["temporary_name"],
     ):
@@ -670,23 +688,32 @@ def _finish(store, chat, journal_id, result, entry, selected):
         if record is not None:
             sessions._status_projection(record)
         if result.outcome == "published":
-            document = state["documents"][entry["file_id"]]
-            document["versions"][selected["number"] - 1]["published"] = True
-            document["published_version"] = selected["number"]
-            document["published_sha256"] = selected["sha256"]
-            if record is not None:
-                if record["baseline_sha256"] != selected["sha256"]:
-                    record.pop("last_checked_size", None)
-                    record.pop("last_checked_mtime_ns", None)
-                record["baseline_sha256"] = selected["sha256"]
-                record["last_published_seq"] = max(record.get("last_published_seq", 0), entry["save_seq"])
+            if result.saved_as is not None:
+                save_as_mod.apply_successor(state, entry, selected, result.saved_as)
+                if record is not None:
+                    record = state["sessions"][session_id]
+                    record["last_published_seq"] = max(
+                        record.get("last_published_seq", 0), entry["save_seq"],
+                    )
+            else:
+                document = state["documents"][entry["file_id"]]
+                document["versions"][selected["number"] - 1]["published"] = True
+                document["published_version"] = selected["number"]
+                document["published_sha256"] = selected["sha256"]
+                if record is not None:
+                    if record["baseline_sha256"] != selected["sha256"]:
+                        record.pop("last_checked_size", None)
+                        record.pop("last_checked_mtime_ns", None)
+                    record["baseline_sha256"] = selected["sha256"]
+                    record["last_published_seq"] = max(record.get("last_published_seq", 0), entry["save_seq"])
         if record is not None and entry["requester"] in ("save", "final"):
+            record = state["sessions"][session_id]
             owns_save = record.get("pending_save_seq") == entry["save_seq"]
             if entry["requester"] == "final":
                 record["state"] = {
                     "published": "closed", "conflict": "conflict", "failed": "error",
                 }[result.outcome]
-                record["reason"] = result.reason
+                record["reason"] = None if result.saved_as is not None else result.reason
                 record["pending_close_seq"] = None
             elif record["state"] not in sessions.FINAL_STATES and record["state"] != "closing":
                 if result.outcome == "conflict":
@@ -709,6 +736,55 @@ def add_obligation(state, journal_id, record, selected, save_seq, requester):
         "session_id": record["session_id"], "save_seq": save_seq,
         "requester": requester,
     }
+
+
+def _final_save_as(store, broker, chat, journal_id, entry, selected, fence, original, *, identity_missing=False, held=None, stage=None):
+    """Decide and drive a final copy from the settled, writer-excluded world."""
+    try:
+        refusal, destination = save_as_mod.plan(chat, original, identity_missing=identity_missing)
+    except OSError as extra:
+        if extra.errno not in _PATH_ERRORS:
+            raise
+        refusal, destination = "unsafe_path", None
+    if refusal is not None:
+        return _finish(store, chat, journal_id, PublishResult("failed", refusal), entry, selected), stage
+    if destination is None:
+        return None, stage
+    previous = list(held or ())
+    if held is not None:
+        held.clear()
+    predecessor = None
+    copied = None
+    try:
+        binding = entry.get("staging")
+        if isinstance(binding, dict) and not binding.get("retired", False):
+            if not previous:
+                raise RecoveryRequiredError("publish shared absence is unverified")
+            predecessor = _Stage(store, chat, journal_id, entry)
+            predecessor.cleanup(previous[-1])
+            predecessor.close()
+            predecessor = None
+            stage = None
+            fence.checkpoint()
+        copied = save_as_mod.drive(store, broker, chat, journal_id, entry, selected, fence, destination)
+        return copied, None
+    finally:
+        primary = sys.exc_info()[1]
+        error = None
+        if predecessor is not None:
+            try:
+                predecessor.close()
+            except OSError as extra:
+                error = extra
+        for fd in reversed(previous):
+            try:
+                os.close(fd)
+            except OSError as extra:
+                error = error or extra
+        if error is not None:
+            if primary is None and copied is None:
+                raise error
+            _record("Office publication workspace cleanup failed", chat_id=chat)
 
 
 def drive_obligation(chat, journal_id):
@@ -750,7 +826,8 @@ def publish(chat_id: str, journal_id: str) -> PublishResult:
             try:
                 outcome = _publish_locked(
                     store, broker, chat, obligation,
-                    recovering=not requested or "target_path" in state["journal"][obligation],
+                    recovering=not requested or "target_path" in state["journal"][obligation]
+                    or "copy" in state["journal"][obligation],
                 )
                 if requested:
                     result = outcome
@@ -783,7 +860,47 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
     replaced, result = False, None
     writer_excluded = container is None or container.status == "exited" or paused
     try:
-        # Recorded paths remain obligations even if the current index moved them.
+        path = None
+        identity_missing = False
+        try:
+            path = broker.resolve_file_id(chat, entry["file_id"])
+        except FileIdNotFoundError:
+            identity_missing = True
+            result = PublishResult("conflict", "path_missing")
+        except OutputsBrokerError:
+            result = PublishResult("failed", "index_unavailable")
+        if "copy" in entry:
+            if not writer_excluded:
+                if fence.acquire():
+                    writer_excluded = True
+                elif recovering:
+                    raise RecoveryRequiredError("publication recovery could not exclude the writer")
+                else:
+                    result = PublishResult("failed", "pause_failed")
+            if writer_excluded:
+                result = save_as_mod.drive(store, broker, chat, journal_id, entry, selected, fence, None)
+                return result
+        if (entry["requester"] == "final" and identity_missing
+                and result is not None and result.outcome == "conflict"
+                and result.reason == "path_missing"):
+            original = _document_path(state, entry["file_id"])
+            if original is None:
+                raise StateCorruptError("final publish document path is invalid")
+            if not writer_excluded:
+                if fence.acquire():
+                    writer_excluded = True
+                elif recovering:
+                    raise RecoveryRequiredError("publication recovery could not exclude the writer")
+                else:
+                    result = PublishResult("failed", "pause_failed")
+            if writer_excluded:
+                copied, stage = _final_save_as(
+                    store, broker, chat, journal_id, entry, selected, fence, original,
+                    identity_missing=True, held=held, stage=stage,
+                )
+                if copied is not None:
+                    return copied
+        # Recorded replacement paths remain obligations if the index moved them.
         if "target_path" in entry:
             if not writer_excluded:
                 if not fence.acquire():
@@ -800,12 +917,6 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
             finally:
                 for fd in reversed(previous):
                     os.close(fd)
-        try:
-            path = broker.resolve_file_id(chat, entry["file_id"])
-        except FileIdNotFoundError:
-            result = PublishResult("conflict", "path_missing")
-        except OutputsBrokerError:
-            result = PublishResult("failed", "index_unavailable")
         if result is None:
             parts = workspace._parts(path)
             temporary = f".office-publish.{uuid.uuid4().hex}.tmp"
@@ -824,13 +935,34 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                 if exc.errno not in _PATH_ERRORS:
                     raise
                 result = PublishResult("conflict", "path_missing" if exc.errno == errno.ENOENT else "baseline_mismatch")
-            if result is None and not writer_excluded:
+            if not writer_excluded and (result is None or entry["requester"] == "final"):
                 if fence.acquire():
                     writer_excluded = True
                 elif recovering:
                     raise RecoveryRequiredError("publication recovery could not exclude the writer")
                 else:
                     result = PublishResult("failed", "pause_failed")
+            if writer_excluded and result is not None and result.outcome == "conflict":
+                for fd in reversed(held):
+                    os.close(fd)
+                held = []
+                try:
+                    held, absent = _prepared_parents(chat, parts)
+                    if absent is not None:
+                        result = PublishResult("conflict", "path_missing")
+                    else:
+                        target = os.lstat(parts[-1], dir_fd=held[-1])
+                        if not stat.S_ISREG(target.st_mode):
+                            result = PublishResult("conflict", "baseline_mismatch")
+                        else:
+                            result = None
+                except OSError as extra:
+                    if extra.errno not in _PATH_ERRORS:
+                        raise
+                    result = PublishResult(
+                        "conflict",
+                        "path_missing" if extra.errno == errno.ENOENT else "baseline_mismatch",
+                    )
             try:
                 if result is None:
                     fence.checkpoint()
@@ -856,6 +988,19 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
             if (result is None and digest != baseline
                     and not (recovering and digest == selected["sha256"])):
                 result = PublishResult("conflict", "baseline_mismatch")
+            if (entry["requester"] == "final"
+                    and result is not None
+                    and result.outcome == "conflict"
+                    and result.reason in ("path_missing", "baseline_mismatch")):
+                original = path if path is not None else _document_path(state, entry["file_id"])
+                if original is None:
+                    raise StateCorruptError("final publish document path is invalid")
+                copied, stage = _final_save_as(
+                    store, broker, chat, journal_id, entry, selected, fence, original,
+                    identity_missing=result.reason == "path_missing", held=held, stage=stage,
+                )
+                if copied is not None:
+                    return copied
             if result is None:
                 content = versions.read_version_bytes(store, chat, selected["sha256"])
                 fence.checkpoint()
@@ -895,7 +1040,9 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                         raise StateCorruptError("registered publish differs from its version")
                     result = PublishResult("published")
     except _BudgetExpired:
-        result = PublishResult("interrupted" if replaced or recovering else "failed", "publish_timeout")
+        pending = store.read(chat)["journal"].get(journal_id)
+        copied = pending is not None and "copy" in pending and save_as_mod.exposed(store, chat, journal_id, pending)
+        result = PublishResult("interrupted" if replaced or recovering or copied else "failed", "publish_timeout")
     finally:
         primary = sys.exc_info()[1]
         cleanup_error = None

@@ -31,8 +31,9 @@ def _sha(body):
 
 @pytest.fixture(autouse=True)
 def _reload_publish(world):
-    if "office.publish" in sys.modules:
-        importlib.reload(sys.modules["office.publish"])
+    for module in ("office.save_as", "office.publish"):
+        if module in sys.modules:
+            importlib.reload(sys.modules[module])
 
 
 def _prepared(world, sandbox_state="exited", path="report.docx"):

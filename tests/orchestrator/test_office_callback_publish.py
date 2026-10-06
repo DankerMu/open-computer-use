@@ -665,6 +665,45 @@ def test_callback_conflict_keeps_workspace_and_unpublished_version(office_world,
         assert workspace.read_bytes() == content + b"agent"
 
 
+def test_final_callback_missing_original_closes_with_new_document(office_world, monkeypatch):
+    http, data, _origin, _manager, broker, _content, session = _opened(office_world)
+    original_id = session["file_id"]
+    original_key = session["document_key"]
+    workspace = _outputs(data) / "report.docx"
+    workspace.unlink()
+    with _content_origin({"/save.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        response = _post(http, session, _payload(session, server.url + "/save.docx", True))
+    assert response.status_code == 200
+    assert response.json() == {"error": 0}
+    status = _status(http, session["session_id"])
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["saved_as"] == {"file_id": payload["file_id"], "path": "report (2).docx"}
+    assert payload["state"] == "closed"
+    assert payload["document_key"] == original_key
+    assert payload["file_id"] != original_id
+    copied = _outputs(data) / "report (2).docx"
+    assert copied.read_bytes() == CHANGED
+    assert not workspace.exists()
+    listing = broker.OutputsBroker().reconcile(CHAT)
+    by_path = {entry["path"]: entry for entry in listing["entries"]}
+    assert "report.docx" not in by_path
+    assert by_path["report (2).docx"]["file_id"] == payload["file_id"]
+    persisted = _read(data)
+    successor = persisted["documents"][payload["file_id"]]
+    version = successor["versions"][0]
+    assert successor["path"] == "report (2).docx"
+    assert (version["number"], version["parent"], version["source"], version["published"]) == (
+        1, None, "conflict", True,
+    )
+    assert version["sha256"] == _sha(CHANGED)
+    record = persisted["sessions"][session["session_id"]]
+    assert record["saved_as"] == payload["saved_as"]
+    assert record["state"] == "closed"
+    assert record["file_id"] == payload["file_id"]
+    assert record["document_key"] == original_key
+
+
 @pytest.mark.parametrize("final", (False, True), ids=("save", "final"))
 @pytest.mark.parametrize("conflict", (False, True), ids=("published", "conflict"))
 def test_duplicate_drives_only_its_validated_surviving_publication(office_world, monkeypatch, final, conflict):
