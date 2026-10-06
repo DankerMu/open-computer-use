@@ -116,7 +116,7 @@ def test_poll_sweeps_office_only_sessions_and_preserves_every_other_record(
     file_id, created = _aged(office_world, state)
     session_id = created["session_id"]
     store = OfficeStore()
-    store.update(CHAT, lambda working: working["journal"].__setitem__("unrelated", {"keep": True}))
+    store.update(CHAT, lambda working: working["documents"][file_id].__setitem__("notes", {"keep": True}))
     _change(session_id, save_seq=4, pending_save_seq=3, pending_close_seq=4,
             save_intents={"1": "persist", "3": "publish"},
             last_committed_seq=2, last_published_seq=1)
@@ -784,3 +784,75 @@ def test_missing_data_root_poll_creates_no_chat_or_office_state(office_world, mo
     _poll(monkeypatch)
     assert not missing.exists()
     assert recording.hits == 0
+
+
+def test_unresolved_journal_blocks_session_orphaning_and_isolates_other_chats(
+    office_world, monkeypatch,
+):
+    from office.store import OfficeStore
+    monkeypatch.setattr("time.time", lambda: NOW)
+    _file, blocked = _aged(office_world, "editing")
+    _other_file, other = _aged(office_world, "editing", chat=CHAT_B)
+    store = OfficeStore()
+    store.update(CHAT, lambda state: state["journal"].__setitem__("malformed", {"keep": True}))
+    before = store.read(CHAT)
+    with _info_origin(monkeypatch, {other["document_key"]}, code=1) as (_origin, seen):
+        _poll(monkeypatch)
+    assert seen == [{"c": "info", "key": other["document_key"]}]
+    assert store.read(CHAT) == before
+    assert store.read(CHAT)["sessions"][blocked["session_id"]]["state"] == "editing"
+    assert store.read(CHAT_B)["sessions"][other["session_id"]]["state"] == "orphaned"
+
+
+def test_poll_completes_publication_before_documentserver_can_orphan_session(
+    office_world, monkeypatch,
+):
+    import hashlib
+    from office.store import OfficeStore
+    from tests.orchestrator.test_lifecycle import _docker
+    _http, data, _recording, manager, _broker = office_world
+    manager._docker_client = _docker([])
+    monkeypatch.setattr("time.time", lambda: NOW)
+    file_id, created = _aged(office_world, "editing")
+    session_id = created["session_id"]
+    store = OfficeStore()
+    saved = b"recovered-v2"
+    digest = hashlib.sha256(saved).hexdigest()
+    selected = store.store_version(CHAT, file_id, saved, source="save", parent=1,
+                                   published=False, min_free_bytes=0)
+    _change(session_id, save_seq=1, last_committed_seq=1, save_intents={"1": "publish"})
+    def seed(state):
+        state["journal"]["surviving-save"] = {
+            "file_id": file_id, "version": selected["number"], "session_id": session_id,
+            "save_seq": 1, "requester": "save",
+        }
+        state["receipts"][session_id] = {"1": {
+            "status": 6, "version": selected["number"], "sha256": digest, "answer": {"error": 0},
+        }}
+    store.update(CHAT, seed)
+    errors, seen = [], []
+    def respond(handler, body, _parent):
+        try:
+            command = _oracle_verify(json.loads(body)["token"], JWT_SECRET)
+            assert command == {"c": "info", "key": created["document_key"]}
+            assert (data / CHAT / "outputs" / "brief.docx").read_bytes() == b"recovered-v2"
+            state = json.loads(_state(data).read_bytes())
+            assert state["journal"] == {}
+            assert state["documents"][file_id]["published_sha256"] == digest
+            assert state["sessions"][session_id]["state"] == "editing"
+            seen.append(command)
+            return 200, {"Content-Type": "application/json"}, b'{"error":1}'
+        except BaseException as exc:
+            errors.append(exc)
+            return 500, {}, b""
+    with _command_origin(respond) as origin:
+        with monkeypatch.context() as patch:
+            patch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+            _poll(patch)
+    if errors:
+        raise errors[0]
+    assert seen == [{"c": "info", "key": created["document_key"]}]
+    after = store.read(CHAT)
+    assert after["sessions"][session_id]["state"] == "orphaned"
+    assert after["sessions"][session_id]["reason"] == "editor_state_lost"
+    assert after["journal"] == {}

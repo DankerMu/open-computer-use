@@ -12,12 +12,21 @@ import docker_manager
 
 from . import commands, config
 from .sessions import _persisted_session, _status_projection
+from .publish import recover_publications
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
 
 _ELIGIBLE = frozenset({"opening", "editing", "saving", "closing"})
 
 
 def sweep_office_sessions(now: float | None = None) -> None:
+    _sweep(_sweep_chat, now)
+
+
+def sweep_office_publications(now: float | None = None) -> None:
+    _sweep(_recover_chat, now)
+
+
+def _sweep(visit, now):
     if not config.enabled():
         return
     current = time.time() if now is None else now
@@ -34,7 +43,7 @@ def sweep_office_sessions(now: float | None = None) -> None:
                 try:
                     if not child.is_dir(follow_symlinks=False) or not _has_state(store, chat):
                         continue
-                    _sweep_chat(store, chat, current)
+                    visit(store, chat, current)
                 except StateDurabilityError:
                     print("[OFFICE] session sweep state durability failed")
                 except Exception:
@@ -70,11 +79,16 @@ def _expired(record, field, current, timeout) -> bool:
     return field in record and current - record[field] > timeout
 
 
+def _recover_chat(store, chat, current):
+    recover_publications(chat, now=current)
+
+
 def _sweep_chat(store: OfficeStore, chat: str, current: float) -> None:
     store._assert_chat_root_safe(chat, allow_missing=False)
-    with docker_manager._combined_lock(chat):
-        if not _has_state(store, chat):
+    with docker_manager._combined_lock(chat, create=False) as lock:
+        if lock is None or not _has_state(store, chat):
             return
+        recover_publications(chat, now=current)
         state = store.read(chat)
         for session_id, stored in state["sessions"].items():
             record = _persisted_session(session_id, stored)

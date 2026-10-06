@@ -128,8 +128,11 @@ def _post(http, session, extra, *, unsigned=None):
 
 
 
+@contextmanager
 def _bind_internal(monkeypatch, url: str):
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", url)
+    with monkeypatch.context() as patch:
+        patch.setenv("OCU_OFFICE_DOCSERVER_URL", url)
+        yield url
 
 
 def _history(data, file_id):
@@ -196,8 +199,7 @@ def test_unknown_session_is_404_without_download(office_world, monkeypatch):
     http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
     missing = dict(session)
     missing["session_id"] = "00000000-0000-4000-8000-000000000099"
-    with _content_origin({"/cache/output.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/output.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_2_payload(
             document_key=session["document_key"],
             url=OFFICE_SETTINGS["OCU_OFFICE_DOCSERVER_ORIGIN"] + "/cache/output.docx",
@@ -321,8 +323,7 @@ def test_status6_persist_stores_unpublished_autosave(office_world, monkeypatch):
     )
     before_workspace = (_outputs(data) / "report.docx").read_bytes()
     before_index = (data / CHAT / ".ocu" / "index.json").read_bytes()
-    with _content_origin({"/cache/output.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/output.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=OFFICE_SETTINGS["OCU_OFFICE_DOCSERVER_ORIGIN"] + "/cache/output.docx",
@@ -359,8 +360,10 @@ def test_status6_publish_and_status2_store_unpublished_versions(office_world, mo
         save_intents={"1": "publish"},
     )
     before_workspace = (_outputs(data) / "report.docx").read_bytes()
-    with _content_origin({"/cache/save.docx": CHANGED, "/cache/close.docx": CHANGED + b"x"}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with (
+        _content_origin({"/cache/save.docx": CHANGED, "/cache/close.docx": CHANGED + b"x"}) as server,
+        _bind_internal(monkeypatch, server.url),
+    ):
         payload6 = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/save.docx",
@@ -405,8 +408,7 @@ def test_out_of_order_and_duplicate_forcesave_delivery(office_world, monkeypatch
         save_intents={"3": "persist", "4": "persist"},
         last_committed_seq=0,
     )
-    with _content_origin({"/cache/3.docx": first, "/cache/4.docx": second}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/3.docx": first, "/cache/4.docx": second}) as server, _bind_internal(monkeypatch, server.url):
         four = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/4.docx",
@@ -449,8 +451,7 @@ def test_out_of_order_and_duplicate_forcesave_delivery(office_world, monkeypatch
 def test_unissued_userdata_is_invalid_without_download(office_world, monkeypatch):
     http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
     _change(session["session_id"], state="editing", save_seq=1, save_intents={"1": "persist"})
-    with _content_origin({"/cache/output.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/output.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/output.docx",
@@ -469,8 +470,7 @@ def test_unissued_userdata_is_invalid_without_download(office_world, monkeypatch
 
 def test_retried_final_callbacks_do_not_redownload(office_world, monkeypatch):
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
-    with _content_origin({"/cache/close.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/close.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_2_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/close.docx",
@@ -525,8 +525,10 @@ def test_close_status1_autosave_status2_allocates_above_committed(office_world, 
         save_intents={"4": "persist"},
         last_committed_seq=0,
     )
-    with _content_origin({"/cache/auto.docx": CHANGED, "/cache/final.docx": CHANGED + b"f"}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with (
+        _content_origin({"/cache/auto.docx": CHANGED, "/cache/final.docx": CHANGED + b"f"}) as server,
+        _bind_internal(monkeypatch, server.url),
+    ):
         auto = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/auto.docx",
@@ -562,8 +564,7 @@ def test_forcesave_while_closing_or_conflict_keeps_state(office_world, monkeypat
         save_intents={"1": "publish"},
         reason="held",
     )
-    with _content_origin({"/cache/save.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/save.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         if kind == "status6":
             payload = recorded_status_6_payload(
                 document_key=session["document_key"],
@@ -600,8 +601,7 @@ def test_status6_then_status7_same_seq_is_stale(office_world, monkeypatch):
         save_intents={"1": "publish"},
         reason="held",
     )
-    with _content_origin({"/cache/save.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/save.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/save.docx",
@@ -632,8 +632,7 @@ def test_late_timed_out_save_does_not_end_newer_saving(office_world, monkeypatch
         save_intents={"3": "persist", "4": "publish"},
         last_committed_seq=2,
     )
-    with _content_origin({"/cache/old.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/old.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/old.docx",
@@ -652,8 +651,7 @@ def test_late_timed_out_save_does_not_end_newer_saving(office_world, monkeypatch
 def test_ended_session_without_matching_receipt_is_not_open(office_world, monkeypatch):
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
     _change(session["session_id"], state="closed", save_seq=2, last_committed_seq=2)
-    with _content_origin({"/cache/output.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/output.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/output.docx",
@@ -670,8 +668,7 @@ def test_epoch_mismatch_orphans_before_replay(office_world, monkeypatch):
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
     marker = data / ".office-restore-epoch"
     marker.write_text("new-epoch", encoding="utf-8")
-    with _content_origin({"/cache/output.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/output.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_2_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/output.docx",
@@ -694,8 +691,7 @@ def test_download_origin_matrix_and_content_failures(office_world, monkeypatch):
         pending_save_seq=1,
         save_intents={"1": "persist"},
     )
-    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         browser = recorded_status_6_payload(
             document_key=session["document_key"],
             url=OFFICE_SETTINGS["OCU_OFFICE_DOCSERVER_ORIGIN"] + "/cache/ok.docx",
@@ -728,8 +724,10 @@ def test_download_origin_matrix_and_content_failures(office_world, monkeypatch):
         response = _post(http, session, foreign)
         _assert_refusal(response, 422, "download_url_rejected")
         assert server.hits == hits
-    with _content_origin({"/start": b""}, redirect=("/start", "http://example.test/elsewhere")) as redirected:
-        _bind_internal(monkeypatch, redirected.url)
+    with (
+        _content_origin({"/start": b""}, redirect=("/start", "http://example.test/elsewhere")) as redirected,
+        _bind_internal(monkeypatch, redirected.url),
+    ):
         _change(
             session["session_id"],
             state="saving",
@@ -750,8 +748,7 @@ def test_download_origin_matrix_and_content_failures(office_world, monkeypatch):
         assert record["state"] == "editing"
         assert record["reason"] == "download_failed"
         assert "3" not in json.loads(_state(data).read_bytes())["receipts"].get(session["session_id"], {})
-    with _content_origin({"/cache/sheet.xlsx": intact_xlsx()}) as typed:
-        _bind_internal(monkeypatch, typed.url)
+    with _content_origin({"/cache/sheet.xlsx": intact_xlsx()}) as typed, _bind_internal(monkeypatch, typed.url):
         _change(
             session["session_id"],
             state="saving",
@@ -772,8 +769,7 @@ def test_download_origin_matrix_and_content_failures(office_world, monkeypatch):
         record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
         assert record["state"] == "editing"
         assert record["reason"] == "invalid_content"
-    with _content_origin({"/cache/plain": b"not-ooxml"}) as plain:
-        _bind_internal(monkeypatch, plain.url)
+    with _content_origin({"/cache/plain": b"not-ooxml"}) as plain, _bind_internal(monkeypatch, plain.url):
         _change(
             session["session_id"],
             state="saving",
@@ -805,8 +801,7 @@ def test_oversized_download_leaves_no_staging(office_world, monkeypatch):
         pending_save_seq=1,
         save_intents={"1": "persist"},
     )
-    with _content_origin({"/cache/big.docx": b"0123456789"}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/big.docx": b"0123456789"}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/big.docx",
@@ -855,9 +850,10 @@ def test_callback_dns_stall_returns_before_resolver_executor_shutdown(office_wor
 
     monkeypatch.setattr(socket, "getaddrinfo", delayed)
     try:
-        with _content_origin({"/cache/ok.docx": CHANGED}) as server:
-            host_url = f"http://slow-resolution.example:{urlsplit(server.url).port}"
-            _bind_internal(monkeypatch, host_url)
+        with (
+            _content_origin({"/cache/ok.docx": CHANGED}) as server,
+            _bind_internal(monkeypatch, f"http://slow-resolution.example:{urlsplit(server.url).port}") as host_url,
+        ):
             payload = recorded_status_6_payload(
                 document_key=session["document_key"],
                 url=host_url + "/cache/ok.docx",
@@ -901,9 +897,10 @@ def test_callback_persists_when_default_executor_has_one_worker(office_world, mo
         asyncio.get_running_loop().set_default_executor(limited)
 
     http.portal.call(limit_executor)
-    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
-        host_url = f"http://localhost:{urlsplit(server.url).port}"
-        _bind_internal(monkeypatch, host_url)
+    with (
+        _content_origin({"/cache/ok.docx": CHANGED}) as server,
+        _bind_internal(monkeypatch, f"http://localhost:{urlsplit(server.url).port}") as host_url,
+    ):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=host_url + "/cache/ok.docx",
@@ -941,8 +938,7 @@ def test_committed_seq3_then_seq4_replay_same_bytes_and_reject_different(office_
         save_intents={"3": "persist", "4": "persist"},
         last_committed_seq=0,
     )
-    with _content_origin({"/cache/3.docx": first, "/cache/4.docx": second}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/3.docx": first, "/cache/4.docx": second}) as server, _bind_internal(monkeypatch, server.url):
         three = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/3.docx",
@@ -1004,8 +1000,7 @@ def test_route_timeout_returns_editing_then_same_signed_retry_commits(office_wor
         save_intents={"1": "persist"},
     )
     monkeypatch.setattr(commands, "HTTP_TIMEOUT_SECONDS", 0.05)
-    with _content_origin({"/cache/ok.docx": CHANGED}, delay=0.3) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/ok.docx": CHANGED}, delay=0.3) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/ok.docx",
@@ -1044,8 +1039,7 @@ def test_epoch_change_after_open_final_receipt_orphans_without_fetch(office_worl
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
     opened = _post(http, session, recorded_status_1_payload(document_key=session["document_key"]))
     assert opened.status_code == 200
-    with _content_origin({"/cache/close.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/close.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_2_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/close.docx",
@@ -1123,19 +1117,19 @@ def test_gzip_negotiating_origin_persists_identity_ooxml(office_world, monkeypat
 
     server = EncodingOrigin()
     try:
-        _bind_internal(monkeypatch, server.url)
-        payload = recorded_status_6_payload(
-            document_key=session["document_key"],
-            url=server.url + "/cache/ok.docx",
-            save_seq=1,
-            intent="persist",
-        )
-        response = _post(http, session, payload)
-        assert response.status_code == 200
-        listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
-        assert listed[-1]["sha256"] == _sha(CHANGED)
-        assert listed[-1]["sha256"] != _sha(packed)
-        assert server.requests[0]["headers"].get("accept-encoding") == "identity"
+        with _bind_internal(monkeypatch, server.url):
+            payload = recorded_status_6_payload(
+                document_key=session["document_key"],
+                url=server.url + "/cache/ok.docx",
+                save_seq=1,
+                intent="persist",
+            )
+            response = _post(http, session, payload)
+            assert response.status_code == 200
+            listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
+            assert listed[-1]["sha256"] == _sha(CHANGED)
+            assert listed[-1]["sha256"] != _sha(packed)
+            assert server.requests[0]["headers"].get("accept-encoding") == "identity"
     finally:
         server.close()
     assert origin.hits == 0
@@ -1157,8 +1151,7 @@ def test_malformed_receipt_answer_is_state_corrupt_without_fetch(office_world, m
         }
 
     OfficeStore().update(CHAT, plant_final)
-    with _content_origin({"/cache/close.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/close.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_2_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/close.docx",
@@ -1185,8 +1178,7 @@ def test_malformed_receipt_answer_is_state_corrupt_without_fetch(office_world, m
         }
 
     OfficeStore().update(CHAT, plant_forcesave)
-    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/ok.docx",
@@ -1223,8 +1215,7 @@ def test_storage_low_returns_session_to_editing_and_retry_commits(office_world, 
         pending_save_seq=1,
         save_intents={"1": "persist"},
     )
-    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/ok.docx",
@@ -1260,8 +1251,7 @@ def test_equal_latest_content_adds_no_version(office_world, monkeypatch):
         pending_save_seq=1,
         save_intents={"1": "persist"},
     )
-    with _content_origin({"/cache/same.docx": content}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/same.docx": content}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_6_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/same.docx",
@@ -1304,8 +1294,7 @@ def test_status2_precommit_state_write_eio_is_structured_then_retry_commits(
             raise OSError(errno.EIO, "injected precommit state write failure")
         return original(fd, encoded)
 
-    with _content_origin({"/close.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/close.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_2_payload(
             document_key=session["document_key"],
             url=server.url + "/close.docx",

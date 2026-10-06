@@ -117,8 +117,7 @@ def test_cross_worker_duplicate_serializes_one_version(office_world, monkeypatch
         save_intents={"1": "persist"},
     )
     first = second = None
-    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         ready_a = data.parent / "callback-worker-a"
         ready_b = data.parent / "callback-worker-b"
         env_a = _callback_child_env(data, session, server, {"OCU_READY": str(ready_a)})
@@ -177,8 +176,7 @@ def test_crash_after_download_before_store_retries_once(office_world, monkeypatc
         save_intents={"1": "persist"},
     )
     child = None
-    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         downloaded = data.parent / "callback-downloaded"
         env = _callback_child_env(
             data, session, server, {"OCU_CRASH": "1", "OCU_DOWNLOADED": str(downloaded)},
@@ -241,8 +239,7 @@ def test_postreplace_durability_failure_replays_without_rewrite(office_world, mo
         return original_fsync(fd)
 
     failing = recovered = None
-    with _content_origin({"/cache/ok.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         payload = recorded_status_2_payload(
             document_key=session["document_key"],
             url=server.url + "/cache/ok.docx",

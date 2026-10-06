@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, R
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from office.router import OfficeAvailabilityMiddleware, create_office_router
 from office.control_plane import install_source_access_log_filter
-from office.sweep import sweep_office_sessions
+from office.sweep import sweep_office_publications, sweep_office_sessions
 from ws_recheck import (
     admit,
     forward_cdp_backend,
@@ -381,6 +381,12 @@ async def _idle_reaper(stop_idle: asyncio.Event):
         raise
     except Exception as exc:
         print(f"[IDLE] startup sweep failed: {exc}")
+    try:
+        await asyncio.to_thread(sweep_office_publications)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        print("[OFFICE] publication startup sweep failed")
     _timeout, poll = validate_idle_configuration()
     while not stop_idle.is_set():
         try:

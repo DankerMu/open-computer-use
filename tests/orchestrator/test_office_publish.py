@@ -66,15 +66,19 @@ def _prepared(world, sandbox_state="exited", path="report.docx"):
             "pending_save_seq": 4, "save_intents": {"3": "publish", "4": "persist"},
             "workspace_changed": False, "saved_as": None, "last_activity_at": 123,
         }
-        # Deliberately inert sibling records probe collection conservation only.
-        state["sessions"]["sibling-session"] = {"state": "closing", "save_seq": 8}
+        state["sessions"]["sibling-session"] = {
+            "session_id": "sibling-session", "file_id": "sibling-file",
+            "document_key": "sibling-key", "restore_epoch": "epoch-one",
+            "state": "closing", "reason": None, "save_seq": 8,
+            "last_committed_seq": 0, "last_published_seq": 0,
+            "baseline_sha256": _sha(BASELINE), "last_activity_at": 123,
+        }
         state["receipts"][SESSION] = {"3": {"status": 6, "version": 2,
             "sha256": _sha(SAVED), "answer": {"error": 0}}}
         state["journal"][OBLIGATION] = {
             "file_id": file_id, "version": 2, "session_id": SESSION,
             "save_seq": 3, "requester": "save",
         }
-        state["journal"]["sibling-obligation"] = {"untouched": True}
 
     before = store.update(CHAT, seed)
     container = _container(docker_manager._container_name(CHAT), status="exited")
@@ -149,7 +153,7 @@ def _on_staging_sync(monkeypatch, action):
         return fd
 
     def synced(fd):
-        if fd in staged:
+        if fd in staged and os.fstat(fd).st_size > 0:
             staged.remove(fd)
             action(fd)
         return original_sync(fd)
@@ -242,24 +246,25 @@ def test_late_parent_change_rejects_replace_and_cleans_renamed_parent(world, mon
 @pytest.mark.parametrize("collision", ["file", "symlink"])
 def test_temporary_collision_is_never_followed_or_removed(world, monkeypatch, collision):
     fixture = _prepared(world)
-    original = os.open
+    original = os.link
     collided = []
     outside = fixture.data.parent / "outside"
     outside.write_bytes(b"not-owned")
 
-    def opened(path, flags, *args, **kwargs):
-        if isinstance(path, str) and path.startswith(".office-publish."):
+    def linked(source, destination, *args, **kwargs):
+        if isinstance(destination, str) and destination.startswith(".office-publish."):
             entry = fixture.store.read(CHAT)["journal"][OBLIGATION]
             assert entry["target_path"] == "report.docx"
-            assert entry["temporary_name"] == path
-            target = fixture.target.parent / path
+            assert entry["temporary_name"] == destination
+            assert entry["staging"]["anchor_name"] == source
+            target = fixture.target.parent / destination
             if collision == "file":
                 target.write_bytes(b"collision")
             else:
                 target.symlink_to(outside)
             collided.append(target)
-        return original(path, flags, *args, **kwargs)
-    monkeypatch.setattr(os, "open", opened)
+        return original(source, destination, *args, **kwargs)
+    monkeypatch.setattr(os, "link", linked)
     with pytest.raises(FileExistsError):
         _publish()
     assert fixture.target.read_bytes() == BASELINE
@@ -476,7 +481,7 @@ def test_real_launch_waits_for_publish_and_reads_complete_file(world, monkeypatc
     assert observed == [SAVED]
     assert outcomes["publish"].outcome == "published"
     assert outcomes["launch"] == {"state": "running"}
-    assert fixture.store.read(CHAT)["journal"] == {"sibling-obligation": {"untouched": True}}
+    assert fixture.store.read(CHAT)["journal"] == {}
 
 
 @pytest.mark.parametrize("phase", [
@@ -490,7 +495,7 @@ def test_interrupted_io_retains_recovery_obligation_or_visible_successor(world, 
     original_replace, original_sync, original_read = os.replace, os.fsync, os.read
     temporary_fds = set()
     workspace_fds = set()
-    state_replaces = 0
+    completion_replaced = False
     workspace_replaced = False
     index_replaced = False
     office_identity = (fixture.data / CHAT / ".ocu" / "office").stat()
@@ -524,13 +529,17 @@ def test_interrupted_io_retains_recovery_obligation_or_visible_successor(world, 
         return original_write(fd, body)
 
     def replace(source, destination, *args, **kwargs):
-        nonlocal state_replaces, workspace_replaced, index_replaced
+        nonlocal completion_replaced, workspace_replaced, index_replaced
         if destination == "state.json":
-            state_replaces += 1
-            if phase == "prepare-replace" and state_replaces == 1:
+            successor = json.loads((fixture.data / CHAT / ".ocu" / "office" / source).read_bytes())
+            completing = OBLIGATION not in successor["journal"]
+            if phase == "prepare-replace":
                 fault()
-            if phase == "completion-replace" and state_replaces == 2:
+            if phase == "completion-replace" and completing:
                 fault()
+            answer = original_replace(source, destination, *args, **kwargs)
+            completion_replaced = completing
+            return answer
         if isinstance(source, str) and source.startswith(".office-publish."):
             if phase == "workspace-replace":
                 fault()
@@ -552,7 +561,7 @@ def test_interrupted_io_retains_recovery_obligation_or_visible_successor(world, 
             fault()
         if phase == "index-directory-sync" and index_replaced and same(fd, control_identity):
             fault()
-        if phase == "completion-directory-sync" and state_replaces == 2 and same(fd, office_identity):
+        if phase == "completion-directory-sync" and completion_replaced and same(fd, office_identity):
             fault()
         return original_sync(fd)
 
@@ -590,13 +599,13 @@ def test_interrupted_io_retains_recovery_obligation_or_visible_successor(world, 
     assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + int(registered)
 
 
-def test_prepared_obligation_cannot_be_republished_as_new_attempt(world):
-    from office.publish import RecoveryRequiredError
+def test_malformed_prepared_obligation_is_retained_without_publication(world):
+    from office.store import StateCorruptError
     fixture = _prepared(world)
     def prepare(state):
         state["journal"][OBLIGATION].update(target_path="report.docx", temporary_name=".interrupted")
     before = fixture.store.update(CHAT, prepare)
-    with pytest.raises(RecoveryRequiredError):
+    with pytest.raises(StateCorruptError):
         _publish()
     assert fixture.store.read(CHAT) == before
     assert fixture.target.read_bytes() == BASELINE
@@ -606,17 +615,22 @@ def test_temporary_path_replacement_does_not_delete_foreign_inode(world, monkeyp
     fixture = _prepared(world)
     foreign = []
 
-    def substitute(_fd):
-        temporary = fixture.target.parent / fixture.store.read(CHAT)["journal"][OBLIGATION]["temporary_name"]
-        temporary.unlink()
-        temporary.write_bytes(b"foreign-temp")
-        foreign.append(temporary)
-    _on_staging_sync(monkeypatch, substitute)
-    result = _publish()
-    assert (result.outcome, result.reason) == ("failed", "unsafe_path")
+    original_link = os.link
+    def substitute(source, destination, *args, **kwargs):
+        answer = original_link(source, destination, *args, **kwargs)
+        if isinstance(destination, str) and destination.startswith(".office-publish."):
+            temporary = fixture.target.parent / destination
+            temporary.unlink()
+            temporary.write_bytes(b"foreign-temp")
+            foreign.append(temporary)
+        return answer
+    monkeypatch.setattr(os, "link", substitute)
+    from office.publish import RecoveryRequiredError
+    with pytest.raises(RecoveryRequiredError):
+        _publish()
     assert foreign[0].read_bytes() == b"foreign-temp"
     assert fixture.target.read_bytes() == BASELINE
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert OBLIGATION in fixture.store.read(CHAT)["journal"]
 
 
 def test_target_and_temporary_metadata_are_durable_before_workspace_access(world, monkeypatch):
@@ -671,6 +685,7 @@ def test_workspace_permission_failure_retains_obligation_before_replace(world, m
     assert obligation["temporary_name"].startswith(".office-publish.")
     del obligation["target_path"]
     del obligation["temporary_name"]
+    obligation.pop("staging", None)
     assert after == fixture.before
     assert fixture.target.read_bytes() == BASELINE
     assert stat.S_IMODE(fixture.target.stat().st_mode) == 0o644
