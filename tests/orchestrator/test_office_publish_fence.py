@@ -688,22 +688,27 @@ def test_running_final_bookkeeping_keeps_visible_successor_durability_rules(worl
     fixture = _running(world)
     real_replace, real_sync = os.replace, os.fsync
     office_identity = fixture.marker.parent.stat()
-    state_replaces = 0
+    completion_replaced = False
 
     def replace(source, destination, *args, **kwargs):
-        nonlocal state_replaces
+        nonlocal completion_replaced
+        completing = False
         if destination == "state.json":
-            state_replaces += 1
-            if state_replaces == 2:
+            successor = json.loads((fixture.marker.parent / source).read_bytes())
+            completing = OBLIGATION not in successor["journal"]
+            if completing:
                 assert "unpause" in fixture.events
                 assert not fixture.marker.exists()
                 if failure == "completion-replace":
                     raise OSError(5, "completion failed")
-        return real_replace(source, destination, *args, **kwargs)
+        answer = real_replace(source, destination, *args, **kwargs)
+        if completing:
+            completion_replaced = True
+        return answer
 
     def sync(fd):
         info = os.fstat(fd)
-        if (failure == "completion-directory-sync" and state_replaces == 2
+        if (failure == "completion-directory-sync" and completion_replaced
                 and (info.st_dev, info.st_ino) == (office_identity.st_dev, office_identity.st_ino)):
             raise OSError(5, "completion durability failed")
         return real_sync(fd)

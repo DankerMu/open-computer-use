@@ -702,8 +702,7 @@ def test_repeat_close_after_consumed_pending_reuses_final_receipt_seq(office_wor
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
     opened = _post(http, session, recorded_status_1_payload(document_key=session["document_key"]))
     assert opened.status_code == 200
-    with _content_origin({"/close.docx": CHANGED}) as server:
-        _bind_internal(monkeypatch, server.url)
+    with _content_origin({"/close.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
         first = _close(http, session["session_id"])
         assert first.status_code == 202
         allocated = first.json()["save_seq"]

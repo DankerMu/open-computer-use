@@ -16,19 +16,24 @@
 
 
 ### Changed
-- **Standalone fenced Office publication.** `office.publish.publish` consumes a
-  persisted obligation under the shared chat lock. A running sandbox is paused
-  and freshly observed paused before hashing or replacing workspace bytes;
-  stopped/absent sandboxes need no pause, and externally paused sandboxes stay
-  paused. Publication retains bounded baseline reads, exclusive no-follow staging,
-  atomic shared-permission replacement and one broker revision. Only the owned
-  container and marker are released; uncertain release keeps the marker without
-  changing an established outcome. A monotonic five-second safe-boundary budget
-  stops new publication phases, not an in-flight blocking operation: pre-replace
-  timeout preserves the old file, while incomplete postreplace timeout returns
-  `interrupted` / `publish_timeout` with complete successor bytes and journal
-  retained. Pause-request elapsed time is logged without a hard release guarantee.
-  Recovery driving and caller/lifecycle integration are excluded.
+- **Fenced Office publication and automatic recovery.** `office.publish.publish`
+  and `recover_publications` share one pipeline under the no-create chat lock.
+  Startup and the existing idle poll discover Office-only chats; recovery
+  precedes swept session reads and new publication. Prepared shared staging is
+  inspected and cleaned only after a running writer is freshly observed paused,
+  using one fence through replay. Stale markers are released by original container
+  ID only when strictly older than five seconds; uncertainty retains responsibility.
+  Private anchor/witness ownership is durable before no-clobber shared hardlink
+  exposure; verified shared absence precedes durable retirement and private cleanup.
+  Foreign entries are preserved, verified missing parents are not recreated, and
+  harmless unbound/retired private leftovers may remain without blocking recovery.
+  Matching successor bytes complete metadata without another workspace replacement.
+  Interrupted registration may advance the broker revision again; completed
+  recovery is a no-op. The monotonic five-second safe-boundary budget retains
+  interrupted recovery/postreplace obligations, without a hard unpause guarantee.
+  An established requested result survives deferred successor recovery; unresolved
+  obligations or owned markers remain, while unexpected transaction errors propagate.
+  Callback outcome mapping and `last_published_seq` integration remain excluded.
 
 - **Office DocumentServer control-plane routes.** `GET /office/source/{ticket}`
   authenticates by a short-lived source ticket and returns the bound immutable
@@ -46,8 +51,8 @@
   A chat directory that disappears before the non-creating canonical lock is
   admitted as source 401 / callback 404 without recreation. Source tickets are
   redacted in Uvicorn access logs; rejected callbacks log
-  chat, session and reason without the token. Publish, journal and workspace
-  replacement remain later work.
+  chat, session and reason without the token. Callback-driven publication
+  and session-outcome integration remain excluded.
 
 - **Office periodic session recovery.** The existing idle poll discovers Office
   state independently of sandbox metadata. Under the shared chat lock it checks
