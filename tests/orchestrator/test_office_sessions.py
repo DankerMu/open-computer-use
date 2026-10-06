@@ -185,6 +185,9 @@ def office_world(tmp_path, monkeypatch):
         monkeypatch.setenv("MCP_API_KEY", MCP_KEY)
         monkeypatch.setenv("OPENAI_API_KEY", MODEL_KEY)
         import outputs_broker
+        from tests.orchestrator.test_lifecycle import _docker
+
+        docker_manager._docker_client = _docker()
 
         (data / CHAT).mkdir()
         (data / CHAT_B).mkdir()

@@ -109,6 +109,7 @@ def test_stopped_publish_commits_workspace_index_and_office_together(world, sand
     expected["documents"][file_id]["published_version"] = 2
     expected["documents"][file_id]["published_sha256"] = _sha(SAVED)
     expected["sessions"][SESSION]["baseline_sha256"] = _sha(SAVED)
+    expected["sessions"][SESSION]["last_published_seq"] = 3
     del expected["journal"][OBLIGATION]
     assert after == expected
     persisted_index = json.loads((data / CHAT / ".ocu" / "index.json").read_text())
@@ -132,8 +133,9 @@ def _publish():
     return publish(CHAT, OBLIGATION)
 
 
-def _without_obligation(fixture):
+def _without_obligation(fixture, *, state="saving", reason=None):
     expected = copy.deepcopy(fixture.before)
+    expected["sessions"][SESSION].update(state=state, reason=reason)
     del expected["journal"][OBLIGATION]
     return expected
 
@@ -170,7 +172,7 @@ def test_same_size_and_same_mtime_workspace_change_conflicts(world):
     result = _publish()
     assert (result.outcome, result.reason) == ("conflict", "baseline_mismatch")
     assert fixture.target.read_bytes() == b"agent-change"
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert fixture.store.read(CHAT) == _without_obligation(fixture, state="conflict", reason="baseline_mismatch")
     assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"]
 
 
@@ -192,7 +194,7 @@ def test_publish_follows_only_indexed_rename(world, change):
         assert fixture.store.read(CHAT)["documents"][fixture.file_id]["published_version"] == 2
     else:
         assert (result.outcome, result.reason) == ("conflict", "path_missing")
-        assert fixture.store.read(CHAT) == _without_obligation(fixture)
+        assert fixture.store.read(CHAT) == _without_obligation(fixture, state="conflict", reason="path_missing")
         if change != "missing":
             assert renamed.read_bytes() == BASELINE
 
@@ -214,7 +216,7 @@ def test_initial_symlink_does_not_read_outside_workspace(world, monkeypatch, com
     _forbid_inode_open(world[0], monkeypatch, outside_file)
     result = _publish()
     assert (result.outcome, result.reason) == ("conflict", "baseline_mismatch")
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert fixture.store.read(CHAT) == _without_obligation(fixture, state="conflict", reason="baseline_mismatch")
     assert outside_file.read_bytes() == BASELINE
 
 
@@ -240,7 +242,7 @@ def test_late_parent_change_rejects_replace_and_cleans_renamed_parent(world, mon
     assert (detached / "report.docx").read_bytes() == BASELINE
     assert not list(detached.glob(".office-publish.*"))
     assert (outside / "report.docx").read_bytes() == b"outside-data"
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert fixture.store.read(CHAT) == _without_obligation(fixture, reason="unsafe_path")
 
 
 @pytest.mark.parametrize("collision", ["file", "symlink"])
@@ -281,7 +283,7 @@ def test_corrupt_index_fails_without_workspace_change(world):
     assert (result.outcome, result.reason) == ("failed", "index_unavailable")
     assert _index(fixture).read_bytes() == b"{broken"
     assert fixture.target.read_bytes() == BASELINE
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert fixture.store.read(CHAT) == _without_obligation(fixture, reason="index_unavailable")
 
 
 def test_hidden_staging_adds_no_listing_event(world, monkeypatch):
@@ -343,12 +345,13 @@ def test_second_publish_uses_updated_bound_baseline(world):
     def next_obligation(state):
         state["journal"][OBLIGATION] = {"file_id": fixture.file_id, "version": 3,
             "session_id": SESSION, "save_seq": 4, "requester": "save"}
+        state["sessions"][SESSION]["last_committed_seq"] = 4
     fixture.store.update(CHAT, next_obligation)
     assert _publish().outcome == "published"
     assert fixture.target.read_bytes() == third
     after = fixture.store.read(CHAT)
     assert after["sessions"][SESSION]["baseline_sha256"] == _sha(third)
-    assert after["sessions"][SESSION]["last_published_seq"] == 1
+    assert after["sessions"][SESSION]["last_published_seq"] == 4
     assert after["documents"][fixture.file_id]["published_version"] == 3
     assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 2
 
@@ -726,7 +729,7 @@ def test_grown_workspace_conflict_bounds_actual_target_reads(world, monkeypatch)
     assert fixture.target.stat().st_ino == target_identity.st_ino
     assert fixture.target.stat().st_size == len(grown)
     assert _index(fixture).read_bytes() == before_index
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert fixture.store.read(CHAT) == _without_obligation(fixture, state="conflict", reason="baseline_mismatch")
     blob = fixture.data / CHAT / ".ocu" / "office" / "versions" / _sha(SAVED)
     assert blob.read_bytes() == SAVED
 
@@ -765,6 +768,7 @@ def test_exact_limit_baseline_is_hashed_and_published(world, monkeypatch):
     document["published_version"] = 2
     document["published_sha256"] = _sha(SAVED)
     expected["sessions"][SESSION]["baseline_sha256"] = _sha(SAVED)
+    expected["sessions"][SESSION]["last_published_seq"] = 3
     del expected["journal"][OBLIGATION]
     assert after == expected
     before_counter = json.loads(before_index)["counter"]

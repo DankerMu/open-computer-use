@@ -42,6 +42,31 @@ exist, reconciliation fails retryably and preserves the index. Live names that
 cannot be persisted as relative POSIX paths fail explicitly rather than being
 rewritten as a corrupt index.
 
+### Office callback publication
+
+Authenticated status 6 callbacks with recorded `publish` intent and status 2
+callbacks commit their version, receipt and publish obligation together. The
+existing fenced publisher then runs synchronously; terminal conflict or failure
+still acknowledges durable content with `{"error": 0}`. Classified sandbox or
+recovery admission refusals also acknowledge it while retaining the obligation
+and session ownership for recovery. Unexpected publication errors retain their
+error behavior, and unresolved pre-orphan recovery still blocks orphaning.
+Persist-intent saves store unpublished content without a publication obligation.
+
+Publication completion removes its obligation in the same state update that
+records the session outcome, published version, baseline and monotonic
+`last_published_seq`. Save outcomes preserve newer outstanding saves and closing
+sessions. Interrupted obligations remain recoverable. Receipt replays drive
+only a matching obligation, after status/content validation; final replays do
+not download. Requests and the session sweep complete surviving obligations
+before orphaning. Closed/error outcomes remain terminal; epoch orphaning
+preserves a final conflict only in the request that recovered its surviving
+final obligation. A pre-existing final conflict without an obligation still
+obeys the epoch policy. An epoch-invalid callback refuses without downloading
+or processing new content; pre-orphan recovery drives only prior durable
+obligations. Status 4/no-change publication and automatic copies for missing
+final paths are separate behavior outside this callback-content path.
+
 ## API Endpoints
 
 ### MCP

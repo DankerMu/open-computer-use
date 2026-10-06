@@ -126,6 +126,7 @@ def test_running_publish_observes_pause_before_workspace_work_and_releases_owned
     expected["documents"][fixture.file_id]["published_version"] = 2
     expected["documents"][fixture.file_id]["published_sha256"] = _sha(SAVED)
     expected["sessions"][SESSION]["baseline_sha256"] = _sha(SAVED)
+    expected["sessions"][SESSION]["last_published_seq"] = 3
     del expected["journal"][OBLIGATION]
     assert fixture.store.read(CHAT) == expected
     index = json.loads((fixture.data / CHAT / ".ocu" / "index.json").read_text())
@@ -183,7 +184,7 @@ def test_failed_pause_keeps_workspace_and_releases_any_owned_pause(world, failur
     result = _publish()
     assert (result.outcome, result.reason) == ("failed", "pause_failed")
     assert fixture.target.read_bytes() == BASELINE
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert fixture.store.read(CHAT) == _without_obligation(fixture, reason="pause_failed")
     assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"]
     assert fixture.engine_state["status"] == "running"
     assert not fixture.marker.exists()
@@ -494,7 +495,7 @@ def test_blocking_pause_overruns_budget_without_starting_workspace_write(world, 
     assert (result.outcome, result.reason) == ("failed", "publish_timeout")
     assert workspace_opens == []
     assert fixture.target.read_bytes() == BASELINE
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert fixture.store.read(CHAT) == _without_obligation(fixture, reason="publish_timeout")
     assert fixture.engine_state["status"] == "running"
     assert not fixture.marker.exists()
     records = [record for record in caplog.records if hasattr(record, "paused_duration_seconds")]
@@ -639,7 +640,7 @@ def test_unverified_pause_cannot_hash_workspace_or_release_unowned_identity(worl
     assert (result.outcome, result.reason) == ("failed", "pause_failed")
     assert target_reads == []
     assert fixture.target.read_bytes() == BASELINE
-    assert fixture.store.read(CHAT) == _without_obligation(fixture)
+    assert fixture.store.read(CHAT) == _without_obligation(fixture, reason="pause_failed")
     assert fixture.marker.exists()
     fixture.container.unpause.assert_not_called()
 
