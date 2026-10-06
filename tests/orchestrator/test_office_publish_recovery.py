@@ -1261,3 +1261,183 @@ def test_matching_prepared_recovery_keeps_one_fence_through_cleanup_and_registra
     assert fixture.container.unpause.call_count == 1
     assert fixture.container.status == "running"
     _published(fixture)
+
+
+def test_requested_publication_result_survives_refused_release_before_newer_obligation(
+    world, monkeypatch,
+):
+    from office.publish import publish, recover_publications
+    from tests.orchestrator.test_office_publish_fence import _running
+    fixture = _running(world)
+    third = _third_obligation(fixture)
+    monkeypatch.setattr(time, "time", lambda: 100.0)
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+    def pause():
+        fixture.engine_state["status"] = "paused"
+    fixture.container.pause.side_effect = pause
+    release = fixture.container.unpause.side_effect
+    def refused_release():
+        raise OSError(errno.EIO, "requested publication release refused")
+    fixture.container.unpause.side_effect = refused_release
+    _engine_by_identity(fixture, fixture.container)
+    before = fixture.store.read(CHAT)
+
+    result = publish(CHAT, OBLIGATION)
+
+    assert (result.outcome, result.reason) == ("published", None)
+    state = fixture.store.read(CHAT)
+    assert set(state["journal"]) == {"a-newer"}
+    assert state["journal"]["a-newer"] == before["journal"]["a-newer"]
+    assert fixture.target.read_bytes() == SAVED
+    assert state["documents"][fixture.file_id]["published_version"] == 2
+    assert state["documents"][fixture.file_id]["published_sha256"] == _sha(SAVED)
+    assert [item["published"] for item in state["documents"][fixture.file_id]["versions"]] == [True, True, False]
+    assert state["sessions"][SESSION]["baseline_sha256"] == _sha(SAVED)
+    assert state["receipts"] == before["receipts"]
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 1
+    assert fixture.marker.exists()
+    assert json.loads(fixture.marker.read_bytes())["container_id"] == fixture.original_id
+    assert fixture.engine_state["status"] == "paused"
+
+    fixture.container.unpause.side_effect = release
+    recover_publications(CHAT, now=106.0)
+    after = fixture.store.read(CHAT)
+    assert after["journal"] == {}
+    assert after["documents"][fixture.file_id]["published_version"] == 3
+    assert after["documents"][fixture.file_id]["published_sha256"] == _sha(third)
+    assert [item["published"] for item in after["documents"][fixture.file_id]["versions"]] == [True, True, True]
+    assert fixture.target.read_bytes() == b"third-save-v3"
+    assert after["receipts"] == before["receipts"]
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 2
+    assert fixture.engine_state["status"] == "running"
+    assert not fixture.marker.exists()
+    completed = _snapshot(fixture.data), list(fixture.engine.mock_calls)
+    recover_publications(CHAT, now=112.0)
+    assert (_snapshot(fixture.data), fixture.engine.mock_calls) == completed
+
+
+def test_requested_publication_result_survives_newer_successor_timeout(
+    world, monkeypatch,
+):
+    from office.publish import publish, recover_publications
+    from tests.orchestrator.test_office_publish_fence import _running
+    fixture = _running(world)
+    third = _third_obligation(fixture)
+    def pause():
+        fixture.engine_state["status"] = "paused"
+    fixture.container.pause.side_effect = pause
+    clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    real_replace = os.replace
+    replacements = []
+    def replace(source, destination, *args, **kwargs):
+        answer = real_replace(source, destination, *args, **kwargs)
+        if destination == "report.docx":
+            replacements.append(fixture.target.read_bytes())
+            if len(replacements) == 2:
+                clock["now"] = 5.0
+        return answer
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", replace)
+        result = publish(CHAT, OBLIGATION)
+
+    assert (result.outcome, result.reason) == ("published", None)
+    assert replacements == [SAVED, third]
+    state = fixture.store.read(CHAT)
+    assert set(state["journal"]) == {"a-newer"}
+    assert state["journal"]["a-newer"]["target_path"] == "report.docx"
+    assert fixture.target.read_bytes() == b"third-save-v3"
+    assert state["documents"][fixture.file_id]["published_version"] == 2
+    assert [item["published"] for item in state["documents"][fixture.file_id]["versions"]] == [True, True, False]
+    assert state["sessions"][SESSION]["baseline_sha256"] == _sha(SAVED)
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 1
+    assert fixture.engine_state["status"] == "running"
+    assert not fixture.marker.exists()
+    inode = fixture.target.stat().st_ino
+
+    clock["now"] = 0.0
+    recover_publications(CHAT)
+    after = fixture.store.read(CHAT)
+    assert after["journal"] == {}
+    assert after["documents"][fixture.file_id]["published_version"] == 3
+    assert after["documents"][fixture.file_id]["published_sha256"] == _sha(third)
+    assert [item["published"] for item in after["documents"][fixture.file_id]["versions"]] == [True, True, True]
+    assert fixture.target.stat().st_ino == inode
+    assert fixture.target.read_bytes() == b"third-save-v3"
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 2
+    completed = _snapshot(fixture.data), list(fixture.engine.mock_calls)
+    recover_publications(CHAT)
+    assert (_snapshot(fixture.data), fixture.engine.mock_calls) == completed
+
+
+def test_requested_result_survives_post_successor_owned_fence_check(world, monkeypatch):
+    from office.publish import publish, recover_publications
+    from tests.orchestrator.test_office_publish_fence import _running
+    fixture = _running(world)
+    third = _third_obligation(fixture)
+    monkeypatch.setattr(time, "time", lambda: 100.0)
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+    def pause():
+        fixture.engine_state["status"] = "paused"
+    fixture.container.pause.side_effect = pause
+    original_release = fixture.container.unpause.side_effect
+    releases = 0
+    def release():
+        nonlocal releases
+        releases += 1
+        if releases == 2:
+            raise OSError(errno.EIO, "successor release refused")
+        original_release()
+    fixture.container.unpause.side_effect = release
+    _engine_by_identity(fixture, fixture.container)
+
+    result = publish(CHAT, OBLIGATION)
+
+    assert (result.outcome, result.reason) == ("published", None)
+    state = fixture.store.read(CHAT)
+    assert state["journal"] == {}
+    assert state["documents"][fixture.file_id]["published_version"] == 3
+    assert state["documents"][fixture.file_id]["published_sha256"] == _sha(third)
+    assert fixture.target.read_bytes() == b"third-save-v3"
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 2
+    assert fixture.marker.exists()
+    assert json.loads(fixture.marker.read_bytes())["container_id"] == fixture.original_id
+    assert fixture.engine_state["status"] == "paused"
+    recover_publications(CHAT, now=106.0)
+    assert not fixture.marker.exists()
+    assert fixture.engine_state["status"] == "running"
+    assert fixture.store.read(CHAT) == state
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 2
+
+
+@pytest.mark.parametrize("failure", ("programming", "io"))
+def test_unexpected_successor_failure_still_propagates_after_requested_completion(
+    world, monkeypatch, failure,
+):
+    from office.publish import publish
+    fixture = _prepared(world, "absent")
+    _third_obligation(fixture)
+    original = os.replace
+    replacements = 0
+    error = RuntimeError("successor programming failure") if failure == "programming" else OSError(
+        errno.EIO, "successor workspace IO failure",
+    )
+    def replace(source, destination, *args, **kwargs):
+        nonlocal replacements
+        if destination == "report.docx":
+            replacements += 1
+            if replacements == 2:
+                raise error
+        return original(source, destination, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", replace)
+        with pytest.raises(type(error)) as caught:
+            publish(CHAT, OBLIGATION)
+    assert caught.value is error
+    assert replacements == 2
+    state = fixture.store.read(CHAT)
+    assert set(state["journal"]) == {"a-newer"}
+    assert state["documents"][fixture.file_id]["published_version"] == 2
+    assert [item["published"] for item in state["documents"][fixture.file_id]["versions"]] == [True, True, False]
+    assert fixture.target.read_bytes() == SAVED
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 1

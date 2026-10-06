@@ -31,6 +31,8 @@
   Interrupted registration may advance the broker revision again; completed
   recovery is a no-op. The monotonic five-second safe-boundary budget retains
   interrupted recovery/postreplace obligations, without a hard unpause guarantee.
+  An established requested result survives deferred successor recovery; unresolved
+  obligations or owned markers remain, while unexpected transaction errors propagate.
   Callback outcome mapping and `last_published_seq` integration remain excluded.
 
 - **Office DocumentServer control-plane routes.** `GET /office/source/{ticket}`

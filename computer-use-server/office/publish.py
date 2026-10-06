@@ -703,18 +703,23 @@ def publish(chat_id: str, journal_id: str) -> PublishResult:
         result = None
         for obligation in (*preceding, journal_id, *succeeding):
             requested = obligation == journal_id
-            outcome = _publish_locked(
-                store, broker, chat, obligation,
-                recovering=not requested or "target_path" in state["journal"][obligation],
-            )
-            if requested:
-                result = outcome
-            if outcome.outcome == "interrupted":
+            try:
+                outcome = _publish_locked(
+                    store, broker, chat, obligation,
+                    recovering=not requested or "target_path" in state["journal"][obligation],
+                )
                 if requested:
-                    return outcome
-                raise RecoveryRequiredError("prior publication was interrupted")
-            if not requested:
-                _recover_fence(store, chat, time.time())
+                    result = outcome
+                if outcome.outcome == "interrupted":
+                    if requested:
+                        return outcome
+                    raise RecoveryRequiredError("publication recovery was interrupted")
+                if not requested:
+                    _recover_fence(store, chat, time.time())
+            except RecoveryRequiredError:
+                if result is None:
+                    raise
+                return result
         return result
 
 
