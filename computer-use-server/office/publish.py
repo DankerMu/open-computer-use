@@ -886,14 +886,8 @@ def publish(chat_id: str, journal_id: str) -> PublishResult:
             if obligation == journal_id:
                 continue
             entry = state["journal"][obligation]
-            newer_resolve_sequence = (
-                requested_entry["requester"] == "resolve"
-                and entry.get("session_id") == requested_entry["session_id"]
-                and type(entry.get("save_seq")) is int
-                and entry["save_seq"] > requested_entry["save_seq"]
-            )
             if (entry["file_id"] == requested_entry["file_id"]
-                    and (entry["version"] > requested_version["number"] or newer_resolve_sequence)):
+                    and entry["version"] > requested_version["number"]):
                 succeeding.append(obligation)
             else:
                 preceding.append(obligation)

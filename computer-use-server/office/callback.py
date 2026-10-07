@@ -108,6 +108,8 @@ def _process(
         raise CallbackRefusal(409, "session_not_open")
     if status not in _KNOWN:
         raise CallbackRefusal(422, "unknown_status", reported=status)
+    if status not in (2, 6):
+        _settle_resolve(store, chat, session_id, status, userdata)
     if status == 1:
         _apply_status_1(store, chat, session_id, payload)
         return JSONResponse(status_code=200, content=_SUCCESS)
@@ -123,7 +125,7 @@ def _process(
         if journal_id is not None:
             publish.drive_obligation(chat, journal_id)
         return JSONResponse(status_code=200, content=_SUCCESS)
-    _persist_content(store, chat, session_id, record, status, payload, userdata, loop)
+    _persist_content(store, chat, session_id, status, payload, userdata, loop)
     return JSONResponse(status_code=200, content=_SUCCESS)
 
 
@@ -141,12 +143,18 @@ def _forcesave_order(
         if record["state"] in _ENDED:
             raise CallbackRefusal(409, "session_not_open")
         raise CallbackRefusal(422, "invalid_userdata")
-    save_seq, presented_intent = userdata
+    save_seq = userdata[0]
     existing = _receipt_at(store._snapshot(store._load(chat, create=False)), session_id, save_seq)
     if existing is not None:
         response = _replay_forcesave(store, chat, status, existing, payload, loop)
         _drive_receipt_publication(store, chat, session_id, save_seq, existing)
         return response
+    _require_issued_save(record, userdata)
+    return None
+
+
+def _require_issued_save(record: dict[str, Any], userdata: tuple[int, str]) -> None:
+    save_seq, presented_intent = userdata
     issued = _issued_intent(record, save_seq)
     if issued is None or save_seq > record["save_seq"] or presented_intent != issued:
         if record["state"] in _ENDED:
@@ -159,14 +167,36 @@ def _forcesave_order(
         if record["state"] in _ENDED:
             raise CallbackRefusal(409, "session_not_open")
         raise CallbackRefusal(409, "stale_save_seq")
-    return None
+
+
+def _settle_resolve(store, chat, session_id, status, userdata) -> None:
+    """Finish accepted identity/lineage changes before a new callback binds content."""
+    state = store.read(chat)
+    if not any(
+        entry.get("session_id") == session_id and entry.get("requester") == "resolve"
+        for entry in state["journal"].values()
+    ):
+        return
+    try:
+        state = sessions._recover_session_publications(store, chat, session_id)
+    except (publish.RecoveryRequiredError, publish.SandboxStateError) as extra:
+        raise CallbackRefusal(503, "publish_pending") from extra
+    except StorageLowError as extra:
+        raise CallbackRefusal(503, "storage_low") from extra
+    if any(entry.get("session_id") == session_id for entry in state["journal"].values()):
+        raise CallbackRefusal(503, "publish_pending")
+    record = sessions._require_session(state, session_id)
+    if status in _FORCESAVE:
+        assert userdata is not None
+        _require_issued_save(record, userdata)
+    if record["state"] in _ENDED:
+        raise CallbackRefusal(409, "session_not_open")
 
 
 def _persist_content(
     store: OfficeStore,
     chat: str,
     session_id: str,
-    record: dict[str, Any],
     status: int,
     payload: dict[str, Any],
     userdata: tuple[int, str] | None,
@@ -177,6 +207,7 @@ def _persist_content(
     try:
         body = download.fetch_callback_content(payload.get("url"), loop)
         _validate_content(store, chat, session_id, body)
+        _settle_resolve(store, chat, session_id, status, userdata)
         if status == 6:
             assert save_seq is not None and intent is not None
             source = "save" if intent == "publish" else "autosave"
@@ -385,7 +416,7 @@ def _apply_status_4(working: dict[str, Any], record: dict[str, Any], save_seq: i
     if listed[-1]["published"]:
         record["state"] = "closed"
         record["pending_close_seq"] = None
-    sessions._advance_committed(record, save_seq, None)
+    sessions._advance_committed(record, save_seq, listed[-1])
 
 
 

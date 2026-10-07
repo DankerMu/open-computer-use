@@ -285,6 +285,7 @@ def test_status4_closes_when_latest_version_is_published(office_world):
     record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
     assert record["state"] == "closed"
     assert record["last_committed_seq"] == 1
+    assert record["last_published_seq"] == 1
     assert _receipt(data, session["session_id"], 1)["status"] == 4
     after_versions, _, after_journal = _history(data, session["file_id"])
     assert after_versions == versions

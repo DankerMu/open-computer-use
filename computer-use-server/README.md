@@ -123,6 +123,18 @@ captures intervening workspace content before overwrite, and reuses owned
 copy/replacement and registration evidence instead of duplicating publication.
 Drain accepted resolve journals before downgrading their reader.
 
+An eligible new callback settles an accepted resolve before binding content,
+a receipt or lifecycle changes to the document, then reloads the current session.
+This applies to final status 2/4, higher-sequence status 6 with either intent,
+and status 1/3/7. Authentication, status/sequence admission and content validation
+precede this barrier; rejected callbacks and receipt-only replays gain no
+unrelated resolve authority. Pending ownership or fencing returns 503
+`publish_pending` without committing the incoming callback, so it remains
+retryable. Save-as receipts keep their original version binding; later content
+belongs to the successor, and overwrite lineage precedes later user versions.
+Status 4 on an already-published latest version advances both committed and
+published progress to its final sequence without another version or write.
+
 Malformed/non-object bodies and unsupported actions return 422 `invalid_request`;
 unknown sessions return 404 `unknown_session`; other states, including
 epoch-orphaned sessions, return 409 `not_in_conflict`. Overwrite never recreates
