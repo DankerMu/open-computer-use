@@ -100,6 +100,65 @@ content; and unavailable copy-registration capacity ends `error` /
 `index_unavailable`, retaining stored content without an unregistered
 visible copy or a listing deadlock.
 
+`POST /api/office/{chat}/sessions/{session}/resolve` accepts `save_as` (the
+default for an empty body or omitted action) or explicit `overwrite`, only
+in `conflict`. Success returns `session_id`, `state`, `file_id` and the actual
+`path`. Save-as keeps the original bytes and history, claims a numbered name
+without replacing, and moves the session to a new document under the same key.
+Missing or linked original parents select the safe workspace root.
+
+Overwrite captures safe workspace content inside the same publication fence,
+reusing any historical hash. Capture and a user-content `restore` record are
+committed together with the journal binding; the restore parent is the selected
+user version. Latest-hash deduplication and immutable blobs are shared with
+ordinary saves. The latest version remains user content for join/source,
+nothing-new saves and status 4, including after a refused replacement.
+Successful completion publishes the restore and original selected user record.
+
+Resolve freezes action, source and committed sequence before capture, allocates
+no sequence or receipt, and completes lifecycle and publication atomically.
+It becomes `closed` iff a final callback receipt exists, otherwise `editing`;
+published and committed sequences agree. Recovery drives the bound action,
+captures intervening workspace content before overwrite, and reuses owned
+copy/replacement and registration evidence instead of duplicating publication.
+Drain accepted resolve journals before downgrading their reader.
+
+An eligible new callback settles an accepted resolve before binding content,
+a receipt or lifecycle changes to the document, then reloads the current session.
+This applies to final status 2/4, higher-sequence status 6 with either intent,
+and status 1/3/7. Authentication, status/sequence admission and content validation
+precede this barrier; rejected callbacks and receipt-only replays gain no
+unrelated resolve authority. Pending ownership or fencing returns 503
+`publish_pending` without committing the incoming callback, so it remains
+retryable. Save-as receipts keep their original version binding; later content
+belongs to the successor, and overwrite lineage precedes later user versions.
+Status 4 on an already-published latest version advances both committed and
+published progress to its final sequence without another version or write.
+
+Nothing-new save-command completion uses the same accepted-resolve settlement
+owner before advancing progress or binding a save obligation. The command waits
+outside the chat lock; reconciliation checks its key, pending sequence, issued
+intent, lifecycle/final receipt and restore epoch under that lock, then reloads
+and rechecks authority after recovery. Either intent advances both counters when
+resolve has published the current latest version. Uncertain ownership or fencing
+returns 503 `publish_pending`, retaining the accepted resolve and pending save
+allocation without a journal tied to the old document. A later eligible callback
+can complete that save. Registration and durability errors remain explicit.
+Accepted command responses do not mutate completion state; stale responses do
+not consume newer allocations or revive ended sessions. Unknown-key completion
+still recovers prior publication before orphaning; epoch changes grant no new
+completion authority.
+
+Malformed/non-object bodies and unsupported actions return 422 `invalid_request`;
+unknown sessions return 404 `unknown_session`; other states, including
+epoch-orphaned sessions, return 409 `not_in_conflict`. Overwrite never recreates
+a missing path (409 `path_missing`) or follows unsafe paths (503 `unsafe_path`).
+A missing workspace returns 409 `workspace_missing`, retaining history and
+ending `error` without directory creation. Ordinary pause, timeout, index and
+storage refusals return 503 with their exact reason and preserve the conflict.
+Interrupted ownership or postreplacement work retains its obligation, not a
+successful response or a fabricated rollback.
+
 ## API Endpoints
 
 ### MCP

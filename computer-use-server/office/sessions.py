@@ -40,6 +40,10 @@ class DocumentServerUnavailableError(RuntimeError):
     reason = "documentserver_unavailable"
 
 
+class CommandCompletionPendingError(RuntimeError):
+    reason = "publish_pending"
+
+
 class UnknownSessionError(RuntimeError):
     reason = "unknown_session"
 
@@ -116,6 +120,8 @@ async def save_session(request: Request) -> JSONResponse:
         return _error(409, "session_not_editing")
     except DocumentServerUnavailableError:
         return _error(502, "documentserver_unavailable")
+    except CommandCompletionPendingError:
+        return _error(503, "publish_pending")
     except StorageLowError:
         return _error(503, "storage_low")
     except (RestoreEpochError, StateCorruptError):
@@ -377,6 +383,21 @@ def _recover_session_publications(store, chat, session_id):
     return state
 
 
+def _settle_session_resolve(store, chat, session_id):
+    """Settle accepted identity/lineage before a new mutation binds responsibility."""
+    from . import publish
+
+    state = store.read(chat)
+    if any(
+        entry.get("session_id") == session_id and entry.get("requester") == "resolve"
+        for entry in state["journal"].values()
+    ):
+        state = _recover_session_publications(store, chat, session_id)
+        if any(entry.get("session_id") == session_id for entry in state["journal"].values()):
+            raise publish.RecoveryRequiredError("session resolve remains pending")
+    return state
+
+
 def _orphan_session(store, chat, session_id, reason):
     before = store.read(chat)
     recovering_final = any(
@@ -619,6 +640,8 @@ def _maybe_orphan_epoch(store, chat, record, session_id):
 
 
 def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
+    from .publish import RecoveryRequiredError, SandboxStateError
+
     chat, store = _load_session(chat_id, session_id)
     prepared = None
     with docker_manager._combined_lock(chat):
@@ -651,7 +674,10 @@ def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
         prepared = {}
         store.update(chat, mutate)
     outcome = asyncio.run(commands.forcesave(prepared["document_key"], prepared["save_seq"], intent))
-    return _reconcile_save(store, chat, session_id, prepared["save_seq"], intent, document_key, outcome)
+    try:
+        return _reconcile_save(store, chat, session_id, prepared["save_seq"], intent, document_key, outcome)
+    except (RecoveryRequiredError, SandboxStateError) as extra:
+        raise CommandCompletionPendingError("command completion publication remains pending") from extra
 
 
 def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, outcome) -> dict[str, Any]:
@@ -664,18 +690,23 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
     journal_id = None
     obligation = {"selected": None}
 
-    def mutate(working):
-        obligation["selected"] = None
+    def eligible(working):
         current = _require_session(working, session_id)
         _status_projection(current)
-        if current["document_key"] != document_key:
+        return (
+            current["document_key"] == document_key
+            and current.get("pending_save_seq") == save_seq
+            and current.get("save_intents", {}).get(str(save_seq)) == intent
+            and current["state"] not in FINAL_STATES
+            and _final_receipt(working, session_id) is None
+        )
+
+    def mutate(working):
+        obligation["selected"] = None
+        if not eligible(working):
             return
-        if current.get("pending_save_seq") != save_seq:
-            return
-        if current["state"] in FINAL_STATES:
-            return
-        ended_conflict = current["state"] == "conflict" and _final_receipt(working, session_id) is not None
-        if ended_conflict:
+        current = _require_session(working, session_id)
+        if current["restore_epoch"] != epoch.current_epoch():
             return
         if outcome is not commands.ForceSaveOutcome.NOTHING_TO_SAVE:
             current["pending_save_seq"] = None
@@ -701,6 +732,15 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
 
     with docker_manager._combined_lock(chat):
         preview = store.read(chat)
+        if eligible(preview):
+            record = _require_session(preview, session_id)
+            if _maybe_orphan_epoch(store, chat, record, session_id) is not None:
+                preview = store.read(chat)
+            elif outcome is commands.ForceSaveOutcome.NOTHING_TO_SAVE:
+                preview = _settle_session_resolve(store, chat, session_id)
+                record = _require_session(preview, session_id)
+                if _maybe_orphan_epoch(store, chat, record, session_id) is not None:
+                    preview = store.read(chat)
         mutate(preview)
         if changed["value"] and outcome is commands.ForceSaveOutcome.KEY_UNKNOWN:
             allocation = preview["sessions"][session_id]["save_seq"]
@@ -712,6 +752,10 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
             )
             recovered = _recover_session_publications(store, chat, session_id)
             live = _require_session(recovered, session_id)
+            orphaned = _maybe_orphan_epoch(store, chat, live, session_id)
+            if orphaned is not None:
+                recovered = orphaned
+                live = _require_session(recovered, session_id)
             changed["value"] = False
             if (
                 survived and live["document_key"] == document_key

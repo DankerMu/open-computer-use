@@ -131,25 +131,9 @@ def store_version(
 
         def mutate(working: dict[str, Any]) -> None:
             nonlocal selected
-            listed = _document_versions(working, file_id)
-            current = listed[-1] if listed else None
-            if current is not None and current["sha256"] == digest:
-                if published and not current["published"]:
-                    current["published"] = True
-                selected = dict(current)
-            else:
-                number = listed[-1]["number"] + 1 if listed else 1
-                _require_parent(listed, parent, number)
-                selected = {
-                    "number": number,
-                    "parent": parent,
-                    "sha256": digest,
-                    "size": len(content),
-                    "source": source,
-                    "created_at": _now(),
-                    "published": published,
-                }
-                listed.append(selected)
+            selected = append_record(
+                working, file_id, digest, len(content), source, parent, published,
+            )
             if bound is not None:
                 _put_receipt(working, bound["session_id"], bound["save_seq"], bound["value"])
             if mutate_state is not None:
@@ -171,6 +155,88 @@ def store_version(
             raise
     assert selected is not None
     return dict(selected)
+
+
+def append_record(
+    state: dict[str, Any],
+    file_id: str,
+    digest: str,
+    size: int,
+    source: str,
+    parent: int | None,
+    published: bool,
+) -> dict[str, Any]:
+    listed = _document_versions(state, file_id)
+    current = listed[-1] if listed else None
+    if current is not None and current["sha256"] == digest:
+        if published and not current["published"]:
+            current["published"] = True
+        return dict(current)
+    number = listed[-1]["number"] + 1 if listed else 1
+    _require_parent(listed, parent, number)
+    selected = {
+        "number": number,
+        "parent": parent,
+        "sha256": digest,
+        "size": size,
+        "source": source,
+        "created_at": _now(),
+        "published": published,
+    }
+    listed.append(selected)
+    return selected
+
+
+def commit_overwrite_lineage(store, chat, journal_id, content, digest, path, *, min_free_bytes):
+    """Commit capture and user restore together; caller holds the canonical lock."""
+    state = store.read(chat)
+    entry = state["journal"][journal_id]
+    file_id, user_number = entry["file_id"], entry["version"]
+    listed = _document_versions(state, file_id)
+    user = listed[user_number - 1]
+    if user["sha256"] != entry["source_sha256"]:
+        raise StateCorruptError("resolve source content changed")
+    read_version_bytes(store, chat, user["sha256"])
+    known = next((item for item in listed if item["sha256"] == digest), None)
+    owned_blob = False
+    _require_free_space(store, chat, min_free_bytes)
+    if known is None:
+        try:
+            owned_blob = _publish_blob(store, chat, digest, content)
+        except OSError as extra:
+            raise _storage_error(extra) from extra
+    else:
+        read_version_bytes(store, chat, digest)
+
+    def mutate(working):
+        live = working["journal"][journal_id]
+        current = _document_versions(working, file_id)
+        capture = next((item for item in current if item["sha256"] == digest), None)
+        if capture is None:
+            capture = append_record(
+                working, file_id, digest, len(content), "workspace",
+                current[-1]["number"], True,
+            )
+        restored = append_record(
+            working, file_id, user["sha256"], user["size"], "restore", user_number, False,
+        )
+        live.update(
+            capture_sha256=digest, capture_version=capture["number"],
+            capture_path=path, restore_version=restored["number"],
+        )
+
+    try:
+        return store.update(chat, mutate)
+    except StateDurabilityError:
+        raise
+    except OSError as extra:
+        if owned_blob:
+            _unlink_blob(store, chat, digest)
+        raise _storage_error(extra) from extra
+    except BaseException:
+        if owned_blob:
+            _unlink_blob(store, chat, digest)
+        raise
 
 
 def mark_published(store: OfficeStore, chat_id: str, file_id: str, number: int) -> dict[str, Any]:

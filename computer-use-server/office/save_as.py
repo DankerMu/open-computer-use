@@ -13,10 +13,12 @@ from pathlib import Path
 from outputs_broker import LimitExceededError, OutputsBrokerError
 from uploads import claim_file_no_replace
 
-from . import versions, workspace
+from . import config, versions, workspace
 from .store import StateCorruptError, _FILE_FLAGS
 
 _MAX_CANDIDATES = 10_000
+
+
 
 
 def validate_intent(binding):
@@ -50,12 +52,12 @@ def validate_intent(binding):
     if "retained" in binding and type(binding["retained"]) is not bool:
         raise StateCorruptError("publish copy retention binding is invalid")
     if "retained_reason" in binding and binding["retained_reason"] not in (
-        "index_unavailable", "publish_timeout",
+        "index_unavailable", "publish_timeout", "storage_low",
     ):
         raise StateCorruptError("publish copy retention reason is invalid")
 
 
-def plan(chat, path, *, identity_missing=False):
+def plan(chat, path, *, identity_missing=False, explicit_request=False):
     """Select a safe destination using the publisher's sole parent walker."""
     from .publish import _parents, _prepared_parents
 
@@ -81,7 +83,7 @@ def plan(chat, path, *, identity_missing=False):
                 if stat.S_ISLNK(info.st_mode):
                     return None, ("", parts[-1])
                 if not stat.S_ISDIR(info.st_mode):
-                    return None, None
+                    return (None, ("", parts[-1])) if explicit_request else (None, None)
             finally:
                 for fd in reversed(held):
                     os.close(fd)
@@ -90,7 +92,7 @@ def plan(chat, path, *, identity_missing=False):
     try:
         if absent is not None:
             return None, ("", parts[-1])
-        if identity_missing:
+        if identity_missing or explicit_request:
             return None, ("/".join(parts[:-1]), parts[-1])
         try:
             os.lstat(parts[-1], dir_fd=held[-1])
@@ -110,12 +112,9 @@ def apply_successor(state, entry, selected, saved_as):
     state["documents"][new_id] = {
         "file_id": new_id, "type": source["type"], "path": path,
         "published_version": 1, "published_sha256": selected["sha256"],
-        "versions": [{
-            "number": 1, "parent": None, "sha256": selected["sha256"],
-            "size": selected["size"], "source": "conflict",
-            "created_at": versions._now(), "published": True,
-        }],
+        "versions": [],
     }
+    versions.append_record(state, new_id, selected["sha256"], selected["size"], "conflict", None, True)
     record = state["sessions"][entry["session_id"]]
     record.update(file_id=new_id, saved_as=dict(saved_as),
                   baseline_sha256=selected["sha256"], workspace_changed=False)
@@ -523,6 +522,8 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
         else:
             stage.entry = entry
         identity = stage.inspect()
+        if identity is None and entry["requester"] == "resolve":
+            store.check_free_space(chat, config.MIN_FREE_BYTES)
         content = versions.read_version_bytes(store, chat, selected["sha256"])
         if len(content) != selected["size"]:
             raise StateCorruptError("publish version size differs from its blob")
