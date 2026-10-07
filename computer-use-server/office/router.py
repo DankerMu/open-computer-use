@@ -13,6 +13,7 @@ from auth_guard import OFFICE_PREFIX
 
 from . import config
 from .control_plane import admit_callback, serve_source
+from .resolution import resolve_session
 from .sessions import close_session, create_session, save_session, session_status
 
 _SUFFIX_CONVERTOR = "ocu_office_suffix"
@@ -119,6 +120,12 @@ def create_office_router() -> APIRouter:
     router.add_api_route(
         f"{OFFICE_PREFIX}{{chat_id}}/sessions/{{session_id}}/close",
         close_session,
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    router.add_api_route(
+        f"{OFFICE_PREFIX}{{chat_id}}/sessions/{{session_id}}/resolve",
+        resolve_session,
         methods=["POST"],
         include_in_schema=False,
     )

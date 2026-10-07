@@ -57,6 +57,7 @@ _APP_MODULES = (
     "office.workspace",
     "office.publish",
     "office.save_as",
+    "office.resolution",
     "office.epoch",
     "office.tokens",
     "office.commands",

@@ -35,6 +35,7 @@ APP_MODULES = {
     "office", "office.config", "office.router", "office.store",
     "office.versions", "office.workspace", "office.publish",
     "office.save_as", "office.epoch", "office.tokens",
+    "office.resolution",
     "office.commands", "office.sessions", "office.notice",
     "office.ooxml", "office.sweep", "office.control_plane",
     "office.download", "office.callback",

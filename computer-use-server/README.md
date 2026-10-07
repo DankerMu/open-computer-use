@@ -100,6 +100,39 @@ content; and unavailable copy-registration capacity ends `error` /
 `index_unavailable`, retaining stored content without an unregistered
 visible copy or a listing deadlock.
 
+`POST /api/office/{chat}/sessions/{session}/resolve` accepts `save_as` (the
+default for an empty body or omitted action) or explicit `overwrite`, only
+in `conflict`. Success returns `session_id`, `state`, `file_id` and the actual
+`path`. Save-as keeps the original bytes and history, claims a numbered name
+without replacing, and moves the session to a new document under the same key.
+Missing or linked original parents select the safe workspace root.
+
+Overwrite captures safe workspace content inside the same publication fence,
+reusing any historical hash. Capture and a user-content `restore` record are
+committed together with the journal binding; the restore parent is the selected
+user version. Latest-hash deduplication and immutable blobs are shared with
+ordinary saves. The latest version remains user content for join/source,
+nothing-new saves and status 4, including after a refused replacement.
+Successful completion publishes the restore and original selected user record.
+
+Resolve freezes action, source and committed sequence before capture, allocates
+no sequence or receipt, and completes lifecycle and publication atomically.
+It becomes `closed` iff a final callback receipt exists, otherwise `editing`;
+published and committed sequences agree. Recovery drives the bound action,
+captures intervening workspace content before overwrite, and reuses owned
+copy/replacement and registration evidence instead of duplicating publication.
+Drain accepted resolve journals before downgrading their reader.
+
+Malformed/non-object bodies and unsupported actions return 422 `invalid_request`;
+unknown sessions return 404 `unknown_session`; other states, including
+epoch-orphaned sessions, return 409 `not_in_conflict`. Overwrite never recreates
+a missing path (409 `path_missing`) or follows unsafe paths (503 `unsafe_path`).
+A missing workspace returns 409 `workspace_missing`, retaining history and
+ending `error` without directory creation. Ordinary pause, timeout, index and
+storage refusals return 503 with their exact reason and preserve the conflict.
+Interrupted ownership or postreplacement work retains its obligation, not a
+successful response or a fabricated rollback.
+
 ## API Endpoints
 
 ### MCP
