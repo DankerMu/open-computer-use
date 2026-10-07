@@ -763,17 +763,24 @@ def _final_save_as(store, broker, chat, journal_id, entry, selected, fence, orig
         held.clear()
     predecessor = None
     copied = None
+    opened = None
     try:
         binding = entry.get("staging")
         if isinstance(binding, dict) and not binding.get("retired", False):
-            if not previous:
-                raise RecoveryRequiredError("publish shared absence is unverified")
+            parent = previous[-1] if previous else None
+            absent = None
+            if parent is None:
+                if "target_path" not in entry:
+                    raise RecoveryRequiredError("publish shared absence is unverified")
+                opened, absent = _prepared_parents(chat, workspace._parts(entry["target_path"]))
+                parent = opened[-1] if absent is None else None
             predecessor = _Stage(store, chat, journal_id, entry)
-            predecessor.cleanup(previous[-1])
+            predecessor.cleanup(parent, absent_parent=absent)
             predecessor.close()
             predecessor = None
             stage = None
             fence.checkpoint()
+            entry = store.read(chat)["journal"][journal_id]
         copied = save_as_mod.drive(store, broker, chat, journal_id, entry, selected, fence, destination)
         return copied, None
     finally:
@@ -784,7 +791,7 @@ def _final_save_as(store, broker, chat, journal_id, entry, selected, fence, orig
                 predecessor.close()
             except OSError as extra:
                 error = extra
-        for fd in reversed(previous):
+        for fd in reversed((opened or []) + previous):
             try:
                 os.close(fd)
             except OSError as extra:
@@ -888,6 +895,27 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
             if writer_excluded:
                 result = save_as_mod.drive(store, broker, chat, journal_id, entry, selected, fence, None)
                 return result
+        # Recorded replacement paths remain obligations if the index moved them.
+        # Cleanup and retirement precede identity-missing copy classification so
+        # an older prepared witness is not abandoned when the source is already tombstoned.
+        if "target_path" in entry:
+            if not writer_excluded:
+                if not fence.acquire():
+                    raise RecoveryRequiredError("publication recovery could not exclude the writer")
+                writer_excluded = True
+            fence.checkpoint()
+            previous, absent = _prepared_parents(chat, workspace._parts(entry["target_path"]))
+            try:
+                stage = _Stage(store, chat, journal_id, entry)
+                stage.cleanup(previous[-1] if absent is None else None, absent_parent=absent)
+                stage.close()
+                stage = None
+                fence.checkpoint()
+            finally:
+                for fd in reversed(previous):
+                    os.close(fd)
+            state = store.read(chat)
+            entry, selected, baseline = _binding(state, journal_id)
         if (entry["requester"] == "final" and identity_missing
                 and result is not None and result.outcome == "conflict"
                 and result.reason == "path_missing"):
@@ -908,23 +936,6 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                 )
                 if copied is not None:
                     return copied
-        # Recorded replacement paths remain obligations if the index moved them.
-        if "target_path" in entry:
-            if not writer_excluded:
-                if not fence.acquire():
-                    raise RecoveryRequiredError("publication recovery could not exclude the writer")
-                writer_excluded = True
-            fence.checkpoint()
-            previous, absent = _prepared_parents(chat, workspace._parts(entry["target_path"]))
-            try:
-                stage = _Stage(store, chat, journal_id, entry)
-                stage.cleanup(previous[-1] if absent is None else None, absent_parent=absent)
-                stage.close()
-                stage = None
-                fence.checkpoint()
-            finally:
-                for fd in reversed(previous):
-                    os.close(fd)
         if result is None:
             parts = workspace._parts(path)
             temporary = f".office-publish.{uuid.uuid4().hex}.tmp"

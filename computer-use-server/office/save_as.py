@@ -10,6 +10,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from outputs_broker import LimitExceededError, OutputsBrokerError
 from uploads import claim_file_no_replace
 
 from . import versions, workspace
@@ -29,7 +30,7 @@ def validate_intent(binding):
             workspace._parts(binding["destination"])
         if len(workspace._parts(binding["basename"])) != 1:
             raise workspace.UnsafePathError()
-        for field in ("claimed_name", "attempt"):
+        for field in ("claimed_name", "attempt", "retained_name"):
             if field in binding and len(workspace._parts(binding[field])) != 1:
                 raise workspace.UnsafePathError()
     except (TypeError, workspace.UnsafePathError) as extra:
@@ -46,6 +47,8 @@ def validate_intent(binding):
         not isinstance(binding["registered_file_id"], str) or not binding["registered_file_id"]
     ):
         raise StateCorruptError("publish copy registration binding is invalid")
+    if "retained" in binding and type(binding["retained"]) is not bool:
+        raise StateCorruptError("publish copy retention binding is invalid")
 
 
 def plan(chat, path, *, identity_missing=False):
@@ -136,6 +139,124 @@ def _index(broker, chat):
     return {} if index is None else index["active"]
 
 
+def _private_links(stage, identity):
+    from .publish import RecoveryRequiredError, _identity
+    binding = stage.entry.get("staging")
+    if not isinstance(binding, dict):
+        raise RecoveryRequiredError("publish copy witness is missing")
+    found = 0
+    for name in (binding["anchor_name"], binding["witness_name"]):
+        try:
+            info = os.lstat(name, dir_fd=stage.directory)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or _identity(info) != identity:
+            raise RecoveryRequiredError("publish copy witness changed")
+        found += 1
+    if found == 0:
+        raise RecoveryRequiredError("publish copy witness disappeared")
+    return found
+
+
+def _open_private(stage, identity):
+    from .publish import RecoveryRequiredError, _identity
+    binding = stage.entry["staging"]
+    for name in (binding["anchor_name"], binding["witness_name"]):
+        try:
+            fd = os.open(name, _FILE_FLAGS, dir_fd=stage.directory)
+        except FileNotFoundError:
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or _identity(info) != identity:
+                raise RecoveryRequiredError("publish copy witness changed")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    raise RecoveryRequiredError("publish copy witness disappeared")
+
+
+def _external_links(stage, identity):
+    from .publish import RecoveryRequiredError
+    if identity is None:
+        return 0
+    private = _private_links(stage, identity)
+    fd = _open_private(stage, identity)
+    try:
+        links = os.fstat(fd).st_nlink
+    finally:
+        os.close(fd)
+    if links < private:
+        raise RecoveryRequiredError("publish copy witness link count is inconsistent")
+    return links - private
+
+
+def _shared_exposure(stage, identity):
+    return _external_links(stage, identity) > 0
+
+
+def _require_single_owner(stage, identity):
+    from .publish import RecoveryRequiredError
+    extra = _external_links(stage, identity)
+    if extra != 1:
+        raise RecoveryRequiredError("publish copy has an unexpected shared owner")
+
+
+def _hash_owned(stage, identity, *, max_bytes):
+    fd = _open_private(stage, identity)
+    try:
+        return workspace._hash_regular(fd, "private publish copy", max_bytes=max_bytes)
+    finally:
+        os.close(fd)
+
+
+def _safe_copy_name(name, original):
+    try:
+        return len(workspace._parts(name)) == 1 and not name.startswith(".") and name != original
+    except workspace.UnsafePathError:
+        return False
+
+
+def _scan_owned(parent, identity, fence, original):
+    from .publish import RecoveryRequiredError, _identity
+    claimed = None
+    with os.scandir(parent) as entries:
+        for count, item in enumerate(entries):
+            fence.checkpoint()
+            if count >= _MAX_CANDIDATES:
+                raise RecoveryRequiredError("publish copy directory exceeds ownership search bound")
+            info = item.stat(follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode) and _identity(info) == identity:
+                if not _safe_copy_name(item.name, original):
+                    raise RecoveryRequiredError("publish copy has an unexpected shared owner")
+                if claimed is not None:
+                    raise RecoveryRequiredError("publish copy has multiple shared owners")
+                claimed = item.name
+    return claimed
+
+
+def _owned_matches(stage, identity, selected, *, max_bytes):
+    body, digest = _hash_owned(stage, identity, max_bytes=max_bytes)
+    return digest == selected["sha256"] and len(body) == selected["size"]
+
+
+def _admit_registration(broker, chat, path):
+    from .publish import RecoveryRequiredError
+    try:
+        active = _index(broker, chat)
+    except LimitExceededError:
+        return None, False
+    except OutputsBrokerError as extra:
+        raise RecoveryRequiredError("publish copy index is unavailable") from extra
+    if path is not None and path in active:
+        return active, True
+    if len(active) >= broker.max_active_files:
+        return active, False
+    return active, True
+
+
+
 def prepare(store, broker, chat, journal_id, entry, fence, destination):
     if "copy" in entry:
         return entry
@@ -154,8 +275,8 @@ def prepare(store, broker, chat, journal_id, entry, fence, destination):
 
 def exposed(store, chat, journal_id, entry):
     """Check the live private witness, including a link before helper return."""
-    from .publish import RecoveryRequiredError, _Stage, _identity
-    if "claimed_name" in entry["copy"]:
+    from .publish import RecoveryRequiredError, _Stage
+    if "claimed_name" in entry.get("copy", {}):
         return True
     if "staging" not in entry:
         return False
@@ -164,17 +285,72 @@ def exposed(store, chat, journal_id, entry):
         identity = stage.inspect()
         if identity is None:
             raise RecoveryRequiredError("publish copy witness is missing at timeout")
-        for name in (entry["staging"]["anchor_name"], entry["staging"]["witness_name"]):
-            try:
-                info = os.lstat(name, dir_fd=stage.directory)
-            except FileNotFoundError:
-                continue
-            if _identity(info) != identity:
-                raise RecoveryRequiredError("publish copy witness changed at timeout")
-            return info.st_nlink > 2
-        raise RecoveryRequiredError("publish copy witness disappeared at timeout")
+        return _shared_exposure(stage, identity)
     finally:
         stage.close()
+
+
+def _retain_unregistered(store, broker, chat, journal_id, entry, selected, fence, stage, held, components, claimed, identity):
+    from .publish import PublishResult, RecoveryRequiredError, _finish, _identity, _remove_owned, _verify_parent_prefix
+    binding = entry["copy"]
+    parent = held[-1]
+    target = binding.get("retained_name", claimed)
+    path = _join(binding["destination"], target) if target is not None else None
+    if "registered_file_id" in binding:
+        raise RecoveryRequiredError("publish copy registration changed")
+    try:
+        active = _index(broker, chat)
+    except (LimitExceededError, OutputsBrokerError) as extra:
+        raise RecoveryRequiredError("publish copy index is unavailable") from extra
+    if path is not None and path in active:
+        raise RecoveryRequiredError("publish copy registration changed")
+    if identity is None:
+        raise RecoveryRequiredError("publish copy content changed before completion")
+    extra = _external_links(stage, identity)
+    if extra > 1:
+        raise RecoveryRequiredError("publish copy has an unexpected shared owner")
+    if extra == 0:
+        if claimed is not None:
+            raise RecoveryRequiredError("publish copy shared ownership changed")
+        return _finish(store, chat, journal_id, PublishResult("failed", "index_unavailable"), entry, selected)
+    if claimed != target or target is None:
+        raise RecoveryRequiredError("publish copy shared ownership changed")
+    try:
+        if not _owned_matches(stage, identity, selected, max_bytes=broker.max_file_size):
+            raise RecoveryRequiredError("publish copy content changed before completion")
+    except workspace.FileTooLargeError as extra:
+        raise RecoveryRequiredError("publish copy content changed before completion") from extra
+    info = os.lstat(target, dir_fd=parent)
+    if not stat.S_ISREG(info.st_mode) or _identity(info) != identity:
+        raise RecoveryRequiredError("publish copy ownership changed before completion")
+    try:
+        body, digest = store.read_workspace_file(chat, path, max_bytes=broker.max_file_size)
+    except workspace.FileTooLargeError as extra:
+        raise RecoveryRequiredError("publish copy content changed before completion") from extra
+    if digest != selected["sha256"] or len(body) != selected["size"]:
+        raise RecoveryRequiredError("publish copy content changed before completion")
+    if not binding.get("retained"):
+        def retire(state):
+            live = state["journal"][journal_id]["copy"]
+            live["retained"] = True
+            live["retained_name"] = target
+            live.pop("claimed_name", None)
+        fence.checkpoint()
+        entry = store.update(chat, retire)["journal"][journal_id]
+        fence.checkpoint()
+    _verify_parent_prefix(components, held)
+    if not _remove_owned(parent, target, identity):
+        raise RecoveryRequiredError("publish copy claim ownership changed")
+    os.fsync(parent)
+    try:
+        os.lstat(target, dir_fd=parent)
+    except FileNotFoundError:
+        pass
+    else:
+        raise RecoveryRequiredError("publish copy shared entry reappeared during retirement")
+    if _external_links(stage, identity) != 0:
+        raise RecoveryRequiredError("publish copy has an unexpected shared owner")
+    return _finish(store, chat, journal_id, PublishResult("failed", "index_unavailable"), entry, selected)
 
 
 def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
@@ -184,7 +360,10 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
         _prepared_parents, _record, _remove_owned, _verify_parent_prefix,
     )
 
-    entry = prepare(store, broker, chat, journal_id, entry, fence, destination)
+    try:
+        entry = prepare(store, broker, chat, journal_id, entry, fence, destination)
+    except LimitExceededError:
+        return _finish(store, chat, journal_id, PublishResult("failed", "index_unavailable"), entry, selected)
     binding = entry["copy"]
     components = (chat, "outputs", *(workspace._parts(binding["destination"]) if binding["destination"] else ()))
     held, absent = _prepared_parents(chat, (
@@ -195,12 +374,15 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
     result = None
     try:
         if absent is not None:
+            stage = _Stage(store, chat, journal_id, entry)
+            identity = stage.inspect()
+            if _shared_exposure(stage, identity):
+                raise RecoveryRequiredError("publish copy destination is missing")
             if absent.prefix == (chat,) and absent.missing == "outputs":
                 fence.checkpoint()
                 result = _finish(store, chat, journal_id, PublishResult("failed", "workspace_missing"), entry, selected)
                 return result
-            claimed = "claimed_name" in binding or "registered_file_id" in binding
-            if claimed or binding["destination"] == "":
+            if "claimed_name" in binding or "registered_file_id" in binding or binding["destination"] == "":
                 raise RecoveryRequiredError("publish copy destination is missing")
             stale = held
             held = []
@@ -220,6 +402,8 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
                 for fd in reversed(stale):
                     os.close(fd)
             if absent is not None:
+                if _shared_exposure(stage, identity):
+                    raise RecoveryRequiredError("publish copy destination is missing")
                 if absent.prefix == (chat,) and absent.missing == "outputs":
                     fence.checkpoint()
                     result = _finish(store, chat, journal_id, PublishResult("failed", "workspace_missing"), entry, selected)
@@ -233,7 +417,10 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
         elif parents != binding["parent_identities"]:
             raise RecoveryRequiredError("publish copy destination identity changed")
         _verify_parent_prefix(components, held)
-        stage = _Stage(store, chat, journal_id, entry)
+        if stage is None:
+            stage = _Stage(store, chat, journal_id, entry)
+        else:
+            stage.entry = entry
         identity = stage.inspect()
         content = versions.read_version_bytes(store, chat, selected["sha256"])
         if len(content) != selected["size"]:
@@ -244,42 +431,33 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
         if identity is not None:
             # Only metadata in this one pinned directory is inspected. This also
             # covers the helper's successful link before its return/name journal.
-            with os.scandir(parent) as entries:
-                for count, item in enumerate(entries):
-                    fence.checkpoint()
-                    if count >= _MAX_CANDIDATES:
-                        raise RecoveryRequiredError("publish copy directory exceeds ownership search bound")
-                    info = item.stat(follow_symlinks=False)
-                    if stat.S_ISREG(info.st_mode) and _identity(info) == identity:
-                        if item.name.startswith(".") or item.name == binding["basename"]:
-                            raise RecoveryRequiredError("publish copy has an unexpected shared owner")
-                        if claimed is not None:
-                            raise RecoveryRequiredError("publish copy has multiple shared owners")
-                        claimed = item.name
+            claimed = _scan_owned(parent, identity, fence, binding["basename"])
+            extra = _external_links(stage, identity)
+            if claimed is None and extra:
+                raise RecoveryRequiredError("publish copy destination is missing")
+            if claimed is not None and extra != 1:
+                raise RecoveryRequiredError("publish copy has an unexpected shared owner")
+        if binding.get("retained"):
+            result = _retain_unregistered(
+                store, broker, chat, journal_id, entry, selected, fence, stage, held, components, claimed, identity,
+            )
+            return result
         if "claimed_name" in binding and claimed != binding["claimed_name"]:
             raise RecoveryRequiredError("publish copy shared ownership changed")
-        if claimed is not None and "claimed_name" not in binding:
-            indexed = _index(broker, chat).get(_join(binding["destination"], claimed))
-            if claimed != binding.get("attempt") or (
-                indexed is not None and indexed["revision"] <= binding["initial_revision"]
-            ):
-                # The helper advanced after an unlocked collision. Its link is
-                # proven ours, but not the selected unindexed numbered candidate.
-                _verify_parent_prefix(components, held)
-                fence.checkpoint()
-                if not _remove_owned(parent, claimed, identity):
-                    raise RecoveryRequiredError("publish copy claim ownership changed")
-                os.fsync(parent)
-                claimed = None
+        if claimed is not None:
+            try:
+                if not _owned_matches(stage, identity, selected, max_bytes=broker.max_file_size):
+                    raise RecoveryRequiredError("publish copy content changed before completion")
+            except workspace.FileTooLargeError as extra:
+                raise RecoveryRequiredError("publish copy content changed before completion") from extra
+            _require_single_owner(stage, identity)
         if claimed is None:
-            complete = False
-            if identity is not None:
-                fd = os.open(entry["staging"]["anchor_name"], _FILE_FLAGS, dir_fd=stage.directory)
-                try:
-                    body, digest = workspace._hash_regular(fd, "private publish copy", max_bytes=broker.max_file_size)
-                    complete = digest == selected["sha256"] and len(body) == selected["size"]
-                finally:
-                    os.close(fd)
+            extra = _external_links(stage, identity)
+            if extra:
+                raise RecoveryRequiredError("publish copy has an unexpected shared owner")
+            complete = identity is not None and _owned_matches(
+                stage, identity, selected, max_bytes=broker.max_file_size,
+            )
             if not complete:
                 # Before shared exposure an interrupted allocation has no deletion
                 # authority. Fresh private names leave any old allocation harmless.
@@ -291,7 +469,14 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
                 entry = store.update(chat, renew)["journal"][journal_id]
                 stage.entry = entry
                 identity = stage.allocate(journal_id, content, fence)
-            active = _index(broker, chat)
+            active, admitted = _admit_registration(broker, chat, None)
+            if active is None:
+                raise RecoveryRequiredError("publish copy index is unavailable")
+            if not admitted:
+                result = _finish(
+                    store, chat, journal_id, PublishResult("failed", "index_unavailable"), entry, selected,
+                )
+                return result
             requested = Path(binding["basename"])
             for number in range(2, _MAX_CANDIDATES):
                 fence.checkpoint()
@@ -316,6 +501,9 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
                 if not stat.S_ISREG(info.st_mode) or _identity(info) != identity:
                     raise RecoveryRequiredError("publish copy claim ownership changed")
                 if claimed != name or _join(binding["destination"], claimed) in active:
+                    extra = _external_links(stage, identity)
+                    if extra != 1 or not _owned_matches(stage, identity, selected, max_bytes=broker.max_file_size):
+                        raise RecoveryRequiredError("publish copy content changed before completion")
                     if not _remove_owned(parent, claimed, identity):
                         raise RecoveryRequiredError("publish copy claim ownership changed")
                     os.fsync(parent)
@@ -324,17 +512,36 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
                 break
             if claimed is None:
                 raise RecoveryRequiredError("publish copy exhausted numbered names")
+        _require_single_owner(stage, identity)
+        try:
+            if not _owned_matches(stage, identity, selected, max_bytes=broker.max_file_size):
+                raise RecoveryRequiredError("publish copy content changed before completion")
+        except workspace.FileTooLargeError as extra:
+            raise RecoveryRequiredError("publish copy content changed before completion") from extra
         _verify_parent_prefix(components, held)
         fence.checkpoint()
         os.fsync(parent)
         fence.checkpoint()
         entry = _update(store, chat, journal_id, fence, claimed_name=claimed)
         path = _join(binding["destination"], claimed)
-        active = _index(broker, chat)
+        active, admitted = _admit_registration(broker, chat, path)
+        if active is None:
+            raise RecoveryRequiredError("publish copy index is unavailable")
+        if not admitted:
+            result = _retain_unregistered(
+                store, broker, chat, journal_id, entry, selected, fence, stage, held, components, claimed, identity,
+            )
+            return result
         registered = active.get(path)
         if registered is None:
             fence.checkpoint()
-            registered = broker.register_host_write(chat, path)
+            try:
+                registered = broker.register_host_write(chat, path)
+            except LimitExceededError:
+                result = _retain_unregistered(
+                    store, broker, chat, journal_id, entry, selected, fence, stage, held, components, claimed, identity,
+                )
+                return result
             fence.checkpoint()
         if (registered["file_id"] == entry["file_id"] or registered["hash"] != selected["sha256"]
                 or registered["size"] != selected["size"] or registered["revision"] <= binding["initial_revision"]

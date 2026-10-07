@@ -92,7 +92,13 @@ The new identity is distinct; source history, receipts and `document_key` stay
 on the original document. Ordinary saves and a leaf symlink keep
 `baseline_mismatch` for the next create. A missing or unsafe outputs root
 creates nothing and ends `error` / `workspace_missing` without recreating
-directories. Crash recovery of an owned copy remains the publisher's.
+directories. Crash recovery of an owned copy remains the publisher's: it
+preserves changed or renamed exposed content; an unchanged, proven-owned
+single copy can complete at its actual safe name; an ambiguous moved parent
+or extra ownership blocks Files with 503 rather than duplicating or deleting
+content; and unavailable copy-registration capacity ends `error` /
+`index_unavailable`, retaining stored content without an unregistered
+visible copy or a listing deadlock.
 
 ## API Endpoints
 

@@ -84,6 +84,89 @@ def _copy_outcome(http, data, broker, session, path):
     return state, status
 
 
+EDITED = CHANGED + b"newer-workspace-edit"
+
+
+def _interrupt_claim(monkeypatch, save_as):
+    claim = save_as.claim_file_no_replace
+
+    def claimed_then_interrupted(*args, **kwargs):
+        _claimed = claim(*args, **kwargs)
+        raise OSError("interrupted after actual no-replace claim")
+
+    monkeypatch.setattr(save_as, "claim_file_no_replace", claimed_then_interrupted)
+
+
+def _interrupt_helper_fallback(monkeypatch, save_as, occupied):
+    claim = save_as.claim_file_no_replace
+
+    def claimed_then_interrupted(temporary, *, src_dir_fd, dst_dir_fd, requested_name):
+        occupied.write_bytes(b"foreign")
+        _claimed = claim(temporary, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, requested_name=requested_name)
+        raise OSError("interrupted after helper fallback claim")
+
+    monkeypatch.setattr(save_as, "claim_file_no_replace", claimed_then_interrupted)
+
+
+def _interrupt_prepare_allocate(monkeypatch, publish_mod):
+    allocate = publish_mod._Stage.allocate
+
+    def allocated(self, *args, **kwargs):
+        _identity = allocate(self, *args, **kwargs)
+        raise OSError("interrupted after real prepared allocation")
+
+    monkeypatch.setattr(publish_mod._Stage, "allocate", allocated)
+    monkeypatch.setattr(publish_mod._Stage, "cleanup", lambda *a, **k: None)
+
+
+def _final_fault(http, session, monkeypatch, *, content=CHANGED):
+    with _content_origin({"/save.docx": content}) as origin, _bind_internal(monkeypatch, origin.url):
+        try:
+            response = _post(http, session, _payload(session, origin.url + "/save.docx", True))
+        except OSError:
+            return None
+        return response
+
+
+def _recover(recovery, http, session, monkeypatch):
+    if recovery == "direct":
+        from office.publish import recover_publications
+        recover_publications(CHAT)
+        return None
+    if recovery == "files":
+        return http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    if recovery == "files-first":
+        status, body = _raw_office(
+            http.app, f"/api/outputs/{CHAT}", [(b"authorization", f"Bearer {INTERNAL}".encode())],
+        )
+        return status, body
+    if recovery == "callback":
+        with _content_origin({"/save.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+            return _post(http, session, _payload(session, origin.url + "/save.docx", True))
+    from office.sweep import sweep_office_publications
+    sweep_office_publications()
+    return None
+
+
+def _refused_listing(listed, data, broker, revision, index_before, session, path, body):
+    if isinstance(listed, tuple):
+        status, payload = listed
+        assert status == 503
+        assert "outputs listing failed" in str(payload.get("detail", payload))
+    else:
+        assert listed.status_code == 503
+        assert listed.headers["Retry-After"] == "1"
+        assert "outputs listing failed" in str(listed.json()["detail"])
+    state = _read(data)
+    assert state["journal"]
+    assert state["sessions"][session["session_id"]]["file_id"] == session["file_id"]
+    assert path.read_bytes() == body
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+
+
+
+
 @pytest.mark.parametrize("status4", (False, True), ids=("status2", "status4"))
 @pytest.mark.parametrize("tombstoned", (False, True), ids=("active-index", "tombstoned"))
 def test_final_missing_copy_conserves_source_receipt_key_and_replay(office_world, monkeypatch, status4, tombstoned):
@@ -1081,5 +1164,403 @@ def test_files_refuses_foreign_same_hash_substitution_without_index_write(office
     assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
     assert broker.OutputsBroker().current_revision(CHAT) == revision
     assert _read(data)["journal"]
+
+
+@pytest.mark.parametrize("recovery", ("direct", "files", "files-first", "callback", "sweep"))
+def test_moved_parent_after_unjournaled_claim_retains_owned_copy(office_world, monkeypatch, recovery):
+    from office import save_as
+    from office.publish import RecoveryRequiredError
+
+    http, data, _origin, _manager, broker, _body, session = _nested(office_world, "nested/report.docx")
+    target = _outputs(data) / "nested/report.docx"
+    target.unlink()
+    with monkeypatch.context() as cut:
+        _interrupt_claim(cut, save_as)
+        _final_fault(http, session, cut)
+    root = _outputs(data)
+    claimed = root / "nested/report (2).docx"
+    inode = claimed.stat().st_ino
+    (root / "nested").rename(root / "moved")
+    moved = root / "moved/report (2).docx"
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    if recovery == "direct":
+        with pytest.raises(RecoveryRequiredError):
+            _recover(recovery, http, session, monkeypatch)
+        listed = None
+    else:
+        listed = _recover(recovery, http, session, monkeypatch)
+        if recovery in ("files", "files-first"):
+            _refused_listing(listed, data, broker, revision, index_before, session, moved, CHANGED)
+        else:
+            if listed is not None:
+                assert listed.status_code == 200
+            state = _read(data)
+            assert state["journal"]
+            assert state["sessions"][session["session_id"]]["file_id"] == session["file_id"]
+    assert not (root / "report (2).docx").exists()
+    assert moved.read_bytes() == CHANGED
+    assert moved.stat().st_ino == inode
+    assert _read(data)["journal"]
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+
+
+@pytest.mark.parametrize("recovery", ("direct", "files", "files-first", "callback", "sweep"))
+def test_renamed_and_edited_exposed_copy_is_retained(office_world, monkeypatch, recovery):
+    from office import save_as
+    from office.publish import RecoveryRequiredError
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    with monkeypatch.context() as cut:
+        _interrupt_claim(cut, save_as)
+        _final_fault(http, session, cut)
+    root = _outputs(data)
+    claimed = root / "report (2).docx"
+    claimed.rename(root / "revised.docx")
+    revised = root / "revised.docx"
+    revised.write_bytes(EDITED)
+    inode = revised.stat().st_ino
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    if recovery == "direct":
+        with pytest.raises(RecoveryRequiredError):
+            _recover(recovery, http, session, monkeypatch)
+    else:
+        listed = _recover(recovery, http, session, monkeypatch)
+        if recovery in ("files", "files-first"):
+            _refused_listing(listed, data, broker, revision, index_before, session, revised, EDITED)
+        elif listed is not None:
+            assert listed.status_code == 200
+    assert revised.exists() and revised.read_bytes() == EDITED
+    assert revised.stat().st_ino == inode
+    assert not (root / "report (2).docx").exists()
+    assert _read(data)["journal"]
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+
+
+@pytest.mark.parametrize("recovery", ("direct", "files", "files-first"))
+def test_rename_only_exposed_copy_completes_in_place(office_world, monkeypatch, recovery):
+    from office import save_as
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    with monkeypatch.context() as cut:
+        _interrupt_claim(cut, save_as)
+        _final_fault(http, session, cut)
+    root = _outputs(data)
+    claimed = root / "report (2).docx"
+    inode = claimed.stat().st_ino
+    claimed.rename(root / "revised.docx")
+    revised = root / "revised.docx"
+    listed = _recover(recovery, http, session, monkeypatch)
+    if recovery == "files":
+        assert listed.status_code == 200
+        listed_path = next(item["path"] for item in listed.json()["files"] if item["path"] == "revised.docx")
+        assert listed_path == "revised.docx"
+    elif recovery == "files-first":
+        status, body = listed
+        assert status == 200
+        assert any(item["path"] == "revised.docx" for item in body["files"])
+    _copy_outcome(http, data, broker, session, "revised.docx")
+    assert revised.stat().st_ino == inode
+    assert revised.read_bytes() == CHANGED
+    assert not (root / "report (2).docx").exists()
+
+
+@pytest.mark.parametrize("recovery", ("direct", "files", "files-first"))
+def test_helper_fallback_before_return_completes_actual_name(office_world, monkeypatch, recovery):
+    from office import save_as
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    root = _outputs(data)
+    occupied = root / "report (2).docx"
+    (root / "report.docx").unlink()
+    with monkeypatch.context() as cut:
+        _interrupt_helper_fallback(cut, save_as, occupied)
+        _final_fault(http, session, cut)
+    fallback = root / "report (2) (2).docx"
+    inode = fallback.stat().st_ino
+    listed = _recover(recovery, http, session, monkeypatch)
+    if recovery == "files":
+        assert listed.status_code == 200
+    elif recovery == "files-first":
+        status, _body = listed
+        assert status == 200
+    _copy_outcome(http, data, broker, session, "report (2) (2).docx")
+    assert fallback.stat().st_ino == inode
+    assert occupied.read_bytes() == b"foreign"
+    assert fallback.read_bytes() == CHANGED
+
+
+@pytest.mark.parametrize("recovery", ("direct", "files", "files-first", "callback", "sweep"))
+def test_stale_active_index_limit_fails_before_exposure_and_keeps_files_available(
+    office_world, monkeypatch, recovery,
+):
+    import office.publish as publish_mod
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    source = _outputs(data) / "report.docx"
+    cls = broker.OutputsBroker
+    monkeypatch.setattr(publish_mod, "OutputsBroker", lambda: cls(max_active_files=1))
+    source.unlink()
+    response, _payload_value = _final(http, session, monkeypatch)
+    assert response.status_code == 200
+    listed = _recover(recovery, http, session, monkeypatch)
+    if recovery == "files":
+        assert listed.status_code == 200
+        assert listed.json()["files"] == []
+    elif recovery == "files-first":
+        status, body = listed
+        assert status == 200
+        assert body["files"] == []
+    elif listed is not None:
+        assert listed.status_code == 200
+    state = _read(data)
+    record = state["sessions"][session["session_id"]]
+    assert record["state"] == "error"
+    assert record["reason"] == "index_unavailable"
+    assert record["file_id"] == session["file_id"]
+    assert not state["journal"]
+    assert not (_outputs(data) / "report (2).docx").exists()
+    assert state["documents"][session["file_id"]]["versions"][-1]["published"] is False
+    listing = broker.OutputsBroker().reconcile(CHAT)
+    assert listing["entries"] == []
+
+
+def test_index_size_limit_after_claim_retires_unedited_copy(office_world, monkeypatch):
+    import office.publish as publish_mod
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    index_path = data / CHAT / ".ocu" / "index.json"
+    before_bytes = index_path.read_bytes()
+    cls = broker.OutputsBroker
+    monkeypatch.setattr(publish_mod, "OutputsBroker", lambda: cls(max_index_size=len(before_bytes) + 1))
+    (_outputs(data) / "report.docx").unlink()
+    response, _payload_value = _final(http, session, monkeypatch)
+    assert response.status_code == 200
+    listed = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listed.status_code == 200
+    state = _read(data)
+    record = state["sessions"][session["session_id"]]
+    assert record["state"] == "error"
+    assert record["reason"] == "index_unavailable"
+    assert record["file_id"] == session["file_id"]
+    assert not state["journal"]
+    assert not (_outputs(data) / "report (2).docx").exists()
+    assert state["documents"][session["file_id"]]["versions"][-1]["published"] is False
+
+
+def test_postclaim_capacity_retirement_interrupted_before_finish_converges(office_world, monkeypatch):
+    import office.publish as publish_mod
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    index_path = data / CHAT / ".ocu" / "index.json"
+    before_bytes = index_path.read_bytes()
+    cls = broker.OutputsBroker
+    monkeypatch.setattr(publish_mod, "OutputsBroker", lambda: cls(max_index_size=len(before_bytes) + 1))
+    (_outputs(data) / "report.docx").unlink()
+    real_finish = publish_mod._finish
+    stopped = []
+
+    def finish_once(store, chat, journal_id, result, entry, selected):
+        if result.outcome == "failed" and result.reason == "index_unavailable" and not stopped:
+            stopped.append(True)
+            raise OSError(errno.EIO, "retirement finish interrupted")
+        return real_finish(store, chat, journal_id, result, entry, selected)
+
+    monkeypatch.setattr(publish_mod, "_finish", finish_once)
+    response, _payload_value = _final(http, session, monkeypatch)
+    assert response.status_code == 500
+    assert stopped == [True]
+    assert _read(data)["journal"]
+    listed = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listed.status_code == 200
+    state = _read(data)
+    record = state["sessions"][session["session_id"]]
+    assert record["state"] == "error"
+    assert record["reason"] == "index_unavailable"
+    assert not state["journal"]
+    assert not (_outputs(data) / "report (2).docx").exists()
+
+
+@pytest.mark.parametrize("recovery", ("direct", "files", "files-first", "callback", "sweep"))
+def test_prepared_tombstoned_source_cleans_up_and_copies(office_world, monkeypatch, recovery):
+    import office.publish as publish_mod
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    with monkeypatch.context() as cut:
+        _interrupt_prepare_allocate(cut, publish_mod)
+        _final_fault(http, session, cut)
+    state = _read(data)
+    entry = next(iter(state["journal"].values()))
+    assert "target_path" in entry and entry["staging"]["retired"] is False
+    (_outputs(data) / "report.docx").unlink()
+    broker.OutputsBroker().reconcile(CHAT)
+    listed = _recover(recovery, http, session, monkeypatch)
+    if recovery == "files":
+        assert listed.status_code == 200
+    elif recovery == "files-first":
+        status, _body = listed
+        assert status == 200
+    elif listed is not None:
+        assert listed.status_code == 200
+    _copy_outcome(http, data, broker, session, "report (2).docx")
+
+
+def test_prepared_foreign_temporary_still_refuses(office_world, monkeypatch):
+    import office.publish as publish_mod
+    from office.publish import RecoveryRequiredError
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    with monkeypatch.context() as cut:
+        _interrupt_prepare_allocate(cut, publish_mod)
+        _final_fault(http, session, cut)
+    state = _read(data)
+    entry = next(iter(state["journal"].values()))
+    temporary = _outputs(data) / entry["temporary_name"]
+    foreign = data.parent / "foreign-prepared"
+    foreign.write_bytes(CHANGED)
+    foreign.replace(temporary)
+    inode = temporary.stat().st_ino
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    with pytest.raises(RecoveryRequiredError):
+        publish_mod.recover_publications(CHAT)
+    listed = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listed.status_code == 503
+    assert temporary.read_bytes() == CHANGED
+    assert temporary.stat().st_ino == inode
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert _read(data)["journal"]
+
+
+def test_prepared_cleanup_before_copy_when_parent_is_already_absent(office_world, monkeypatch):
+    import office.publish as publish_mod
+
+    http, data, _origin, _manager, broker, _body, session = _nested(office_world, "nested/report.docx")
+    with monkeypatch.context() as cut:
+        _interrupt_prepare_allocate(cut, publish_mod)
+        _final_fault(http, session, cut)
+    state = _read(data)
+    entry = next(iter(state["journal"].values()))
+    assert entry["target_path"] == "nested/report.docx"
+    assert entry["staging"]["retired"] is False
+    shutil.rmtree(_outputs(data) / "nested")
+    listed = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listed.status_code == 200
+    _copy_outcome(http, data, broker, session, "report (2).docx")
+    assert not (_outputs(data) / "nested").exists()
+
+
+def test_prepared_exposed_temporary_is_retired_before_copy(office_world, monkeypatch):
+    import office.publish as publish_mod
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    expose = publish_mod._Stage.expose
+
+    def exposed_then_interrupted(self, parent, fence):
+        identity = expose(self, parent, fence)
+        raise OSError("interrupted after real shared exposure")
+        return identity
+
+    with monkeypatch.context() as cut:
+        cut.setattr(publish_mod._Stage, "expose", exposed_then_interrupted)
+        cut.setattr(publish_mod._Stage, "cleanup", lambda *a, **k: None)
+        _final_fault(http, session, cut)
+    state = _read(data)
+    entry = next(iter(state["journal"].values()))
+    temporary = _outputs(data) / entry["temporary_name"]
+    assert temporary.exists()
+    (_outputs(data) / "report.docx").unlink()
+    broker.OutputsBroker().reconcile(CHAT)
+    listed = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listed.status_code == 200
+    assert not temporary.exists()
+    _copy_outcome(http, data, broker, session, "report (2).docx")
+
+
+def test_extra_hardlink_outside_destination_is_retained(office_world, monkeypatch):
+    from office import save_as
+    from office.publish import RecoveryRequiredError
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    with monkeypatch.context() as cut:
+        _interrupt_claim(cut, save_as)
+        _final_fault(http, session, cut)
+    copy = _outputs(data) / "report (2).docx"
+    extra = data.parent / "extra-hardlink.docx"
+    os.link(copy, extra)
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    with pytest.raises(RecoveryRequiredError):
+        from office.publish import recover_publications
+        recover_publications(CHAT)
+    listed = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listed.status_code == 503
+    assert copy.read_bytes() == CHANGED
+    assert extra.read_bytes() == CHANGED
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert _read(data)["journal"]
+
+
+def test_journaled_claim_edited_before_registration_is_retained(office_world, monkeypatch):
+    from office.store import OfficeStore
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    original_replace = os.replace
+
+    def stop(source, destination, *args, **kwargs):
+        if destination == "index.json":
+            raise OSError(errno.EIO, "registration refused")
+        return original_replace(source, destination, *args, **kwargs)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(os, "replace", stop)
+        response, _payload_value = _final(http, session, boundary)
+    assert response.status_code == 500
+    copy = _outputs(data) / "report (2).docx"
+    copy.write_bytes(EDITED)
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    listed = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listed.status_code == 503
+    after = OfficeStore().read(CHAT)
+    assert after["journal"]
+    assert after["sessions"][session["session_id"]]["file_id"] == session["file_id"]
+    assert copy.read_bytes() == EDITED
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+
+
+def test_retirement_interrupted_after_unlink_finishes_without_second_copy(office_world, monkeypatch):
+    import office.publish as publish_mod
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    index_path = data / CHAT / ".ocu" / "index.json"
+    before_bytes = index_path.read_bytes()
+    cls = broker.OutputsBroker
+    monkeypatch.setattr(publish_mod, "OutputsBroker", lambda: cls(max_index_size=len(before_bytes) + 1))
+    (_outputs(data) / "report.docx").unlink()
+    real_unlink = os.unlink
+    stopped = []
+
+    def unlinked(name, *args, **kwargs):
+        answer = real_unlink(name, *args, **kwargs)
+        if isinstance(name, str) and name.endswith(".docx") and not stopped:
+            stopped.append(True)
+            raise OSError(errno.EIO, "retirement unlink interrupted")
+        return answer
+
+    with monkeypatch.context() as cut:
+        cut.setattr(os, "unlink", unlinked)
+        response, _payload_value = _final(http, session, cut)
+    assert response.status_code == 500
+    listed = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listed.status_code == 200
+    state = _read(data)
+    record = state["sessions"][session["session_id"]]
+    assert record["state"] == "error"
+    assert record["reason"] == "index_unavailable"
+    assert not state["journal"]
+    assert not (_outputs(data) / "report (2).docx").exists()
 
 
