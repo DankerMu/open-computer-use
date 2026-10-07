@@ -171,20 +171,12 @@ def _require_issued_save(record: dict[str, Any], userdata: tuple[int, str]) -> N
 
 def _settle_resolve(store, chat, session_id, status, userdata) -> None:
     """Finish accepted identity/lineage changes before a new callback binds content."""
-    state = store.read(chat)
-    if not any(
-        entry.get("session_id") == session_id and entry.get("requester") == "resolve"
-        for entry in state["journal"].values()
-    ):
-        return
     try:
-        state = sessions._recover_session_publications(store, chat, session_id)
+        state = sessions._settle_session_resolve(store, chat, session_id)
     except (publish.RecoveryRequiredError, publish.SandboxStateError) as extra:
         raise CallbackRefusal(503, "publish_pending") from extra
     except StorageLowError as extra:
         raise CallbackRefusal(503, "storage_low") from extra
-    if any(entry.get("session_id") == session_id for entry in state["journal"].values()):
-        raise CallbackRefusal(503, "publish_pending")
     record = sessions._require_session(state, session_id)
     if status in _FORCESAVE:
         assert userdata is not None

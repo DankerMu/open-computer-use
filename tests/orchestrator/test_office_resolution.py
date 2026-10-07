@@ -7,12 +7,15 @@ import errno
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from urllib.parse import urlsplit
 
+import httpx
 import pytest
 
 from tests.orchestrator._office_recorded_callbacks import recorded_status_4_payload
@@ -646,7 +649,11 @@ def synced(fd):
     return result
 os.replace, os.link, os.fsync = replaced, linked, synced
 mode = os.environ.get("RESOLVE_MODE", "request")
-if mode == "recover":
+if mode == "http":
+    import uvicorn
+    uvicorn.run(app.app, host="127.0.0.1", port=int(os.environ["OCU_PORT"]),
+                lifespan="off", log_level="warning")
+elif mode == "recover":
     recover_publications(os.environ["OCU_CHAT"])
 elif mode == "startup":
     app.sweep_office_publications()
@@ -1487,3 +1494,402 @@ def test_resolve_registration_io_cut_does_not_consume_incoming_callback(
         frozen = _snapshot(data)
         assert _post(http, session, payload).json() == {"error": 0}
         assert _snapshot(data) == frozen
+
+
+def _timeout_first_save(world, monkeypatch):
+    from office import config
+    from office.sweep import sweep_office_sessions
+
+    opened = _opened(world)
+    http, data, _origin, _manager, _broker, _original, session = opened
+    _allocate(http, session, monkeypatch)
+    started = _read(data)["sessions"][session["session_id"]]["saving_started_at"]
+    with _info(monkeypatch, session["document_key"]):
+        sweep_office_sessions(now=started + config.SAVE_CALLBACK_TIMEOUT_SECONDS + 1)
+    record = _read(data)["sessions"][session["session_id"]]
+    assert (record["state"], record["save_seq"], record["last_committed_seq"]) == ("editing", 1, 0)
+    return opened
+
+
+@contextmanager
+def _resolve_http_worker(data, session, action, origin, *, cut=""):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    marker = data.parent / ("http-resolve-" + (cut or "live"))
+    environment = _child_env(
+        data, OCU_PORT=str(port), RESOLVE_MODE="http", RESOLVE_CUT=cut,
+        RESOLVE_MARKER=str(marker), RESOLVE_SESSION=session["session_id"],
+        RESOLVE_ACTION=action, OCU_OFFICE_DOCSERVER_URL=origin,
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", _RESOLVE_WORKER], cwd=str(SERVER_DIR), env=environment,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                if child.poll() is not None or time.monotonic() >= deadline:
+                    pytest.fail("resolve HTTP worker did not bind")
+                time.sleep(0.01)
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=15) as http:
+            yield http, child, marker, environment
+    finally:
+        _stop_child(child)
+
+
+@pytest.mark.parametrize("intent", ("publish", "persist"))
+@pytest.mark.parametrize("action", ("save_as", "overwrite"))
+def test_two_http_workers_nothing_new_command_settles_sigkill_resolve_before_completion(
+    office_world, monkeypatch, intent, action,
+):
+    from tests.orchestrator.test_office_commands import _command_origin, _independent_verify
+    from tests.orchestrator.test_office_control_plane import _header_jwt
+    from tests.orchestrator.test_office_sessions import JWT_SECRET
+
+    _http, data, _origin, _manager, broker, original, session = _timeout_first_save(
+        office_world, monkeypatch,
+    )
+    entered, release = threading.Event(), threading.Event()
+    command_errors, seen = [], []
+    held_at = []
+
+    def responder(handler, body, _parent):
+        try:
+            assert handler.path == "/command"
+            payload = _independent_verify(json.loads(body)["token"], JWT_SECRET)
+            assert payload["key"] == session["document_key"] and payload["c"] == "forcesave"
+            seen.append(json.loads(payload["userdata"]))
+            held_at.append(time.monotonic())
+            entered.set()
+            assert release.wait(8), "command response was not released within its production timeout"
+            return 200, {"Content-Type": "application/json"}, b'{"error":4}'
+        except Exception as extra:
+            command_errors.append(extra)
+            raise
+
+    with _command_origin(responder, trap=(200, {}, CHANGED)) as origin:
+        with _resolve_http_worker(data, session, action, origin.url) as (live, _live_child, _marker, _environment), \
+                _resolve_http_worker(data, session, action, origin.url, cut="accepted") as (resolver, child, marker, environment):
+            results = {}
+            saver = threading.Thread(target=lambda: results.setdefault(
+                "save", _save(live, session["session_id"], intent),
+            ))
+            def resolve():
+                try:
+                    results["resolve"] = _resolve(resolver, session, action)
+                except httpx.TransportError:
+                    # The crash may abort transport; the marker and child exit prove it.
+                    pass
+            cutter = threading.Thread(target=resolve)
+            saver.start()
+            try:
+                assert entered.wait(5), "live worker never issued the second command"
+                assert seen == [{"save_seq": 2, "intent": intent}]
+                (_outputs(data) / "report.docx").write_bytes(original + b"agent-workspace")
+                payload = _payload(session, origin.url + "/delayed.docx")
+                callback = live.post(
+                    f"/office/callback/{CHAT}/{session['session_id']}",
+                    headers={"Authorization": "Bearer " + _header_jwt(session, extra=payload)}, json={},
+                )
+                assert callback.status_code == 200 and callback.json() == {"error": 0}
+                before = _read(data)
+                record = before["sessions"][session["session_id"]]
+                assert (record["state"], record["pending_save_seq"], record["last_committed_seq"]) == ("conflict", 2, 1)
+                revision = broker.OutputsBroker().current_revision(CHAT)
+                cutter.start()
+                _wait_marker(marker, child, "separate HTTP worker never durably accepted resolve")
+                assert marker.read_text() == "accepted"
+                accepted = _read(data)
+                entry, = accepted["journal"].values()
+                assert (entry["requester"], entry["action"], entry["save_seq"], entry["file_id"]) == (
+                    "resolve", action, 1, session["file_id"],
+                )
+                child.kill()
+                child.communicate(timeout=5)
+                assert child.returncode == -9
+                cutter.join(timeout=5)
+                assert not cutter.is_alive()
+                # Command completion is the first mutation after the process cut.
+                assert time.monotonic() - held_at[0] < 10
+                release.set()
+                saver.join(timeout=10)
+                assert not saver.is_alive() and not command_errors
+                response = results["save"]
+                assert response.status_code == 202, response.text
+                assert response.json() == {"session_id": session["session_id"], "save_seq": 2, "intent": intent}
+                after = _assert_resolved(data, session)
+                record = after["sessions"][session["session_id"]]
+                current_id = record["file_id"]
+                document = after["documents"][current_id]
+                latest = document["versions"][-1]
+                path = "report (2).docx" if action == "save_as" else "report.docx"
+                assert (record["save_seq"], record["last_committed_seq"], record["last_published_seq"]) == (2, 2, 2)
+                assert record["pending_save_seq"] is None
+                assert after["receipts"] == before["receipts"]
+                assert after["receipts"][session["session_id"]]["1"]["version"] == 2
+                assert after["receipts"][session["session_id"]]["1"]["sha256"] == _sha(CHANGED)
+                assert (latest["sha256"], latest["published"], document["published_version"]) == (
+                    _sha(CHANGED), True, latest["number"],
+                )
+                assert (_outputs(data) / path).read_bytes() == CHANGED
+                assert (_versions(data) / _sha(original)).read_bytes() == original
+                assert (_versions(data) / _sha(CHANGED)).read_bytes() == CHANGED
+                if action == "save_as":
+                    assert current_id != session["file_id"]
+                    assert record["saved_as"] == {"file_id": current_id, "path": path}
+                    assert after["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+                    assert (_outputs(data) / "report.docx").read_bytes() == original + b"agent-workspace"
+                    assert [(v["number"], v["parent"], v["source"]) for v in document["versions"]] == [(1, None, "conflict")]
+                else:
+                    assert current_id == session["file_id"]
+                    assert [(v["number"], v["parent"], v["source"], v["sha256"]) for v in document["versions"]] == [
+                        (1, None, "workspace", _sha(original)),
+                        (2, 1, "save", _sha(CHANGED)),
+                        (3, 2, "workspace", _sha(original + b"agent-workspace")),
+                        (4, 2, "restore", _sha(CHANGED)),
+                    ]
+                    assert (_versions(data) / _sha(original + b"agent-workspace")).read_bytes() == original + b"agent-workspace"
+                index = json.loads((data / CHAT / ".ocu" / "index.json").read_bytes())
+                target = index["active"][path]
+                assert (target["file_id"], target["hash"], target["size"], target["revision"]) == (
+                    current_id, _sha(CHANGED), len(CHANGED), revision + 1,
+                )
+                listing = live.get(f"/api/outputs/{CHAT}", headers=_auth())
+                assert listing.status_code == 200, listing.text
+                entries = {item["path"]: item["file_id"] for item in listing.json()["files"]}
+                assert entries[path] == current_id and entries["report.docx"] == session["file_id"]
+                settled = _snapshot(data)
+                settled_revision = broker.OutputsBroker().current_revision(CHAT)
+                replay = live.post(
+                    f"/office/callback/{CHAT}/{session['session_id']}",
+                    headers={"Authorization": "Bearer " + _header_jwt(session, extra=payload)}, json={},
+                )
+                assert replay.status_code == 200 and replay.json() == {"error": 0}
+                _fresh_resolve(environment, mode="startup")
+                _fresh_resolve(environment)
+                assert _fresh_files(data).status_code == 200
+                assert _snapshot(data) == settled
+                assert broker.OutputsBroker().current_revision(CHAT) == settled_revision
+            finally:
+                release.set()
+                _stop_child(child)
+                saver.join(timeout=15)
+                assert not saver.is_alive()
+                if cutter.ident is not None:
+                    cutter.join(timeout=15)
+                    assert not cutter.is_alive()
+
+
+@contextmanager
+def _held_conflict_command(world, monkeypatch, intent="publish", *, code=4, status=200):
+    from tests.orchestrator.test_office_save_close import _command_box
+
+    opened = _timeout_first_save(world, monkeypatch)
+    http, data, _origin, _manager, _broker, original, session = opened
+    entered, release = threading.Event(), threading.Event()
+    with _command_box(
+        monkeypatch, session["document_key"], forcesave_code=code, forcesave_status=status,
+        entered=entered, release=release,
+    ):
+        saver = threading.Thread(target=lambda: setattr(saver, "response", _save(http, session["session_id"], intent)))
+        saver.start()
+        try:
+            assert entered.wait(5)
+            (_outputs(data) / "report.docx").write_bytes(original + b"agent-workspace")
+            with _content_origin({"/late.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+                assert _post(http, session, _payload(session, origin.url + "/late.docx")).json() == {"error": 0}
+            record = _read(data)["sessions"][session["session_id"]]
+            assert (record["state"], record["pending_save_seq"], record["last_committed_seq"]) == ("conflict", 2, 1)
+            yield opened, saver, release
+        finally:
+            release.set()
+            saver.join(timeout=10)
+            assert not saver.is_alive()
+
+
+@pytest.mark.parametrize("code", (4, 1), ids=("nothing-new", "unknown-key"))
+@pytest.mark.parametrize("intent", ("publish", "persist"))
+@pytest.mark.parametrize("action,obstruction", (
+    ("save_as", "fence"), ("overwrite", "fence"), ("save_as", "path"), ("save_as", "index"),
+))
+def test_uncertain_resolve_retains_command_allocation_without_old_identity_journal(
+    office_world, monkeypatch, intent, action, obstruction, code,
+):
+    with _held_conflict_command(office_world, monkeypatch, intent, code=code) as (opened, saver, release):
+        http, data, _origin, manager, _broker, _original, session = opened
+        environment = _kill_resolve(data, session, action, "accepted" if obstruction == "fence" else "claim")
+        before = _read(data)
+        copied = _outputs(data) / "report (2).docx"
+        index = data / CHAT / ".ocu" / "index.json"
+        if obstruction == "fence":
+            container = _running(manager)
+            pause = container.pause.side_effect
+            container.pause.side_effect = RuntimeError("writer exclusion refused")
+        elif obstruction == "path":
+            retained = data.parent / "command-owned-copy.docx"
+            copied.rename(retained)
+            copied.write_bytes(CHANGED)
+        else:
+            saved_index = index.read_bytes()
+            index.write_bytes(b"{broken")
+        release.set()
+        saver.join(timeout=10)
+        _assert_refusal(saver.response, 503, "publish_pending")
+        pending = _read(data)
+        assert pending["sessions"] == before["sessions"]
+        assert pending["documents"] == before["documents"]
+        assert pending["receipts"] == before["receipts"]
+        entry, = pending["journal"].values()
+        assert (entry["requester"], entry["action"], entry["save_seq"], entry["file_id"]) == (
+            "resolve", action, 1, session["file_id"],
+        )
+        assert pending["sessions"][session["session_id"]]["pending_save_seq"] == 2
+        if obstruction == "fence":
+            container.pause.side_effect = pause
+        elif obstruction == "path":
+            copied.unlink()
+            retained.rename(copied)
+        else:
+            index.write_bytes(saved_index)
+        _fresh_resolve(environment)
+        with _content_origin({"/same.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+            payload = _late_payload(session, origin.url + "/same.docx", intent)
+            assert _post(http, session, payload).json() == {"error": 0}
+            after = _assert_resolved(data, session)
+            assert after["sessions"][session["session_id"]]["last_published_seq"] == 2
+            assert after["receipts"][session["session_id"]]["1"] == before["receipts"][session["session_id"]]["1"]
+            frozen = _snapshot(data)
+            assert _post(http, session, payload).json() == {"error": 0}
+            assert _snapshot(data) == frozen
+
+
+@pytest.mark.parametrize("action", ("save_as", "overwrite"))
+@pytest.mark.parametrize("code,status,http_status", ((0, 200, 202), (1, 200, 409), (5, 200, 502), (0, 500, 502)))
+def test_command_outcomes_preserve_resolve_responsibility_and_unknown_key_recovery(
+    office_world, monkeypatch, action, code, status, http_status,
+):
+    with _held_conflict_command(office_world, monkeypatch, code=code, status=status) as (opened, saver, release):
+        _http, data, _origin, _manager, _broker, _original, session = opened
+        environment = _kill_resolve(data, session, action, "accepted")
+        before = _read(data)
+        release.set()
+        saver.join(timeout=10)
+        assert saver.response.status_code == http_status, saver.response.text
+        after = _read(data)
+        record = after["sessions"][session["session_id"]]
+        assert after["receipts"] == before["receipts"]
+        assert record["last_committed_seq"] == 1
+        assert record["document_key"] == session["document_key"]
+        if code == 1:
+            assert (record["state"], record["reason"], record["pending_save_seq"]) == ("orphaned", "editor_state_lost", None)
+            assert record["last_published_seq"] == 1 and after["journal"] == {}
+            assert after["documents"][record["file_id"]]["versions"][-1]["sha256"] == _sha(CHANGED)
+        else:
+            assert after["documents"] == before["documents"] and after["journal"] == before["journal"]
+            assert record["state"] == "conflict"
+            assert record["pending_save_seq"] == (2 if code == 0 and status == 200 else None)
+            _fresh_resolve(environment)
+            assert _read(data)["journal"] == {}
+
+
+@pytest.mark.parametrize("action", ("save_as", "overwrite"))
+@pytest.mark.parametrize("code,http_status", ((4, 202), (1, 409), (5, 502)))
+@pytest.mark.parametrize("transition", ("newer-pending", "final-conflict", "closed", "new-session", "error", "epoch"))
+def test_delayed_command_cannot_consume_newer_or_terminal_responsibility(
+    office_world, monkeypatch, action, code, http_status, transition,
+):
+    with _held_conflict_command(office_world, monkeypatch, code=code) as (opened, saver, release):
+        http, data, _origin, _manager, _broker, _original, session = opened
+        if transition == "newer-pending":
+            assert _resolve(http, session, action).status_code == 200
+            assert _post(http, session, {"key": session["document_key"], "status": 1, "users": ["editor"]}).json() == {"error": 0}
+            with _forcesave(monkeypatch, session["document_key"]):
+                assert _save(http, session["session_id"]).json()["save_seq"] == 3
+            # A delayed earlier callback creates a new conflict while save3 owns admission.
+            with _content_origin({"/third.docx": CHANGED + b"second-conflict"}) as origin, _bind_internal(monkeypatch, origin.url):
+                (_outputs(data) / ("report (2).docx" if action == "save_as" else "report.docx")).write_bytes(CHANGED + b"agent-again")
+                assert _post(http, session, _payload(session, origin.url + "/third.docx", save_seq=2)).json() == {"error": 0}
+            _kill_resolve(data, session, action, "accepted")
+        else:
+            if transition in ("final-conflict", "closed", "new-session"):
+                assert _post(http, session, recorded_status_4_payload(document_key=session["document_key"])).json() == {"error": 0}
+            elif transition == "error":
+                assert _post(http, session, {"key": session["document_key"], "status": 3}).json() == {"error": 0}
+            if transition in ("closed", "new-session"):
+                assert _resolve(http, session, action).status_code == 200
+                if transition == "new-session":
+                    current_id = _read(data)["sessions"][session["session_id"]]["file_id"]
+                    new = _create(http, current_id)
+                    assert new.status_code == 201
+                    assert new.json()["document_key"] != session["document_key"]
+                    assert new.json()["session_id"] != session["session_id"]
+            elif transition != "error":
+                _kill_resolve(data, session, action, "accepted")
+            if transition == "epoch":
+                (data / ".office-restore-epoch").write_text("changed-with-command-inflight\n")
+        before = _read(data)
+        frozen = _snapshot(data)
+        release.set()
+        saver.join(timeout=10)
+        assert saver.response.status_code == http_status, saver.response.text
+        after = _read(data)
+        if transition != "epoch":
+            assert _snapshot(data) == frozen
+            assert after == before
+            if transition == "newer-pending":
+                assert after["sessions"][session["session_id"]]["pending_save_seq"] == 3
+        else:
+            record = after["sessions"][session["session_id"]]
+            assert (record["state"], record["reason"]) == ("orphaned", "restore_epoch_changed")
+            assert record["last_committed_seq"] == record["last_published_seq"] == 1
+            assert record["pending_save_seq"] == 2
+            assert after["receipts"] == before["receipts"] and after["journal"] == {}
+
+
+@pytest.mark.parametrize("intent", ("publish", "persist"))
+@pytest.mark.parametrize("action", ("save_as", "overwrite"))
+@pytest.mark.parametrize("error,status,reason", (
+    (errno.EIO, 500, "state_corrupt"), (errno.ENOSPC, 503, "publish_pending"),
+))
+def test_command_completion_registration_error_preserves_both_responsibilities(
+    office_world, monkeypatch, intent, action, error, status, reason,
+):
+    with _held_conflict_command(office_world, monkeypatch, intent) as (opened, saver, release):
+        http, data, _origin, _manager, broker, _original, session = opened
+        environment = _kill_resolve(data, session, action, "accepted")
+        before = _read(data)
+        revision = broker.OutputsBroker().current_revision(CHAT)
+        real_replace = os.replace
+
+        def interrupted(source, destination, *args, **kwargs):
+            result = real_replace(source, destination, *args, **kwargs)
+            if destination == "index.json":
+                raise OSError(error, "interrupted after real command-recovery registration")
+            return result
+
+        with monkeypatch.context() as boundary:
+            boundary.setattr(os, "replace", interrupted)
+            release.set()
+            saver.join(timeout=10)
+            _assert_refusal(saver.response, status, reason)
+        pending = _read(data)
+        assert pending["sessions"] == before["sessions"]
+        assert pending["receipts"] == before["receipts"]
+        entry, = pending["journal"].values()
+        assert (entry["requester"], entry["action"], entry["save_seq"]) == ("resolve", action, 1)
+        assert pending["sessions"][session["session_id"]]["pending_save_seq"] == 2
+        _fresh_resolve(environment)
+        assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+        with _content_origin({"/same.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+            payload = _late_payload(session, origin.url + "/same.docx", intent)
+            assert _post(http, session, payload).json() == {"error": 0}
+            after = _assert_resolved(data, session)
+            assert after["sessions"][session["session_id"]]["last_published_seq"] == 2
+            frozen = _snapshot(data)
+            assert _post(http, session, payload).json() == {"error": 0}
+            assert _snapshot(data) == frozen

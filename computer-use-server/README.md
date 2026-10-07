@@ -135,6 +135,20 @@ belongs to the successor, and overwrite lineage precedes later user versions.
 Status 4 on an already-published latest version advances both committed and
 published progress to its final sequence without another version or write.
 
+Nothing-new save-command completion uses the same accepted-resolve settlement
+owner before advancing progress or binding a save obligation. The command waits
+outside the chat lock; reconciliation checks its key, pending sequence, issued
+intent, lifecycle/final receipt and restore epoch under that lock, then reloads
+and rechecks authority after recovery. Either intent advances both counters when
+resolve has published the current latest version. Uncertain ownership or fencing
+returns 503 `publish_pending`, retaining the accepted resolve and pending save
+allocation without a journal tied to the old document. A later eligible callback
+can complete that save. Registration and durability errors remain explicit.
+Accepted command responses do not mutate completion state; stale responses do
+not consume newer allocations or revive ended sessions. Unknown-key completion
+still recovers prior publication before orphaning; epoch changes grant no new
+completion authority.
+
 Malformed/non-object bodies and unsupported actions return 422 `invalid_request`;
 unknown sessions return 404 `unknown_session`; other states, including
 epoch-orphaned sessions, return 409 `not_in_conflict`. Overwrite never recreates
