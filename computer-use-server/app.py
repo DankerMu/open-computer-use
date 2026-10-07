@@ -87,6 +87,9 @@ from outputs_broker import (
     StaleCursorError,
     UnstableReadError,
 )
+from office.publish import RecoveryRequiredError, SandboxStateError, recover_publications
+from office.store import StateCorruptError, StateDurabilityError
+import docker
 import skill_manager
 
 _OUTPUTS_BROKER = OutputsBroker()
@@ -109,6 +112,15 @@ def _outputs_http_error(exc: BaseException) -> HTTPException:
         status = 500
     headers = {"Retry-After": "1"} if status == 503 else None
     return HTTPException(status_code=status, detail=_GENERIC_OUTPUTS_FAILURE, headers=headers)
+
+
+def _recover_then_reconcile(chat_id: str, cursor: str | None, limit: int) -> dict:
+    """Hold one chat lock across existing Office recovery then broker reconcile."""
+    chat = sanitize_chat_id(chat_id)
+    _OUTPUTS_BROKER._assert_chat_root_safe(chat, allow_missing=True)
+    with _combined_lock(chat):
+        recover_publications(chat, allow_missing_office=True)
+        return _OUTPUTS_BROKER.reconcile(chat, cursor=cursor, limit=limit)
 
 
 def _listing_etag(payload: dict) -> str:
@@ -174,7 +186,7 @@ def _listing_files(chat_id: str, entries: list[dict]) -> list[dict]:
 
 
 def _reconcile_outputs(chat_id: str, cursor: str | None, limit: int) -> dict:
-    page = _OUTPUTS_BROKER.reconcile(chat_id, cursor=cursor, limit=limit)
+    page = _recover_then_reconcile(chat_id, cursor, limit)
     files = _listing_files(chat_id, page["entries"])
     body = {
         "chat_id": chat_id,
@@ -869,8 +881,12 @@ async def list_outputs(
         raise HTTPException(status_code=422, detail=_GENERIC_OUTPUTS_FAILURE)
     try:
         listing = await asyncio.to_thread(_reconcile_outputs, chat_id, cursor, limit)
-    except (OutputsBrokerError, OSError) as exc:
-        raise _outputs_http_error(exc) from exc
+    except (RecoveryRequiredError, SandboxStateError, docker.errors.DockerException) as exc:
+        raise _outputs_http_error(UnstableReadError(str(exc))) from exc
+    except (StateCorruptError, StateDurabilityError) as extra:
+        raise _outputs_http_error(extra) from extra
+    except (OutputsBrokerError, OSError) as extra:
+        raise _outputs_http_error(extra) from extra
     response.headers["ETag"] = listing["etag"]
     if _if_none_match_hits(if_none_match, listing["etag"]):
         return Response(

@@ -562,3 +562,180 @@ def test_describe_reads_persisted_revision_without_scan_or_index_create(tmp_path
         assert "index.json" not in detail
         assert _index(data).read_bytes() == corrupt_bytes
         running.start.assert_not_called()
+
+
+def test_listing_unknown_chat_uses_broker_cursor_without_office_tree(tmp_path):
+    with _isolated_app(tmp_path) as (_loaded, _docker_manager, _broker, data):
+        http = _client(_loaded)
+        missing = "c3d4e5f6-a7b8-9012-cdef-123456789012"
+        response = http.get(_list_url(missing), headers=_auth())
+        assert response.status_code == 200
+        body = response.json()
+        assert body["chat_id"] == missing
+        assert body["files"] == []
+        assert body["total"] == 0
+        assert body["revision"] == 0
+        assert _index(data, missing).is_file()
+        assert not (data / missing / ".ocu" / "office").exists()
+
+        unseen = "d4e5f6a7-b8c9-0123-def0-234567890123"
+        malformed = http.get(_list_url(unseen, cursor="bad"), headers=_auth())
+        assert malformed.status_code == 400
+        assert GENERIC_FAILURE in str(malformed.json()["detail"])
+        assert _index(data, unseen).is_file()
+        assert not (data / unseen / ".ocu" / "office").exists()
+
+
+def test_listing_without_office_does_not_create_office_tree(tmp_path):
+    with _isolated_app(tmp_path) as (_loaded, _docker_manager, _broker, data):
+        path = _put(data, "keep.txt", b"keep")
+        http = _client(_loaded)
+        response = http.get(_list_url(), headers=_auth())
+        assert response.status_code == 200
+        body = response.json()
+        assert [entry["path"] for entry in body["files"]] == ["keep.txt"]
+        assert body["files"][0]["size"] == len(b"keep")
+        assert path.read_bytes() == b"keep"
+        assert _index(data).is_file()
+        assert not (data / CHAT / ".ocu" / "office").exists()
+
+
+def test_listing_rename_retains_id_and_etag_auth_controls(tmp_path):
+    with _isolated_app(tmp_path) as (_loaded, _docker_manager, _broker, data):
+        old = _put(data, "report.html", b"unchanged content")
+        http = _client(_loaded)
+        first = http.get(_list_url(), headers=_auth())
+        assert first.status_code == 200
+        first_body = first.json()
+        file_id = first_body["files"][0]["file_id"]
+        etag = first.headers["ETag"]
+        old.rename(old.with_name("final.html"))
+        renamed = http.get(_list_url(), headers=_auth())
+        assert renamed.status_code == 200
+        renamed_body = renamed.json()
+        assert [entry["path"] for entry in renamed_body["files"]] == ["final.html"]
+        assert renamed_body["files"][0]["file_id"] == file_id
+        assert renamed_body["revision"] == first_body["revision"] + 1
+        assert renamed.headers["ETag"] != etag
+        matched = http.get(
+            _list_url(),
+            headers={**_auth(), "If-None-Match": renamed.headers["ETag"]},
+        )
+        assert matched.status_code == 304
+        denied = http.get(_list_url(), headers={"If-None-Match": renamed.headers["ETag"]})
+        assert denied.status_code == 401
+        second = http.get(_list_url(limit=1, cursor=f"{renamed_body['revision']}:1"), headers=_auth())
+        assert second.status_code == 400
+        assert GENERIC_FAILURE in str(second.json()["detail"])
+
+
+def test_listing_young_fence_is_503_without_index_write(tmp_path, monkeypatch):
+    with _isolated_app(tmp_path) as (loaded, _docker_manager, _broker, data):
+        from office.store import OfficeStore
+
+        _put(data, "keep.txt", b"keep")
+        http = _client(loaded)
+        baseline = http.get(_list_url(), headers=_auth())
+        assert baseline.status_code == 200
+        index_before = _index(data).read_bytes()
+        OfficeStore().update(CHAT, lambda state: None)
+        office = data / CHAT / ".ocu" / "office"
+        (office / "fence.json").write_text(
+            json.dumps({"schema_version": 1, "container_id": "cid-1", "pause_started_at": 100}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("office.publish.time.time", lambda: 104)
+        response = http.get(
+            _list_url(),
+            headers={**_auth(), "If-None-Match": "*"},
+        )
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "1"
+        assert GENERIC_FAILURE in str(response.json()["detail"])
+        assert _index(data).read_bytes() == index_before
+        assert json.loads((office / "fence.json").read_text(encoding="utf-8"))["pause_started_at"] == 100
+
+
+def test_listing_unavailable_sandbox_is_503_without_index_write(tmp_path):
+    with _isolated_app(tmp_path) as (_loaded, docker_manager, _broker, data):
+        from office.store import OfficeStore
+        import docker as docker_sdk
+
+        body = b"keep"
+        _put(data, "keep.txt", body)
+        http = _client(_loaded)
+        baseline = http.get(_list_url(), headers=_auth())
+        assert baseline.status_code == 200
+        file_id = baseline.json()["files"][0]["file_id"]
+        index_before = _index(data).read_bytes()
+        digest = hashlib.sha256(body).hexdigest()
+        store = OfficeStore()
+        store.store_version(
+            CHAT, file_id, body, source="workspace", parent=None, published=True, min_free_bytes=0,
+        )
+
+        def seed(state):
+            state["documents"][file_id].update({
+                "file_id": file_id, "type": "txt", "path": "keep.txt",
+                "published_version": 1, "published_sha256": digest,
+            })
+            state["sessions"]["sess-1"] = {
+                "session_id": "sess-1", "file_id": file_id, "document_key": "key-1",
+                "baseline_sha256": digest, "restore_epoch": None,
+                "state": "closing", "reason": None, "save_seq": 1,
+                "last_committed_seq": 1, "last_published_seq": 1,
+                "pending_close_seq": 1, "workspace_changed": False, "saved_as": None,
+            }
+            state["journal"]["pending"] = {
+                "file_id": file_id, "version": 1, "session_id": "sess-1",
+                "save_seq": 1, "requester": "final",
+            }
+
+        store.update(CHAT, seed)
+        response_obj = MagicMock(status_code=500, url="http://docker.test", reason="error")
+
+        class Engine:
+            def ping(self):
+                return True
+
+            @property
+            def containers(self):
+                raise docker_sdk.errors.APIError(
+                    "engine unavailable", response=response_obj, explanation=b"unavailable",
+                )
+
+        docker_manager._docker_client = Engine()
+        listed = http.get(
+            _list_url(),
+            headers={**_auth(), "If-None-Match": "*"},
+        )
+        assert listed.status_code == 503
+        assert listed.headers["Retry-After"] == "1"
+        assert GENERIC_FAILURE in str(listed.json()["detail"])
+        assert "/tmp/" not in str(listed.json()["detail"])
+        assert _index(data).read_bytes() == index_before
+        assert "pending" in OfficeStore().read(CHAT)["journal"]
+
+
+def test_listing_corrupt_office_state_is_500_without_index_write(tmp_path):
+    with _isolated_app(tmp_path) as (_loaded, _docker_manager, _broker, data):
+        from office.store import OfficeStore
+
+        _put(data, "keep.txt", b"keep")
+        http = _client(_loaded)
+        baseline = http.get(_list_url(), headers=_auth())
+        assert baseline.status_code == 200
+        index_before = _index(data).read_bytes()
+        OfficeStore().update(CHAT, lambda state: None)
+        state_path = data / CHAT / ".ocu" / "office" / "state.json"
+        state_path.write_bytes(b"{not-json")
+        response = http.get(
+            _list_url(),
+            headers={**_auth(), "If-None-Match": "*"},
+        )
+        assert response.status_code == 500
+        assert GENERIC_FAILURE in str(response.json()["detail"])
+        assert "/tmp/" not in str(response.json()["detail"])
+        assert "Retry-After" not in response.headers
+        assert _index(data).read_bytes() == index_before
+        assert state_path.read_bytes() == b"{not-json"

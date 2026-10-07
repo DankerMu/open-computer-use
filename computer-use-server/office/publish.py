@@ -672,14 +672,22 @@ def _recover_locked(store, broker, chat, now):
         _recover_fence(store, chat, now)
 
 
-def recover_publications(chat_id: str, now: float | None = None) -> None:
+def recover_publications(chat_id: str, now: float | None = None, *, allow_missing_office: bool = False) -> None:
     """Drive surviving obligations; uncertainty retains responsibility and raises."""
     chat = docker_manager.canonical_lock_chat_id(chat_id)
     store, broker = OfficeStore(), OutputsBroker()
     with docker_manager._combined_lock(chat, create=False) as lock:
         if lock is None:
             raise StateCorruptError("publish chat is missing or unsafe")
+        opened = store._open_tree(chat, create=False)
+        if opened is None:
+            if allow_missing_office:
+                return
+            raise StateCorruptError("publish office directory is missing")
+        for fd in reversed(opened):
+            os.close(fd)
         _recover_locked(store, broker, chat, time.time() if now is None else now)
+
 
 def _finish(store, chat, journal_id, result, entry, selected):
     def complete(state):

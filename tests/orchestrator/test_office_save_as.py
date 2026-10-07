@@ -8,13 +8,14 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import sys
 import time
 
 import pytest
 
 from tests.orchestrator._office_recorded_callbacks import recorded_status_1_payload, recorded_status_4_payload
-from tests.orchestrator._office_store import _child_env
+from tests.orchestrator._office_store import SERVER_DIR, _child_env, _stop_child, _wait_marker
 from tests.orchestrator.test_office_callback_publish import (
     CHANGED, _allocate, _autosaved, _bind_internal, _content_origin, _opened,
     _payload, _post, _read, _running, _sha,
@@ -22,9 +23,10 @@ from tests.orchestrator.test_office_callback_publish import (
 from tests.orchestrator.test_office_control_plane import _open_session
 from tests.orchestrator.test_office_session_lifecycle import _status
 from tests.orchestrator.test_office_sessions import (
-    _assert_refusal, _create, _outputs, _snapshot, _versions, office_world,
+    _assert_refusal, _create, _index_file, _office, _outputs, _put, _snapshot, _versions, office_world,
 )
-from tests.orchestrator.test_outputs_endpoint import CHAT
+from tests.orchestrator.test_outputs_endpoint import CHAT, INTERNAL, _auth
+from tests.orchestrator.test_office_router import _raw_office
 
 
 def _nested(world, name):
@@ -757,3 +759,327 @@ def test_final_copy_release_failure_keeps_completed_successor_and_owned_marker(o
     assert container.status == "paused"
     container.unpause.assert_called_once()
     assert (data / CHAT / ".ocu" / "office" / "fence.json").exists()
+
+
+def test_files_lists_new_identity_after_interrupted_equal_content_claim(office_world, monkeypatch):
+    from office import save_as
+    from office.store import OfficeStore
+
+    http, data, _origin, _manager, _broker, original, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    claim = save_as.claim_file_no_replace
+
+    def claimed_then_interrupted(*args, **kwargs):
+        claim(*args, **kwargs)
+        raise OSError("interrupted after actual no-replace claim")
+
+    with monkeypatch.context() as cut:
+        cut.setattr(save_as, "claim_file_no_replace", claimed_then_interrupted)
+        with _content_origin({"/save.docx": original}) as server, _bind_internal(cut, server.url):
+            try:
+                response = _post(http, session, _payload(session, server.url + "/save.docx", True))
+            except OSError as error:
+                assert str(error) == "interrupted after actual no-replace claim"
+            else:
+                assert response.status_code >= 500
+
+    copied = _outputs(data) / "report (2).docx"
+    assert copied.read_bytes() == original
+    before = OfficeStore().read(CHAT)
+    assert len(before["journal"]) == 1
+    staging = next(iter(before["journal"].values()))["staging"]
+    private = _office(data) / "staging"
+    witness = private / staging["witness_name"]
+    assert (witness.stat().st_dev, witness.stat().st_ino) == (copied.stat().st_dev, copied.stat().st_ino)
+    assert (private / staging["anchor_name"]).read_bytes() == original
+    listing = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listing.status_code == 200, listing.text
+    listed = next(item for item in listing.json()["files"] if item["path"] == "report (2).docx")
+    after = OfficeStore().read(CHAT)
+    record = after["sessions"][session["session_id"]]
+    assert listed["file_id"] != session["file_id"]
+    assert record["state"] == "closed"
+    assert record["file_id"] == listed["file_id"]
+    assert record["saved_as"] == {"file_id": listed["file_id"], "path": listed["path"]}
+    assert after["journal"] == {}
+    assert after["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+    new = after["documents"][listed["file_id"]]
+    assert new["path"] == "report (2).docx"
+    assert len(new["versions"]) == 1
+    assert new["versions"][0]["source"] == "conflict"
+    assert new["versions"][0]["published"] is True
+    assert sorted(path.name for path in _outputs(data).glob("report (*).docx")) == ["report (2).docx"]
+    assert copied.read_bytes() == original
+
+
+def test_files_lists_new_identity_after_interrupted_claim_matching_removed_history(
+    office_world, monkeypatch,
+):
+    from office import save_as
+    from office.store import OfficeStore
+
+    http, data, _origin, _manager, broker, _original, session = _opened(office_world)
+    notes_path = _put(data, "notes.docx", CHANGED)
+    notes_id = _index_file(broker, data, "notes.docx")
+    created = _create(http, notes_id)
+    assert created.status_code == 201
+    prior = OfficeStore().read(CHAT)
+    notes_history = prior["documents"][notes_id]
+    (_outputs(data) / "report.docx").unlink()
+    notes_path.unlink()
+    claim = save_as.claim_file_no_replace
+
+    def claimed_then_interrupted(*args, **kwargs):
+        claim(*args, **kwargs)
+        raise OSError("interrupted after actual no-replace claim")
+
+    with monkeypatch.context() as cut:
+        cut.setattr(save_as, "claim_file_no_replace", claimed_then_interrupted)
+        with _content_origin({"/save.docx": CHANGED}) as server, _bind_internal(cut, server.url):
+            try:
+                response = _post(http, session, _payload(session, server.url + "/save.docx", True))
+            except OSError as error:
+                assert str(error) == "interrupted after actual no-replace claim"
+            else:
+                assert response.status_code >= 500
+
+    copied = _outputs(data) / "report (2).docx"
+    assert copied.read_bytes() == CHANGED
+    before = OfficeStore().read(CHAT)
+    assert len(before["journal"]) == 1
+    listing = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listing.status_code == 200, listing.text
+    files = listing.json()["files"]
+    listed = next(item for item in files if item["path"] == "report (2).docx")
+    assert listed["file_id"] != session["file_id"]
+    assert listed["file_id"] != notes_id
+    assert all(item["file_id"] != notes_id for item in files)
+    after = OfficeStore().read(CHAT)
+    record = after["sessions"][session["session_id"]]
+    assert record["state"] == "closed"
+    assert record["file_id"] == listed["file_id"]
+    assert record["saved_as"] == {"file_id": listed["file_id"], "path": listed["path"]}
+    assert after["journal"] == {}
+    assert after["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+    assert after["documents"][notes_id] == notes_history
+    new = after["documents"][listed["file_id"]]
+    assert new["path"] == "report (2).docx"
+    assert len(new["versions"]) == 1
+    assert new["versions"][0]["source"] == "conflict"
+    assert new["versions"][0]["published"] is True
+    persisted = json.loads((data / CHAT / ".ocu" / "index.json").read_text(encoding="utf-8"))
+    assert notes_id in persisted["tombstones"]
+    assert persisted["tombstones"][notes_id]["path"] == "notes.docx"
+    assert persisted["tombstones"][notes_id]["hash"] == _sha(CHANGED)
+    assert persisted["active"]["report (2).docx"]["file_id"] == listed["file_id"]
+    assert sorted(path.name for path in _outputs(data).glob("*.docx")) == ["report (2).docx"]
+    assert copied.read_bytes() == CHANGED
+
+
+def test_files_first_lifespan_off_recovers_interrupted_equal_content_claim(office_world, monkeypatch):
+    from office import save_as
+    from office.store import OfficeStore
+
+    http, data, _origin, _manager, _broker, original, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    claim = save_as.claim_file_no_replace
+
+    def claimed_then_interrupted(*args, **kwargs):
+        claim(*args, **kwargs)
+        raise OSError("interrupted after actual no-replace claim")
+
+    with monkeypatch.context() as cut:
+        cut.setattr(save_as, "claim_file_no_replace", claimed_then_interrupted)
+        with _content_origin({"/save.docx": original}) as server, _bind_internal(cut, server.url):
+            try:
+                response = _post(http, session, _payload(session, server.url + "/save.docx", True))
+            except OSError as error:
+                assert str(error) == "interrupted after actual no-replace claim"
+            else:
+                assert response.status_code >= 500
+
+    before = OfficeStore().read(CHAT)
+    assert len(before["journal"]) == 1
+    status, body = _raw_office(
+        http.app,
+        f"/api/outputs/{CHAT}",
+        [(b"authorization", f"Bearer {INTERNAL}".encode())],
+    )
+    assert status == 200
+    listed = next(item for item in body["files"] if item["path"] == "report (2).docx")
+    after = OfficeStore().read(CHAT)
+    record = after["sessions"][session["session_id"]]
+    assert listed["file_id"] != session["file_id"]
+    assert record["state"] == "closed"
+    assert record["file_id"] == listed["file_id"]
+    assert record["saved_as"] == {"file_id": listed["file_id"], "path": listed["path"]}
+    assert after["journal"] == {}
+    assert after["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+
+
+def test_files_lock_excludes_second_publisher_between_recovery_and_scan(office_world, monkeypatch):
+    from office import save_as
+    from office.store import OfficeStore
+    import office.publish as publish_mod
+
+    http, data, _origin, _manager, broker, original, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    claim = save_as.claim_file_no_replace
+
+    def claimed_then_interrupted(*args, **kwargs):
+        claim(*args, **kwargs)
+        raise OSError("interrupted after actual no-replace claim")
+
+    with monkeypatch.context() as cut:
+        cut.setattr(save_as, "claim_file_no_replace", claimed_then_interrupted)
+        with _content_origin({"/save.docx": original}) as server, _bind_internal(cut, server.url):
+            try:
+                response = _post(http, session, _payload(session, server.url + "/save.docx", True))
+            except OSError as error:
+                assert str(error) == "interrupted after actual no-replace claim"
+            else:
+                assert response.status_code >= 500
+
+    before = OfficeStore().read(CHAT)
+    assert len(before["journal"]) == 1
+    entered = data.parent / "files-recovery-entered"
+    release = data.parent / "files-recovery-release"
+    contended = data.parent / "files-publisher-contended"
+    real_recover = publish_mod.recover_publications
+    recovered_index = []
+
+    def recover_then_hold(chat_id, now=None, *, allow_missing_office=False):
+        real_recover(chat_id, now=now, allow_missing_office=allow_missing_office)
+        recovered_index.append((data / CHAT / ".ocu" / "index.json").read_bytes())
+        entered.write_text("1", encoding="utf-8")
+        deadline = time.monotonic() + 10
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise AssertionError("Files recovery hold was not released")
+            time.sleep(0.005)
+
+    monkeypatch.setattr(publish_mod, "recover_publications", recover_then_hold)
+    monkeypatch.setattr("app.recover_publications", recover_then_hold)
+    outcome = {}
+
+    def list_files():
+        outcome["response"] = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+
+    holder = threading.Thread(target=list_files)
+    child = None
+    holder.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not entered.exists():
+            if time.monotonic() >= deadline or not holder.is_alive():
+                raise AssertionError(("Files did not hold after recovery", holder.is_alive(), outcome))
+            time.sleep(0.005)
+        assert holder.is_alive()
+        assert recovered_index
+        index_after_recovery = recovered_index[0]
+        child = subprocess.Popen(
+            [sys.executable, "-c", _FILES_PUBLISHER_CHILD],
+            cwd=str(SERVER_DIR),
+            env=_child_env(
+                data,
+                OCU_CONTENDED=str(contended),
+                OCU_RELEASE=str(release),
+                OCU_LOCK_DENIAL="publisher lock was granted between recovery and scan",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _wait_marker(contended, child, "second publisher did not contend for the chat flock")
+        assert child.poll() is None
+        assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_after_recovery
+        release.write_text("1", encoding="utf-8")
+        holder.join(timeout=10)
+        assert not holder.is_alive()
+        stdout, stderr = child.communicate(timeout=10)
+        assert child.returncode == 0, (stdout, stderr)
+    finally:
+        release.write_text("1", encoding="utf-8")
+        _stop_child(child)
+        holder.join(timeout=2)
+
+    listed = outcome["response"]
+    assert listed.status_code == 200, listed.text
+    copy = next(item for item in listed.json()["files"] if item["path"] == "report (2).docx")
+    after = OfficeStore().read(CHAT)
+    assert after["journal"] == {}
+    assert after["sessions"][session["session_id"]]["file_id"] == copy["file_id"]
+    assert copy["file_id"] != session["file_id"]
+    assert after["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+
+
+_FILES_PUBLISHER_CHILD = r'''
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+os.environ["DOCKER_HOST"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
+os.environ["DOCKER_SOCKET"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
+
+import docker_manager
+
+original_flock = fcntl.flock
+
+def contend_then_block(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        try:
+            original_flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            Path(os.environ["OCU_CONTENDED"]).write_text("1", encoding="utf-8")
+            return original_flock(fd, operation)
+        try:
+            original_flock(fd, fcntl.LOCK_UN)
+        finally:
+            raise AssertionError(os.environ["OCU_LOCK_DENIAL"])
+    return original_flock(fd, operation)
+
+fcntl.flock = contend_then_block
+with docker_manager._combined_lock(os.environ["OCU_CHAT"], create=False) as lock:
+    assert lock is not None
+print("acquired")
+'''
+
+
+def test_files_refuses_foreign_same_hash_substitution_without_index_write(office_world, monkeypatch):
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    original_replace = os.replace
+
+    def stop(source, destination, *args, **kwargs):
+        if destination == "index.json":
+            raise OSError(errno.EIO, "registration refused")
+        return original_replace(source, destination, *args, **kwargs)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(os, "replace", stop)
+        response, _payload_value = _final(http, session, boundary)
+    assert response.status_code == 500
+    copy = _outputs(data) / "report (2).docx"
+    foreign = data.parent / "foreign-samehash"
+    foreign.write_bytes(CHANGED)
+    foreign.replace(copy)
+    inode = copy.stat().st_ino
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    listed = http.get(
+        f"/api/outputs/{CHAT}",
+        headers={**_auth(), "If-None-Match": "*"},
+    )
+    assert listed.status_code == 503
+    assert listed.headers["Retry-After"] == "1"
+    assert "outputs listing failed" in str(listed.json()["detail"])
+    assert copy.read_bytes() == CHANGED
+    assert copy.stat().st_ino == inode
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+    assert _read(data)["journal"]
+
+

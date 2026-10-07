@@ -1446,3 +1446,22 @@ def test_unexpected_successor_failure_still_propagates_after_requested_completio
     assert [item["published"] for item in state["documents"][fixture.file_id]["versions"]] == [True, True, False]
     assert fixture.target.read_bytes() == SAVED
     assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 1
+
+
+def test_missing_office_is_corrupt_unless_peripheral_admission_noops(world):
+    from office.publish import recover_publications
+    from office.store import StateCorruptError
+
+    _store_mod, docker_manager, data = world
+    outputs = _outputs(data)
+    outputs.mkdir(parents=True)
+    (outputs / "keep.txt").write_bytes(b"keep")
+    with docker_manager._combined_lock(CHAT):
+        pass
+    before = _snapshot(data)
+    with pytest.raises(StateCorruptError, match="publish office directory is missing"):
+        recover_publications(CHAT)
+    assert _snapshot(data) == before
+    recover_publications(CHAT, allow_missing_office=True)
+    assert _snapshot(data) == before
+    assert not (data / CHAT / ".ocu" / "office").exists()
