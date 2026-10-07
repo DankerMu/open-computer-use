@@ -1062,6 +1062,10 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
         pending = store.read(chat)["journal"].get(journal_id)
         copied = pending is not None and "copy" in pending and save_as_mod.exposed(store, chat, journal_id, pending)
         result = PublishResult("interrupted" if replaced or recovering or copied else "failed", "publish_timeout")
+        if result.outcome == "failed" and pending is not None and "copy" in pending:
+            entry = save_as_mod.retire_unexposed(
+                store, chat, journal_id, pending, "publish_timeout",
+            )
     finally:
         primary = sys.exc_info()[1]
         cleanup_error = None

@@ -7,12 +7,14 @@ import errno
 import json
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import sys
 import time
 
 import pytest
+import httpx
 
 from tests.orchestrator._office_recorded_callbacks import recorded_status_1_payload, recorded_status_4_payload
 from tests.orchestrator._office_store import SERVER_DIR, _child_env, _stop_child, _wait_marker
@@ -85,6 +87,12 @@ def _copy_outcome(http, data, broker, session, path):
 
 
 EDITED = CHANGED + b"newer-workspace-edit"
+
+
+def _assert_private_reclaimed(data):
+    private = _office(data) / "staging"
+    assert not [path for path in private.iterdir() if path.is_file() and path.read_bytes() == CHANGED]
+    assert (_versions(data) / _sha(CHANGED)).read_bytes() == CHANGED
 
 
 def _interrupt_claim(monkeypatch, save_as):
@@ -757,6 +765,7 @@ def test_copy_budget_preserves_preclaim_failure_and_postclaim_recovery(office_wo
         assert state["documents"][session["file_id"]]["versions"][-1]["published"] is False
         assert not copy.exists()
         assert broker.OutputsBroker().current_revision(CHAT) == revision
+        _assert_private_reclaimed(data)
     frozen = _snapshot(data)
     assert _post(http, session, payload).json() == {"error": 0}
     assert _snapshot(data) == frozen
@@ -1326,6 +1335,7 @@ def test_stale_active_index_limit_fails_before_exposure_and_keeps_files_availabl
     assert state["documents"][session["file_id"]]["versions"][-1]["published"] is False
     listing = broker.OutputsBroker().reconcile(CHAT)
     assert listing["entries"] == []
+    _assert_private_reclaimed(data)
 
 
 def test_index_size_limit_after_claim_retires_unedited_copy(office_world, monkeypatch):
@@ -1349,6 +1359,7 @@ def test_index_size_limit_after_claim_retires_unedited_copy(office_world, monkey
     assert not state["journal"]
     assert not (_outputs(data) / "report (2).docx").exists()
     assert state["documents"][session["file_id"]]["versions"][-1]["published"] is False
+    _assert_private_reclaimed(data)
 
 
 def test_postclaim_capacity_retirement_interrupted_before_finish_converges(office_world, monkeypatch):
@@ -1382,6 +1393,7 @@ def test_postclaim_capacity_retirement_interrupted_before_finish_converges(offic
     assert record["reason"] == "index_unavailable"
     assert not state["journal"]
     assert not (_outputs(data) / "report (2).docx").exists()
+    _assert_private_reclaimed(data)
 
 
 @pytest.mark.parametrize("recovery", ("direct", "files", "files-first", "callback", "sweep"))
@@ -1562,5 +1574,538 @@ def test_retirement_interrupted_after_unlink_finishes_without_second_copy(office
     assert record["reason"] == "index_unavailable"
     assert not state["journal"]
     assert not (_outputs(data) / "report (2).docx").exists()
+    _assert_private_reclaimed(data)
 
 
+_FILES_HTTP_WORKER = r'''
+import os
+from types import SimpleNamespace
+from docker.errors import NotFound
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+import docker_manager
+def missing(identity):
+    raise NotFound(identity)
+docker_manager._docker_client = SimpleNamespace(containers=SimpleNamespace(get=missing))
+import app
+import uvicorn
+uvicorn.run(app.app, host="127.0.0.1", port=int(os.environ["OCU_PORT"]),
+            lifespan="off", log_level="warning")
+'''
+
+
+def _fresh_files(data):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    child = subprocess.Popen(
+        [sys.executable, "-c", _FILES_HTTP_WORKER], cwd=str(SERVER_DIR),
+        env=_child_env(data, OCU_PORT=str(port)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                if child.poll() is not None or time.monotonic() >= deadline:
+                    pytest.fail("fresh Files worker did not bind its HTTP socket")
+                time.sleep(0.01)
+        # Socket readiness makes no HTTP request; Files is the first request,
+        # and lifespan=off prevents sweep/startup recovery from doing its work.
+        return httpx.get(f"http://127.0.0.1:{port}/api/outputs/{CHAT}", headers=_auth(), timeout=15)
+    finally:
+        _stop_child(child)
+
+
+def _kill_worker_at(data, script, cut, session, **settings):
+    marker = data.parent / "retirement-crash-marker"
+    if marker.exists():
+        marker.unlink()
+    environment = _child_env(
+        data, COPY_CUT=cut, COPY_MARKER=str(marker), COPY_SESSION=session["session_id"], **settings,
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script], cwd=str(SERVER_DIR), env=environment,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        _wait_marker(marker, child, f"durable boundary {cut} not reached")
+        assert marker.read_text() == cut
+        child.kill()
+        child.communicate(timeout=5)
+        assert child.returncode == -9
+    finally:
+        _stop_child(child)
+    return environment
+
+
+@pytest.mark.parametrize("recovery", ("direct", "fresh-files"))
+def test_journaled_preregistration_rename_completes_same_inode_in_place(
+    office_world, monkeypatch, recovery,
+):
+    from tests.orchestrator.test_office_callback_publish import _surviving
+    from office.publish import recover_publications
+
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    with _content_origin({"/save.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+        payload = _surviving(http, data, session, monkeypatch, origin, final=True)
+    _kill_worker_at(data, _COPY_WORKER, "registration-before", session)
+    before = _read(data)
+    entry = next(iter(before["journal"].values()))
+    assert entry["copy"]["claimed_name"] == "report (2).docx"
+    assert "registered_file_id" not in entry["copy"]
+    index = json.loads((data / CHAT / ".ocu" / "index.json").read_bytes())
+    assert "report (2).docx" not in index["active"]
+    assert "revised.docx" not in index["active"]
+    claimed = _outputs(data) / "report (2).docx"
+    identity = claimed.stat().st_dev, claimed.stat().st_ino
+    witness = _office(data) / "staging" / entry["staging"]["witness_name"]
+    assert (witness.stat().st_dev, witness.stat().st_ino) == identity
+    assert witness.stat().st_nlink == 3
+    claimed.rename(_outputs(data) / "revised.docx")
+    revised = _outputs(data) / "revised.docx"
+    if recovery == "direct":
+        recover_publications(CHAT)
+        assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+    else:
+        listed = _fresh_files(data)
+        assert listed.status_code == 200, listed.text
+        assert [item["path"] for item in listed.json()["files"]] == ["revised.docx"]
+        assert listed.json()["files"][0]["file_id"] != session["file_id"]
+    state, status = _copy_outcome(http, data, broker, session, "revised.docx")
+    assert set(state["documents"]) == {session["file_id"], status["file_id"]}
+    assert state["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+    assert state["receipts"] == before["receipts"]
+    assert state["sessions"][session["session_id"]]["document_key"] == session["document_key"]
+    assert (revised.stat().st_dev, revised.stat().st_ino) == identity
+    assert revised.read_bytes() == CHANGED
+    assert sorted(path.name for path in _outputs(data).iterdir()) == ["revised.docx"]
+    _assert_private_reclaimed(data)
+    frozen = _snapshot(data)
+    assert _post(http, session, payload).json() == {"error": 0}
+    assert _snapshot(data) == frozen
+
+
+@pytest.mark.parametrize("registered_path", ("report (2).docx", "revised.docx"))
+def test_journaled_rename_refuses_registration_at_either_path(
+    office_world, monkeypatch, registered_path,
+):
+    from office.publish import RecoveryRequiredError, recover_publications
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    real_replace = os.replace
+    def stop(source, destination, *args, **kwargs):
+        if destination == "index.json":
+            raise OSError(errno.EIO, "registration refused")
+        return real_replace(source, destination, *args, **kwargs)
+    with monkeypatch.context() as boundary:
+        boundary.setattr(os, "replace", stop)
+        response, _payload_value = _final(http, session, boundary)
+    assert response.status_code == 500
+    claimed = _outputs(data) / "report (2).docx"
+    if registered_path == "report (2).docx":
+        broker.OutputsBroker().register_host_write(CHAT, registered_path)
+    claimed.rename(_outputs(data) / "revised.docx")
+    if registered_path == "revised.docx":
+        broker.OutputsBroker().register_host_write(CHAT, registered_path)
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    with pytest.raises(RecoveryRequiredError):
+        recover_publications(CHAT)
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert (_outputs(data) / "revised.docx").read_bytes() == CHANGED
+    assert _read(data)["journal"]
+
+
+@pytest.mark.parametrize("capacity", ("active-count", "index-size"))
+def test_equal_content_capacity_failures_reclaim_each_private_allocation(
+    office_world, monkeypatch, capacity,
+):
+    import office.publish as publish_mod
+    histories = {}
+    for number in range(3):
+        name = f"report-{number}.docx"
+        http, data, _origin, _manager, broker, _body, session = _nested(office_world, name)
+        cls = broker.OutputsBroker
+        index = data / CHAT / ".ocu" / "index.json"
+        if capacity == "active-count":
+            limit = len(json.loads(index.read_bytes())["active"])
+            factory = lambda: cls(max_active_files=limit)
+        else:
+            limit = index.stat().st_size + 1
+            factory = lambda: cls(max_index_size=limit)
+        (_outputs(data) / name).unlink()
+        with monkeypatch.context() as configured:
+            configured.setattr(publish_mod, "OutputsBroker", factory)
+            response, _payload_value = _final(http, session, configured)
+        assert response.status_code == 200
+        state = _read(data)
+        record = state["sessions"][session["session_id"]]
+        assert (record["state"], record["reason"]) == ("error", "index_unavailable")
+        assert not state["journal"]
+        assert list(_outputs(data).iterdir()) == []
+        assert state["documents"][session["file_id"]]["versions"][-1]["published"] is False
+        histories[session["file_id"]] = state["documents"][session["file_id"]]
+        for file_id, history in histories.items():
+            assert state["documents"][file_id] == history
+        _assert_private_reclaimed(data)
+
+
+_RETIREMENT_WORKER = r'''
+import json, os, time
+from pathlib import Path
+from types import SimpleNamespace
+from docker.errors import NotFound
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+import docker_manager
+def missing(identity):
+    raise NotFound(identity)
+docker_manager._docker_client = SimpleNamespace(containers=SimpleNamespace(get=missing))
+timeout = os.environ.get("RETIRE_PRECLAIM_TIMEOUT") == "1"
+elapsed = [0.0]
+if timeout:
+    container = SimpleNamespace(id="retirement-budget-sandbox", status="running", attrs={"State": {"Paused": False}})
+    def pause():
+        container.status, container.attrs["State"]["Paused"] = "paused", True
+    def unpause():
+        container.status, container.attrs["State"]["Paused"] = "running", False
+    container.pause, container.unpause, container.reload = pause, unpause, lambda: None
+    docker_manager._docker_client = SimpleNamespace(containers=SimpleNamespace(get=lambda identity: container))
+    monotonic = time.monotonic
+    time.monotonic = lambda: monotonic() + elapsed[0]
+import office.publish as publish
+from outputs_broker import OutputsBroker
+if os.environ.get("RETIRE_LIMIT"):
+    limit = int(os.environ["RETIRE_LIMIT"])
+    publish.OutputsBroker = lambda: OutputsBroker(max_index_size=limit)
+cut = os.environ.get("COPY_CUT", "")
+marker = Path(os.environ["COPY_MARKER"])
+def stop(point):
+    if point == cut:
+        marker.write_text(point)
+        while True:
+            time.sleep(0.02)
+real_replace, real_sync, real_unlink = os.replace, os.fsync, os.unlink
+pending = {}
+def replaced(source, destination, *args, **kwargs):
+    point = None
+    if destination == "state.json":
+        fd = os.open(source, os.O_RDONLY, dir_fd=kwargs.get("src_dir_fd"))
+        try:
+            state = json.loads(os.read(fd, 1024 * 1024))
+        finally:
+            os.close(fd)
+        entries = list(state["journal"].values())
+        if entries and entries[0].get("copy", {}).get("retained"):
+            point = "private-retirement" if entries[0].get("staging", {}).get("retired") else "retained-intent"
+    answer = real_replace(source, destination, *args, **kwargs)
+    if point:
+        pending[kwargs["dst_dir_fd"]] = point
+    if timeout and destination == "state.json" and entries and "attempt" in entries[0].get("copy", {}):
+        elapsed[0] = 6.0
+    return answer
+def synced(fd):
+    answer = real_sync(fd)
+    point = pending.pop(fd, None)
+    if point:
+        stop(point)
+    return answer
+def unlinked(name, *args, **kwargs):
+    point = "shared-unlink" if name == "report (2).docx" else (
+        "anchor-unlink" if isinstance(name, str) and name.startswith(".office-publish.") else (
+            "witness-unlink" if isinstance(name, str) and name.startswith(".publish-owner.") else ""
+        )
+    )
+    stop(point + "-before")
+    answer = real_unlink(name, *args, **kwargs)
+    stop(point + "-after")
+    return answer
+os.replace, os.fsync, os.unlink = replaced, synced, unlinked
+if timeout:
+    from office.store import OfficeStore
+    journal_id = next(iter(OfficeStore().read(os.environ["OCU_CHAT"])["journal"]))
+    publish.publish(os.environ["OCU_CHAT"], journal_id)
+else:
+    recover_now = os.environ.get("OCU_RECOVER_NOW")
+    publish.recover_publications(os.environ["OCU_CHAT"], now=None if recover_now is None else float(recover_now))
+'''
+
+
+def _pending_retirement(office_world, monkeypatch, cut):
+    from tests.orchestrator.test_office_callback_publish import _surviving
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    index = data / CHAT / ".ocu" / "index.json"
+    index_before = index.read_bytes()
+    with _content_origin({"/save.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+        _surviving(http, data, session, monkeypatch, origin, final=True)
+    environment = _kill_worker_at(
+        data, _RETIREMENT_WORKER, cut, session, RETIRE_LIMIT=str(len(index_before) + 1),
+    )
+    return http, data, broker, session, index_before, environment
+
+
+@pytest.mark.parametrize("cut", (
+    "retained-intent", "shared-unlink-before", "shared-unlink-after",
+    "private-retirement", "anchor-unlink-after", "witness-unlink-after",
+))
+def test_killed_retirement_finishes_failure_without_republication_or_private_leak(
+    office_world, monkeypatch, cut,
+):
+    http, data, broker, session, index_before, environment = _pending_retirement(office_world, monkeypatch, cut)
+    before = _read(data)
+    entry = next(iter(before["journal"].values()))
+    assert entry["copy"].get("retained") is True
+    assert entry["copy"]["retained_name"] == "report (2).docx"
+    assert "claimed_name" not in entry["copy"]
+    assert "registered_file_id" not in entry["copy"]
+    shared = _outputs(data) / "report (2).docx"
+    private = _office(data) / "staging"
+    names = [private / entry["staging"][field] for field in ("anchor_name", "witness_name")]
+    identity = entry["staging"]["device"], entry["staging"]["inode"]
+    if cut in ("retained-intent", "shared-unlink-before"):
+        # A reordered unlink-before-intent implementation fails here; an
+        # omitted intent fails above at the actual shared-unlink boundary.
+        assert shared.read_bytes() == CHANGED
+        assert (shared.stat().st_dev, shared.stat().st_ino) == identity
+        assert all(path.read_bytes() == CHANGED for path in names)
+    else:
+        assert not shared.exists()
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    # Remove the capacity restriction in the fresh process. Only durable
+    # retirement intent, not a repeated refusal, may choose terminal failure.
+    fresh = subprocess.run(
+        [sys.executable, "-c", _RETIREMENT_WORKER],
+        cwd=str(SERVER_DIR), env={**environment, "COPY_CUT": "", "RETIRE_LIMIT": ""},
+        capture_output=True, text=True, timeout=15,
+    )
+    assert fresh.returncode == 0, (fresh.stdout, fresh.stderr)
+    state = _read(data)
+    record = state["sessions"][session["session_id"]]
+    assert (record["state"], record["reason"], record["saved_as"]) == ("error", "index_unavailable", None)
+    assert record["file_id"] == session["file_id"]
+    assert state["journal"] == {}
+    assert state["documents"] == before["documents"]
+    assert state["receipts"] == before["receipts"]
+    assert list(_outputs(data).iterdir()) == []
+    assert all(not path.exists() for path in names)
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    _assert_private_reclaimed(data)
+    listing = _fresh_files(data)
+    assert listing.status_code == 200 and listing.json()["files"] == []
+
+
+@pytest.mark.parametrize("mutation", ("changed", "renamed", "foreign", "extra-link", "private-foreign"))
+def test_pending_retirement_preserves_mutated_content_and_refuses_in_fresh_files(
+    office_world, monkeypatch, mutation,
+):
+    http, data, broker, session, index_before, _environment = _pending_retirement(
+        office_world, monkeypatch, "retained-intent",
+    )
+    before = _read(data)
+    shared = _outputs(data) / "report (2).docx"
+    preserved = shared
+    body = CHANGED
+    if mutation == "changed":
+        shared.write_bytes(EDITED)
+        body = EDITED
+    elif mutation == "renamed":
+        shared.rename(_outputs(data) / "revised.docx")
+        preserved = _outputs(data) / "revised.docx"
+    elif mutation == "foreign":
+        replacement = data.parent / "foreign.docx"
+        replacement.write_bytes(CHANGED)
+        replacement.replace(shared)
+    elif mutation == "extra-link":
+        os.link(shared, data.parent / "extra.docx")
+    else:
+        entry = next(iter(before["journal"].values()))
+        preserved = _office(data) / "staging" / entry["staging"]["witness_name"]
+        replacement = data.parent / "foreign-private"
+        replacement.write_bytes(CHANGED)
+        replacement.replace(preserved)
+    identity = preserved.stat().st_dev, preserved.stat().st_ino
+    response = _fresh_files(data)
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert preserved.read_bytes() == body
+    assert (preserved.stat().st_dev, preserved.stat().st_ino) == identity
+    assert _read(data)["journal"] == before["journal"]
+    assert _read(data)["documents"] == before["documents"]
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert not (_outputs(data) / "report (3).docx").exists()
+
+
+def test_shared_absence_sync_failure_keeps_retirement_responsibility(office_world, monkeypatch):
+    from office.publish import recover_publications
+    http, data, broker, session, index_before, _environment = _pending_retirement(
+        office_world, monkeypatch, "shared-unlink-after",
+    )
+    parent = _outputs(data)
+    identity = parent.stat().st_dev, parent.stat().st_ino
+    real_sync = os.fsync
+    def refuse(fd):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == identity:
+            raise OSError(errno.EIO, "shared absence durability refused")
+        return real_sync(fd)
+    with monkeypatch.context() as boundary:
+        boundary.setattr(os, "fsync", refuse)
+        with pytest.raises(OSError):
+            recover_publications(CHAT)
+    pending = _read(data)
+    assert next(iter(pending["journal"].values()))["copy"]["retained"] is True
+    assert list(parent.iterdir()) == []
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    recover_publications(CHAT)
+    state = _read(data)
+    assert state["journal"] == {}
+    assert state["sessions"][session["session_id"]]["reason"] == "index_unavailable"
+    _assert_private_reclaimed(data)
+
+
+@pytest.mark.parametrize("mutation", ("changed-private", "foreign-private", "extra-link", "foreign-shared"))
+def test_private_retirement_replay_preserves_foreign_or_changed_remaining_links(
+    office_world, monkeypatch, mutation,
+):
+    _http, data, _broker, _session, index_before, _environment = _pending_retirement(
+        office_world, monkeypatch, "private-retirement",
+    )
+    before = _read(data)
+    entry = next(iter(before["journal"].values()))
+    assert entry["staging"]["retired"] is True
+    assert not (_outputs(data) / "report (2).docx").exists()
+    anchor = _office(data) / "staging" / entry["staging"]["anchor_name"]
+    preserved = anchor
+    body = CHANGED
+    if mutation == "changed-private":
+        anchor.write_bytes(EDITED)
+        body = EDITED
+    elif mutation == "foreign-private":
+        replacement = data.parent / "foreign-retired"
+        replacement.write_bytes(CHANGED)
+        replacement.replace(anchor)
+    elif mutation == "extra-link":
+        preserved = data.parent / "retired-extra.docx"
+        os.link(anchor, preserved)
+    else:
+        preserved = _outputs(data) / "report (2).docx"
+        preserved.write_bytes(CHANGED)
+    identity = preserved.stat().st_dev, preserved.stat().st_ino
+    response = _fresh_files(data)
+    assert response.status_code == 503
+    assert preserved.read_bytes() == body
+    assert (preserved.stat().st_dev, preserved.stat().st_ino) == identity
+    assert _read(data)["journal"] == before["journal"]
+    assert _read(data)["documents"] == before["documents"]
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+
+
+def test_journaled_registered_identity_rename_does_not_duplicate_registration(office_world, monkeypatch):
+    from tests.orchestrator.test_office_callback_publish import _surviving
+    http, data, _origin, _manager, _broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    with _content_origin({"/save.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+        _surviving(http, data, session, monkeypatch, origin, final=True)
+    _kill_worker_at(data, _COPY_WORKER, "registration-journal-after", session)
+    before = _read(data)
+    binding = next(iter(before["journal"].values()))["copy"]
+    assert binding["registered_file_id"] != session["file_id"]
+    claimed = _outputs(data) / "report (2).docx"
+    claimed.rename(_outputs(data) / "revised.docx")
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    response = _fresh_files(data)
+    assert response.status_code == 503
+    assert (_outputs(data) / "revised.docx").read_bytes() == CHANGED
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert _read(data)["journal"] == before["journal"]
+
+
+def test_full_active_index_refuses_before_unavailable_private_allocation(office_world, monkeypatch):
+    import office.publish as publish_mod
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    cls = broker.OutputsBroker
+    monkeypatch.setattr(publish_mod, "OutputsBroker", lambda: cls(max_active_files=1))
+    real_open = os.open
+    def storage_full(name, flags, *args, **kwargs):
+        if isinstance(name, str) and name.startswith(".office-publish.") and flags & os.O_CREAT:
+            raise OSError(errno.ENOSPC, "private staging allocation unavailable")
+        return real_open(name, flags, *args, **kwargs)
+    with monkeypatch.context() as filesystem:
+        filesystem.setattr(os, "open", storage_full)
+        response, _payload_value = _final(http, session, filesystem)
+    assert response.status_code == 200
+    state = _read(data)
+    record = state["sessions"][session["session_id"]]
+    assert (record["state"], record["reason"]) == ("error", "index_unavailable")
+    assert state["journal"] == {}
+    assert list(_outputs(data).iterdir()) == []
+    _assert_private_reclaimed(data)
+
+
+def test_capacity_retirement_does_not_collect_unbound_private_content(office_world, monkeypatch):
+    import office.publish as publish_mod
+    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
+    private = _office(data) / "staging"
+    private.mkdir(mode=0o700, exist_ok=True)
+    unbound = private / (".office-publish." + "a" * 32 + ".tmp")
+    unbound.write_bytes(CHANGED)
+    witness = private / (".publish-owner." + "b" * 32)
+    os.link(unbound, witness)
+    identity = unbound.stat().st_dev, unbound.stat().st_ino
+    (_outputs(data) / "report.docx").unlink()
+    cls = broker.OutputsBroker
+    index = data / CHAT / ".ocu" / "index.json"
+    monkeypatch.setattr(publish_mod, "OutputsBroker", lambda: cls(max_index_size=index.stat().st_size + 1))
+    response, _payload_value = _final(http, session, monkeypatch)
+    assert response.status_code == 200
+    assert _read(data)["journal"] == {}
+    assert _read(data)["sessions"][session["session_id"]]["reason"] == "index_unavailable"
+    assert (unbound.stat().st_dev, unbound.stat().st_ino) == identity
+    assert (witness.stat().st_dev, witness.stat().st_ino) == identity
+    assert unbound.read_bytes() == witness.read_bytes() == CHANGED
+    assert {path.name for path in private.iterdir()} == {unbound.name, witness.name}
+
+
+@pytest.mark.parametrize("cut", ("retained-intent", "private-retirement", "anchor-unlink-after", "witness-unlink-after"))
+def test_killed_preclaim_timeout_reclaims_private_content_without_publishing(
+    office_world, monkeypatch, cut,
+):
+    from tests.orchestrator.test_office_callback_publish import _surviving
+    http, data, _origin, _manager, _broker, _body, session = _opened(office_world)
+    (_outputs(data) / "report.docx").unlink()
+    with _content_origin({"/save.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+        _surviving(http, data, session, monkeypatch, origin, final=True)
+    index = data / CHAT / ".ocu" / "index.json"
+    index_before = index.read_bytes()
+    environment = _kill_worker_at(
+        data, _RETIREMENT_WORKER, cut, session, RETIRE_PRECLAIM_TIMEOUT="1",
+    )
+    before = _read(data)
+    entry = next(iter(before["journal"].values()))
+    assert entry["copy"]["retained"] is True
+    assert entry["copy"]["retained_reason"] == "publish_timeout"
+    assert "retained_name" not in entry["copy"]
+    assert "claimed_name" not in entry["copy"]
+    assert list(_outputs(data).iterdir()) == []
+    started = json.loads((_office(data) / "fence.json").read_bytes())["pause_started_at"]
+    fresh = subprocess.run(
+        [sys.executable, "-c", _RETIREMENT_WORKER], cwd=str(SERVER_DIR),
+        env={**environment, "COPY_CUT": "", "RETIRE_PRECLAIM_TIMEOUT": "",
+             "OCU_RECOVER_NOW": str(started + 5.001)},
+        capture_output=True, text=True, timeout=15,
+    )
+    assert fresh.returncode == 0, (fresh.stdout, fresh.stderr)
+    state = _read(data)
+    record = state["sessions"][session["session_id"]]
+    assert (record["state"], record["reason"], record["saved_as"]) == ("error", "publish_timeout", None)
+    assert state["journal"] == {}
+    assert state["documents"] == before["documents"]
+    assert state["receipts"] == before["receipts"]
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert list(_outputs(data).iterdir()) == []
+    _assert_private_reclaimed(data)
