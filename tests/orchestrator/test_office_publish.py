@@ -31,7 +31,7 @@ def _sha(body):
 
 @pytest.fixture(autouse=True)
 def _reload_publish(world):
-    for module in ("office.save_as", "office.publish", "office.resolution"):
+    for module in ("office.save_as", "office.publish", "office.resolution", "office.history"):
         if module in sys.modules:
             importlib.reload(sys.modules[module])
 

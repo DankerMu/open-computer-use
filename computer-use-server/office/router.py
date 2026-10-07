@@ -13,6 +13,7 @@ from auth_guard import OFFICE_PREFIX
 
 from . import config
 from .control_plane import admit_callback, serve_source
+from .history import list_versions
 from .resolution import resolve_session
 from .sessions import close_session, create_session, save_session, session_status
 
@@ -103,6 +104,12 @@ def create_office_router() -> APIRouter:
         f"{OFFICE_PREFIX}{{chat_id}}/documents/{{file_id}}/sessions",
         create_session,
         methods=["POST"],
+        include_in_schema=False,
+    )
+    router.add_api_route(
+        f"{OFFICE_PREFIX}{{chat_id}}/documents/{{file_id}}/versions",
+        list_versions,
+        methods=["GET"],
         include_in_schema=False,
     )
     router.add_api_route(

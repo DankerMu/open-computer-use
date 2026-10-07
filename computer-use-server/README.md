@@ -47,6 +47,32 @@ rewritten as a corrupt index.
 
 ### Office save and callback publication
 
+`GET /api/office/{chat}/documents/{file}/versions` returns exactly `file_id`,
+`published_version`, `open_session` and `versions`. Versions are ordered by
+ascending `number`; each contains exactly `number`, `parent`, `source`, `sha256`,
+`size`, `created_at` and `published`. Each `published` flag records historical
+publication, not the current workspace version; `published_version` is the
+current published pointer and must not be inferred from the highest flagged
+version.
+
+Any active workspace file, regardless of type, can be listed without creating
+persisted Office state. Without history, `versions` is `[]` and
+`published_version` is `null`. Without an open session, `open_session` is `null`;
+otherwise it contains exactly `session_id`, `state`, `reason` and `editor_ended`.
+`editor_ended` means a final callback receipt (status 2, 3 or 4) exists, not that
+the session has a terminal lifecycle state. Malformed, unknown, tombstoned or
+other-chat file identities return 404 `unknown_file`.
+
+Normal listing does not contact DocumentServer, read or hash workspace content,
+mutate files/history, or refresh activity/notices. On an epoch change, existing
+accepted publication obligations recover before orphaning; this can change
+files/history but creates no new publication intent and makes no DocumentServer
+request. Recovery commits before the requested file identity is re-resolved and
+its open session reselected, so a save-as session moved to a new document is not
+reported on the original. Unresolved recovery retains the obligation and returns
+503 `publish_pending`, not a successful list or fabricated orphan. Existing
+final-outcome protections described below still apply.
+
 Authenticated status 6 callbacks with recorded `publish` intent and status 2
 callbacks commit their version, receipt and publish obligation together. The
 existing fenced publisher then runs synchronously; terminal conflict or failure
