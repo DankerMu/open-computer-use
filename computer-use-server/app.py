@@ -831,11 +831,13 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
     # Return file
     # ?download=1 → force download (Content-Disposition: attachment)
     # default → serve with real MIME type (browser displays inline)
+    headers = {"Cache-Control": "no-store"}
     if download:
         return FileResponse(
             path=file_path,
             filename=file_path.name,
-            media_type="application/octet-stream"
+            media_type="application/octet-stream",
+            headers=headers,
         )
     else:
         mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
@@ -846,12 +848,11 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
             "text/xml",
             "application/xml",
         }
-        headers = None
         if isolated:
-            headers = {
+            headers.update({
                 "Content-Security-Policy": "sandbox allow-scripts allow-forms",
                 "X-Content-Type-Options": "nosniff",
-            }
+            })
         return FileResponse(
             path=file_path,
             filename=file_path.name if isolated else None,
