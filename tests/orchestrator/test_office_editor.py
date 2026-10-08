@@ -764,3 +764,23 @@ def test_queued_publish_waits_for_owned_autosave_acceptance_before_retry(tmp_pat
     assert result["actionResources"][4]["saves"] == 3
     assert all(state["reason"] is None for state in result["actionStates"])
     assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+
+
+def test_accepted_autosave_owns_retry_before_its_status_is_observed(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, actions=[
+        {"kind": "tick", "ms": 300000},
+        {"kind": "command", "command": "save"},
+        {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "status", "status": {
+            "state": "editing", "save_seq": 4, "last_committed_seq": 4, "last_published_seq": 4,
+        }},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert result["actionStates"][0]["state"] == "editing"
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
+        "persist", "publish", "publish",
+    ]
+    assert all(state["reason"] is None for state in result["actionStates"])
+    assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False

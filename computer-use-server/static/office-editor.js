@@ -235,6 +235,7 @@ export function createOfficeEditorHost({
     const requestedModification = modification;
     const command = ++latestCommand;
     const autoOwner = intent === 'publish' && autoSave && (autoSave.pending ||
+      snapshot?.save_seq < autoSave.sequence ||
       snapshot?.state === 'saving' && snapshot.save_seq === autoSave.sequence) ? autoSave : null;
     const attempt = intent === 'persist' ? { pending: true, sequence: null } : null;
     mutationEpoch++;
