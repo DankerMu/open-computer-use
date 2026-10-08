@@ -7,6 +7,7 @@
 import { html, render, useState, useEffect, useRef, useCallback } from './preact-htm.min.js';
 import { icon, fileIcon, fileIconLarge } from './icons.js';
 import { BrowserViewer } from './browser-viewer.js';
+import { createOfficeEditorHost } from './office-editor.js';
 import { t, LANG } from './locale.js';
 import {
   ocuFetch,
@@ -2469,6 +2470,21 @@ function App() {
   `;
 }
 
+function OfficeEditorApp() {
+  const container = useRef(null);
+  useEffect(() => {
+    createOfficeEditorHost({
+      chatId: CHAT_ID,
+      docserverOrigin: window.__CONFIG__.officeDocserverOrigin,
+      container: container.current,
+    });
+  }, []);
+  return html`
+    <section id="office-editor" ref=${container} aria-label="Office editor" style="display:flex;flex:1;flex-direction:column;min-height:100vh">
+      <div role="status" class="empty-state">Office editor idle</div>
+    </section>`;
+}
+
 // =============================================================================
 // Mount
 // =============================================================================
@@ -2476,9 +2492,6 @@ function App() {
 render(EMBED_MODE === 'files' ? html`<${EmbeddedFilesApp} />`
   : EMBED_MODE === 'browser' || EMBED_MODE === 'terminal'
     ? html`<${EmbeddedRuntimeApp} mode=${EMBED_MODE} />`
-    : EMBED_MODE === 'office' ? html`
-      <section id="office-editor" aria-label="Office editor" style="display:flex;flex:1;flex-direction:column;min-height:100vh">
-        <div role="status" class="empty-state">Office editor idle</div>
-      </section>`
+    : EMBED_MODE === 'office' ? html`<${OfficeEditorApp} />`
     : EMBED_MODE === 'invalid' ? html`<div class="empty-state" role="alert">Invalid preview embedding</div>`
       : html`<${App} />`, document.getElementById('app'));

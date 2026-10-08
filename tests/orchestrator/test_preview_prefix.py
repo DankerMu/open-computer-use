@@ -415,6 +415,7 @@ def test_office_embed_response_has_docserver_origin_nonce_bound_csp(prefix, monk
         scripts = re.findall(r'<script\b[^>]*\bsrc="([^"]+)"', response.text)
         scripts.extend(f"{prefix}/static/{name}" for name in (
             "preact-htm.min.js", "icons.js", "browser-viewer.js", "locale.js", "ocu-request.js",
+            "office-editor.js",
         ))
         served_scripts = [client.get(script) for script in scripts]
         assert all(script.status_code == 200 for script in served_scripts)
