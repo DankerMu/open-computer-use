@@ -23,6 +23,8 @@ const file = options.file ?? 'document-id';
 const calls = [], messages = [], scripts = [], configs = [], order = [], actionStates = [];
 const listeners = new Map(), timers = new Map();
 let timerId = 0, attempts = 0, resolveCreate, resolveSave, pendingLoad;
+let now = 0, activeStatuses = 0, maxActiveStatuses = 0, statusReads = 0;
+const heldStatuses = [];
 const clone = value => JSON.parse(JSON.stringify(value));
 const signed = {documentType:'word', document:{key:'stable-key',url:'http://private.test/office/source/ticket',fileType:'docx',permissions:{edit:true}},editorConfig:{callbackUrl:'http://private.test/office/callback/chat/session',mode:'edit',customization:{forcesave:false}},token:'signed-configuration-token'};
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
@@ -61,7 +63,7 @@ const hostWindow={location:{origin:'https://webui.test'},parent:{
     if(data.type==='ocu:office-ready'&&options.replyOnReady){dispatch(open);if(options.duplicateOnReady)dispatch({...open,generation:8});}
   }
 },addEventListener(type,listener){order.push('listener:'+type);listeners.set(type,listener);},
-  setTimeout(fn,ms){const id=++timerId;timers.set(id,{fn,ms});return id;},clearTimeout(id){timers.delete(id);}};
+  setTimeout(fn,ms){const id=++timerId;timers.set(id,{fn,ms,due:now+ms});return id;},clearTimeout(id){timers.delete(id);}};
 const open={type:'ocu:office-open',chat_id:chat,file_id:file,generation:7};
 function dispatch(data, changes={}){listeners.get('message')?.({source:hostWindow.parent,origin:hostWindow.location.origin,data,...changes});}
 const fetch=async(url,init={})=>{
@@ -69,7 +71,10 @@ const fetch=async(url,init={})=>{
   const body=init.body?JSON.parse(init.body):null;
   calls.push({url:String(url),method,headers,body});order.push('fetch:'+method);
   if(method==='POST'&&String(url).endsWith('/save')){
+    if(options.rejectSave)return response(502,{reason:'documentserver_unavailable'});
     currentStatus={...currentStatus,state:'saving',save_seq:options.nextSaveSequence??currentStatus.save_seq+1,reason:null};
+    if(options.autoCommit)currentStatus={...currentStatus,state:'editing',last_committed_seq:currentStatus.save_seq,
+      last_published_seq:options.equalPublished?currentStatus.save_seq:currentStatus.last_published_seq};
     const reply=response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,intent:body.intent});
     if(options.deferSave)return new Promise(resolve=>{resolveSave=()=>resolve(reply);});
     return reply;
@@ -81,7 +86,13 @@ const fetch=async(url,init={})=>{
     return response(options.joined?200:201,{session_id:'session-id',file_id:file,document_key:'stable-key',state:'opening',joined:Boolean(options.joined),editor_config:options.noConfig?null:clone(signed)});
   }
   if(options.statusError)return response(500,{reason:'state_corrupt'});
-  return response(200,currentStatus);
+  statusReads++; activeStatuses++; maxActiveStatuses=Math.max(maxActiveStatuses,activeStatuses);
+  const reply=response(200,currentStatus);
+  if(options.holdStatusAfter!==undefined&&statusReads>options.holdStatusAfter){
+    return new Promise(resolve=>heldStatuses.push(()=>{activeStatuses--;resolve(reply);}));
+  }
+  activeStatuses--;
+  return reply;
 };
 const context=vm.createContext({window:hostWindow,document:hostDocument,URL,Headers,fetch,console,
   setTimeout:hostWindow.setTimeout,clearTimeout:hostWindow.clearTimeout,queueMicrotask});
@@ -97,11 +108,21 @@ async function load(url){
 const module=await load('https://webui.test/tools/ocu/static/office-editor.js');await module.evaluate();
 const host=module.namespace.createOfficeEditorHost({chatId:chat,docserverOrigin:options.origin||'https://office.test:8443',container,window:hostWindow,document:hostDocument});
 const idle=()=>new Promise(resolve=>setImmediate(resolve));
+async function advance(milliseconds){
+  const end=now+milliseconds;
+  for(let count=0;count<10000;count++){
+    const next=[...timers].filter(([,timer])=>timer.due<=end).sort((a,b)=>a[1].due-b[1].due||a[0]-b[0])[0];
+    if(!next){now=end;return;}
+    const [id,timer]=next;now=timer.due;timers.delete(id);timer.fn();await idle();
+  }
+  throw new Error('Timer did not make progress');
+}
 if(options.messages){for(const row of options.messages){const data=row.data;const changes={};if(row.source)changes.source={parent:row.source==='nested'?hostWindow:hostWindow.parent};if(row.origin)changes.origin=row.origin;dispatch(data,changes);}await idle();}
 if(options.open)dispatch(open);
 await idle();
 if(resolveCreate&&options.releaseCreate){resolveCreate(response(201,{session_id:'session-id',file_id:file,document_key:'stable-key',state:'opening',joined:false,editor_config:clone(signed)}));await idle();}
-if(options.expire){for(const [id,timer] of [...timers]){timers.delete(id);timer.fn();}await idle();}
+if(options.expire)await advance(10000);
+const beforeLate=options.lateLoad?clone({calls,messages}):null;
 if(options.lateLoad){hostWindow.DocsAPI={DocEditor:class{constructor(){attempts++;}}};pendingLoad?.();await idle();}
 if(options.modify&&configs.length){for(const value of options.modify){configs[0].events.onDocumentStateChange({data:value});await idle();}}
 if(options.error&&configs.length){configs[0].events.onError({data:{errorCode:-18,errorDescription:'connection lost'}});await idle();}
@@ -112,12 +133,16 @@ for(const action of options.actions||[]){
   else if(action.kind==='command')dispatch({type:'ocu:office-command',chat_id:chat,generation:7,command:action.command});
   else if(action.kind==='snapshot'){currentStatus={...currentStatus,...action.status};host.applyStatus(clone(currentStatus));}
   else if(action.kind==='releaseSave')resolveSave();
+  else if(action.kind==='status')currentStatus={...currentStatus,...action.status};
+  else if(action.kind==='tick')await advance(action.ms);
+  else if(action.kind==='releaseStatus')heldStatuses.shift()();
   else throw new Error('Unknown test action: '+action.kind);
   await idle();
   actionStates.push(clone(messages.at(-1).data));
 }
 const dom=node=>({tag:node.tagName,text:node.textContent,hidden:node.hidden,attributes:node.attributes,children:node.children.map(dom)});
-process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,dom:dom(container)}));
+process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,
+  activeStatuses,maxActiveStatuses,beforeLate,timerDelays:[...timers.values()].map(timer=>timer.ms),dom:dom(container)}));
 """
 
 
@@ -154,7 +179,6 @@ def test_ready_reply_opens_once_with_signed_configuration(tmp_path):
                          "workspace_changed": False, "reason": None}
     assert states[-1] == {**states[0], "session_id": "session-id", "state": "editing"}
     assert result["attempts"] == 1
-    assert result["timers"] == 0
 
 
 def _open(**changes):
@@ -330,7 +354,8 @@ def test_late_api_completion_cannot_resurrect_a_timed_out_open(tmp_path):
     assert states[-1]["state"] == "error"
     assert [row["state"] for row in states].count("error") == 1
     assert result["attempts"] == 0
-    assert [row["method"] for row in result["calls"]] == ["POST", "GET"]
+    assert result["calls"] == result["beforeLate"]["calls"]
+    assert result["messages"] == result["beforeLate"]["messages"]
     assert result["timers"] == 0
 
 
@@ -371,3 +396,30 @@ def test_another_tabs_sequence_does_not_acknowledge_local_edits(tmp_path):
     ])
     assert _states(result)[-1]["dirty"] is True
     assert all(not row["url"].endswith("/save") for row in result["calls"])
+
+
+@pytest.mark.parametrize(("mode", "save_count", "dirty"), [
+    ("commit", 1, True), ("equal", 1, False), ("reject", 2, True),
+])
+def test_editing_polls_do_not_starve_autosave_or_repeat_covered_edits(tmp_path, mode, save_count, dirty):
+    result = _run(tmp_path, open=True, modify=[True], autoCommit=mode != "reject",
+                  equalPublished=mode == "equal", rejectSave=mode == "reject", actions=[
+                      {"kind": "tick", "ms": 300000}, {"kind": "tick", "ms": 300000},
+                  ])
+    saves = [row for row in result["calls"] if row["url"].endswith("/save")]
+    assert len(saves) == save_count
+    assert all(row["body"] == {"intent": "persist"} for row in saves)
+    assert _states(result)[-1]["dirty"] is dirty
+    assert result["timerDelays"].count(300000) == 1
+    assert result["maxActiveStatuses"] == 1
+    if mode == "reject":
+        assert _states(result)[-1]["state"] == "editing"
+        assert _states(result)[-1]["reason"] == "documentserver_unavailable"
+
+
+def test_status_poll_does_not_overlap_a_held_request(tmp_path):
+    result = _run(tmp_path, open=True, holdStatusAfter=1, actions=[
+        {"kind": "tick", "ms": 1000}, {"kind": "tick", "ms": 5000},
+    ])
+    assert len([row for row in result["calls"] if row["method"] == "GET"]) == 2
+    assert result["activeStatuses"] == result["maxActiveStatuses"] == 1

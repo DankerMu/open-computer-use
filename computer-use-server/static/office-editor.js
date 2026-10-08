@@ -13,6 +13,8 @@ const REFUSALS = new Map([
 ]);
 // A stalled API script must become a visible failure instead of leaving opening forever.
 const API_LOAD_TIMEOUT_MS = 10000;
+const POLL_DELAY_MS = 1000;
+const AUTO_SAVE_DELAY_MS = 5 * 60 * 1000;
 
 function loadEditorApi(origin, hostWindow, hostDocument) {
   return new Promise((resolve, reject) => {
@@ -80,6 +82,12 @@ export function createOfficeEditorHost({
   let localError = null;
   let commandReason = null;
   let lastReport = null;
+  let pollTimer = null;
+  let autoSaveTimer = null;
+  let statusFlight = null;
+  let refreshAgain = false;
+  let mutationEpoch = 0;
+  let autoSaveRequestPending = false;
 
   const final = () => refusalReason !== null || localError !== null || FINAL_STATES.has(snapshot?.state);
   const report = () => {
@@ -106,6 +114,7 @@ export function createOfficeEditorHost({
   const fail = reason => {
     if (final()) return;
     localError = reason;
+    stopTimers();
     report();
   };
   const coverModifications = () => {
@@ -124,36 +133,87 @@ export function createOfficeEditorHost({
     }
     snapshot = { ...status };
     coverModifications();
+    if (final()) stopTimers();
+    else syncAutoSave();
     report();
     return true;
   };
-  async function refreshStatus() {
-    try {
-      const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
-      const status = await response.json();
-      if (!response.ok) {
-        fail(reasonOf(status, 'session_status_failed'));
-        return false;
-      }
-      return applyStatus(status);
-    } catch {
-      fail('session_status_failed');
-      return false;
+  function stopTimers() {
+    hostWindow.clearTimeout(pollTimer);
+    hostWindow.clearTimeout(autoSaveTimer);
+    pollTimer = autoSaveTimer = null;
+  }
+
+  function syncAutoSave() {
+    if (final() || snapshot?.state !== 'editing') {
+      hostWindow.clearTimeout(autoSaveTimer);
+      autoSaveTimer = null;
+    } else if (autoSaveTimer === null) {
+      autoSaveTimer = hostWindow.setTimeout(() => {
+        autoSaveTimer = null;
+        if (!final() && snapshot?.state === 'editing' &&
+            modification > coveredModification && !autoSaveRequestPending) void save('persist');
+        syncAutoSave();
+      }, AUTO_SAVE_DELAY_MS);
     }
   }
 
-  async function save() {
+  function refreshStatus() {
+    if (!sessionId || final()) return Promise.resolve(false);
+    if (statusFlight) {
+      refreshAgain = true;
+      return statusFlight;
+    }
+    hostWindow.clearTimeout(pollTimer);
+    pollTimer = null;
+    statusFlight = (async () => {
+      let applied = false;
+      do {
+        refreshAgain = false;
+        const epoch = mutationEpoch;
+        try {
+          const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
+          const status = await response.json();
+          if (final()) return false;
+          if (epoch !== mutationEpoch) {
+            refreshAgain = true;
+            continue;
+          }
+          if (!response.ok) {
+            fail(reasonOf(status, 'session_status_failed'));
+            return false;
+          }
+          applied = applyStatus(status);
+        } catch {
+          if (epoch !== mutationEpoch) refreshAgain = true;
+          else fail('session_status_failed');
+        }
+      } while (refreshAgain && !final());
+      return applied;
+    })().finally(() => {
+      statusFlight = null;
+      if (!final()) pollTimer = hostWindow.setTimeout(() => {
+        pollTimer = null;
+        void refreshStatus();
+      }, POLL_DELAY_MS);
+    });
+    return statusFlight;
+  }
+
+  async function save(intent = 'publish') {
     if (!sessionId || final()) return;
     const requestedModification = modification;
+    mutationEpoch++;
+    if (intent === 'persist') autoSaveRequestPending = true;
     try {
       const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/save`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent: 'publish' }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent }),
       });
       const body = await response.json();
       if (!response.ok) {
         commandReason = reasonOf(body, 'save_failed');
       } else if (response.status !== 202 || body?.session_id !== sessionId ||
-          !Number.isSafeInteger(body.save_seq) || body.save_seq < 1 || body.intent !== 'publish') {
+          !Number.isSafeInteger(body.save_seq) || body.save_seq < 1 || body.intent !== intent) {
         commandReason = 'invalid_save_response';
       } else {
         commandReason = null;
@@ -163,6 +223,9 @@ export function createOfficeEditorHost({
       }
     } catch {
       commandReason = 'save_failed';
+    } finally {
+      mutationEpoch++;
+      if (intent === 'persist') autoSaveRequestPending = false;
     }
     await refreshStatus();
   }
