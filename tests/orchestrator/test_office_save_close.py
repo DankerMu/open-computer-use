@@ -382,7 +382,7 @@ def test_rejected_or_unreachable_save_retains_seq_and_returns_editing(office_wor
         with _forcesave(monkeypatch, first["document_key"], code=code, status=status) as (origin, _seen):
             response = _save(http, first["session_id"], "publish")
         hits = len(origin.requests)
-    _assert_refusal(response, 502, "documentserver_unavailable")
+    _assert_refusal(response, 502, "documentserver_unavailable", save_seq=1)
     record = _record(first["session_id"])
     assert record["state"] == "editing"
     assert record["save_seq"] == 1
@@ -427,7 +427,8 @@ def test_save_outside_editing_allocates_nothing(office_world, monkeypatch, state
     before = _snapshot(data)
     with monkeypatch.context() as env:
         env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-        _assert_refusal(_save(http, first["session_id"], "publish"), 409, "session_not_editing")
+        correlation = {"blocking_save_seq": 2} if state == "saving" else {}
+        _assert_refusal(_save(http, first["session_id"], "publish"), 409, "session_not_editing", **correlation)
     assert _snapshot(data) == before
     assert recording.hits == 0
 
@@ -608,7 +609,7 @@ def test_failed_save_never_recycles_sequence(office_world, monkeypatch):
     _file_id, first = _created(office_world, "editing")
     with monkeypatch.context() as env:
         env.setenv("OCU_OFFICE_DOCSERVER_URL", "http://127.0.0.1:9")
-        _assert_refusal(_save(http, first["session_id"], "publish"), 502, "documentserver_unavailable")
+        _assert_refusal(_save(http, first["session_id"], "publish"), 502, "documentserver_unavailable", save_seq=1)
     assert _record(first["session_id"])["save_seq"] == 1
     with _forcesave(monkeypatch, first["document_key"]) as (origin, seen):
         response = _save(http, first["session_id"], "persist")
@@ -963,7 +964,7 @@ print(json.dumps({"status": response.status_code, "body": response.json()}))
             child_response = json.loads(stdout.strip().splitlines()[-1])
             assert child.returncode == 0, stderr
             assert child_response["status"] == 409
-            assert child_response["body"] == {"reason": "session_not_editing"}
+            assert child_response["body"] == {"reason": "session_not_editing", "blocking_save_seq": 1}
             assert seen == [{"save_seq": 1, "intent": "publish"}]
             assert len(origin.requests) == 1
             record = _record(first["session_id"])
@@ -1199,7 +1200,7 @@ def test_delayed_ordinary_save_failure_preserves_live_conflict(
                     "session_id": first["session_id"], "save_seq": 1, "intent": "publish",
                 }
             else:
-                assert json.loads(saver.response.content) == {"reason": "documentserver_unavailable"}
+                assert json.loads(saver.response.content) == {"reason": "documentserver_unavailable", "save_seq": 1}
             after = _record(first["session_id"])
             expected = dict(owned)
             expected["pending_save_seq"] = None
@@ -1354,12 +1355,13 @@ def test_delayed_nothing_new_does_not_touch_completed_callback(office_world, mon
     assert recording.hits == 0
 
 
-def test_delayed_stale_save_does_not_touch_newer_real_save(office_world, monkeypatch):
+@pytest.mark.parametrize(("code", "response_status"), [(4, 202), (5, 502)])
+def test_delayed_stale_save_does_not_touch_newer_real_save(office_world, monkeypatch, code, response_status):
     http, data, recording, _docker, _broker = office_world
     from office.store import OfficeStore
     _file_id, first = _created(office_world, "editing")
     origin, seen, infos, saver, release, box = _hold_save(
-        http, monkeypatch, first, forcesave_code=4,
+        http, monkeypatch, first, forcesave_code=code,
     )
     second_release = threading.Event()
     try:
@@ -1383,7 +1385,8 @@ def test_delayed_stale_save_does_not_touch_newer_real_save(office_world, monkeyp
             assert expected["save_intents"] == {"1": "publish", "2": "persist"}
             release.set()
             saver.join(timeout=10)
-            assert saver.response.status_code == 202
+            assert saver.response.status_code == response_status
+            assert saver.response.json()["save_seq"] == 1
             assert _record(first["session_id"]) == expected
             second_release.set()
             newer.join(timeout=10)
