@@ -806,3 +806,21 @@ def test_failed_owned_autosave_keeps_queued_publication_without_covering_edits(t
     assert all(state["dirty"] for state in result["actionStates"][:5])
     assert all(state["reason"] is None for state in result["actionStates"])
     assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+
+
+@pytest.mark.parametrize("command", ["save", "close"])
+@pytest.mark.parametrize(("state", "reason"), [
+    ("conflict", "path_missing"), ("error", "state_corrupt"), ("orphaned", "editor_state_lost"),
+])
+def test_broker_failure_reason_overrides_prior_command_failure(tmp_path, command, state, reason):
+    result = _run(tmp_path, open=True, modify=[True], rejectSave=True, rejectClose=True, actions=[
+        {"kind": "command", "command": command}, {"kind": "tick", "ms": 1000},
+        {"kind": "status", "status": {"state": state, "reason": reason}},
+        {"kind": "tick", "ms": 1000},
+    ])
+    failed_command_reason = "documentserver_unavailable" if command == "save" else "storage_low"
+    assert result["actionStates"][1]["state"] == "editing"
+    assert result["actionStates"][1]["reason"] == failed_command_reason
+    assert _states(result)[-1]["state"] == state
+    assert _states(result)[-1]["reason"] == reason
+    assert _states(result)[-1]["dirty"] is True

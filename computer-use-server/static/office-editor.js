@@ -107,7 +107,9 @@ export function createOfficeEditorHost({
   const report = () => {
     if (!opened || disposed) return;
     const state = refusalReason !== null ? 'refused' : localError !== null ? 'error' : snapshot?.state || 'opening';
-    const reason = refusalReason ?? localError ?? commandReason ?? snapshot?.reason ?? null;
+    const sessionReason = state === 'conflict' || FINAL_STATES.has(state)
+      ? snapshot?.reason : commandReason ?? snapshot?.reason;
+    const reason = refusalReason ?? localError ?? sessionReason ?? null;
     const next = {
       type: 'ocu:office-state', chat_id: chatId, file_id: opened.fileId, generation: opened.generation,
       session_id: sessionId, state,
