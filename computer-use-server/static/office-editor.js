@@ -91,6 +91,8 @@ export function createOfficeEditorHost({
   let queuedPublish = null;
   let publishRequests = 0;
   let latestCommand = 0;
+  let closeRequested = false;
+  let closeAccepted = false;
 
   const final = () => refusalReason !== null || localError !== null || FINAL_STATES.has(snapshot?.state);
   const report = () => {
@@ -151,13 +153,13 @@ export function createOfficeEditorHost({
   }
 
   function syncAutoSave() {
-    if (final() || snapshot?.state !== 'editing') {
+    if (final() || closeRequested || snapshot?.state !== 'editing') {
       hostWindow.clearTimeout(autoSaveTimer);
       autoSaveTimer = null;
     } else if (autoSaveTimer === null) {
       autoSaveTimer = hostWindow.setTimeout(() => {
         autoSaveTimer = null;
-        if (!final() && snapshot?.state === 'editing' &&
+        if (!final() && !closeRequested && snapshot?.state === 'editing' &&
             modification > coveredModification && !autoSave?.pending) void save('persist');
         syncAutoSave();
       }, AUTO_SAVE_DELAY_MS);
@@ -165,7 +167,7 @@ export function createOfficeEditorHost({
   }
 
   function drainQueuedPublish() {
-    if (!queuedPublish || queuedPublish.pending || publishRequests || final()) return;
+    if (!queuedPublish || queuedPublish.pending || publishRequests || closeRequested || final()) return;
     if (queuedPublish.sequence === null) {
       queuedPublish = null;
       commandReason = 'session_not_editing';
@@ -219,7 +221,7 @@ export function createOfficeEditorHost({
   }
 
   async function save(intent = 'publish') {
-    if (!sessionId || final()) return;
+    if (!sessionId || closeRequested || final()) return;
     const requestedModification = modification;
     const command = ++latestCommand;
     const autoOwner = intent === 'publish' && autoSave && (autoSave.pending ||
@@ -233,6 +235,7 @@ export function createOfficeEditorHost({
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent }),
       });
       const body = await response.json();
+      if (final()) return;
       if (!response.ok) {
         if (command === latestCommand) {
           if (autoOwner && response.status === 409 && body?.reason === 'session_not_editing') queuedPublish = autoOwner;
@@ -249,11 +252,54 @@ export function createOfficeEditorHost({
         report();
       }
     } catch {
-      if (command === latestCommand) commandReason = 'save_failed';
+      if (!final() && command === latestCommand) commandReason = 'save_failed';
     } finally {
       mutationEpoch++;
       if (attempt) attempt.pending = false;
       else publishRequests--;
+    }
+    await refreshStatus();
+  }
+
+  function releaseEditor() {
+    const instance = editor;
+    editor = null;
+    instance?.destroyEditor();
+  }
+
+  async function close() {
+    if (!sessionId || closeRequested || final()) return;
+    closeRequested = true;
+    queuedPublish = null;
+    const command = ++latestCommand;
+    mutationEpoch++;
+    syncAutoSave();
+    try {
+      const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/close`, { method: 'POST' });
+      const body = await response.json();
+      if (final()) return;
+      if (!response.ok) {
+        commandReason = reasonOf(body, 'close_failed');
+      } else if (response.status !== 202 || body?.session_id !== sessionId ||
+          !Number.isSafeInteger(body.save_seq) || body.save_seq < 1 ||
+          !['closing', 'closed', 'conflict'].includes(body.state)) {
+        commandReason = 'invalid_close_response';
+      } else {
+        commandReason = null;
+        closeAccepted = true;
+      }
+    } catch {
+      if (!final() && command === latestCommand) commandReason = 'close_failed';
+    } finally {
+      mutationEpoch++;
+      if (!closeAccepted) closeRequested = false;
+    }
+    if (closeAccepted) {
+      try {
+        releaseEditor();
+      } catch {
+        fail('editor_release_failed');
+      }
     }
     await refreshStatus();
   }
@@ -287,7 +333,7 @@ export function createOfficeEditorHost({
       return;
     }
 
-    if (!await refreshStatus() || final()) return;
+    if (!await refreshStatus() || final() || closeAccepted) return;
     if (created.editor_config === null && snapshot.state === 'conflict') return;
     if (!created.editor_config || typeof created.editor_config !== 'object' || Array.isArray(created.editor_config)) {
       fail('editor_configuration_missing');
@@ -298,19 +344,20 @@ export function createOfficeEditorHost({
     try {
       DocEditor = await loadEditorApi(docserverOrigin, hostWindow, hostDocument);
     } catch (error) {
-      fail(error.message || 'editor_api_load_failed');
+      if (!closeAccepted) fail(error.message || 'editor_api_load_failed');
       return;
     }
-    if (final()) return;
+    if (final() || closeAccepted) return;
     const events = {
       ...created.editor_config.events,
       onDocumentStateChange(event) {
-        if (final() || event?.data !== true) return;
+        if (final() || closeAccepted || event?.data !== true) return;
         // false acknowledges delivery to DocumentServer, not a committed workspace save.
         modification++;
         report();
       },
       onError(event) {
+        if (closeAccepted) return;
         const code = event?.data?.errorCode;
         fail(Number.isInteger(code) ? `editor_error_${code}` : 'editor_error');
       },
@@ -330,8 +377,10 @@ export function createOfficeEditorHost({
     if (event.source !== hostWindow.parent || event.origin !== origin ||
         !data || typeof data !== 'object' || Array.isArray(data) || data.chat_id !== chatId) return;
     if (data.type === 'ocu:office-command') {
-      if (opened && Object.keys(data).sort().join(',') === COMMAND_KEYS &&
-          data.generation === opened.generation && data.command === 'save') void save();
+      if (opened && Object.keys(data).sort().join(',') === COMMAND_KEYS && data.generation === opened.generation) {
+        if (data.command === 'save') void save();
+        else if (data.command === 'close') void close();
+      }
       return;
     }
     if (opened || Object.keys(data).sort().join(',') !== OPEN_KEYS || data.type !== 'ocu:office-open' ||

@@ -20,9 +20,9 @@ const [directory, optionsJson] = process.argv.slice(2);
 const options = JSON.parse(optionsJson);
 const chat = options.chat;
 const file = options.file ?? 'document-id';
-const calls = [], messages = [], scripts = [], configs = [], order = [], actionStates = [];
+const calls = [], messages = [], scripts = [], configs = [], order = [], actionStates = [], actionResources = [];
 const listeners = new Map(), timers = new Map();
-let timerId = 0, attempts = 0, resolveCreate, resolveSave, pendingLoad;
+let timerId = 0, attempts = 0, destroyed = 0, resolveCreate, resolveSave, resolveClose, pendingLoad;
 let now = 0, activeStatuses = 0, maxActiveStatuses = 0, statusReads = 0;
 const heldStatuses = [];
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -47,6 +47,7 @@ function element(tag) {
               if(options.syncModified)config.events.onDocumentStateChange({data:true});
               config.events.onDocumentReady?.({});
             }
+            destroyEditor(){destroyed++;order.push('destroyEditor');}
           }};
           child.onload?.();
         });
@@ -78,6 +79,14 @@ const fetch=async(url,init={})=>{
       last_published_seq:options.equalPublished?currentStatus.save_seq:currentStatus.last_published_seq};
     const reply=response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,intent:body.intent});
     if(options.deferSave)return new Promise(resolve=>{resolveSave=()=>resolve(reply);});
+    return reply;
+  }
+  if(method==='POST'&&String(url).endsWith('/close')){
+    if(options.rejectClose)return response(503,{reason:'storage_low'});
+    currentStatus={...currentStatus,save_seq:currentStatus.save_seq+1,
+      state:currentStatus.state==='opening'?'closed':currentStatus.state==='conflict'?'conflict':'closing'};
+    const reply=response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,state:currentStatus.state});
+    if(options.deferClose)return new Promise(resolve=>{resolveClose=()=>resolve(reply);});
     return reply;
   }
   if(method==='POST'){
@@ -137,13 +146,16 @@ for(const action of options.actions||[]){
   else if(action.kind==='status')currentStatus={...currentStatus,...action.status};
   else if(action.kind==='tick')await advance(action.ms);
   else if(action.kind==='releaseStatus')heldStatuses.shift()();
+  else if(action.kind==='releaseClose')resolveClose?.();
+  else if(action.kind==='allowClose')options.rejectClose=false;
   else throw new Error('Unknown test action: '+action.kind);
   await idle();
   actionStates.push(clone(messages.at(-1).data));
+  actionResources.push({destroyed,timerDelays:[...timers.values()].map(timer=>timer.ms),calls:calls.length,messages:messages.length});
 }
 const dom=node=>({tag:node.tagName,text:node.textContent,hidden:node.hidden,attributes:node.attributes,children:node.children.map(dom)});
 process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,
-  activeStatuses,maxActiveStatuses,beforeLate,timerDelays:[...timers.values()].map(timer=>timer.ms),dom:dom(container)}));
+  activeStatuses,maxActiveStatuses,beforeLate,destroyed,actionResources,timerDelays:[...timers.values()].map(timer=>timer.ms),dom:dom(container)}));
 """
 
 
@@ -454,3 +466,45 @@ def test_another_tabs_save_refusal_is_not_an_automatic_retry(tmp_path):
     assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 1
     assert _states(result)[-1]["state"] == "editing"
     assert _states(result)[-1]["reason"] == "session_not_editing"
+
+
+def test_close_releases_editor_only_after_acceptance_and_polls_to_closed(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], deferClose=True, actions=[
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 300000},
+        {"kind": "releaseClose"},
+        {"kind": "status", "status": {"state": "closed"}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 300000},
+    ])
+    assert len([row for row in result["calls"] if row["url"].endswith("/close")]) == 1
+    assert result["actionResources"][0]["destroyed"] == 0
+    assert 300000 not in result["actionResources"][0]["timerDelays"]
+    assert result["actionResources"][1]["destroyed"] == 0
+    assert result["actionResources"][2]["destroyed"] == 1
+    assert result["actionStates"][2]["state"] == "closing"
+    assert _states(result)[-1]["state"] == "closed"
+    assert _states(result)[-1]["dirty"] is False
+    assert result["timers"] == 0
+    assert result["actionResources"][-1]["calls"] == result["actionResources"][4]["calls"]
+    assert all(not row["url"].endswith("/save") for row in result["calls"])
+
+
+def test_rejected_close_retains_editor_and_resumes_editing_timer(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], rejectClose=True, actions=[
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 3000},
+        {"kind": "allowClose"},
+        {"kind": "command", "command": "close"},
+    ])
+    assert len([row for row in result["calls"] if row["url"].endswith("/close")]) == 2
+    assert result["actionStates"][1]["state"] == "editing"
+    assert result["actionStates"][1]["dirty"] is True
+    assert result["actionStates"][1]["reason"] == "storage_low"
+    assert result["actionResources"][1]["destroyed"] == 0
+    assert result["actionResources"][1]["timerDelays"].count(300000) == 1
+    assert result["destroyed"] == 1
+    assert _states(result)[-1]["state"] == "closing"
+    assert _states(result)[-1]["reason"] is None
