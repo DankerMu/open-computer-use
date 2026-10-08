@@ -86,7 +86,11 @@ const fetch=async(url,init={})=>{
   if(method==='POST'&&String(url).endsWith('/save')){
     if(options.saveTransportError)throw new Error('save transport failed');
     if(options.rejectSave)return response(502,{reason:'documentserver_unavailable'});
-    if(currentStatus.state!=='editing')return response(409,{reason:'session_not_editing'});
+    if(currentStatus.state!=='editing'){
+      const refusal=response(409,{reason:'session_not_editing'});
+      if(options.deferPersistRefusal&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>resolve(refusal);});
+      return refusal;
+    }
     currentStatus={...currentStatus,state:'saving',save_seq:options.nextSaveSequence??currentStatus.save_seq+1,reason:null};
     if(options.deferPersistFailure&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>{
       currentStatus={...currentStatus,state:'editing'};
@@ -823,4 +827,49 @@ def test_broker_failure_reason_overrides_prior_command_failure(tmp_path, command
     assert result["actionStates"][1]["reason"] == failed_command_reason
     assert _states(result)[-1]["state"] == state
     assert _states(result)[-1]["reason"] == reason
+    assert _states(result)[-1]["dirty"] is True
+
+
+def test_pending_but_refused_autosave_cannot_own_another_tabs_retry(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], deferPersistRefusal=True, actions=[
+        {"kind": "tick", "ms": 299999},
+        {"kind": "status", "status": {"state": "saving", "save_seq": 3}},
+        {"kind": "tick", "ms": 1}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing"}},
+        {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert _states(result)[-1]["reason"] == "session_not_editing"
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("ending", ["close", "dispose"])
+def test_failed_autosave_cannot_revive_a_superseded_publication(tmp_path, ending):
+    result = _run(tmp_path, open=True, modify=[True], deferPersistFailure=True, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"} if ending == "close" else {"kind": "dispose"},
+        {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert result["destroyed"] == 1
+    if ending == "dispose":
+        assert result["actionResources"][2]["messages"] == result["actionResources"][-1]["messages"]
+        assert result["timers"] == result["listeners"] == 0
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_old_autosave_does_not_own_a_later_foreign_allocation(tmp_path, timed_out):
+    transition = [
+        {"kind": "status", "status": {"state": "editing", "reason": "save_timeout"}},
+        {"kind": "tick", "ms": 1000},
+    ] if timed_out else []
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "tick", "ms": 300000}, *transition,
+        {"kind": "status", "status": {"state": "saving", "save_seq": 4, "reason": None}},
+        {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing"}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert _states(result)[-1]["reason"] == "session_not_editing"
     assert _states(result)[-1]["dirty"] is True
