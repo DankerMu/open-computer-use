@@ -73,7 +73,9 @@ export function createOfficeEditorHost({
   let sessionId = null;
   let snapshot = null;
   let editor = null;
-  let modified = false;
+  let modification = 0;
+  let coveredModification = 0;
+  const saveCoverage = new Map();
   let refusalReason = null;
   let localError = null;
   let commandReason = null;
@@ -87,7 +89,7 @@ export function createOfficeEditorHost({
     const next = {
       type: 'ocu:office-state', chat_id: chatId, file_id: opened.fileId, generation: opened.generation,
       session_id: sessionId, state,
-      dirty: state === 'closed' ? false : state === 'conflict' || modified ||
+      dirty: state === 'closed' ? false : state === 'conflict' || modification > coveredModification ||
         Boolean(snapshot && snapshot.last_committed_seq > snapshot.last_published_seq),
       workspace_changed: snapshot?.workspace_changed ?? false, reason,
     };
@@ -106,6 +108,14 @@ export function createOfficeEditorHost({
     localError = reason;
     report();
   };
+  const coverModifications = () => {
+    for (const [sequence, generation] of saveCoverage) {
+      if (snapshot && sequence <= snapshot.last_committed_seq) {
+        coveredModification = Math.max(coveredModification, generation);
+        saveCoverage.delete(sequence);
+      }
+    }
+  };
   const applyStatus = status => {
     if (!opened || !sessionId || final()) return false;
     if (!validStatus(status, sessionId)) {
@@ -113,6 +123,7 @@ export function createOfficeEditorHost({
       return false;
     }
     snapshot = { ...status };
+    coverModifications();
     report();
     return true;
   };
@@ -133,6 +144,7 @@ export function createOfficeEditorHost({
 
   async function save() {
     if (!sessionId || final()) return;
+    const requestedModification = modification;
     try {
       const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/save`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent: 'publish' }),
@@ -145,6 +157,9 @@ export function createOfficeEditorHost({
         commandReason = 'invalid_save_response';
       } else {
         commandReason = null;
+        saveCoverage.set(body.save_seq, requestedModification);
+        coverModifications();
+        report();
       }
     } catch {
       commandReason = 'save_failed';
@@ -201,7 +216,7 @@ export function createOfficeEditorHost({
       onDocumentStateChange(event) {
         if (final() || event?.data !== true) return;
         // false acknowledges delivery to DocumentServer, not a committed workspace save.
-        modified = true;
+        modification++;
         report();
       },
       onError(event) {

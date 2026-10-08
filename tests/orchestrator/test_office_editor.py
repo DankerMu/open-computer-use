@@ -20,9 +20,9 @@ const [directory, optionsJson] = process.argv.slice(2);
 const options = JSON.parse(optionsJson);
 const chat = options.chat;
 const file = options.file ?? 'document-id';
-const calls = [], messages = [], scripts = [], configs = [], order = [];
+const calls = [], messages = [], scripts = [], configs = [], order = [], actionStates = [];
 const listeners = new Map(), timers = new Map();
-let timerId = 0, attempts = 0, resolveCreate, pendingLoad;
+let timerId = 0, attempts = 0, resolveCreate, resolveSave, pendingLoad;
 const clone = value => JSON.parse(JSON.stringify(value));
 const signed = {documentType:'word', document:{key:'stable-key',url:'http://private.test/office/source/ticket',fileType:'docx',permissions:{edit:true}},editorConfig:{callbackUrl:'http://private.test/office/callback/chat/session',mode:'edit',customization:{forcesave:false}},token:'signed-configuration-token'};
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
@@ -69,8 +69,10 @@ const fetch=async(url,init={})=>{
   const body=init.body?JSON.parse(init.body):null;
   calls.push({url:String(url),method,headers,body});order.push('fetch:'+method);
   if(method==='POST'&&String(url).endsWith('/save')){
-    currentStatus={...currentStatus,state:'saving',save_seq:currentStatus.save_seq+1,reason:null};
-    return response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,intent:body.intent});
+    currentStatus={...currentStatus,state:'saving',save_seq:options.nextSaveSequence??currentStatus.save_seq+1,reason:null};
+    const reply=response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,intent:body.intent});
+    if(options.deferSave)return new Promise(resolve=>{resolveSave=()=>resolve(reply);});
+    return reply;
   }
   if(method==='POST'){
     if(options.transportError)throw new Error('network failed');
@@ -105,8 +107,17 @@ if(options.modify&&configs.length){for(const value of options.modify){configs[0]
 if(options.error&&configs.length){configs[0].events.onError({data:{errorCode:-18,errorDescription:'connection lost'}});await idle();}
 if(options.laterStatus){for(const status of options.laterStatus){host.applyStatus({...initial,...status});await idle();}}
 if(options.after){for(const data of options.after)dispatch(data);await idle();}
+for(const action of options.actions||[]){
+  if(action.kind==='modify')configs.at(-1).events.onDocumentStateChange({data:action.value??true});
+  else if(action.kind==='command')dispatch({type:'ocu:office-command',chat_id:chat,generation:7,command:action.command});
+  else if(action.kind==='snapshot'){currentStatus={...currentStatus,...action.status};host.applyStatus(clone(currentStatus));}
+  else if(action.kind==='releaseSave')resolveSave();
+  else throw new Error('Unknown test action: '+action.kind);
+  await idle();
+  actionStates.push(clone(messages.at(-1).data));
+}
 const dom=node=>({tag:node.tagName,text:node.textContent,hidden:node.hidden,attributes:node.attributes,children:node.children.map(dom)});
-process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,dom:dom(container)}));
+process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,dom:dom(container)}));
 """
 
 
@@ -333,3 +344,30 @@ def test_parent_publish_command_does_not_acknowledge_uncommitted_edits(tmp_path)
     assert saves[0]["body"] == {"intent": "publish"}
     assert _states(result)[-1]["dirty"] is True
     assert _states(result)[-1]["state"] == "saving"
+
+
+@pytest.mark.parametrize("later_edit", [False, True])
+@pytest.mark.parametrize("commit_before_reply", [False, True])
+def test_committed_save_covers_only_its_dispatch_generation(tmp_path, later_edit, commit_before_reply):
+    actions = [{"kind": "command", "command": "save"}]
+    if later_edit:
+        actions.append({"kind": "modify"})
+    committed = {"kind": "snapshot", "status": {
+        "state": "editing", "save_seq": 9, "last_committed_seq": 9, "last_published_seq": 9,
+    }}
+    actions += ([committed, {"kind": "releaseSave"}] if commit_before_reply
+                else [{"kind": "releaseSave"}, committed])
+    result = _run(tmp_path, open=True, modify=[True], deferSave=True,
+                  nextSaveSequence=9, actions=actions)
+    assert result["actionStates"][0]["dirty"] is True
+    assert result["actionStates"][-1]["dirty"] is later_edit
+    assert _states(result)[-1]["state"] == "editing"
+    assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 1
+
+
+def test_another_tabs_sequence_does_not_acknowledge_local_edits(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "snapshot", "status": {"save_seq": 9, "last_committed_seq": 9, "last_published_seq": 9}},
+    ])
+    assert _states(result)[-1]["dirty"] is True
+    assert all(not row["url"].endswith("/save") for row in result["calls"])
