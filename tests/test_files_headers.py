@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 import sys
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -81,7 +84,7 @@ def _assert_mirror_headers(response):
     csp_values = response.headers.get_list("content-security-policy")
     assert csp_values == [SANDBOX_CSP]
     assert all("allow-same-origin" not in value for value in csp_values)
-    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers.get_list("x-content-type-options") == ["nosniff"]
 
 
 def _assert_headers_absent(response):
@@ -92,6 +95,7 @@ def _assert_headers_absent(response):
 def _assert_target_response(response, mime_type, contents, download):
     assert response.status_code == 200
     assert response.content == contents
+    assert response.headers.get_list("cache-control") == ["no-store"]
     if download:
         assert response.headers["content-type"] == "application/octet-stream"
         assert response.headers["content-disposition"].startswith("attachment;")
@@ -182,62 +186,179 @@ def test_other_xml_content_type_is_isolated(
 @pytest.mark.parametrize(
     ("filename", "mime_type", "contents"),
     (
+        (
+            "document.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            b"PK\x03\x04document output",
+        ),
         ("note.txt", "text/plain", b"plain output"),
         ("image.png", "image/png", b"\x89PNG\r\n\x1a\n"),
         ("unknown", "application/octet-stream", b"unknown output"),
     ),
 )
-def test_non_active_file_responses_remain_unheadered(
-    client, output_dir, filename, mime_type, contents
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_non_active_file_responses_have_no_isolation_headers(
+    client, output_dir, filename, mime_type, contents, download
 ):
     (output_dir / filename).write_bytes(contents)
 
-    response = client.get(_file_url(filename), headers=_auth_headers())
+    response = client.get(
+        _file_url(filename),
+        headers=_auth_headers(),
+        params={"download": 1} if download else None,
+    )
 
     assert response.status_code == 200
     assert response.content == contents
-    assert response.headers["content-type"].split(";", 1)[0] == mime_type
+    assert response.headers.get_list("cache-control") == ["no-store"]
+    if download:
+        assert response.headers["content-type"] == "application/octet-stream"
+        assert response.headers["content-disposition"] == f'attachment; filename="{filename}"'
+    else:
+        assert response.headers["content-type"].split(";", 1)[0] == mime_type
+        assert "content-disposition" not in response.headers
     _assert_headers_absent(response)
 
 
-def test_file_errors_remain_unheadered(client, output_dir):
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_inline_plain_text_replacement_is_fresh_and_no_store(client, output_dir, download):
+    filename = "note.txt"
+    original = b"first output"
+    replacement = b"fresh output"
+    assert len(original) == len(replacement)
+    target = output_dir / filename
+    target.write_bytes(original)
+    original_stat = target.stat()
+
+    first = client.get(
+        _file_url(filename),
+        headers=_auth_headers(),
+        params={"download": 1} if download else None,
+    )
+
+    assert first.status_code == 200
+    assert first.content == original
+    expected_mime = "application/octet-stream" if download else "text/plain"
+    assert first.headers["content-type"].split(";", 1)[0] == expected_mime
+    if download:
+        assert first.headers["content-disposition"] == 'attachment; filename="note.txt"'
+    else:
+        assert "content-disposition" not in first.headers
+    _assert_headers_absent(first)
+
+    staged = output_dir / "replacement.txt"
+    staged.write_bytes(replacement)
+    os.replace(staged, target)
+    os.utime(target, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    replaced_stat = target.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+
+    second = client.get(
+        _file_url(filename),
+        headers={
+            **_auth_headers(),
+            "If-None-Match": first.headers["etag"],
+            "If-Modified-Since": first.headers["last-modified"],
+        },
+        params={"download": 1} if download else None,
+    )
+
+    assert second.status_code == 200
+    assert second.content == replacement
+    assert second.headers["content-type"].split(";", 1)[0] == expected_mime
+    if download:
+        assert second.headers["content-disposition"] == 'attachment; filename="note.txt"'
+    else:
+        assert "content-disposition" not in second.headers
+    _assert_headers_absent(second)
+    assert first.headers.get_list("cache-control") == ["no-store"]
+    assert second.headers.get_list("cache-control") == ["no-store"]
+
+
+def test_file_errors_have_no_cache_or_isolation_headers(client, output_dir):
     missing = client.get(_file_url("missing.html"), headers=_auth_headers())
     denied = client.get(_file_url("missing.html"))
 
     assert missing.status_code == 404
+    assert missing.content == b'{"detail":"File not found: missing.html"}'
+    assert missing.headers["content-type"] == "application/json"
+    assert missing.headers.get_list("cache-control") == []
     _assert_headers_absent(missing)
     assert denied.status_code == 401
+    assert denied.content == b'{"detail":"Unauthorized"}'
+    assert denied.headers["content-type"] == "application/json"
+    assert denied.headers.get_list("www-authenticate") == ["Bearer"]
+    assert denied.headers.get_list("cache-control") == []
     _assert_headers_absent(denied)
 
-def test_inline_html_uses_rfc5987_filename_encoding(client, output_dir):
+
+def test_archive_keeps_zip_contents_without_cache_or_isolation_headers(client, output_dir):
+    (output_dir / "note.txt").write_bytes(b"plain output")
+    nested = output_dir / "nested"
+    nested.mkdir()
+    (nested / "active.html").write_bytes(b"<p>archived output</p>")
+
+    response = client.get(_file_url("archive"), headers=_auth_headers())
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["content-disposition"] == f"attachment; filename=chat-{CHAT}-outputs.zip"
+    assert response.headers.get_list("cache-control") == []
+    _assert_headers_absent(response)
+    with zipfile.ZipFile(BytesIO(response.content)) as archive:
+        assert sorted(archive.namelist()) == ["nested/active.html", "note.txt"]
+        assert archive.read("note.txt") == b"plain output"
+        assert archive.read("nested/active.html") == b"<p>archived output</p>"
+
+
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_inline_html_uses_rfc5987_filename_encoding(client, output_dir, download):
     chinese = "简报.html"
     quoted = 'quote"name.html'
     (output_dir / chinese).write_bytes(b"<p>chinese</p>")
     (output_dir / quoted).write_bytes(b"<p>quoted</p>")
 
-    chinese_resp = client.get(_file_url(chinese), headers=_auth_headers())
-    quoted_resp = client.get(_file_url(quoted), headers=_auth_headers())
+    params = {"download": 1} if download else None
+    chinese_resp = client.get(_file_url(chinese), headers=_auth_headers(), params=params)
+    quoted_resp = client.get(_file_url(quoted), headers=_auth_headers(), params=params)
 
     assert chinese_resp.status_code == 200
     assert quoted_resp.status_code == 200
     assert chinese_resp.content == b"<p>chinese</p>"
     assert quoted_resp.content == b"<p>quoted</p>"
-    _assert_mirror_headers(chinese_resp)
-    _assert_mirror_headers(quoted_resp)
+    assert chinese_resp.headers.get_list("cache-control") == ["no-store"]
+    assert quoted_resp.headers.get_list("cache-control") == ["no-store"]
+    if download:
+        _assert_headers_absent(chinese_resp)
+        _assert_headers_absent(quoted_resp)
+    else:
+        _assert_mirror_headers(chinese_resp)
+        _assert_mirror_headers(quoted_resp)
     chinese_disp = chinese_resp.headers["content-disposition"]
     quoted_disp = quoted_resp.headers["content-disposition"]
-    assert chinese_disp.startswith("inline;")
-    assert quoted_disp.startswith("inline;")
+    disposition = "attachment" if download else "inline"
+    assert chinese_disp.startswith(f"{disposition};")
+    assert quoted_disp.startswith(f"{disposition};")
     assert "filename*=utf-8''" in chinese_disp
     assert "%E7%AE%80%E6%8A%A5.html" in chinese_disp
     assert '"' not in chinese_disp.split("filename*=", 1)[0] or "filename*=utf-8''" in chinese_disp
     assert "filename*=utf-8''" in quoted_disp
     assert "%22" in quoted_disp
-    assert chinese_resp.headers["content-type"].startswith("text/html")
+    if download:
+        assert chinese_resp.headers["content-type"] == "application/octet-stream"
+    else:
+        assert chinese_resp.headers["content-type"].startswith("text/html")
     encoded = client.get(
         "/files/%s/%s" % (CHAT, "%E7%AE%80%E6%8A%A5.html"),
         headers=_auth_headers(),
+        params=params,
     )
     assert encoded.status_code == 200
     assert encoded.content == b"<p>chinese</p>"
-    _assert_mirror_headers(encoded)
+    assert encoded.headers.get_list("cache-control") == ["no-store"]
+    if download:
+        _assert_headers_absent(encoded)
+        assert encoded.headers["content-type"] == "application/octet-stream"
+    else:
+        _assert_mirror_headers(encoded)

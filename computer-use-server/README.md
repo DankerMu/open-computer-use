@@ -239,8 +239,10 @@ successful response or a fabricated rollback.
   `X-Content-Type-Options: nosniff`, and Starlette
   `FileResponse(..., content_disposition_type="inline", filename=...)`
   (RFC 5987 `filename*` for non-Latin-1 names). `?download=1` still forces
-  `attachment`. The SPA HTML renderer uses the same sandbox tokens on `srcdoc`
-  and `src` iframes and does not add `allow-same-origin`.
+  `attachment`. Every successful file GET, inline or forced download, carries
+  exactly one `Cache-Control: no-store` header. The SPA HTML renderer uses the
+  same sandbox tokens on `srcdoc` and `src` iframes and does not add
+  `allow-same-origin`.
 - `GET /files/{chat_id}/archive` — Download all outputs as ZIP
 - `GET /api/outputs/{chat_id}` — Authenticated broker listing: `chat_id`, `files`, `total`, `timestamp`, `revision`, `next_cursor`. Query `cursor` and `limit` (1..1000, default 100). Malformed, out-of-range, or unparseable cursors (including oversized digit runs) return 400; stale cursors return 409. The listing holds one chat lock across pending Office recovery then the ordinary broker reconcile; unavailable recovery returns 503 with `Retry-After: 1` and does not scan. `If-None-Match` uses a weak ETag over the page representation excluding `timestamp`. Each file keeps SPA `modified` seconds for one release and emits `url` as `{OCU_PUBLIC_PREFIX}/files/{chat_id}/{percent-encoded path}`.
 - `POST /api/uploads/{chat_id}/{filename}` — Upload a file into the workspace files directory (`{BASE_DATA_DIR}/{chat_id}/outputs`, mounted at `/mnt/user-data/files`)
