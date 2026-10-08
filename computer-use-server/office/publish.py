@@ -277,6 +277,36 @@ def _binding(state, journal_id):
             selected = listed[restored - 1]
         elif any(field in entry for field in ("capture_version", "capture_sha256", "capture_path")):
             raise StateCorruptError("resolve capture has no user restoration")
+    if requester == "restore":
+        if session_id is not None or entry.get("source_sha256") != selected["sha256"]:
+            raise StateCorruptError("history restore source binding is invalid")
+        if "initial_revision" in entry and (
+            type(entry["initial_revision"]) is not int or entry["initial_revision"] < 0
+        ):
+            raise StateCorruptError("restore registration revision binding is invalid")
+        if "target_path" in entry and "initial_revision" not in entry:
+            raise StateCorruptError("restore prepared registration binding is missing")
+        if "restore_version" in entry:
+            restored = entry["restore_version"]
+            if (type(restored) is not int or not number < restored <= len(listed)
+                    or listed[restored - 1]["source"] != "restore"
+                    or listed[restored - 1]["parent"] != number
+                    or listed[restored - 1]["sha256"] != selected["sha256"]
+                    or listed[restored - 1]["size"] != selected["size"]):
+                raise StateCorruptError("history restore lineage is invalid")
+            selected = listed[restored - 1]
+        captured = entry.get("capture_version")
+        if captured is not None:
+            if (type(captured) is not int or not 1 <= captured <= len(listed)
+                    or listed[captured - 1]["sha256"] != entry.get("capture_sha256")
+                    or "restore_version" not in entry):
+                raise StateCorruptError("history capture binding is invalid")
+            try:
+                workspace._parts(entry.get("capture_path"))
+            except workspace.UnsafePathError as extra:
+                raise StateCorruptError("history capture path is invalid") from extra
+        elif any(field in entry for field in ("capture_sha256", "capture_path")):
+            raise StateCorruptError("history capture binding is incomplete")
     if not isinstance(baseline, str) or not _HASH.fullmatch(baseline):
         raise StateCorruptError("publish baseline is invalid")
     _prepared_fields(entry)
@@ -748,6 +778,8 @@ def _finish(store, chat, journal_id, result, entry, selected):
                             break
                         source = document["versions"][source["parent"] - 1]
                     document["path"] = entry["target_path"]
+                if entry["requester"] == "restore":
+                    document["path"] = entry["target_path"]
                 if record is not None:
                     if record["baseline_sha256"] != selected["sha256"]:
                         record.pop("last_checked_size", None)
@@ -939,6 +971,8 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
             identity_missing = True
             result = PublishResult("conflict", "path_missing")
         except OutputsBrokerError:
+            if entry["requester"] == "restore":
+                raise
             result = PublishResult("failed", "index_unavailable")
         if "copy" in entry:
             if not writer_excluded:
@@ -1031,7 +1065,7 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
         if result is None:
             parts = workspace._parts(path)
             temporary = f".office-publish.{uuid.uuid4().hex}.tmp"
-            initial_revision = broker.current_revision(chat) if entry["requester"] == "resolve" else None
+            initial_revision = broker.current_revision(chat) if entry["requester"] in ("resolve", "restore") else None
             def prepare(working):
                 live = working["journal"][journal_id]
                 live.update(target_path=path, temporary_name=temporary)
@@ -1056,6 +1090,27 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                     raise RecoveryRequiredError("publication recovery could not exclude the writer")
                 else:
                     result = PublishResult("failed", "pause_failed")
+                    if entry["requester"] == "restore":
+                        try:
+                            fresh = os.lstat(parts[-1], dir_fd=held[-1])
+                            if not stat.S_ISREG(fresh.st_mode) or fresh.st_size > broker.max_file_size:
+                                raise workspace.UnsafePathError("restore target is not safe")
+                            _revalidate(chat, parts, held, _identity(fresh))
+                        except workspace.UnsafePathError:
+                            result = PublishResult("failed", "unsafe_path")
+                        except OSError as extra:
+                            if extra.errno not in _PATH_ERRORS:
+                                raise
+                            result = PublishResult(
+                                "conflict" if extra.errno == errno.ENOENT else "failed",
+                                "path_missing" if extra.errno == errno.ENOENT else "unsafe_path",
+                            )
+                        else:
+                            state = versions.commit_publication_lineage(
+                                store, chat, journal_id, None, None, None,
+                                min_free_bytes=sessions.config.MIN_FREE_BYTES,
+                            )
+                            entry, selected, baseline = _binding(state, journal_id)
             if writer_excluded and result is not None and result.outcome == "conflict":
                 for fd in reversed(held):
                     os.close(fd)
@@ -1082,16 +1137,18 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                     fence.checkpoint()
                     target = os.lstat(parts[-1], dir_fd=held[-1])
                     _body, digest = store.read_workspace_file(chat, path, max_bytes=broker.max_file_size)
-                    if entry["requester"] == "resolve" and entry["action"] == "overwrite":
+                    if (entry["requester"] == "restore" or
+                            entry["requester"] == "resolve" and entry["action"] == "overwrite"):
                         if ("restore_version" not in entry or digest not in (
-                                entry["capture_sha256"], entry["source_sha256"])):
+                                entry.get("capture_sha256"), entry["source_sha256"])):
                             fence.checkpoint()
-                            state = versions.commit_overwrite_lineage(
+                            state = versions.commit_publication_lineage(
                                 store, chat, journal_id, _body, digest, path,
                                 min_free_bytes=sessions.config.MIN_FREE_BYTES,
+                                initial_revision=broker.current_revision(chat) if entry["requester"] == "restore" else None,
                             )
                             entry, selected, baseline = _binding(state, journal_id)
-                        baseline = entry["capture_sha256"]
+                        baseline = entry.get("capture_sha256", digest)
                     del _body
                     fence.checkpoint()
             except workspace.FileTooLargeError:
@@ -1109,11 +1166,11 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                     raise
                 fence.checkpoint()
                 result = PublishResult("conflict", "path_missing" if exc.errno == errno.ENOENT else "baseline_mismatch")
-            if entry["requester"] == "resolve" and result is not None:
+            if entry["requester"] in ("resolve", "restore") and result is not None:
                 reason = "unsafe_path" if result.reason == "baseline_mismatch" else result.reason
                 result = PublishResult("conflict" if reason == "path_missing" else "failed", reason)
             if (result is None and digest != baseline
-                    and not ((recovering or entry["requester"] == "resolve") and digest == selected["sha256"])):
+                    and not ((recovering or entry["requester"] in ("resolve", "restore")) and digest == selected["sha256"])):
                 result = PublishResult("conflict", "baseline_mismatch")
             if (entry["requester"] == "final"
                     and result is not None
@@ -1160,7 +1217,7 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                         fence.checkpoint()
                 if result is None:
                     registered = None
-                    if entry["requester"] == "resolve" and already_replaced:
+                    if entry["requester"] in ("resolve", "restore") and already_replaced:
                         active = save_as_mod._index(broker, chat).get(path)
                         if (active is not None and active["file_id"] == entry["file_id"]
                                 and active["hash"] == selected["sha256"]
@@ -1175,8 +1232,14 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                             or registered["size"] != selected["size"]):
                         raise StateCorruptError("registered publish differs from its version")
                     result = PublishResult("published")
+    except OutputsBrokerError:
+        if entry["requester"] != "restore":
+            raise
+        pending = store.read(chat)["journal"].get(journal_id)
+        unprepared = pending is not None and "restore_version" not in pending
+        result = PublishResult("interrupted" if replaced or recovering or unprepared else "failed", "index_unavailable")
     except (versions.StorageLowError, OSError) as extra:
-        if entry["requester"] != "resolve":
+        if entry["requester"] not in ("resolve", "restore"):
             raise
         if isinstance(extra, OSError) and extra.errno != errno.ENOSPC:
             raise
@@ -1184,13 +1247,15 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
         if pending is None:
             raise
         copied = pending is not None and "copy" in pending and save_as_mod.exposed(store, chat, journal_id, pending)
-        result = PublishResult("interrupted" if replaced or recovering or copied else "failed", "storage_low")
+        unprepared_restore = pending.get("requester") == "restore" and "restore_version" not in pending
+        result = PublishResult("interrupted" if replaced or recovering or copied or unprepared_restore else "failed", "storage_low")
         if result.outcome == "failed" and pending is not None and "copy" in pending:
             entry = save_as_mod.retire_unexposed(store, chat, journal_id, pending, "storage_low")
     except _BudgetExpired:
         pending = store.read(chat)["journal"].get(journal_id)
         copied = pending is not None and "copy" in pending and save_as_mod.exposed(store, chat, journal_id, pending)
-        result = PublishResult("interrupted" if replaced or recovering or copied else "failed", "publish_timeout")
+        unprepared_restore = pending is not None and pending.get("requester") == "restore" and "restore_version" not in pending
+        result = PublishResult("interrupted" if replaced or recovering or copied or unprepared_restore else "failed", "publish_timeout")
         if result.outcome == "failed" and pending is not None and "copy" in pending:
             entry = save_as_mod.retire_unexposed(
                 store, chat, journal_id, pending, "publish_timeout",

@@ -165,10 +165,12 @@ def append_record(
     source: str,
     parent: int | None,
     published: bool,
+    *,
+    force_new: bool = False,
 ) -> dict[str, Any]:
     listed = _document_versions(state, file_id)
     current = listed[-1] if listed else None
-    if current is not None and current["sha256"] == digest:
+    if not force_new and current is not None and current["sha256"] == digest:
         if published and not current["published"]:
             current["published"] = True
         return dict(current)
@@ -187,43 +189,57 @@ def append_record(
     return selected
 
 
-def commit_overwrite_lineage(store, chat, journal_id, content, digest, path, *, min_free_bytes):
-    """Commit capture and user restore together; caller holds the canonical lock."""
+def commit_publication_lineage(store, chat, journal_id, content, digest, path, *, min_free_bytes, initial_revision=None):
+    """Prepare canonical overwrite/history lineage; None capture is the pause-failure exception."""
     state = store.read(chat)
     entry = state["journal"][journal_id]
+    history_restore = entry["requester"] == "restore"
+    if content is None and not history_restore:
+        raise StateCorruptError("only history restore admits preparation without capture")
     file_id, user_number = entry["file_id"], entry["version"]
     listed = _document_versions(state, file_id)
     user = listed[user_number - 1]
     if user["sha256"] != entry["source_sha256"]:
-        raise StateCorruptError("resolve source content changed")
+        raise StateCorruptError("publication source content changed")
     read_version_bytes(store, chat, user["sha256"])
+    if history_restore and "restore_version" in entry and (
+        content is None or digest in (entry.get("capture_sha256"), user["sha256"])
+    ):
+        return state
     known = next((item for item in listed if item["sha256"] == digest), None)
     owned_blob = False
     _require_free_space(store, chat, min_free_bytes)
-    if known is None:
-        try:
-            owned_blob = _publish_blob(store, chat, digest, content)
-        except OSError as extra:
-            raise _storage_error(extra) from extra
-    else:
-        read_version_bytes(store, chat, digest)
+    if content is not None:
+        if known is None:
+            try:
+                owned_blob = _publish_blob(store, chat, digest, content)
+            except OSError as extra:
+                raise _storage_error(extra) from extra
+        else:
+            read_version_bytes(store, chat, digest)
 
     def mutate(working):
         live = working["journal"][journal_id]
         current = _document_versions(working, file_id)
-        capture = next((item for item in current if item["sha256"] == digest), None)
-        if capture is None:
-            capture = append_record(
-                working, file_id, digest, len(content), "workspace",
-                current[-1]["number"], True,
+        if content is not None:
+            capture = next((item for item in current if item["sha256"] == digest), None)
+            if capture is None:
+                capture = append_record(
+                    working, file_id, digest, len(content), "workspace",
+                    current[-1]["number"], True,
+                )
+            live.update(capture_sha256=digest, capture_version=capture["number"], capture_path=path)
+        latest = working["documents"][file_id]["versions"][-1]
+        if history_restore and live.get("restore_version") == latest["number"]:
+            restored = latest
+        else:
+            restored = append_record(
+                working, file_id, user["sha256"], user["size"], "restore", user_number, False,
+                force_new=history_restore,
             )
-        restored = append_record(
-            working, file_id, user["sha256"], user["size"], "restore", user_number, False,
-        )
-        live.update(
-            capture_sha256=digest, capture_version=capture["number"],
-            capture_path=path, restore_version=restored["number"],
-        )
+        if history_restore and initial_revision is not None:
+            live["initial_revision"] = initial_revision
+        live["restore_version"] = restored["number"]
 
     try:
         return store.update(chat, mutate)
