@@ -17,8 +17,18 @@ const ROOT = path.resolve(__dirname, '../..');
 const STATIC = path.join(ROOT, 'computer-use-server/static');
 const CHAT = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
 let previewCaptures;
+let secretCanaries = [];
+const officeArrivals = { allowed: [], denied: [] };
+const officeStandins = Object.keys(officeArrivals).map(name => http.createServer((req, res) => {
+  officeArrivals[name].push({ path: req.url, authorization: req.headers.authorization });
+  if (req.url === '/office-script.js')
+    return respond(res, 200, 'window.__officeScriptCanary = "executed";', 'text/javascript');
+  if (req.url === '/office-frame')
+    return respond(res, 200, '<!doctype html><p id="office-frame-canary">Office frame rendered</p>', 'text/html');
+  return respond(res, 200, '{}');
+}));
 
-async function captureProductionPreviews() {
+async function captureProductionPreviews(docserverOrigin) {
   const python = process.env.OCU_PREVIEW_PYTHON ||
     (process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python') : null);
   if (!python || !path.isAbsolute(python))
@@ -29,7 +39,7 @@ async function captureProductionPreviews() {
   const output = path.join(directory, 'responses.json');
   try {
     const result = spawnSync(python,
-      [path.join(__dirname, '_preview_capture.py'), CHAT, output],
+      [path.join(__dirname, '_preview_capture.py'), CHAT, output, docserverOrigin],
       {
         cwd: ROOT,
         env: {
@@ -44,8 +54,11 @@ async function captureProductionPreviews() {
     if (result.error || result.status !== 0)
       throw new Error(`production preview capture failed (${result.error?.code || result.status}); ` +
         'OCU_PREVIEW_PYTHON must provide Python 3.12, server requirements and pytest');
-    const captures = JSON.parse(await fs.readFile(output, 'utf8'));
-    if (!Array.isArray(captures) || captures.length !== 21)
+    const captured = JSON.parse(await fs.readFile(output, 'utf8'));
+    const captures = captured.responses;
+    secretCanaries = captured.secretCanaries;
+    assert(Array.isArray(secretCanaries) && secretCanaries.length === 6);
+    if (!Array.isArray(captures) || captures.length !== 36)
       throw new Error('production preview capture omitted required prefix/mode responses');
     const byRoute = new Map();
     for (const response of captures) {
@@ -54,6 +67,13 @@ async function captureProductionPreviews() {
           !response.headers?.['content-type'])
         throw new Error(`invalid production preview capture: ${key}`);
       byRoute.set(key, response);
+    }
+    for (const prefix of ['', '/ocu', '/tools/ocu']) {
+      for (const query of ['', '?embed=files', '?embed=files&embed=files', '?embed=browser',
+        '?embed=browser&embed=browser', '?embed=terminal', '?embed=unknown', '?embed=office',
+        '?embed=office&embed=office', '?embed=office&embed=files',
+        '?embed=office&office_fixture=absent', '?embed=office&office_fixture=blank'])
+        assert(byRoute.has(prefix + query), `missing production preview capture: ${prefix}${query}`);
     }
     return byRoute;
   } finally {
@@ -224,7 +244,12 @@ const server = http.createServer(async (req, res) => {
         }
       }
       record.status = 200;
-      return respond(res, 200, await fs.readFile(filename), contentTypes[path.extname(filename)] || 'application/octet-stream');
+      const body = await fs.readFile(filename);
+      if (contentTypes[path.extname(filename)] === 'text/javascript') {
+        for (const secret of secretCanaries)
+          assert(!body.includes(secret), `served script exposed synthetic signing material: ${rel}`);
+      }
+      return respond(res, 200, body, contentTypes[path.extname(filename)] || 'application/octet-stream');
     }
     if (url.pathname === `${prefix}/preview/${CHAT}`) {
       const captured = previewCaptures?.get(prefix + url.search);
@@ -313,6 +338,7 @@ const server = http.createServer(async (req, res) => {
       <script src="/ocu/static/mammoth.browser.min.js"></script>
       <script>
         window.states=[];
+        window.frameMessages=[];
         window.expectedSelections={};
         window.beacons={};
         window.retiredFrames=new Set();
@@ -322,6 +348,7 @@ const server = http.createServer(async (req, res) => {
             window.beacons[e.data.type]={origin:e.origin, source:e.source};
           }
           const current=document.querySelector('#preview')?.contentWindow;
+          if(e.source===current) window.frameMessages.push(e.data);
           if(e.source===current && e.origin===location.origin && e.data
               && typeof e.data==='object' && typeof e.data.type==='string'
               && e.data.type.startsWith('ocu:preview-')) window.states.push(e.data);
@@ -430,14 +457,212 @@ server.on('upgrade', (req, socket, head) => {
   else acceptUpgrade({ req, socket, head });
 });
 
+async function verifyOfficeShell(browser, origin, artifacts, allowedOrigin, deniedOrigin) {
+  const context = await browser.newContext();
+  context.setDefaultTimeout(10000);
+  await context.addInitScript(() => {
+    window.__officeViolations = [];
+    document.addEventListener('securitypolicyviolation', event => window.__officeViolations.push({
+      directive: event.effectiveDirective, uri: event.blockedURI,
+    }));
+    window.__officeMessages = [];
+    window.addEventListener('message', event => {
+      if (event.source !== window) window.__officeMessages.push(event.data);
+    });
+    window.__officeMessageListeners = 0;
+    const add = window.addEventListener.bind(window);
+    window.addEventListener = (type, ...args) => {
+      if (type === 'message') window.__officeMessageListeners++;
+      return add(type, ...args);
+    };
+    window.__officeIntervals = 0;
+    const interval = window.setInterval.bind(window);
+    window.setInterval = (...args) => {
+      window.__officeIntervals++;
+      return interval(...args);
+    };
+  });
+  const page = await context.newPage();
+  const errors = [];
+  const failures = [];
+  const outbound = [];
+  const probes = [];
+  page.on('pageerror', error => errors.push({ text: String(error), pageerror: true }));
+  page.on('console', message => {
+    if (message.type() === 'error') errors.push({ text: message.text(), pageerror: false });
+  });
+  page.on('requestfailed', request => failures.push({
+    url: request.url(), failure: request.failure()?.errorText || '',
+  }));
+  page.on('request', request => outbound.push(request.url()));
+  page.on('websocket', socket => outbound.push(socket.url()));
+  const shell = () => page.frameLocator('#preview');
+  const settle = async () => {
+    await shell().locator('#app').evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await new Promise(resolve => setTimeout(resolve, 150));
+  };
+  const silent = async (start) => {
+    const nonAssets = outbound.slice(start).filter(url => {
+      const address = new URL(url);
+      return address.origin !== origin ||
+        !(/\/static\//.test(address.pathname) || address.pathname.includes(`/preview/${CHAT}`));
+    });
+    assert.deepEqual(nonAssets, [], 'Office or invalid embedding issued a request');
+    assert.deepEqual(await page.evaluate(() => window.__officeMessages), [], 'idle embedding posted a message');
+    assert.equal(await shell().locator('#app').evaluate(() => window.__officeIntervals), 0,
+      'idle embedding started a timer');
+    assert.equal(await shell().locator('#app').evaluate(() => window.__officeMessageListeners), 0,
+      'idle embedding installed a message listener');
+    assert.deepEqual(officeArrivals, { allowed: [], denied: [] }, 'idle embedding loaded DocumentServer');
+  };
+  try {
+    for (const prefix of ['', '/ocu', '/tools/ocu']) {
+      await page.goto(`${origin}/parent`);
+      const start = outbound.length;
+      await page.evaluate(prefix => window.mount('?embed=office', prefix), prefix);
+      await shell().locator('#office-editor [role="status"]').getByText('Office editor idle').waitFor();
+      assert.equal(await shell().locator('#office-editor').isVisible(), true);
+      const area = await shell().locator('#office-editor').boundingBox();
+      assert(area && area.width > 0 && area.height > 0, 'Office editor has no visible area');
+      assert.equal(await shell().locator('.view-tabs, .files-panel, .file-selector-btn, .upload-btn, .browser-panel, .terminal-panel, .cli-badge, input[type="file"]').count(), 0);
+      assert.equal(await shell().locator('#app').evaluate(() => window.__CONFIG__.officeDocserverOrigin), allowedOrigin);
+      await page.evaluate(() => window.select('doc', 0));
+      await page.waitForFunction(() => document.querySelector('#preview').contentWindow.__officeMessages
+        .some(payload => payload?.type === 'ocu:preview-select' && payload.generation === 0));
+      await settle();
+      await silent(start);
+      await page.screenshot({ path: path.join(artifacts, `office-shell-${prefix ? prefix.replaceAll('/', '-') : 'root'}.png`) });
+      await page.evaluate(() => window.retire());
+      for (const query of ['?embed=office&embed=office', '?embed=office&embed=files', '?embed=unknown',
+        '?embed=office&office_fixture=absent', '?embed=office&office_fixture=blank']) {
+        const invalidStart = outbound.length;
+        await page.evaluate(({ query, prefix }) => window.mount(query, prefix), { query, prefix });
+        await shell().getByRole('alert').getByText('Invalid preview embedding').waitFor();
+        assert.equal(await shell().locator('#office-editor').count(), 0);
+        await settle();
+        await silent(invalidStart);
+        await page.screenshot({ path: path.join(artifacts, `office-invalid-${prefix ? prefix.replaceAll('/', '-') : 'root'}-${query.replaceAll(/[^a-z]/g, '-')}.png`) });
+        await page.evaluate(() => window.retire());
+      }
+      const top = await context.newPage();
+      const topRequests = [];
+      top.on('request', request => topRequests.push(request.url()));
+      top.on('websocket', socket => topRequests.push(socket.url()));
+      top.on('pageerror', error => errors.push({ text: String(error), pageerror: true }));
+      top.on('console', message => {
+        if (message.type() === 'error') errors.push({ text: message.text(), pageerror: false });
+      });
+      top.on('requestfailed', request => failures.push({
+        url: request.url(), failure: request.failure()?.errorText || '',
+      }));
+      try {
+        await top.goto(`${origin}${prefix}/preview/${CHAT}?embed=office`);
+        await top.getByRole('alert').getByText('Invalid preview embedding').waitFor();
+        await new Promise(resolve => setTimeout(resolve, 150));
+        assert.equal(await top.locator('#office-editor').count(), 0);
+        assert.deepEqual(topRequests.filter(url => {
+          const address = new URL(url);
+          return address.origin !== origin || !(/\/static\//.test(address.pathname) ||
+            address.pathname === `${prefix}/preview/${CHAT}` || address.pathname === '/favicon.ico');
+        }), [], 'top-level Office embedding issued a request');
+        assert.deepEqual(await top.evaluate(() => window.__officeMessages), []);
+        assert.equal(await top.evaluate(() => window.__officeMessageListeners + window.__officeIntervals), 0);
+        assert.deepEqual(officeArrivals, { allowed: [], denied: [] });
+        await top.screenshot({ path: path.join(artifacts, `office-top-level-${prefix ? prefix.replaceAll('/', '-') : 'root'}.png`) });
+      } finally { await top.close(); }
+    }
+    assert.deepEqual(errors, [], 'idle or invalid Office embedding produced console errors');
+    assert.deepEqual(failures, [], 'idle or invalid Office embedding produced network failures');
+    await page.goto(`${origin}/parent`);
+    await page.evaluate(() => window.mount('?embed=office'));
+    await shell().locator('#office-editor').waitFor();
+    const positive = await shell().locator('#app').evaluate(async (_node, allowed) => {
+      const script = document.createElement('script');
+      script.src = `${allowed}/office-script.js`;
+      const loaded = new Promise((resolve, reject) => {
+        script.onload = () => resolve(window.__officeScriptCanary);
+        script.onerror = () => reject(new Error('configured script did not load'));
+      });
+      document.head.appendChild(script);
+      const frame = document.createElement('iframe');
+      frame.id = 'office-policy-frame';
+      frame.src = `${allowed}/office-frame`;
+      document.body.appendChild(frame);
+      return loaded;
+    }, allowedOrigin);
+    assert.equal(positive, 'executed', 'configured-origin script did not execute');
+    const positiveFrame = shell().frameLocator('#office-policy-frame').locator('#office-frame-canary');
+    await positiveFrame.getByText('Office frame rendered').waitFor();
+    assert.equal(await positiveFrame.isVisible(), true, 'configured-origin frame did not render');
+    assert.deepEqual(officeArrivals.allowed.map(row => row.path).sort(), ['/office-frame', '/office-script.js']);
+    assert(officeArrivals.allowed.every(row => row.authorization === undefined), 'external origin received authorization');
+    assert.deepEqual(errors, [], 'configured-origin canaries produced console errors');
+    assert.deepEqual(failures, [], 'configured-origin canaries produced network failures');
+    probes.push(
+      { url: `${deniedOrigin}/office-script.js`, directive: 'script-src-elem' },
+      { url: `${deniedOrigin}/office-frame`, directive: 'frame-src' },
+      { url: `${deniedOrigin}/office-connect`, directive: 'connect-src' },
+      { url: `${allowedOrigin}/office-connect`, directive: 'connect-src' },
+    );
+    const blocked = await shell().locator('#app').evaluate(async (_node, probes) => {
+      const script = document.createElement('script');
+      script.src = probes[0].url;
+      const deniedScript = new Promise(resolve => {
+        script.onload = () => resolve(false);
+        script.onerror = () => resolve(true);
+      });
+      document.head.appendChild(script);
+      const frame = document.createElement('iframe');
+      frame.src = probes[1].url;
+      document.body.appendChild(frame);
+      return Promise.all([deniedScript, ...probes.slice(2).map(probe => fetch(probe.url).then(() => false, () => true))]);
+    }, probes);
+    assert.deepEqual(blocked, [true, true, true], 'Office CSP admitted forbidden script or connections');
+    await page.waitForFunction(probes => {
+      const violations = document.querySelector('#preview').contentWindow.__officeViolations;
+      return probes.every(probe => violations.some(event => event.directive === probe.directive &&
+        (event.uri === probe.url || event.uri === new URL(probe.url).origin)));
+    }, probes);
+    const violations = await shell().locator('#app').evaluate(() => window.__officeViolations);
+    await waitUntil(() => probes.every(probe => errors.some(error =>
+      !error.pageerror && /content security policy/i.test(error.text) &&
+      (error.text.includes(probe.url) || probe.directive === 'frame-src' &&
+        error.text.includes(new URL(probe.url).origin) && error.text.includes('frame-src')))),
+    'correlated Office CSP console errors');
+    await settle();
+    const correlated = probe => violations.some(event => event.directive === probe.directive &&
+      (event.uri === probe.url || event.uri === new URL(probe.url).origin));
+    assert(probes.every(correlated), 'Office denial lacked a correlated CSP event');
+    assert.deepEqual(errors.filter(error => error.pageerror ||
+      !/content security policy/i.test(error.text) ||
+      !probes.some(probe => correlated(probe) &&
+        (error.text.includes(probe.url) || probe.directive === 'frame-src' &&
+          error.text.includes(new URL(probe.url).origin) && error.text.includes('frame-src')))),
+    [], 'unexpected Office browser console errors');
+    assert.deepEqual(failures.filter(failure =>
+      !probes.some(probe => probe.url === failure.url && correlated(probe)) ||
+      !(failure.failure === 'csp' || failure.failure.includes('ERR_BLOCKED_BY_CSP'))),
+    [], 'unexpected Office network failure');
+    assert.deepEqual(officeArrivals.denied, [], 'forbidden origin received a request');
+    assert.deepEqual(officeArrivals.allowed.map(row => row.path).sort(), ['/office-frame', '/office-script.js'],
+      'configured origin received a forbidden connection');
+    assert.equal(await shell().locator('#app').evaluate(() => window.__officeScriptCanary), 'executed');
+    assert.deepEqual(await page.evaluate(() => window.__officeMessages), [], 'Office shell reported policy probes');
+  } finally { await context.close(); }
+}
+
+
 async function main() {
   const artifacts = process.env.OCU_PREVIEW_ARTIFACTS || await fs.mkdtemp(path.join(os.tmpdir(), 'ocu-preview-browser-'));
   await fs.mkdir(artifacts, { recursive: true });
-  previewCaptures = await captureProductionPreviews();
+  await Promise.all(officeStandins.map(standin => new Promise(resolve => standin.listen(0, '127.0.0.1', resolve))));
+  const [allowedOrigin, deniedOrigin] = officeStandins.map(standin => `http://127.0.0.1:${standin.address().port}`);
+  previewCaptures = await captureProductionPreviews(allowedOrigin);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
   const browser = await playwright.chromium.launch({ headless: true });
   try {
+    await verifyOfficeShell(browser, origin, artifacts, allowedOrigin, deniedOrigin);
     const context = await browser.newContext();
     context.setDefaultTimeout(10000);
     const freezePollingClock = () => {
@@ -806,6 +1031,25 @@ async function main() {
     await frame().locator('#app').waitFor();
     assert.equal(await frame().locator('#app').evaluate(() => window.__heartbeatTimers.size), 0,
       'Files embedding started a runtime heartbeat');
+    const officeOpenRequests = requests.length;
+    const officeOpenStates = await page.evaluate(() => window.states.length);
+    const officeOpenMessages = await page.evaluate(() => window.frameMessages.length);
+    const officeOpenUi = await frame().locator('#app').innerHTML();
+    await frame().locator('#app').evaluate(() => {
+      window.__filesOfficeDelivered = false;
+      window.addEventListener('message', event => {
+        window.__filesOfficeDelivered = event.data?.type === 'ocu:office-open';
+      }, { once: true });
+    });
+    await page.evaluate(chat => document.querySelector('#preview').contentWindow.postMessage({
+      type: 'ocu:office-open', chat_id: chat, file_id: 'doc', version: 1, generation: 0,
+    }, location.origin), CHAT);
+    await page.waitForFunction(() => document.querySelector('#preview').contentWindow.__filesOfficeDelivered);
+    await frame().locator('#app').evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+    assert.equal(requests.length, officeOpenRequests, 'Files frame acted on Office open');
+    assert.equal(await page.evaluate(() => window.states.length), officeOpenStates, 'Files frame reported Office open');
+    assert.equal(await page.evaluate(() => window.frameMessages.length), officeOpenMessages, 'Files frame posted an Office message');
+    assert.equal(await frame().locator('#app').innerHTML(), officeOpenUi, 'Files frame changed on Office open');
     await page.evaluate(({ payload, target }) => {
       const iframe = document.createElement('iframe');
       iframe.srcdoc = `<script>parent.frames[0].postMessage(${JSON.stringify(payload)}, ${JSON.stringify(target)});parent.postMessage({type:'sibling-done'}, ${JSON.stringify(target)})<\/script>`;
@@ -2393,4 +2637,6 @@ main().catch(error => { console.error(error); process.exitCode = 1; }).finally(a
   for (const upgrade of heldUpgrades.splice(0)) upgrade.socket.destroy();
   for (const socket of activeSockets) socket.destroy();
   await new Promise(resolve => server.close(resolve));
+  for (const standin of officeStandins) standin.closeAllConnections();
+  await Promise.all(officeStandins.map(standin => new Promise(resolve => standin.close(resolve))));
 });

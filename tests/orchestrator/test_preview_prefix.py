@@ -8,6 +8,9 @@ Expected URLs are the ocu-public-prefix spec literals.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -372,6 +375,198 @@ def test_runtime_embed_response_has_scoped_nonce_bound_csp(mode, prefix):
         runtime.text,
     ), f"{mode} configuration script did not use its response nonce"
     assert f"'nonce-{nonce.group(1)}'" not in another_runtime.headers["content-security-policy"]
+
+
+
+@pytest.mark.parametrize("prefix", ("", "/ocu", "/tools/ocu"))
+def test_office_embed_response_has_docserver_origin_nonce_bound_csp(prefix, monkeypatch):
+    docserver_origin = "https://docserver.office.test:8443"
+    jwt_secret = "ocu-preview-office-jwt-secret-canary"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ocu-preview-model-key-canary")
+    with _isolated_app(prefix) as loaded:
+        from office.config import (
+            OCU_OFFICE_DOCSERVER_ORIGIN,
+            OCU_OFFICE_DOCSERVER_URL,
+            OCU_OFFICE_JWT_SECRET,
+            OCU_OFFICE_SELF_URL,
+        )
+
+        os.environ.update(
+            {
+                OCU_OFFICE_DOCSERVER_URL: "http://docserver-internal.office.test:8080/",
+                OCU_OFFICE_DOCSERVER_ORIGIN: docserver_origin,
+                OCU_OFFICE_SELF_URL: "http://ocu-internal.office.test:8081",
+                OCU_OFFICE_JWT_SECRET: jwt_secret,
+            }
+        )
+        ticket_key = hmac.new(INTERNAL.encode(), b"ocu-office-source-ticket", hashlib.sha256).digest()
+        secret_canaries = (
+            INTERNAL, MCP_KEY, jwt_secret, os.environ["ANTHROPIC_API_KEY"],
+            ticket_key.hex(), base64.urlsafe_b64encode(ticket_key).decode().rstrip("="),
+        )
+        client = _client(loaded)
+        authorization = {"Authorization": f"Bearer {INTERNAL}"}
+        response = client.get(
+            f"/preview/{CHAT}", params={"embed": "office"}, headers=authorization
+        )
+        another_response = client.get(
+            f"/preview/{CHAT}", params={"embed": "office"}, headers=authorization
+        )
+        scripts = re.findall(r'<script\b[^>]*\bsrc="([^"]+)"', response.text)
+        scripts.extend(f"{prefix}/static/{name}" for name in (
+            "preact-htm.min.js", "icons.js", "browser-viewer.js", "locale.js", "ocu-request.js",
+        ))
+        served_scripts = [client.get(script) for script in scripts]
+        assert all(script.status_code == 200 for script in served_scripts)
+        for script in served_scripts:
+            for secret in secret_canaries:
+                assert secret not in script.text
+
+    nonces = []
+    for office in (response, another_response):
+        assert office.status_code == 200
+        policy = office.headers.get("content-security-policy")
+        assert policy, "Office embedding has no response content policy"
+        parts = [part.split() for part in policy.split(";") if part.strip()]
+        directives = {part[0]: set(part[1:]) for part in parts}
+        assert len(parts) == len(directives), "Office policy repeats a directive"
+        nonce = re.search(r"'nonce-([A-Za-z0-9+/_=-]+)'", policy)
+        assert nonce, "Office embedding has no nonce-bound scripts"
+        assert directives == {
+            "default-src": {"'none'"},
+            "script-src": {"'self'", f"'nonce-{nonce.group(1)}'", docserver_origin},
+            "style-src": {"'self'", "'unsafe-inline'"},
+            "img-src": {"'self'", "data:", "blob:"},
+            "font-src": {"'self'", "data:"},
+            "connect-src": {"'self'"},
+            "frame-src": {docserver_origin},
+            "base-uri": {"'none'"},
+            "object-src": {"'none'"},
+            "form-action": {"'none'"},
+            "frame-ancestors": {"'self'"},
+        }
+        assert re.search(
+            rf'<script\b[^>]*\bnonce="{re.escape(nonce.group(1))}"[^>]*>\s*window\.__CONFIG__',
+            office.text,
+        ), "Office configuration script did not use its response nonce"
+        assert _field(office.text, "officeDocserverOrigin") == docserver_origin
+        assert set(re.findall(r"^\s*(\w+):", office.text, re.MULTILINE)) == {
+            "apiUrl", "filesBase", "chatId", "describeUrl", "officeDocserverOrigin",
+        }
+        for secret in secret_canaries:
+            assert secret not in office.text
+            assert secret not in policy
+        nonces.append(nonce.group(1))
+    assert nonces[0] != nonces[1], "Office responses reused their configuration nonce"
+
+
+@pytest.mark.parametrize("prefix", ("", "/ocu", "/tools/ocu"))
+def test_office_configuration_does_not_change_other_preview_responses(prefix):
+    queries = ("", "?embed=files", "?embed=browser", "?embed=terminal",
+               "?embed=office&embed=office", "?embed=office&embed=files", "?embed=unknown")
+    with _isolated_app(prefix) as loaded:
+        from office import config
+
+        client = _client(loaded)
+        headers = {"Authorization": f"Bearer {INTERNAL}"}
+        os.environ.pop(config.OCU_OFFICE_DOCSERVER_URL, None)
+        before = [client.get(f"/preview/{CHAT}{query}", headers=headers) for query in queries]
+        os.environ[config.OCU_OFFICE_DOCSERVER_URL] = "http://docserver-internal.test"
+        os.environ[config.OCU_OFFICE_DOCSERVER_ORIGIN] = "https://office-only.test:8443"
+        after = [client.get(f"/preview/{CHAT}{query}", headers=headers) for query in queries]
+
+    def without_nonce(value):
+        return re.sub(r'nonce(?:-|=")[A-Za-z0-9+/_=-]+', "nonce-RESPONSE", value)
+
+    for query, old, new in zip(queries, before, after):
+        assert old.status_code == new.status_code == 200
+        assert without_nonce(old.text) == without_nonce(new.text)
+        assert set(re.findall(r"^\s*(\w+):", new.text, re.MULTILINE)) == {
+            "apiUrl", "filesBase", "chatId", "describeUrl",
+        }
+        assert "office-only.test" not in new.text
+        assert without_nonce(old.headers.get("content-security-policy", "")) == without_nonce(
+            new.headers.get("content-security-policy", "")
+        )
+        assert "office-only.test" not in new.headers.get("content-security-policy", "")
+        if query not in ("?embed=browser", "?embed=terminal"):
+            assert "content-security-policy" not in new.headers
+
+
+@pytest.mark.parametrize("prefix", ("", "/ocu", "/tools/ocu"))
+@pytest.mark.parametrize("server_url", (None, "", " \t\n"))
+def test_disabled_office_keeps_ordinary_preview_response(prefix, server_url):
+    with _isolated_app(prefix) as loaded:
+        from office import config
+
+        if server_url is None:
+            os.environ.pop(config.OCU_OFFICE_DOCSERVER_URL, None)
+        else:
+            os.environ[config.OCU_OFFICE_DOCSERVER_URL] = server_url
+        os.environ[config.OCU_OFFICE_DOCSERVER_ORIGIN] = "https://disabled-office.test"
+        client = _client(loaded)
+        headers = {"Authorization": f"Bearer {INTERNAL}"}
+        office = client.get(f"/preview/{CHAT}?embed=office", headers=headers)
+        standalone = client.get(f"/preview/{CHAT}", headers=headers)
+
+    assert office.status_code == 200
+    assert office.text == standalone.text
+    assert "content-security-policy" not in office.headers
+    assert "disabled-office.test" not in office.text
+    assert "officeDocserverOrigin" not in office.text
+
+
+@pytest.mark.parametrize("origin", (
+    "", "https://office.test/", "https://office.test/path", "https://office.test?x=1",
+    "https://office.test#fragment", "https://user:secret@office.test", "https://office.test:65536",
+    "https://office.test:bad", "https://office.test:", "https://*.office.test",
+    "javascript:alert(1)", "//office.test", "https://office.test; script-src *",
+    "https://office.test 'unsafe-inline'", 'https://office.test"><script>alert(1)</script>',
+    "https://office.test\\evil", "https://office.test%3b", "https://office.test\n",
+    "https://office.test\r", "https://office.test\t", "https://office.test\x01",
+    " https://office.test", "https://office.test\u2028", "https://[not-ipv6]",
+    "http://[::1]:8080",
+    "https://office..test", "https://office.test..",
+    "https://\u212a.office.test", "https://\u0131.office.test",
+))
+def test_unserializable_office_origin_fails_closed_without_echoing_configuration(origin):
+    with _isolated_app("/ocu") as loaded:
+        from office import config
+
+        os.environ[config.OCU_OFFICE_DOCSERVER_URL] = "http://docserver-internal.test"
+        os.environ[config.OCU_OFFICE_DOCSERVER_ORIGIN] = origin
+        client = _client(loaded)
+        headers = {"Authorization": f"Bearer {INTERNAL}"}
+        response = client.get(f"/preview/{CHAT}?embed=office", headers=headers)
+        for query in ("", "?embed=files", "?embed=browser", "?embed=terminal",
+                      "?embed=office&embed=office", "?embed=office&embed=files", "?embed=unknown"):
+            unaffected = client.get(f"/preview/{CHAT}{query}", headers=headers)
+            assert unaffected.status_code == 200
+            assert "officeDocserverOrigin" not in unaffected.text
+        os.environ[config.OCU_OFFICE_DOCSERVER_URL] = " \t\n"
+        disabled = client.get(f"/preview/{CHAT}?embed=office", headers=headers)
+        assert disabled.status_code == 200
+        assert "officeDocserverOrigin" not in disabled.text
+        assert "content-security-policy" not in disabled.headers
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Invalid Office browser origin configuration"}
+    assert "content-security-policy" not in response.headers
+    assert "window.__CONFIG__" not in response.text
+
+
+@pytest.mark.parametrize("origin", ("http://localhost:8080", "https://office.test"))
+def test_office_policy_accepts_single_http_origin(origin):
+    with _isolated_app("") as loaded:
+        from office import config
+
+        os.environ[config.OCU_OFFICE_DOCSERVER_URL] = "http://docserver-internal.test"
+        os.environ[config.OCU_OFFICE_DOCSERVER_ORIGIN] = origin
+        response = _client(loaded).get(
+            f"/preview/{CHAT}?embed=office", headers={"Authorization": f"Bearer {INTERNAL}"}
+        )
+    assert response.status_code == 200
+    assert _field(response.text, "officeDocserverOrigin") == origin
+    assert f"frame-src {origin};" in response.headers["content-security-policy"]
 
 
 @pytest.mark.parametrize("prefix", ("/tools/ocu", "/.ocu"))

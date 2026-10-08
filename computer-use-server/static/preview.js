@@ -29,7 +29,9 @@ import {
 const { apiUrl: API_URL, filesBase: FILES_BASE, chatId: CHAT_ID, describeUrl: DESCRIBE_URL } = window.__CONFIG__;
 const embedParams = new URLSearchParams(location.search).getAll('embed');
 const EMBED_MODE = embedParams.length === 0 ? 'standalone'
-  : embedParams.length === 1 && ['files', 'browser', 'terminal'].includes(embedParams[0])
+  : embedParams.length === 1
+    && (['files', 'browser', 'terminal'].includes(embedParams[0])
+      || embedParams[0] === 'office' && window.__CONFIG__.officeDocserverOrigin)
     && window.parent !== window ? embedParams[0] : 'invalid';
 const EMBED_PAGES = 100;
 const EMBED_DEADLINE_MS = 10000;
@@ -2474,5 +2476,9 @@ function App() {
 render(EMBED_MODE === 'files' ? html`<${EmbeddedFilesApp} />`
   : EMBED_MODE === 'browser' || EMBED_MODE === 'terminal'
     ? html`<${EmbeddedRuntimeApp} mode=${EMBED_MODE} />`
+    : EMBED_MODE === 'office' ? html`
+      <section id="office-editor" aria-label="Office editor" style="display:flex;flex:1;flex-direction:column;min-height:100vh">
+        <div role="status" class="empty-state">Office editor idle</div>
+      </section>`
     : EMBED_MODE === 'invalid' ? html`<div class="empty-state" role="alert">Invalid preview embedding</div>`
       : html`<${App} />`, document.getElementById('app'));
