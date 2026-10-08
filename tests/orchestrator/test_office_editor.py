@@ -531,3 +531,21 @@ def test_retirement_aborts_creation_and_ignores_abort_insensitive_completion(tmp
     assert len(result["messages"]) == result["actionResources"][0]["messages"]
     assert result["timers"] == result["listeners"] == 0
     assert result["signals"] == [True]
+
+
+@pytest.mark.parametrize("later_edit", [False, True])
+@pytest.mark.parametrize("committed_sequence", [3, 4])
+def test_timeout_does_not_revoke_later_cumulative_coverage(tmp_path, later_edit, committed_sequence):
+    actions = [
+        {"kind": "command", "command": "save"},
+        {"kind": "snapshot", "status": {"state": "editing", "reason": "save_timeout"}},
+    ]
+    if later_edit:
+        actions.append({"kind": "modify"})
+    actions.append({"kind": "snapshot", "status": {
+        "state": "editing", "reason": None, "save_seq": committed_sequence,
+        "last_committed_seq": committed_sequence, "last_published_seq": committed_sequence,
+    }})
+    result = _run(tmp_path, open=True, modify=[True], actions=actions)
+    assert result["actionStates"][1]["dirty"] is True
+    assert result["actionStates"][-1]["dirty"] is later_edit
