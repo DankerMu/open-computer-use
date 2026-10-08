@@ -77,12 +77,14 @@ const hostWindow={location:{origin:'https://webui.test'},parent:{
 const open={type:'ocu:office-open',chat_id:chat,file_id:file,generation:7};
 function emit(type,event={}){for(const listener of [...(listeners.get(type)||[])])listener(event);}
 function dispatch(data, changes={}){emit('message',{source:hostWindow.parent,origin:hostWindow.location.origin,data,...changes});}
+function sendTestMessage(row){const changes={};if(row.source)changes.source={parent:row.source==='nested'?hostWindow:hostWindow.parent};if(row.origin)changes.origin=row.origin;dispatch(row.data,changes);}
 const fetch=async(url,init={})=>{
   const method=init.method||'GET';const headers=Object.fromEntries(new Headers(init.headers));
   const body=init.body?JSON.parse(init.body):null;
   calls.push({url:String(url),method,headers,body});order.push('fetch:'+method);
   if(init.signal)signals.push(init.signal);
   if(method==='POST'&&String(url).endsWith('/save')){
+    if(options.saveTransportError)throw new Error('save transport failed');
     if(options.rejectSave)return response(502,{reason:'documentserver_unavailable'});
     if(currentStatus.state!=='editing')return response(409,{reason:'session_not_editing'});
     currentStatus={...currentStatus,state:'saving',save_seq:options.nextSaveSequence??currentStatus.save_seq+1,reason:null};
@@ -126,7 +128,7 @@ async function load(url){
   await module.link((specifier,parent)=>load(new URL(specifier,parent.identifier).href));
   return module;
 }
-const module=await load('https://webui.test/tools/ocu/static/office-editor.js');await module.evaluate();
+const module=await load('https://webui.test'+(options.prefix??'/tools/ocu')+'/static/office-editor.js');await module.evaluate();
 const mount=()=>module.namespace.createOfficeEditorHost({chatId:chat,docserverOrigin:options.origin||'https://office.test:8443',container,window:hostWindow,document:hostDocument});
 let host=mount();
 const idle=()=>new Promise(resolve=>setImmediate(resolve));
@@ -139,7 +141,7 @@ async function advance(milliseconds){
   }
   throw new Error('Timer did not make progress');
 }
-if(options.messages){for(const row of options.messages){const data=row.data;const changes={};if(row.source)changes.source={parent:row.source==='nested'?hostWindow:hostWindow.parent};if(row.origin)changes.origin=row.origin;dispatch(data,changes);}await idle();}
+if(options.messages){for(const row of options.messages)sendTestMessage(row);await idle();}
 if(options.open)dispatch(open);
 await idle();
 if(resolveCreate&&options.releaseCreate){resolveCreate();await idle();}
@@ -168,6 +170,8 @@ for(const action of options.actions||[]){
   else if(action.kind==='dispose')host.dispose();
   else if(action.kind==='error')configs.at(-1).events.onError({data:{errorCode:-18}});
   else if(action.kind==='allowStatus')options.holdStatusAfter=undefined;
+  else if(action.kind==='allowSave'){options.rejectSave=false;options.saveTransportError=false;}
+  else if(action.kind==='message')sendTestMessage(action);
   else throw new Error('Unknown test action: '+action.kind);
   await idle();
   actionStates.push(clone(messages.at(-1).data));
@@ -633,3 +637,102 @@ def test_terminal_status_before_close_reply_still_releases_accepted_editor(tmp_p
     assert result["actionStates"][-1]["state"] == "closed"
     assert result["actionResources"][-1]["calls"] == result["actionResources"][2]["calls"]
     assert result["actionResources"][-1]["messages"] == result["actionResources"][2]["messages"]
+
+
+@pytest.mark.parametrize("first_intent", ["publish", "persist"])
+def test_unchanged_publishing_save_finishes_clean_without_inventing_edits(tmp_path, first_intent):
+    first = {"kind": "command", "command": "save"} if first_intent == "publish" else {"kind": "tick", "ms": 300000}
+    result = _run(tmp_path, prefix="/ocu", open=True, modify=[True], actions=[
+        first, {"kind": "status", "status": {
+            "state": "editing", "last_committed_seq": 3, "last_published_seq": 3 if first_intent == "publish" else 2,
+        }}, {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4, "last_published_seq": 4}},
+        {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "close"},
+    ])
+    saves = [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")]
+    assert saves == [first_intent, "publish"]
+    assert result["actionStates"][5]["dirty"] is False
+    if first_intent == "publish":
+        assert all(state["dirty"] is False for state in result["actionStates"][3:])
+    assert all(row["url"].startswith(f"/ocu/api/office/{CHAT}/") for row in result["calls"])
+    assert all(row["url"].count("/ocu/") == 1 for row in result["calls"])
+    assert all(row["headers"]["x-requested-with"] == "ocu-workspace" for row in result["calls"])
+
+
+@pytest.mark.parametrize("transport", [False, True])
+def test_rejected_publishing_save_stays_dirty_and_retryable(tmp_path, transport):
+    result = _run(tmp_path, open=True, modify=[True], rejectSave=not transport, saveTransportError=transport, actions=[
+        {"kind": "command", "command": "save"}, {"kind": "tick", "ms": 3000},
+        {"kind": "allowSave"}, {"kind": "command", "command": "save"},
+    ])
+    failed = result["actionStates"][1]
+    assert failed["state"] == "editing" and failed["dirty"] is True and failed["reason"]
+    if not transport:
+        assert failed["reason"] == "documentserver_unavailable"
+    assert result["actionResources"][1]["timerDelays"].count(300000) == 1
+    assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
+    assert _states(result)[-1]["reason"] is None
+    assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 2
+
+
+@pytest.mark.parametrize("reason", ["save_timeout", "storage_low"])
+def test_callback_failure_keeps_save_and_autosave_usable(tmp_path, reason):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "reason": reason}},
+        {"kind": "tick", "ms": 3000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "reason": reason}},
+        {"kind": "tick", "ms": 301000},
+    ])
+    assert result["actionStates"][2]["state"] == "editing"
+    assert result["actionStates"][2]["dirty"] is True and result["actionStates"][2]["reason"] == reason
+    assert result["actionResources"][2]["timerDelays"].count(300000) == 1
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["publish", "publish", "persist"]
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("state", ["closed", "error", "orphaned"])
+def test_observed_final_state_stops_live_host_work(tmp_path, state):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "status", "status": {"state": state, "reason": "final_failure" if state == "error" else None}},
+        {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"}, {"kind": "modify"}, {"kind": "tick", "ms": 300000},
+    ])
+    assert _states(result)[-1]["state"] == state
+    assert _states(result)[-1]["dirty"] is (state != "closed")
+    assert result["timerDelays"] == []
+    assert result["actionResources"][-1]["calls"] == result["actionResources"][1]["calls"]
+    assert result["actionResources"][-1]["messages"] == result["actionResources"][1]["messages"]
+
+
+def test_old_status_cannot_reverse_a_later_save_mutation(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], status={"state": "saving"}, holdStatusAfter=1, actions=[
+        {"kind": "status", "status": {"state": "editing"}}, {"kind": "tick", "ms": 1000},
+        {"kind": "command", "command": "save"}, {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+    ])
+    assert result["maxActiveStatuses"] == 1
+    assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
+    assert all(state["state"] != "editing" for state in _states(result))
+
+
+@pytest.mark.parametrize("variant", ["sibling", "nested", "origin", "chat", "generation", "extra", "missing", "unknown"])
+def test_bound_host_rejects_unauthorized_and_malformed_commands(tmp_path, variant):
+    data = {"type": "ocu:office-command", "chat_id": CHAT, "generation": 7, "command": "save"}
+    action = {"kind": "message", "data": data}
+    if variant in {"sibling", "nested"}:
+        action["source"] = variant
+    elif variant == "origin":
+        action["origin"] = "https://foreign.test"
+    elif variant == "chat":
+        data["chat_id"] = "another-chat"
+    elif variant == "generation":
+        data["generation"] = 6
+    elif variant == "extra":
+        data.update(command="close", extra=True)
+    elif variant == "missing":
+        del data["generation"]
+    else:
+        data["command"] = "unknown"
+    result = _run(tmp_path, open=True, actions=[action])
+    assert [row["method"] for row in result["calls"]] == ["POST", "GET"]
+    assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
