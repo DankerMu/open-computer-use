@@ -176,7 +176,8 @@ for(const action of options.actions||[]){
   await idle();
   actionStates.push(clone(messages.at(-1).data));
   actionResources.push({destroyed,timerDelays:[...timers.values()].map(timer=>timer.ms),calls:calls.length,messages:messages.length,
-    listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),apiElements:hostDocument.head.children.length});
+    listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),apiElements:hostDocument.head.children.length,
+    saves:calls.filter(row=>row.url.endsWith('/save')).length});
 }
 const dom=node=>({tag:node.tagName,text:node.textContent,hidden:node.hidden,attributes:node.attributes,children:node.children.map(dom)});
 process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,
@@ -735,4 +736,31 @@ def test_bound_host_rejects_unauthorized_and_malformed_commands(tmp_path, varian
         data["command"] = "unknown"
     result = _run(tmp_path, open=True, actions=[action])
     assert [row["method"] for row in result["calls"]] == ["POST", "GET"]
+    assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+
+
+def test_close_supersedes_an_already_queued_publishing_retry(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"},
+        {"kind": "status", "status": {"state": "closed"}}, {"kind": "tick", "ms": 300000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert len([row for row in result["calls"] if row["url"].endswith("/close")]) == 1
+    assert _states(result)[-1]["state"] == "closed" and result["destroyed"] == 1
+    assert result["timers"] == 0
+
+
+def test_queued_publish_waits_for_owned_autosave_acceptance_before_retry(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], deferSave=True, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000}, {"kind": "releaseSave"}, {"kind": "releaseSave"},
+        {"kind": "status", "status": {
+            "state": "editing", "save_seq": 4, "last_committed_seq": 4, "last_published_seq": 4,
+        }}, {"kind": "tick", "ms": 1000},
+    ])
+    assert result["actionResources"][3]["saves"] == 2
+    assert result["actionResources"][4]["saves"] == 3
+    assert all(state["reason"] is None for state in result["actionStates"])
     assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
