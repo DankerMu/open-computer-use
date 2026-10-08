@@ -95,6 +95,7 @@ CHAT_ROUTES = (
     ("GET", f"/terminal/{CHAT}/heartbeat"),
     ("GET", f"/preview/{CHAT}"),
     ("POST", f"/api/office/{CHAT}/documents/file/sessions"),
+    ("GET", f"/api/office/{CHAT}/documents/file/versions"),
     ("GET", f"/api/office/{CHAT}/sessions/session"),
     ("POST", f"/api/office/{CHAT}/sessions/session/save"),
     ("POST", f"/api/office/{CHAT}/sessions/session/close"),
@@ -152,6 +153,7 @@ def app_module(monkeypatch):
             "office.publish",
             "office.save_as",
             "office.resolution",
+            "office.history",
             "office.epoch",
             "office.tokens",
             "office.commands",
@@ -906,6 +908,7 @@ class TestHttpAuthorization:
         "method,path",
         (
             ("POST", f"/api/office/{CHAT}/documents/file/sessions"),
+            ("GET", f"/api/office/{CHAT}/documents/file/versions"),
             ("GET", f"/api/office/{CHAT}/sessions/session"),
             ("POST", f"/api/office/{CHAT}/sessions/session/save"),
             ("POST", f"/api/office/{CHAT}/sessions/session/close"),

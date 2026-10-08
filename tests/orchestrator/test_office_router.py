@@ -269,7 +269,10 @@ def test_disabled_office_routes_are_404_without_work(
         assert not (data / CHAT / ".ocu" / "office").exists()
 
 
-def test_enabled_missing_chat_is_404_without_creating_directory(tmp_path, monkeypatch):
+@pytest.mark.parametrize("method,suffix", (
+    ("POST", "sessions"), ("GET", "versions"),
+))
+def test_enabled_missing_chat_is_404_without_creating_directory(tmp_path, monkeypatch, method, suffix):
     with _office_app(tmp_path, monkeypatch, enabled=True) as (
         http,
         data,
@@ -278,8 +281,8 @@ def test_enabled_missing_chat_is_404_without_creating_directory(tmp_path, monkey
     ):
         before = _inventory(data)
         with _trap_lock_and_state(docker_manager):
-            response = http.post(
-                f"/api/office/{MISSING}/documents/{FILE_ID}/sessions",
+            response = http.request(
+                method, f"/api/office/{MISSING}/documents/{FILE_ID}/{suffix}",
                 headers=_auth(),
             )
         _assert_reason(response, "unknown_chat")

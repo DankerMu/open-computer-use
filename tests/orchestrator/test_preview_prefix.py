@@ -55,6 +55,7 @@ _APP_MODULES = (
     "office.publish",
     "office.save_as",
     "office.resolution",
+    "office.history",
     "office.epoch",
     "office.tokens",
     "office.commands",

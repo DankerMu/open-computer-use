@@ -29,7 +29,7 @@ def test_sweep_publishes_unstarted_obligation_in_office_only_chat(world, monkeyp
     store_mod, manager, data = world
     monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://documentserver.invalid")
     _bind_outputs_broker(manager)
-    for module in ("office.sessions", "office.save_as", "office.publish", "office.resolution", "office.sweep"):
+    for module in ("office.sessions", "office.save_as", "office.publish", "office.resolution", "office.history", "office.sweep"):
         if module in sys.modules:
             importlib.reload(sys.modules[module])
 
