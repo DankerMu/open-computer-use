@@ -280,10 +280,12 @@ Committed-but-unpublished content remains dirty. The editor's own save shortcut
 and delivery acknowledgements neither issue a broker save nor clear dirty.
 
 Rejected save/close requests retain the editor and dirty state, with a failure
-reason until another command is accepted. Save timeout and callback refusal
-remain retryable. A publishing save refused because this host's auto-save is
-outstanding retries once editing resumes; unrelated refusals do not create a
-generic retry loop.
+reason through ordinary editing polls until another command is accepted. Conflict
+and terminal reports use the broker's authoritative reason. Save timeout and
+callback refusal remain retryable. A publishing save refused because this host's
+auto-save is outstanding retries once editing resumes, including when acceptance
+precedes its status observation or the allocated persist command fails. Unrelated
+refusals and unproven transport failures do not create a generic retry loop.
 
 Close stops auto-save, releases the editor only after broker acceptance and
 keeps observing status until a final state. A rejected close retains the editor
