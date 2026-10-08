@@ -2473,11 +2473,11 @@ function App() {
 function OfficeEditorApp() {
   const container = useRef(null);
   useEffect(() => {
-    createOfficeEditorHost({
+    return createOfficeEditorHost({
       chatId: CHAT_ID,
       docserverOrigin: window.__CONFIG__.officeDocserverOrigin,
       container: container.current,
-    });
+    }).dispose;
   }, []);
   return html`
     <section id="office-editor" ref=${container} aria-label="Office editor" style="display:flex;flex:1;flex-direction:column;min-height:100vh">

@@ -24,12 +24,14 @@ const calls = [], messages = [], scripts = [], configs = [], order = [], actionS
 const listeners = new Map(), timers = new Map();
 let timerId = 0, attempts = 0, destroyed = 0, resolveCreate, resolveSave, resolveClose, pendingLoad;
 let now = 0, activeStatuses = 0, maxActiveStatuses = 0, statusReads = 0;
-const heldStatuses = [];
+const heldStatuses = [], signals = [];
 const clone = value => JSON.parse(JSON.stringify(value));
 const signed = {documentType:'word', document:{key:'stable-key',url:'http://private.test/office/source/ticket',fileType:'docx',permissions:{edit:true}},editorConfig:{callbackUrl:'http://private.test/office/callback/chat/session',mode:'edit',customization:{forcesave:false}},token:'signed-configuration-token'};
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
 let currentStatus = clone(initial);
 const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>clone(body)});
+const createReply=()=>response(options.joined?200:201,{session_id:'session-id',file_id:file,document_key:'stable-key',
+  state:'opening',joined:Boolean(options.joined),editor_config:options.noConfig?null:clone(signed)});
 function element(tag) {
   return {tagName:tag.toUpperCase(),children:[],style:{},attributes:{},hidden:false,textContent:'',parentNode:null,
     setAttribute(key,value){this.attributes[key]=String(value);},
@@ -63,14 +65,17 @@ const hostWindow={location:{origin:'https://webui.test'},parent:{
   postMessage(data,target){messages.push({data:clone(data),target});order.push('message:'+data.type);
     if(data.type==='ocu:office-ready'&&options.replyOnReady){dispatch(open);if(options.duplicateOnReady)dispatch({...open,generation:8});}
   }
-},addEventListener(type,listener){order.push('listener:'+type);listeners.set(type,listener);},
+},addEventListener(type,listener){order.push('listener:'+type);if(!listeners.has(type))listeners.set(type,new Set());listeners.get(type).add(listener);},
+  removeEventListener(type,listener){const group=listeners.get(type);group?.delete(listener);if(group?.size===0)listeners.delete(type);},
   setTimeout(fn,ms){const id=++timerId;timers.set(id,{fn,ms,due:now+ms});return id;},clearTimeout(id){timers.delete(id);}};
 const open={type:'ocu:office-open',chat_id:chat,file_id:file,generation:7};
-function dispatch(data, changes={}){listeners.get('message')?.({source:hostWindow.parent,origin:hostWindow.location.origin,data,...changes});}
+function emit(type,event={}){for(const listener of [...(listeners.get(type)||[])])listener(event);}
+function dispatch(data, changes={}){emit('message',{source:hostWindow.parent,origin:hostWindow.location.origin,data,...changes});}
 const fetch=async(url,init={})=>{
   const method=init.method||'GET';const headers=Object.fromEntries(new Headers(init.headers));
   const body=init.body?JSON.parse(init.body):null;
   calls.push({url:String(url),method,headers,body});order.push('fetch:'+method);
+  if(init.signal)signals.push(init.signal);
   if(method==='POST'&&String(url).endsWith('/save')){
     if(options.rejectSave)return response(502,{reason:'documentserver_unavailable'});
     if(currentStatus.state!=='editing')return response(409,{reason:'session_not_editing'});
@@ -91,9 +96,9 @@ const fetch=async(url,init={})=>{
   }
   if(method==='POST'){
     if(options.transportError)throw new Error('network failed');
-    if(options.deferCreate)return new Promise(resolve=>{resolveCreate=resolve;});
+    if(options.deferCreate)return new Promise(resolve=>{resolveCreate=()=>resolve(createReply());});
     if(options.refusal)return response(options.refusal.status,{reason:options.refusal.reason});
-    return response(options.joined?200:201,{session_id:'session-id',file_id:file,document_key:'stable-key',state:'opening',joined:Boolean(options.joined),editor_config:options.noConfig?null:clone(signed)});
+    return createReply();
   }
   if(options.statusError)return response(500,{reason:'state_corrupt'});
   statusReads++; activeStatuses++; maxActiveStatuses=Math.max(maxActiveStatuses,activeStatuses);
@@ -104,7 +109,7 @@ const fetch=async(url,init={})=>{
   activeStatuses--;
   return reply;
 };
-const context=vm.createContext({window:hostWindow,document:hostDocument,URL,Headers,fetch,console,
+const context=vm.createContext({window:hostWindow,document:hostDocument,URL,Headers,AbortController,fetch,console,
   setTimeout:hostWindow.setTimeout,clearTimeout:hostWindow.clearTimeout,queueMicrotask});
 const modules=new Map();
 async function load(url){
@@ -130,7 +135,7 @@ async function advance(milliseconds){
 if(options.messages){for(const row of options.messages){const data=row.data;const changes={};if(row.source)changes.source={parent:row.source==='nested'?hostWindow:hostWindow.parent};if(row.origin)changes.origin=row.origin;dispatch(data,changes);}await idle();}
 if(options.open)dispatch(open);
 await idle();
-if(resolveCreate&&options.releaseCreate){resolveCreate(response(201,{session_id:'session-id',file_id:file,document_key:'stable-key',state:'opening',joined:false,editor_config:clone(signed)}));await idle();}
+if(resolveCreate&&options.releaseCreate){resolveCreate();await idle();}
 if(options.expire)await advance(10000);
 const beforeLate=options.lateLoad?clone({calls,messages}):null;
 if(options.lateLoad){hostWindow.DocsAPI={DocEditor:class{constructor(){attempts++;}}};pendingLoad?.();await idle();}
@@ -148,14 +153,19 @@ for(const action of options.actions||[]){
   else if(action.kind==='releaseStatus')heldStatuses.shift()();
   else if(action.kind==='releaseClose')resolveClose?.();
   else if(action.kind==='allowClose')options.rejectClose=false;
+  else if(action.kind==='pagehide')emit('pagehide');
+  else if(action.kind==='releaseCreate')resolveCreate?.();
   else throw new Error('Unknown test action: '+action.kind);
   await idle();
   actionStates.push(clone(messages.at(-1).data));
-  actionResources.push({destroyed,timerDelays:[...timers.values()].map(timer=>timer.ms),calls:calls.length,messages:messages.length});
+  actionResources.push({destroyed,timerDelays:[...timers.values()].map(timer=>timer.ms),calls:calls.length,messages:messages.length,
+    listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0)});
 }
 const dom=node=>({tag:node.tagName,text:node.textContent,hidden:node.hidden,attributes:node.attributes,children:node.children.map(dom)});
 process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,
-  activeStatuses,maxActiveStatuses,beforeLate,destroyed,actionResources,timerDelays:[...timers.values()].map(timer=>timer.ms),dom:dom(container)}));
+  activeStatuses,maxActiveStatuses,beforeLate,destroyed,actionResources,signals:signals.map(signal=>signal.aborted),
+  listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),
+  timerDelays:[...timers.values()].map(timer=>timer.ms),dom:dom(container)}));
 """
 
 
@@ -174,7 +184,7 @@ def _run(tmp_path, **options):
 def test_ready_reply_opens_once_with_signed_configuration(tmp_path):
     file_id = "opaque/file ?文档"
     result = _run(tmp_path, file=file_id, replyOnReady=True, duplicateOnReady=True)
-    assert result["order"][:2] == ["listener:message", "message:ocu:office-ready"]
+    assert result["order"].index("listener:message") < result["order"].index("message:ocu:office-ready")
     assert result["messages"][0] == {
         "data": {"type": "ocu:office-ready", "chat_id": CHAT}, "target": "https://webui.test",
     }
@@ -508,3 +518,16 @@ def test_rejected_close_retains_editor_and_resumes_editing_timer(tmp_path):
     assert result["destroyed"] == 1
     assert _states(result)[-1]["state"] == "closing"
     assert _states(result)[-1]["reason"] is None
+
+
+def test_retirement_aborts_creation_and_ignores_abort_insensitive_completion(tmp_path):
+    result = _run(tmp_path, open=True, deferCreate=True, actions=[
+        {"kind": "pagehide"}, {"kind": "releaseCreate"}, {"kind": "tick", "ms": 300000},
+        {"kind": "command", "command": "save"}, {"kind": "pagehide"},
+    ])
+    assert result["attempts"] == 0
+    assert result["scripts"] == []
+    assert len(result["calls"]) == result["actionResources"][0]["calls"] == 1
+    assert len(result["messages"]) == result["actionResources"][0]["messages"]
+    assert result["timers"] == result["listeners"] == 0
+    assert result["signals"] == [True]

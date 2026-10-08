@@ -16,7 +16,7 @@ const API_LOAD_TIMEOUT_MS = 10000;
 const POLL_DELAY_MS = 1000;
 const AUTO_SAVE_DELAY_MS = 5 * 60 * 1000;
 
-function loadEditorApi(origin, hostWindow, hostDocument) {
+function loadEditorApi(origin, hostWindow, hostDocument, signal) {
   return new Promise((resolve, reject) => {
     const script = hostDocument.createElement('script');
     script.src = new URL('/web-apps/apps/api/documents/api.js', origin).href;
@@ -29,16 +29,23 @@ function loadEditorApi(origin, hostWindow, hostDocument) {
       script.onload = null;
       script.onerror = null;
       if (reason) {
+        signal.removeEventListener('abort', abort);
         script.remove();
         reject(new Error(reason));
       } else {
         resolve(hostWindow.DocsAPI.DocEditor);
       }
     };
+    const abort = () => {
+      if (settled) script.remove();
+      else finish('editor_api_cancelled');
+    };
     const deadline = hostWindow.setTimeout(() => finish('editor_api_timeout'), API_LOAD_TIMEOUT_MS);
     script.onload = () => finish(typeof hostWindow.DocsAPI?.DocEditor === 'function' ? null : 'editor_api_unavailable');
     script.onerror = () => finish('editor_api_load_failed');
-    hostDocument.head.appendChild(script);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    else hostDocument.head.appendChild(script);
   });
 }
 
@@ -60,6 +67,8 @@ export function createOfficeEditorHost({
   chatId, docserverOrigin, container, window: hostWindow = window, document: hostDocument = document,
 }) {
   const origin = hostWindow.location.origin;
+  const lifetime = new AbortController();
+  let disposed = false;
   const statusElement = hostDocument.createElement('div');
   statusElement.className = 'empty-state';
   statusElement.setAttribute('role', 'status');
@@ -94,9 +103,9 @@ export function createOfficeEditorHost({
   let closeRequested = false;
   let closeAccepted = false;
 
-  const final = () => refusalReason !== null || localError !== null || FINAL_STATES.has(snapshot?.state);
+  const final = () => disposed || refusalReason !== null || localError !== null || FINAL_STATES.has(snapshot?.state);
   const report = () => {
-    if (!opened) return;
+    if (!opened || disposed) return;
     const state = refusalReason !== null ? 'refused' : localError !== null ? 'error' : snapshot?.state || 'opening';
     const reason = refusalReason ?? localError ?? commandReason ?? snapshot?.reason ?? null;
     const next = {
@@ -192,7 +201,8 @@ export function createOfficeEditorHost({
         refreshAgain = false;
         const epoch = mutationEpoch;
         try {
-          const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
+          const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store', signal: lifetime.signal });
+          if (final()) return false;
           const status = await response.json();
           if (final()) return false;
           if (epoch !== mutationEpoch) {
@@ -232,8 +242,9 @@ export function createOfficeEditorHost({
     else publishRequests++;
     try {
       const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/save`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent }), signal: lifetime.signal,
       });
+      if (final()) return;
       const body = await response.json();
       if (final()) return;
       if (!response.ok) {
@@ -267,6 +278,18 @@ export function createOfficeEditorHost({
     instance?.destroyEditor();
   }
 
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    stopTimers();
+    hostWindow.removeEventListener('message', receive);
+    hostWindow.removeEventListener('pagehide', dispose);
+    lifetime.abort();
+    saveCoverage.clear();
+    autoSave = null;
+    releaseEditor();
+  }
+
   async function close() {
     if (!sessionId || closeRequested || final()) return;
     closeRequested = true;
@@ -275,7 +298,8 @@ export function createOfficeEditorHost({
     mutationEpoch++;
     syncAutoSave();
     try {
-      const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/close`, { method: 'POST' });
+      const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/close`, { method: 'POST', signal: lifetime.signal });
+      if (final()) return;
       const body = await response.json();
       if (final()) return;
       if (!response.ok) {
@@ -309,8 +333,10 @@ export function createOfficeEditorHost({
     const base = `/api/office/${encodeURIComponent(chatId)}`;
     let created;
     try {
-      const response = await ocuFetch(`${base}/documents/${encodeURIComponent(opened.fileId)}/sessions`, { method: 'POST' });
+      const response = await ocuFetch(`${base}/documents/${encodeURIComponent(opened.fileId)}/sessions`, { method: 'POST', signal: lifetime.signal });
+      if (disposed) return;
       const body = await response.json();
+      if (disposed) return;
       if (!response.ok) {
         const reason = reasonOf(body, 'session_creation_failed');
         if (REFUSALS.get(reason) === response.status) {
@@ -342,7 +368,7 @@ export function createOfficeEditorHost({
 
     let DocEditor;
     try {
-      DocEditor = await loadEditorApi(docserverOrigin, hostWindow, hostDocument);
+      DocEditor = await loadEditorApi(docserverOrigin, hostWindow, hostDocument, lifetime.signal);
     } catch (error) {
       if (!closeAccepted) fail(error.message || 'editor_api_load_failed');
       return;
@@ -364,9 +390,15 @@ export function createOfficeEditorHost({
     };
     try {
       documentElement.hidden = false;
-      editor = new DocEditor(documentElement.id, { ...created.editor_config, events });
+      const instance = new DocEditor(documentElement.id, { ...created.editor_config, events });
+      if (disposed || closeAccepted) {
+        instance.destroyEditor();
+        return;
+      }
+      editor = instance;
       report();
     } catch {
+      if (disposed) return;
       documentElement.replaceChildren();
       fail('editor_creation_failed');
     }
@@ -374,7 +406,7 @@ export function createOfficeEditorHost({
 
   function receive(event) {
     const data = event.data;
-    if (event.source !== hostWindow.parent || event.origin !== origin ||
+    if (disposed || event.source !== hostWindow.parent || event.origin !== origin ||
         !data || typeof data !== 'object' || Array.isArray(data) || data.chat_id !== chatId) return;
     if (data.type === 'ocu:office-command') {
       if (opened && Object.keys(data).sort().join(',') === COMMAND_KEYS && data.generation === opened.generation) {
@@ -392,6 +424,7 @@ export function createOfficeEditorHost({
   }
 
   hostWindow.addEventListener('message', receive);
+  hostWindow.addEventListener('pagehide', dispose);
   hostWindow.parent.postMessage({ type: 'ocu:office-ready', chat_id: chatId }, origin);
-  return { applyStatus };
+  return { applyStatus, dispose };
 }
