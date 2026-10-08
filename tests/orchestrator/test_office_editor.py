@@ -72,6 +72,7 @@ const fetch=async(url,init={})=>{
   calls.push({url:String(url),method,headers,body});order.push('fetch:'+method);
   if(method==='POST'&&String(url).endsWith('/save')){
     if(options.rejectSave)return response(502,{reason:'documentserver_unavailable'});
+    if(currentStatus.state!=='editing')return response(409,{reason:'session_not_editing'});
     currentStatus={...currentStatus,state:'saving',save_seq:options.nextSaveSequence??currentStatus.save_seq+1,reason:null};
     if(options.autoCommit)currentStatus={...currentStatus,state:'editing',last_committed_seq:currentStatus.save_seq,
       last_published_seq:options.equalPublished?currentStatus.save_seq:currentStatus.last_published_seq};
@@ -423,3 +424,33 @@ def test_status_poll_does_not_overlap_a_held_request(tmp_path):
     ])
     assert len([row for row in result["calls"] if row["method"] == "GET"]) == 2
     assert result["activeStatuses"] == result["maxActiveStatuses"] == 1
+
+
+def test_publish_refused_during_own_autosave_retries_once_after_editing(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "tick", "ms": 300000},
+        {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "status", "status": {
+            "state": "editing", "save_seq": 4, "last_committed_seq": 4, "last_published_seq": 4,
+        }},
+        {"kind": "tick", "ms": 5000},
+    ])
+    saves = [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")]
+    assert saves == ["persist", "publish", "publish"]
+    assert result["actionStates"][1]["state"] == "saving"
+    assert result["actionStates"][1]["reason"] is None
+    assert _states(result)[-1]["state"] == "editing"
+    assert _states(result)[-1]["dirty"] is False
+
+
+def test_another_tabs_save_refusal_is_not_an_automatic_retry(tmp_path):
+    result = _run(tmp_path, open=True, joined=True, status={"state": "saving"}, actions=[
+        {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing"}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 1
+    assert _states(result)[-1]["state"] == "editing"
+    assert _states(result)[-1]["reason"] == "session_not_editing"

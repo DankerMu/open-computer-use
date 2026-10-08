@@ -87,7 +87,10 @@ export function createOfficeEditorHost({
   let statusFlight = null;
   let refreshAgain = false;
   let mutationEpoch = 0;
-  let autoSaveRequestPending = false;
+  let autoSave = null;
+  let queuedPublish = null;
+  let publishRequests = 0;
+  let latestCommand = 0;
 
   const final = () => refusalReason !== null || localError !== null || FINAL_STATES.has(snapshot?.state);
   const report = () => {
@@ -136,12 +139,15 @@ export function createOfficeEditorHost({
     if (final()) stopTimers();
     else syncAutoSave();
     report();
+    drainQueuedPublish();
+    if (!autoSave?.pending && snapshot.state === 'editing') autoSave = null;
     return true;
   };
   function stopTimers() {
     hostWindow.clearTimeout(pollTimer);
     hostWindow.clearTimeout(autoSaveTimer);
     pollTimer = autoSaveTimer = null;
+    queuedPublish = null;
   }
 
   function syncAutoSave() {
@@ -152,9 +158,21 @@ export function createOfficeEditorHost({
       autoSaveTimer = hostWindow.setTimeout(() => {
         autoSaveTimer = null;
         if (!final() && snapshot?.state === 'editing' &&
-            modification > coveredModification && !autoSaveRequestPending) void save('persist');
+            modification > coveredModification && !autoSave?.pending) void save('persist');
         syncAutoSave();
       }, AUTO_SAVE_DELAY_MS);
+    }
+  }
+
+  function drainQueuedPublish() {
+    if (!queuedPublish || queuedPublish.pending || publishRequests || final()) return;
+    if (queuedPublish.sequence === null) {
+      queuedPublish = null;
+      commandReason = 'session_not_editing';
+      report();
+    } else if (snapshot?.state === 'editing') {
+      queuedPublish = null;
+      void save();
     }
   }
 
@@ -203,29 +221,39 @@ export function createOfficeEditorHost({
   async function save(intent = 'publish') {
     if (!sessionId || final()) return;
     const requestedModification = modification;
+    const command = ++latestCommand;
+    const autoOwner = intent === 'publish' && autoSave && (autoSave.pending ||
+      snapshot?.state === 'saving' && snapshot.save_seq === autoSave.sequence) ? autoSave : null;
+    const attempt = intent === 'persist' ? { pending: true, sequence: null } : null;
     mutationEpoch++;
-    if (intent === 'persist') autoSaveRequestPending = true;
+    if (attempt) autoSave = attempt;
+    else publishRequests++;
     try {
       const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/save`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent }),
       });
       const body = await response.json();
       if (!response.ok) {
-        commandReason = reasonOf(body, 'save_failed');
+        if (command === latestCommand) {
+          if (autoOwner && response.status === 409 && body?.reason === 'session_not_editing') queuedPublish = autoOwner;
+          else commandReason = reasonOf(body, 'save_failed');
+        }
       } else if (response.status !== 202 || body?.session_id !== sessionId ||
           !Number.isSafeInteger(body.save_seq) || body.save_seq < 1 || body.intent !== intent) {
-        commandReason = 'invalid_save_response';
+        if (command === latestCommand) commandReason = 'invalid_save_response';
       } else {
-        commandReason = null;
+        if (command === latestCommand) commandReason = null;
+        if (attempt) attempt.sequence = body.save_seq;
         saveCoverage.set(body.save_seq, requestedModification);
         coverModifications();
         report();
       }
     } catch {
-      commandReason = 'save_failed';
+      if (command === latestCommand) commandReason = 'save_failed';
     } finally {
       mutationEpoch++;
-      if (intent === 'persist') autoSaveRequestPending = false;
+      if (attempt) attempt.pending = false;
+      else publishRequests--;
     }
     await refreshStatus();
   }
