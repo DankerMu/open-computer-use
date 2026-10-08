@@ -249,13 +249,30 @@ successful response or a fabricated rollback.
 
 #### Office editor host embedding
 
-The authenticated same-origin `/preview/{chat_id}?embed=office` page exposes an
-idle host only: `#office-editor` displays `Office editor idle`. A single Office
-parameter receives Office configuration and CSP when server-side Office is
-enabled; the client additionally requires a parent frame. This surface loads no
-DocumentServer API script and starts no Office protocol, session, polling or save
-behavior. It mounts no Files/Browser/Terminal clients and emits no protocol
-messages; Files selection messages do not activate it.
+The authenticated same-origin `/preview/{chat_id}?embed=office` page requires a
+single Office parameter, server-side Office enablement and a parent frame.
+`office-editor.js` installs its listener before announcing `ocu:office-ready`.
+Before the first valid `ocu:office-open`, it shows `Office editor idle` and makes
+no Office request or DocumentServer API load. It accepts only its same-origin
+parent, exact message fields, matching chat and a non-negative safe generation;
+one page admits one open, including after failure. Files selection messages do
+not activate it, and no Files/Browser/Terminal client is mounted.
+
+The host creates or joins through `ocuFetch`, then reads the returned session
+once for its persisted state, reason, publication sequences and change notice.
+That initial read is not a poll loop. The API script comes from the configured
+origin at `/web-apps/apps/api/documents/api.js`; the broker's signed document,
+editorConfig and token fields pass through unchanged. State reports retain the
+original file and generation, including after save-as, and are sent only when a
+reported value changes.
+
+Named broker validation refusals and `unpublished_version` are final `refused`
+with no session id. Creation transport/server failures, failed status reads,
+API load/timeout/constructor failures and editor connection loss are `error`;
+an obtained session id is retained and another tab's session is not closed.
+Editor modification acknowledgements do not prove a workspace save or clear
+dirty state. Save/close execution, recurring polling and auto-save are not part
+of this host's delivered protocol behavior.
 
 `officeDocserverOrigin` comes only from `OCU_OFFICE_DOCSERVER_ORIGIN` on the server,
 not a query, parent message or user iframe setting. Browser configuration and
@@ -265,8 +282,8 @@ The dedicated policy uses a fresh configuration-script nonce:
 `frame-src <DocumentServer origin>` and `connect-src 'self'`.
 It retains runtime `style-src 'self' 'unsafe-inline'`, `img-src 'self' data: blob:`
 and `font-src 'self' data:`, with `base-uri`, `object-src` and `form-action` all
-`'none'`, and `frame-ancestors 'self'`. Configured API JavaScript, if loaded,
-executes with host-origin privileges; only the cross-origin nested document is
+`'none'`, and `frame-ancestors 'self'`. Configured API JavaScript executes with
+host-origin privileges; only the cross-origin nested document is
 SOP-separated. See the [Office host trust decision](https://github.com/DankerMu/open-webui/blob/main/docs/decisions/implemented/architecture/2026-10-08-ocu-office-editor-frame.md).
 Generated-content opaque isolation and existing Files/runtime policies are unchanged.
 

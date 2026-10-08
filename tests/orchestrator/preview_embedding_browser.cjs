@@ -501,18 +501,22 @@ async function verifyOfficeShell(browser, origin, artifacts, allowedOrigin, deni
     await shell().locator('#app').evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     await new Promise(resolve => setTimeout(resolve, 150));
   };
-  const silent = async (start) => {
+  const silent = async (start, officeReady = false, priorMessages = []) => {
     const nonAssets = outbound.slice(start).filter(url => {
       const address = new URL(url);
       return address.origin !== origin ||
         !(/\/static\//.test(address.pathname) || address.pathname.includes(`/preview/${CHAT}`));
     });
     assert.deepEqual(nonAssets, [], 'Office or invalid embedding issued a request');
-    assert.deepEqual(await page.evaluate(() => window.__officeMessages), [], 'idle embedding posted a message');
+    if (!officeReady) {
+      assert.deepEqual(await page.evaluate(() => window.__officeMessages), priorMessages, 'invalid embedding posted a message');
+    }
     assert.equal(await shell().locator('#app').evaluate(() => window.__officeIntervals), 0,
       'idle embedding started a timer');
-    assert.equal(await shell().locator('#app').evaluate(() => window.__officeMessageListeners), 0,
-      'idle embedding installed a message listener');
+    if (!officeReady) {
+      assert.equal(await shell().locator('#app').evaluate(() => window.__officeMessageListeners), 0,
+        'invalid embedding installed a message listener');
+    }
     assert.deepEqual(officeArrivals, { allowed: [], denied: [] }, 'idle embedding loaded DocumentServer');
   };
   try {
@@ -530,17 +534,20 @@ async function verifyOfficeShell(browser, origin, artifacts, allowedOrigin, deni
       await page.waitForFunction(() => document.querySelector('#preview').contentWindow.__officeMessages
         .some(payload => payload?.type === 'ocu:preview-select' && payload.generation === 0));
       await settle();
-      await silent(start);
+      assert.deepEqual(await page.evaluate(() => window.__officeMessages),
+        [{ type: 'ocu:office-ready', chat_id: CHAT }], 'Office host did not announce readiness');
+      await silent(start, true);
       await page.screenshot({ path: path.join(artifacts, `office-shell-${prefix ? prefix.replaceAll('/', '-') : 'root'}.png`) });
       await page.evaluate(() => window.retire());
       for (const query of ['?embed=office&embed=office', '?embed=office&embed=files', '?embed=unknown',
         '?embed=office&office_fixture=absent', '?embed=office&office_fixture=blank']) {
         const invalidStart = outbound.length;
+        const priorMessages = await page.evaluate(() => window.__officeMessages);
         await page.evaluate(({ query, prefix }) => window.mount(query, prefix), { query, prefix });
         await shell().getByRole('alert').getByText('Invalid preview embedding').waitFor();
         assert.equal(await shell().locator('#office-editor').count(), 0);
         await settle();
-        await silent(invalidStart);
+        await silent(invalidStart, false, priorMessages);
         await page.screenshot({ path: path.join(artifacts, `office-invalid-${prefix ? prefix.replaceAll('/', '-') : 'root'}-${query.replaceAll(/[^a-z]/g, '-')}.png`) });
         await page.evaluate(() => window.retire());
       }
@@ -576,6 +583,9 @@ async function verifyOfficeShell(browser, origin, artifacts, allowedOrigin, deni
     await page.goto(`${origin}/parent`);
     await page.evaluate(() => window.mount('?embed=office'));
     await shell().locator('#office-editor').waitFor();
+    await page.waitForFunction(() => window.__officeMessages.some(message => message?.type === 'ocu:office-ready'));
+    const policyMessages = await page.evaluate(() => window.__officeMessages);
+    assert.deepEqual(policyMessages, [{ type: 'ocu:office-ready', chat_id: CHAT }]);
     const positive = await shell().locator('#app').evaluate(async (_node, allowed) => {
       const script = document.createElement('script');
       script.src = `${allowed}/office-script.js`;
@@ -647,7 +657,7 @@ async function verifyOfficeShell(browser, origin, artifacts, allowedOrigin, deni
     assert.deepEqual(officeArrivals.allowed.map(row => row.path).sort(), ['/office-frame', '/office-script.js'],
       'configured origin received a forbidden connection');
     assert.equal(await shell().locator('#app').evaluate(() => window.__officeScriptCanary), 'executed');
-    assert.deepEqual(await page.evaluate(() => window.__officeMessages), [], 'Office shell reported policy probes');
+    assert.deepEqual(await page.evaluate(() => window.__officeMessages), policyMessages, 'Office shell reported policy probes');
   } finally { await context.close(); }
 }
 
