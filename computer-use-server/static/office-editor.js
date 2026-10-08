@@ -3,6 +3,7 @@
 import { ocuFetch } from './ocu-request.js';
 
 const OPEN_KEYS = 'chat_id,file_id,generation,type';
+const COMMAND_KEYS = 'chat_id,command,generation,type';
 const SESSION_STATES = new Set(['opening', 'editing', 'saving', 'closing', 'closed', 'conflict', 'error', 'orphaned']);
 const FINAL_STATES = new Set(['closed', 'error', 'orphaned']);
 const REFUSALS = new Map([
@@ -75,13 +76,14 @@ export function createOfficeEditorHost({
   let modified = false;
   let refusalReason = null;
   let localError = null;
+  let commandReason = null;
   let lastReport = null;
 
   const final = () => refusalReason !== null || localError !== null || FINAL_STATES.has(snapshot?.state);
   const report = () => {
     if (!opened) return;
     const state = refusalReason !== null ? 'refused' : localError !== null ? 'error' : snapshot?.state || 'opening';
-    const reason = refusalReason ?? localError ?? snapshot?.reason ?? null;
+    const reason = refusalReason ?? localError ?? commandReason ?? snapshot?.reason ?? null;
     const next = {
       type: 'ocu:office-state', chat_id: chatId, file_id: opened.fileId, generation: opened.generation,
       session_id: sessionId, state,
@@ -114,6 +116,42 @@ export function createOfficeEditorHost({
     report();
     return true;
   };
+  async function refreshStatus() {
+    try {
+      const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
+      const status = await response.json();
+      if (!response.ok) {
+        fail(reasonOf(status, 'session_status_failed'));
+        return false;
+      }
+      return applyStatus(status);
+    } catch {
+      fail('session_status_failed');
+      return false;
+    }
+  }
+
+  async function save() {
+    if (!sessionId || final()) return;
+    try {
+      const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/save`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent: 'publish' }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        commandReason = reasonOf(body, 'save_failed');
+      } else if (response.status !== 202 || body?.session_id !== sessionId ||
+          !Number.isSafeInteger(body.save_seq) || body.save_seq < 1 || body.intent !== 'publish') {
+        commandReason = 'invalid_save_response';
+      } else {
+        commandReason = null;
+      }
+    } catch {
+      commandReason = 'save_failed';
+    }
+    await refreshStatus();
+  }
+
 
   async function openSession() {
     const base = `/api/office/${encodeURIComponent(chatId)}`;
@@ -143,18 +181,7 @@ export function createOfficeEditorHost({
       return;
     }
 
-    try {
-      const response = await ocuFetch(`${base}/sessions/${encodeURIComponent(sessionId)}`);
-      const status = await response.json();
-      if (!response.ok) {
-        fail(reasonOf(status, 'session_status_failed'));
-        return;
-      }
-      if (!applyStatus(status) || final()) return;
-    } catch {
-      fail('session_status_failed');
-      return;
-    }
+    if (!await refreshStatus() || final()) return;
     if (created.editor_config === null && snapshot.state === 'conflict') return;
     if (!created.editor_config || typeof created.editor_config !== 'object' || Array.isArray(created.editor_config)) {
       fail('editor_configuration_missing');
@@ -194,10 +221,15 @@ export function createOfficeEditorHost({
 
   function receive(event) {
     const data = event.data;
-    if (opened || event.source !== hostWindow.parent || event.origin !== origin ||
-        !data || typeof data !== 'object' || Array.isArray(data) ||
-        Object.keys(data).sort().join(',') !== OPEN_KEYS || data.type !== 'ocu:office-open' ||
-        data.chat_id !== chatId || typeof data.file_id !== 'string' || data.file_id.length === 0 ||
+    if (event.source !== hostWindow.parent || event.origin !== origin ||
+        !data || typeof data !== 'object' || Array.isArray(data) || data.chat_id !== chatId) return;
+    if (data.type === 'ocu:office-command') {
+      if (opened && Object.keys(data).sort().join(',') === COMMAND_KEYS &&
+          data.generation === opened.generation && data.command === 'save') void save();
+      return;
+    }
+    if (opened || Object.keys(data).sort().join(',') !== OPEN_KEYS || data.type !== 'ocu:office-open' ||
+        typeof data.file_id !== 'string' || data.file_id.length === 0 ||
         !Number.isSafeInteger(data.generation) || data.generation < 0) return;
     opened = { fileId: data.file_id, generation: data.generation };
     report();

@@ -26,6 +26,7 @@ let timerId = 0, attempts = 0, resolveCreate, pendingLoad;
 const clone = value => JSON.parse(JSON.stringify(value));
 const signed = {documentType:'word', document:{key:'stable-key',url:'http://private.test/office/source/ticket',fileType:'docx',permissions:{edit:true}},editorConfig:{callbackUrl:'http://private.test/office/callback/chat/session',mode:'edit',customization:{forcesave:false}},token:'signed-configuration-token'};
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
+let currentStatus = clone(initial);
 const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>clone(body)});
 function element(tag) {
   return {tagName:tag.toUpperCase(),children:[],style:{},attributes:{},hidden:false,textContent:'',parentNode:null,
@@ -65,7 +66,12 @@ const open={type:'ocu:office-open',chat_id:chat,file_id:file,generation:7};
 function dispatch(data, changes={}){listeners.get('message')?.({source:hostWindow.parent,origin:hostWindow.location.origin,data,...changes});}
 const fetch=async(url,init={})=>{
   const method=init.method||'GET';const headers=Object.fromEntries(new Headers(init.headers));
-  calls.push({url:String(url),method,headers});order.push('fetch:'+method);
+  const body=init.body?JSON.parse(init.body):null;
+  calls.push({url:String(url),method,headers,body});order.push('fetch:'+method);
+  if(method==='POST'&&String(url).endsWith('/save')){
+    currentStatus={...currentStatus,state:'saving',save_seq:currentStatus.save_seq+1,reason:null};
+    return response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,intent:body.intent});
+  }
   if(method==='POST'){
     if(options.transportError)throw new Error('network failed');
     if(options.deferCreate)return new Promise(resolve=>{resolveCreate=resolve;});
@@ -73,7 +79,7 @@ const fetch=async(url,init={})=>{
     return response(options.joined?200:201,{session_id:'session-id',file_id:file,document_key:'stable-key',state:'opening',joined:Boolean(options.joined),editor_config:options.noConfig?null:clone(signed)});
   }
   if(options.statusError)return response(500,{reason:'state_corrupt'});
-  return response(200,initial);
+  return response(200,currentStatus);
 };
 const context=vm.createContext({window:hostWindow,document:hostDocument,URL,Headers,fetch,console,
   setTimeout:hostWindow.setTimeout,clearTimeout:hostWindow.clearTimeout,queueMicrotask});
@@ -315,3 +321,15 @@ def test_late_api_completion_cannot_resurrect_a_timed_out_open(tmp_path):
     assert result["attempts"] == 0
     assert [row["method"] for row in result["calls"]] == ["POST", "GET"]
     assert result["timers"] == 0
+
+
+def test_parent_publish_command_does_not_acknowledge_uncommitted_edits(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], after=[
+        {"type": "ocu:office-command", "chat_id": CHAT, "generation": 7, "command": "save"},
+    ])
+    saves = [row for row in result["calls"] if row["url"].endswith("/save")]
+    assert len(saves) == 1
+    assert saves[0]["method"] == "POST"
+    assert saves[0]["body"] == {"intent": "publish"}
+    assert _states(result)[-1]["dirty"] is True
+    assert _states(result)[-1]["state"] == "saving"
