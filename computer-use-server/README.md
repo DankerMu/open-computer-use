@@ -73,6 +73,48 @@ reported on the original. Unresolved recovery retains the obligation and returns
 503 `publish_pending`, not a successful list or fabricated orphan. Existing
 final-outcome protections described below still apply.
 
+`POST /api/office/{chat}/documents/{file}/restore` accepts `{"number": n}`,
+where `n` is an integer historical version number (not a boolean, string or
+float). Success returns exactly `{"file_id": file_id, "number": new_number,
+"published": true}`; `new_number` identifies the newly published restore,
+not the selected version. Invalid bodies return 422 `invalid_request`;
+unknown/inactive file identities and absent version numbers return 404
+`unknown_file` and `unknown_version`, respectively, before session mutation.
+
+Restore uses the same epoch, document-key and final-receipt reopen checks as
+create, recovering accepted publication before orphaning. An unreachable key
+returns 502 `documentserver_unavailable` without orphaning; any remaining open
+session returns 409 `session_open`. The original file identity is re-resolved
+after recovery, never replaced with a save-as successor. Missing paths return
+409 `path_missing`; unsafe paths return 503 `unsafe_path`. Neither refusal
+adds a version, follows links or recreates a path.
+
+Inside one canonical publication fence, restore preserves current Agent
+workspace content absent from history as a `workspace` version, then appends
+and publishes a fresh `restore` whose parent is the selected version. Known
+workspace hashes reuse history. Even latest-equal content gets a new restore
+record sharing the selected immutable blob; old records, publication flags
+and blobs are not rewritten. Callback and conflict-overwrite latest-hash
+deduplication remain unchanged. Recovery reuses the accepted restore binding
+and captures intervening Agent content before replacement.
+
+Pause failure returns 503 `pause_failed` and retains a new unpublished restore
+of stored historical content without reading, capturing or modifying workspace
+bytes. Prepared failures before replacement return 503 `storage_low`,
+`index_unavailable` or `publish_timeout`, retaining unpublished content.
+After acceptance, those interruptions before lineage preparation, after
+replacement, or during recovery retain the publication obligation instead of
+claiming rollback; the initiating request returns the specific failure reason.
+Unresolved recovery or uncertain fencing returns 503 `publish_pending`.
+Durability and corrupt-state errors remain explicit 500 `state_durability`
+and `state_corrupt`.
+
+Create drains an accepted restore for that file before admitting an editor;
+unresolved recovery refuses admission with 503 `publish_pending`. Disable new
+Office requests and drain accepted restore obligations before downgrading
+their reader; do not delete history or journals to permit downgrade.
+No restore frontend or gateway integration is provided.
+
 Authenticated status 6 callbacks with recorded `publish` intent and status 2
 callbacks commit their version, receipt and publish obligation together. The
 existing fenced publisher then runs synchronously; terminal conflict or failure

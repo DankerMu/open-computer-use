@@ -93,6 +93,8 @@ def create_session(request: Request) -> JSONResponse:
         return _error(409, "unpublished_version")
     except DocumentServerUnavailableError:
         return _error(502, "documentserver_unavailable")
+    except CommandCompletionPendingError:
+        return _error(503, "publish_pending")
     except (RestoreEpochError, StateCorruptError, CorruptIndexError):
         return _error(500, "state_corrupt")
     except StateDurabilityError:
@@ -169,28 +171,21 @@ def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
         if document_type is None:
             raise UnsupportedTypeError()
         state = store.read(chat)
-        active = _open_session(state, file_id)
-        restore_epoch = epoch.current_epoch()
-        orphaned_here = False
+        state, active, restore_epoch, orphaned_here = _reopen_session(store, chat, file_id, state)
+        if any(entry.get("requester") == "restore" and entry.get("session_id") is None
+               and entry.get("file_id") == file_id for entry in state["journal"].values()):
+            from .publish import RecoveryRequiredError, SandboxStateError, recover_publications
+            try:
+                recover_publications(chat)
+            except (RecoveryRequiredError, SandboxStateError) as extra:
+                raise CommandCompletionPendingError("accepted restore publication remains pending") from extra
+            state = store.read(chat)
+            relative_path = broker.resolve_file_id(chat, file_id)
+            document_type = _document_type(relative_path)
+            if document_type is None:
+                raise UnsupportedTypeError()
+            active = _open_session(state, file_id)
         if active is not None:
-            _status_projection(active)
-            latest = _active_versions(state, file_id)[-1]
-            ended = active["state"] == "conflict" and _final_receipt(state, active["session_id"]) is not None
-            reason = None
-            if active["restore_epoch"] != restore_epoch:
-                reason = "restore_epoch_changed"
-            elif active["state"] != "opening" and not ended:
-                # FastAPI dispatches this synchronous handler on a worker thread.
-                # Keep the blocking chat lock off the application event loop.
-                outcome = asyncio.run(commands.lookup_key(active["document_key"]))
-                if outcome is commands.KeyLookupOutcome.UNREACHABLE:
-                    raise DocumentServerUnavailableError()
-                if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
-                    reason = "editor_state_lost"
-            if reason is not None:
-                state = _orphan_session(store, chat, active["session_id"], reason)
-                active = _require_session(state, active["session_id"])
-                orphaned_here = active["state"] == "orphaned"
             if active["state"] in OPEN_STATES:
                 latest = _active_versions(state, file_id)[-1]
                 ended = active["state"] == "conflict" and _final_receipt(state, active["session_id"]) is not None
@@ -372,6 +367,31 @@ def _final_receipt(state, session_id) -> tuple[int, dict[str, Any]] | None:
     if found is not None:
         _successful_answer(found[1])
     return found
+
+
+def _reopen_session(store, chat, file_id, state):
+    """Apply the canonical create/reopen decision while the caller holds the chat lock."""
+    active = _open_session(state, file_id)
+    restore_epoch = epoch.current_epoch()
+    orphaned_here = False
+    if active is not None:
+        _status_projection(active)
+        _active_versions(state, file_id)[-1]
+        ended = active["state"] == "conflict" and _final_receipt(state, active["session_id"]) is not None
+        reason = None
+        if active["restore_epoch"] != restore_epoch:
+            reason = "restore_epoch_changed"
+        elif active["state"] != "opening" and not ended:
+            outcome = asyncio.run(commands.lookup_key(active["document_key"]))
+            if outcome is commands.KeyLookupOutcome.UNREACHABLE:
+                raise DocumentServerUnavailableError()
+            if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
+                reason = "editor_state_lost"
+        if reason is not None:
+            state = _orphan_session(store, chat, active["session_id"], reason)
+            active = _require_session(state, active["session_id"])
+            orphaned_here = active["state"] == "orphaned"
+    return state, active, restore_epoch, orphaned_here
 
 
 def _recover_session_publications(store, chat, session_id):

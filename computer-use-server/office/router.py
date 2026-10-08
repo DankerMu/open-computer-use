@@ -15,6 +15,7 @@ from . import config
 from .control_plane import admit_callback, serve_source
 from .history import list_versions
 from .resolution import resolve_session
+from .restore import restore_version
 from .sessions import close_session, create_session, save_session, session_status
 
 _SUFFIX_CONVERTOR = "ocu_office_suffix"
@@ -110,6 +111,12 @@ def create_office_router() -> APIRouter:
         f"{OFFICE_PREFIX}{{chat_id}}/documents/{{file_id}}/versions",
         list_versions,
         methods=["GET"],
+        include_in_schema=False,
+    )
+    router.add_api_route(
+        f"{OFFICE_PREFIX}{{chat_id}}/documents/{{file_id}}/restore",
+        restore_version,
+        methods=["POST"],
         include_in_schema=False,
     )
     router.add_api_route(

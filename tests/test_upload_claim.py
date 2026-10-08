@@ -37,6 +37,7 @@ APP_MODULES = {
     "office.save_as", "office.epoch", "office.tokens",
     "office.resolution",
     "office.history",
+    "office.restore",
     "office.commands", "office.sessions", "office.notice",
     "office.ooxml", "office.sweep", "office.control_plane",
     "office.download", "office.callback",

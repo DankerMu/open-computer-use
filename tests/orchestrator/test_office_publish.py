@@ -31,7 +31,7 @@ def _sha(body):
 
 @pytest.fixture(autouse=True)
 def _reload_publish(world):
-    for module in ("office.save_as", "office.publish", "office.resolution", "office.history"):
+    for module in ("office.save_as", "office.publish", "office.resolution", "office.history", "office.restore"):
         if module in sys.modules:
             importlib.reload(sys.modules[module])
 
@@ -403,12 +403,19 @@ def test_invalid_obligation_binding_preserves_everything(world, field, value):
 def test_sessionless_restore_uses_document_baseline_without_touching_sessions(world):
     fixture = _prepared(world)
     def unbind(state):
-        state["journal"][OBLIGATION].update(session_id=None, save_seq=None, requester="restore")
+        state["journal"][OBLIGATION].update(
+            session_id=None, save_seq=None, requester="restore", source_sha256=_sha(SAVED),
+        )
         state["sessions"][SESSION]["baseline_sha256"] = _sha(b"different-session-baseline")
     before = fixture.store.update(CHAT, unbind)
     assert _publish().outcome == "published"
     assert fixture.target.read_bytes() == SAVED
     assert fixture.store.read(CHAT)["sessions"] == before["sessions"]
+    after = fixture.store.read(CHAT)
+    assert after["receipts"] == before["receipts"]
+    assert after["documents"][fixture.file_id]["versions"][:2] == before["documents"][fixture.file_id]["versions"]
+    assert after["documents"][fixture.file_id]["published_version"] == 3
+    assert after["documents"][fixture.file_id]["versions"][2]["source"] == "restore"
 
 
 def test_missing_chat_is_not_recreated(world):
