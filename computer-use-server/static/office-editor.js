@@ -177,7 +177,7 @@ export function createOfficeEditorHost({
 
   function drainQueuedPublish() {
     if (!queuedPublish || queuedPublish.pending || publishRequests || closeRequested || final()) return;
-    if (queuedPublish.sequence === null) {
+    if (!queuedPublish.allocated) {
       queuedPublish = null;
       commandReason = 'session_not_editing';
       report();
@@ -237,7 +237,7 @@ export function createOfficeEditorHost({
     const autoOwner = intent === 'publish' && autoSave && (autoSave.pending ||
       snapshot?.save_seq < autoSave.sequence ||
       snapshot?.state === 'saving' && snapshot.save_seq === autoSave.sequence) ? autoSave : null;
-    const attempt = intent === 'persist' ? { pending: true, sequence: null } : null;
+    const attempt = intent === 'persist' ? { pending: true, sequence: null, allocated: false } : null;
     mutationEpoch++;
     if (attempt) autoSave = attempt;
     else publishRequests++;
@@ -249,6 +249,8 @@ export function createOfficeEditorHost({
       const body = await response.json();
       if (final()) return;
       if (!response.ok) {
+        // This broker failure is returned after allocating and reconciling the save.
+        if (attempt && response.status === 502 && body?.reason === 'documentserver_unavailable') attempt.allocated = true;
         if (command === latestCommand) {
           if (autoOwner && response.status === 409 && body?.reason === 'session_not_editing') queuedPublish = autoOwner;
           else commandReason = reasonOf(body, 'save_failed');
@@ -258,7 +260,10 @@ export function createOfficeEditorHost({
         if (command === latestCommand) commandReason = 'invalid_save_response';
       } else {
         if (command === latestCommand) commandReason = null;
-        if (attempt) attempt.sequence = body.save_seq;
+        if (attempt) {
+          attempt.sequence = body.save_seq;
+          attempt.allocated = true;
+        }
         saveCoverage.set(body.save_seq, requestedModification);
         coverModifications();
         report();

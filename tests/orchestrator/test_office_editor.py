@@ -88,6 +88,10 @@ const fetch=async(url,init={})=>{
     if(options.rejectSave)return response(502,{reason:'documentserver_unavailable'});
     if(currentStatus.state!=='editing')return response(409,{reason:'session_not_editing'});
     currentStatus={...currentStatus,state:'saving',save_seq:options.nextSaveSequence??currentStatus.save_seq+1,reason:null};
+    if(options.deferPersistFailure&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>{
+      currentStatus={...currentStatus,state:'editing'};
+      resolve(response(502,{reason:'documentserver_unavailable'}));
+    };});
     if(options.autoCommit)currentStatus={...currentStatus,state:'editing',last_committed_seq:currentStatus.save_seq,
       last_published_seq:options.equalPublished?currentStatus.save_seq:currentStatus.last_published_seq};
     const reply=response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,intent:body.intent});
@@ -782,5 +786,23 @@ def test_accepted_autosave_owns_retry_before_its_status_is_observed(tmp_path):
     assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
         "persist", "publish", "publish",
     ]
+    assert all(state["reason"] is None for state in result["actionStates"])
+    assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+
+
+def test_failed_owned_autosave_keeps_queued_publication_without_covering_edits(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], deferPersistFailure=True, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"last_committed_seq": 3, "last_published_seq": 3}},
+        {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
+        {"kind": "status", "status": {
+            "state": "editing", "save_seq": 4, "last_committed_seq": 4, "last_published_seq": 4,
+        }},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
+        "persist", "publish", "publish",
+    ]
+    assert all(state["dirty"] for state in result["actionStates"][:5])
     assert all(state["reason"] is None for state in result["actionStates"])
     assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
