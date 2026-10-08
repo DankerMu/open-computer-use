@@ -86,8 +86,10 @@ const fetch=async(url,init={})=>{
   if(method==='POST'&&String(url).endsWith('/save')){
     if(options.saveTransportError)throw new Error('save transport failed');
     if(currentStatus.state!=='editing'){
-      const refusal=response(409,{reason:'session_not_editing',
-        ...(currentStatus.state==='saving'?{blocking_save_seq:currentStatus.save_seq}:{})});
+      const correlation=options.refusalCorrelation===undefined
+        ?(currentStatus.state==='saving'?{blocking_save_seq:currentStatus.save_seq}:{})
+        :options.refusalCorrelation;
+      const refusal=response(409,{reason:'session_not_editing',...correlation});
       if(options.deferPersistRefusal&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>resolve(refusal);});
       return refusal;
     }
@@ -99,7 +101,8 @@ const fetch=async(url,init={})=>{
     }
     if(options.deferPersistFailure&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>{
       if(currentStatus.state==='saving'&&currentStatus.save_seq===allocatedSequence)currentStatus={...currentStatus,state:'editing'};
-      resolve(response(502,{reason:'documentserver_unavailable',save_seq:allocatedSequence}));
+      const correlation=options.failureCorrelation===undefined?{save_seq:allocatedSequence}:options.failureCorrelation;
+      resolve(response(502,{reason:'documentserver_unavailable',...correlation}));
     };});
     if(options.autoCommit)currentStatus={...currentStatus,state:'editing',last_committed_seq:currentStatus.save_seq,
       last_published_seq:options.equalPublished?currentStatus.save_seq:currentStatus.last_published_seq};
@@ -894,4 +897,52 @@ def test_correlated_refusal_distinguishes_a_foreign_successor(tmp_path, cause):
     expected = ["persist", "publish", "publish"] if cause == "owned" else ["persist", "publish"]
     assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
     assert _states(result)[-1]["reason"] == (None if cause == "owned" else "session_not_editing")
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("boundary", ["response", "body", "failure", "failure-body"])
+@pytest.mark.parametrize("timed_out", [False, True])
+@pytest.mark.parametrize("cause", ["owned", "foreign"])
+def test_delayed_auto_reply_cannot_change_refusal_ownership(tmp_path, boundary, timed_out, cause):
+    options = {"deferSave": True} if boundary == "response" else {"deferBody": "save"}
+    if boundary.startswith("failure"):
+        options = {"deferPersistFailure": True}
+        if boundary == "failure-body":
+            options["deferBody"] = "save"
+    publish = {"kind": "command", "command": "save"}
+    ending = {"state": "editing", "reason": "save_timeout" if timed_out else None}
+    if not timed_out:
+        ending["last_committed_seq"] = 3
+    release = [{"kind": "releaseBody"}] if boundary == "body" else [{"kind": "releaseSave"}]
+    if boundary == "failure-body":
+        release.append({"kind": "releaseBody"})
+    result = _run(tmp_path, open=True, modify=[True], **options, actions=[
+        {"kind": "tick", "ms": 300000},
+        *([publish] if cause == "owned" else []),
+        {"kind": "status", "status": ending}, {"kind": "tick", "ms": 1000},
+        {"kind": "status", "status": {"state": "saving", "save_seq": 4, "reason": None}},
+        *([publish] if cause == "foreign" else []), *release,
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    expected = ["persist", "publish", "publish"] if cause == "owned" else ["persist", "publish"]
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
+    assert _states(result)[-1]["reason"] == (None if cause == "owned" else "session_not_editing")
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("value", ["missing", None, True, 0, -1, 3.5, "3", 9007199254740992])
+@pytest.mark.parametrize("response_kind", ["refusal", "failure"])
+def test_unusable_correlation_never_authorizes_a_publishing_retry(tmp_path, value, response_kind):
+    key = "blocking_save_seq" if response_kind == "refusal" else "save_seq"
+    options = {response_kind + "Correlation": {} if value == "missing" else {key: value}}
+    if response_kind == "failure":
+        options["deferPersistFailure"] = True
+    result = _run(tmp_path, open=True, modify=[True], **options, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        *([{"kind": "releaseSave"}] if response_kind == "failure" else []),
+        {"kind": "status", "status": {"state": "editing"}}, {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert _states(result)[-1]["reason"] == "session_not_editing"
     assert _states(result)[-1]["dirty"] is True
