@@ -247,6 +247,42 @@ successful response or a fabricated rollback.
 - `GET /api/outputs/{chat_id}` — Authenticated broker listing: `chat_id`, `files`, `total`, `timestamp`, `revision`, `next_cursor`. Query `cursor` and `limit` (1..1000, default 100). Malformed, out-of-range, or unparseable cursors (including oversized digit runs) return 400; stale cursors return 409. The listing holds one chat lock across pending Office recovery then the ordinary broker reconcile; unavailable recovery returns 503 with `Retry-After: 1` and does not scan. `If-None-Match` uses a weak ETag over the page representation excluding `timestamp`. Each file keeps SPA `modified` seconds for one release and emits `url` as `{OCU_PUBLIC_PREFIX}/files/{chat_id}/{percent-encoded path}`.
 - `POST /api/uploads/{chat_id}/{filename}` — Upload a file into the workspace files directory (`{BASE_DATA_DIR}/{chat_id}/outputs`, mounted at `/mnt/user-data/files`)
 
+#### Office editor host embedding
+
+The authenticated same-origin `/preview/{chat_id}?embed=office` page exposes an
+idle host only: `#office-editor` displays `Office editor idle`. A single Office
+parameter receives Office configuration and CSP when server-side Office is
+enabled; the client additionally requires a parent frame. This surface loads no
+DocumentServer API script and starts no Office protocol, session, polling or save
+behavior. It mounts no Files/Browser/Terminal clients and emits no protocol
+messages; Files selection messages do not activate it.
+
+`officeDocserverOrigin` comes only from `OCU_OFFICE_DOCSERVER_ORIGIN` on the server,
+not a query, parent message or user iframe setting. Browser configuration and
+served local scripts contain no service/model/JWT secrets or derived ticket keys.
+The dedicated policy uses a fresh configuration-script nonce:
+`default-src 'none'`, `script-src 'self' 'nonce-<response nonce>' <DocumentServer origin>`,
+`frame-src <DocumentServer origin>` and `connect-src 'self'`.
+It retains runtime `style-src 'self' 'unsafe-inline'`, `img-src 'self' data: blob:`
+and `font-src 'self' data:`, with `base-uri`, `object-src` and `form-action` all
+`'none'`, and `frame-ancestors 'self'`. Configured API JavaScript, if loaded,
+executes with host-origin privileges; only the cross-origin nested document is
+SOP-separated. See the [Office host trust decision](https://github.com/DankerMu/open-webui/blob/main/docs/decisions/implemented/architecture/2026-10-08-ocu-office-editor-frame.md).
+Generated-content opaque isolation and existing Files/runtime policies are unchanged.
+
+Absent, empty or whitespace-only `OCU_OFFICE_DOCSERVER_URL` keeps Office disabled:
+the preview returns HTTP 200 and displays `Invalid preview embedding`, without a
+DocumentServer origin/configuration or Office CSP. Repeated, mixed, unknown and
+top-level embedding also fails visibly without Office/Files/runtime application
+requests or outgoing messages; enabled single-Office top-level responses still
+carry the Office configuration and policy.
+Only enabled single-Office responses validate the browser origin. Malformed or
+CSP-inexpressible authorities return HTTP 500 with the fixed detail
+`Invalid Office browser origin configuration`, without echoing the value or
+relaxing policy. Bracketed IPv6 URLs are valid URLs but unsupported CSP authorities;
+use a DNS hostname instead, including one resolving to IPv6. This request-time
+CSP validation does not add URL-format startup validation.
+
 #### Files-only preview embedding
 
 Embed the authenticated same-origin `/preview/{chat_id}?embed=files` page in an

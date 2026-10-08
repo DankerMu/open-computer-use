@@ -24,12 +24,13 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Dict, List, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from office.router import OfficeAvailabilityMiddleware, create_office_router
+from office import config as office_config
 from office.control_plane import install_source_access_log_filter
 from office.sweep import sweep_office_publications, sweep_office_sessions
 from ws_recheck import (
@@ -1257,6 +1258,24 @@ async def terminal_ws_proxy(websocket: WebSocket, chat_id: str):
     )
 
 
+def _office_csp_origin() -> str:
+    """Serialize a CSP-compatible HTTP(S) origin, never an arbitrary policy token."""
+    origin = os.environ.get(office_config.OCU_OFFICE_DOCSERVER_ORIGIN, "")
+    # Bracketed IPv6 URLs are not supported CSP host sources; DNS names remain valid.
+    if not re.fullmatch(
+        r"https?://[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*\.?(?::[0-9]+)?",
+        origin,
+        flags=re.IGNORECASE | re.ASCII,
+    ):
+        raise HTTPException(500, "Invalid Office browser origin configuration")
+    try:
+        parsed = urlsplit(origin)
+        parsed.port
+    except ValueError:
+        raise HTTPException(500, "Invalid Office browser origin configuration") from None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 @app.get("/preview/{chat_id}", response_class=HTMLResponse, tags=["Files"])
 async def preview_page(chat_id: str, request: Request, response: Response):
     """
@@ -1270,29 +1289,35 @@ async def preview_page(chat_id: str, request: Request, response: Response):
     api_url = f"{OCU_PUBLIC_PREFIX}/api/outputs/{chat_id}"
     files_base = f"{OCU_PUBLIC_PREFIX}/files/{chat_id}"
     embed = request.query_params.getlist("embed")
-    nonce = secrets.token_urlsafe(24) if len(embed) == 1 and embed[0] in ("browser", "terminal") else None
+    office_origin = _office_csp_origin() if embed == ["office"] and office_config.enabled() else None
+    nonce = secrets.token_urlsafe(24) if office_origin or len(embed) == 1 and embed[0] in ("browser", "terminal") else None
     if nonce:
+        frame_source = office_origin or "'none'"
         response.headers["Content-Security-Policy"] = (
             "default-src 'none'; "
-            f"script-src 'self' 'nonce-{nonce}'; "
+            f"script-src 'self' 'nonce-{nonce}'{f' {office_origin}' if office_origin else ''}; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
             "font-src 'self' data:; "
             "connect-src 'self'; "
-            "frame-src 'none'; "
+            f"frame-src {frame_source}; "
             "base-uri 'none'; "
             "object-src 'none'; "
             "form-action 'none'; "
             "frame-ancestors 'self'"
         )
-    return _generate_preview_html(chat_id, api_url, files_base, nonce)
+    return _generate_preview_html(chat_id, api_url, files_base, nonce, office_origin)
 
 
-def _generate_preview_html(chat_id: str, api_url: str, files_base: str, nonce: Optional[str] = None) -> str:
+def _generate_preview_html(
+    chat_id: str, api_url: str, files_base: str, nonce: Optional[str] = None,
+    office_origin: Optional[str] = None,
+) -> str:
     """Generate the preview SPA HTML page."""
     asset = f"{OCU_PUBLIC_PREFIX}/static"
     describe_url = f"/api/v1/ocu/workspaces/{chat_id}"
     config_nonce = f' nonce="{nonce}"' if nonce else ""
+    office_config_line = f",\n  officeDocserverOrigin: {json.dumps(office_origin)}" if office_origin else ""
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1318,7 +1343,7 @@ window.__CONFIG__ = {{
   apiUrl: {json.dumps(api_url)},
   filesBase: {json.dumps(files_base)},
   chatId: {json.dumps(chat_id)},
-  describeUrl: {json.dumps(describe_url)}
+  describeUrl: {json.dumps(describe_url)}{office_config_line}
 }};
 </script>
 <script type="module" src="{asset}/preview.js"></script>
