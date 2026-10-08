@@ -139,6 +139,88 @@ def test_active_file_without_office_history_returns_empty_without_creating_state
     assert origin.hits == 0
 
 
+def test_versions_refuses_symlinked_chat_root_without_external_mutation(office_world):
+    http, data, origin, _manager, _broker = office_world
+    file_id, _session = _created(office_world)
+    root = data / CHAT
+    detached = data.parent / "detached-chat"
+    outside = data.parent / "external-control-root"
+    outside.mkdir()
+    (outside / "private.txt").write_bytes(b"external content must be conserved")
+    root.rename(detached)
+    root.symlink_to(outside, target_is_directory=True)
+    outside_before = _snapshot(outside)
+    detached_before = _snapshot(detached)
+    before = _snapshot(data)
+
+    _assert_refusal(_listing(http, file_id), 500, "state_corrupt")
+
+    assert _snapshot(outside) == outside_before
+    assert not (outside / ".lifecycle.lock").exists()
+    assert _snapshot(detached) == detached_before
+    assert _snapshot(data) == before
+    assert root.is_symlink()
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("removed_at", ("availability", "lock_open"))
+def test_versions_does_not_recreate_chat_removed_during_admission(office_world, monkeypatch, removed_at):
+    from pathlib import Path
+
+    http, data, origin, _manager, _broker = office_world
+    file_id, _session = _created(office_world)
+    root = data / CHAT
+    detached = data.parent / "removed-chat"
+    before = _snapshot(root)
+    real_is_dir, real_open, real_lstat = Path.is_dir, Path.open, os.lstat
+    removed = False
+    lock_unavailable = False
+
+    def checked_directory(path):
+        nonlocal removed
+        result = real_is_dir(path)
+        if path == root and result and not removed:
+            root.rename(detached)
+            removed = True
+        return result
+
+    def opened(path, *args, **kwargs):
+        nonlocal removed, lock_unavailable
+        if path == root / ".lifecycle.lock" and not removed:
+            root.rename(detached)
+            removed = True
+            try:
+                return real_open(path, *args, **kwargs)
+            except FileNotFoundError:
+                lock_unavailable = True
+                raise
+        return real_open(path, *args, **kwargs)
+
+    def inspected(path, *args, **kwargs):
+        if lock_unavailable and os.fspath(path) == os.fspath(root):
+            pytest.fail("versions inspected chat state after lock acquisition failed")
+        return real_lstat(path, *args, **kwargs)
+
+    with monkeypatch.context() as boundary:
+        if removed_at == "availability":
+            boundary.setattr(Path, "is_dir", checked_directory)
+        else:
+            boundary.setattr(Path, "open", opened)
+            boundary.setattr(os, "lstat", inspected)
+        response = _listing(http, file_id)
+
+    _assert_refusal(response, 404, "unknown_file")
+    assert removed
+    if removed_at == "lock_open":
+        assert lock_unavailable
+    assert not root.exists()
+    assert not (root / ".lifecycle.lock").exists()
+    assert _snapshot(detached) == before
+    assert not (root / ".ocu" / "office").exists()
+    assert origin.hits == 0
+
+
+
 def test_identity_refusals_precede_history_access_and_preserve_both_chats(office_world):
     http, data, origin, _manager, broker = office_world
     gone = _put(data, "gone.docx", b"gone")
@@ -393,6 +475,56 @@ def test_epoch_listing_finishes_save_or_final_obligation_before_orphaning(office
     assert workspace.read_bytes() == (CHANGED if outcome == "published" else content + b"agent")
     assert broker.OutputsBroker().current_revision(CHAT) == revision + (outcome == "published")
     assert origin.hits == 0
+
+
+def test_second_epoch_listing_orphans_recovered_final_conflict(office_world, monkeypatch):
+    from office.store import OfficeStore
+
+    http, data, origin, manager, broker, content, session = _accepted_callback(
+        office_world, monkeypatch, final=True,
+    )
+    workspace = _outputs(data) / "report.docx"
+    workspace.write_bytes(content + b"agent")
+    (data / ".office-restore-epoch").write_text("restored-after-final-acceptance")
+
+    first = _listing(http, session["file_id"])
+    assert first.status_code == 200
+    assert first.json()["open_session"] == {
+        "session_id": session["session_id"], "state": "conflict",
+        "reason": "baseline_mismatch", "editor_ended": True,
+    }
+    assert first.json()["published_version"] == 1
+    assert [(item["number"], item["source"], item["published"]) for item in first.json()["versions"]] == [
+        (1, "workspace", True), (2, "close", False),
+    ]
+    after_recovery = OfficeStore().read(CHAT)
+    assert after_recovery["journal"] == {}
+    assert (after_recovery["sessions"][session["session_id"]]["state"],
+            after_recovery["sessions"][session["session_id"]]["reason"]) == (
+        "conflict", "baseline_mismatch",
+    )
+    outputs_before = _snapshot(_outputs(data))
+    versions_before = _snapshot(_versions(data))
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    calls = list(manager._docker_client.mock_calls)
+
+    second = _listing(http, session["file_id"])
+    assert second.status_code == 200
+    assert second.json() == {
+        **first.json(), "open_session": None,
+    }
+    expected = json.loads(json.dumps(after_recovery))
+    expected["sessions"][session["session_id"]].update(
+        state="orphaned", reason="restore_epoch_changed",
+    )
+    assert OfficeStore().read(CHAT) == expected
+    assert _snapshot(_outputs(data)) == outputs_before
+    assert _snapshot(_versions(data)) == versions_before
+    assert workspace.read_bytes() == content + b"agent"
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+    assert manager._docker_client.mock_calls == calls
+    assert origin.hits == 0
+
 
 
 @pytest.mark.parametrize("ended", (False, True))

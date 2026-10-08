@@ -42,7 +42,10 @@ def list_versions(request: Request) -> JSONResponse:
 def _list_versions(chat_id: str, file_id: str) -> dict:
     chat = docker_manager.canonical_lock_chat_id(chat_id)
     store, broker = OfficeStore(), OutputsBroker()
-    with docker_manager._combined_lock(chat):
+    store._assert_chat_root_safe(chat, allow_missing=True)
+    with docker_manager._combined_lock(chat, create=False) as lock:
+        if lock is None:
+            raise FileIdNotFoundError("chat control root is unavailable")
         broker.resolve_file_id(chat, file_id)
         state = store.read(chat)
         record = sessions._open_session(state, file_id)
