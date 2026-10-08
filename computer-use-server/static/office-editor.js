@@ -299,9 +299,9 @@ export function createOfficeEditorHost({
     syncAutoSave();
     try {
       const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/close`, { method: 'POST', signal: lifetime.signal });
-      if (final()) return;
+      if (disposed) return;
       const body = await response.json();
-      if (final()) return;
+      if (disposed) return;
       if (!response.ok) {
         commandReason = reasonOf(body, 'close_failed');
       } else if (response.status !== 202 || body?.session_id !== sessionId ||

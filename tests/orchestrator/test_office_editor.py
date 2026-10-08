@@ -22,14 +22,19 @@ const chat = options.chat;
 const file = options.file ?? 'document-id';
 const calls = [], messages = [], scripts = [], configs = [], order = [], actionStates = [], actionResources = [];
 const listeners = new Map(), timers = new Map();
-let timerId = 0, attempts = 0, destroyed = 0, resolveCreate, resolveSave, resolveClose, pendingLoad;
+let timerId = 0, attempts = 0, destroyed = 0, resolveCreate, resolveSave, resolveClose, resolveBody, pendingLoad;
 let now = 0, activeStatuses = 0, maxActiveStatuses = 0, statusReads = 0;
 const heldStatuses = [], signals = [];
 const clone = value => JSON.parse(JSON.stringify(value));
 const signed = {documentType:'word', document:{key:'stable-key',url:'http://private.test/office/source/ticket',fileType:'docx',permissions:{edit:true}},editorConfig:{callbackUrl:'http://private.test/office/callback/chat/session',mode:'edit',customization:{forcesave:false}},token:'signed-configuration-token'};
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
 let currentStatus = clone(initial);
-const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>clone(body)});
+const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>{
+  const kind=body?.editor_config!==undefined?'create':body?.workspace_changed!==undefined?'status':
+    body?.intent?'save':body?.session_id&&body?.state?'close':null;
+  if(kind&&options.deferBody===kind)return new Promise(resolve=>{resolveBody=()=>resolve(clone(body));});
+  return clone(body);
+}});
 const createReply=()=>response(options.joined?200:201,{session_id:'session-id',file_id:file,document_key:'stable-key',
   state:'opening',joined:Boolean(options.joined),editor_config:options.noConfig?null:clone(signed)});
 function element(tag) {
@@ -47,6 +52,7 @@ function element(tag) {
               configs.push(config);
               if(options.syncError)config.events.onError({data:{errorCode:-18,errorDescription:'connection lost'}});
               if(options.syncModified)config.events.onDocumentStateChange({data:true});
+              if(options.syncDispose)emit('pagehide');
               config.events.onDocumentReady?.({});
             }
             destroyEditor(){destroyed++;order.push('destroyEditor');}
@@ -121,7 +127,8 @@ async function load(url){
   return module;
 }
 const module=await load('https://webui.test/tools/ocu/static/office-editor.js');await module.evaluate();
-const host=module.namespace.createOfficeEditorHost({chatId:chat,docserverOrigin:options.origin||'https://office.test:8443',container,window:hostWindow,document:hostDocument});
+const mount=()=>module.namespace.createOfficeEditorHost({chatId:chat,docserverOrigin:options.origin||'https://office.test:8443',container,window:hostWindow,document:hostDocument});
+let host=mount();
 const idle=()=>new Promise(resolve=>setImmediate(resolve));
 async function advance(milliseconds){
   const end=now+milliseconds;
@@ -155,16 +162,22 @@ for(const action of options.actions||[]){
   else if(action.kind==='allowClose')options.rejectClose=false;
   else if(action.kind==='pagehide')emit('pagehide');
   else if(action.kind==='releaseCreate')resolveCreate?.();
+  else if(action.kind==='releaseBody'){options.deferBody=null;resolveBody?.();}
+  else if(action.kind==='lateApi'){hostWindow.DocsAPI={DocEditor:class{constructor(){attempts++;}destroyEditor(){destroyed++;}}};pendingLoad?.();}
+  else if(action.kind==='remount'){currentStatus=clone(initial);host=mount();dispatch(open);}
+  else if(action.kind==='dispose')host.dispose();
+  else if(action.kind==='error')configs.at(-1).events.onError({data:{errorCode:-18}});
+  else if(action.kind==='allowStatus')options.holdStatusAfter=undefined;
   else throw new Error('Unknown test action: '+action.kind);
   await idle();
   actionStates.push(clone(messages.at(-1).data));
   actionResources.push({destroyed,timerDelays:[...timers.values()].map(timer=>timer.ms),calls:calls.length,messages:messages.length,
-    listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0)});
+    listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),apiElements:hostDocument.head.children.length});
 }
 const dom=node=>({tag:node.tagName,text:node.textContent,hidden:node.hidden,attributes:node.attributes,children:node.children.map(dom)});
 process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,
   activeStatuses,maxActiveStatuses,beforeLate,destroyed,actionResources,signals:signals.map(signal=>signal.aborted),
-  listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),
+  listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),apiElements:hostDocument.head.children.length,
   timerDelays:[...timers.values()].map(timer=>timer.ms),dom:dom(container)}));
 """
 
@@ -549,3 +562,74 @@ def test_timeout_does_not_revoke_later_cumulative_coverage(tmp_path, later_edit,
     result = _run(tmp_path, open=True, modify=[True], actions=actions)
     assert result["actionStates"][1]["dirty"] is True
     assert result["actionStates"][-1]["dirty"] is later_edit
+
+
+@pytest.mark.parametrize(("options", "before", "release", "had_editor"), [
+    ({"holdStatusAfter": 0}, [], "releaseStatus", False),
+    ({"deferSave": True}, [{"kind": "command", "command": "save"}], "releaseSave", True),
+    ({"deferClose": True}, [{"kind": "command", "command": "close"}], "releaseClose", True),
+    ({"api": "timeout"}, [], "lateApi", False),
+    ({"deferBody": "create"}, [], "releaseBody", False),
+    ({"deferBody": "status"}, [], "releaseBody", False),
+    ({"deferBody": "save"}, [{"kind": "command", "command": "save"}], "releaseBody", True),
+    ({"deferBody": "close"}, [{"kind": "command", "command": "close"}], "releaseBody", True),
+])
+def test_retirement_fences_every_deferred_boundary(tmp_path, options, before, release, had_editor):
+    result = _run(tmp_path, open=True, **options, actions=before + [
+        {"kind": "pagehide"}, {"kind": release}, {"kind": "tick", "ms": 300000},
+        {"kind": "dispose"},
+    ])
+    retired = result["actionResources"][len(before)]
+    assert result["attempts"] == int(had_editor)
+    assert result["destroyed"] == int(had_editor)
+    assert len(result["calls"]) == retired["calls"]
+    assert len(result["messages"]) == retired["messages"]
+    assert result["timers"] == result["listeners"] == result["apiElements"] == result["activeStatuses"] == 0
+    assert result["signals"] and all(result["signals"])
+
+
+def test_constructor_time_disposal_destroys_the_returned_editor_once(tmp_path):
+    result = _run(tmp_path, open=True, syncDispose=True, actions=[
+        {"kind": "modify"}, {"kind": "error"}, {"kind": "dispose"}, {"kind": "tick", "ms": 300000},
+    ])
+    assert result["attempts"] == result["destroyed"] == 1
+    assert result["timers"] == result["listeners"] == result["apiElements"] == 0
+    assert result["actionResources"][0]["messages"] == result["actionResources"][-1]["messages"]
+    assert result["actionResources"][0]["calls"] == result["actionResources"][-1]["calls"]
+    assert all(not row["url"].endswith("/close") for row in result["calls"])
+
+
+def test_twenty_retired_hosts_release_editing_and_saving_resources(tmp_path):
+    actions, retirements = [], []
+    for index in range(20):
+        if index % 2:
+            actions += [{"kind": "modify"}, {"kind": "command", "command": "save"}]
+        retirements.append(len(actions))
+        actions.append({"kind": "dispose"})
+        actions.append({"kind": "tick", "ms": 1000})
+        if index != 19:
+            actions.append({"kind": "remount"})
+    result = _run(tmp_path, open=True, actions=actions)
+    assert result["attempts"] == result["destroyed"] == 20
+    for index in retirements:
+        retired = result["actionResources"][index]
+        assert retired["listeners"] == retired["apiElements"] == 0
+        assert retired["timerDelays"] == []
+        assert result["actionResources"][index + 1]["calls"] == retired["calls"]
+        assert result["actionResources"][index + 1]["messages"] == retired["messages"]
+    assert all(not row["url"].endswith("/close") for row in result["calls"])
+    assert all(result["signals"])
+
+
+def test_terminal_status_before_close_reply_still_releases_accepted_editor(tmp_path):
+    result = _run(tmp_path, open=True, deferClose=True, actions=[
+        {"kind": "command", "command": "close"},
+        {"kind": "status", "status": {"state": "closed"}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "releaseClose"},
+    ])
+    assert result["actionResources"][2]["destroyed"] == 0
+    assert result["destroyed"] == 1
+    assert result["actionStates"][-1]["state"] == "closed"
+    assert result["actionResources"][-1]["calls"] == result["actionResources"][2]["calls"]
+    assert result["actionResources"][-1]["messages"] == result["actionResources"][2]["messages"]
