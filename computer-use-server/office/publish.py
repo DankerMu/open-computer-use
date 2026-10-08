@@ -971,6 +971,8 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
             identity_missing = True
             result = PublishResult("conflict", "path_missing")
         except OutputsBrokerError:
+            if entry["requester"] == "restore":
+                raise
             result = PublishResult("failed", "index_unavailable")
         if "copy" in entry:
             if not writer_excluded:

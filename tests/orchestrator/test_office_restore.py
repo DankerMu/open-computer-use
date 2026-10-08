@@ -588,9 +588,16 @@ def test_safe_boundary_timeout_keeps_prepared_restore_unpublished(office_world, 
     assert not (_office(data) / "fence.json").exists()
 
 
-def test_index_failure_after_replace_retains_obligation_and_unpublished_restore(office_world, monkeypatch):
-    from office.publish import recover_publications
+@pytest.mark.parametrize("recovery", ("direct", "startup", "idle"))
+def test_index_failure_after_replace_retains_obligation_and_unpublished_restore(office_world, monkeypatch, recovery):
+    from office.publish import RecoveryRequiredError, recover_publications
+    from office.sweep import sweep_office_publications, sweep_office_sessions
+    from tests.orchestrator._office_store import _child_env
+    from tests.orchestrator.test_office_restore_recovery import _fresh
     http, data, _origin, _manager, broker, original, session = _closed(office_world, monkeypatch)
+    before = _read(data)
+    history = _snapshot(_versions(data))
+    revision = broker.OutputsBroker().current_revision(CHAT)
     index = data / CHAT / ".ocu" / "index.json"
     index_before = index.read_bytes()
     real_replace = os.replace
@@ -606,11 +613,53 @@ def test_index_failure_after_replace_retains_obligation_and_unpublished_restore(
     assert (_outputs(data) / "report.docx").read_bytes() == original
     assert after["journal"]
     assert after["documents"][session["file_id"]]["versions"][-1]["published"] is False
+    journal_id, = after["journal"]
+    entry = after["journal"][journal_id]
+    binding = {key: entry[key] for key in (
+        "file_id", "requester", "session_id", "save_seq", "version", "source_sha256",
+        "target_path", "initial_revision", "restore_version",
+    )}
+    assert (binding["requester"], binding["session_id"], binding["save_seq"], binding["version"]) == (
+        "restore", None, None, 1,
+    )
+    assert binding["source_sha256"] == before["documents"][session["file_id"]]["versions"][0]["sha256"]
+    assert after["documents"][session["file_id"]]["published_version"] == 2
+    for _ in range(2):
+        if recovery == "direct":
+            with pytest.raises(RecoveryRequiredError):
+                recover_publications(CHAT)
+        elif recovery == "startup":
+            sweep_office_publications()
+        else:
+            sweep_office_sessions()
+        unresolved = _read(data)
+        assert set(unresolved["journal"]) == {journal_id}
+        assert {key: unresolved["journal"][journal_id][key] for key in binding} == binding
+        assert unresolved["documents"] == after["documents"]
+        assert unresolved["sessions"] == after["sessions"] and unresolved["receipts"] == after["receipts"]
+        assert _snapshot(_versions(data)) == history
+        assert (_outputs(data) / "report.docx").read_bytes() == original
+        assert index.read_bytes() == b"{broken"
     index.write_bytes(index_before)
-    recover_publications(CHAT)
+    environment = _child_env(data, RESTORE_FILE=session["file_id"])
+    _fresh(environment)
     completed = _read(data)
     assert completed["journal"] == {}
     assert completed["documents"][session["file_id"]]["published_version"] == 3
+    listed = completed["documents"][session["file_id"]]["versions"]
+    assert listed[:2] == before["documents"][session["file_id"]]["versions"]
+    assert [(item["number"], item["source"], item["parent"], item["published"]) for item in listed[2:]] == [
+        (3, "restore", 1, True),
+    ]
+    assert completed["documents"][session["file_id"]]["published_sha256"] == listed[0]["sha256"]
+    assert completed["sessions"] == before["sessions"] and completed["receipts"] == before["receipts"]
+    assert _snapshot(_versions(data)) == history
+    assert (_outputs(data) / "report.docx").read_bytes() == original
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+    frozen = _snapshot(data)
+    _fresh(environment)
+    recover_publications(CHAT)
+    assert _snapshot(data) == frozen
 
 
 @pytest.mark.parametrize("mutation", ("missing", "link"))

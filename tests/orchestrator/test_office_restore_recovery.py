@@ -320,3 +320,101 @@ def test_create_cannot_admit_editor_when_accepted_restore_cannot_exclude_writer(
     assert after["sessions"] == before["sessions"] and after["documents"] == before["documents"]
     assert after["receipts"] == before["receipts"] and set(after["journal"]) == set(before["journal"])
     assert path.read_bytes() == b"Agent content pending restore"
+
+
+def test_accepted_restore_survives_repeated_index_lookup_failure_without_fabricating_history(
+    office_world, monkeypatch,
+):
+    from office.publish import RecoveryRequiredError, recover_publications
+    http, data, _origin, _manager, broker, original, session = _closed(office_world, monkeypatch)
+    before = _read(data)
+    history = _snapshot(_versions(data))
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    environment = _cut(data, session["file_id"], "accepted")
+    accepted = _read(data)
+    journal_id, = accepted["journal"]
+    entry = accepted["journal"][journal_id]
+    assert (entry["file_id"], entry["requester"], entry["session_id"], entry["save_seq"], entry["version"]) == (
+        session["file_id"], "restore", None, None, 1,
+    )
+    assert entry["source_sha256"] == before["documents"][session["file_id"]]["versions"][0]["sha256"]
+    assert "target_path" not in entry and "restore_version" not in entry
+    assert accepted["documents"] == before["documents"]
+    index = data / CHAT / ".ocu" / "index.json"
+    index_before = index.read_bytes()
+    index.write_bytes(b"{broken")
+    for _ in range(2):
+        with pytest.raises(RecoveryRequiredError):
+            recover_publications(CHAT)
+        unresolved = _read(data)
+        assert unresolved["journal"] == accepted["journal"]
+        assert unresolved["documents"] == before["documents"]
+        assert unresolved["sessions"] == before["sessions"] and unresolved["receipts"] == before["receipts"]
+        assert _snapshot(_versions(data)) == history
+        assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+        assert index.read_bytes() == b"{broken"
+    index.write_bytes(index_before)
+    _fresh(environment)
+    completed = _read(data)
+    document = completed["documents"][session["file_id"]]
+    assert document["versions"][:2] == before["documents"][session["file_id"]]["versions"]
+    assert [(item["number"], item["source"], item["parent"], item["published"]) for item in document["versions"][2:]] == [
+        (3, "restore", 1, True),
+    ]
+    assert document["published_version"] == 3 and document["published_sha256"] == document["versions"][0]["sha256"]
+    assert completed["journal"] == {}
+    assert completed["sessions"] == before["sessions"] and completed["receipts"] == before["receipts"]
+    assert (_outputs(data) / "report.docx").read_bytes() == original
+    assert _snapshot(_versions(data)) == history
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+    frozen = _snapshot(data)
+    _fresh(environment)
+    assert _snapshot(data) == frozen
+
+
+def test_create_first_after_unresolved_index_recovery_preserves_restore_and_never_admits_stale_editor(
+    office_world, monkeypatch,
+):
+    from office.sweep import sweep_office_publications
+    from tests.orchestrator.test_office_sessions import _b64url_decode
+    http, data, _origin, _manager, broker, original, session = _closed(office_world, monkeypatch)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    environment = _cut(data, session["file_id"], "accepted")
+    accepted = _read(data)
+    index = data / CHAT / ".ocu" / "index.json"
+    index_before = index.read_bytes()
+    index.write_bytes(b"{broken")
+    sweep_office_publications()
+    before_create = _snapshot(data)
+    response = _create(http, session["file_id"])
+    assert response.status_code == 500 and response.json() == {"reason": "state_corrupt"}
+    assert _snapshot(data) == before_create
+    unresolved = _read(data)
+    assert unresolved["journal"] == accepted["journal"]
+    assert unresolved["documents"] == accepted["documents"]
+    assert unresolved["sessions"] == accepted["sessions"] and unresolved["receipts"] == accepted["receipts"]
+    assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
+    index.write_bytes(index_before)
+    result = _fresh(environment, "create")
+    response = json.loads(next(line[9:] for line in result.stdout.splitlines() if line.startswith("response=")))
+    assert response["status"] == 201
+    payload = response["body"]
+    assert payload["file_id"] == session["file_id"] and payload["state"] == "opening"
+    ticket = payload["editor_config"]["document"]["url"].rsplit("/", 1)[-1]
+    claims = json.loads(_b64url_decode(ticket.split(".")[1]))
+    assert claims["version"] == 3 and claims["session_id"] == payload["session_id"]
+    completed = _read(data)
+    document = completed["documents"][session["file_id"]]
+    assert completed["journal"] == {} and (_outputs(data) / "report.docx").read_bytes() == original
+    assert document["published_version"] == 3
+    assert document["versions"][:2] == accepted["documents"][session["file_id"]]["versions"]
+    assert [(item["number"], item["source"], item["parent"], item["published"]) for item in document["versions"][2:]] == [
+        (3, "restore", 1, True),
+    ]
+    assert set(completed["sessions"]) == {*accepted["sessions"], payload["session_id"]}
+    assert completed["sessions"][session["session_id"]] == accepted["sessions"][session["session_id"]]
+    assert completed["receipts"] == accepted["receipts"]
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+    frozen = _snapshot(data)
+    _fresh(environment)
+    assert _snapshot(data) == frozen
