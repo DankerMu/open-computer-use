@@ -178,8 +178,8 @@ export function createOfficeEditorHost({
   }
 
   function drainQueuedPublish() {
-    if (!queuedPublish || queuedPublish.pending || publishRequests || closeRequested || final()) return;
-    if (!queuedPublish.allocated) {
+    if (!queuedPublish || queuedPublish.attempt.pending || publishRequests || closeRequested || final()) return;
+    if (queuedPublish.attempt.sequence !== queuedPublish.blockingSequence) {
       queuedPublish = null;
       commandReason = 'session_not_editing';
       report();
@@ -236,10 +236,8 @@ export function createOfficeEditorHost({
     if (!sessionId || closeRequested || final()) return;
     const requestedModification = modification;
     const command = ++latestCommand;
-    const autoOwner = intent === 'publish' && autoSave && (autoSave.pending ||
-      snapshot?.save_seq < autoSave.sequence ||
-      snapshot?.state === 'saving' && snapshot.save_seq === autoSave.sequence) ? autoSave : null;
-    const attempt = intent === 'persist' ? { pending: true, sequence: null, allocated: false } : null;
+    const autoOwner = intent === 'publish' ? autoSave : null;
+    const attempt = intent === 'persist' ? { pending: true, sequence: null } : null;
     mutationEpoch++;
     if (attempt) autoSave = attempt;
     else publishRequests++;
@@ -251,21 +249,20 @@ export function createOfficeEditorHost({
       const body = await response.json();
       if (final()) return;
       if (!response.ok) {
-        // This broker failure is returned after allocating and reconciling the save.
-        if (attempt && response.status === 502 && body?.reason === 'documentserver_unavailable') attempt.allocated = true;
+        if (attempt && response.status === 502 && body?.reason === 'documentserver_unavailable' &&
+            Number.isSafeInteger(body.save_seq) && body.save_seq > 0) attempt.sequence = body.save_seq;
         if (command === latestCommand) {
-          if (autoOwner && response.status === 409 && body?.reason === 'session_not_editing') queuedPublish = autoOwner;
-          else commandReason = reasonOf(body, 'save_failed');
+          if (autoOwner && response.status === 409 && body?.reason === 'session_not_editing' &&
+              Number.isSafeInteger(body.blocking_save_seq) && body.blocking_save_seq > 0) {
+            queuedPublish = { attempt: autoOwner, blockingSequence: body.blocking_save_seq };
+          } else commandReason = reasonOf(body, 'save_failed');
         }
       } else if (response.status !== 202 || body?.session_id !== sessionId ||
           !Number.isSafeInteger(body.save_seq) || body.save_seq < 1 || body.intent !== intent) {
         if (command === latestCommand) commandReason = 'invalid_save_response';
       } else {
         if (command === latestCommand) commandReason = null;
-        if (attempt) {
-          attempt.sequence = body.save_seq;
-          attempt.allocated = true;
-        }
+        if (attempt) attempt.sequence = body.save_seq;
         saveCoverage.set(body.save_seq, requestedModification);
         coverModifications();
         report();

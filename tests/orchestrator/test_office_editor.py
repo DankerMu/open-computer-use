@@ -31,7 +31,7 @@ const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',
 let currentStatus = clone(initial);
 const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>{
   const kind=body?.editor_config!==undefined?'create':body?.workspace_changed!==undefined?'status':
-    body?.intent?'save':body?.session_id&&body?.state?'close':null;
+    body?.intent||body?.reason==='documentserver_unavailable'&&body?.save_seq!==undefined?'save':body?.session_id&&body?.state?'close':null;
   if(kind&&options.deferBody===kind)return new Promise(resolve=>{resolveBody=()=>resolve(clone(body));});
   return clone(body);
 }});
@@ -85,16 +85,21 @@ const fetch=async(url,init={})=>{
   if(init.signal)signals.push(init.signal);
   if(method==='POST'&&String(url).endsWith('/save')){
     if(options.saveTransportError)throw new Error('save transport failed');
-    if(options.rejectSave)return response(502,{reason:'documentserver_unavailable'});
     if(currentStatus.state!=='editing'){
-      const refusal=response(409,{reason:'session_not_editing'});
+      const refusal=response(409,{reason:'session_not_editing',
+        ...(currentStatus.state==='saving'?{blocking_save_seq:currentStatus.save_seq}:{})});
       if(options.deferPersistRefusal&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>resolve(refusal);});
       return refusal;
     }
     currentStatus={...currentStatus,state:'saving',save_seq:options.nextSaveSequence??currentStatus.save_seq+1,reason:null};
-    if(options.deferPersistFailure&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>{
+    const allocatedSequence=currentStatus.save_seq;
+    if(options.rejectSave){
       currentStatus={...currentStatus,state:'editing'};
-      resolve(response(502,{reason:'documentserver_unavailable'}));
+      return response(502,{reason:'documentserver_unavailable',save_seq:allocatedSequence});
+    }
+    if(options.deferPersistFailure&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>{
+      if(currentStatus.state==='saving'&&currentStatus.save_seq===allocatedSequence)currentStatus={...currentStatus,state:'editing'};
+      resolve(response(502,{reason:'documentserver_unavailable',save_seq:allocatedSequence}));
     };});
     if(options.autoCommit)currentStatus={...currentStatus,state:'editing',last_committed_seq:currentStatus.save_seq,
       last_published_seq:options.equalPublished?currentStatus.save_seq:currentStatus.last_published_seq};
@@ -872,4 +877,21 @@ def test_old_autosave_does_not_own_a_later_foreign_allocation(tmp_path, timed_ou
     ])
     assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
     assert _states(result)[-1]["reason"] == "session_not_editing"
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("cause", ["owned", "foreign"])
+def test_correlated_refusal_distinguishes_a_foreign_successor(tmp_path, cause):
+    publish = {"kind": "command", "command": "save"}
+    successor = {"kind": "status", "status": {"state": "saving", "save_seq": 4}}
+    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, actions=[
+        {"kind": "tick", "ms": 300000},
+        *([publish, successor] if cause == "owned" else [successor, publish]),
+        {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    expected = ["persist", "publish", "publish"] if cause == "owned" else ["persist", "publish"]
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
+    assert _states(result)[-1]["reason"] == (None if cause == "owned" else "session_not_editing")
     assert _states(result)[-1]["dirty"] is True
