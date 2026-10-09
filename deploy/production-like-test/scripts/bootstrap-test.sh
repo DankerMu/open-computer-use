@@ -217,36 +217,50 @@ if offenders:
     raise SystemExit(1)
 PY
 
-require_nonempty OCU_WEBUI_ORIGIN
-safe_dotenv_value OCU_WEBUI_ORIGIN "$OCU_WEBUI_ORIGIN"
-python3 - "$OCU_WEBUI_ORIGIN" <<'PY' || fail 'OCU_WEBUI_ORIGIN must be an absolute HTTP(S) origin without path, credentials, query, fragment, or trailing slash'
+require_nonempty ENABLE_OCU_OFFICE_EDIT
+case "$ENABLE_OCU_OFFICE_EDIT" in
+    true|false) ;;
+    *) fail 'ENABLE_OCU_OFFICE_EDIT must be true or false' ;;
+esac
+for name in OCU_WEBUI_ORIGIN OCU_OFFICE_DOCSERVER_ORIGIN; do
+    require_nonempty "$name"
+    safe_dotenv_value "$name" "${!name}"
+done
+python3 - "$OCU_WEBUI_ORIGIN" "$OCU_OFFICE_DOCSERVER_ORIGIN" <<'PY'
 import sys
 from urllib.parse import urlsplit
 
-value = sys.argv[1]
-if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
-    raise SystemExit(1)
-if any(marker in value for marker in ("@", "?", "#")):
-    raise SystemExit(1)
-try:
-    parsed = urlsplit(value)
-    port = parsed.port
-except ValueError:
-    raise SystemExit(1)
-if (
-    parsed.scheme not in {"http", "https"}
-    or not parsed.hostname
-    or parsed.username
-    or parsed.password
-    or parsed.path
-    or parsed.query
-    or parsed.fragment
-    or value.endswith("/")
-    or parsed.netloc != parsed.netloc.lower()
-):
-    raise SystemExit(1)
-if port is not None and not (1 <= port <= 65535):
-    raise SystemExit(1)
+def origin(name, value):
+    error = f"{name} must be an absolute HTTP(S) origin without path, credentials, query, fragment, or trailing slash"
+    if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
+        raise SystemExit(error)
+    if any(marker in value for marker in ("@", "?", "#")):
+        raise SystemExit(error)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise SystemExit(error) from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or value.endswith("/")
+        or parsed.netloc != parsed.netloc.lower()
+    ):
+        raise SystemExit(error)
+    if port is not None and not (1 <= port <= 65535):
+        raise SystemExit(error)
+    return parsed.scheme, parsed.hostname, port or (443 if parsed.scheme == "https" else 80)
+
+webui = origin("OCU_WEBUI_ORIGIN", sys.argv[1])
+documentserver = origin("OCU_OFFICE_DOCSERVER_ORIGIN", sys.argv[2])
+if webui == documentserver:
+    raise SystemExit("OCU_OFFICE_DOCSERVER_ORIGIN must differ from OCU_WEBUI_ORIGIN")
 PY
 
 openwebui_version=${OPENWEBUI_VERSION:-0.11.3}

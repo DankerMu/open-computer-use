@@ -272,6 +272,31 @@ class BootstrapRuntimeTests(unittest.TestCase):
             elif name != "ENABLE_OCU_OFFICE_EDIT":
                 self.assertEqual(snapshots[0][name], snapshots[1][name], name)
 
+    def test_invalid_office_choices_refuse_both_outputs(self):
+        flag_name = "ENABLE_OCU_OFFICE_EDIT"
+        origin_name = "OCU_OFFICE_DOCSERVER_ORIGIN"
+        cases = [(flag_name, value, {}) for value in (None, "", "TRUE", "0", "no")]
+        cases += [(origin_name, value, {}) for value in (
+            None, "", ORIGIN, ORIGIN + ":443", ORIGIN + "/",
+            ORIGIN + "/editor", "https://user:credential-canary@docs.example.test",
+            "https://docs.example.test?", "https://docs.example.test#",
+            "https://docs.example.test:abc", "https://docs.example.test:65536",
+        )]
+        cases += [(origin_name, ORIGIN, {"OCU_WEBUI_ORIGIN": ORIGIN + ":443"})]
+        for name, value, extra in cases:
+            with self.subTest(name=name, value=value):
+                for path in (self.runtime_path(), self.credentials):
+                    if path.exists():
+                        path.unlink()
+                unset = [name] if value is None else None
+                if value is not None:
+                    extra = {**extra, name: value}
+                result = self.run_bootstrap(extra, unset=unset)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stderr)
+                self.assertNotIn("credential-canary", self.combined(result))
+                self.assert_unpublished()
+
     def test_success_emits_consumer_visible_topology_and_shared_token(self):
         result = self.run_bootstrap(
             extra={"OCU_RELEASE_FONTS_DIR": "/unselected/fonts"},
