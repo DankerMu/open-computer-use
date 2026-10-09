@@ -63,6 +63,18 @@ services:
       - documentserver-data:/var/www/onlyoffice/Data
       - documentserver-cache:/var/lib/onlyoffice
       - documentserver-logs:/var/log/onlyoffice
+      - type: bind
+        source: ${OCU_RELEASE_FONTS_DIR:?OCU_RELEASE_FONTS_DIR is required}
+        target: /usr/share/fonts/truetype/ocu-release
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${OCU_OFFICE_FONTS_DIR:?OCU_OFFICE_FONTS_DIR is required}
+        target: /usr/share/fonts/truetype/ocu-operator
+        read_only: true
+        bind:
+          create_host_path: false
     restart: unless-stopped
 
   # The upstream cleanup service stops sandboxes and deletes data/volumes.
