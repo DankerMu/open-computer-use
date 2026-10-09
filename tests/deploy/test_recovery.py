@@ -4,15 +4,19 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import unittest
+from test_deployment_smoke import wait_for
 
 from support import (
     DEFAULT_RELEASE_DIGESTS,
@@ -154,6 +158,8 @@ class RecoveryCliTests(unittest.TestCase):
         self.env.pop("FAKE_ID_UID", None)
         self.env.pop("IMAGE_STORE_LOCK_DIR", None)
         self.env.pop("OCU_RECOVERY_LOCK_DIR", None)
+        self.env.pop("OCU_OFFICE_BACKUP_TIMEOUT_SECONDS", None)
+        self.env.pop("FAKE_DOCKER_HOLD_OFFICE_SHUTDOWN", None)
         self.launcher = self._write_launcher()
         seed_images(self.state)
         seed_healthy_host(self.state)
@@ -210,8 +216,7 @@ class RecoveryCliTests(unittest.TestCase):
 
     def _seed_chat(self):
         live = self.chat_dir / CHAT_ID
-        (live / "uploads").mkdir(parents=True)
-        (live / "outputs").mkdir()
+        (live / "outputs").mkdir(parents=True)
         environment = self.env.copy()
         environment.update(
             {
@@ -232,6 +237,7 @@ class RecoveryCliTests(unittest.TestCase):
                 "    raise AssertionError('broker fixture must not contact Docker')\n"
                 "docker_manager.get_docker_client = forbidden_client\n"
                 "broker = outputs_broker.OutputsBroker()\n"
+                "docker_manager.save_container_meta(sys.argv[2], 'owner@fixture.test', 'owner', '')\n"
                 "for content in (b'first', b'second version', b'broker-bytes\\n'):\n"
                 "    Path(sys.argv[1]).write_bytes(content)\n"
                 "    broker.reconcile(sys.argv[2])\n"
@@ -245,6 +251,52 @@ class RecoveryCliTests(unittest.TestCase):
         self.file_id = index["active"]["result.txt"]["file_id"]
         (self.skills_dir / "demo").mkdir()
         (self.skills_dir / "demo" / "SKILL.md").write_text("skill\n", encoding="utf-8")
+
+    def _seed_office(self, session_state="closed", journal=None, content=b"office-version", parent=None):
+        program = """
+import json, sys
+import docker_manager
+from office.store import OfficeStore
+def forbidden_client():
+    raise AssertionError('Office fixture must not contact Docker')
+docker_manager.get_docker_client = forbidden_client
+store = OfficeStore()
+store.store_version(sys.argv[1], sys.argv[2], bytes.fromhex(sys.argv[5]),
+                    source='close', parent=json.loads(sys.argv[6]), published=True, min_free_bytes=0)
+def seed(state):
+    state['sessions']['session-save'] = {'session_id': 'session-save', 'state': sys.argv[3]}
+    state['journal'] = json.loads(sys.argv[4])
+store.update(sys.argv[1], seed)
+"""
+        subprocess.run(
+            [sys.executable, "-c", program, CHAT_ID, self.file_id, session_state,
+             json.dumps(journal or {}), content.hex(), json.dumps(parent)],
+            env={**self.env, "BASE_DATA_DIR": str(self.chat_dir),
+                 "PYTHONPATH": str(ROOT / "computer-use-server")},
+            capture_output=True, text=True, check=True,
+        )
+        office = self.chat_dir / CHAT_ID / ".ocu/office"
+        return office / "state.json", office / "versions" / hashlib.sha256(content).hexdigest()
+
+    def _observe_office_wait(self, *, expire=False):
+        observer = f"""
+import json, time as real_time
+from pathlib import Path
+from types import SimpleNamespace
+import recovery_resources
+clock = [0.0]
+def observed_sleep(seconds):
+    assert 0 < seconds <= 1, seconds
+    clock[0] += 900 if {expire!r} else seconds
+    Path({str(self.state / 'office-poll.json')!r}).write_text(json.dumps({{'elapsed': clock[0], 'sleep': seconds}}))
+    if not {expire!r}:
+        real_time.sleep(seconds)
+recovery_resources.time = SimpleNamespace(
+    monotonic=(lambda: clock[0]) if {expire!r} else real_time.monotonic,
+    sleep=observed_sleep)
+"""
+        marker = "runpy.run_module('recovery', run_name='__main__')"
+        self.launcher.write_text(self.launcher.read_text().replace(marker, observer + "\n" + marker))
 
     def _volume(self, name: str, files: dict[str, bytes]) -> Path:
         mount = self.state / "volume-data" / name
@@ -265,6 +317,7 @@ class RecoveryCliTests(unittest.TestCase):
         self._volume("ocu-test_open-webui-data", {".computer-use-initialized": b"1\n"})
         self._volume("ocu-test_postgres-data", {"PG_VERSION": b"17\n"})
         self._volume(f"chat-{CHAT_ID}-workspace", {"README.md": b"sandbox-home\n"})
+        self._volume("ocu-test_documentserver-data", {"not-in-backup": b"documentserver-owned"})
         images = DEFAULT_RELEASE_IMAGES
         containers = [
             stack_container(
@@ -284,6 +337,8 @@ class RecoveryCliTests(unittest.TestCase):
                 service="open-webui-init",
             ),
             stack_container("ocu-test-proxy", image=images["proxy"], service="proxy"),
+            stack_container("ocu-test-documentserver-1", image=images["documentserver"],
+                            service="documentserver"),
             stack_container(
                 "ocu-test-open-webui-1",
                 image=images["open-webui"],
@@ -556,7 +611,7 @@ class RecoveryCliTests(unittest.TestCase):
                                "--runtime-file", str(self.runtime)])
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def run_cli(self, args, extra=None, uid="0"):
+    def _cli_env(self, extra=None, uid="0"):
         env = dict(self.env)
         env["OCU_TEST_EUID"] = uid
         env["DEPLOY_ROOT"] = str(self.deploy_root)
@@ -565,6 +620,10 @@ class RecoveryCliTests(unittest.TestCase):
         if extra:
             env.update(extra)
         env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+        return env
+
+    def run_cli(self, args, extra=None, uid="0"):
+        env = self._cli_env(extra, uid)
         return subprocess.run(
             [sys.executable, str(self.launcher), *args],
             cwd=str(ROOT),
@@ -576,6 +635,9 @@ class RecoveryCliTests(unittest.TestCase):
         )
 
     def test_full_cold_capture_includes_detached_workspace(self):
+        office_state, version = self._seed_office()
+        before = {path.relative_to(self.chat_dir).as_posix(): path.read_bytes()
+                  for path in self.chat_dir.rglob("*") if path.is_file()}
         dest = self.root / "backup-running"
         result = self.run_cli(
             [
@@ -597,6 +659,304 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertNotIn("docker start", (self.state / "ops.log").read_text(encoding="utf-8"))
         self.assertEqual(stat.S_IMODE(dest.stat().st_mode), 0o700)
         self.assertNotIn(PROVIDER_A, result.stdout + result.stderr)
+        calls = ops(self.state)
+        command = "docker exec ocu-test-documentserver-1 /usr/bin/documentserver-prepare4shutdown.sh"
+        self.assertIn(command, calls)
+        self.assertLess(calls.index("docker stop --time 30 ocu-test-proxy"), calls.index(command))
+        for name in ("ocu-test-documentserver-1", "ocu-test-computer-use-server",
+                     "ocu-test-open-webui-1"):
+            self.assertGreater(calls.index("docker stop --time 30 " + name), calls.index(command))
+        observed = json.loads((self.state / "office-shutdown.json").read_text())
+        self.assertTrue(observed["ocu_running"])
+        self.assertFalse(observed["proxy_running"])
+        self.assertEqual(set(manifest["components"]), {
+            "database", "webui-data", "chat-data", "skills-cache", "workspaces",
+            "runtime-config", "admin-config", "release-inventory", "version-record",
+        })
+        self.assertNotIn("documentserver-data", json.dumps(manifest))
+        self.assertFalse((self.chat_dir / CHAT_ID / "uploads").exists())
+        with tarfile.open(dest / "chat-data.tar.gz") as archive:
+            captured = {member.name.removeprefix("./"): archive.extractfile(member).read()
+                        for member in archive.getmembers() if member.isfile()}
+        self.assertEqual(captured, before)
+        self.assertEqual(office_state.read_bytes(), before[office_state.relative_to(self.chat_dir).as_posix()])
+        self.assertEqual(version.read_bytes(), b"office-version")
+
+    def test_office_blockers_or_failed_shutdown_leave_writers_stopped_without_capture(self):
+        self._observe_office_wait(expire=True)
+        for cause in ("opening", "editing", "saving", "closing", "journal", "command"):
+            with self.subTest(cause=cause):
+                self._seed_volumes_and_db()
+                journal = {"pending-journal": {"session_id": "session-save"}} if cause == "journal" else {}
+                path, _blob = self._seed_office(
+                    "closed" if cause == "journal" else ("saving" if cause == "command" else cause),
+                    journal)
+                before = path.read_bytes()
+                if cause == "command":
+                    (self.state / "exec.jsonl").write_text(json.dumps({
+                        "container": "ocu-test-documentserver-1",
+                        "match": "/usr/bin/documentserver-prepare4shutdown.sh",
+                        "code": 17, "stderr": "command-output-secret",
+                    }) + "\n")
+                dest = self.root / ("refused-" + cause)
+                result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                                       "--destination", str(dest), "--runtime-file", str(self.runtime)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(CHAT_ID, result.stderr)
+                self.assertIn("pending-journal" if cause == "journal" else "session-save", result.stderr)
+                self.assertNotIn("command-output-secret", result.stderr)
+                self.assertFalse(dest.exists())
+                self.assertEqual(path.read_bytes(), before)
+                for row in json.loads((self.state / "containers.json").read_text()):
+                    if row["Name"] != "ocu-test-postgres-1":
+                        self.assertFalse(row["State"]["Running"], row["Name"])
+                        self.assertFalse(row["State"]["Paused"], row["Name"])
+                self.assertFalse(any("pg_dump" in call or " capture " in call for call in ops(self.state)))
+                if cause != "command":
+                    observed = json.loads((self.state / "office-poll.json").read_text())
+                    self.assertEqual(observed["elapsed"], 900)
+
+    def test_office_drain_captures_version_committed_during_wait(self):
+        self._seed_office("saving")
+        self._observe_office_wait()
+        content = b"final callback version"
+
+        def commit_callback():
+            self.assertTrue(wait_for(lambda: (self.state / "office-poll.json").exists()))
+            return self._seed_office("closed", content=content, parent=1)
+
+        dest = self.root / "drained-backup"
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            committed = executor.submit(commit_callback)
+            result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                                   "--destination", str(dest), "--runtime-file", str(self.runtime)])
+            state_path, blob = committed.result(timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with tarfile.open(dest / "chat-data.tar.gz") as archive:
+            captured = {member.name.removeprefix("./"): archive.extractfile(member).read()
+                        for member in archive.getmembers() if member.isfile()}
+        self.assertEqual(captured[blob.relative_to(self.chat_dir).as_posix()], content)
+        self.assertEqual(captured[state_path.relative_to(self.chat_dir).as_posix()], state_path.read_bytes())
+        self.assertEqual(json.loads(state_path.read_text())["sessions"]["session-save"]["state"], "closed")
+
+    def test_documentserver_identity_is_checked_before_any_stop(self):
+        path = self.state / "containers.json"
+        for defect in ("image", "service"):
+            with self.subTest(defect=defect):
+                self._seed_volumes_and_db()
+                containers = json.loads(path.read_text())
+                documentserver = next(row for row in containers if row["Name"] == "ocu-test-documentserver-1")
+                if defect == "image":
+                    documentserver["Image"] = "sha256:" + "0" * 64
+                else:
+                    documentserver["Config"]["Labels"]["com.docker.compose.service"] = "foreign"
+                path.write_text(json.dumps(containers))
+                before = path.read_bytes()
+                dest = self.root / ("wrong-documentserver-" + defect)
+                result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                                       "--destination", str(dest), "--runtime-file", str(self.runtime)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("ocu-test-documentserver-1", result.stderr)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertFalse((self.state / "stopped.log").exists())
+                self.assertFalse(dest.exists())
+
+    def test_cancellation_during_shutdown_reaps_exec_and_stops_writers(self):
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=signum):
+                self._seed_volumes_and_db()
+                self._seed_office("saving")
+                entered = self.state / "entered-office-shutdown"
+                entered.unlink(missing_ok=True)
+                hold = self.state / "hold-office"
+                hold.touch()
+                dest = self.root / ("cancelled-" + str(signum))
+                process = subprocess.Popen(
+                    [sys.executable, str(self.launcher), "backup",
+                     "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+                     "--runtime-file", str(self.runtime)],
+                    cwd=ROOT, env=self._cli_env({"FAKE_DOCKER_HOLD_OFFICE_SHUTDOWN": str(hold)}),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+                )
+                try:
+                    self.assertTrue(wait_for(entered.exists, timeout=10))
+                    child = int(entered.read_text())
+                    process.send_signal(signum)
+                    try:
+                        stdout, stderr = process.communicate(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        self.fail("shutdown cancellation did not release the owned Docker CLI")
+                    self.assertEqual(process.returncode, 128 + signum, stdout + stderr)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(child, 0)
+                    for row in json.loads((self.state / "containers.json").read_text()):
+                        if row["Name"] != "ocu-test-postgres-1":
+                            self.assertFalse(row["State"]["Running"], row["Name"])
+                    self.assertFalse(dest.exists())
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=5)
+                    hold.unlink(missing_ok=True)
+
+    def test_owned_docker_timeout_reaps_shutdown_process(self):
+        hold = self.state / "hold-office"
+        hold.touch()
+        entered = self.state / "entered-office-shutdown"
+        code = """
+import recovery, subprocess
+try:
+    recovery.docker("exec", "ocu-test-documentserver-1",
+                    "/usr/bin/documentserver-prepare4shutdown.sh", timeout=0.5)
+except subprocess.TimeoutExpired:
+    print("owned deadline")
+else:
+    raise AssertionError("shutdown command escaped its deadline")
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-c", code], cwd=ROOT,
+            env=self._cli_env({"FAKE_DOCKER_HOLD_OFFICE_SHUTDOWN": str(hold)}),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout.strip(), "owned deadline")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(entered.read_text()), 0)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+            hold.unlink(missing_ok=True)
+
+    def test_office_timeout_configuration_refuses_before_mutation(self):
+        import runpy
+        import recovery_resources
+        liveness = runpy.run_path(str(ROOT / "computer-use-server/office/config.py"))[
+            "SESSION_LIVENESS_INTERVAL_SECONDS"]
+        self.assertEqual(recovery_resources.OFFICE_LIVENESS_SECONDS, liveness)
+        self.assertGreater(recovery_resources.OFFICE_QUIESCE_TIMEOUT_SECONDS, liveness)
+        before = (self.state / "containers.json").read_bytes()
+        for value in ("", "invalid", "nan", "inf", "-inf", "-1", str(liveness)):
+            with self.subTest(value=value):
+                dest = self.root / "invalid-timeout"
+                result = self.run_cli(
+                    ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+                     "--runtime-file", str(self.runtime)],
+                    {"OCU_OFFICE_BACKUP_TIMEOUT_SECONDS": value})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("OCU_OFFICE_BACKUP_TIMEOUT_SECONDS", result.stderr)
+                self.assertEqual((self.state / "containers.json").read_bytes(), before)
+                self.assertFalse((self.state / "stopped.log").exists())
+                self.assertFalse(dest.exists())
+
+    def test_unsafe_office_state_cannot_certify_quiescence(self):
+        state, _ = self._seed_office()
+        good = state.read_bytes()
+        outside = self.root / "outside-state"
+        outside.write_bytes(good)
+        for defect in ("malformed", "schema", "duplicate", "symlink", "fifo", "directory"):
+            with self.subTest(defect=defect):
+                self._seed_volumes_and_db()
+                if state.is_dir():
+                    state.rmdir()
+                else:
+                    state.unlink(missing_ok=True)
+                if defect == "malformed":
+                    state.write_text("{")
+                elif defect == "schema":
+                    payload = json.loads(good)
+                    payload["schema_version"] = 2
+                    state.write_text(json.dumps(payload))
+                elif defect == "duplicate":
+                    state.write_text('{"schema_version":1,"schema_version":1}')
+                elif defect == "symlink":
+                    state.symlink_to(outside)
+                elif defect == "fifo":
+                    os.mkfifo(state)
+                else:
+                    state.mkdir()
+                dest = self.root / ("unsafe-office-" + defect)
+                result = self.run_cli(
+                    ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+                     "--runtime-file", str(self.runtime)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("cannot safely read Office state", result.stderr)
+                self.assertIn(CHAT_ID, result.stderr)
+                self.assertFalse(dest.exists())
+                self.assertEqual(outside.read_bytes(), good)
+                for row in json.loads((self.state / "containers.json").read_text()):
+                    if row["Name"] != "ocu-test-postgres-1":
+                        self.assertFalse(row["State"]["Running"], row["Name"])
+
+    def test_terminal_office_sessions_without_journal_allow_capture(self):
+        for status in ("closed", "error", "orphaned", "conflict"):
+            with self.subTest(status=status):
+                self._seed_volumes_and_db()
+                state, _ = self._seed_office(status)
+                before = state.read_bytes()
+                dest = self.root / ("terminal-office-" + status)
+                result = self.run_cli(
+                    ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+                     "--runtime-file", str(self.runtime)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(state.read_bytes(), before)
+                self.assertTrue((dest / "recovery.json").is_file())
+
+    def test_documentserver_stop_failure_does_not_skip_other_writer_stops(self):
+        for status in ("running", "paused", "stop-error"):
+            with self.subTest(status=status):
+                self._seed_volumes_and_db()
+                self._seed_office()
+                path = self.state / "containers.json"
+                rows = json.loads(path.read_text())
+                ds = next(row for row in rows if row["Name"] == "ocu-test-documentserver-1")
+                if status == "stop-error":
+                    ds["unstoppable"] = True
+                else:
+                    ds["after_stop_state"] = {"Status": status, "Running": status == "running",
+                                              "Paused": status == "paused"}
+                path.write_text(json.dumps(rows))
+                dest = self.root / ("surviving-documentserver-" + status)
+                result = self.run_cli(
+                    ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+                     "--runtime-file", str(self.runtime)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("ocu-test-documentserver-1", result.stderr)
+                self.assertFalse(dest.exists())
+                for row in json.loads(path.read_text()):
+                    if row["Name"] not in ("ocu-test-postgres-1", "ocu-test-documentserver-1"):
+                        self.assertFalse(row["State"]["Running"], row["Name"])
+                self.assertFalse(any("pg_dump" in op for op in ops(self.state)))
+
+    def test_late_office_journal_after_drain_prevents_capture(self):
+        state, _ = self._seed_office()
+        hold = self.state / "hold-stop"
+        hold.touch()
+        entered = self.state / "entered-stop"
+        dest = self.root / "late-office"
+        def commit_late_obligation():
+            self.assertTrue(wait_for(entered.exists, timeout=10))
+            payload = json.loads(state.read_text())
+            payload["journal"]["late-save"] = {"kind": "publish"}
+            staged = state.with_suffix(".pending")
+            staged.write_text(json.dumps(payload))
+            staged.replace(state)
+            hold.unlink()
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            pending = workers.submit(commit_late_obligation)
+            result = self.run_cli(
+                ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+                 "--runtime-file", str(self.runtime)],
+                {"FAKE_DOCKER_HOLD_STOP": str(hold),
+                 "FAKE_DOCKER_HOLD_STOP_TARGET": "ocu-test-documentserver-1"})
+            pending.result()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("late-save", result.stderr)
+        self.assertIn("Office state changed before capture", result.stderr)
+        self.assertFalse(dest.exists())
+        self.assertIn("late-save", json.loads(state.read_text())["journal"])
 
     def test_detached_volume_is_captured_without_sandbox_container(self):
         self._seed_volumes_and_db(running_sandbox=False)
@@ -658,6 +1018,8 @@ class RecoveryCliTests(unittest.TestCase):
 
         chat_only = self.chat_dir / "chat-unlaunched"
         chat_only.mkdir()
+        # A second maintenance run follows an operator start, not the stopped backup state.
+        (self.state / "containers.json").write_text(json.dumps(containers), encoding="utf-8")
         dest2 = self.root / "backup-unlaunched"
         result = self.run_cli(
             [
@@ -1005,7 +1367,6 @@ class RecoveryCliTests(unittest.TestCase):
         other = "chat-other"
         self._volume(f"chat-{other}-workspace", {"README.md": b"other-home\n"})
         extra = sandbox(f"owui-chat-{other}", other, running=False, chat_dir=self.chat_dir)
-        (self.chat_dir / other / "uploads").mkdir(parents=True)
         (self.chat_dir / other / "outputs").mkdir(parents=True)
         self._seed_volumes_and_db(running_sandbox=False, extra_containers=[extra])
         backup = self.root / "two-chat-backup"
@@ -1071,7 +1432,6 @@ class RecoveryCliTests(unittest.TestCase):
         other = "chat-other"
         self._volume(f"chat-{other}-workspace", {"README.md": b"other-home\n"})
         extra = sandbox(f"owui-chat-{other}", other, running=False, chat_dir=self.chat_dir)
-        (self.chat_dir / other / "uploads").mkdir(parents=True)
         (self.chat_dir / other / "outputs").mkdir(parents=True)
         self._seed_volumes_and_db(running_sandbox=False, extra_containers=[extra])
         backup = self.root / "keep-two-backup"

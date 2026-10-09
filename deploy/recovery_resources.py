@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -18,6 +20,116 @@ import recovery_db
 import recovery_fs
 import release
 from recovery import RecoveryError, docker, require_command, sha256_file
+
+# Leave the broker's 600-second liveness interval for final callback recovery.
+# Cross-component tests bind this floor to office/config.py without importing the app.
+OFFICE_LIVENESS_SECONDS = 600
+OFFICE_QUIESCE_TIMEOUT_SECONDS = 900
+OFFICE_SHUTDOWN_COMMAND = "/usr/bin/documentserver-prepare4shutdown.sh"
+
+
+def _office_timeout() -> float:
+    name = "OCU_OFFICE_BACKUP_TIMEOUT_SECONDS"
+    try:
+        value = float(os.environ.get(name, str(OFFICE_QUIESCE_TIMEOUT_SECONDS)))
+    except ValueError:
+        raise RecoveryError(f"{name} must exceed the Office liveness interval") from None
+    if not math.isfinite(value) or value <= OFFICE_LIVENESS_SECONDS:
+        raise RecoveryError(f"{name} must exceed the Office liveness interval")
+    return value
+
+
+def _office_blockers(root: Path) -> dict:
+    blockers = {}
+    chat = "deployment"
+    directories = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        with ExitStack() as roots:
+            root_fd = os.open(root, directories)
+            roots.callback(os.close, root_fd)
+            for child in sorted(os.listdir(root_fd)):
+                if not stat.S_ISDIR(os.stat(child, dir_fd=root_fd, follow_symlinks=False).st_mode):
+                    continue
+                chat = recovery.canonical_chat_id(child)
+                with ExitStack() as held:
+                    parent = root_fd
+                    try:
+                        for part in (child, ".ocu", "office"):
+                            parent = os.open(part, directories, dir_fd=parent)
+                            held.callback(os.close, parent)
+                        fd = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                     dir_fd=parent)
+                    except FileNotFoundError:
+                        continue
+                    held.callback(os.close, fd)
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise ValueError("not a regular state file")
+                    with os.fdopen(fd, encoding="utf-8", closefd=False) as stream:
+                        # int rejects the JSON decoder's nonstandard NaN/Infinity constants.
+                        state = json.load(stream, object_pairs_hook=release._reject_duplicate_keys,
+                                          parse_constant=int)
+                collections = {"documents", "sessions", "receipts", "journal"}
+                if (not isinstance(state, dict) or set(state) != collections | {"schema_version"}
+                        or type(state["schema_version"]) is not int or state["schema_version"] != 1
+                        or any(not isinstance(state[name], dict) for name in collections)):
+                    raise ValueError("unsupported Office state")
+                opened = []
+                for session_id, record in state["sessions"].items():
+                    if (not isinstance(record, dict) or record.get("state") not in
+                            ("opening", "editing", "saving", "closing", "closed", "error", "orphaned", "conflict")):
+                        raise ValueError("invalid Office session")
+                    if record["state"] in ("opening", "editing", "saving", "closing"):
+                        opened.append(session_id)
+                if opened or state["journal"]:
+                    blockers[chat] = {"sessions": sorted(opened), "journal": sorted(state["journal"])}
+    except (OSError, ValueError, UnicodeError, release.ReleaseError) as exc:
+        raise RecoveryError(f"cannot safely read Office state for {chat}") from exc
+    return blockers
+
+
+def _wait_for_office(root: Path, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        blockers = _office_blockers(root)
+        if not blockers:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RecoveryError("Office quiescence timed out: " + json.dumps(blockers, sort_keys=True))
+        time.sleep(min(1.0, remaining))
+
+
+def _host_chats(identity: dict) -> set[str]:
+    return {
+        recovery.canonical_chat_id(child.name)
+        for child in identity["chat_dir"].iterdir()
+        if child.is_dir() and not child.is_symlink()
+    } if identity["chat_dir"].exists() else set()
+
+
+def _stop_after_office_failure(identity: dict, writers: list[str], known: list[dict],
+                              chats: set[str]) -> list[str]:
+    errors = []
+    for name in [identity["proxy_container"], *writers]:
+        try:
+            _stop_writer(name)
+        except (RecoveryError, release.ReleaseError, OSError) as exc:
+            errors.append(str(exc))
+    candidates = {item["id"]: item for item in known}
+    try:
+        chats |= _host_chats(identity)
+        candidates.update({item["id"]: item for item in discover_sandboxes()})
+    except (RecoveryError, release.ReleaseError, OSError) as exc:
+        errors.append(str(exc))
+    for sandbox in candidates.values():
+        try:
+            payload = inspect_container(sandbox["id"])
+            if not _sandbox_attributed({**sandbox, "payload": payload}, identity, chats):
+                raise RecoveryError(f"sandbox {sandbox['name']} cannot be attributed during failure cleanup")
+            _stop_writer(sandbox["id"])
+        except (RecoveryError, release.ReleaseError, OSError) as exc:
+            errors.append(str(exc))
+    return errors
 
 
 def _json_command(*args: str):
@@ -159,6 +271,7 @@ def deployment_identity(runtime: dict[str, str], deploy_root: Path) -> dict:
         "retention_container": "ocu-test-retention-guard",
         "init_container": "ocu-test-open-webui-init",
         "proxy_container": "ocu-test-proxy",
+        "documentserver_container": recovery.compose_name(project, "documentserver"),
     }
 
 
@@ -276,6 +389,20 @@ def _stop_container(name: str) -> None:
         raise RecoveryError(f"{name} remained active after stop")
 
 
+def _stop_writer(name: str) -> None:
+    result = docker("inspect", name)
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().lower()
+        if "no such" in detail or "not found" in detail:
+            return
+        raise RecoveryError(f"cannot inspect {name}")
+    payload = inspect_container(name)
+    if container_paused(payload):
+        raise RecoveryError(f"{name} is paused and cannot be captured")
+    if container_running(payload):
+        _stop_container(name)
+
+
 def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inventory: dict) -> None:
     expected_images = {
         identity["server_container"]: inventory["images"]["computer-use-server"]["configuration_digest"],
@@ -283,6 +410,7 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
         identity["init_container"]: inventory["images"]["open-webui"]["configuration_digest"],
         identity["webui_container"]: inventory["images"]["open-webui"]["configuration_digest"],
         identity["proxy_container"]: inventory["images"]["proxy"]["configuration_digest"],
+        identity["documentserver_container"]: inventory["images"]["documentserver"]["configuration_digest"],
         identity["postgres_container"]: inventory["images"]["postgres"]["configuration_digest"],
     }
     expected_services = {
@@ -291,6 +419,7 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
         identity["init_container"]: "open-webui-init",
         identity["webui_container"]: "open-webui",
         identity["proxy_container"]: "proxy",
+        identity["documentserver_container"]: "documentserver",
         identity["postgres_container"]: "postgres",
     }
     inspected = set()
@@ -340,25 +469,23 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
             actual_source = mount.get("Name") if kind == "volume" else mount.get("Source")
             if mount.get("Type") != kind or actual_source != expected_source or mount.get("RW") is not True:
                 raise RecoveryError(f"{name} required data mount does not match runtime")
-    required = {identity["server_container"], identity["webui_container"], identity["postgres_container"]}
+    required = {identity["server_container"], identity["webui_container"],
+                identity["postgres_container"], identity["documentserver_container"]}
     if not required.issubset(inspected):
         raise RecoveryError("required deployment data services could not be inspected")
 
 
 def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dict) -> dict:
+    timeout = _office_timeout()
     _require_stack_matches_runtime(identity, runtime, inventory)
     writers = [
         identity["init_container"],
         identity["retention_container"],
+        identity["documentserver_container"],
         identity["server_container"],
         identity["webui_container"],
-        identity["proxy_container"],
     ]
-    host_chats = {
-        recovery.canonical_chat_id(child.name)
-        for child in identity["chat_dir"].iterdir()
-        if child.is_dir() and not child.is_symlink()
-    } if identity["chat_dir"].exists() else set()
+    host_chats = _host_chats(identity)
     initial = discover_sandboxes()
     seen_chats = set()
     for sandbox in initial:
@@ -367,26 +494,40 @@ def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dic
         seen_chats.add(sandbox["chat_id"])
         if container_paused(sandbox["payload"]):
             raise RecoveryError(f"{sandbox['name']} is paused and cannot be captured")
+    try:
+        return _quiesce_and_discover(identity, writers, timeout)
+    except BaseException as failure:
+        errors = _stop_after_office_failure(identity, writers, initial, host_chats)
+        if isinstance(failure, (SystemExit, KeyboardInterrupt)):
+            if errors:
+                recovery.report("; ".join(errors))
+            raise
+        try:
+            blockers = _office_blockers(identity["chat_dir"])
+            detail = "Office blockers: " + json.dumps(blockers, sort_keys=True)
+        except RecoveryError as exc:
+            detail = str(exc)
+        reason = str(failure) if isinstance(failure, RecoveryError) else type(failure).__name__
+        raise RecoveryError("; ".join([reason, detail, *errors])) from failure
+
+
+def _quiesce_and_discover(identity: dict, writers: list[str], timeout: float) -> dict:
+    proxy = identity["proxy_container"]
+    _stop_writer(proxy)
+    server = inspect_required_container(identity["server_container"])
+    if not container_running(server) or container_paused(server):
+        raise RecoveryError("OCU must remain running for Office shutdown")
+    shutdown = docker("exec", identity["documentserver_container"],
+                      OFFICE_SHUTDOWN_COMMAND, timeout=timeout)
+    if shutdown.returncode:
+        raise RecoveryError("DocumentServer shutdown-preparation command failed")
+    _wait_for_office(identity["chat_dir"], timeout)
     for name in writers:
-        result = docker("inspect", name)
-        if result.returncode != 0:
-            detail = (result.stderr or "").strip().lower()
-            if "no such" in detail or "not found" in detail:
-                continue
-            raise RecoveryError(f"cannot inspect {name}")
-        payload = inspect_container(name)
-        if container_paused(payload):
-            raise RecoveryError(f"{name} is paused and cannot be captured")
-        if container_running(payload):
-            _stop_container(name)
+        _stop_writer(name)
     postgres = inspect_required_container(identity["postgres_container"])
     if not container_running(postgres) or container_paused(postgres):
         raise RecoveryError("postgres must remain available for dump")
-    host_chats = set()
-    if identity["chat_dir"].exists():
-        for child in sorted(identity["chat_dir"].iterdir()):
-            if child.is_dir() and not child.is_symlink():
-                host_chats.add(recovery.canonical_chat_id(child.name))
+    host_chats = _host_chats(identity)
     first = discover_sandboxes()
     if len({item["chat_id"] for item in first}) != len(first):
         raise RecoveryError("ambiguous sandbox ownership after admission shutdown")
@@ -422,13 +563,18 @@ def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dic
             raise RecoveryError(
                 f"sandbox {sandbox['name']} cannot be attributed to the selected deployment"
             )
-    for name in writers:
+    for name in [proxy, *writers]:
         result = docker("inspect", name)
         if result.returncode != 0:
-            continue
+            if "No such" in result.stderr or "not found" in result.stderr:
+                continue
+            raise RecoveryError(f"could not verify stopped writer {name}")
         payload = inspect_container(name)
-        if container_running(payload):
+        if container_running(payload) or container_paused(payload):
             raise RecoveryError(f"{name} remained active at capture")
+    blockers = _office_blockers(identity["chat_dir"])
+    if blockers:
+        raise RecoveryError("Office state changed before capture: " + json.dumps(blockers, sort_keys=True))
     chats = set(host_chats)
     for item in attributed:
         chats.add(item["chat_id"])
@@ -743,6 +889,7 @@ def colliding_resources(identity: dict) -> list[str]:
     for name in recovery.FIXED_CONTAINER_NAMES + (
         identity["postgres_container"],
         identity["webui_container"],
+        identity["documentserver_container"],
         identity.get("restore_postgres_container") or "",
     ):
         if name and docker("inspect", name).returncode == 0:

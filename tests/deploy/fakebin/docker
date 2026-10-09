@@ -552,7 +552,11 @@ def docker_stop(state: Path, argv: list[str]) -> int:
             }
         else:
             container["State"] = "exited"
+        if container.get("after_stop_state"):
+            container["State"] = container["after_stop_state"]
         save_containers(state, containers)
+        if target == os.environ.get("FAKE_DOCKER_HOLD_STOP_TARGET"):
+            hold_named(state, "FAKE_DOCKER_HOLD_STOP", "entered-stop")
         with (state / "stopped.log").open("a", encoding="utf-8") as stream:
             stream.write(container["Id"] + "\n")
         sys.stdout.write(container["Id"] + "\n")
@@ -683,6 +687,15 @@ def docker_exec(state: Path, argv: list[str]) -> int:
     if not running:
         sys.stderr.write(f"Error: No such container: {container}\n")
         return 1
+    office_shutdown = command == ["/usr/bin/documentserver-prepare4shutdown.sh"]
+    if office_shutdown:
+        states = {item.get("Name"): item.get("State", {}) for item in load_containers(state)}
+        write_json(state / "office-shutdown.json", {
+            "container": container, "pid": os.getpid(),
+            "ocu_running": bool(states.get("ocu-test-computer-use-server", {}).get("Running")),
+            "proxy_running": bool(states.get("ocu-test-proxy", {}).get("Running")),
+        })
+        hold_named(state, "FAKE_DOCKER_HOLD_OFFICE_SHUTDOWN", "entered-office-shutdown")
     fail_marker = state / "exec-fail"
     if fail_marker.exists():
         sys.stderr.write("exec failed\n")
@@ -692,6 +705,8 @@ def docker_exec(state: Path, argv: list[str]) -> int:
             sys.stdout.write(str(rule.get("stdout") or ""))
             sys.stderr.write(str(rule.get("stderr") or ""))
             return int(rule.get("code", 0))
+    if office_shutdown:
+        return 0
     handled = handle_postgres_command(state, container, command, user=user, interactive=interactive)
     if handled is not None:
         code, stdout, stderr = handled
