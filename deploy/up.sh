@@ -116,6 +116,15 @@ for name in DOCUMENTSERVER_IMAGE OCU_OFFICE_JWT_SECRET OCU_OFFICE_DOCSERVER_URL 
     require "$name"
 done
 export PYTHONPATH="$ROOT/deploy${PYTHONPATH:+:$PYTHONPATH}"
+run_owned python3 - <<'PY'
+import os
+from settings import origin, port
+
+if os.environ["ENABLE_OCU_OFFICE_EDIT"] not in {"true", "false"}:
+    raise SystemExit("deploy: ENABLE_OCU_OFFICE_EDIT must be true or false")
+port("OCU_OFFICE_PROXY_PORT", os.environ["OCU_OFFICE_PROXY_PORT"])
+origin("OCU_OFFICE_DOCSERVER_ORIGIN", os.environ["OCU_OFFICE_DOCSERVER_ORIGIN"])
+PY
 if ! run_owned python3 - "$ROOT" "$OCU_RELEASE_MANIFEST" <<'PY'
 from __future__ import annotations
 

@@ -182,6 +182,25 @@ class DeployEntryTests(unittest.TestCase):
                         self.assertEqual(ops(self.state), [])
                         self.assertEqual(leftover_tmp(self.state), [])
 
+    def test_invalid_office_inputs_refuse_before_engine_contact(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        cases = [("OCU_OFFICE_PROXY_PORT", value) for value in ("abc", "0", "65536", "８０")]
+        cases += [("OCU_OFFICE_DOCSERVER_ORIGIN", value) for value in (
+            "docs.test", "http://docs.test/", "http://docs.test/path",
+            "http://user:origin-credential-canary@docs.test", "http://docs.test?", "http://docs.test#")]
+        cases += [("ENABLE_OCU_OFFICE_EDIT", value) for value in ("TRUE", "0", "no")]
+        for flag in ("false", "true"):
+            for name, value in cases:
+                with self.subTest(flag=flag, name=name, value=value):
+                    result = run_script(script, {**env, "ENABLE_OCU_OFFICE_EDIT": flag, name: value})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(name, result.stderr)
+                    for secret in (env["OCU_OFFICE_JWT_SECRET"], "origin-credential-canary"):
+                        self.assertNotIn(secret, result.stdout + result.stderr)
+                    self.assertEqual(starts(self.state), [])
+                    self.assertEqual(ops(self.state), [])
+                    self.assertEqual(leftover_tmp(self.state), [])
+
     def test_missing_sandbox_bridge_is_created_then_reinspected(self):
         result = run_script(PROVISION, self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
