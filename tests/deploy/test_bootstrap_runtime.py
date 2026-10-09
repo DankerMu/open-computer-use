@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from support import (
     DEFAULT_RELEASE_IMAGES,
@@ -144,6 +145,9 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.sha = committed_up_fixture(source, lock_dir=self.state / "image-store-lock")
         self.webui_sha = WEBUI_SYNTHETIC_SHA
         self.env = os.environ.copy()
+        # Ambient operator paths must never escape this fixture's owned root.
+        self.env.pop("OCU_OFFICE_PROXY_PORT", None)
+        self.env.pop("OCU_OFFICE_FONTS_DIR", None)
         self.env["PATH"] = str(FAKE_DOCKER.parent) + os.pathsep + self.env.get("PATH", "")
         self.env["FAKE_DOCKER_STATE"] = str(self.state)
         self.env["DOCKER_HOST"] = "unix://" + str(self.state / "docker.sock")
@@ -262,6 +266,23 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         self.assertIn("root", result.stderr)
         self.assert_unpublished()
         self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
+
+    def test_ambient_office_options_cannot_write_outside_fixture(self):
+        external = self.root / "ambient-fonts"
+        with patch.dict(os.environ, {"OCU_OFFICE_PROXY_PORT": "8444",
+                                     "OCU_OFFICE_FONTS_DIR": str(external)}):
+            isolated = BootstrapRuntimeTests()
+            isolated.setUp()
+            try:
+                result = isolated.run_bootstrap()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(external.exists())
+                runtime = parse_env_file(isolated.runtime_path())
+                self.assertEqual(runtime["OCU_OFFICE_PROXY_PORT"], "8083")
+                self.assertEqual(runtime["OCU_OFFICE_FONTS_DIR"],
+                                 str(isolated.deploy_root / "data/office-fonts"))
+            finally:
+                isolated.tearDown()
 
     def test_office_flag_changes_only_visibility(self):
         snapshots = []
