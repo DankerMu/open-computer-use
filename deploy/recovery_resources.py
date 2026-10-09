@@ -1209,6 +1209,30 @@ def _own_created(owned: list[str], name: str) -> None:
         owned.append(name)
 
 
+def _write_restore_epoch(destination_root: Path) -> None:
+    """Replace the captured marker without following links or rewriting their targets."""
+    staged = None
+    chat_root = destination_root / "data" / "chat"
+    try:
+        with release._blocked_signals():
+            staged = recovery.exclusive_private_file(destination_root, ".office-restore-epoch-")
+        with staged.open("wb") as stream:
+            stream.write(os.urandom(32).hex().encode("ascii") + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, chat_root / ".office-restore-epoch")
+        directory = os.open(chat_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        raise RecoveryError("cannot establish Office restore epoch") from exc
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
 def restore_deployment(
     *,
     recovery_set: Path,
@@ -1312,6 +1336,7 @@ def restore_deployment(
             session.committed = True
             session.stage = None
             _own_created(owned, str(destination_root))
+            _write_restore_epoch(destination_root)
             runtime = materialize_runtime(
                 target_runtime,
                 destination_root=destination_root,
