@@ -35,6 +35,37 @@ class CheckPortsTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "")
         self.assertEqual(result.stderr.strip(), "")
 
+    def test_two_publications_and_documentserver_wiring_are_required(self):
+        for defect in ("one", "three", "duplicate", "wrong-port", "wrong-target",
+                       "same-host-port", "missing-listen", "wrong-listen",
+                       "missing-upstream", "wrong-upstream"):
+            with self.subTest(defect=defect):
+                docs = intended_docs()
+                proxy = docs["proxy.json"]["services"][PROXY_SERVICE]
+                if defect == "one":
+                    proxy["ports"].pop()
+                elif defect == "three":
+                    proxy["ports"].append(proxy_mapping(published="8084", target=8084))
+                elif defect == "duplicate":
+                    proxy["ports"][1] = dict(proxy["ports"][0])
+                elif defect in ("wrong-port", "wrong-target", "same-host-port"):
+                    key = "target" if defect == "wrong-target" else "published"
+                    proxy["ports"][1][key] = "8082" if defect == "same-host-port" else "9999"
+                else:
+                    key = ("OCU_OFFICE_PROXY_LISTEN" if defect.endswith("listen")
+                           else "OCU_OFFICE_PROXY_UPSTREAM")
+                    proxy["environment"].pop(key)
+                    if defect.startswith("wrong"):
+                        proxy["environment"][key] = "127.0.0.1:8083" if defect.endswith("listen") else "http://other"
+                result = self.check(docs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("proxy", result.stderr)
+        docs = intended_docs()
+        for mapping, port in zip(docs["proxy.json"]["services"][PROXY_SERVICE]["ports"], ("18082", "18083")):
+            mapping["published"] = port
+        result = self.check(docs, {"OCU_PROXY_PORT": "18082", "OCU_OFFICE_PROXY_PORT": "18083"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_documentserver_membership_and_exposure_are_checked(self):
         for defect in ("missing", "duplicate", "lan", "loopback", "sandbox-only",
                        "sandbox-additional", "no-control", "other-additional",
@@ -110,16 +141,14 @@ class CheckPortsTests(unittest.TestCase):
 
     def test_proxy_loopback_mapping_is_rejected(self):
         docs = intended_docs()
-        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"] = [
-            proxy_mapping(host_ip="127.0.0.1")
-        ]
+        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"][0] = proxy_mapping(host_ip="127.0.0.1")
         result = self.check(docs)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(PROXY_SERVICE, result.stderr)
 
     def test_proxy_wrong_target_is_rejected(self):
         docs = intended_docs()
-        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"] = [proxy_mapping(target=80)]
+        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"][0] = proxy_mapping(target=80)
         result = self.check(docs)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(PROXY_SERVICE, result.stderr)
@@ -140,7 +169,7 @@ class CheckPortsTests(unittest.TestCase):
 
     def test_proxy_udp_mapping_is_rejected(self):
         docs = intended_docs()
-        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"] = [proxy_mapping(protocol="udp")]
+        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"][0] = proxy_mapping(protocol="udp")
         result = self.check(docs)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(PROXY_SERVICE, result.stderr)
@@ -152,12 +181,10 @@ class CheckPortsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(PROXY_SERVICE, result.stderr)
 
-    def test_proxy_second_mapping_is_rejected(self):
+    def test_proxy_third_mapping_is_rejected(self):
         docs = intended_docs()
-        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"] = [
-            proxy_mapping(),
-            proxy_mapping(published="8443", target=8443),
-        ]
+        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"].append(
+            proxy_mapping(published="8443", target=8443))
         result = self.check(docs)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(PROXY_SERVICE, result.stderr)
@@ -296,7 +323,7 @@ class CheckPortsTests(unittest.TestCase):
 
     def test_integer_published_port_is_accepted(self):
         docs = intended_docs()
-        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"] = [proxy_mapping(published=8082)]
+        docs["proxy.json"]["services"][PROXY_SERVICE]["ports"][0] = proxy_mapping(published=8082)
         result = self.check(docs)
         self.assertEqual(result.returncode, 0, result.stderr)
 

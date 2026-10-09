@@ -67,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
     def _serve(self):
         kind = self.server.kind
         extra = {}
-        if kind == "ocu" and self.command == "POST":
+        if kind in {"ocu", "documentserver"} and self.command == "POST":
             length = int(self.headers.get("Content-Length", "0"))
             payload = self.rfile.read(length) if length else b""
             extra["body_sha256"] = hashlib.sha256(payload).hexdigest()
@@ -102,6 +102,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._reply(401)
                 return
             elif self.path == "/api/v1/auths/":
+                if cookie.startswith("session=status-"):
+                    self._reply(int(cookie.removeprefix("session=status-")))
+                    return
                 if cookie in {"session=owner", "session=foreign"}:
                     self._reply(200, b"authenticated")
                 elif cookie == "session=error":
@@ -182,17 +185,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--auth-port", type=int, required=True)
     parser.add_argument("--ocu-port", type=int, required=True)
+    parser.add_argument("--documentserver-port", type=int, required=True)
     parser.add_argument("--record", type=Path, required=True)
     args = parser.parse_args()
     args.record.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if args.record.exists() and args.record.stat().st_mode & 0o077:
         raise SystemExit("record path must be private")
     servers = []
-    for kind, port in (("auth", args.auth_port), ("ocu", args.ocu_port)):
+    for kind, port in (("auth", args.auth_port), ("ocu", args.ocu_port),
+                       ("documentserver", args.documentserver_port)):
         server = RecordingServer(("127.0.0.1", port), Handler, args.record)
         server.kind = kind
         servers.append(server)
-    threading.Thread(target=servers[1].serve_forever, daemon=True).start()
+    for server in servers[1:]:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
     print("recording fixtures ready", flush=True)
     try:
         servers[0].serve_forever()

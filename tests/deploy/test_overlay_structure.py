@@ -120,6 +120,7 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None) -> d
         "OCU_PRIVATE_GATEWAY": "172.30.0.1", "OCU_SANDBOX_NETWORK": "ocu-sandbox",
         "OCU_SANDBOX_SUBNET": "172.31.0.0/24", "OCU_SANDBOX_GATEWAY": "172.31.0.1",
         "OCU_SANDBOX_DNS": "8.8.8.8", "OCU_PROXY_PORT": "8082",
+        "OCU_OFFICE_PROXY_PORT": "8083",
         "OCU_WEBUI_ORIGIN": "http://workbench.test:8082",
         "OCU_WEBUI_AUTH_URL": "http://open-webui:8080/api/v1/ocu/auth",
         "PUBLIC_BASE_URL": "http://workbench.test:8082/ocu",
@@ -219,7 +220,14 @@ class OverlayStructureTests(unittest.TestCase):
                 self.assertEqual(jwt.get("JWT_SECRET"),
                                  environment[office_config.OCU_OFFICE_JWT_SECRET])
                 self.assertEqual(webui["services"]["open-webui"]["environment"]["ENABLE_OCU_OFFICE_EDIT"], flag)
-                self.assertEqual(len(proxy["services"]["proxy"]["ports"]), 1)
+                gateway = proxy["services"]["proxy"]
+                self.assertEqual({(str(port["target"]), str(port["published"]))
+                                  for port in gateway["ports"]},
+                                 {("8082", "8082"), ("8083", "8083")})
+                self.assertEqual(len(gateway["ports"]), 2)
+                self.assertEqual(gateway["environment"]["OCU_OFFICE_PROXY_LISTEN"], "0.0.0.0:8083")
+                self.assertEqual(gateway["environment"]["OCU_OFFICE_PROXY_UPSTREAM"],
+                                 environment[office_config.OCU_OFFICE_DOCSERVER_URL])
                 states.append((service, {name: core["volumes"][name] for name in expected_mounts.values()}))
         self.assertEqual(states[0], states[1])
 

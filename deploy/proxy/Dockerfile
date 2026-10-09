@@ -16,5 +16,5 @@ RUN chown -R ocu-proxy:ocu-proxy /opt/ocu-proxy \
     && chmod 0555 /opt/ocu-proxy/entrypoint.sh
 
 USER ocu-proxy
-EXPOSE 8082
+EXPOSE 8082 8083
 ENTRYPOINT ["/opt/ocu-proxy/entrypoint.sh"]

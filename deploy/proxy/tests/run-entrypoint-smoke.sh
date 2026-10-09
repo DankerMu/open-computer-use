@@ -14,6 +14,8 @@ WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ocu-proxy-entry-smoke.XXXXXX")"
 AUTH_PORT="${OCU_TEST_AUTH_PORT:-18780}"
 OCU_PORT="${OCU_TEST_OCU_PORT:-18790}"
 LISTEN_PORT="${OCU_TEST_PROXY_PORT:-18782}"
+OFFICE_PORT="${OCU_TEST_DOCUMENTSERVER_PORT:-18791}"
+OFFICE_LISTEN_PORT="${OCU_TEST_OFFICE_PROXY_PORT:-18783}"
 TOKEN='synthetic-entry-token'
 ORIGIN="http://127.0.0.1:${AUTH_PORT}"
 RECORD="$WORKDIR/record/requests.jsonl"
@@ -52,6 +54,7 @@ chmod 0555 "$WORKDIR/opt/entrypoint.sh"
 python3 "$PROXY/tests/fixture.py" \
     --auth-port "$AUTH_PORT" \
     --ocu-port "$OCU_PORT" \
+    --documentserver-port "$OFFICE_PORT" \
     --record "$RECORD" &
 FIXTURE_PID=$!
 
@@ -67,6 +70,8 @@ export OCU_WEBUI_ORIGIN="$ORIGIN"
 export OCU_WEBUI_UPSTREAM="http://127.0.0.1:${AUTH_PORT}"
 export OCU_PROXY_UPSTREAM="http://127.0.0.1:${OCU_PORT}"
 export OCU_PROXY_LISTEN="127.0.0.1:${LISTEN_PORT}"
+export OCU_OFFICE_PROXY_LISTEN="127.0.0.1:${OFFICE_LISTEN_PORT}"
+export OCU_OFFICE_PROXY_UPSTREAM="http://127.0.0.1:${OFFICE_PORT}"
 
 "$WORKDIR/opt/entrypoint.sh" &
 ENTRY_PID=$!
@@ -116,6 +121,18 @@ if [[ "$ocu_forward" == $'200\nocu' ]]; then
 else
     fail "owner-authenticated OCU request was not forwarded"
 fi
+
+python3 - "$OFFICE_LISTEN_PORT" <<'PY'
+import http.client, sys
+for cookie, expected in (("", 401), ("session=owner", 200)):
+    conn = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=5)
+    conn.request("GET", "/web-apps/apps/api/documents/api.js", headers={"Cookie": cookie})
+    resp = conn.getresponse()
+    assert resp.status == expected, (resp.status, expected)
+    resp.read()
+    conn.close()
+PY
+pass "DocumentServer listener authenticates before forwarding"
 
 
 conf="$WORKDIR/opt/nginx.conf"

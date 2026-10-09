@@ -1,11 +1,12 @@
-# OCU same-origin reverse proxy
+# OCU and DocumentServer reverse proxy
 
 `routes.json` is the single reviewed allowlist. `render.py` validates the table,
 configuration and token before generating the self-contained, secret-bearing
 `nginx.conf` from `nginx.conf.in`. Its reviewed table fingerprint is pinned in
 `render.py`: changing any row requires updating that fingerprint and reviewing the
 route/auth/method/mutation/transport implications together. Unknown methods and
-`/ocu/` paths do not contact OCU. Outside `/ocu`, the proxy forwards to WebUI.
+`/ocu/` paths do not contact OCU. Outside `/ocu`, the gateway listener forwards
+to WebUI. The second listener forwards only to DocumentServer after session auth.
 
 ## Provision and run
 
@@ -17,18 +18,21 @@ config is replaced. Never put the token in shell history, command-line arguments
 logs or a tracked file. Render with a protected environment or mounted secret,
 not by pasting a production token into an example command.
 
-Optional variables for the native local harness (production must explicitly
-provision its internal topology):
+Listener variables (production must explicitly provision its internal topology):
 
 | Variable | Local default | Purpose |
 | --- | --- | --- |
 | `OCU_WEBUI_UPSTREAM` | `http://127.0.0.1:8080` | Direct WebUI auth/WebUI traffic, not the browser gateway |
 | `OCU_PROXY_UPSTREAM` | `http://127.0.0.1:8090` | Internal OCU HTTP/WebSocket listener |
 | `OCU_PROXY_LISTEN` | `127.0.0.1:8082` | Browser-facing nginx listener |
+| `OCU_OFFICE_PROXY_LISTEN` | none; required | Separate DocumentServer listener, container `0.0.0.0:8083` |
+| `OCU_OFFICE_PROXY_UPSTREAM` | none; required | DocumentServer internal HTTP origin, from `OCU_OFFICE_DOCSERVER_URL` |
 
-The two internal upstreams accept only `http://hostname:port` (or IPv4): nginx
-resolves named upstreams when it validates/starts the config. TLS termination
-belongs to the deployment overlay, not this internal transport.
+WebUI and OCU upstreams require `http://hostname:port` (or IPv4).
+The DocumentServer upstream also accepts an omitted port as HTTP80, matching
+`http://documentserver`. nginx resolves names at validation/startup.
+Both Office inputs are required even when editing is disabled. Compose publishes
+`OCU_PROXY_PORT:8082` and `OCU_OFFICE_PROXY_PORT:8083`; only the proxy publishes.
 
 From the OCU checkout root, after configuring the environment:
 
@@ -100,12 +104,27 @@ Change the route table, reviewed row count and raw-byte SHA pin together.
 Their unprefixed forms are not OCU gateway routes either. The proxy does not
 implement the Office broker or expose its control-plane listener.
 
+## DocumentServer listener
+
+Every request and WebSocket handshake authenticates through WebUI `/api/v1/auths/`
+using only the browser cookie. Auth401 remains401, auth403 denies403 and other
+failures deny500 without contacting DocumentServer. The auth location is internal.
+No path selects OCU or a WebUI application upstream on this listener.
+
+DocumentServer receives the original method, body, path and query, not the
+browser's Cookie, Authorization, internal token or chat/user identity headers.
+Host and X-Forwarded-Host retain the browser-facing port; X-Forwarded-Proto and
+X-Forwarded-For come from nginx. Client forwarding headers cannot override them.
+The direct listener supplies its own HTTP scheme; a separate TLS front-end needs
+an explicitly reviewed origin contract rather than trusting arbitrary headers.
+WebSocket upgrade is preserved with3600-second read/send idle timeouts.
+
 ## Focused native proof and limits
 
 `python3 -m unittest discover -s deploy/proxy/tests -p 'test_render.py' -v`
 checks private, atomic, fail-loud rendering and visible-ASCII punctuation with
 native `nginx -t`. `tests/fixture.py` supplies loopback non-echoing recording
-WebUI-auth/OCU HTTP+WS boundaries. Its JSONL observations contain headers,
+WebUI-auth/OCU/DocumentServer HTTP+WS boundaries. Its JSONL observations contain headers,
 including the synthetic Bearer token, and must be kept in a private 0700
 location (record file mode 0600); they are never browser responses or stdout.
 Start the fixture and rendered nginx with `hub start` (observe readiness), run

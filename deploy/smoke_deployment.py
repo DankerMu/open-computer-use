@@ -40,6 +40,7 @@ RETENTION = "retention-guard"
 CLEANUP = "cleanup"
 REQUIRED_RUNNING = (OCU, WEBUI, PROXY, POSTGRES, RETENTION)
 PROXY_TARGET = "8082"
+OFFICE_PROXY_TARGET = "8083"
 OCU_TARGET = 8081
 WEBUI_TARGET = 8080
 MANAGED_LABEL = "mcp-computer-use-orchestrator"
@@ -280,20 +281,7 @@ def service_running(state: str) -> bool:
     return state in {"running", "up"} or state.startswith("running")
 
 
-def publisher_ok(mapping: dict, published: str, bound: str) -> bool:
-    if not isinstance(mapping, dict):
-        return False
-    target = str(mapping.get("TargetPort") or mapping.get("Target") or "")
-    published_port = str(mapping.get("PublishedPort") or mapping.get("Published") or "")
-    protocol = str(mapping.get("Protocol") or "tcp").lower()
-    url = str(mapping.get("URL") or mapping.get("url") or "")
-    host_ip = str(mapping.get("HostIP") or mapping.get("HostIp") or "")
-    if target != PROXY_TARGET or published_port != published or protocol != "tcp":
-        return False
-    return (host_ip or url) == bound
-
-
-def judge_publications(inventory: dict[str, dict], published: str) -> None:
+def judge_publications(inventory: dict[str, dict], published: str, office_published: str) -> None:
     by_service: dict[str, list[dict]] = {}
     for row in inventory.values():
         service = row["Service"]
@@ -314,19 +302,25 @@ def judge_publications(inventory: dict[str, dict], published: str) -> None:
     publications = []
     for row in proxy_rows:
         publications.extend(row["Publishers"])
-    if not 1 <= len(publications) <= 2 or not any(
-        publisher_ok(mapping, published, "0.0.0.0") or publisher_ok(mapping, published, "")
-        for mapping in publications
-    ):
-        fail(f"{PROXY}: incorrect TCP listen/publication mapping")
-    if len(publications) == 2 and not any(
-        publisher_ok(mapping, published, "::") for mapping in publications
-    ):
-        fail(f"{PROXY}: incorrect IPv6 TCP publication")
-    if len(publications) == 2 and sum(
-        publisher_ok(mapping, published, "::") for mapping in publications
-    ) != 1:
-        fail(f"{PROXY}: unexpected proxy publication")
+    expected = {(PROXY_TARGET, published), (OFFICE_PROXY_TARGET, office_published)}
+    if published == office_published:
+        fail(f"{PROXY}: distinct TCP publications are required")
+    seen = set()
+    for mapping in publications:
+        if not isinstance(mapping, dict):
+            fail(f"{PROXY}: malformed publication")
+        target = str(mapping.get("TargetPort") or mapping.get("Target") or "")
+        port = str(mapping.get("PublishedPort") or mapping.get("Published") or "")
+        protocol = str(mapping.get("Protocol") or "tcp").lower()
+        bound = str(mapping.get("HostIP") or mapping.get("HostIp")
+                    or mapping.get("URL") or mapping.get("url") or "0.0.0.0")
+        identity = (target, port, bound)
+        if ((target, port) not in expected or protocol != "tcp"
+                or bound not in {"0.0.0.0", "::"} or identity in seen):
+            fail(f"{PROXY}: incorrect TCP listen/publication mapping")
+        seen.add(identity)
+    if not all((target, port, "0.0.0.0") in seen for target, port in expected):
+        fail(f"{PROXY}: expected exactly two TCP publications")
     for service, rows in by_service.items():
         if service == PROXY:
             continue
@@ -618,6 +612,7 @@ def exclusive_ack_ok(raw: str) -> bool:
 def load_inputs() -> dict:
     project = require_nonempty("COMPOSE_PROJECT_NAME")
     published = require_nonempty("OCU_PROXY_PORT")
+    office_published = require_nonempty("OCU_OFFICE_PROXY_PORT")
     private_name = require_nonempty("OCU_PRIVATE_NETWORK")
     sandbox_name = require_nonempty("OCU_SANDBOX_NETWORK")
     origin = require_nonempty("OCU_WEBUI_ORIGIN")
@@ -659,6 +654,7 @@ def load_inputs() -> dict:
     return {
         "project": project,
         "published": published,
+        "office_published": office_published,
         "private_name": private_name,
         "sandbox_name": sandbox_name,
         "origin": origin.rstrip("/"),
@@ -1053,7 +1049,7 @@ def run(argv: list[str]) -> int:
     inputs = load_inputs()
     root = script_root()
     inventory = collect_inventory(root, inputs["project"])
-    judge_publications(inventory, inputs["published"])
+    judge_publications(inventory, inputs["published"], inputs["office_published"])
     sandbox = resolve_sandbox(inputs["chat_id"], inputs["sandbox_id"], inputs["sandbox_name"])
     endpoints = resolve_control_endpoints(inventory, inputs["private_name"])
     probe_tcp_refused(inputs["former_host"], inputs["former_port"])
