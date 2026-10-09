@@ -25,6 +25,7 @@ from support import (
     WEBUI_SYNTHETIC_SHA,
     config_payload,
     copy_tracked,
+    font_mount_docs,
     git_init_commit,
     ops,
     prepare_up_context,
@@ -1405,6 +1406,7 @@ class RecoveryCliTests(unittest.TestCase):
 
     def test_activation_uses_selected_up_and_leaves_sandboxes_stopped(self):
         backup = self.root / "backup"
+        self.assertNotIn("OCU_RELEASE_FONTS_DIR=", self.runtime.read_text())
         created = self.run_cli(
             [
                 "backup",
@@ -1417,6 +1419,7 @@ class RecoveryCliTests(unittest.TestCase):
             ]
         )
         self.assertEqual(created.returncode, 0, created.stderr)
+        self.assertNotIn("OCU_RELEASE_FONTS_DIR=", (backup / "runtime.env").read_text())
         provider = self.root / "provider.env"
         provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
         os.chmod(provider, 0o600)
@@ -1426,7 +1429,7 @@ class RecoveryCliTests(unittest.TestCase):
         seed_healthy_host(target_state)
         write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
         write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
-        write_fake_configs(target_state)
+        write_fake_configs(target_state, font_mount_docs())
         (target_state / "docker-info.json").write_text(json.dumps({"ID": "activate-daemon"}), encoding="utf-8")
         dest = self.root / "activate-root"
         extra = {"FAKE_DOCKER_STATE": str(target_state)}
@@ -1443,6 +1446,7 @@ class RecoveryCliTests(unittest.TestCase):
             extra=extra,
         )
         self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertNotIn("OCU_RELEASE_FONTS_DIR=", (dest / "config/runtime.env").read_text())
         self.assertFalse((dest / "source").exists())
         delivery, payload, _source = self._write_retained_delivery()
         captured = json.loads((dest / "release.json").read_text(encoding="utf-8"))
@@ -1540,11 +1544,21 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(persisted["OPENWEBUI_IMAGE"], payload["images"]["open-webui"]["reference"])
         self.assertEqual(persisted.get("DMX_ENV_FILE"), str(provider))
         self.assertNotIn("OCU_RELEASE_FONTS_DIR", persisted)
+        self.assertEqual(persisted["OCU_OFFICE_FONTS_DIR"], self.env["OCU_OFFICE_FONTS_DIR"])
         starts = (target_state / "starts.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual(starts, ["core", "webui", "proxy"])
         executed = (target_state / "executed.json").read_text(encoding="utf-8")
         self.assertIn("--no-build", executed)
         self.assertIn("never", executed)
+        rows = [json.loads(line) for line in executed.splitlines()]
+        core = next(row["consumer_document"] for row in rows if row["stack"] == "core")
+        mounts = {mount["target"]: mount for mount in core["services"]["documentserver"]["volumes"]}
+        release_source = Path(mounts["/usr/share/fonts/truetype/ocu-release"]["source"])
+        self.assertEqual(release_source, dest / "fonts")
+        self.assertEqual(release_source.resolve(), (foreign_root / "fonts").resolve())
+        self.assertNotEqual(release_source.resolve(), (self.state / "fonts").resolve())
+        self.assertEqual(mounts["/usr/share/fonts/truetype/ocu-operator"]["source"],
+                         self.env["OCU_OFFICE_FONTS_DIR"])
         containers = json.loads((target_state / "containers.json").read_text(encoding="utf-8"))
         sandboxes = [item for item in containers if str(item.get("Name", "")).startswith("owui-chat-")]
         for item in sandboxes:

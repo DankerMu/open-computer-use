@@ -34,6 +34,17 @@ installed font and license before inventory publication or startup.
 directory after verifying its font material. This path is not a persisted runtime
 setting; inherited values cannot select a different font directory.
 
+Before activation, make the retained `OCU_OFFICE_FONTS_DIR` available on the target
+host; recovery does not capture, remap or create this operator-owned directory.
+An empty directory is valid when no operator fonts are supplied. Relative stored
+paths are based on the restored source root during activation; see
+[font-path ownership](production-like-test/NETWORK-HARDENING.md) before preparing
+that path. Prefer an absolute path for repeatable activation.
+
+The post-activation smoke derives its Compose font input from the selected
+`OCU_RELEASE_MANIFEST` itself, overriding stale inherited values. No additional
+stored setting or manual font export is required for `deploy/smoke.sh`.
+
 Backup compares Docker's actual `Image` configuration digest with the inventory, independently of the launch reference in `Config.Image`. Sandbox attribution requires the producer's canonical name, required labels, and exact volume/bind mount types, paths, destinations, and access modes. Every discovered sandbox is checked before stopping any writer, then checked again after admission shutdown.
 
 An interrupted activation can resume only its recorded selected-source publication. A private receipt binds the target directory identity, complete retained inventory, selected-source location, and random ownership token; the imported tree carries the matching marker from before publication. Pre-existing unowned directories, symlinks, and altered inventories are refused without overwriting the restored target. Keep these ownership records with the restored target when retrying the same delivery.

@@ -8,6 +8,7 @@ import errno
 import ipaddress
 import json
 import os
+from pathlib import Path
 import signal
 import socket
 import subprocess
@@ -18,6 +19,7 @@ import urllib.request
 from urllib.parse import urlsplit
 
 from firewall.policy import METADATA, parse_allowlist
+from release import release_fonts_directory
 from netinspect import (
     NetworkInspectError,
     container_identity,
@@ -194,8 +196,8 @@ def run_cmd(argv: list[str], *, timeout: float, env=None) -> subprocess.Complete
         _OWNED_PGIDS.discard(pgid)
 
 
-def docker(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess:
-    return run_cmd(["docker", *args], timeout=timeout)
+def docker(*args: str, timeout: float = 20.0, env=None) -> subprocess.CompletedProcess:
+    return run_cmd(["docker", *args], timeout=timeout, env=env)
 
 
 def suppress_unsafe(text: str) -> str:
@@ -671,9 +673,11 @@ def load_inputs() -> dict:
 
 
 def collect_inventory(root: str, project: str) -> dict[str, dict]:
+    manifest = Path(require_nonempty("OCU_RELEASE_MANIFEST"))
+    env = {**os.environ, "OCU_RELEASE_FONTS_DIR": str(release_fonts_directory(manifest))}
     stacks = []
     for name, args in compose_contexts(root, project):
-        result = docker("compose", *args, "ps", "--all", "--format", "json")
+        result = docker("compose", *args, "ps", "--all", "--format", "json", env=env)
         if result.returncode != 0:
             fail(f"{name}: compose ps failed", 2)
         stacks.append((name, parse_compose_ps(result.stdout or "", name)))

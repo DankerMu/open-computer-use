@@ -420,6 +420,40 @@ class OverlaySmokeCliTests(unittest.TestCase):
         self.assertNotIn(INTERNAL, text)
         self.assertNotIn("synthetic-internal-token", " ".join(ops(self.state)))
 
+    def test_inventory_uses_selected_manifest_fonts_not_ambient_value(self):
+        self.start_http()
+        self.seed_probes()
+        self.env.pop("OCU_RELEASE_FONTS_DIR", None)
+        for manifest in (str(self.state / "selected-release/release.json"), "selected-release/release.json"):
+            for stale in (None, "/unselected/fonts"):
+                with self.subTest(manifest=manifest, stale=stale):
+                    self.seed_inventory()
+                    extra = {"OCU_RELEASE_MANIFEST": manifest}
+                    if stale is not None:
+                        extra["OCU_RELEASE_FONTS_DIR"] = stale
+                    result = self.run_smoke(extra)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    rows = [json.loads(line) for line in
+                            (self.state / "ps-environment.jsonl").read_text().splitlines()][-3:]
+                    self.assertEqual([row["stack"] for row in rows], ["core", "webui", "proxy"])
+                    expected = (Path(manifest) if Path(manifest).is_absolute()
+                                else ROOT / manifest).parent / "fonts"
+                    self.assertTrue(all(row["release_fonts"] is not None for row in rows))
+                    self.assertEqual({Path(row["release_fonts"]).resolve() for row in rows},
+                                     {expected.resolve()})
+                    self.assert_no_secrets(result)
+
+    def test_release_manifest_is_required_for_compose_inventory(self):
+        for value in (None, ""):
+            with self.subTest(value=value):
+                self.env.pop("OCU_RELEASE_MANIFEST", None)
+                if value is not None:
+                    self.env["OCU_RELEASE_MANIFEST"] = value
+                result = self.run_smoke()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("OCU_RELEASE_MANIFEST", result.stderr)
+                self.assertEqual(ops(self.state), [])
+
     def test_missing_exclusive_acknowledgement_is_prerequisite(self):
         result = self.run_smoke({"OCU_SMOKE_EXCLUSIVE": ""})
         self.assertEqual(result.returncode, 2)

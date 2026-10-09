@@ -264,6 +264,21 @@ def intended_docs():
         "proxy.json": intended_proxy(),
     }
 
+
+def font_mount_docs():
+    docs = intended_docs()
+    core = docs["core.json"]
+    core["__unresolved__"] = True
+    core["services"][DOCUMENTSERVER_SERVICE]["volumes"] = [
+        {"type": "bind", "source": f"${{{name}}}",
+         "target": f"/usr/share/fonts/truetype/{target}", "read_only": True,
+         "bind": {"create_host_path": False}}
+        for name, target in (("OCU_RELEASE_FONTS_DIR", "ocu-release"),
+                             ("OCU_OFFICE_FONTS_DIR", "ocu-operator"))
+    ]
+    return docs
+
+
 def intended_docs_for_images(images: dict) -> dict:
     docs = intended_docs()
     mapping = {
@@ -361,6 +376,7 @@ def fake_env(state_dir: Path, extra=None):
 
 def smoke_env(state_dir: Path, extra=None):
     env = fake_env(state_dir)
+    env["OCU_RELEASE_MANIFEST"] = str(state_dir / "release.json")
     env["OCU_SMOKE_CHAT_ID"] = "smoke-chat"
     env["OCU_SMOKE_SANDBOX_ID"] = "sandbox-smoke"
     env["OCU_SMOKE_EXCLUSIVE"] = "1"
@@ -1005,6 +1021,7 @@ def prepare_up_context(state_dir: Path, extra=None):
     lock_dir = state_dir / "image-store-lock"
     lock_dir.mkdir(parents=True, exist_ok=True)
     if not (source / ".git").exists():
+        (state_dir / "office-fonts").mkdir(exist_ok=True)
         source.mkdir(parents=True, exist_ok=True)
         sha = committed_up_fixture(source, lock_dir=lock_dir)
         inventory = write_release_for_sha(state_dir / "release.json", sha, WEBUI_SYNTHETIC_SHA)

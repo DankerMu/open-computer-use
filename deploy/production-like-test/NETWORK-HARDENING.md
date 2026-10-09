@@ -63,8 +63,8 @@ image must match the release inventory before provisioning or startup.
 `OCU_OFFICE_PROXY_PORT`, `OCU_OFFICE_FONTS_DIR` and `ENABLE_OCU_OFFICE_EDIT`,
 even when editing is off. It rejects an invalid flag, nondecimal or out-of-range
 Office port, and an invalid browser origin using the same origin
-and port validators as bootstrap. `OCU_OFFICE_FONTS_DIR` must be nonempty;
-this preflight does not check its directory or mount it.
+and port validators as bootstrap. `OCU_OFFICE_FONTS_DIR` must name an existing
+directory before any engine mutation; missing paths, dangling links and files fail.
 
 DocumentServer receives `JWT_ENABLED=true` and `JWT_SECRET` from the bootstrap
 secret. The selected upstream entrypoint applies these controls to browser,
@@ -74,11 +74,37 @@ enablement and requires the resolved secret to match both the supplied
 setting without printing a credential, preserves engine state and removes owned
 temporary snapshots. Startup uses those checked snapshots, not a new resolution.
 
-DocumentServer's configured mounts are project-scoped named volumes:
+DocumentServer's own-data mounts are project-scoped named volumes:
 `documentserver-data` at `/var/www/onlyoffice/Data`, `documentserver-cache` at
 `/var/lib/onlyoffice`, and `documentserver-logs` at `/var/log/onlyoffice`.
-No Docker socket, chat, skills, workspace or other host bind is attached.
+Its only configured host binds are the two font directories below; no Docker
+socket, chat, skills or workspace bind is attached.
 The proxy remains the sole publisher, with one publication.
+
+The release font directory mounts at `/usr/share/fonts/truetype/ocu-release`;
+`OCU_OFFICE_FONTS_DIR` mounts at `/usr/share/fonts/truetype/ocu-operator`.
+Both binds are read-only and refuse automatic host-path creation. Empty operator
+directories and directory symlinks are accepted without modifying their contents
+or metadata.
+
+A relative operator path is relative to the `up.sh` invocation's working directory,
+not Compose's project directory. The entry exports its absolute spelling for
+checking and mounting; it does not rewrite stored configuration. Prefer an absolute
+stored path for repeatable activation. On a restored host the operator must make
+that configured directory available: it is not captured, remapped or created by
+recovery. Recovery invokes the entry from the restored source root, which becomes
+the base for any retained relative operator path.
+
+The release-font bind follows the verified manifest-adjacent `fonts` entry,
+including the selected-release link after activation. Do not store
+`OCU_RELEASE_FONTS_DIR` or substitute the operator directory for that release material.
+
+`release.release_fonts_directory` owns the lexical manifest-relative path rule.
+Startup exports the path returned by its existing font verification; the smoke
+uses the same pure rule for Compose inventory queries, without repeating content
+verification. Both override an inherited release-font value. Ad-hoc Compose
+commands that load the core model must also supply this derived input from the
+selected manifest; do not persist or reuse it across release activation.
 
 Overlay contract tests require a native Compose v2 resolver (`docker-compose` or
 the system `docker compose` plugin). They resolve all three stacks using
@@ -102,7 +128,7 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 
 `deploy/check-ports.sh` 的输入是 **完整的** `docker compose config --format json` 输出集合，不能用原始 YAML 代替；`expose` 不发布端口。bridge 已存在但 driver、internal 模式、subnet 或 gateway 不匹配时入口拒绝启动，不删除、替换、断开网络或现存 sandbox。防火墙安装绑定权威 sandbox 网桥入口接口，而不是源地址；同一宿主机只维护一份 owned 策略。安装器与检查器通过 `OCU_SANDBOX_EGRESS_LOCK`（默认 `/run/ocu-sandbox-egress/ocu-sandbox-egress.lock`）串行化合作进程；该路径必须位于当前 euid 拥有、非符号链接、非 group/world-writable 的目录中。DNS 解析、真实镜像构建、Compose 合并、内核数据包路径和引擎端口矩阵的实际验收留给 #36。
 
-部署完成后不要把 overlay smoke 接到 `deploy/up.sh`。在同一已配置的部署 shell 中运行 `deploy/smoke.sh`：Compose 插值变量与 `up.sh` 相同，另需显式 `OCU_SMOKE_CHAT_ID`、`OCU_SMOKE_SANDBOX_ID`、`OCU_SMOKE_EXCLUSIVE=1`、`OCU_SMOKE_OWNER_TOKEN`（只进进程环境，不得出现在 argv/日志）、IPv4 字面量 `OCU_SMOKE_FORMER_URL`、`OCU_SMOKE_EGRESS_URL` 与 `OCU_SMOKE_HOST_LAN_IPV4`。命令核验三套 Compose `ps --all` 清单（仅 proxy 发布 TCP `${OCU_PROXY_PORT}:8082`；`computer-use-server`/`open-webui`/`proxy`/`postgres`/`retention-guard` 必须在跑；oneshot 可缺席但其 publication 仍检查；运行中的 `cleanup` 失败）、前 OCU 入口 `ECONNREFUSED`、宿主机对 control 字面量的 HTTP 存活、sandbox 内允许列表 HTTP 2xx/3xx，然后才接受 sandbox 对 OCU:8081/WebUI:8080/proxy:8082 与宿主机 LAN proxy 的 curl 连接阶段超时（exit 28 且无 TCP 连接）。空允许列表是合法 deny-all，但不能完成本 smoke，以非零前提失败。终端只在独占、无既有 ttyd/tmux 的 smoke sandbox 上经 `dangerous_mode=false` 的 start-ttyd 与 `tty` WebSocket 观察产品 pane/前台 Bash；清理失败即失败。退出码：0 全部断言与 owned cleanup 完成；1 断言失败；2 前提/用法；129/130/143 为 HUP/INT/TERM。本地 fake/native 证据不是真实引擎验收；数据包、ttyd 镜像与宿主防火墙证明留给 #36。
+部署完成后不要把 overlay smoke 接到 `deploy/up.sh`。在同一已配置的部署 shell 中运行 `deploy/smoke.sh`：使用与 `up.sh` 相同的存储配置；smoke 从 `OCU_RELEASE_MANIFEST` 自动派生 Compose 所需的 release-font 路径，覆盖过期的继承值，无需额外导出。另需显式 `OCU_SMOKE_CHAT_ID`、`OCU_SMOKE_SANDBOX_ID`、`OCU_SMOKE_EXCLUSIVE=1`、`OCU_SMOKE_OWNER_TOKEN`（只进进程环境，不得出现在 argv/日志）、IPv4 字面量 `OCU_SMOKE_FORMER_URL`、`OCU_SMOKE_EGRESS_URL` 与 `OCU_SMOKE_HOST_LAN_IPV4`。命令核验三套 Compose `ps --all` 清单（仅 proxy 发布 TCP `${OCU_PROXY_PORT}:8082`；`computer-use-server`/`open-webui`/`proxy`/`postgres`/`retention-guard` 必须在跑；oneshot 可缺席但其 publication 仍检查；运行中的 `cleanup` 失败）、前 OCU 入口 `ECONNREFUSED`、宿主机对 control 字面量的 HTTP 存活、sandbox 内允许列表 HTTP 2xx/3xx，然后才接受 sandbox 对 OCU:8081/WebUI:8080/proxy:8082 与宿主机 LAN proxy 的 curl 连接阶段超时（exit 28 且无 TCP 连接）。空允许列表是合法 deny-all，但不能完成本 smoke，以非零前提失败。终端只在独占、无既有 ttyd/tmux 的 smoke sandbox 上经 `dangerous_mode=false` 的 start-ttyd 与 `tty` WebSocket 观察产品 pane/前台 Bash；清理失败即失败。退出码：0 全部断言与 owned cleanup 完成；1 断言失败；2 前提/用法；129/130/143 为 HUP/INT/TERM。本地 fake/native 证据不是真实引擎验收；数据包、ttyd 镜像与宿主防火墙证明留给 #36。
 
 ## 已知边界
 

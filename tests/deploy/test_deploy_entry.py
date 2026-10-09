@@ -23,6 +23,7 @@ from support import (
     PROVISION,
     SANDBOX_NETWORK,
     fake_env,
+    font_mount_docs,
     intended_docs,
     ops,
     prepare_up_context,
@@ -237,6 +238,67 @@ class DeployEntryTests(unittest.TestCase):
                     mutations = {"load", "pull", "build", "create", "up", "iptables-restore", "ip6tables-restore"}
                     self.assertFalse(any(set(row.split()) & mutations for row in ops(self.state)[before_ops:]))
                     self.assertEqual(leftover_tmp(self.state), [])
+
+    def test_operator_font_source_must_be_an_existing_directory(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        for kind in ("missing", "file", "dangling"):
+            with self.subTest(kind=kind):
+                path = self.state / f"invalid-font-{kind}"
+                if kind == "file":
+                    path.write_bytes(b"operator-owned")
+                elif kind == "dangling":
+                    path.symlink_to(self.state / "absent-font-target")
+                result = run_script(script, {**env, "OCU_OFFICE_FONTS_DIR": str(path)})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("OCU_OFFICE_FONTS_DIR", result.stderr)
+                self.assertNotIn(env["OCU_OFFICE_JWT_SECRET"], result.stdout + result.stderr)
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual(ops(self.state), [])
+                self.assertEqual(leftover_tmp(self.state), [])
+                if kind == "file":
+                    self.assertEqual(path.read_bytes(), b"operator-owned")
+                else:
+                    self.assertFalse(path.exists())
+                if kind != "missing":
+                    path.unlink()
+
+    def test_relative_operator_fonts_bind_the_checked_directory(self):
+        env, script, source = prepare_up_context(self.state, extra=self.env)
+        invocation = self.state / "invocation"
+        invocation.mkdir()
+        fonts = invocation / "operator-fonts"
+        fonts.mkdir(mode=0o750)
+        decoy = source / "operator-fonts"
+        decoy.mkdir()
+        (decoy / "untouched").write_bytes(b"wrong project-directory source")
+        write_fake_configs(self.state, font_mount_docs())
+        for kind in ("empty", "populated", "symlink"):
+            with self.subTest(kind=kind):
+                if kind == "populated":
+                    (fonts / "operator.otf").write_bytes(b"operator-owned-font")
+                selected = fonts
+                if kind == "symlink":
+                    selected = invocation / "operator-link"
+                    selected.symlink_to(fonts, target_is_directory=True)
+                before = {p.name: (p.stat().st_ino, p.stat().st_mode, p.stat().st_mtime_ns)
+                          for p in (fonts, *fonts.iterdir())}
+                result = subprocess.run(
+                    ["bash", str(script)], cwd=invocation,
+                    env={**env, "OCU_OFFICE_FONTS_DIR": selected.name},
+                    capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                row = [row for row in executed_rows(self.state) if row["stack"] == "core"][-1]
+                mounts = row["consumer_document"]["services"]["documentserver"]["volumes"]
+                operator = next(m for m in mounts if m["target"].endswith("/ocu-operator"))
+                self.assertTrue(Path(operator["source"]).is_absolute())
+                self.assertEqual(Path(operator["source"]).resolve(), fonts.resolve())
+                self.assertEqual({p.name: (p.stat().st_ino, p.stat().st_mode, p.stat().st_mtime_ns)
+                                  for p in (fonts, *fonts.iterdir())}, before)
+                if kind != "empty":
+                    self.assertEqual((fonts / "operator.otf").read_bytes(), b"operator-owned-font")
+                self.assertEqual((decoy / "untouched").read_bytes(), b"wrong project-directory source")
+                self.assertEqual(leftover_tmp(self.state), [])
 
     def test_missing_sandbox_bridge_is_created_then_reinspected(self):
         result = run_script(PROVISION, self.env)

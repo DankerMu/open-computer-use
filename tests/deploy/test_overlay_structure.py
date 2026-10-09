@@ -125,6 +125,8 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None) -> d
         "PUBLIC_BASE_URL": "http://workbench.test:8082/ocu",
         "OCU_CHAT_DATA_DIR": str(directory / "chat"),
         "OCU_SKILLS_CACHE_DIR": str(directory / "skills"),
+        "OCU_RELEASE_FONTS_DIR": str(directory.parent / "release-fonts"),
+        "OCU_OFFICE_FONTS_DIR": str(directory.parent / "operator-fonts"),
         "CONTAINER_MEM_LIMIT": "2g", "CONTAINER_CPU_LIMIT": "1.0",
         "CONTAINER_IDLE_TIMEOUT": "604800", "COMMAND_TIMEOUT": "120",
         "SUB_AGENT_TIMEOUT": "3600", "RETENTION_CHECK_INTERVAL_SECONDS": "3600",
@@ -185,13 +187,23 @@ class OverlayStructureTests(unittest.TestCase):
                     "/var/lib/onlyoffice": "documentserver-cache",
                     "/var/log/onlyoffice": "documentserver-logs",
                 }
-                mounts = service["volumes"]
+                mounts = [mount for mount in service["volumes"] if mount["type"] == "volume"]
                 self.assertEqual({mount["target"]: mount["source"] for mount in mounts},
                                  expected_mounts)
                 self.assertEqual(len(mounts), len(expected_mounts))
                 for mount in mounts:
                     self.assertEqual(mount["type"], "volume")
                     self.assertIn(mount["source"], core["volumes"])
+                binds = [mount for mount in service["volumes"] if mount["type"] == "bind"]
+                self.assertEqual({mount["target"]: mount["source"] for mount in binds}, {
+                    "/usr/share/fonts/truetype/ocu-release": str(Path(raw) / "release-fonts"),
+                    "/usr/share/fonts/truetype/ocu-operator": str(Path(raw) / "operator-fonts"),
+                })
+                self.assertEqual(len(service["volumes"]), len(mounts) + 2)
+                for mount in binds:
+                    self.assertIs(mount.get("read_only", False), True)
+                    # Compose omits false bind options from normalized JSON.
+                    self.assertIs(mount["bind"].get("create_host_path", False), False)
                 names = (
                     office_config.OCU_OFFICE_DOCSERVER_URL,
                     office_config.OCU_OFFICE_DOCSERVER_ORIGIN,

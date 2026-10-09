@@ -2263,6 +2263,7 @@ class OfflineReleaseTests(unittest.TestCase):
         for role, record in payload["images"].items():
             self.assertEqual(loaded[record["reference"]]["Id"], record["configuration_digest"], role)
         env = fake_env(self.state)
+        Path(env["OCU_OFFICE_FONTS_DIR"]).mkdir()
         env["OCU_RELEASE_MANIFEST"] = str(install / "release.json")
         env["OCU_TEST_ROOT"] = str(install / "source")
         env["SOURCE_SHA"] = payload["ocu_source_sha"]
