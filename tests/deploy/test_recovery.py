@@ -278,7 +278,7 @@ store.update(sys.argv[1], seed)
         office = self.chat_dir / CHAT_ID / ".ocu/office"
         return office / "state.json", office / "versions" / hashlib.sha256(content).hexdigest()
 
-    def _observe_office_wait(self, *, expire=False):
+    def _observe_office_wait(self, *, expire=False, elapsed_step=900):
         observer = f"""
 import json, time as real_time
 from pathlib import Path
@@ -287,7 +287,7 @@ import recovery_resources
 clock = [0.0]
 def observed_sleep(seconds):
     assert 0 < seconds <= 1, seconds
-    clock[0] += 900 if {expire!r} else seconds
+    clock[0] += {elapsed_step!r} if {expire!r} else seconds
     Path({str(self.state / 'office-poll.json')!r}).write_text(json.dumps({{'elapsed': clock[0], 'sleep': seconds}}))
     if not {expire!r}:
         real_time.sleep(seconds)
@@ -850,6 +850,50 @@ else:
                 self.assertEqual((self.state / "containers.json").read_bytes(), before)
                 self.assertFalse((self.state / "stopped.log").exists())
                 self.assertFalse(dest.exists())
+
+    def test_custom_office_timeout_bounds_the_drain(self):
+        self._observe_office_wait(expire=True, elapsed_step=601.5)
+        state, _ = self._seed_office("saving")
+        before = state.read_bytes()
+        dest = self.root / "custom-office-deadline"
+        result = self.run_cli(
+            ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+             "--runtime-file", str(self.runtime)],
+            {"OCU_OFFICE_BACKUP_TIMEOUT_SECONDS": "601.5"})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Office quiescence timed out", result.stderr)
+        self.assertIn("session-save", result.stderr)
+        self.assertEqual(json.loads((self.state / "office-poll.json").read_text())["elapsed"], 601.5)
+        self.assertEqual(state.read_bytes(), before)
+        self.assertFalse(dest.exists())
+        for row in json.loads((self.state / "containers.json").read_text()):
+            if row["Name"] != "ocu-test-postgres-1":
+                self.assertFalse(row["State"]["Running"], row["Name"])
+
+    def test_office_shutdown_requires_a_running_callback_server(self):
+        path = self.state / "containers.json"
+        for status in ("exited", "paused"):
+            with self.subTest(status=status):
+                self._seed_volumes_and_db()
+                self._seed_office()
+                rows = json.loads(path.read_text())
+                server = next(row for row in rows if row["Name"] == "ocu-test-computer-use-server")
+                server["State"] = {"Status": status, "Running": False, "Paused": status == "paused"}
+                path.write_text(json.dumps(rows))
+                dest = self.root / ("no-callback-server-" + status)
+                result = self.run_cli(
+                    ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+                     "--runtime-file", str(self.runtime)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("OCU must remain running for Office shutdown", result.stderr)
+                self.assertFalse((self.state / "office-shutdown.json").exists())
+                self.assertFalse(dest.exists())
+                self.assertFalse(any("pg_dump" in op for op in ops(self.state)))
+                for row in json.loads(path.read_text()):
+                    if row["Name"] not in ("ocu-test-postgres-1", "ocu-test-computer-use-server"):
+                        self.assertFalse(row["State"]["Running"], row["Name"])
+                if status == "paused":
+                    self.assertIn("is paused", result.stderr)
 
     def test_unsafe_office_state_cannot_certify_quiescence(self):
         state, _ = self._seed_office()
