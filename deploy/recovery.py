@@ -108,8 +108,13 @@ def require_root() -> None:
         raise RecoveryError("recovery requires root")
 
 
-def docker(*args: str, cwd: Path | None = None, input: bytes | None = None) -> subprocess.CompletedProcess:
-    return release.docker(*args, cwd=cwd) if input is None else _docker_with_input(args, cwd, input)
+def docker(
+    *args: str, cwd: Path | None = None, input: bytes | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    if input is None and timeout is None:
+        return release.docker(*args, cwd=cwd)
+    return _docker_with_input(args, cwd, input, timeout)
 
 
 def _docker_env() -> dict[str, str]:
@@ -146,7 +151,8 @@ def _drain_bounded(stream, bucket: list[bytes], limit: int = 64 * 1024) -> None:
 
 
 def _docker_with_input(
-    args: tuple[str, ...], cwd: Path | None, input: bytes
+    args: tuple[str, ...], cwd: Path | None, input: bytes | None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
     process = subprocess.Popen(
         ["docker", *args],
@@ -157,7 +163,7 @@ def _docker_with_input(
         env=_docker_env(),
     )
     try:
-        stdout, stderr = process.communicate(input)
+        stdout, stderr = process.communicate(input, timeout=timeout)
     except BaseException:
         process.kill()
         process.wait()
