@@ -39,6 +39,20 @@ path in runtime configuration. Font binaries are release material, not tracked
 source files; unrelated existing application fonts remain unchanged. This
 preflight does not establish renderer consumption or DocumentServer readiness.
 
+Bootstrap requires `ENABLE_OCU_OFFICE_EDIT=true|false` and
+`OCU_OFFICE_DOCSERVER_ORIGIN` explicitly, even with editing disabled. The latter
+must be an absolute HTTP(S) origin distinct from WebUI, including its effective
+port. `OCU_OFFICE_PROXY_PORT` defaults to `8083`; `OCU_OFFICE_FONTS_DIR` defaults
+to `<DEPLOY_ROOT>/data/office-fonts`. Explicit empty values are errors. Bootstrap
+creates an absent operator-font directory empty and leaves existing contents and
+metadata unchanged.
+
+Both flag values provision the same settings: DocumentServer at
+`http://documentserver`, OCU callbacks at `http://computer-use-server:8081`, and
+one fresh JWT secret in the mode0600 runtime file only. Existing runtime/admin
+outputs are never overwritten and no replacement secret is generated for them.
+These settings do not certify compose wiring or a running DocumentServer.
+
 WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` / 模型自动更新关闭开关，并保留已配置的 LAN OpenAI/RAG 端点与本地 Draw.io/Pyodide 材料。实际 Docker 引擎导入、平台/entrypoint 兼容和断网重启验收属于 #36；本源码阶段的 fake CLI 证据不能关闭 #33。
 
 失败边界：损坏或越界归档、符号链接、未声明或冲突的归档内部标签、隐藏 OCI 别名、配置 digest 冲突、脏的 tracked 源、不兼容的源消费者契约、缺失/替换的本地镜像、错误平台、密钥 build-arg、已有安装根、不受支持的远程 Docker 守护进程。
