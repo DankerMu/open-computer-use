@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import unittest
 
@@ -19,6 +21,7 @@ from support import (
     DEFAULT_RELEASE_IMAGES,
     DOCUMENTSERVER_UPSTREAM,
     FAKE_DOCKER,
+    FONT_FILES,
     HISTORICAL_INCOMPATIBLE_SOURCE,
     ROOT,
     ROLE_ORDER,
@@ -34,9 +37,12 @@ from support import (
     run_script,
     seed_healthy_host,
     seed_images,
+    serve_font_archive,
     synthetic_inventory,
     tmp_dir,
     write_fake_configs,
+    write_font_bundle,
+    write_font_pin,
     write_hybrid_image_archive,
     write_image_archive,
     write_inventory,
@@ -197,6 +203,8 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
             "deploy/release.py",
+            "deploy/fonts/prepare_fonts.py",
+            "deploy/fonts/fonts.json",
             "deploy/up.sh",
             "deploy/production-like-test/scripts/bootstrap-test.sh",
             "deploy/production-like-test/scripts/write-deployed-version.sh",
@@ -205,11 +213,13 @@ class OfflineReleaseTests(unittest.TestCase):
             dest = ocu / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(source.read_bytes())
+        write_font_pin(ocu)
         (ocu / "README").write_text("delivery source\n", encoding="utf-8")
         ocu_sha = git_init_commit(ocu, "delivery source")
         delivery = self.root / name
         images_dir = delivery / "images"
         images_dir.mkdir(parents=True)
+        write_font_bundle(delivery)
         image_records = {}
         for role in ROLE_ORDER:
             if role == skip_role:
@@ -291,6 +301,9 @@ class OfflineReleaseTests(unittest.TestCase):
         dest = self.root / f"isolated-release-{self._script_serial}.py"
         dest.write_text(source, encoding="utf-8")
         dest.chmod(0o755)
+        helper = self.root / "fonts" / "prepare_fonts.py"
+        helper.parent.mkdir(exist_ok=True)
+        helper.write_bytes((ROOT / "deploy/fonts/prepare_fonts.py").read_bytes())
         return dest
 
     def patched_release(self, *replacements: tuple[str, str]) -> Path:
@@ -351,6 +364,8 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
             "deploy/release.py",
+            "deploy/fonts/prepare_fonts.py",
+            "deploy/fonts/fonts.json",
             "deploy/up.sh",
             "deploy/production-like-test/scripts/bootstrap-test.sh",
             "deploy/production-like-test/scripts/write-deployed-version.sh",
@@ -358,11 +373,13 @@ class OfflineReleaseTests(unittest.TestCase):
             dest = ocu / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes((ROOT / relative).read_bytes())
+        write_font_pin(ocu)
         (ocu / "README").write_text("hybrid delivery source\n", encoding="utf-8")
         ocu_sha = git_init_commit(ocu, "hybrid delivery source")
         delivery = self.root / "hybrid-delivery"
         images_dir = delivery / "images"
         images_dir.mkdir(parents=True)
+        write_font_bundle(delivery)
         image_records = {}
         for role in ROLE_ORDER:
             tag = DEFAULT_RELEASE_IMAGES[role]
@@ -411,6 +428,8 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
             "deploy/up.sh",
+            "deploy/fonts/prepare_fonts.py",
+            "deploy/fonts/fonts.json",
             "deploy/production-like-test/scripts/bootstrap-test.sh",
             "deploy/production-like-test/scripts/write-deployed-version.sh",
         ):
@@ -419,11 +438,13 @@ class OfflineReleaseTests(unittest.TestCase):
             dest.write_bytes((ROOT / relative).read_bytes())
         (ocu / "deploy" / "release.py").parent.mkdir(parents=True, exist_ok=True)
         (ocu / "deploy" / "release.py").write_text("FORMAT_VERSION = 1\n", encoding="utf-8")
+        write_font_pin(ocu)
         (ocu / "README").write_text(f"legacy {HISTORICAL_INCOMPATIBLE_SOURCE}\n", encoding="utf-8")
         ocu_sha = git_init_commit(ocu, "legacy source")
         delivery = self.root / "legacy-delivery"
         images_dir = delivery / "images"
         images_dir.mkdir(parents=True)
+        write_font_bundle(delivery)
         image_records = {}
         for role in ROLE_ORDER:
             tag = DEFAULT_RELEASE_IMAGES[role]
@@ -534,10 +555,17 @@ class OfflineReleaseTests(unittest.TestCase):
             "computer-use-server/sandbox_dns.py",
             "docker-compose.yml",
             "docker-compose.webui.yml",
+            "deploy/fonts/prepare_fonts.py",
+            "deploy/fonts/fonts.json",
         ):
             dest = ocu / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes((ROOT / relative).read_bytes())
+        url = self.enterContext(serve_font_archive())
+        write_font_pin(ocu, url)
+        # A wrong source pin must fail locally rather than fetch real fonts during tests.
+        self.env.update(http_proxy="http://127.0.0.1:1", https_proxy="http://127.0.0.1:1",
+                        no_proxy="127.0.0.1,localhost")
         ocu_sha = git_init_commit(ocu, "ocu sources")
         (webui / "Dockerfile").write_text(
             'FROM scratch\nARG BUILD_HASH=dev-build\nARG USE_TIKTOKEN_ENCODING_NAME="cl100k_base"\nARG USE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2\n',
@@ -811,6 +839,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "ocu_source_sha": inventory["ocu_source_sha"],
             "webui_source_sha": inventory["webui_source_sha"],
             "source_consumer_contract": inventory["source_consumer_contract"],
+            "font_bundle": inventory["font_bundle"],
             "source_bundle": inventory["source_bundle"],
             "images": {
                 role: inventory["images"][role]
@@ -990,6 +1019,7 @@ class OfflineReleaseTests(unittest.TestCase):
         delivery, inventory, _sha = self.write_delivery(skip_role="documentserver")
         inventory["format_version"] = 1
         inventory["images"].pop("documentserver")
+        inventory.pop("font_bundle")
         write_inventory(delivery / "release.json", inventory)
         install = self.root / "unsupported-release"
         for result in (
@@ -1052,6 +1082,109 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertIn("documentserver", result.stderr)
         self.assertFalse(install.exists())
         self.assertFalse((self.state / "load-count").exists())
+
+    def test_build_records_verified_font_bundle(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        destination = self.root / "font-release"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        inventory = json.loads((destination / "release.json").read_text())
+        self.assertIn("font_bundle", inventory)
+        bundle = destination / inventory["font_bundle"]["path"]
+        self.assertEqual(
+            inventory["font_bundle"]["sha256"],
+            hashlib.sha256(bundle.read_bytes()).hexdigest(),
+        )
+        pin = json.loads((ocu / "deploy/fonts/fonts.json").read_text())
+        expected = {
+            item["name"]: item
+            for archive in pin["archives"]
+            for item in archive["files"]
+        }
+        with tarfile.open(bundle) as archive:
+            self.assertEqual(set(archive.getnames()), set(expected))
+            for name, item in expected.items():
+                member = archive.getmember(name)
+                self.assertTrue(member.isfile())
+                content = archive.extractfile(member).read()
+                self.assertEqual(len(content), item["size"])
+                self.assertEqual(hashlib.sha256(content).hexdigest(), item["sha256"])
+        installed = self.root / "font-install"
+        imported = self.import_cmd(destination, installed)
+        self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+        self.assertFalse((installed / "fonts.tar").exists())
+        self.assertEqual(
+            {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+             for path in (installed / "fonts").iterdir()},
+            {name: item["sha256"] for name, item in expected.items()},
+        )
+
+    def test_build_rejects_wrong_font_archive_and_file_hashes(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        pin_path = ocu / "deploy/fonts/fonts.json"
+        original = pin_path.read_text()
+        for defect in ("archive", "file"):
+            with self.subTest(defect=defect):
+                pin = json.loads(original)
+                record = pin["archives"][0]
+                (record if defect == "archive" else record["files"][0])["sha256"] = "0" * 64
+                pin_path.write_text(json.dumps(pin))
+                git_init_commit(ocu, f"wrong font {defect} hash")
+                destination = self.root / f"font-{defect}-refused"
+                result = self.build_cmd(ocu, webui, destination)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("SHA-256", result.stderr)
+                self.assertFalse(destination.exists())
+                self.assertEqual(ops(self.state), [])
+
+    def test_import_and_verify_refuse_invalid_font_material(self):
+        outside = self.root / "outside.otf"
+        outside.write_bytes(b"unrelated bytes")
+        for defect in ("checksum", "missing", "missing-field", "symlink", "directory",
+                       "escape", "altered", "duplicate", "extra"):
+            with self.subTest(defect=defect):
+                delivery, inventory, _sha = self.write_delivery(name=f"font-{defect}")
+                bundle = delivery / "fonts.tar"
+                if defect == "checksum":
+                    bundle.write_bytes(bundle.read_bytes() + b"changed")
+                elif defect == "missing":
+                    bundle.unlink()
+                elif defect == "missing-field":
+                    inventory.pop("font_bundle")
+                else:
+                    entries = list(FONT_FILES.items())
+                    if defect == "duplicate":
+                        entries.append(entries[0])
+                    elif defect == "extra":
+                        entries.append(("unlisted.otf", b"unlisted bytes"))
+                    with tarfile.open(bundle, "w") as archive:
+                        for index, (name, content) in enumerate(entries):
+                            member = tarfile.TarInfo(name)
+                            if index == 0:
+                                if defect == "escape":
+                                    member.name = str(outside)
+                                elif defect == "symlink":
+                                    member.type = tarfile.SYMTYPE
+                                    member.linkname = "fixture-LICENSE.txt"
+                                elif defect == "directory":
+                                    member.type = tarfile.DIRTYPE
+                                elif defect == "altered":
+                                    content = bytes([content[0] ^ 1]) + content[1:]
+                            member.size = len(content)
+                            archive.addfile(member, io.BytesIO(content))
+                    inventory["font_bundle"]["sha256"] = hashlib.sha256(bundle.read_bytes()).hexdigest()
+                write_inventory(delivery / "release.json", inventory)
+                installed = self.root / f"install-{defect}"
+                for result in (
+                    self.import_cmd(delivery, installed),
+                    self.verify_cmd(delivery / "release.json", delivery=delivery),
+                ):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("font", result.stderr)
+                self.assertFalse(installed.exists())
+                self.assertFalse((self.state / "load-count").exists())
+                self.assertEqual(ops(self.state), [])
+                self.assertEqual(outside.read_bytes(), b"unrelated bytes")
 
     def test_build_exports_documentserver_as_unmodified_pulled_role(self):
         ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()

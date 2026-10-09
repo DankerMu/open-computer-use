@@ -18,6 +18,7 @@ from support import (
     DEFAULT_RELEASE_DIGESTS,
     DEFAULT_RELEASE_IMAGES,
     FAKE_DOCKER,
+    FONT_FILES,
     ROLE_ORDER,
     ROOT,
     UP_FIXTURE_PATHS,
@@ -32,6 +33,9 @@ from support import (
     synthetic_inventory,
     tmp_dir,
     write_fake_configs,
+    write_font_bundle,
+    write_font_pin,
+    write_installed_fonts,
     write_image_archive,
     write_inventory,
     write_network,
@@ -412,12 +416,14 @@ class RecoveryCliTests(unittest.TestCase):
         source.mkdir()
         for relative in UP_FIXTURE_PATHS:
             copy_tracked(relative, source)
+        write_font_pin(source)
         (source / "README").write_text(f"retained delivery source {name}\n", encoding="utf-8")
         (source / "IDENTITY").write_text(f"{name}\n", encoding="utf-8")
         ocu_sha = git_init_commit(source, f"retained delivery {name}")
         delivery = self.root / name
         images_dir = delivery / "images"
         images_dir.mkdir(parents=True)
+        write_font_bundle(delivery)
         image_records = {}
         selected = images or DEFAULT_RELEASE_IMAGES
         for role in ROLE_ORDER:
@@ -1473,6 +1479,32 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertFalse((dest / "config" / "selected-source-owner.json").exists())
         self.assertEqual((dest / "source").resolve(), (independently_built / "source").resolve())
         (dest / "source").unlink()
+        write_installed_fonts(independently_built)
+        font_entry = dest / "fonts"
+        for linked in (False, True):
+            with self.subTest(foreign_font_link=linked):
+                if linked:
+                    font_entry.symlink_to(independently_built / "fonts", target_is_directory=True)
+                else:
+                    shutil.copytree(independently_built / "fonts", font_entry)
+                refused = self.run_cli(
+                    ["activate", "--destination-root", str(dest),
+                     "--retained-delivery", str(delivery)], extra=extra
+                )
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("font", refused.stderr)
+                self.assertEqual((dest / "release.json").read_bytes(), before_manifest)
+                self.assertEqual((dest / "config/runtime.env").read_bytes(), before_runtime)
+                self.assertFalse((target_state / "starts.log").exists())
+                self.assertFalse((dest / "config/selected-source-owner.json").exists())
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in font_entry.iterdir()}, FONT_FILES
+                )
+                if linked:
+                    self.assertEqual(font_entry.resolve(), (independently_built / "fonts").resolve())
+                    font_entry.unlink()
+                else:
+                    shutil.rmtree(font_entry)
         activated = self.run_cli(
             [
                 "activate",
@@ -1486,6 +1518,11 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(activated.returncode, 0, activated.stderr)
         self.assertTrue((dest / "source" / "deploy" / "up.sh").is_file())
         self.assertTrue((dest / "source" / ".git").exists())
+        self.assertTrue(font_entry.is_symlink())
+        self.assertEqual(font_entry.resolve(), (foreign_root / "fonts").resolve())
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in font_entry.iterdir()}, FONT_FILES
+        )
         installed = json.loads((dest / "release.json").read_text(encoding="utf-8"))
         self.assertEqual(installed["ocu_source_sha"], payload["ocu_source_sha"])
         persisted = {}
@@ -1498,6 +1535,7 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(persisted["DOCKER_IMAGE"], payload["images"]["workspace"]["reference"])
         self.assertEqual(persisted["OPENWEBUI_IMAGE"], payload["images"]["open-webui"]["reference"])
         self.assertEqual(persisted.get("DMX_ENV_FILE"), str(provider))
+        self.assertNotIn("OCU_RELEASE_FONTS_DIR", persisted)
         starts = (target_state / "starts.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual(starts, ["core", "webui", "proxy"])
         executed = (target_state / "executed.json").read_text(encoding="utf-8")
@@ -1509,6 +1547,27 @@ class RecoveryCliTests(unittest.TestCase):
             state = item.get("State")
             running = state.get("Running") if isinstance(state, dict) else str(state) == "running"
             self.assertFalse(running)
+        published = [dest / "release.json", dest / "config/runtime.env"]
+        identities = [(path.stat().st_ino, path.read_bytes()) for path in published]
+        before_starts = (target_state / "starts.log").read_bytes()
+        selected_font = font_entry / "fixture-cjk.otf"
+        selected_font.write_bytes(b"altered selected font")
+        refused = self.run_cli(
+            ["activate", "--destination-root", str(dest),
+             "--retained-delivery", str(delivery)], extra=extra
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("font", refused.stderr)
+        self.assertEqual(
+            [(path.stat().st_ino, path.read_bytes()) for path in published], identities
+        )
+        self.assertEqual((target_state / "starts.log").read_bytes(), before_starts)
+        selected_font.write_bytes(FONT_FILES["fixture-cjk.otf"])
+        repeated = self.run_cli(
+            ["activate", "--destination-root", str(dest),
+             "--retained-delivery", str(delivery)], extra=extra
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
 
 
     def test_activation_refuses_mixed_identity_and_tampered_source(self):
@@ -1745,6 +1804,7 @@ class RecoveryCliTests(unittest.TestCase):
         original = package.read_text(encoding="utf-8")
         after_import = '        release.import_release(delivery=delivery, install_root=source_root, recovery_owner=owner)'
         after_symlink = '        os.symlink(source_root / "source", source)'
+        after_fonts = '        os.symlink(source_root / "fonts", fonts)'
         after_inventory = "    _publish_selected_inventory(manifest, source_root)"
         after_runtime = "        env = activation_env(published, inventory, destination_root, provider)"
         after_version = '        record = destination_root / "DEPLOYED_VERSION.md"'
@@ -1757,6 +1817,7 @@ class RecoveryCliTests(unittest.TestCase):
         for needle, injection in (
             (after_import, after_import + '\n        raise RecoveryError("injected interruption after source-root")'),
             (after_symlink, after_symlink + '\n        raise RecoveryError("injected interruption after source publication")'),
+            (after_fonts, after_fonts + '\n        raise RecoveryError("injected interruption after font publication")'),
             (after_inventory, after_inventory + '\n    raise RecoveryError("injected interruption after inventory publication")'),
             (after_runtime, '        raise RecoveryError("injected interruption after runtime publication")\n' + after_runtime),
             (after_version, '        raise RecoveryError("injected interruption after version publication")\n' + after_version),
@@ -1764,6 +1825,7 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertIn(needle, original)
             if (dest / "source").exists() or (dest / "source").is_symlink():
                 (dest / "source").unlink()
+            (dest / "fonts").unlink(missing_ok=True)
             if selected_root.exists():
                 shutil.rmtree(selected_root)
             (dest / "release.json").write_bytes(before_manifest)
@@ -1913,6 +1975,7 @@ class RecoveryCliTests(unittest.TestCase):
         delivery, inventory, _source = self._write_retained_delivery()
         inventory["format_version"] = 1
         inventory["images"].pop("documentserver")
+        inventory.pop("font_bundle")
         write_inventory(delivery / "release.json", inventory)
         target_state = self.root / "historical-target"
         target_state.mkdir()

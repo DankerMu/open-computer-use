@@ -25,6 +25,20 @@ from a derived Dockerfile. Its existing provenance `build.dockerfile` field name
 that declaration file. The upstream index digest is distinct from the inspected
 linux/amd64 configuration digest and the exported archive checksum.
 
+Format 2 requires `font_bundle: {path, sha256}`. Build reads the selected committed
+source's `deploy/fonts/fonts.json`, verifies upstream ZIP sizes and hashes, and
+packages only its pinned fonts and licenses into `fonts.tar`. Import and delivery
+verification reject missing, extra, duplicate, linked, or changed members. Import
+publishes `fonts/` beside `release.json` without retaining the transport archive.
+Fontless inventories are refused, including format-2 inventories.
+
+Before any mutation, `up.sh` verifies the installed font directory against that
+selected source and exports its inventory-relative absolute path as
+`OCU_RELEASE_FONTS_DIR`, overriding inherited values. Do not persist this derived
+path in runtime configuration. Font binaries are release material, not tracked
+source files; unrelated existing application fonts remain unchanged. This
+preflight does not establish renderer consumption or DocumentServer readiness.
+
 WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` / 模型自动更新关闭开关，并保留已配置的 LAN OpenAI/RAG 端点与本地 Draw.io/Pyodide 材料。实际 Docker 引擎导入、平台/entrypoint 兼容和断网重启验收属于 #36；本源码阶段的 fake CLI 证据不能关闭 #33。
 
 失败边界：损坏或越界归档、符号链接、未声明或冲突的归档内部标签、隐藏 OCI 别名、配置 digest 冲突、脏的 tracked 源、不兼容的源消费者契约、缺失/替换的本地镜像、错误平台、密钥 build-arg、已有安装根、不受支持的远程 Docker 守护进程。

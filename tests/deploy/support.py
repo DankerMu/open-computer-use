@@ -3,6 +3,8 @@
 """Independent literals and paths for deployment preflight tests."""
 
 from __future__ import annotations
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import hashlib
 import io
@@ -14,6 +16,8 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
+import zipfile
 
 
 
@@ -96,6 +100,8 @@ DOCUMENTSERVER_UPSTREAM = (
 UP_FIXTURE_PATHS = (
     "deploy/up.sh",
     "deploy/release.py",
+    "deploy/fonts/prepare_fonts.py",
+    "deploy/fonts/fonts.json",
     "deploy/recovery.py",
     "deploy/recovery_fs.py",
     "deploy/recovery_resources.py",
@@ -506,6 +512,96 @@ def tmp_dir():
     return tempfile.TemporaryDirectory(prefix="ocu-deploy-test-")
 
 
+FONT_FILES = {
+    "fixture-cjk.otf": b"OTTO synthetic CJK font bytes\n",
+    "fixture-LICENSE.txt": b"SIL Open Font License 1.1 fixture\n",
+}
+
+
+def font_archive_bytes(*, year=2020, linked=False) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in sorted(FONT_FILES.items()):
+            member = zipfile.ZipInfo("upstream/" + name, (year, 1, 1, 0, 0, 0))
+            kind = stat.S_IFLNK if linked and name.endswith(".otf") else stat.S_IFREG
+            member.external_attr = (kind | 0o644) << 16
+            archive.writestr(member, content)
+    return buffer.getvalue()
+
+
+def font_pin(url="http://127.0.0.1:1/fonts.zip", *, archive_bytes=None) -> dict:
+    data = font_archive_bytes() if archive_bytes is None else archive_bytes
+    return {"archives": [{
+        "url": url,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "files": [
+            {"member": "upstream/" + name, "name": name,
+             "sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
+            for name, content in sorted(FONT_FILES.items())
+        ],
+    }]}
+
+
+def write_font_pin(root: Path, url="http://127.0.0.1:1/fonts.zip") -> Path:
+    path = root / "deploy/fonts/fonts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(font_pin(url)) + "\n", encoding="utf-8")
+    return path
+
+
+def font_bundle_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, content in sorted(FONT_FILES.items()):
+            member = tarfile.TarInfo(name)
+            member.size = len(content)
+            member.mode = 0o644
+            archive.addfile(member, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def write_font_bundle(root: Path) -> dict:
+    root.mkdir(parents=True, exist_ok=True)
+    data = font_bundle_bytes()
+    (root / "fonts.tar").write_bytes(data)
+    return {"path": "fonts.tar", "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def write_installed_fonts(root: Path) -> None:
+    directory = root / "fonts"
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, content in FONT_FILES.items():
+        (directory / name).write_bytes(content)
+
+
+@contextmanager
+def serve_font_archive(data=None):
+    content = font_archive_bytes() if data is None else data
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/fonts.zip":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/fonts.zip"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        if thread.is_alive():
+            raise RuntimeError("font fixture server did not stop")
+
+
 def empty_build(role: str) -> dict:
     upstream = DOCUMENTSERVER_UPSTREAM if role == "documentserver" else None
     return {
@@ -551,6 +647,9 @@ def synthetic_inventory(*, ocu_sha: str, webui_sha: str, images=None, bundle_sha
         "source_bundle": {
             "path": "source.bundle",
             "sha256": bundle_sha or hashlib.sha256(b"bundle").hexdigest(),
+        },
+        "font_bundle": {
+            "path": "fonts.tar", "sha256": hashlib.sha256(font_bundle_bytes()).hexdigest(),
         },
         "images": records,
     }
@@ -857,12 +956,14 @@ def committed_up_fixture(dest_root: Path, *, lock_dir: Path | None = None) -> st
             ),
             encoding="utf-8",
         )
+    write_font_pin(dest_root)
     (dest_root / "README").write_text("synthetic committed fixture\n", encoding="utf-8")
     return git_init_commit(dest_root, "committed deploy fixture")
 
 
 def write_release_for_sha(dest: Path, ocu_sha: str, webui_sha: str, *, images=None) -> Path:
     payload = synthetic_inventory(ocu_sha=ocu_sha, webui_sha=webui_sha, images=images)
+    write_installed_fonts(dest.parent)
     return write_inventory(dest, payload)
 
 

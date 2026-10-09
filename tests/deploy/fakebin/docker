@@ -272,6 +272,7 @@ def compose_up(state: Path, argv: list[str]) -> int:
         "remove_orphans": remove_orphans(argv),
         "env_remove_orphans": os.environ.get("COMPOSE_REMOVE_ORPHANS", ""),
         "env_profiles": os.environ.get("COMPOSE_PROFILES", ""),
+        "release_fonts": os.environ.get("OCU_RELEASE_FONTS_DIR"),
         "argv": argv,
         "no_build": "--no-build" in argv,
         "pull": None,

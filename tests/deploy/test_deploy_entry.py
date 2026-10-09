@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
@@ -15,6 +16,7 @@ import unittest
 
 from support import (
     CONTROL_NETWORK,
+    FONT_FILES,
     DEFAULT_DNS,
     METADATA_ADDR,
     OCU_SERVICE,
@@ -31,6 +33,7 @@ from support import (
     with_core_dns,
     write_containers,
     write_fake_configs,
+    write_installed_fonts,
     write_network,
 )
 
@@ -319,12 +322,68 @@ class DeployEntryTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assert_no_destructive()
 
+    def test_missing_fonts_refuse_before_deployment_mutation(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        fonts = Path(env["OCU_RELEASE_MANIFEST"]).parent / "fonts"
+        before_images = (self.state / "images.json").read_bytes()
+        before_networks = {
+            path.name: path.read_bytes() for path in (self.state / "networks").iterdir()
+        }
+        foreign = self.state / "foreign-fonts"
+        write_installed_fonts(foreign)
+        for defect in ("missing", "empty", "altered", "extra", "file-link", "directory-link"):
+            with self.subTest(defect=defect):
+                if fonts.is_symlink():
+                    fonts.unlink()
+                elif fonts.exists():
+                    shutil.rmtree(fonts)
+                write_installed_fonts(fonts.parent)
+                if defect == "missing":
+                    shutil.rmtree(fonts)
+                elif defect == "empty":
+                    for path in fonts.iterdir():
+                        path.unlink()
+                elif defect == "extra":
+                    (fonts / "unlisted.otf").write_bytes(b"extra font")
+                elif defect == "altered":
+                    content = FONT_FILES["fixture-cjk.otf"]
+                    (fonts / "fixture-cjk.otf").write_bytes(bytes([content[0] ^ 1]) + content[1:])
+                elif defect == "file-link":
+                    (fonts / "fixture-cjk.otf").unlink()
+                    (fonts / "fixture-cjk.otf").symlink_to(foreign / "fonts/fixture-cjk.otf")
+                else:
+                    shutil.rmtree(fonts)
+                    fonts.symlink_to(foreign / "fonts", target_is_directory=True)
+                before_ops = len(ops(self.state))
+                result = run_script(script, env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(fonts), result.stderr)
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual((self.state / "images.json").read_bytes(), before_images)
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in (self.state / "networks").iterdir()},
+                    before_networks,
+                )
+                mutations = {"load", "pull", "build", "create", "up", "iptables-restore", "ip6tables-restore"}
+                self.assertFalse(any(set(row.split()) & mutations for row in ops(self.state)[before_ops:]))
+
+    def test_exported_fonts_path_overrides_stale_caller_value(self):
+        self.env["OCU_RELEASE_FONTS_DIR"] = "/unselected/fonts"
+        result = self.up()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = executed_rows(self.state)
+        self.assertEqual([row["stack"] for row in rows], ["core", "webui", "proxy"])
+        self.assertEqual(
+            [row["release_fonts"] for row in rows], [str(self.state / "fonts")] * 3
+        )
+
     def test_version_one_inventory_refuses_before_deployment_mutation(self):
         env, script, _source = prepare_up_context(self.state, extra=self.env)
         inventory_path = Path(env["OCU_RELEASE_MANIFEST"])
         inventory = json.loads(inventory_path.read_text())
         inventory["format_version"] = 1
         inventory["images"].pop("documentserver")
+        inventory.pop("font_bundle")
         inventory_path.write_text(json.dumps(inventory))
         before_images = (self.state / "images.json").read_bytes()
         before_networks = {
