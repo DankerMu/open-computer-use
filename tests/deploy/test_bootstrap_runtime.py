@@ -277,6 +277,7 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
                 "OCU_OFFICE_SELF_URL", "OCU_OFFICE_FONTS_DIR", "ENABLE_OCU_OFFICE_EDIT",
             })
             self.assertEqual(office["ENABLE_OCU_OFFICE_EDIT"], flag)
+            self.assertEqual(office["OCU_OFFICE_PROXY_PORT"], "8083")
             self.assertEqual(office["OCU_OFFICE_DOCSERVER_URL"], "http://documentserver")
             self.assertEqual(office["OCU_OFFICE_SELF_URL"], "http://computer-use-server:8081")
             self.assertEqual(office["OCU_OFFICE_DOCSERVER_ORIGIN"],
