@@ -81,7 +81,7 @@ PY
     printf -- '- Multi-user mode: `SINGLE_USER_MODE=%s`\n' "$(env_value SINGLE_USER_MODE)"
     printf -- '- Per-sandbox limit: `%s` memory, `%s` CPU\n' "$(env_value CONTAINER_MEM_LIMIT)" "$(env_value CONTAINER_CPU_LIMIT)"
     printf -- '- Sandbox idle/maximum continuous runtime: `%s` seconds / `%s` hours\n' "$(env_value CONTAINER_IDLE_TIMEOUT)" "$(env_value CONTAINER_MAX_AGE_HOURS)"
-    printf -- '- Host publication: proxy only (`OCU_PROXY_PORT`)\n'
+    printf -- '- Host publications: proxy only (`OCU_PROXY_PORT:8082`, `OCU_OFFICE_PROXY_PORT:8083`)\n'
     printf -- '- Sandbox CDP/ttyd published ports: dedicated sandbox bridge gateway (`%s`)\n' "$(env_value OCU_SANDBOX_GATEWAY)"
     printf -- '- Chat/workspace data retention: no automatic deletion\n'
     printf -- '- Offline mode: `OFFLINE_MODE=true`; version update checks disabled; embedding/rerank auto-update disabled\n'

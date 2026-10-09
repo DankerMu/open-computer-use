@@ -49,19 +49,23 @@ def _host_port(value: str, name: str) -> str:
         raise RenderError(f"{name} must be host:port")
     return value
 
-def _endpoint(value: str, name: str) -> str:
+def _endpoint(value: str, name: str, *, default_port: int | None = None) -> str:
     if not isinstance(value, str) or any(ord(c) < 0x21 or ord(c) > 0x7E for c in value):
         raise RenderError(f"{name} must be an absolute internal http origin with an explicit port")
     try:
         parsed = urlsplit(value)
         if (parsed.scheme != "http" or parsed.username or parsed.password
                 or parsed.path or parsed.query or parsed.fragment or not parsed.hostname
-                or parsed.port is None):
+                or (parsed.port is None and default_port is None)):
             raise ValueError
-        _host_port(parsed.netloc, name)
+        hostport = parsed.netloc
+        if parsed.port is None and default_port is not None:
+            hostport = f"{hostport}:{default_port}"
+        _host_port(hostport, name)
     except (ValueError, TypeError):
-        raise RenderError(f"{name} must be an absolute internal http origin with an explicit port") from None
-    return parsed.netloc
+        suffix = " with an explicit port" if default_port is None else ""
+        raise RenderError(f"{name} must be an absolute internal http origin{suffix}") from None
+    return hostport
 
 
 def _origin(value: str) -> str:
@@ -273,6 +277,11 @@ def render(*, table: Path = ROOT / "routes.json", output: Path = ROOT / "nginx.c
     webui = _endpoint(variables.get("OCU_WEBUI_UPSTREAM", DEFAULTS["OCU_WEBUI_UPSTREAM"]), "OCU_WEBUI_UPSTREAM")
     ocu = _endpoint(variables.get("OCU_PROXY_UPSTREAM", DEFAULTS["OCU_PROXY_UPSTREAM"]), "OCU_PROXY_UPSTREAM")
     listen = _host_port(variables.get("OCU_PROXY_LISTEN", DEFAULTS["OCU_PROXY_LISTEN"]), "OCU_PROXY_LISTEN")
+    office_listen = _host_port(variables.get("OCU_OFFICE_PROXY_LISTEN", ""), "OCU_OFFICE_PROXY_LISTEN")
+    if office_listen == listen:
+        raise RenderError("OCU_OFFICE_PROXY_LISTEN must differ from OCU_PROXY_LISTEN")
+    office = _endpoint(variables.get("OCU_OFFICE_PROXY_UPSTREAM", ""),
+                       "OCU_OFFICE_PROXY_UPSTREAM", default_port=80)
     nginx = nginx or shutil.which("nginx")
     if nginx is None:
         raise RenderError("nginx executable is unavailable")
@@ -299,6 +308,7 @@ def render(*, table: Path = ROOT / "routes.json", output: Path = ROOT / "nginx.c
         "@@RUNTIME@@": str(runtime), "@@ORIGIN_REGEX@@": re.escape(origin),
         "@@LISTEN@@": listen, "@@WEBUI@@": "http://ocu_proxy_webui",
         "@@WEBUI_HOSTPORT@@": webui, "@@OCU_HOSTPORT@@": ocu,
+        "@@OFFICE_LISTEN@@": office_listen, "@@OFFICE_HOSTPORT@@": office,
         "@@LOCATIONS@@": _locations(rows, "http://ocu_proxy_ocu", _nginx_quoted(token)),
     }
     markers = re.findall(r"@@[A-Z_]+@@", template)

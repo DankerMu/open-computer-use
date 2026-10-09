@@ -326,7 +326,7 @@ class OverlaySmokeCliTests(unittest.TestCase):
                 ps_row("open-webui-init", "cid-init", state="exited"),
             ],
         )
-        proxy_pubs = extra_publishers.get("proxy", [publisher()])
+        proxy_pubs = extra_publishers.get("proxy", [publisher(), publisher("8083", 8083)])
         rows = [ps_row("proxy", "cid-proxy", publishers=proxy_pubs)]
         if extra_rows:
             rows.extend(extra_rows)
@@ -526,27 +526,47 @@ class OverlaySmokeCliTests(unittest.TestCase):
         write_ps(
             self.state,
             "proxy",
-            json.dumps([ps_row("proxy", "cid-proxy", publishers=[publisher()])]),
+            json.dumps([ps_row("proxy", "cid-proxy", publishers=[publisher(), publisher("8083", 8083)])]),
         )
         result = self.run_smoke()
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_proxy_ipv4_and_ipv6_wildcard_twins_are_one_publication(self):
+    def test_proxy_ipv4_and_ipv6_wildcard_twins_count_as_two_ports(self):
         self.start_http()
-        self.seed_inventory(extra_publishers={"proxy": [publisher(), publisher(url="::")]})
+        self.seed_inventory(extra_publishers={"proxy": [
+            publisher(), publisher(url="::"), publisher("8083", 8083), publisher("8083", 8083, url="::")]})
         self.seed_probes()
         result = self.run_smoke()
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_wrong_ipv6_twin_or_ipv6_only_is_not_the_port_matrix(self):
-        self.seed_inventory(extra_publishers={"proxy": [publisher(), publisher(url="::", target=80)]})
+        self.seed_inventory(extra_publishers={"proxy": [
+            publisher(), publisher("8083", 8083), publisher(url="::", target=80)]})
         result = self.run_smoke()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("proxy", result.stderr)
-        self.seed_inventory(extra_publishers={"proxy": [publisher(url="::")]})
+        self.seed_inventory(extra_publishers={"proxy": [publisher(url="::"), publisher("8083", 8083)]})
         result = self.run_smoke()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("proxy", result.stderr)
+
+    def test_proxy_requires_exactly_two_distinct_correct_ports(self):
+        for publications in (
+            [publisher()], [publisher("8083", 8083)],
+            [publisher(), publisher("8083", 8083), publisher("8084", 8084)],
+            [publisher(), publisher()],
+            [publisher(), publisher("8083", 8083), publisher("8083", 8083)],
+            [publisher(), publisher("8083", 8083), publisher(url="::"), publisher(url="::")],
+            [publisher(), publisher("8083", 8082)],
+            [publisher(), publisher("8083", 8083, protocol="udp")],
+            [publisher(), publisher("8083", 8083, url="127.0.0.1")],
+        ):
+            with self.subTest(publications=publications):
+                self.seed_inventory(extra_publishers={"proxy": publications})
+                result = self.run_smoke()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("proxy", result.stderr)
+                self.assertIn("publication", result.stderr)
 
     def test_non_proxy_publication_fails_named_assertion(self):
         self.start_http()

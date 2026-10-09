@@ -22,6 +22,8 @@ OCU = "computer-use-server"
 DOCUMENTSERVER = "documentserver"
 TARGET = "8082"
 PUBLISHED = os.environ.get("OCU_PROXY_PORT", "8082")
+OFFICE_TARGET = "8083"
+OFFICE_PUBLISHED = os.environ.get("OCU_OFFICE_PROXY_PORT", "")
 SANDBOX = os.environ.get("OCU_SANDBOX_NETWORK", "ocu-sandbox")
 CONTROL = os.environ.get("OCU_PRIVATE_NETWORK", "ocu-test-private")
 
@@ -103,17 +105,24 @@ for services, networks in docs:
             if ports:
                 fail(f"{name}: host publication is forbidden")
             continue
-        if len(ports) != 1 or not isinstance(ports[0], dict):
-            fail(f"{name}: expected exactly one TCP publication")
-        mapping = ports[0]
-        target = str(mapping.get("target") or "")
-        published = str(mapping.get("published") or "")
-        protocol = str(mapping.get("protocol") or "tcp")
-        bound = str(mapping.get("host_ip") or "")
-        if target != TARGET or published != PUBLISHED or protocol != "tcp":
+        if len(ports) != 2 or not all(isinstance(mapping, dict) for mapping in ports):
+            fail(f"{name}: expected exactly two TCP publications")
+        if not OFFICE_PUBLISHED or OFFICE_PUBLISHED == PUBLISHED:
+            fail(f"{name}: distinct configured proxy ports are required")
+        expected_ports = {(TARGET, PUBLISHED), (OFFICE_TARGET, OFFICE_PUBLISHED)}
+        actual_ports = set()
+        for mapping in ports:
+            target = str(mapping.get("target") or "")
+            published = str(mapping.get("published") or "")
+            protocol = str(mapping.get("protocol") or "tcp")
+            bound = str(mapping.get("host_ip") or "")
+            if protocol != "tcp":
+                fail(f"{name}: incorrect TCP listen/publication mapping")
+            if bound not in {"", "0.0.0.0"}:
+                fail(f"{name}: proxy publication must bind the configured LAN entry")
+            actual_ports.add((target, published))
+        if actual_ports != expected_ports:
             fail(f"{name}: incorrect TCP listen/publication mapping")
-        if bound not in {"", "0.0.0.0"}:
-            fail(f"{name}: proxy publication must bind the configured LAN entry")
         environment = service.get("environment")
         if not isinstance(environment, dict):
             fail(f"{name}: missing proxy listen/upstream configuration")
@@ -121,6 +130,8 @@ for services, networks in docs:
             "OCU_PROXY_LISTEN": f"0.0.0.0:{TARGET}",
             "OCU_WEBUI_UPSTREAM": f"http://{WEBUI}:8080",
             "OCU_PROXY_UPSTREAM": f"http://{OCU}:8081",
+            "OCU_OFFICE_PROXY_LISTEN": f"0.0.0.0:{OFFICE_TARGET}",
+            "OCU_OFFICE_PROXY_UPSTREAM": f"http://{DOCUMENTSERVER}",
         }
         if any(environment.get(key) != value for key, value in expected.items()):
             fail(f"{name}: incorrect proxy listen/upstream configuration")

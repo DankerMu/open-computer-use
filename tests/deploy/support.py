@@ -244,11 +244,13 @@ def intended_proxy():
         {
             PROXY_SERVICE: service(
                 networks={"default": {}},
-                ports=[proxy_mapping()],
+                ports=[proxy_mapping(), proxy_mapping(published="8083", target=8083)],
                 environment={
                     "OCU_PROXY_LISTEN": "0.0.0.0:8082",
                     "OCU_WEBUI_UPSTREAM": "http://open-webui:8080",
                     "OCU_PROXY_UPSTREAM": "http://computer-use-server:8081",
+                    "OCU_OFFICE_PROXY_LISTEN": "0.0.0.0:8083",
+                    "OCU_OFFICE_PROXY_UPSTREAM": "http://documentserver",
                 },
                 image=DEFAULT_RELEASE_IMAGES["proxy"],
             )
@@ -325,6 +327,7 @@ def run_checker(paths, *, env=None, extra_env=None):
             "OCU_PRIVATE_NETWORK": CONTROL_NETWORK,
             "OCU_SANDBOX_NETWORK": SANDBOX_NETWORK,
             "OCU_PROXY_PORT": PROXY_PUBLISHED,
+            "OCU_OFFICE_PROXY_PORT": "8083",
         })
     if extra_env:
         merged.update(extra_env)

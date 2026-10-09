@@ -31,7 +31,9 @@ class RenderTests(unittest.TestCase):
         self.env = {"OCU_INTERNAL_TOKEN": "synthetic-render-token", "OCU_WEBUI_ORIGIN": ORIGIN,
                     "OCU_PROXY_LISTEN": "127.0.0.1:18782",
                     "OCU_WEBUI_UPSTREAM": ORIGIN,
-                    "OCU_PROXY_UPSTREAM": "http://127.0.0.1:18790"}
+                    "OCU_PROXY_UPSTREAM": "http://127.0.0.1:18790",
+                    "OCU_OFFICE_PROXY_LISTEN": "127.0.0.1:18783",
+                    "OCU_OFFICE_PROXY_UPSTREAM": "http://127.0.0.1:18791"}
 
     def render(self, **kwargs):
         return render_module.render(output=self.output, env=self.env, nginx=NGINX, **kwargs)
@@ -64,6 +66,32 @@ class RenderTests(unittest.TestCase):
                     self.assertEqual(self.output.read_bytes(), original)
                 finally:
                     self.env[name] = previous
+
+    def test_office_inputs_are_required_and_failed_render_preserves_config(self):
+        self.render()
+        original = self.output.read_bytes()
+        for name, invalids in (
+            ("OCU_OFFICE_PROXY_LISTEN", (None, "", "127.0.0.1", "0.0.0.0:0",
+                                        "127.0.0.1:18782", "0.0.0.0:65536", "0.0.0.0:8083;#")),
+            ("OCU_OFFICE_PROXY_UPSTREAM", (None, "", "https://127.0.0.1:80",
+                                          "http://user@127.0.0.1:80", "http://127.0.0.1:80/a",
+                                          "http://127.0.0.1:80?x=1", "http://127.0.0.1:",
+                                          "http://127.0.0.1:65536", "http://127.0.0.1\n")),
+        ):
+            previous = self.env[name]
+            for invalid in invalids:
+                with self.subTest(name=name, invalid=invalid):
+                    self.env.pop(name, None)
+                    if invalid is not None:
+                        self.env[name] = invalid
+                    with self.assertRaisesRegex(render_module.RenderError, name):
+                        self.render()
+                    self.assertEqual(self.output.read_bytes(), original)
+            self.env[name] = previous
+        self.env["OCU_OFFICE_PROXY_UPSTREAM"] = "http://127.0.0.1"
+        self.render()
+        self.assertEqual(subprocess.run([NGINX, "-t", "-c", str(self.output)],
+                                        capture_output=True).returncode, 0)
 
     def test_every_visible_ascii_token_byte_renders_as_valid_nginx(self):
         tokens = ("".join(chr(n) for n in range(0x21, 0x7F)),

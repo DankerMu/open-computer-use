@@ -13,12 +13,15 @@ services:
     container_name: ocu-test-proxy
     ports:
       - "${OCU_PROXY_PORT:?OCU_PROXY_PORT is required}:8082"
+      - "${OCU_OFFICE_PROXY_PORT:?OCU_OFFICE_PROXY_PORT is required}:8083"
     environment:
       OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
       OCU_WEBUI_ORIGIN: ${OCU_WEBUI_ORIGIN:?OCU_WEBUI_ORIGIN is required}
       OCU_WEBUI_UPSTREAM: http://open-webui:8080
       OCU_PROXY_UPSTREAM: http://computer-use-server:8081
       OCU_PROXY_LISTEN: 0.0.0.0:8082
+      OCU_OFFICE_PROXY_LISTEN: 0.0.0.0:8083
+      OCU_OFFICE_PROXY_UPSTREAM: ${OCU_OFFICE_DOCSERVER_URL:?OCU_OFFICE_DOCSERVER_URL is required}
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

@@ -79,7 +79,11 @@ DocumentServer's own-data mounts are project-scoped named volumes:
 `/var/lib/onlyoffice`, and `documentserver-logs` at `/var/log/onlyoffice`.
 Its only configured host binds are the two font directories below; no Docker
 socket, chat, skills or workspace bind is attached.
-The proxy remains the sole publisher, with one publication.
+The proxy is the sole publisher: `OCU_PROXY_PORT:8082` serves WebUI/OCU and
+`OCU_OFFICE_PROXY_PORT:8083` serves DocumentServer, in both editing-flag states.
+The second listener requires WebUI session authentication, strips cookies and
+credential/identity headers before forwarding, and keeps the browser-facing
+host/port and listener scheme. Its upstream comes from `OCU_OFFICE_DOCSERVER_URL`.
 
 The release font directory mounts at `/usr/share/fonts/truetype/ocu-release`;
 `OCU_OFFICE_FONTS_DIR` mounts at `/usr/share/fonts/truetype/ocu-operator`.
@@ -117,9 +121,9 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 
 支持的归档形式限于经典 Docker `manifest.json`/`repositories` 以及 Moby/containerd 导出的单目标平台 hybrid（`oci-layout` + `index.json` + `manifest.json` + content-addressed blobs）。嵌套 index 与 exporter 添加的 attestation/referrer 必须被显式核算；不支持的 metadata 在 load 前拒绝。
 
-从源码 checkout 根目录配置运行环境后运行 `deploy/up.sh`。入口依次解析 core、WebUI、proxy 三套 Compose 配置为私有临时 JSON，运行 `deploy/check-ports.sh` 与 `deploy/provision-networks.sh`，再通过 `run_owned` 运行 `deploy/check-sandbox-dns.sh`、`deploy/firewall/docker-user-rules.sh` 与 `deploy/firewall/check.sh`，然后用已检查的快照启动 core 和 WebUI，最后启动 proxy。core/WebUI 的项目目录是源码根；proxy 的项目目录是 overlay，以保持 `../proxy` 构建上下文。启动时覆盖 `COMPOSE_REMOVE_ORPHANS=false` 和 `COMPOSE_PROFILES=`，避免拆除共享项目中的兄弟栈或激活 cleanup。nginx 在配置校验时解析 `open-webui:8080` 和 `computer-use-server:8081`，因此两个应用必须先存在。入口监督配置解析、快照冻结、检查、建网、DNS 预检、防火墙安装和启动子进程；TERM/INT/HUP 会结束所属进程组并删除私有临时文件，但不会 `down`、删除卷、迁移网络、刷新共享防火墙链或修改现存 sandbox。
+从源码 checkout 根目录配置运行环境后运行 `deploy/up.sh`。入口依次解析 core、WebUI、proxy 三套 Compose 配置为私有临时 JSON，运行 `deploy/check-ports.sh` 与 `deploy/provision-networks.sh`，再通过 `run_owned` 运行 `deploy/check-sandbox-dns.sh`、`deploy/firewall/docker-user-rules.sh` 与 `deploy/firewall/check.sh`，然后用已检查的快照启动 core 和 WebUI，最后启动 proxy。core/WebUI 的项目目录是源码根；proxy 的项目目录是 overlay，以保持 `../proxy` 构建上下文。启动时覆盖 `COMPOSE_REMOVE_ORPHANS=false` 和 `COMPOSE_PROFILES=`，避免拆除共享项目中的兄弟栈或激活 cleanup。nginx 在配置校验时解析 `open-webui:8080`、`computer-use-server:8081` 和 `documentserver:80`，因此三个上游必须先存在。入口监督配置解析、快照冻结、检查、建网、DNS 预检、防火墙安装和启动子进程；TERM/INT/HUP 会结束所属进程组并删除私有临时文件，但不会 `down`、删除卷、迁移网络、刷新共享防火墙链或修改现存 sandbox。
 
-- 只有 proxy 将 `${OCU_PROXY_PORT}` 映射到容器的 TCP 8082。WebUI、Computer Use、PostgreSQL、initializer 和维护服务不得发布宿主机端口，即使只绑定 loopback 也不允许。
+- 只有 proxy 发布两个 TCP 端口：`${OCU_PROXY_PORT}:8082` 和 `${OCU_OFFICE_PROXY_PORT}:8083`。WebUI、Computer Use、DocumentServer、PostgreSQL、initializer 和维护服务不得发布宿主机端口，即使只绑定 loopback 也不允许。
 - 应用服务仅连接由 `${OCU_PRIVATE_NETWORK}` 命名、`${OCU_PRIVATE_SUBNET}` 与 `${OCU_PRIVATE_GATEWAY}` 定址的 control-plane bridge；proxy 通过同一 bridge 的 Docker DNS 找到应用。显式 `network_mode`（包括 `bridge`）不得代替该命名网。
 - `${OCU_SANDBOX_NETWORK}` 是部署入口单独创建或校验的非 internal bridge，具有 `${OCU_SANDBOX_SUBNET}` 和 `${OCU_SANDBOX_GATEWAY}`。Compose 服务不加入此网络。OCU 将 CDP/ttyd 动态端口只绑定到该 gateway，且原生网络策略只允许 sandbox 连接这张 bridge。
 - Open WebUI 必须设置 `ENABLE_OCU_WORKSPACE=true` 和 `OCU_INTERNAL_URL=http://computer-use-server:8081`；`ORCHESTRATOR_URL` 不是客户端别名。
@@ -128,7 +132,7 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 
 `deploy/check-ports.sh` 的输入是 **完整的** `docker compose config --format json` 输出集合，不能用原始 YAML 代替；`expose` 不发布端口。bridge 已存在但 driver、internal 模式、subnet 或 gateway 不匹配时入口拒绝启动，不删除、替换、断开网络或现存 sandbox。防火墙安装绑定权威 sandbox 网桥入口接口，而不是源地址；同一宿主机只维护一份 owned 策略。安装器与检查器通过 `OCU_SANDBOX_EGRESS_LOCK`（默认 `/run/ocu-sandbox-egress/ocu-sandbox-egress.lock`）串行化合作进程；该路径必须位于当前 euid 拥有、非符号链接、非 group/world-writable 的目录中。DNS 解析、真实镜像构建、Compose 合并、内核数据包路径和引擎端口矩阵的实际验收留给 #36。
 
-部署完成后不要把 overlay smoke 接到 `deploy/up.sh`。在同一已配置的部署 shell 中运行 `deploy/smoke.sh`：使用与 `up.sh` 相同的存储配置；smoke 从 `OCU_RELEASE_MANIFEST` 自动派生 Compose 所需的 release-font 路径，覆盖过期的继承值，无需额外导出。另需显式 `OCU_SMOKE_CHAT_ID`、`OCU_SMOKE_SANDBOX_ID`、`OCU_SMOKE_EXCLUSIVE=1`、`OCU_SMOKE_OWNER_TOKEN`（只进进程环境，不得出现在 argv/日志）、IPv4 字面量 `OCU_SMOKE_FORMER_URL`、`OCU_SMOKE_EGRESS_URL` 与 `OCU_SMOKE_HOST_LAN_IPV4`。命令核验三套 Compose `ps --all` 清单（仅 proxy 发布 TCP `${OCU_PROXY_PORT}:8082`；`computer-use-server`/`open-webui`/`proxy`/`postgres`/`retention-guard` 必须在跑；oneshot 可缺席但其 publication 仍检查；运行中的 `cleanup` 失败）、前 OCU 入口 `ECONNREFUSED`、宿主机对 control 字面量的 HTTP 存活、sandbox 内允许列表 HTTP 2xx/3xx，然后才接受 sandbox 对 OCU:8081/WebUI:8080/proxy:8082 与宿主机 LAN proxy 的 curl 连接阶段超时（exit 28 且无 TCP 连接）。空允许列表是合法 deny-all，但不能完成本 smoke，以非零前提失败。终端只在独占、无既有 ttyd/tmux 的 smoke sandbox 上经 `dangerous_mode=false` 的 start-ttyd 与 `tty` WebSocket 观察产品 pane/前台 Bash；清理失败即失败。退出码：0 全部断言与 owned cleanup 完成；1 断言失败；2 前提/用法；129/130/143 为 HUP/INT/TERM。本地 fake/native 证据不是真实引擎验收；数据包、ttyd 镜像与宿主防火墙证明留给 #36。
+部署完成后不要把 overlay smoke 接到 `deploy/up.sh`。在同一已配置的部署 shell 中运行 `deploy/smoke.sh`：使用与 `up.sh` 相同的存储配置；smoke 从 `OCU_RELEASE_MANIFEST` 自动派生 Compose 所需的 release-font 路径，覆盖过期的继承值，无需额外导出。另需显式 `OCU_SMOKE_CHAT_ID`、`OCU_SMOKE_SANDBOX_ID`、`OCU_SMOKE_EXCLUSIVE=1`、`OCU_SMOKE_OWNER_TOKEN`（只进进程环境，不得出现在 argv/日志）、IPv4 字面量 `OCU_SMOKE_FORMER_URL`、`OCU_SMOKE_EGRESS_URL` 与 `OCU_SMOKE_HOST_LAN_IPV4`。命令核验三套 Compose `ps --all` 清单（仅 proxy 发布 TCP `${OCU_PROXY_PORT}:8082` 与 `${OCU_OFFICE_PROXY_PORT}:8083`，各需 IPv4 wildcard，可有一个 IPv6 twin，不按地址族重复计端口；`computer-use-server`/`open-webui`/`proxy`/`postgres`/`retention-guard` 必须在跑；oneshot 可缺席但其 publication 仍检查；运行中的 `cleanup` 失败）、前 OCU 入口 `ECONNREFUSED`、宿主机对 control 字面量的 HTTP 存活、sandbox 内允许列表 HTTP 2xx/3xx，然后才接受 sandbox 对 OCU:8081/WebUI:8080/proxy:8082 与宿主机 LAN proxy 的 curl 连接阶段超时（exit 28 且无 TCP 连接）。空允许列表是合法 deny-all，但不能完成本 smoke，以非零前提失败。终端只在独占、无既有 ttyd/tmux 的 smoke sandbox 上经 `dangerous_mode=false` 的 start-ttyd 与 `tty` WebSocket 观察产品 pane/前台 Bash；清理失败即失败。退出码：0 全部断言与 owned cleanup 完成；1 断言失败；2 前提/用法；129/130/143 为 HUP/INT/TERM。本地 fake/native 证据不是真实引擎验收；数据包、ttyd 镜像与宿主防火墙证明留给 #36。
 
 ## 已知边界
 

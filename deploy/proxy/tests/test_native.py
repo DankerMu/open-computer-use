@@ -20,6 +20,7 @@ TOKEN = ("".join(chr(n) for n in range(0x21, 0x7F)) + "$http_host${x}@@LOCATIONS
 MUTATION = {"X-Requested-With": "ocu-workspace", "Origin": ORIGIN}
 RECORD = Path(os.environ.get("OCU_TEST_RECORD", "/tmp/ocu-proxy-native-record/requests.jsonl"))
 PROXY_PORT = int(os.environ.get("OCU_TEST_PROXY_PORT", "18782"))
+OFFICE_PROXY_PORT = int(os.environ.get("OCU_TEST_OFFICE_PROXY_PORT", "18783"))
 OFFICE_ROWS = (
     ("documents/file-123/sessions", "POST"),
     ("sessions/session-123", "GET"),
@@ -43,8 +44,8 @@ class NativeProxyTests(unittest.TestCase):
     def since(self, kind, before):
         return [row for row in self.observations()[before:] if row["kind"] == kind]
 
-    def request(self, path, method="GET", headers=None, body=None):
-        connection = http.client.HTTPConnection("127.0.0.1", PROXY_PORT, timeout=15)
+    def request(self, path, method="GET", headers=None, body=None, *, port=PROXY_PORT):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
         connection.request(method, path, body=body, headers=headers or {})
         response = connection.getresponse()
         result = (response.status, response.getheaders(), response.read())
@@ -93,6 +94,101 @@ class NativeProxyTests(unittest.TestCase):
             self.assertEqual(seen.get("body_sha256"), hashlib.sha256(body).hexdigest())
             self.assertEqual(seen.get("body_length"), len(body))
         return seen
+
+    def test_documentserver_request_preserves_target_and_withholds_credentials(self):
+        path = "/web-apps/space%20name%2Fpart.js?x=1&x=%2B"
+        forged = {name: "forged-private-value" for name in (
+            "Authorization", "X-OCU-Internal-Token", "X-Chat-Id",
+            "X-User-Id", "X-User-Email", "X-Forwarded-Host",
+            "X-Forwarded-Proto", "X-Forwarded-For")}
+        before = self.snapshot()
+        body = b"documentserver-body"
+        status, _, _ = self.request(
+            path, "POST", self.owner({**forged, "Host": "editor.test:19443"}),
+            body, port=OFFICE_PROXY_PORT)
+        self.assertEqual(status, 200)
+        self.expect_auth(before, session=True)
+        self.assertEqual(self.since("ocu", before), [])
+        rows = self.since("documentserver", before)
+        self.assertEqual(len(rows), 1)
+        seen = rows[0]
+        self.assertEqual((seen["method"], seen["target"]), ("POST", path))
+        self.assertEqual(seen["body_sha256"], hashlib.sha256(body).hexdigest())
+        self.assertEqual(seen["body_length"], len(body))
+        headers = seen["headers"]
+        for name in ("authorization", "cookie", "x-ocu-internal-token",
+                     "x-chat-id", "x-user-id", "x-user-email"):
+            self.assertNotIn(name, headers)
+        self.assertEqual(headers.get("host"), "editor.test:19443")
+        self.assertEqual(headers.get("x-forwarded-host"), "editor.test:19443")
+        self.assertEqual(headers.get("x-forwarded-proto"), "http")
+        self.assertEqual(headers.get("x-forwarded-for"), "127.0.0.1")
+
+    def test_documentserver_denials_and_listener_separation(self):
+        for upgrade in (False, True):
+            for cookie, expected in ((None, 401), ("session=status-302", 500),
+                                     ("session=status-403", 403), ("session=status-404", 500),
+                                     ("session=status-500", 500), ("session=error", 500)):
+                with self.subTest(upgrade=upgrade, cookie=cookie):
+                    before = self.snapshot()
+                    headers = {"Authorization": "Bearer forged", "X-Api-Key": "forged"}
+                    if cookie:
+                        headers["Cookie"] = cookie
+                    if upgrade:
+                        headers.update({"Upgrade": "websocket", "Connection": "Upgrade"})
+                    status, _, _ = self.request("/doc/key/c", headers=headers, port=OFFICE_PROXY_PORT)
+                    self.assertEqual(status, expected)
+                    self.expect_auth(before, session=True, cookie=cookie)
+                    self.assertEqual(self.since("documentserver", before), [])
+                    self.assertEqual(self.since("ocu", before), [])
+        before = self.snapshot()
+        self.assertEqual(self.request("/_ocu_session_auth", headers=self.owner(),
+                                      port=OFFICE_PROXY_PORT)[0], 404)
+        self.assertEqual(self.observations()[before:], [])
+        for path in (f"/ocu/api/outputs/{CHAT}",
+                     f"/ocu/api/office/{CHAT}/sessions/session-123",
+                     f"/office/callback/{CHAT}/session-123", "/api/v1/chats/", "/"):
+            before = self.snapshot()
+            self.assertEqual(self.request(path, headers=self.owner(),
+                                          port=OFFICE_PROXY_PORT)[0], 200)
+            self.expect_auth(before, session=True)
+            self.assertEqual(self.since("ocu", before), [])
+            self.assertEqual([row["target"] for row in self.since("documentserver", before)], [path])
+        before = self.snapshot()
+        self.assertEqual(self.request("/web-apps/apps/api/documents/api.js",
+                                      headers=self.owner())[0], 200)
+        self.assertEqual(self.since("documentserver", before), [])
+
+    def test_documentserver_websocket_is_bidirectional_and_cookie_free(self):
+        before = self.snapshot()
+        key = base64.b64encode(b"office-native-12").decode()
+        request = "\r\n".join((
+            "GET /doc/key/c?transport=websocket HTTP/1.1", "Host: editor.test:19443",
+            "Connection: Upgrade", "Upgrade: websocket", f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13", "Cookie: session=foreign",
+            "Authorization: Bearer forged", "X-Chat-Id: forged", "", "",
+        )).encode()
+        with socket.create_connection(("127.0.0.1", OFFICE_PROXY_PORT), timeout=15) as connection:
+            connection.sendall(request)
+            with connection.makefile("rb") as stream:
+                self.assertEqual(stream.readline().split()[1], b"101")
+                headers = {}
+                while (line := stream.readline()) != b"\r\n":
+                    self.assertTrue(line)
+                    name, value = line.split(b":", 1)
+                    headers[name.lower()] = value.strip()
+                accept = base64.b64encode(hashlib.sha1(
+                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+                self.assertEqual(headers.get(b"sec-websocket-accept"), accept)
+                connection.sendall(b"\x89\x82\x11\x22\x33\x44\x7e\x49")
+                self.assertEqual(stream.read(4), b"\x8a\x02ok")
+        self.expect_auth(before, session=True, cookie="session=foreign")
+        self.assertEqual(self.since("ocu", before), [])
+        rows = self.since("documentserver", before)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["target"], "/doc/key/c?transport=websocket")
+        for name in ("cookie", "authorization", "x-chat-id"):
+            self.assertNotIn(name, rows[0]["headers"])
 
     def test_office_rows_forward_with_path_chat_and_internal_auth(self):
         for suffix, method in OFFICE_ROWS:
