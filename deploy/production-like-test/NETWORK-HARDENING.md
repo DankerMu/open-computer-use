@@ -58,6 +58,22 @@ It uses `DOCUMENTSERVER_IMAGE`, publishes no host port, and joins only the
 control-plane network. The port guard requires it exactly once; its resolved
 image must match the release inventory before provisioning or startup.
 
+`up.sh` requires `DOCUMENTSERVER_IMAGE`, `OCU_OFFICE_JWT_SECRET`,
+`OCU_OFFICE_DOCSERVER_URL`, `OCU_OFFICE_DOCSERVER_ORIGIN`, `OCU_OFFICE_SELF_URL`,
+`OCU_OFFICE_PROXY_PORT`, `OCU_OFFICE_FONTS_DIR` and `ENABLE_OCU_OFFICE_EDIT`,
+even when editing is off. It rejects an invalid flag, nondecimal or out-of-range
+Office port, and an invalid browser origin using the same origin
+and port validators as bootstrap. `OCU_OFFICE_FONTS_DIR` must be nonempty;
+this preflight does not check its directory or mount it.
+
+DocumentServer receives `JWT_ENABLED=true` and `JWT_SECRET` from the bootstrap
+secret. The selected upstream entrypoint applies these controls to browser,
+inbox and outbox. Before provisioning or startup, admission checks the resolved
+enablement and requires the resolved secret to match both the supplied
+`OCU_OFFICE_JWT_SECRET` and the OCU service's resolved value. A failure names the
+setting without printing a credential, preserves engine state and removes owned
+temporary snapshots. Startup uses those checked snapshots, not a new resolution.
+
 DocumentServer's configured mounts are project-scoped named volumes:
 `documentserver-data` at `/var/www/onlyoffice/Data`, `documentserver-cache` at
 `/var/lib/onlyoffice`, and `documentserver-logs` at `/var/log/onlyoffice`.
@@ -81,7 +97,7 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 - 应用服务仅连接由 `${OCU_PRIVATE_NETWORK}` 命名、`${OCU_PRIVATE_SUBNET}` 与 `${OCU_PRIVATE_GATEWAY}` 定址的 control-plane bridge；proxy 通过同一 bridge 的 Docker DNS 找到应用。显式 `network_mode`（包括 `bridge`）不得代替该命名网。
 - `${OCU_SANDBOX_NETWORK}` 是部署入口单独创建或校验的非 internal bridge，具有 `${OCU_SANDBOX_SUBNET}` 和 `${OCU_SANDBOX_GATEWAY}`。Compose 服务不加入此网络。OCU 将 CDP/ttyd 动态端口只绑定到该 gateway，且原生网络策略只允许 sandbox 连接这张 bridge。
 - Open WebUI 必须设置 `ENABLE_OCU_WORKSPACE=true` 和 `OCU_INTERNAL_URL=http://computer-use-server:8081`；`ORCHESTRATOR_URL` 不是客户端别名。
-- 运行环境必须显式提供 `OCU_RELEASE_MANIFEST`、`OCU_PRIVATE_NETWORK`、`OCU_PRIVATE_SUBNET`、`OCU_PRIVATE_GATEWAY`、`OCU_SANDBOX_NETWORK`、`OCU_SANDBOX_SUBNET`、`OCU_SANDBOX_GATEWAY`、`OCU_SANDBOX_EGRESS_ALLOW`、`OCU_SANDBOX_DNS`、`OCU_PROXY_PORT`、`OCU_PROXY_IMAGE`、`OCU_INTERNAL_TOKEN`、`OCU_WEBUI_ORIGIN`、`OCU_WEBUI_AUTH_URL` 和 `PUBLIC_BASE_URL`，以及既有应用和 provider 的必要变量。`OCU_SANDBOX_EGRESS_ALLOW` 未设置是配置错误；显式空值表示拒绝全部新的 sandbox 出站。`OCU_SANDBOX_DNS` 未设置是配置错误；显式空值通过容器本地 `127.0.0.11` 覆盖关闭外部 DNS 转发，而不是继承宿主机 nameserver。不要将 token 写在命令行、日志或仓库文件中。`scripts/bootstrap-test.sh` 要求 `OCU_RELEASE_MANIFEST`、匹配 checkout 的完整 `SOURCE_SHA` 和 `OCU_WEBUI_ORIGIN`；六张镜像引用必须与清单一致，或从清单安全派生。它写入上述拓扑/鉴权变量、`PUBLIC_BASE_URL=${OCU_WEBUI_ORIGIN}/ocu`、内部 `OCU_WEBUI_AUTH_URL=http://open-webui:8080/api/v1/ocu/auth`、共享内部 token、`OCU_PUBLIC_PREFIX=/ocu` 与 `OCU_SANDBOX_NO_AUTOSTART=1`。
+- 运行环境必须显式提供 `OCU_RELEASE_MANIFEST`、`OCU_PRIVATE_NETWORK`、`OCU_PRIVATE_SUBNET`、`OCU_PRIVATE_GATEWAY`、`OCU_SANDBOX_NETWORK`、`OCU_SANDBOX_SUBNET`、`OCU_SANDBOX_GATEWAY`、`OCU_SANDBOX_EGRESS_ALLOW`、`OCU_SANDBOX_DNS`、`OCU_PROXY_PORT`、`OCU_PROXY_IMAGE`、`OCU_INTERNAL_TOKEN`、`OCU_WEBUI_ORIGIN`、`OCU_WEBUI_AUTH_URL` 和 `PUBLIC_BASE_URL`，以及上述 Office 设置、既有应用和 provider 的必要变量。`OCU_SANDBOX_EGRESS_ALLOW` 未设置是配置错误；显式空值表示拒绝全部新的 sandbox 出站。`OCU_SANDBOX_DNS` 未设置是配置错误；显式空值通过容器本地 `127.0.0.11` 覆盖关闭外部 DNS 转发，而不是继承宿主机 nameserver。不要将 token 写在命令行、日志或仓库文件中。`scripts/bootstrap-test.sh` 要求 `OCU_RELEASE_MANIFEST`、匹配 checkout 的完整 `SOURCE_SHA`、`OCU_WEBUI_ORIGIN` 及上述显式 Office 输入；七张镜像引用必须与清单一致，或从清单安全派生。它写入上述拓扑/鉴权变量、`PUBLIC_BASE_URL=${OCU_WEBUI_ORIGIN}/ocu`、内部 `OCU_WEBUI_AUTH_URL=http://open-webui:8080/api/v1/ocu/auth`、共享内部 token、`OCU_PUBLIC_PREFIX=/ocu` 与 `OCU_SANDBOX_NO_AUTOSTART=1`。
 
 
 `deploy/check-ports.sh` 的输入是 **完整的** `docker compose config --format json` 输出集合，不能用原始 YAML 代替；`expose` 不发布端口。bridge 已存在但 driver、internal 模式、subnet 或 gateway 不匹配时入口拒绝启动，不删除、替换、断开网络或现存 sandbox。防火墙安装绑定权威 sandbox 网桥入口接口，而不是源地址；同一宿主机只维护一份 owned 策略。安装器与检查器通过 `OCU_SANDBOX_EGRESS_LOCK`（默认 `/run/ocu-sandbox-egress/ocu-sandbox-egress.lock`）串行化合作进程；该路径必须位于当前 euid 拥有、非符号链接、非 group/world-writable 的目录中。DNS 解析、真实镜像构建、Compose 合并、内核数据包路径和引擎端口矩阵的实际验收留给 #36。
