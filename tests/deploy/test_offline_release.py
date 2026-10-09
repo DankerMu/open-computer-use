@@ -207,6 +207,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
             "deploy/up.sh",
+            "deploy/settings.py",
             "deploy/production-like-test/scripts/bootstrap-test.sh",
             "deploy/production-like-test/scripts/write-deployed-version.sh",
         ):
@@ -538,6 +539,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/functions/computer_link_filter.py",
             "deploy/release.py",
             "deploy/up.sh",
+            "deploy/settings.py",
             "deploy/__init__.py",
             "deploy/check-ports.sh",
             "deploy/provision-networks.sh",

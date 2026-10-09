@@ -100,6 +100,7 @@ DOCUMENTSERVER_UPSTREAM = (
 
 UP_FIXTURE_PATHS = (
     "deploy/up.sh",
+    "deploy/settings.py",
     "deploy/release.py",
     "deploy/fonts/prepare_fonts.py",
     "deploy/fonts/fonts.json",
