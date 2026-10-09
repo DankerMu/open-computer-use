@@ -51,6 +51,7 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       ORCHESTRATOR_URL: http://computer-use-server:8081
       ENABLE_OCU_WORKSPACE: "true"
+      ENABLE_OCU_OFFICE_EDIT: ${ENABLE_OCU_OFFICE_EDIT:?ENABLE_OCU_OFFICE_EDIT is required}
       OCU_INTERNAL_URL: http://computer-use-server:8081
       MCP_API_KEY: ${MCP_API_KEY}
       OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}

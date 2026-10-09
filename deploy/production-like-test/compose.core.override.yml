@@ -24,6 +24,11 @@ services:
       OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
       OCU_WEBUI_ORIGIN: ${OCU_WEBUI_ORIGIN:?OCU_WEBUI_ORIGIN is required}
       OCU_WEBUI_AUTH_URL: ${OCU_WEBUI_AUTH_URL:?OCU_WEBUI_AUTH_URL is required}
+      # The broker stays configured when the WebUI editing entry is hidden.
+      OCU_OFFICE_DOCSERVER_URL: ${OCU_OFFICE_DOCSERVER_URL:?OCU_OFFICE_DOCSERVER_URL is required}
+      OCU_OFFICE_DOCSERVER_ORIGIN: ${OCU_OFFICE_DOCSERVER_ORIGIN:?OCU_OFFICE_DOCSERVER_ORIGIN is required}
+      OCU_OFFICE_SELF_URL: ${OCU_OFFICE_SELF_URL:?OCU_OFFICE_SELF_URL is required}
+      OCU_OFFICE_JWT_SECRET: ${OCU_OFFICE_JWT_SECRET:?OCU_OFFICE_JWT_SECRET is required}
       DOCKER_IMAGE: ${DOCKER_IMAGE}
       BASE_DATA_DIR: ${OCU_CHAT_DATA_DIR}
       SKILLS_CACHE_DIR: ${OCU_SKILLS_CACHE_DIR}
@@ -45,6 +50,17 @@ services:
       OCU_SANDBOX_DNS: ${OCU_SANDBOX_DNS?OCU_SANDBOX_DNS is required}
       # The injected Open WebUI Tool intentionally omits sub_agent. Do not pass
       # credentials for Claude, Codex, OpenCode, or other external sub-agents.
+
+  documentserver:
+    image: ${DOCUMENTSERVER_IMAGE:?DOCUMENTSERVER_IMAGE is required}
+    ports: []
+    networks:
+      - default
+    volumes:
+      - documentserver-data:/var/www/onlyoffice/Data
+      - documentserver-cache:/var/lib/onlyoffice
+      - documentserver-logs:/var/log/onlyoffice
+    restart: unless-stopped
 
   # The upstream cleanup service stops sandboxes and deletes data/volumes.
   # It must never start for this retention policy.
@@ -77,3 +93,8 @@ networks:
       config:
         - subnet: ${OCU_PRIVATE_SUBNET:?OCU_PRIVATE_SUBNET is required}
           gateway: ${OCU_PRIVATE_GATEWAY:?OCU_PRIVATE_GATEWAY is required}
+
+volumes:
+  documentserver-data:
+  documentserver-cache:
+  documentserver-logs:

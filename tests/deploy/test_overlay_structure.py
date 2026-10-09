@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
-"""Parsed overlay and packaging assertions without emulating Compose merge."""
+"""Native Compose contracts plus parsed overlay and packaging guards."""
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 try:
@@ -16,12 +22,26 @@ except ImportError as exc:  # pragma: no cover - exercised by missing-dependency
 from interpolation import UnsupportedInterpolation, interpolate_value
 from support import (
     CORE_OVERRIDE,
+    DEFAULT_RELEASE_IMAGES,
     PROXY_COMPOSE,
     PROXY_DOCKERFILE,
     PROXY_DOCKERIGNORE,
     ROOT,
+    RUNTIME_IMAGE_VARS,
     WEBUI_OVERRIDE,
 )
+
+SERVER_DIR = ROOT / "computer-use-server"
+if str(SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(SERVER_DIR))
+from office import config as office_config
+
+OFFICE_INPUTS = {
+    "OCU_OFFICE_DOCSERVER_URL": "http://documentserver",
+    "OCU_OFFICE_DOCSERVER_ORIGIN": "http://workbench.test:8083",
+    "OCU_OFFICE_SELF_URL": "http://computer-use-server:8081",
+    "OCU_OFFICE_JWT_SECRET": "native-office-jwt-canary",
+}
 
 
 REQUIRED_CORE_NAMES = (
@@ -87,7 +107,106 @@ def interpolated_present(value: str, name: str) -> bool:
     return isinstance(value, str) and value.startswith(f"${{{name}?")
 
 
+def resolved_stacks(directory: Path, flag: str, source: Path | None = None) -> dict:
+    source = source or ROOT
+    directory.mkdir(parents=True, exist_ok=True)
+    empty = directory / "empty.env"
+    empty.write_text("", encoding="utf-8")
+    environment = {
+        "PATH": os.environ["PATH"], "HOME": str(directory),
+        "DOCKER_CONFIG": str(directory), "COMPOSE_DISABLE_ENV_FILE": "1",
+        "DOCKER_HOST": "unix://" + str(directory / "no-daemon.sock"),
+        "OCU_PRIVATE_NETWORK": "ocu-test-private", "OCU_PRIVATE_SUBNET": "172.30.0.0/24",
+        "OCU_PRIVATE_GATEWAY": "172.30.0.1", "OCU_SANDBOX_NETWORK": "ocu-sandbox",
+        "OCU_SANDBOX_SUBNET": "172.31.0.0/24", "OCU_SANDBOX_GATEWAY": "172.31.0.1",
+        "OCU_SANDBOX_DNS": "8.8.8.8", "OCU_PROXY_PORT": "8082",
+        "OCU_WEBUI_ORIGIN": "http://workbench.test:8082",
+        "OCU_WEBUI_AUTH_URL": "http://open-webui:8080/api/v1/ocu/auth",
+        "PUBLIC_BASE_URL": "http://workbench.test:8082/ocu",
+        "OCU_CHAT_DATA_DIR": str(directory / "chat"),
+        "OCU_SKILLS_CACHE_DIR": str(directory / "skills"),
+        "CONTAINER_MEM_LIMIT": "2g", "CONTAINER_CPU_LIMIT": "1.0",
+        "CONTAINER_IDLE_TIMEOUT": "604800", "COMMAND_TIMEOUT": "120",
+        "SUB_AGENT_TIMEOUT": "3600", "RETENTION_CHECK_INTERVAL_SECONDS": "3600",
+        "ADMIN_EMAIL": "admin@fixture.test", "DMXAPI_BASE_URL": "http://provider.fixture/v1",
+        "ENABLE_OCU_OFFICE_EDIT": flag, **OFFICE_INPUTS,
+    }
+    for name in ("MCP_API_KEY", "OCU_INTERNAL_TOKEN", "WEBUI_SECRET_KEY",
+                 "POSTGRES_PASSWORD", "ADMIN_PASSWORD", "DMXAPI_API_KEY"):
+        environment[name] = "native-fixture-" + name.lower()
+    environment.update({name: DEFAULT_RELEASE_IMAGES[role]
+                        for role, name in RUNTIME_IMAGE_VARS.items()})
+    standalone = shutil.which("docker-compose")
+    command = [standalone] if standalone else ["docker", "compose"]
+    overlay = source / "deploy/production-like-test"
+    documents = {}
+    for name, project, files in (
+        ("core", source, (source / "docker-compose.yml", overlay / "compose.core.override.yml")),
+        ("webui", source, (source / "docker-compose.webui.yml", overlay / "compose.webui.override.yml")),
+        ("proxy", overlay, (overlay / "compose.proxy.yml",)),
+    ):
+        argv = [*command, "-p", "ocu-test", "--project-directory", str(project),
+                "--env-file", str(empty)]
+        for path in files:
+            argv.extend(("-f", str(path)))
+        result = subprocess.run(
+            [*argv, "config", "--format", "json", "--no-env-resolution"],
+            cwd=source, env=environment, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode:
+            raise AssertionError(f"native Compose v2 resolution failed: {result.stderr}")
+        document = json.loads(result.stdout)
+        if any(service.get("env_file") for service in document["services"].values()):
+            raise AssertionError("native resolver must not omit service env_file inputs")
+        documents[name + ".json"] = document
+    return documents
+
+
 class OverlayStructureTests(unittest.TestCase):
+    def test_native_documentserver_topology_and_consumer_contract(self):
+        states = []
+        with tempfile.TemporaryDirectory(prefix="ocu-native-compose-") as raw:
+            for flag in ("false", "true"):
+                documents = resolved_stacks(Path(raw) / flag, flag)
+                core, webui, proxy = (documents[name + ".json"] for name in ("core", "webui", "proxy"))
+                self.assertIn("documentserver", core["services"])
+                service = core["services"]["documentserver"]
+                self.assertEqual(sum("documentserver" in doc["services"]
+                                     for doc in documents.values()), 1)
+                self.assertEqual(service["image"], DEFAULT_RELEASE_IMAGES["documentserver"])
+                self.assertNotIn("build", service)
+                self.assertFalse(service.get("profiles"))
+                self.assertFalse(service.get("ports"))
+                self.assertFalse(service.get("network_mode"))
+                self.assertEqual(set(service["networks"]), {"default"})
+                self.assertEqual(core["networks"]["default"]["name"], "ocu-test-private")
+                expected_mounts = {
+                    "/var/www/onlyoffice/Data": "documentserver-data",
+                    "/var/lib/onlyoffice": "documentserver-cache",
+                    "/var/log/onlyoffice": "documentserver-logs",
+                }
+                mounts = service["volumes"]
+                self.assertEqual({mount["target"]: mount["source"] for mount in mounts},
+                                 expected_mounts)
+                self.assertEqual(len(mounts), len(expected_mounts))
+                for mount in mounts:
+                    self.assertEqual(mount["type"], "volume")
+                    self.assertIn(mount["source"], core["volumes"])
+                names = (
+                    office_config.OCU_OFFICE_DOCSERVER_URL,
+                    office_config.OCU_OFFICE_DOCSERVER_ORIGIN,
+                    office_config.OCU_OFFICE_SELF_URL,
+                    office_config.OCU_OFFICE_JWT_SECRET,
+                )
+                environment = core["services"]["computer-use-server"]["environment"]
+                for name in names:
+                    self.assertTrue(environment.get(name), name)
+                    self.assertEqual(environment[name], OFFICE_INPUTS[name])
+                self.assertEqual(webui["services"]["open-webui"]["environment"]["ENABLE_OCU_OFFICE_EDIT"], flag)
+                self.assertEqual(len(proxy["services"]["proxy"]["ports"]), 1)
+                states.append((service, {name: core["volumes"][name] for name in expected_mounts.values()}))
+        self.assertEqual(states[0], states[1])
+
     def test_parsed_overrides_and_local_build_mount_dependencies(self):
         core = parsed(CORE_OVERRIDE)
         webui = parsed(WEBUI_OVERRIDE)
