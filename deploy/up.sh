@@ -133,7 +133,9 @@ if [[ ! -d "$OCU_OFFICE_FONTS_DIR" ]]; then
     printf '%s\n' 'deploy: OCU_OFFICE_FONTS_DIR must be an existing directory' >&2
     exit 1
 fi
-if ! run_owned python3 - "$ROOT" "$OCU_RELEASE_MANIFEST" <<'PY'
+CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ocu-deploy-config.XXXXXX")"
+: >"$CONFIG_DIR/empty.env"
+if ! run_owned python3 - "$ROOT" "$OCU_RELEASE_MANIFEST" >"$CONFIG_DIR/release-fonts" <<'PY'
 from __future__ import annotations
 
 import os
@@ -149,8 +151,9 @@ try:
     runtime = dict(os.environ)
     release.verify_runtime_binding(payload, runtime)
     release.verify_tracked_source(root, payload["ocu_source_sha"])
-    release.verify_release_fonts(Path(sys.argv[2]), root)
+    fonts = release.verify_release_fonts(Path(sys.argv[2]), root)
     release.verify_local_images(payload)
+    print(fonts, end="\0")
 except release.ReleaseError as exc:
     print(f"deploy: {exc}", file=sys.stderr)
     raise SystemExit(1)
@@ -159,14 +162,11 @@ then
     printf '%s\n' 'deploy: release inventory verification failed' >&2
     exit 1
 fi
-manifest_path="$OCU_RELEASE_MANIFEST"
-if [[ "$manifest_path" != /* ]]; then manifest_path="$PWD/$manifest_path"; fi
-export OCU_RELEASE_FONTS_DIR="${manifest_path%/*}/fonts"
+IFS= read -r -d '' OCU_RELEASE_FONTS_DIR <"$CONFIG_DIR/release-fonts"
+export OCU_RELEASE_FONTS_DIR
 
 
 
-CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ocu-deploy-config.XXXXXX")"
-: >"$CONFIG_DIR/empty.env"
 core_files=(-p "$PROJECT" --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" -f "$OVERLAY/compose.core.override.yml")
 webui_files=(-p "$PROJECT" --project-directory "$ROOT" -f "$ROOT/docker-compose.webui.yml" -f "$OVERLAY/compose.webui.override.yml")
 proxy_files=(-p "$PROJECT" --project-directory "$OVERLAY" -f "$OVERLAY/compose.proxy.yml")

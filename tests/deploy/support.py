@@ -376,6 +376,7 @@ def fake_env(state_dir: Path, extra=None):
 
 def smoke_env(state_dir: Path, extra=None):
     env = fake_env(state_dir)
+    env["OCU_RELEASE_MANIFEST"] = str(state_dir / "release.json")
     env["OCU_SMOKE_CHAT_ID"] = "smoke-chat"
     env["OCU_SMOKE_SANDBOX_ID"] = "sandbox-smoke"
     env["OCU_SMOKE_EXCLUSIVE"] = "1"

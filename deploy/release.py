@@ -1101,8 +1101,12 @@ def verify_font_bundle(
         raise ReleaseError(f"{path}: font bundle verification failed: {exc}") from exc
 
 
+def release_fonts_directory(inventory: Path) -> Path:
+    return inventory.absolute().parent / "fonts"
+
+
 def verify_release_fonts(inventory: Path, source: Path) -> Path:
-    directory = inventory.absolute().parent / "fonts"
+    directory = release_fonts_directory(inventory)
     try:
         target = directory
         if directory.is_symlink():

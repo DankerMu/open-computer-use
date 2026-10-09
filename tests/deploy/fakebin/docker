@@ -1223,6 +1223,8 @@ def compose_ps(state: Path, argv: list[str]) -> int:
     hold_named(state, "FAKE_DOCKER_HOLD_PS", "entered-ps")
     files = compose_files(argv)
     stack = stack_from_files(files)
+    with (state / "ps-environment.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"stack": stack, "release_fonts": os.environ.get("OCU_RELEASE_FONTS_DIR")}) + "\n")
     fail = state / f"ps-fail-{stack}"
     if fail.exists():
         sys.stderr.write(f"compose ps failed for {stack}\n")
