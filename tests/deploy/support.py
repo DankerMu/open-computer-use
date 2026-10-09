@@ -385,6 +385,7 @@ def smoke_env(state_dir: Path, extra=None):
     env["OCU_SMOKE_EXCLUSIVE"] = "1"
     env["OCU_SMOKE_OWNER_TOKEN"] = "synthetic-owner-token"
     env["OCU_SMOKE_FORMER_URL"] = "127.0.0.1:18081"
+    env["OCU_SMOKE_DOCUMENTSERVER_URL"] = "127.0.0.1:18083"
     env["OCU_SMOKE_EGRESS_URL"] = "http://8.8.8.8:80/"
     env["OCU_SMOKE_HOST_LAN_IPV4"] = "127.0.0.1"
     if extra:
