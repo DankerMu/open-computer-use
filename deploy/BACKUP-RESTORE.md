@@ -13,15 +13,65 @@ python3 deploy/recovery.py restore --recovery-set <backup-dir> --destination-roo
 python3 deploy/recovery.py activate --destination-root <restored-root> --retained-delivery <previous-release-delivery>
 ```
 
-`backup` inspects actual stack images, Compose identity and sandbox mounts against the selected runtime/release before stopping anything. It then stops only attributed application, initializer, retention, and sandbox writers, re-enumerates after admission shutdown, dumps PostgreSQL read-only, and publishes one complete directory: logical dump, WebUI data including a root regular-file `.computer-use-initialized`, chat/skills trees, every existing `chat-<id>-workspace` volume (including detached volumes and deployments with zero workspace volumes), protected runtime/admin files, and the captured `release.json` plus version record. Image archives stay in the retained delivery and are referenced by inventory identity. Writers stay stopped; sandboxes are not started. Unrelated managed-looking sandboxes are refused without being stopped.
+`backup` inspects actual stack images, Compose identity and sandbox mounts against
+the selected runtime/release before stopping anything. OCU and DocumentServer must
+still be running when maintenance begins; do not stop them before invoking backup.
+
+1. Stop the proxy to close browser admission to WebUI, OCU and DocumentServer.
+2. Run `/usr/bin/documentserver-prepare4shutdown.sh` inside DocumentServer while
+   OCU remains running to persist and publish final callbacks over the control plane.
+3. Read each chat's Office state until no session is `opening`, `editing`, `saving`
+   or `closing` and no journal entry remains. This wait makes no OCU HTTP request.
+4. Stop and verify the remaining application, initializer, retention and sandbox
+   writers, including DocumentServer. Recheck Office state before capture;
+   PostgreSQL remains available for the read-only dump.
+
+The process environment setting `OCU_OFFICE_BACKUP_TIMEOUT_SECONDS` defaults to900.
+It must be finite and strictly greater than the broker's600-second liveness
+interval. The shutdown command and the subsequent drain each get this bound;
+it is not a total backup deadline. Command failure or drain timeout names the
+persisted blockers and attempts all safely attributed writer stops. A stop failure
+is reported, never treated as quiescence. No failed run publishes a complete set.
+There is no automatic restart or shutdown-mode reset: the next normal deployment
+start clears DocumentServer's shutdown mode.
+
+The complete directory contains the logical dump, WebUI data with its root
+regular-file `.computer-use-initialized`, chat/skills trees, every existing
+`chat-<id>-workspace` volume (including detached volumes and deployments with none),
+protected runtime/admin files, and captured `release.json` plus version record.
+Each chat includes `outputs/`, broker/lifecycle state and `.ocu/office/` state and
+version blobs; no `uploads/` tree is required. DocumentServer data/cache/log volumes
+are not recovery components. Image archives stay in the retained delivery and are
+referenced by inventory identity. Writers stay stopped; sandboxes are not started.
+Unrelated managed-looking sandboxes are refused without being stopped.
 
 `restore` requires `DOCKER_HOST=unix:///var/run/docker.sock` on a daemon identity different from the captured source, an absent destination root, and no colliding `ocu-test-*` / `owui-chat-*` / selected volumes. A different Compose project name is not isolation. Helpers, `up.sh`, and runtime socket consumers are pinned to that endpoint. Captured dotenv is parsed as inert assignments. Existing target files are not overwritten. `--retained-delivery` imports the selected release's verified images onto an empty image cache before helpers or isolated PostgreSQL run; conflicting tags are refused. Selected source and all seven image references, including `DOCUMENTSERVER_IMAGE`, replace captured release identity together. External chat/skills roots are refused rather than silently relocated. Isolated PostgreSQL occupancy and restore wait for the final TCP-authenticated server, not the official entrypoint's temporary Unix-socket initializer. Provider inspection uses the selected WebUI `config` table (`key`, `value`, `updated_at`) and does not rewrite persistent database credentials.
+
+After publishing the restored chat-data tree, `restore` atomically replaces or
+creates `data/chat/.office-restore-epoch` with a fresh opaque token on one line.
+It does not read the captured token or rewrite Office state or version blobs.
+All other captured workspace and Office bytes remain unchanged. The broker reads
+this marker from `BASE_DATA_DIR` on each relevant request: a captured open session
+with the old epoch becomes `orphaned`, and reopening creates a new session/key.
+Final closed/error/orphaned records remain final. A late callback from an old
+session cannot overwrite restored workspace content.
+
+An epoch write or synchronization failure prevents `.restored`, success output
+and application startup. A post-replacement synchronization failure may leave the
+new token visible in the owned, unready target; it does not imply rollback.
+Use the failure-recovery procedure below rather than reusing a captured epoch.
 
 `activate` holds the same daemon-scoped recovery lock as backup/restore around import, compatibility, selected `up.sh`, and version-record generation. Compatibility with the restored schema is checked against the retained delivery before source, inventory, runtime, or version publication. It imports the requested retained delivery as one identity: source commit, `release.json`, and all seven images. An existing `source/.git` is verified against that delivery before any replacement; a different delivery or a tampered tree is refused and does not start. Occupied restored roots reconstruct the selected source from the delivery's Git bundle beside the destination and bind `source/deploy/up.sh` from that tree. Target provider defaults from the protected provider file enter the inert activation environment without rewriting restored database settings or appearing on argv. Consumer-contract success is not claimed from Compose start alone.
 
 Every release inventory loader requires `format_version` 2. Restore and activation
 refuse a retained version-1 inventory before image import, selected-release
 publication or startup. The recovery-set format number is independent and remains 1.
+
+A manual rollback across the workspace-layout boundary requires matching server
+and sandbox images and operator removal/recreation of the newer sandbox
+containers. Recovery never deletes or resumes sandboxes. A pre-change release
+with a version-1 inventory is not a supported recovery target; container
+recreation does not bypass that refusal.
 
 Format 2 also requires a `font_bundle` archive. Delivery verification checks its
 checksum and exact files against the selected source's `deploy/fonts/fonts.json`.

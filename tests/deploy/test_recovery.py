@@ -252,7 +252,8 @@ class RecoveryCliTests(unittest.TestCase):
         (self.skills_dir / "demo").mkdir()
         (self.skills_dir / "demo" / "SKILL.md").write_text("skill\n", encoding="utf-8")
 
-    def _seed_office(self, session_state="closed", journal=None, content=b"office-version", parent=None):
+    def _seed_office(self, session_state="closed", journal=None, content=b"office-version",
+                     parent=None, chat_id=CHAT_ID):
         program = """
 import json, sys
 import docker_manager
@@ -269,14 +270,35 @@ def seed(state):
 store.update(sys.argv[1], seed)
 """
         subprocess.run(
-            [sys.executable, "-c", program, CHAT_ID, self.file_id, session_state,
+            [sys.executable, "-c", program, chat_id, self.file_id, session_state,
              json.dumps(journal or {}), content.hex(), json.dumps(parent)],
             env={**self.env, "BASE_DATA_DIR": str(self.chat_dir),
                  "PYTHONPATH": str(ROOT / "computer-use-server")},
             capture_output=True, text=True, check=True,
         )
-        office = self.chat_dir / CHAT_ID / ".ocu/office"
+        office = self.chat_dir / chat_id / ".ocu/office"
         return office / "state.json", office / "versions" / hashlib.sha256(content).hexdigest()
+
+    def _read_restored_epoch(self, chat_root):
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import json; from office.epoch import current_epoch; print(json.dumps(current_epoch()))"],
+            env={**self.env, "BASE_DATA_DIR": str(chat_root),
+                 "PYTHONPATH": str(ROOT / "computer-use-server")},
+            capture_output=True, text=True, check=True,
+        )
+        return json.loads(result.stdout)
+
+    def _seed_restore_target(self, name):
+        target = self.root / name
+        target.mkdir()
+        seed_images(target)
+        seed_healthy_host(target)
+        write_network(target, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+        write_network(target, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+        write_fake_configs(target)
+        (target / "docker-info.json").write_text(json.dumps({"ID": name}))
+        return target
 
     def _observe_office_wait(self, *, expire=False, elapsed_step=900):
         observer = f"""
@@ -1138,16 +1160,7 @@ else:
         )
         self.assertNotEqual(same.returncode, 0)
         self.assertIn("distinct empty target daemon", same.stderr)
-        target_state = self.root / "target-state"
-        target_state.mkdir()
-        seed_images(target_state)
-        seed_healthy_host(target_state)
-        write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
-        write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
-        write_fake_configs(target_state)
-        (target_state / "docker-info.json").write_text(
-            json.dumps({"ID": "target-daemon"}), encoding="utf-8"
-        )
+        target_state = self._seed_restore_target("target-state")
         dest = self.root / "restored-root"
         restored = self.run_cli(
             [
@@ -1163,6 +1176,11 @@ else:
         )
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertTrue((dest / ".restored").exists())
+        epoch = (dest / "data/chat/.office-restore-epoch").read_bytes()
+        self.assertEqual(epoch.count(b"\n"), 1)
+        self.assertTrue(epoch.endswith(b"\n"))
+        self.assertTrue(epoch.strip())
+        self.assertEqual(self._read_restored_epoch(dest / "data/chat"), epoch.decode().strip())
         live = dest / "data" / "chat" / CHAT_ID / "outputs" / "result.txt"
         self.assertEqual(live.read_bytes(), b"broker-bytes\n")
         listing = json.loads((dest / "data" / "chat" / CHAT_ID / ".ocu" / "index.json").read_text(encoding="utf-8"))
@@ -1478,6 +1496,13 @@ else:
         extra = sandbox(f"owui-chat-{other}", other, running=False, chat_dir=self.chat_dir)
         (self.chat_dir / other / "outputs").mkdir(parents=True)
         self._seed_volumes_and_db(running_sandbox=False, extra_containers=[extra])
+        (self.chat_dir / other / "outputs/other.txt").write_bytes(b"other-workspace\n")
+        self._seed_office(content=b"broker-bytes\n")
+        self._seed_office(content=b"other-workspace\n", chat_id=other)
+        marker = self.chat_dir / ".office-restore-epoch"
+        marker.write_bytes(b"captured-epoch\n")
+        captured = {path.relative_to(self.chat_dir).as_posix(): path.read_bytes()
+                    for path in self.chat_dir.rglob("*") if path.is_file() and path != marker}
         backup = self.root / "keep-two-backup"
         created = self.run_cli(
             [
@@ -1494,37 +1519,107 @@ else:
         provider = self.root / "provider.env"
         provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
         os.chmod(provider, 0o600)
-        target_state = self.root / "keep-two-state"
-        target_state.mkdir()
-        seed_images(target_state)
-        seed_healthy_host(target_state)
-        write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
-        write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
-        write_fake_configs(target_state)
-        (target_state / "docker-info.json").write_text(json.dumps({"ID": "keep-two-daemon"}), encoding="utf-8")
-        dest = self.root / "keep-two-root"
-        restored = self.run_cli(
-            [
-                "restore",
-                "--recovery-set",
-                str(backup),
-                "--destination-root",
-                str(dest),
-                "--provider-file",
-                str(provider),
-            ],
-            extra={"FAKE_DOCKER_STATE": str(target_state)},
-        )
-        self.assertEqual(restored.returncode, 0, restored.stderr)
-        import recovery_fs
+        tokens = {"captured-epoch"}
+        for attempt in range(2):
+            target_state = self._seed_restore_target(f"keep-two-state-{attempt}")
+            dest = self.root / f"keep-two-root-{attempt}"
+            restored = self.run_cli(
+                ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+                 "--provider-file", str(provider)],
+                extra={"FAKE_DOCKER_STATE": str(target_state)},
+            )
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            chat_root = dest / "data/chat"
+            epoch = (chat_root / marker.name).read_bytes()
+            self.assertEqual(epoch.count(b"\n"), 1)
+            self.assertTrue(epoch.endswith(b"\n"))
+            token = epoch.decode().strip()
+            self.assertNotIn(token, tokens)
+            self.assertTrue(token)
+            tokens.add(token)
+            self.assertEqual(self._read_restored_epoch(chat_root), token)
+            restored_files = {path.relative_to(chat_root).as_posix(): path.read_bytes()
+                              for path in chat_root.rglob("*")
+                              if path.is_file() and path != chat_root / marker.name}
+            self.assertEqual(restored_files, captured)
+            for chat, expected in ((CHAT_ID, b"sandbox-home\n"), (other, b"other-home\n")):
+                home = target_state / "volume-data" / f"chat-{chat}-workspace"
+                self.assertEqual((home / "README.md").read_bytes(), expected)
+            self.assertFalse((target_state / "starts.log").exists())
+        self.assertEqual(marker.read_bytes(), b"captured-epoch\n")
 
-        first = self.root / "first-home"
-        second = self.root / "second-home"
-        recovery_fs.extract_tree(backup / "workspaces" / f"{CHAT_ID}.tar.gz", first)
-        recovery_fs.extract_tree(backup / "workspaces" / f"{other}.tar.gz", second)
-        self.assertEqual((first / "README.md").read_bytes(), b"sandbox-home\n")
-        self.assertEqual((second / "README.md").read_bytes(), b"other-home\n")
 
+    def test_restore_epoch_io_failures_never_publish_readiness(self):
+        (self.chat_dir / ".office-restore-epoch").write_bytes(b"captured-epoch\n")
+        self._seed_office()
+        backup = self.root / "epoch-failure-backup"
+        captured = self.run_cli(
+            ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(backup),
+             "--runtime-file", str(self.runtime)])
+        self.assertEqual(captured.returncode, 0, captured.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n")
+        provider.chmod(0o600)
+        launcher = self.launcher.read_text()
+        for failure in ("write", "replace", "dirsync", "directory"):
+            with self.subTest(failure=failure):
+                target = self._seed_restore_target("epoch-failure-" + failure)
+                dest = self.root / ("epoch-root-" + failure)
+                marker = dest / "data/chat/.office-restore-epoch"
+                observed = self.root / ("epoch-fault-" + failure)
+                injection = f"""
+import errno, io, os, stat
+from pathlib import Path
+original_open, original_replace, original_fsync = io.open, os.replace, os.fsync
+armed = [False]
+def fail_epoch_io():
+    Path({str(observed)!r}).write_text({failure!r})
+    raise OSError(errno.ENOSPC if {failure!r} == 'write' else errno.EIO, 'injected epoch IO')
+def epoch_open(path, mode='r', *args, **kwargs):
+    if ({failure!r} == 'write' and not isinstance(path, int) and 'w' in mode
+            and Path(path).name.startswith('.office-restore-epoch-')):
+        fail_epoch_io()
+    return original_open(path, mode, *args, **kwargs)
+def epoch_replace(source, target, *args, **kwargs):
+    if str(target) == {str(marker)!r}:
+        if {failure!r} == 'replace':
+            fail_epoch_io()
+        if {failure!r} == 'directory':
+            Path(target).unlink()
+            Path(target).mkdir()
+            Path({str(observed)!r}).write_text({failure!r})
+        result = original_replace(source, target, *args, **kwargs)
+        armed[0] = True
+        return result
+    return original_replace(source, target, *args, **kwargs)
+def epoch_fsync(fd):
+    if {failure!r} == 'dirsync' and armed[0] and stat.S_ISDIR(os.fstat(fd).st_mode):
+        fail_epoch_io()
+    return original_fsync(fd)
+io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
+"""
+                entry = "runpy.run_module('recovery', run_name='__main__')"
+                self.launcher.write_text(launcher.replace(entry, injection + "\n" + entry))
+                result = self.run_cli(
+                    ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+                     "--provider-file", str(provider)], {"FAKE_DOCKER_STATE": str(target)})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(observed.read_text(), failure)
+                self.assertIn("cannot establish Office restore epoch", result.stderr)
+                self.assertIn("owned partial resources remain", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse((dest / ".restored").exists())
+                self.assertFalse((target / "starts.log").exists())
+                self.assertFalse((target / "volumes.json").exists())
+                self.assertFalse((target / "postgres.json").exists())
+                self.assertEqual(list(dest.glob(".office-restore-epoch-*")), [])
+                if failure == "dirsync":
+                    self.assertNotEqual(marker.read_bytes(), b"captured-epoch\n")
+                    self.assertEqual(self._read_restored_epoch(marker.parent), marker.read_text().strip())
+                elif failure == "directory":
+                    self.assertTrue(marker.is_dir())
+                else:
+                    self.assertEqual(marker.read_bytes(), b"captured-epoch\n")
 
     def test_stale_runtime_images_fail_before_capture(self):
         containers = json.loads((self.state / "containers.json").read_text(encoding="utf-8"))
