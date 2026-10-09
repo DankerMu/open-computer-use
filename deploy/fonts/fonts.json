@@ -1,0 +1,54 @@
+{
+  "archives": [
+    {
+      "url": "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/08_NotoSansCJKsc.zip",
+      "sha256": "a927e56f53bd6c3b920bc139c0b94aa36c7d9ad0cf009b159437a1a003581140",
+      "size": 94523633,
+      "files": [
+        {
+          "member": "NotoSansCJKsc-Regular.otf",
+          "name": "NotoSansCJKsc-Regular.otf",
+          "sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+          "size": 16437364
+        },
+        {
+          "member": "NotoSansCJKsc-Bold.otf",
+          "name": "NotoSansCJKsc-Bold.otf",
+          "sha256": "b5f0d1a190a7f9b43c310a8850630af12553df32c4c050543f9059732d9b4c0a",
+          "size": 17002248
+        },
+        {
+          "member": "LICENSE",
+          "name": "NotoSansCJKsc-LICENSE.txt",
+          "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+          "size": 4301
+        }
+      ]
+    },
+    {
+      "url": "https://github.com/notofonts/noto-cjk/releases/download/Serif2.003/09_NotoSerifCJKsc.zip",
+      "sha256": "4bcdbff95cedfb6a4c0640403f0de8b69480d869331c24c8eff91f7bb834df04",
+      "size": 138631496,
+      "files": [
+        {
+          "member": "OTF/SimplifiedChinese/NotoSerifCJKsc-Regular.otf",
+          "name": "NotoSerifCJKsc-Regular.otf",
+          "sha256": "2a2eae2628df83556c54018c41e20fa532c1b862c5256ae8b3f23feb918d12ca",
+          "size": 24543080
+        },
+        {
+          "member": "OTF/SimplifiedChinese/NotoSerifCJKsc-Bold.otf",
+          "name": "NotoSerifCJKsc-Bold.otf",
+          "sha256": "8af07d4b6c2e82bcc72a30e066eaf295f11b9424f4aad2eaa9fe0e9c3b38fc73",
+          "size": 25521460
+        },
+        {
+          "member": "LICENSE",
+          "name": "NotoSerifCJKsc-LICENSE.txt",
+          "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+          "size": 4301
+        }
+      ]
+    }
+  ]
+}

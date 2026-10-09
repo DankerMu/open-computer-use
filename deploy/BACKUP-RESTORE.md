@@ -23,6 +23,17 @@ Every release inventory loader requires `format_version` 2. Restore and activati
 refuse a retained version-1 inventory before image import, selected-release
 publication or startup. The recovery-set format number is independent and remains 1.
 
+Format 2 also requires a `font_bundle` archive. Delivery verification checks its
+checksum and exact files against the selected source's `deploy/fonts/fonts.json`.
+Import installs those files under `fonts/` and removes the transport archive.
+Activation binds the target's `fonts` link to the owned selected-release root;
+matching bytes do not authorize a foreign directory or link. Reuse rechecks every
+installed font and license before inventory publication or startup.
+
+`up.sh` derives and exports `OCU_RELEASE_FONTS_DIR` from the selected inventory's
+directory after verifying its font material. This path is not a persisted runtime
+setting; inherited values cannot select a different font directory.
+
 Backup compares Docker's actual `Image` configuration digest with the inventory, independently of the launch reference in `Config.Image`. Sandbox attribution requires the producer's canonical name, required labels, and exact volume/bind mount types, paths, destinations, and access modes. Every discovered sandbox is checked before stopping any writer, then checked again after admission shutdown.
 
 An interrupted activation can resume only its recorded selected-source publication. A private receipt binds the target directory identity, complete retained inventory, selected-source location, and random ownership token; the imported tree carries the matching marker from before publication. Pre-existing unowned directories, symlinks, and altered inventories are refused without overwriting the restored target. Keep these ownership records with the restored target when retrying the same delivery.

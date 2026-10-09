@@ -22,6 +22,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
+
+from fonts import prepare_fonts
 
 
 FORMAT_VERSION = 2
@@ -84,6 +87,8 @@ SOURCE_BIND_PATHS = (
 )
 SOURCE_CONSUMER_PATHS = (
     "deploy/release.py",
+    "deploy/fonts/prepare_fonts.py",
+    "deploy/fonts/fonts.json",
     "deploy/up.sh",
     "deploy/production-like-test/scripts/bootstrap-test.sh",
     "deploy/production-like-test/scripts/write-deployed-version.sh",
@@ -95,6 +100,7 @@ INVENTORY_REQUIRED = (
     "webui_source_sha",
     "source_consumer_contract",
     "source_bundle",
+    "font_bundle",
     "images",
 )
 IMAGE_REQUIRED = (
@@ -129,6 +135,7 @@ PYODIDE_SUPPLEMENT_RELATIVE = "scripts/pyodide-supplement.json"
 PYODIDE_PACKAGE_LOCK_RELATIVE = "package-lock.json"
 DRAWIO_PREPARE_RELATIVE = "computer-use-server/drawio/prepare_drawio.py"
 DRAWIO_INVENTORY_RELATIVE = "computer-use-server/drawio/inventory.json"
+FONT_PIN_RELATIVE = "deploy/fonts/fonts.json"
 HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_WHEEL_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 PINNED_ASSIGNMENT_RE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*=\s*([\"'])([^\"']+)\2\s*$")
@@ -1079,8 +1086,38 @@ def retained_cache_error(exc: BaseException) -> ReleaseError:
     return ReleaseError(f"{message}; image cache entries may remain and were not deleted")
 
 
+def verify_font_bundle(
+    root: Path, payload: dict, source: Path, *, destination: Path | None = None
+) -> None:
+    path = relative_archive_path(root, payload["font_bundle"]["path"])
+    require_regular_file(path)
+    if sha256_file(path) != payload["font_bundle"]["sha256"]:
+        raise ReleaseError(f"{path}: font bundle checksum mismatch")
+    try:
+        pin = prepare_fonts.load_pin(require_tracked_regular_file(source, FONT_PIN_RELATIVE))
+        prepare_fonts.verify_bundle(path, pin, destination=destination)
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        raise ReleaseError(f"{path}: font bundle verification failed: {exc}") from exc
+
+
+def verify_release_fonts(inventory: Path, source: Path) -> Path:
+    directory = inventory.absolute().parent / "fonts"
+    try:
+        target = directory
+        if directory.is_symlink():
+            target = source.resolve().parent / "fonts"
+            if directory.resolve(strict=True) != target:
+                raise ReleaseError(f"{directory}: font link is outside the selected release")
+        pin = prepare_fonts.load_pin(require_tracked_regular_file(source, FONT_PIN_RELATIVE))
+        prepare_fonts.verify_directory(target, pin)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ReleaseError(f"{directory}: font directory verification failed: {exc}") from exc
+    return directory
+
+
 def verify_source_bundle(
-    root: Path, payload: dict, *, reconstruct_into: Path | None = None
+    root: Path, payload: dict, *, reconstruct_into: Path | None = None,
+    fonts_into: Path | None = None,
 ) -> str:
     bundle_rel = payload["source_bundle"]["path"]
     bundle = relative_archive_path(root, bundle_rel)
@@ -1102,6 +1139,7 @@ def verify_source_bundle(
         require_supported_source_contract(
             dest, payload.get("source_consumer_contract")
         )
+        verify_font_bundle(root, payload, dest, destination=fonts_into)
         return reconstructed
     finally:
         if owned and dest is not None:
@@ -1765,6 +1803,10 @@ def write_inventory(path: Path, payload: dict) -> None:
 
 
 def validate_inventory_schema(payload: dict) -> None:
+    if payload.get("format_version") != FORMAT_VERSION:
+        raise ReleaseError(
+            f"inventory format_version {payload.get('format_version')!r} is unsupported"
+        )
     missing = [name for name in INVENTORY_REQUIRED if name not in payload]
     if missing:
         raise ReleaseError(f"inventory is missing {', '.join(missing)}")
@@ -1772,10 +1814,6 @@ def validate_inventory_schema(payload: dict) -> None:
     if extra:
         raise ReleaseError(
             f"inventory has unexpected fields {', '.join(sorted(extra))}"
-        )
-    if payload.get("format_version") != FORMAT_VERSION:
-        raise ReleaseError(
-            f"inventory format_version {payload.get('format_version')!r} is unsupported"
         )
     if payload.get("platform") != PLATFORM:
         raise ReleaseError(f"inventory platform must be {PLATFORM}")
@@ -1797,6 +1835,13 @@ def validate_inventory_schema(payload: dict) -> None:
         raise ReleaseError("source_bundle fields are incomplete")
     if not is_hex(str(source_bundle.get("sha256") or ""), HEX_LEN):
         raise ReleaseError("source_bundle checksum is not a SHA-256 digest")
+    font_bundle = payload["font_bundle"]
+    if not isinstance(font_bundle, dict) or set(font_bundle) != set(ARCHIVE_REQUIRED):
+        raise ReleaseError("font_bundle fields are incomplete")
+    if not isinstance(font_bundle["path"], str) or not font_bundle["path"]:
+        raise ReleaseError("font_bundle path is missing")
+    if not is_hex(str(font_bundle["sha256"]), HEX_LEN):
+        raise ReleaseError("font_bundle checksum is not a SHA-256 digest")
     images = payload.get("images")
     if not isinstance(images, dict):
         raise ReleaseError("images must be an object")
@@ -2206,6 +2251,13 @@ def build_release(
                 requested_args=requested.get(role, {}),
                 source_sha=source_sha,
             )
+        fonts_archive = stage / "fonts.tar"
+        try:
+            prepare_fonts.prepare_fonts(
+                require_tracked_regular_file(ocu_tree, FONT_PIN_RELATIVE), fonts_archive
+            )
+        except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as exc:
+            raise ReleaseError(f"prepare font bundle: {exc}") from exc
         images_dir = stage / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
         images = {}
@@ -2222,6 +2274,7 @@ def build_release(
                 "webui_source_sha": webui_sha,
                 "source_consumer_contract": contract,
                 "source_bundle": source_bundle,
+                "font_bundle": {"path": "fonts.tar", "sha256": sha256_file(fonts_archive)},
                 "images": images,
             }
             validate_inventory_schema(payload)
@@ -2391,7 +2444,16 @@ def import_release(*, delivery: Path, install_root: Path, recovery_owner: dict |
         )
         staged_payload["source_bundle"]["path"] = "source.bundle"
         source_dir = stage / "source"
-        verify_source_bundle(stage, staged_payload, reconstruct_into=source_dir)
+        staged_fonts = stage / "fonts.tar"
+        copy_regular(
+            relative_archive_path(delivery, payload["font_bundle"]["path"]),
+            staged_fonts,
+        )
+        staged_payload["font_bundle"]["path"] = "fonts.tar"
+        verify_source_bundle(
+            stage, staged_payload, reconstruct_into=source_dir, fonts_into=stage / "fonts"
+        )
+        staged_fonts.unlink()
         staged_images = stage / "images"
         staged_images.mkdir()
         seen_paths = set()
@@ -2681,6 +2743,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             require_supported_source_contract(
                 source, payload.get("source_consumer_contract")
             )
+            verify_release_fonts(Path(args.inventory), source)
             verify_local_images(payload)
     except ReleaseError as cop:
         fail(str(cop))

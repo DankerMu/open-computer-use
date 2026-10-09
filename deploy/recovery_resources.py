@@ -1012,6 +1012,7 @@ def _require_matching_selected_root(source_root: Path, requested: dict, owner: d
     require_selected_release(payload, requested)
     release.verify_tracked_source(source_root / "source", requested["ocu_source_sha"])
     release.require_supported_source_contract(source_root / "source")
+    release.verify_release_fonts(manifest, source_root / "source")
     release.verify_local_images(payload)
     return payload
 
@@ -1029,22 +1030,26 @@ def import_selected_release(delivery: Path, install_root: Path) -> dict:
     release.verify_archive_set(delivery, requested)
     release.verify_source_bundle(delivery, requested)
     source = install_root / "source"
+    fonts = install_root / "fonts"
     manifest = install_root / "release.json"
     source_root = _selected_source_root(install_root)
-    if source.exists() and not source.is_symlink():
-        raise RecoveryError("restored source path is not an owned selected checkout")
-    if source.is_symlink() and os.readlink(source) != str(source_root / "source"):
-        raise RecoveryError("restored source points to an unowned checkout")
+    for entry, name in ((source, "source"), (fonts, "fonts")):
+        if entry.exists() and not entry.is_symlink():
+            raise RecoveryError(f"restored {name} path is not an owned selected entry")
+        if entry.is_symlink() and os.readlink(entry) != str(source_root / name):
+            raise RecoveryError(f"restored {name} points to an unowned selected entry")
     owner = _selection_receipt(install_root, requested, source_root)
     if source_root.is_symlink():
         raise RecoveryError("selected source root is a symlink")
     if not source_root.exists():
-        if source.is_symlink():
+        if source.is_symlink() or fonts.is_symlink():
             raise RecoveryError("owned selected source is missing")
         release.import_release(delivery=delivery, install_root=source_root, recovery_owner=owner)
     payload = _require_matching_selected_root(source_root, requested, owner)
     if not source.is_symlink():
         os.symlink(source_root / "source", source)
+    if not fonts.is_symlink():
+        os.symlink(source_root / "fonts", fonts)
     _publish_selected_inventory(manifest, source_root)
     return payload
 

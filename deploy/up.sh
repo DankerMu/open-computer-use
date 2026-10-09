@@ -127,6 +127,7 @@ try:
     runtime = dict(os.environ)
     release.verify_runtime_binding(payload, runtime)
     release.verify_tracked_source(root, payload["ocu_source_sha"])
+    release.verify_release_fonts(Path(sys.argv[2]), root)
     release.verify_local_images(payload)
 except release.ReleaseError as exc:
     print(f"deploy: {exc}", file=sys.stderr)
@@ -136,6 +137,9 @@ then
     printf '%s\n' 'deploy: release inventory verification failed' >&2
     exit 1
 fi
+manifest_path="$OCU_RELEASE_MANIFEST"
+if [[ "$manifest_path" != /* ]]; then manifest_path="$PWD/$manifest_path"; fi
+export OCU_RELEASE_FONTS_DIR="${manifest_path%/*}/fonts"
 
 
 

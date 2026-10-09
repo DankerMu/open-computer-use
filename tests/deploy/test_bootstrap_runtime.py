@@ -234,9 +234,13 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 
     def test_success_emits_consumer_visible_topology_and_shared_token(self):
-        result = self.run_bootstrap(unset=["DOCUMENTSERVER_IMAGE"])
+        result = self.run_bootstrap(
+            extra={"OCU_RELEASE_FONTS_DIR": "/unselected/fonts"},
+            unset=["DOCUMENTSERVER_IMAGE"],
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         runtime = parse_env_file(self.runtime_path())
+        self.assertNotIn("OCU_RELEASE_FONTS_DIR", runtime)
         self.assertEqual(stat.S_IMODE(self.runtime_path().stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.credentials.stat().st_mode), 0o600)
         self.assert_no_temp_residue()
