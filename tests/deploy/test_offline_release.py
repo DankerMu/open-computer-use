@@ -2294,6 +2294,8 @@ class OfflineReleaseTests(unittest.TestCase):
                 "OCU_ADMIN_CREDENTIALS_FILE": str(self.root / "admin-credentials.txt"),
                 "FAKE_ID_UID": "0",
                 "OCU_WEBUI_ORIGIN": "https://workbench.example.test",
+                "OCU_OFFICE_DOCSERVER_ORIGIN": "https://workbench.example.test:8083",
+                "ENABLE_OCU_OFFICE_EDIT": "false",
             },
             check=False,
             timeout=20,

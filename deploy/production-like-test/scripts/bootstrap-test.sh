@@ -7,6 +7,8 @@
 #   OCU_RELEASE_MANIFEST — imported release.json
 #   SOURCE_SHA — full 40-character commit matching the selected source checkout
 #   OCU_WEBUI_ORIGIN — absolute HTTP(S) origin, no path/credentials/query/fragment/slash
+#   OCU_OFFICE_DOCSERVER_ORIGIN — DocumentServer browser origin, distinct from WebUI
+#   ENABLE_OCU_OFFICE_EDIT — explicit true or false; does not change service settings
 #   OCU_SANDBOX_EGRESS_ALLOW — must be present; empty is deny-all
 #   OCU_SANDBOX_DNS — must be present; empty disables external sandbox DNS
 # Optional:
@@ -14,6 +16,7 @@
 #   OCU_PROXY_IMAGE POSTGRES_IMAGE DOCUMENTSERVER_IMAGE — inventory-bound references
 #   OCU_ADMIN_CREDENTIALS_FILE — isolated-test output path; default unchanged
 #   OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
+#   OCU_OFFICE_PROXY_PORT OCU_OFFICE_FONTS_DIR — port and operator-font directory
 
 
 set -euo pipefail
@@ -259,6 +262,10 @@ public_base_url="${OCU_WEBUI_ORIGIN}/ocu"
 internal_auth_url='http://open-webui:8080/api/v1/ocu/auth'
 chat_data_dir="$deploy_root/data/chat"
 skills_cache_dir="$deploy_root/data/skills-cache"
+office_proxy_port=${OCU_OFFICE_PROXY_PORT-8083}
+office_fonts_dir=${OCU_OFFICE_FONTS_DIR-"$deploy_root/data/office-fonts"}
+office_docserver_url='http://documentserver'
+office_self_url='http://computer-use-server:8081'
 
 for pair in \
     POSTGRES_IMAGE:"$POSTGRES_IMAGE" \
@@ -286,6 +293,9 @@ fi
 
 install -d -m 0700 "$runtime_dir" "$deploy_root/backups"
 install -d -m 0755 "$deploy_root/data/chat" "$deploy_root/data/skills-cache"
+if [ ! -d "$office_fonts_dir" ]; then
+    install -d -m 0755 "$office_fonts_dir"
+fi
 if [ ! -d "$credentials_parent" ]; then
     install -d -m 0700 "$credentials_parent"
 fi
@@ -295,6 +305,7 @@ mcp_api_key=$(openssl rand -hex 32)
 postgres_password=$(openssl rand -hex 32)
 admin_password=$(openssl rand -hex 32)
 internal_token=$(openssl rand -hex 32)
+office_jwt_secret=$(openssl rand -hex 32)
 
 runtime_tmp=$(mktemp "$runtime_dir/.runtime.env.XXXXXX")
 credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX")
@@ -335,6 +346,13 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' 'DMXAPI_BASE_URL=https://www.dmxapi.cn/v1'
     printf '%s\n' "OCU_CHAT_DATA_DIR=$chat_data_dir"
     printf '%s\n' "OCU_SKILLS_CACHE_DIR=$skills_cache_dir"
+    printf '%s\n' "OCU_OFFICE_JWT_SECRET=$office_jwt_secret"
+    printf '%s\n' "OCU_OFFICE_PROXY_PORT=$office_proxy_port"
+    printf '%s\n' "OCU_OFFICE_DOCSERVER_URL=$office_docserver_url"
+    printf '%s\n' "OCU_OFFICE_DOCSERVER_ORIGIN=$OCU_OFFICE_DOCSERVER_ORIGIN"
+    printf '%s\n' "OCU_OFFICE_SELF_URL=$office_self_url"
+    printf '%s\n' "OCU_OFFICE_FONTS_DIR=$office_fonts_dir"
+    printf '%s\n' "ENABLE_OCU_OFFICE_EDIT=$ENABLE_OCU_OFFICE_EDIT"
     printf '%s\n' 'ADMIN_EMAIL=admin@ai-test.local'
     printf '%s\n' "ADMIN_PASSWORD=$admin_password"
     printf '%s\n' "WEBUI_SECRET_KEY=$webui_secret"

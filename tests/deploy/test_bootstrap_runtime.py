@@ -58,6 +58,7 @@ GENERATED_SECRETS = (
     "WEBUI_SECRET_KEY",
     "MCP_API_KEY",
     "POSTGRES_PASSWORD",
+    "OCU_OFFICE_JWT_SECRET",
 )
 REQUIRED_RUNTIME = (
     "COMPOSE_PROJECT_NAME",
@@ -152,6 +153,8 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.env["OCU_ADMIN_CREDENTIALS_FILE"] = str(self.credentials)
         self.env["SOURCE_SHA"] = self.sha
         self.env["OCU_WEBUI_ORIGIN"] = ORIGIN
+        self.env["OCU_OFFICE_DOCSERVER_ORIGIN"] = "https://workbench.example.test:8083"
+        self.env["ENABLE_OCU_OFFICE_EDIT"] = "false"
         self.env["OCU_SANDBOX_EGRESS_ALLOW"] = "8.8.8.8/32"
         self.env["OCU_SANDBOX_DNS"] = ""
         self.env.update(IMAGES)
@@ -232,6 +235,42 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertIn("root", result.stderr)
         self.assert_unpublished()
         self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
+
+    def test_office_flag_changes_only_visibility(self):
+        snapshots = []
+        for flag in ("true", "false"):
+            result = self.run_bootstrap({"ENABLE_OCU_OFFICE_EDIT": flag})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            runtime = parse_env_file(self.runtime_path())
+            office = {name: value for name, value in runtime.items()
+                      if name.startswith("OCU_OFFICE_") or name == "ENABLE_OCU_OFFICE_EDIT"}
+            self.assertEqual(set(office), {
+                "OCU_OFFICE_JWT_SECRET", "OCU_OFFICE_PROXY_PORT",
+                "OCU_OFFICE_DOCSERVER_URL", "OCU_OFFICE_DOCSERVER_ORIGIN",
+                "OCU_OFFICE_SELF_URL", "OCU_OFFICE_FONTS_DIR", "ENABLE_OCU_OFFICE_EDIT",
+            })
+            self.assertEqual(office["ENABLE_OCU_OFFICE_EDIT"], flag)
+            self.assertEqual(office["OCU_OFFICE_DOCSERVER_URL"], "http://documentserver")
+            self.assertEqual(office["OCU_OFFICE_SELF_URL"], "http://computer-use-server:8081")
+            self.assertEqual(office["OCU_OFFICE_DOCSERVER_ORIGIN"],
+                             self.env["OCU_OFFICE_DOCSERVER_ORIGIN"])
+            fonts = self.deploy_root / "data/office-fonts"
+            self.assertEqual(office["OCU_OFFICE_FONTS_DIR"], str(fonts))
+            self.assertTrue(fonts.is_dir())
+            self.assertEqual(list(fonts.iterdir()), [])
+            self.assertNotIn("OCU_RELEASE_FONTS_DIR", runtime)
+            self.assertEqual(stat.S_IMODE(self.runtime_path().stat().st_mode), 0o600)
+            self.assert_generated_secrets_hidden(runtime, result)
+            self.assertNotIn(office["OCU_OFFICE_JWT_SECRET"], self.credentials.read_text())
+            snapshots.append(runtime)
+            self.runtime_path().replace(self.private / f"{flag}-runtime.txt")
+            self.credentials.replace(self.private / f"{flag}-admin.txt")
+        self.assertEqual(set(snapshots[0]), set(snapshots[1]))
+        for name in snapshots[0]:
+            if name in GENERATED_SECRETS:
+                self.assertNotEqual(snapshots[0][name], snapshots[1][name], name)
+            elif name != "ENABLE_OCU_OFFICE_EDIT":
+                self.assertEqual(snapshots[0][name], snapshots[1][name], name)
 
     def test_success_emits_consumer_visible_topology_and_shared_token(self):
         result = self.run_bootstrap(
