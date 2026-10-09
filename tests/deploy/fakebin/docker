@@ -977,7 +977,10 @@ def docker_pull(state: Path, argv: list[str]) -> int:
         os_name=os_name,
         architecture=architecture,
         extra={
-            "RepoDigests": [f"{reference.split(':')[0]}@sha256:{image_id[7:]}"],
+            "RepoDigests": [
+                reference if "@sha256:" in reference
+                else f"{reference.split(':')[0]}@sha256:{image_id[7:]}"
+            ],
             "ConfigBytes": config,
         },
     )

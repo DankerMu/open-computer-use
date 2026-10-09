@@ -17,6 +17,7 @@ import unittest
 from support import (
     DEFAULT_RELEASE_DIGESTS,
     DEFAULT_RELEASE_IMAGES,
+    DOCUMENTSERVER_UPSTREAM,
     FAKE_DOCKER,
     HISTORICAL_INCOMPATIBLE_SOURCE,
     ROOT,
@@ -875,10 +876,12 @@ class OfflineReleaseTests(unittest.TestCase):
 
     def test_missing_role_and_wrong_platform_fail_schema(self):
         payload = write_release_for_sha(self.root / "bad.json", "a" * 40, "b" * 40)
-        body = json.loads(payload.read_text(encoding="utf-8"))
-        body["images"].pop("proxy")
-        with self.assertRaises(release.ReleaseError):
-            release.validate_inventory_schema(body)
+        for missing_role in ("proxy", "documentserver"):
+            with self.subTest(missing_role=missing_role):
+                body = json.loads(payload.read_text(encoding="utf-8"))
+                body["images"].pop(missing_role)
+                with self.assertRaises(release.ReleaseError):
+                    release.validate_inventory_schema(body)
         body = json.loads(payload.read_text(encoding="utf-8"))
         body["platform"] = "linux/arm64"
         with self.assertRaises(release.ReleaseError):
@@ -939,18 +942,21 @@ class OfflineReleaseTests(unittest.TestCase):
         write_network(
             self.state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1"
         )
-        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
-        images.pop(DEFAULT_RELEASE_IMAGES["proxy"])
-        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
-        result = run_script(script, env)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("missing image", result.stderr)
-        self.assertFalse((self.state / "starts.log").exists())
-        recorded = "\n".join(ops(self.state))
-        self.assertNotIn("network create", recorded)
-        self.assertNotIn("compose up", recorded)
-        self.assertNotIn(" docker build ", " " + recorded + " ")
-        self.assertNotIn(" docker pull ", " " + recorded + " ")
+        original_images = (self.state / "images.json").read_text()
+        for role in ("proxy", "documentserver"):
+            with self.subTest(role=role):
+                images = json.loads(original_images)
+                images.pop(DEFAULT_RELEASE_IMAGES[role])
+                (self.state / "images.json").write_text(json.dumps(images))
+                result = run_script(script, env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("missing image", result.stderr)
+                self.assertFalse((self.state / "starts.log").exists())
+                recorded = "\n".join(ops(self.state))
+                self.assertNotIn("network create", recorded)
+                self.assertNotIn("compose up", recorded)
+                self.assertNotIn(" docker build ", " " + recorded + " ")
+                self.assertNotIn(" docker pull ", " " + recorded + " ")
 
     def test_image_inspect_daemon_error_is_not_treated_as_missing(self):
         env, script, _source = prepare_up_context(self.state)
@@ -979,6 +985,119 @@ class OfflineReleaseTests(unittest.TestCase):
     def test_secret_build_arguments_are_rejected(self):
         with self.assertRaises(release.ReleaseError):
             release.split_arguments({}, {"NPM_TOKEN": "secret"})
+
+    def test_version_one_import_and_verify_refuse_before_install_or_load(self):
+        delivery, inventory, _sha = self.write_delivery(skip_role="documentserver")
+        inventory["format_version"] = 1
+        inventory["images"].pop("documentserver")
+        write_inventory(delivery / "release.json", inventory)
+        install = self.root / "unsupported-release"
+        for result in (
+            self.import_cmd(delivery, install),
+            self.verify_cmd(delivery / "release.json", delivery=delivery),
+        ):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("format_version 1", result.stderr)
+        self.assertFalse(install.exists())
+        self.assertFalse((self.state / "load-count").exists())
+        self.assertFalse((self.state / "images.json").exists())
+        self.assertEqual(ops(self.state), [])
+
+    def test_documentserver_default_comes_from_selected_source_and_cache_is_reused(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        selected = "onlyoffice/documentserver@sha256:" + "d" * 64
+        declaration = ocu / "deploy" / "release.py"
+        declaration.write_text(declaration.read_text().replace(
+            DOCUMENTSERVER_UPSTREAM.rsplit(":", 1)[1], "d" * 64
+        ))
+        git_init_commit(ocu, "select upstream image")
+        for name in ("uncached", "cached"):
+            destination = self.root / name
+            result = self.build_cmd(ocu, webui, destination)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            inventory = json.loads((destination / "release.json").read_text())
+            image = inventory["images"]["documentserver"]
+            self.assertEqual(image["build"]["arguments"], {"DOCUMENTSERVER_IMAGE": selected})
+            self.assertEqual(image["build"]["argument_defaults"], {"DOCUMENTSERVER_IMAGE": selected})
+            self.assertEqual(image["build"]["materials"], [
+                {"name": "documentserver", "requested": selected, "kind": "upstream-image"}
+            ])
+            self.assertEqual(
+                image["build"]["dockerfile_sha256"],
+                hashlib.sha256(declaration.read_bytes()).hexdigest(),
+            )
+            pulls = [row for row in self.recorded_builds() if row["tag"] == selected]
+            self.assertEqual([row["kind"] for row in pulls], ["pull"])
+            self.assertEqual(image["configuration_digest"], pulls[0]["id"])
+
+    def test_seven_image_release_starts_without_documentserver_compose_service(self):
+        env, script, _source = prepare_up_context(self.state)
+        write_fake_configs(self.state)
+        seed_healthy_host(self.state)
+        result = run_script(script, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.state / "starts.log").read_text().splitlines(),
+                         ["core", "webui", "proxy"])
+        self.assertFalse((self.state / "builds.json").exists())
+
+    def test_import_rejects_built_documentserver_before_loading_images(self):
+        delivery, inventory, _sha = self.write_delivery()
+        inventory["images"]["documentserver"]["build"] = dict(
+            inventory["images"]["proxy"]["build"]
+        )
+        write_inventory(delivery / "release.json", inventory)
+        install = self.root / "built-documentserver-install"
+        result = self.import_cmd(delivery, install)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("documentserver", result.stderr)
+        self.assertFalse(install.exists())
+        self.assertFalse((self.state / "load-count").exists())
+
+    def test_build_exports_documentserver_as_unmodified_pulled_role(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        destination = self.root / "seven-role-release"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = json.loads((destination / "release.json").read_text())
+        self.assertEqual(
+            set(inventory["images"]),
+            {"workspace", "computer-use-server", "retention-guard", "proxy",
+             "open-webui", "postgres", "documentserver"},
+        )
+        self.assertEqual(inventory["format_version"], 2)
+        upstream = (
+            "onlyoffice/documentserver@sha256:"
+            "e3da62a847b9a5d51a11f73cfea1d9c13c3be3809614490d4edddcf01dcf919b"
+        )
+        commands = self.recorded_builds()
+        pulled = [row for row in commands if row["tag"] == upstream]
+        self.assertEqual(len(pulled), 1)
+        self.assertEqual(pulled[0]["kind"], "pull")
+        self.assertEqual(pulled[0]["platform"], "linux/amd64")
+        self.assertFalse(any(
+            row["kind"] == "build" and "documentserver" in row["tag"]
+            for row in commands
+        ))
+        documentserver = inventory["images"]["documentserver"]
+        self.assertEqual(documentserver["configuration_digest"], pulled[0]["id"])
+        self.assertEqual(
+            documentserver["archive"]["sha256"],
+            hashlib.sha256(
+                (destination / documentserver["archive"]["path"]).read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(documentserver["build"]["dockerfile"], "deploy/release.py")
+        self.assertEqual(
+            documentserver["build"]["arguments"], {"DOCUMENTSERVER_IMAGE": upstream}
+        )
+        self.assertEqual(
+            documentserver["build"]["argument_defaults"], {"DOCUMENTSERVER_IMAGE": upstream}
+        )
+        self.assertEqual(documentserver["build"]["argument_overrides"], {})
+        self.assertEqual(
+            documentserver["build"]["materials"],
+            [{"name": "documentserver", "requested": upstream, "kind": "upstream-image"}],
+        )
 
     def test_build_excludes_untracked_context_from_snapshot_inputs(self):
         ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
@@ -1995,6 +2114,7 @@ class OfflineReleaseTests(unittest.TestCase):
             ("proxy", "OCU_PROXY_IMAGE"),
             ("open-webui", "OPENWEBUI_IMAGE"),
             ("postgres", "POSTGRES_IMAGE"),
+            ("documentserver", "DOCUMENTSERVER_IMAGE"),
         ):
             env[name] = payload["images"][role]["reference"]
         result = run_script(install / "source" / "deploy" / "up.sh", env)
@@ -2106,17 +2226,20 @@ class OfflineReleaseTests(unittest.TestCase):
         write_network(
             self.state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1"
         )
-        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
-        tag = DEFAULT_RELEASE_IMAGES["proxy"]
-        images[tag]["Id"] = digest_for("replaced-proxy")
-        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
-        result = run_script(script, env)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("configuration digest", result.stderr)
-        self.assertFalse((self.state / "starts.log").exists())
-        recorded = "\n".join(ops(self.state))
-        self.assertNotIn("network create", recorded)
-        self.assertNotIn("compose up", recorded)
+        original_images = (self.state / "images.json").read_text()
+        for role in ("proxy", "documentserver"):
+            with self.subTest(role=role):
+                images = json.loads(original_images)
+                images[DEFAULT_RELEASE_IMAGES[role]]["Id"] = digest_for(f"replaced-{role}")
+                (self.state / "images.json").write_text(json.dumps(images))
+                result = run_script(script, env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("configuration digest", result.stderr)
+                self.assertFalse((self.state / "starts.log").exists())
+                recorded = "\n".join(ops(self.state))
+                self.assertNotIn("network create", recorded)
+                self.assertNotIn("compose up", recorded)
+                self.assertFalse((self.state / "builds.json").exists())
 
     def test_image_equality_bypass_mutant_starts_replaced_image(self):
         env, _script, source = prepare_up_context(self.state)

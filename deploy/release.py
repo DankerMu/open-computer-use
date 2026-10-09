@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
-"""Build, import, and verify a six-role offline image release."""
+"""Build, import, and verify a seven-role offline image release."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ import tarfile
 import tempfile
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 PLATFORM = "linux/amd64"
 HEX_LEN = 64
 SHA_LEN = 40
@@ -56,6 +56,7 @@ ROLE_ORDER = (
     "proxy",
     "open-webui",
     "postgres",
+    "documentserver",
 )
 RUNTIME_IMAGE_VARS = {
     "workspace": "DOCKER_IMAGE",
@@ -64,6 +65,7 @@ RUNTIME_IMAGE_VARS = {
     "proxy": "OCU_PROXY_IMAGE",
     "open-webui": "OPENWEBUI_IMAGE",
     "postgres": "POSTGRES_IMAGE",
+    "documentserver": "DOCUMENTSERVER_IMAGE",
 }
 SERVICE_IMAGE_VARS = {
     "workspace": "DOCKER_IMAGE",
@@ -117,6 +119,10 @@ BUILD_REQUIRED = (
 SOURCE_BUNDLE_REQUIRED = ("path", "sha256")
 SECRET_BUILD_ARG_MARKERS = ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "API_KEY")
 POSTGRES_DEFAULT = "postgres:17-alpine"
+DOCUMENTSERVER_DEFAULT = (
+    "onlyoffice/documentserver@sha256:"
+    "e3da62a847b9a5d51a11f73cfea1d9c13c3be3809614490d4edddcf01dcf919b"
+)
 WEBUI_BUILD_HASH_ARG = "BUILD_HASH"
 PYODIDE_PREPARE_RELATIVE = "scripts/prepare-pyodide.js"
 PYODIDE_SUPPLEMENT_RELATIVE = "scripts/pyodide-supplement.json"
@@ -165,6 +171,12 @@ ROLE_SPECS = {
         "source": "ocu",
         "context": ".",
         "dockerfile": "docker-compose.webui.yml",
+        "image_kind": "pull",
+    },
+    "documentserver": {
+        "source": "ocu",
+        "context": ".",
+        "dockerfile": "deploy/release.py",
         "image_kind": "pull",
     },
 }
@@ -971,9 +983,14 @@ def inspect_archive_bytes(archive: Path) -> dict[str, dict]:
         return docker_map
 
 
-def existing_reference(reference: str) -> dict | None:
+def existing_reference(reference: str, *, upstream: bool = False) -> dict | None:
     seen: dict[str, dict] = {}
-    for alias in sorted(alias_set(reference)):
+    aliases = (
+        {reference}
+        if upstream and re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", reference)
+        else alias_set(reference)
+    )
+    for alias in sorted(aliases):
         result = docker("image", "inspect", alias)
         if result.returncode != 0:
             detail = (result.stderr or "").strip().lower()
@@ -1399,13 +1416,13 @@ def load_required_json_object(path: Path, label: str) -> dict:
     return payload
 
 
-def extract_pinned_assignments(source: Path) -> dict[str, str]:
+def extract_pinned_assignments(source: Path, names: set[str]) -> dict[str, str]:
     require_regular_file(source)
     try:
         tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
     except SyntaxError as exc:
         raise ReleaseError(
-            f"{source.name}: Draw.io preparation script is malformed"
+            f"{source.name}: literal declaration source is malformed"
         ) from exc
     assignments: dict[str, str] = {}
     for node in tree.body:
@@ -1416,11 +1433,7 @@ def extract_pinned_assignments(source: Path) -> dict[str, str]:
         ):
             continue
         name = node.targets[0].id
-        if name not in {
-            "PINNED_COMMIT",
-            "PINNED_ARCHIVE_SHA256",
-            "PINNED_VIEWER_SHA256",
-        }:
+        if name not in names:
             continue
         value = node.value
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
@@ -1521,7 +1534,9 @@ def pyodide_supplement_materials(webui_root: Path) -> list[dict]:
 def drawio_materials(ocu_root: Path) -> list[dict]:
     prepare = require_tracked_regular_file(ocu_root, DRAWIO_PREPARE_RELATIVE)
     inventory_path = require_tracked_regular_file(ocu_root, DRAWIO_INVENTORY_RELATIVE)
-    pins = extract_pinned_assignments(prepare)
+    pins = extract_pinned_assignments(
+        prepare, {"PINNED_COMMIT", "PINNED_ARCHIVE_SHA256", "PINNED_VIEWER_SHA256"}
+    )
     commit = pins.get("PINNED_COMMIT")
     archive_sha = pins.get("PINNED_ARCHIVE_SHA256")
     viewer_sha = pins.get("PINNED_VIEWER_SHA256")
@@ -1632,13 +1647,14 @@ def material_versions(
                 }
             )
         return materials
-    if role == "postgres":
-        if "POSTGRES_IMAGE" not in arguments:
-            raise ReleaseError("postgres image declaration is missing")
+    if role in ("postgres", "documentserver"):
+        variable = RUNTIME_IMAGE_VARS[role]
+        if variable not in arguments:
+            raise ReleaseError(f"{role} image declaration is missing")
         return [
             {
-                "name": "postgres",
-                "requested": arguments["POSTGRES_IMAGE"],
+                "name": role,
+                "requested": arguments[variable],
                 "kind": "upstream-image",
             }
         ]
@@ -1758,7 +1774,9 @@ def validate_inventory_schema(payload: dict) -> None:
             f"inventory has unexpected fields {', '.join(sorted(extra))}"
         )
     if payload.get("format_version") != FORMAT_VERSION:
-        raise ReleaseError("inventory format_version is unsupported")
+        raise ReleaseError(
+            f"inventory format_version {payload.get('format_version')!r} is unsupported"
+        )
     if payload.get("platform") != PLATFORM:
         raise ReleaseError(f"inventory platform must be {PLATFORM}")
     ocu_sha = str(payload.get("ocu_source_sha") or "")
@@ -1783,7 +1801,7 @@ def validate_inventory_schema(payload: dict) -> None:
     if not isinstance(images, dict):
         raise ReleaseError("images must be an object")
     if set(images) != set(ROLE_ORDER) or len(images) != len(ROLE_ORDER):
-        raise ReleaseError("images must contain the exact six roles")
+        raise ReleaseError("images must contain the exact seven roles")
 
     seen_refs: dict[str, str] = {}
     for role, record in images.items():
@@ -1868,6 +1886,24 @@ def validate_inventory_schema(payload: dict) -> None:
             if "installed" in item:
                 raise ReleaseError(
                     f"{role}: material input hashes are not installed package versions"
+                )
+        if role == "documentserver":
+            variable = RUNTIME_IMAGE_VARS[role]
+            upstream = arguments.get(variable)
+            if (
+                not isinstance(upstream, str)
+                or not upstream
+                or arguments != {variable: upstream}
+                or build["argument_defaults"] != arguments
+                or build["argument_overrides"] != {}
+                or build["dockerfile"] != ROLE_SPECS[role]["dockerfile"]
+                or build["context"] != "."
+                or materials != [
+                    {"name": role, "requested": upstream, "kind": "upstream-image"}
+                ]
+            ):
+                raise ReleaseError(
+                    "documentserver must use pulled upstream-image provenance"
                 )
 
 
@@ -2012,14 +2048,23 @@ def plan_role(
     context = source_root / spec["context"]
     if spec["context"] != "." and not context.is_dir():
         raise ReleaseError(f"{role}: missing build context {spec['context']}")
-    if role == "postgres":
-        declared_image = postgres_declared_default(ocu_root)
-        requested = {} if postgres_image is None else {"POSTGRES_IMAGE": postgres_image}
+    if spec["image_kind"] == "pull":
+        variable = RUNTIME_IMAGE_VARS[role]
+        if role == "postgres":
+            declared_image = postgres_declared_default(ocu_root)
+            requested = {} if postgres_image is None else {variable: postgres_image}
+        else:
+            declared_image = extract_pinned_assignments(
+                dockerfile, {"DOCUMENTSERVER_DEFAULT"}
+            ).get("DOCUMENTSERVER_DEFAULT")
+            if not declared_image:
+                raise ReleaseError("documentserver image declaration is missing")
+            requested = {}
         arguments, argument_defaults, overrides = split_arguments(
-            {"POSTGRES_IMAGE": declared_image}, requested
+            {variable: declared_image}, requested
         )
         if requested_args:
-            raise ReleaseError("postgres does not accept Dockerfile build arguments")
+            raise ReleaseError(f"{role} does not accept Dockerfile build arguments")
         materials = material_versions(
             role, arguments, ocu_root=ocu_root, webui_root=webui_root
         )
@@ -2035,7 +2080,7 @@ def plan_role(
             "materials": materials,
             "input_manifest_sha256": input_manifest_hash_from_entries(entries),
             "image_kind": spec["image_kind"],
-            "temp_tag": arguments["POSTGRES_IMAGE"],
+            "temp_tag": arguments[variable],
         }
     declared = parse_arg_declarations(dockerfile)
     arguments, argument_defaults, overrides = resolve_role_arguments(
@@ -2068,7 +2113,7 @@ def plan_role(
 def export_built_image(*, role: str, plan: dict, archive_dir: Path) -> dict:
     temp_tag = plan["temp_tag"]
     if plan["image_kind"] == "pull":
-        existing = existing_reference(temp_tag)
+        existing = existing_reference(temp_tag, upstream=True)
         if existing is None:
             pull_image(temp_tag)
             payload = inspect_image(temp_tag)
@@ -2646,7 +2691,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    build = sub.add_parser("build", help="build and export a six-role release")
+    build = sub.add_parser("build", help="build and export a seven-role release")
     build.add_argument("--ocu-source", required=True)
     build.add_argument("--webui-source", required=True)
     build.add_argument("--destination", required=True)

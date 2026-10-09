@@ -319,6 +319,34 @@ class DeployEntryTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assert_no_destructive()
 
+    def test_version_one_inventory_refuses_before_deployment_mutation(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        inventory_path = Path(env["OCU_RELEASE_MANIFEST"])
+        inventory = json.loads(inventory_path.read_text())
+        inventory["format_version"] = 1
+        inventory["images"].pop("documentserver")
+        inventory_path.write_text(json.dumps(inventory))
+        before_images = (self.state / "images.json").read_bytes()
+        before_networks = {
+            path.name: path.read_bytes() for path in (self.state / "networks").iterdir()
+        }
+        before_ops = len(ops(self.state))
+        result = run_script(script, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("format_version 1", result.stderr)
+        self.assertEqual(starts(self.state), [])
+        self.assertEqual(compose_up_ops(self.state), [])
+        self.assertEqual((self.state / "images.json").read_bytes(), before_images)
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in (self.state / "networks").iterdir()},
+            before_networks,
+        )
+        mutation_commands = {"load", "pull", "build", "create", "up",
+                             "iptables-restore", "ip6tables-restore"}
+        self.assertFalse(any(
+            set(row.split()) & mutation_commands for row in ops(self.state)[before_ops:]
+        ))
+
     def test_config_resolution_failure_starts_no_service(self):
         (self.state / "config-fail").write_text("1", encoding="utf-8")
         result = self.up()
