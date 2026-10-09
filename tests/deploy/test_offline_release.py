@@ -1060,7 +1060,7 @@ class OfflineReleaseTests(unittest.TestCase):
             self.assertEqual([row["kind"] for row in pulls], ["pull"])
             self.assertEqual(image["configuration_digest"], pulls[0]["id"])
 
-    def test_seven_image_release_starts_without_documentserver_compose_service(self):
+    def test_seven_image_release_starts_with_documentserver_compose_service(self):
         env, script, _source = prepare_up_context(self.state)
         write_fake_configs(self.state)
         seed_healthy_host(self.state)
@@ -1069,6 +1069,7 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertEqual((self.state / "starts.log").read_text().splitlines(),
                          ["core", "webui", "proxy"])
         self.assertFalse((self.state / "builds.json").exists())
+        self.assertEqual(json.loads((self.state / "running.json").read_text())["documentserver"], "core")
 
     def test_import_rejects_built_documentserver_before_loading_images(self):
         delivery, inventory, _sha = self.write_delivery()

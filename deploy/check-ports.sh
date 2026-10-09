@@ -19,6 +19,7 @@ import sys
 PROXY = "proxy"
 WEBUI = "open-webui"
 OCU = "computer-use-server"
+DOCUMENTSERVER = "documentserver"
 TARGET = "8082"
 PUBLISHED = os.environ.get("OCU_PROXY_PORT", "8082")
 SANDBOX = os.environ.get("OCU_SANDBOX_NETWORK", "ocu-sandbox")
@@ -74,7 +75,7 @@ for services, _ in docs:
         if name in seen:
             fail(f"{name}: duplicate service across resolved stacks")
         seen.add(name)
-for critical in (PROXY, WEBUI, OCU):
+for critical in (PROXY, WEBUI, OCU, DOCUMENTSERVER):
     if critical not in seen:
         fail(f"{critical}: required service is missing")
 
@@ -92,6 +93,8 @@ for services, networks in docs:
             fail(f"{name}: joined sandbox network {SANDBOX}")
         if CONTROL not in attached:
             fail(f"{name}: not attached to the control-plane network")
+        if name == DOCUMENTSERVER and attached != {CONTROL}:
+            fail(f"{name}: must use only the control-plane network")
         memberships[name] = attached
         ports = service.get("ports", [])
         if not isinstance(ports, list):
@@ -122,7 +125,7 @@ for services, networks in docs:
         if any(environment.get(key) != value for key, value in expected.items()):
             fail(f"{name}: incorrect proxy listen/upstream configuration")
 
-for application in (WEBUI, OCU):
+for application in (WEBUI, OCU, DOCUMENTSERVER):
     if CONTROL not in memberships[PROXY] or CONTROL not in memberships[application]:
         fail(f"{PROXY}: does not share the control-plane network with {application}")
 PY

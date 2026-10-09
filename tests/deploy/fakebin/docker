@@ -25,7 +25,7 @@ from interpolation import UnsupportedInterpolation, interpolate_value
 
 
 
-CORE_SERVICES = ("workspace", "computer-use-server", "retention-guard")
+CORE_SERVICES = ("workspace", "computer-use-server", "retention-guard", "documentserver")
 WEBUI_SERVICES = ("open-webui", "postgres", "open-webui-init")
 PROXY_SERVICES = ("proxy",)
 CLEANUP_SERVICE = "cleanup"

@@ -8,6 +8,7 @@ from pathlib import Path
 import unittest
 
 from support import (
+    DOCUMENTSERVER_SERVICE,
     OCU_SERVICE,
     PROXY_SERVICE,
     SANDBOX_NETWORK,
@@ -33,6 +34,44 @@ class CheckPortsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "")
         self.assertEqual(result.stderr.strip(), "")
+
+    def test_documentserver_membership_and_exposure_are_checked(self):
+        for defect in ("missing", "duplicate", "lan", "loopback", "sandbox-only",
+                       "sandbox-additional", "no-control", "other-additional",
+                       "host", "shared-service", "shared-container"):
+            with self.subTest(defect=defect):
+                docs = intended_docs()
+                core = docs["core.json"]
+                documentserver = core["services"][DOCUMENTSERVER_SERVICE]
+                documentserver["environment"] = {"JWT_SECRET": "guard-secret-canary"}
+                if defect == "missing":
+                    core["services"].pop(DOCUMENTSERVER_SERVICE)
+                elif defect == "duplicate":
+                    docs["webui.json"]["services"][DOCUMENTSERVER_SERVICE] = dict(documentserver)
+                elif defect in ("lan", "loopback"):
+                    documentserver["ports"] = [
+                        proxy_mapping(published="18083", target=80,
+                                      host_ip="127.0.0.1" if defect == "loopback" else "0.0.0.0")
+                    ]
+                elif defect.startswith("sandbox"):
+                    core["networks"]["sandbox"] = {"name": SANDBOX_NETWORK}
+                    documentserver["networks"] = {"sandbox": {}}
+                    if defect == "sandbox-additional":
+                        documentserver["networks"]["default"] = {}
+                elif defect == "no-control":
+                    documentserver["networks"] = {}
+                elif defect == "other-additional":
+                    core["networks"]["other"] = {"name": "unrelated-bridge"}
+                    documentserver["networks"]["other"] = {}
+                else:
+                    documentserver["network_mode"] = {
+                        "host": "host", "shared-service": f"service:{OCU_SERVICE}",
+                        "shared-container": "container:foreign",
+                    }[defect]
+                result = self.check(docs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(DOCUMENTSERVER_SERVICE, result.stderr)
+                self.assertNotIn("guard-secret-canary", result.stderr)
 
     def test_webui_loopback_publication_is_rejected(self):
         docs = intended_docs()
