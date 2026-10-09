@@ -53,6 +53,9 @@ services:
 
   documentserver:
     image: ${DOCUMENTSERVER_IMAGE:?DOCUMENTSERVER_IMAGE is required}
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${OCU_OFFICE_JWT_SECRET:?OCU_OFFICE_JWT_SECRET is required}
     ports: []
     networks:
       - default
