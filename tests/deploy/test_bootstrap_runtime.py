@@ -117,7 +117,11 @@ def token_docs():
     docs["core.json"]["services"][OCU_SERVICE]["environment"] = {
         "OCU_INTERNAL_TOKEN": "${OCU_INTERNAL_TOKEN}",
         "OCU_SANDBOX_DNS": "${OCU_SANDBOX_DNS}",
+        "OCU_OFFICE_JWT_SECRET": "${OCU_OFFICE_JWT_SECRET}",
     }
+    docs["core.json"]["services"]["documentserver"]["environment"]["JWT_SECRET"] = (
+        "${OCU_OFFICE_JWT_SECRET}"
+    )
     docs["webui.json"]["services"][WEBUI_SERVICE]["environment"] = {
         "OCU_INTERNAL_TOKEN": "${OCU_INTERNAL_TOKEN}",
     }

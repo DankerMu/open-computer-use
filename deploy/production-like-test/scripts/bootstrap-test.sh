@@ -228,34 +228,7 @@ for name in OCU_WEBUI_ORIGIN OCU_OFFICE_DOCSERVER_ORIGIN; do
 done
 python3 - "$OCU_WEBUI_ORIGIN" "$OCU_OFFICE_DOCSERVER_ORIGIN" <<'PY'
 import sys
-from urllib.parse import urlsplit
-
-def origin(name, value):
-    error = f"{name} must be an absolute HTTP(S) origin without path, credentials, query, fragment, or trailing slash"
-    if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
-        raise SystemExit(error)
-    if any(marker in value for marker in ("@", "?", "#")):
-        raise SystemExit(error)
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError:
-        raise SystemExit(error) from None
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.path
-        or parsed.query
-        or parsed.fragment
-        or value.endswith("/")
-        or parsed.netloc != parsed.netloc.lower()
-    ):
-        raise SystemExit(error)
-    if port is not None and not (1 <= port <= 65535):
-        raise SystemExit(error)
-    return parsed.scheme, parsed.hostname, port or (443 if parsed.scheme == "https" else 80)
+from settings import origin
 
 webui = origin("OCU_WEBUI_ORIGIN", sys.argv[1])
 documentserver = origin("OCU_OFFICE_DOCSERVER_ORIGIN", sys.argv[2])
@@ -285,13 +258,9 @@ if [ -z "$office_fonts_dir" ]; then
 fi
 python3 - "$office_proxy_port" <<'PY'
 import sys
-value = sys.argv[1]
-try:
-    valid = value.isascii() and value.isdecimal() and 1 <= int(value) <= 65535
-except ValueError:
-    valid = False
-if not valid:
-    raise SystemExit("OCU_OFFICE_PROXY_PORT must be a decimal port in 1–65535")
+from settings import port
+
+port("OCU_OFFICE_PROXY_PORT", sys.argv[1])
 PY
 
 for pair in \

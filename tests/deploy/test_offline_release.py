@@ -207,6 +207,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
             "deploy/up.sh",
+            "deploy/settings.py",
             "deploy/production-like-test/scripts/bootstrap-test.sh",
             "deploy/production-like-test/scripts/write-deployed-version.sh",
         ):
@@ -538,6 +539,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/functions/computer_link_filter.py",
             "deploy/release.py",
             "deploy/up.sh",
+            "deploy/settings.py",
             "deploy/__init__.py",
             "deploy/check-ports.sh",
             "deploy/provision-networks.sh",
@@ -2261,9 +2263,6 @@ class OfflineReleaseTests(unittest.TestCase):
         for role, record in payload["images"].items():
             self.assertEqual(loaded[record["reference"]]["Id"], record["configuration_digest"], role)
         env = fake_env(self.state)
-        # The copied bootstrap must not create an ambient operator directory.
-        env.pop("OCU_OFFICE_PROXY_PORT", None)
-        env.pop("OCU_OFFICE_FONTS_DIR", None)
         env["OCU_RELEASE_MANIFEST"] = str(install / "release.json")
         env["OCU_TEST_ROOT"] = str(install / "source")
         env["SOURCE_SHA"] = payload["ocu_source_sha"]
@@ -2300,6 +2299,9 @@ class OfflineReleaseTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        # The copied bootstrap must not create an ambient operator directory.
+        env.pop("OCU_OFFICE_PROXY_PORT", None)
+        env.pop("OCU_OFFICE_FONTS_DIR", None)
         bootstrap = subprocess.run(
             [
                 "bash",

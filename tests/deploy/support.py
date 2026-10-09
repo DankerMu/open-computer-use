@@ -100,6 +100,7 @@ DOCUMENTSERVER_UPSTREAM = (
 
 UP_FIXTURE_PATHS = (
     "deploy/up.sh",
+    "deploy/settings.py",
     "deploy/release.py",
     "deploy/fonts/prepare_fonts.py",
     "deploy/fonts/fonts.json",
@@ -184,6 +185,7 @@ def intended_core():
                 networks={"default": {}},
                 environment={
                     "OCU_SANDBOX_DNS": DEFAULT_DNS,
+                    "OCU_OFFICE_JWT_SECRET": "synthetic-office-jwt-secret",
                     "DOCKER_IMAGE": DEFAULT_RELEASE_IMAGES["workspace"],
                 },
                 image=DEFAULT_RELEASE_IMAGES["computer-use-server"],
@@ -195,6 +197,7 @@ def intended_core():
             ),
             DOCUMENTSERVER_SERVICE: service(
                 networks={"default": {}},
+                environment={"JWT_ENABLED": "true", "JWT_SECRET": "synthetic-office-jwt-secret"},
                 image=DEFAULT_RELEASE_IMAGES["documentserver"],
             ),
         }
@@ -340,6 +343,15 @@ def fake_env(state_dir: Path, extra=None):
     env["OCU_PROXY_IMAGE"] = "ocu-test-proxy:synthetic"
     env["OCU_SANDBOX_EGRESS_ALLOW"] = DEFAULT_ALLOW
     env["OCU_SANDBOX_DNS"] = DEFAULT_DNS
+    env.update({
+        "OCU_OFFICE_JWT_SECRET": "synthetic-office-jwt-secret",
+        "OCU_OFFICE_DOCSERVER_URL": "http://documentserver",
+        "OCU_OFFICE_DOCSERVER_ORIGIN": "http://localhost:8083",
+        "OCU_OFFICE_SELF_URL": "http://computer-use-server:8081",
+        "OCU_OFFICE_PROXY_PORT": "8083",
+        "OCU_OFFICE_FONTS_DIR": str(state_dir / "office-fonts"),
+        "ENABLE_OCU_OFFICE_EDIT": "false",
+    })
     env["OCU_SANDBOX_EGRESS_LOCK"] = str(state_dir / "ocu-sandbox-egress.lock")
     env["DOCKER_HOST"] = "unix://" + str(state_dir / "docker.sock")
     if extra:

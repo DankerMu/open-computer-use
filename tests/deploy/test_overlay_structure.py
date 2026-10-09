@@ -202,6 +202,10 @@ class OverlayStructureTests(unittest.TestCase):
                 for name in names:
                     self.assertTrue(environment.get(name), name)
                     self.assertEqual(environment[name], OFFICE_INPUTS[name])
+                jwt = service.get("environment", {})
+                self.assertEqual(jwt.get("JWT_ENABLED"), "true")
+                self.assertEqual(jwt.get("JWT_SECRET"),
+                                 environment[office_config.OCU_OFFICE_JWT_SECRET])
                 self.assertEqual(webui["services"]["open-webui"]["environment"]["ENABLE_OCU_OFFICE_EDIT"], flag)
                 self.assertEqual(len(proxy["services"]["proxy"]["ports"]), 1)
                 states.append((service, {name: core["volumes"][name] for name in expected_mounts.values()}))

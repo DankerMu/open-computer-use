@@ -185,6 +185,10 @@ class RecoveryCliTests(unittest.TestCase):
             "OCU_SANDBOX_DNS": "8.8.8.8",
             "OCU_PROXY_PORT": "8082",
         }
+        for name in ("OCU_OFFICE_JWT_SECRET", "OCU_OFFICE_DOCSERVER_URL",
+                     "OCU_OFFICE_DOCSERVER_ORIGIN", "OCU_OFFICE_SELF_URL",
+                     "OCU_OFFICE_PROXY_PORT", "OCU_OFFICE_FONTS_DIR", "ENABLE_OCU_OFFICE_EDIT"):
+            payload[name] = self.env[name]
         for role, name in (
             ("workspace", "DOCKER_IMAGE"),
             ("computer-use-server", "COMPUTER_USE_SERVER_IMAGE"),
