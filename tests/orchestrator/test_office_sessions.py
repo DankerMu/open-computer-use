@@ -148,9 +148,9 @@ def _assert_no_secrets(response, *hidden: str) -> None:
         assert value not in combined
 
 
-def _assert_refusal(response, status: int, reason: str) -> None:
+def _assert_refusal(response, status: int, reason: str, **details) -> None:
     assert response.status_code == status
-    assert json.loads(response.content) == {"reason": reason}
+    assert json.loads(response.content) == {"reason": reason, **details}
 
 
 def _seed_session(store_mod, file_id: str, state: str, key: str = "closed-key") -> None:

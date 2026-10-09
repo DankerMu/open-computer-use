@@ -39,6 +39,10 @@ class UnpublishedVersionError(RuntimeError):
 class DocumentServerUnavailableError(RuntimeError):
     reason = "documentserver_unavailable"
 
+    def __init__(self, *, save_seq: int | None = None) -> None:
+        super().__init__(self.reason)
+        self.save_seq = save_seq
+
 
 class CommandCompletionPendingError(RuntimeError):
     reason = "publish_pending"
@@ -64,6 +68,10 @@ class UnsupportedTypeError(ValueError):
 
 class SessionNotEditingError(RuntimeError):
     reason = "session_not_editing"
+
+    def __init__(self, *, blocking_save_seq: int | None = None) -> None:
+        super().__init__(self.reason)
+        self.blocking_save_seq = blocking_save_seq
 
 
 class SessionNotOpenError(RuntimeError):
@@ -118,10 +126,14 @@ async def save_session(request: Request) -> JSONResponse:
         return _error(422, "invalid_request")
     except UnknownSessionError:
         return _error(404, "unknown_session")
-    except SessionNotEditingError:
-        return _error(409, "session_not_editing")
-    except DocumentServerUnavailableError:
-        return _error(502, "documentserver_unavailable")
+    except SessionNotEditingError as extra:
+        if extra.blocking_save_seq is not None:
+            return _error(409, extra.reason, blocking_save_seq=extra.blocking_save_seq)
+        return _error(409, extra.reason)
+    except DocumentServerUnavailableError as extra:
+        if extra.save_seq is not None:
+            return _error(502, extra.reason, save_seq=extra.save_seq)
+        return _error(502, extra.reason)
     except CommandCompletionPendingError:
         return _error(503, "publish_pending")
     except StorageLowError:
@@ -675,14 +687,18 @@ def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
         record = _require_session(state, session_id)
         _status_projection(record)
         if record["state"] != "editing":
-            raise SessionNotEditingError()
+            raise SessionNotEditingError(
+                blocking_save_seq=record["pending_save_seq"] if record["state"] == "saving" else None
+            )
         document_key = record["document_key"]
 
         def mutate(working):
             current = _require_session(working, session_id)
             _status_projection(current)
             if current["state"] != "editing":
-                raise SessionNotEditingError()
+                raise SessionNotEditingError(
+                    blocking_save_seq=current["pending_save_seq"] if current["state"] == "saving" else None
+                )
             allocated = _allocate_sequence(current)
             _record_save_intent(current, allocated, intent)
             current["pending_save_seq"] = allocated
@@ -794,7 +810,7 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
         return accepted
     if outcome is commands.ForceSaveOutcome.KEY_UNKNOWN:
         raise SessionNotEditingError()
-    raise DocumentServerUnavailableError()
+    raise DocumentServerUnavailableError(save_seq=save_seq)
 
 
 def _close_session(chat_id, session_id) -> dict[str, Any]:
@@ -888,5 +904,5 @@ def _commit_close_allocation(store, chat, session_id, expected_state) -> dict[st
     }
 
 
-def _error(status: int, reason: str) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"reason": reason})
+def _error(status: int, reason: str, **details: Any) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"reason": reason, **details})

@@ -258,21 +258,53 @@ parent, exact message fields, matching chat and a non-negative safe generation;
 one page admits one open, including after failure. Files selection messages do
 not activate it, and no Files/Browser/Terminal client is mounted.
 
-The host creates or joins through `ocuFetch`, then reads the returned session
-once for its persisted state, reason, publication sequences and change notice.
-That initial read is not a poll loop. The API script comes from the configured
-origin at `/web-apps/apps/api/documents/api.js`; the broker's signed document,
-editorConfig and token fields pass through unchanged. State reports retain the
-original file and generation, including after save-as, and are sent only when a
-reported value changes.
+The host creates or joins through `ocuFetch`, hydrates one initial session
+snapshot, then polls through one non-overlapping status-read owner. Periodic
+reads wait one second after completion; commands share that owner rather than
+starting another poll. The API script comes from the configured origin at
+`/web-apps/apps/api/documents/api.js`; the broker's signed document, editorConfig
+and token fields pass through unchanged. Reports retain the original file and
+generation, including after save-as, and are sent only when a reported value changes.
 
 Named broker validation refusals and `unpublished_version` are final `refused`
 with no session id. Creation transport/server failures, failed status reads,
 API load/timeout/constructor failures and editor connection loss are `error`;
 an obtained session id is retained and another tab's session is not closed.
-Editor modification acknowledgements do not prove a workspace save or clear
-dirty state. Save/close execution, recurring polling and auto-save are not part
-of this host's delivered protocol behavior.
+
+Parent Save requests publishing. One five-minute timer while editing requests
+persist-only auto-save for reported modifications not yet covered by a committed
+save. Ordinary status polls do not postpone that timer. An accepted request is
+not a saved result: coverage uses its returned sequence and the broker's cumulative
+committed watermark, and never covers modifications reported after that request.
+Committed-but-unpublished content remains dirty. The editor's own save shortcut
+and delivery acknowledgements neither issue a broker save nor clear dirty.
+
+Rejected save/close requests retain the editor and dirty state, with a failure
+reason through ordinary editing polls until another command is accepted. Conflict
+and terminal reports use the broker's authoritative reason. Save timeout and
+callback refusal remain retryable. A publishing refusal queues a retry only when
+its `blocking_save_seq` matches the local auto-save's actual sequence, including
+a delayed 202 or post-allocation 502 response. Confirmed user intent survives later
+foreign saves until editing resumes. Missing, malformed or mismatched correlation
+and unproven transport failures never create a generic retry.
+Background persistence cannot supersede an unresolved explicit publishing command.
+A newer explicit Save replaces an older queued intent. Each unresolved publishing
+intent retains only its candidate local auto-save attempts, including attempts
+started during its request flight; exact broker correlation decides ownership.
+Settling, superseding or retiring that intent releases its candidate references.
+
+A saving-state admission 409 includes `blocking_save_seq` captured under the
+rejecting chat lock; other `session_not_editing` refusals omit it. Save 502
+`documentserver_unavailable` includes that failed request's allocated `save_seq`,
+not a newer session allocation. This identifies contention only: a failed save
+does not cover modifications. Creation and restore error shapes are unchanged.
+
+Close stops auto-save, releases the editor only after broker acceptance and
+keeps observing status until a final state. A rejected close retains the editor
+and restores the editing timer. Final states stop polling and auto-save.
+Component cleanup and pagehide share an idempotent disposer that retires authority
+before cancelling timers/requests/API loading and releasing the editor. Late work
+cannot report or restart activity; teardown itself sends no broker close.
 
 `officeDocserverOrigin` comes only from `OCU_OFFICE_DOCSERVER_ORIGIN` on the server,
 not a query, parent message or user iframe setting. Browser configuration and

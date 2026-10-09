@@ -20,13 +20,25 @@ const [directory, optionsJson] = process.argv.slice(2);
 const options = JSON.parse(optionsJson);
 const chat = options.chat;
 const file = options.file ?? 'document-id';
-const calls = [], messages = [], scripts = [], configs = [], order = [];
+const calls = [], messages = [], scripts = [], configs = [], order = [], actionStates = [], actionResources = [];
 const listeners = new Map(), timers = new Map();
-let timerId = 0, attempts = 0, resolveCreate, pendingLoad;
+let timerId = 0, attempts = 0, destroyed = 0, resolveCreate, resolveSave, resolveClose, resolveBody, resolveRefusalBody, pendingLoad;
+let now = 0, activeStatuses = 0, maxActiveStatuses = 0, statusReads = 0;
+const heldStatuses = [], signals = [];
+let releasePublishAdmission;
 const clone = value => JSON.parse(JSON.stringify(value));
 const signed = {documentType:'word', document:{key:'stable-key',url:'http://private.test/office/source/ticket',fileType:'docx',permissions:{edit:true}},editorConfig:{callbackUrl:'http://private.test/office/callback/chat/session',mode:'edit',customization:{forcesave:false}},token:'signed-configuration-token'};
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
-const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>clone(body)});
+let currentStatus = clone(initial);
+const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>{
+  if(status===409&&options.deferRefusalBody)return new Promise(resolve=>{resolveRefusalBody=()=>resolve(clone(body));});
+  const kind=body?.editor_config!==undefined?'create':body?.workspace_changed!==undefined?'status':
+    body?.intent||body?.reason==='documentserver_unavailable'&&body?.save_seq!==undefined?'save':body?.session_id&&body?.state?'close':null;
+  if(kind&&options.deferBody===kind)return new Promise(resolve=>{resolveBody=()=>resolve(clone(body));});
+  return clone(body);
+}});
+const createReply=()=>response(options.joined?200:201,{session_id:'session-id',file_id:file,document_key:'stable-key',
+  state:'opening',joined:Boolean(options.joined),editor_config:options.noConfig?null:clone(signed)});
 function element(tag) {
   return {tagName:tag.toUpperCase(),children:[],style:{},attributes:{},hidden:false,textContent:'',parentNode:null,
     setAttribute(key,value){this.attributes[key]=String(value);},
@@ -42,8 +54,10 @@ function element(tag) {
               configs.push(config);
               if(options.syncError)config.events.onError({data:{errorCode:-18,errorDescription:'connection lost'}});
               if(options.syncModified)config.events.onDocumentStateChange({data:true});
+              if(options.syncDispose)emit('pagehide');
               config.events.onDocumentReady?.({});
             }
+            destroyEditor(){destroyed++;order.push('destroyEditor');}
           }};
           child.onload?.();
         });
@@ -59,23 +73,72 @@ const hostWindow={location:{origin:'https://webui.test'},parent:{
   postMessage(data,target){messages.push({data:clone(data),target});order.push('message:'+data.type);
     if(data.type==='ocu:office-ready'&&options.replyOnReady){dispatch(open);if(options.duplicateOnReady)dispatch({...open,generation:8});}
   }
-},addEventListener(type,listener){order.push('listener:'+type);listeners.set(type,listener);},
-  setTimeout(fn,ms){const id=++timerId;timers.set(id,{fn,ms});return id;},clearTimeout(id){timers.delete(id);}};
+},addEventListener(type,listener){order.push('listener:'+type);if(!listeners.has(type))listeners.set(type,new Set());listeners.get(type).add(listener);},
+  removeEventListener(type,listener){const group=listeners.get(type);group?.delete(listener);if(group?.size===0)listeners.delete(type);},
+  setTimeout(fn,ms){const id=++timerId;timers.set(id,{fn,ms,due:now+ms});return id;},clearTimeout(id){timers.delete(id);}};
 const open={type:'ocu:office-open',chat_id:chat,file_id:file,generation:7};
-function dispatch(data, changes={}){listeners.get('message')?.({source:hostWindow.parent,origin:hostWindow.location.origin,data,...changes});}
+function emit(type,event={}){for(const listener of [...(listeners.get(type)||[])])listener(event);}
+function dispatch(data, changes={}){emit('message',{source:hostWindow.parent,origin:hostWindow.location.origin,data,...changes});}
+function sendTestMessage(row){const changes={};if(row.source)changes.source={parent:row.source==='nested'?hostWindow:hostWindow.parent};if(row.origin)changes.origin=row.origin;dispatch(row.data,changes);}
 const fetch=async(url,init={})=>{
   const method=init.method||'GET';const headers=Object.fromEntries(new Headers(init.headers));
-  calls.push({url:String(url),method,headers});order.push('fetch:'+method);
+  const body=init.body?JSON.parse(init.body):null;
+  calls.push({url:String(url),method,headers,body});order.push('fetch:'+method);
+  if(init.signal)signals.push(init.signal);
+  if(method==='POST'&&String(url).endsWith('/save')){
+    if(body.intent==='publish'&&options.holdPublishAdmission)await new Promise(resolve=>{
+      releasePublishAdmission=()=>{options.holdPublishAdmission=false;resolve();};
+    });
+    if(options.saveTransportError)throw new Error('save transport failed');
+    if(currentStatus.state!=='editing'){
+      const correlation=options.refusalCorrelation===undefined
+        ?(currentStatus.state==='saving'?{blocking_save_seq:currentStatus.save_seq}:{})
+        :options.refusalCorrelation;
+      const refusal=response(409,{reason:'session_not_editing',...correlation});
+      if(options.deferPersistRefusal&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>resolve(refusal);});
+      return refusal;
+    }
+    currentStatus={...currentStatus,state:'saving',save_seq:options.nextSaveSequence??currentStatus.save_seq+1,reason:null};
+    const allocatedSequence=currentStatus.save_seq;
+    if(options.rejectSave){
+      currentStatus={...currentStatus,state:'editing'};
+      return response(502,{reason:'documentserver_unavailable',save_seq:allocatedSequence});
+    }
+    if(options.deferPersistFailure&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>{
+      if(currentStatus.state==='saving'&&currentStatus.save_seq===allocatedSequence)currentStatus={...currentStatus,state:'editing'};
+      const correlation=options.failureCorrelation===undefined?{save_seq:allocatedSequence}:options.failureCorrelation;
+      resolve(response(502,{reason:'documentserver_unavailable',...correlation}));
+    };});
+    if(options.autoCommit)currentStatus={...currentStatus,state:'editing',last_committed_seq:currentStatus.save_seq,
+      last_published_seq:options.equalPublished?currentStatus.save_seq:currentStatus.last_published_seq};
+    const reply=response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,intent:body.intent});
+    if(options.deferSave||options.deferPersist&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>resolve(reply);});
+    return reply;
+  }
+  if(method==='POST'&&String(url).endsWith('/close')){
+    if(options.rejectClose)return response(503,{reason:'storage_low'});
+    currentStatus={...currentStatus,save_seq:currentStatus.save_seq+1,
+      state:currentStatus.state==='opening'?'closed':currentStatus.state==='conflict'?'conflict':'closing'};
+    const reply=response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,state:currentStatus.state});
+    if(options.deferClose)return new Promise(resolve=>{resolveClose=()=>resolve(reply);});
+    return reply;
+  }
   if(method==='POST'){
     if(options.transportError)throw new Error('network failed');
-    if(options.deferCreate)return new Promise(resolve=>{resolveCreate=resolve;});
+    if(options.deferCreate)return new Promise(resolve=>{resolveCreate=()=>resolve(createReply());});
     if(options.refusal)return response(options.refusal.status,{reason:options.refusal.reason});
-    return response(options.joined?200:201,{session_id:'session-id',file_id:file,document_key:'stable-key',state:'opening',joined:Boolean(options.joined),editor_config:options.noConfig?null:clone(signed)});
+    return createReply();
   }
   if(options.statusError)return response(500,{reason:'state_corrupt'});
-  return response(200,initial);
+  statusReads++; activeStatuses++; maxActiveStatuses=Math.max(maxActiveStatuses,activeStatuses);
+  const reply=response(200,currentStatus);
+  if(options.holdStatusAfter!==undefined&&statusReads>options.holdStatusAfter){
+    return new Promise(resolve=>heldStatuses.push(()=>{activeStatuses--;resolve(reply);}));
+  }
+  activeStatuses--;
+  return reply;
 };
-const context=vm.createContext({window:hostWindow,document:hostDocument,URL,Headers,fetch,console,
+const context=vm.createContext({window:hostWindow,document:hostDocument,URL,Headers,AbortController,fetch,console,
   setTimeout:hostWindow.setTimeout,clearTimeout:hostWindow.clearTimeout,queueMicrotask});
 const modules=new Map();
 async function load(url){
@@ -86,21 +149,64 @@ async function load(url){
   await module.link((specifier,parent)=>load(new URL(specifier,parent.identifier).href));
   return module;
 }
-const module=await load('https://webui.test/tools/ocu/static/office-editor.js');await module.evaluate();
-const host=module.namespace.createOfficeEditorHost({chatId:chat,docserverOrigin:options.origin||'https://office.test:8443',container,window:hostWindow,document:hostDocument});
+const module=await load('https://webui.test'+(options.prefix??'/tools/ocu')+'/static/office-editor.js');await module.evaluate();
+const mount=()=>module.namespace.createOfficeEditorHost({chatId:chat,docserverOrigin:options.origin||'https://office.test:8443',container,window:hostWindow,document:hostDocument});
+let host=mount();
 const idle=()=>new Promise(resolve=>setImmediate(resolve));
-if(options.messages){for(const row of options.messages){const data=row.data;const changes={};if(row.source)changes.source={parent:row.source==='nested'?hostWindow:hostWindow.parent};if(row.origin)changes.origin=row.origin;dispatch(data,changes);}await idle();}
+async function advance(milliseconds){
+  const end=now+milliseconds;
+  for(let count=0;count<10000;count++){
+    const next=[...timers].filter(([,timer])=>timer.due<=end).sort((a,b)=>a[1].due-b[1].due||a[0]-b[0])[0];
+    if(!next){now=end;return;}
+    const [id,timer]=next;now=timer.due;timers.delete(id);timer.fn();await idle();
+  }
+  throw new Error('Timer did not make progress');
+}
+if(options.messages){for(const row of options.messages)sendTestMessage(row);await idle();}
 if(options.open)dispatch(open);
 await idle();
-if(resolveCreate&&options.releaseCreate){resolveCreate(response(201,{session_id:'session-id',file_id:file,document_key:'stable-key',state:'opening',joined:false,editor_config:clone(signed)}));await idle();}
-if(options.expire){for(const [id,timer] of [...timers]){timers.delete(id);timer.fn();}await idle();}
+if(resolveCreate&&options.releaseCreate){resolveCreate();await idle();}
+if(options.expire)await advance(10000);
+const beforeLate=options.lateLoad?clone({calls,messages}):null;
 if(options.lateLoad){hostWindow.DocsAPI={DocEditor:class{constructor(){attempts++;}}};pendingLoad?.();await idle();}
 if(options.modify&&configs.length){for(const value of options.modify){configs[0].events.onDocumentStateChange({data:value});await idle();}}
 if(options.error&&configs.length){configs[0].events.onError({data:{errorCode:-18,errorDescription:'connection lost'}});await idle();}
 if(options.laterStatus){for(const status of options.laterStatus){host.applyStatus({...initial,...status});await idle();}}
 if(options.after){for(const data of options.after)dispatch(data);await idle();}
+for(const action of options.actions||[]){
+  if(action.kind==='modify')configs.at(-1).events.onDocumentStateChange({data:action.value??true});
+  else if(action.kind==='command')dispatch({type:'ocu:office-command',chat_id:chat,generation:7,command:action.command});
+  else if(action.kind==='snapshot'){currentStatus={...currentStatus,...action.status};host.applyStatus(clone(currentStatus));}
+  else if(action.kind==='releaseSave')resolveSave();
+  else if(action.kind==='status')currentStatus={...currentStatus,...action.status};
+  else if(action.kind==='tick')await advance(action.ms);
+  else if(action.kind==='releaseStatus')heldStatuses.shift()();
+  else if(action.kind==='releaseClose')resolveClose?.();
+  else if(action.kind==='allowClose')options.rejectClose=false;
+  else if(action.kind==='pagehide')emit('pagehide');
+  else if(action.kind==='releaseCreate')resolveCreate?.();
+  else if(action.kind==='releaseBody'){options.deferBody=null;resolveBody?.();}
+  else if(action.kind==='releaseRefusalBody'){options.deferRefusalBody=false;resolveRefusalBody();}
+  else if(action.kind==='releasePublishAdmission')releasePublishAdmission();
+  else if(action.kind==='lateApi'){hostWindow.DocsAPI={DocEditor:class{constructor(){attempts++;}destroyEditor(){destroyed++;}}};pendingLoad?.();}
+  else if(action.kind==='remount'){currentStatus=clone(initial);host=mount();dispatch(open);}
+  else if(action.kind==='dispose')host.dispose();
+  else if(action.kind==='error')configs.at(-1).events.onError({data:{errorCode:-18}});
+  else if(action.kind==='allowStatus')options.holdStatusAfter=undefined;
+  else if(action.kind==='allowSave'){options.rejectSave=false;options.saveTransportError=false;}
+  else if(action.kind==='message')sendTestMessage(action);
+  else throw new Error('Unknown test action: '+action.kind);
+  await idle();
+  actionStates.push(clone(messages.at(-1).data));
+  actionResources.push({destroyed,timerDelays:[...timers.values()].map(timer=>timer.ms),calls:calls.length,messages:messages.length,
+    listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),apiElements:hostDocument.head.children.length,
+    saves:calls.filter(row=>row.url.endsWith('/save')).length});
+}
 const dom=node=>({tag:node.tagName,text:node.textContent,hidden:node.hidden,attributes:node.attributes,children:node.children.map(dom)});
-process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,dom:dom(container)}));
+process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,
+  activeStatuses,maxActiveStatuses,beforeLate,destroyed,actionResources,signals:signals.map(signal=>signal.aborted),
+  listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),apiElements:hostDocument.head.children.length,
+  timerDelays:[...timers.values()].map(timer=>timer.ms),dom:dom(container)}));
 """
 
 
@@ -119,7 +225,7 @@ def _run(tmp_path, **options):
 def test_ready_reply_opens_once_with_signed_configuration(tmp_path):
     file_id = "opaque/file ?文档"
     result = _run(tmp_path, file=file_id, replyOnReady=True, duplicateOnReady=True)
-    assert result["order"][:2] == ["listener:message", "message:ocu:office-ready"]
+    assert result["order"].index("listener:message") < result["order"].index("message:ocu:office-ready")
     assert result["messages"][0] == {
         "data": {"type": "ocu:office-ready", "chat_id": CHAT}, "target": "https://webui.test",
     }
@@ -137,7 +243,6 @@ def test_ready_reply_opens_once_with_signed_configuration(tmp_path):
                          "workspace_changed": False, "reason": None}
     assert states[-1] == {**states[0], "session_id": "session-id", "state": "editing"}
     assert result["attempts"] == 1
-    assert result["timers"] == 0
 
 
 def _open(**changes):
@@ -313,5 +418,656 @@ def test_late_api_completion_cannot_resurrect_a_timed_out_open(tmp_path):
     assert states[-1]["state"] == "error"
     assert [row["state"] for row in states].count("error") == 1
     assert result["attempts"] == 0
-    assert [row["method"] for row in result["calls"]] == ["POST", "GET"]
+    assert result["calls"] == result["beforeLate"]["calls"]
+    assert result["messages"] == result["beforeLate"]["messages"]
     assert result["timers"] == 0
+
+
+def test_parent_publish_command_does_not_acknowledge_uncommitted_edits(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], after=[
+        {"type": "ocu:office-command", "chat_id": CHAT, "generation": 7, "command": "save"},
+    ])
+    saves = [row for row in result["calls"] if row["url"].endswith("/save")]
+    assert len(saves) == 1
+    assert saves[0]["method"] == "POST"
+    assert saves[0]["body"] == {"intent": "publish"}
+    assert _states(result)[-1]["dirty"] is True
+    assert _states(result)[-1]["state"] == "saving"
+
+
+@pytest.mark.parametrize("later_edit", [False, True])
+@pytest.mark.parametrize("commit_before_reply", [False, True])
+def test_committed_save_covers_only_its_dispatch_generation(tmp_path, later_edit, commit_before_reply):
+    actions = [{"kind": "command", "command": "save"}]
+    if later_edit:
+        actions.append({"kind": "modify"})
+    committed = {"kind": "snapshot", "status": {
+        "state": "editing", "save_seq": 9, "last_committed_seq": 9, "last_published_seq": 9,
+    }}
+    actions += ([committed, {"kind": "releaseSave"}] if commit_before_reply
+                else [{"kind": "releaseSave"}, committed])
+    result = _run(tmp_path, open=True, modify=[True], deferSave=True,
+                  nextSaveSequence=9, actions=actions)
+    assert result["actionStates"][0]["dirty"] is True
+    assert result["actionStates"][-1]["dirty"] is later_edit
+    assert _states(result)[-1]["state"] == "editing"
+    assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 1
+
+
+def test_another_tabs_sequence_does_not_acknowledge_local_edits(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "snapshot", "status": {"save_seq": 9, "last_committed_seq": 9, "last_published_seq": 9}},
+    ])
+    assert _states(result)[-1]["dirty"] is True
+    assert all(not row["url"].endswith("/save") for row in result["calls"])
+
+
+@pytest.mark.parametrize(("mode", "save_count", "dirty"), [
+    ("commit", 1, True), ("equal", 1, False), ("reject", 2, True),
+])
+def test_editing_polls_do_not_starve_autosave_or_repeat_covered_edits(tmp_path, mode, save_count, dirty):
+    result = _run(tmp_path, open=True, modify=[True], autoCommit=mode != "reject",
+                  equalPublished=mode == "equal", rejectSave=mode == "reject", actions=[
+                      {"kind": "tick", "ms": 300000}, {"kind": "tick", "ms": 300000},
+                  ])
+    saves = [row for row in result["calls"] if row["url"].endswith("/save")]
+    assert len(saves) == save_count
+    assert all(row["body"] == {"intent": "persist"} for row in saves)
+    assert _states(result)[-1]["dirty"] is dirty
+    assert result["timerDelays"].count(300000) == 1
+    assert result["maxActiveStatuses"] == 1
+    if mode == "reject":
+        assert _states(result)[-1]["state"] == "editing"
+        assert _states(result)[-1]["reason"] == "documentserver_unavailable"
+
+
+def test_status_poll_does_not_overlap_a_held_request(tmp_path):
+    result = _run(tmp_path, open=True, holdStatusAfter=1, actions=[
+        {"kind": "tick", "ms": 1000}, {"kind": "tick", "ms": 5000},
+    ])
+    assert len([row for row in result["calls"] if row["method"] == "GET"]) == 2
+    assert result["activeStatuses"] == result["maxActiveStatuses"] == 1
+
+
+def test_publish_refused_during_own_autosave_retries_once_after_editing(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "tick", "ms": 300000},
+        {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "status", "status": {
+            "state": "editing", "save_seq": 4, "last_committed_seq": 4, "last_published_seq": 4,
+        }},
+        {"kind": "tick", "ms": 5000},
+    ])
+    saves = [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")]
+    assert saves == ["persist", "publish", "publish"]
+    assert result["actionStates"][1]["state"] == "saving"
+    assert result["actionStates"][1]["reason"] is None
+    assert _states(result)[-1]["state"] == "editing"
+    assert _states(result)[-1]["dirty"] is False
+
+
+def test_another_tabs_save_refusal_is_not_an_automatic_retry(tmp_path):
+    result = _run(tmp_path, open=True, joined=True, status={"state": "saving"}, actions=[
+        {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing"}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 1
+    assert _states(result)[-1]["state"] == "editing"
+    assert _states(result)[-1]["reason"] == "session_not_editing"
+
+
+def test_close_releases_editor_only_after_acceptance_and_polls_to_closed(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], deferClose=True, actions=[
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 300000},
+        {"kind": "releaseClose"},
+        {"kind": "status", "status": {"state": "closed"}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 300000},
+    ])
+    assert len([row for row in result["calls"] if row["url"].endswith("/close")]) == 1
+    assert result["actionResources"][0]["destroyed"] == 0
+    assert 300000 not in result["actionResources"][0]["timerDelays"]
+    assert result["actionResources"][1]["destroyed"] == 0
+    assert result["actionResources"][2]["destroyed"] == 1
+    assert result["actionStates"][2]["state"] == "closing"
+    assert _states(result)[-1]["state"] == "closed"
+    assert _states(result)[-1]["dirty"] is False
+    assert result["timers"] == 0
+    assert result["actionResources"][-1]["calls"] == result["actionResources"][4]["calls"]
+    assert all(not row["url"].endswith("/save") for row in result["calls"])
+
+
+def test_rejected_close_retains_editor_and_resumes_editing_timer(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], rejectClose=True, actions=[
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 3000},
+        {"kind": "allowClose"},
+        {"kind": "command", "command": "close"},
+    ])
+    assert len([row for row in result["calls"] if row["url"].endswith("/close")]) == 2
+    assert result["actionStates"][1]["state"] == "editing"
+    assert result["actionStates"][1]["dirty"] is True
+    assert result["actionStates"][1]["reason"] == "storage_low"
+    assert result["actionResources"][1]["destroyed"] == 0
+    assert result["actionResources"][1]["timerDelays"].count(300000) == 1
+    assert result["destroyed"] == 1
+    assert _states(result)[-1]["state"] == "closing"
+    assert _states(result)[-1]["reason"] is None
+
+
+def test_retirement_aborts_creation_and_ignores_abort_insensitive_completion(tmp_path):
+    result = _run(tmp_path, open=True, deferCreate=True, actions=[
+        {"kind": "pagehide"}, {"kind": "releaseCreate"}, {"kind": "tick", "ms": 300000},
+        {"kind": "command", "command": "save"}, {"kind": "pagehide"},
+    ])
+    assert result["attempts"] == 0
+    assert result["scripts"] == []
+    assert len(result["calls"]) == result["actionResources"][0]["calls"] == 1
+    assert len(result["messages"]) == result["actionResources"][0]["messages"]
+    assert result["timers"] == result["listeners"] == 0
+    assert result["signals"] == [True]
+
+
+@pytest.mark.parametrize("later_edit", [False, True])
+@pytest.mark.parametrize("committed_sequence", [3, 4])
+def test_timeout_does_not_revoke_later_cumulative_coverage(tmp_path, later_edit, committed_sequence):
+    actions = [
+        {"kind": "command", "command": "save"},
+        {"kind": "snapshot", "status": {"state": "editing", "reason": "save_timeout"}},
+    ]
+    if later_edit:
+        actions.append({"kind": "modify"})
+    actions.append({"kind": "snapshot", "status": {
+        "state": "editing", "reason": None, "save_seq": committed_sequence,
+        "last_committed_seq": committed_sequence, "last_published_seq": committed_sequence,
+    }})
+    result = _run(tmp_path, open=True, modify=[True], actions=actions)
+    assert result["actionStates"][1]["dirty"] is True
+    assert result["actionStates"][-1]["dirty"] is later_edit
+
+
+@pytest.mark.parametrize(("options", "before", "release", "had_editor"), [
+    ({"holdStatusAfter": 0}, [], "releaseStatus", False),
+    ({"deferSave": True}, [{"kind": "command", "command": "save"}], "releaseSave", True),
+    ({"deferClose": True}, [{"kind": "command", "command": "close"}], "releaseClose", True),
+    ({"api": "timeout"}, [], "lateApi", False),
+    ({"deferBody": "create"}, [], "releaseBody", False),
+    ({"deferBody": "status"}, [], "releaseBody", False),
+    ({"deferBody": "save"}, [{"kind": "command", "command": "save"}], "releaseBody", True),
+    ({"deferBody": "close"}, [{"kind": "command", "command": "close"}], "releaseBody", True),
+])
+def test_retirement_fences_every_deferred_boundary(tmp_path, options, before, release, had_editor):
+    result = _run(tmp_path, open=True, **options, actions=before + [
+        {"kind": "pagehide"}, {"kind": release}, {"kind": "tick", "ms": 300000},
+        {"kind": "dispose"},
+    ])
+    retired = result["actionResources"][len(before)]
+    assert result["attempts"] == int(had_editor)
+    assert result["destroyed"] == int(had_editor)
+    assert len(result["calls"]) == retired["calls"]
+    assert len(result["messages"]) == retired["messages"]
+    assert result["timers"] == result["listeners"] == result["apiElements"] == result["activeStatuses"] == 0
+    assert result["signals"] and all(result["signals"])
+
+
+def test_constructor_time_disposal_destroys_the_returned_editor_once(tmp_path):
+    result = _run(tmp_path, open=True, syncDispose=True, actions=[
+        {"kind": "modify"}, {"kind": "error"}, {"kind": "dispose"}, {"kind": "tick", "ms": 300000},
+    ])
+    assert result["attempts"] == result["destroyed"] == 1
+    assert result["timers"] == result["listeners"] == result["apiElements"] == 0
+    assert result["actionResources"][0]["messages"] == result["actionResources"][-1]["messages"]
+    assert result["actionResources"][0]["calls"] == result["actionResources"][-1]["calls"]
+    assert all(not row["url"].endswith("/close") for row in result["calls"])
+
+
+def test_twenty_retired_hosts_release_editing_and_saving_resources(tmp_path):
+    actions, retirements = [], []
+    for index in range(20):
+        if index % 2:
+            actions += [{"kind": "modify"}, {"kind": "command", "command": "save"}]
+        retirements.append(len(actions))
+        actions.append({"kind": "dispose"})
+        actions.append({"kind": "tick", "ms": 1000})
+        if index != 19:
+            actions.append({"kind": "remount"})
+    result = _run(tmp_path, open=True, actions=actions)
+    assert result["attempts"] == result["destroyed"] == 20
+    for index in retirements:
+        retired = result["actionResources"][index]
+        assert retired["listeners"] == retired["apiElements"] == 0
+        assert retired["timerDelays"] == []
+        assert result["actionResources"][index + 1]["calls"] == retired["calls"]
+        assert result["actionResources"][index + 1]["messages"] == retired["messages"]
+    assert all(not row["url"].endswith("/close") for row in result["calls"])
+    assert all(result["signals"])
+
+
+def test_terminal_status_before_close_reply_still_releases_accepted_editor(tmp_path):
+    result = _run(tmp_path, open=True, deferClose=True, actions=[
+        {"kind": "command", "command": "close"},
+        {"kind": "status", "status": {"state": "closed"}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "releaseClose"},
+    ])
+    assert result["actionResources"][2]["destroyed"] == 0
+    assert result["destroyed"] == 1
+    assert result["actionStates"][-1]["state"] == "closed"
+    assert result["actionResources"][-1]["calls"] == result["actionResources"][2]["calls"]
+    assert result["actionResources"][-1]["messages"] == result["actionResources"][2]["messages"]
+
+
+@pytest.mark.parametrize("first_intent", ["publish", "persist"])
+def test_unchanged_publishing_save_finishes_clean_without_inventing_edits(tmp_path, first_intent):
+    first = {"kind": "command", "command": "save"} if first_intent == "publish" else {"kind": "tick", "ms": 300000}
+    result = _run(tmp_path, prefix="/ocu", open=True, modify=[True], actions=[
+        first, {"kind": "status", "status": {
+            "state": "editing", "last_committed_seq": 3, "last_published_seq": 3 if first_intent == "publish" else 2,
+        }}, {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4, "last_published_seq": 4}},
+        {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "close"},
+    ])
+    saves = [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")]
+    assert saves == [first_intent, "publish"]
+    assert result["actionStates"][5]["dirty"] is False
+    if first_intent == "publish":
+        assert all(state["dirty"] is False for state in result["actionStates"][3:])
+    assert all(row["url"].startswith(f"/ocu/api/office/{CHAT}/") for row in result["calls"])
+    assert all(row["url"].count("/ocu/") == 1 for row in result["calls"])
+    assert all(row["headers"]["x-requested-with"] == "ocu-workspace" for row in result["calls"])
+
+
+@pytest.mark.parametrize("transport", [False, True])
+def test_rejected_publishing_save_stays_dirty_and_retryable(tmp_path, transport):
+    result = _run(tmp_path, open=True, modify=[True], rejectSave=not transport, saveTransportError=transport, actions=[
+        {"kind": "command", "command": "save"}, {"kind": "tick", "ms": 3000},
+        {"kind": "allowSave"}, {"kind": "command", "command": "save"},
+    ])
+    failed = result["actionStates"][1]
+    assert failed["state"] == "editing" and failed["dirty"] is True and failed["reason"]
+    if not transport:
+        assert failed["reason"] == "documentserver_unavailable"
+    assert result["actionResources"][1]["timerDelays"].count(300000) == 1
+    assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
+    assert _states(result)[-1]["reason"] is None
+    assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 2
+
+
+@pytest.mark.parametrize("reason", ["save_timeout", "storage_low"])
+def test_callback_failure_keeps_save_and_autosave_usable(tmp_path, reason):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "reason": reason}},
+        {"kind": "tick", "ms": 3000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "reason": reason}},
+        {"kind": "tick", "ms": 301000},
+    ])
+    assert result["actionStates"][2]["state"] == "editing"
+    assert result["actionStates"][2]["dirty"] is True and result["actionStates"][2]["reason"] == reason
+    assert result["actionResources"][2]["timerDelays"].count(300000) == 1
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["publish", "publish", "persist"]
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("state", ["closed", "error", "orphaned"])
+def test_observed_final_state_stops_live_host_work(tmp_path, state):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "status", "status": {"state": state, "reason": "final_failure" if state == "error" else None}},
+        {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"}, {"kind": "modify"}, {"kind": "tick", "ms": 300000},
+    ])
+    assert _states(result)[-1]["state"] == state
+    assert _states(result)[-1]["dirty"] is (state != "closed")
+    assert result["timerDelays"] == []
+    assert result["actionResources"][-1]["calls"] == result["actionResources"][1]["calls"]
+    assert result["actionResources"][-1]["messages"] == result["actionResources"][1]["messages"]
+
+
+def test_old_status_cannot_reverse_a_later_save_mutation(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], status={"state": "saving"}, holdStatusAfter=1, actions=[
+        {"kind": "status", "status": {"state": "editing"}}, {"kind": "tick", "ms": 1000},
+        {"kind": "command", "command": "save"}, {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+    ])
+    assert result["maxActiveStatuses"] == 1
+    assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
+    assert all(state["state"] != "editing" for state in _states(result))
+
+
+@pytest.mark.parametrize("variant", ["sibling", "nested", "origin", "chat", "generation", "extra", "missing", "unknown"])
+def test_bound_host_rejects_unauthorized_and_malformed_commands(tmp_path, variant):
+    data = {"type": "ocu:office-command", "chat_id": CHAT, "generation": 7, "command": "save"}
+    action = {"kind": "message", "data": data}
+    if variant in {"sibling", "nested"}:
+        action["source"] = variant
+    elif variant == "origin":
+        action["origin"] = "https://foreign.test"
+    elif variant == "chat":
+        data["chat_id"] = "another-chat"
+    elif variant == "generation":
+        data["generation"] = 6
+    elif variant == "extra":
+        data.update(command="close", extra=True)
+    elif variant == "missing":
+        del data["generation"]
+    else:
+        data["command"] = "unknown"
+    result = _run(tmp_path, open=True, actions=[action])
+    assert [row["method"] for row in result["calls"]] == ["POST", "GET"]
+    assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+
+
+def test_close_supersedes_an_already_queued_publishing_retry(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"},
+        {"kind": "status", "status": {"state": "closed"}}, {"kind": "tick", "ms": 300000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert len([row for row in result["calls"] if row["url"].endswith("/close")]) == 1
+    assert _states(result)[-1]["state"] == "closed" and result["destroyed"] == 1
+    assert result["timers"] == 0
+
+
+def test_queued_publish_waits_for_owned_autosave_acceptance_before_retry(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], deferSave=True, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000}, {"kind": "releaseSave"}, {"kind": "releaseSave"},
+        {"kind": "status", "status": {
+            "state": "editing", "save_seq": 4, "last_committed_seq": 4, "last_published_seq": 4,
+        }}, {"kind": "tick", "ms": 1000},
+    ])
+    assert result["actionResources"][3]["saves"] == 2
+    assert result["actionResources"][4]["saves"] == 3
+    assert all(state["reason"] is None for state in result["actionStates"])
+    assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+
+
+def test_accepted_autosave_owns_retry_before_its_status_is_observed(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, actions=[
+        {"kind": "tick", "ms": 300000},
+        {"kind": "command", "command": "save"},
+        {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "status", "status": {
+            "state": "editing", "save_seq": 4, "last_committed_seq": 4, "last_published_seq": 4,
+        }},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert result["actionStates"][0]["state"] == "editing"
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
+        "persist", "publish", "publish",
+    ]
+    assert all(state["reason"] is None for state in result["actionStates"])
+    assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+
+
+def test_failed_owned_autosave_keeps_queued_publication_without_covering_edits(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], deferPersistFailure=True, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"last_committed_seq": 3, "last_published_seq": 3}},
+        {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
+        {"kind": "status", "status": {
+            "state": "editing", "save_seq": 4, "last_committed_seq": 4, "last_published_seq": 4,
+        }},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
+        "persist", "publish", "publish",
+    ]
+    assert all(state["dirty"] for state in result["actionStates"][:5])
+    assert all(state["reason"] is None for state in result["actionStates"])
+    assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+
+
+@pytest.mark.parametrize("command", ["save", "close"])
+@pytest.mark.parametrize(("state", "reason"), [
+    ("conflict", "path_missing"), ("error", "state_corrupt"), ("orphaned", "editor_state_lost"),
+])
+def test_broker_failure_reason_overrides_prior_command_failure(tmp_path, command, state, reason):
+    result = _run(tmp_path, open=True, modify=[True], rejectSave=True, rejectClose=True, actions=[
+        {"kind": "command", "command": command}, {"kind": "tick", "ms": 1000},
+        {"kind": "status", "status": {"state": state, "reason": reason}},
+        {"kind": "tick", "ms": 1000},
+    ])
+    failed_command_reason = "documentserver_unavailable" if command == "save" else "storage_low"
+    assert result["actionStates"][1]["state"] == "editing"
+    assert result["actionStates"][1]["reason"] == failed_command_reason
+    assert _states(result)[-1]["state"] == state
+    assert _states(result)[-1]["reason"] == reason
+    assert _states(result)[-1]["dirty"] is True
+
+
+def test_pending_but_refused_autosave_cannot_own_another_tabs_retry(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], deferPersistRefusal=True, actions=[
+        {"kind": "tick", "ms": 299999},
+        {"kind": "status", "status": {"state": "saving", "save_seq": 3}},
+        {"kind": "tick", "ms": 1}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing"}},
+        {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert _states(result)[-1]["reason"] == "session_not_editing"
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("ending", ["close", "dispose"])
+def test_failed_autosave_cannot_revive_a_superseded_publication(tmp_path, ending):
+    result = _run(tmp_path, open=True, modify=[True], deferPersistFailure=True, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"} if ending == "close" else {"kind": "dispose"},
+        {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert result["destroyed"] == 1
+    if ending == "dispose":
+        assert result["actionResources"][2]["messages"] == result["actionResources"][-1]["messages"]
+        assert result["timers"] == result["listeners"] == 0
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_old_autosave_does_not_own_a_later_foreign_allocation(tmp_path, timed_out):
+    transition = [
+        {"kind": "status", "status": {"state": "editing", "reason": "save_timeout"}},
+        {"kind": "tick", "ms": 1000},
+    ] if timed_out else []
+    result = _run(tmp_path, open=True, modify=[True], actions=[
+        {"kind": "tick", "ms": 300000}, *transition,
+        {"kind": "status", "status": {"state": "saving", "save_seq": 4, "reason": None}},
+        {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing"}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert _states(result)[-1]["reason"] == "session_not_editing"
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("cause", ["owned", "foreign"])
+def test_correlated_refusal_distinguishes_a_foreign_successor(tmp_path, cause):
+    publish = {"kind": "command", "command": "save"}
+    successor = {"kind": "status", "status": {"state": "saving", "save_seq": 4}}
+    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, actions=[
+        {"kind": "tick", "ms": 300000},
+        *([publish, successor] if cause == "owned" else [successor, publish]),
+        {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    expected = ["persist", "publish", "publish"] if cause == "owned" else ["persist", "publish"]
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
+    assert _states(result)[-1]["reason"] == (None if cause == "owned" else "session_not_editing")
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("boundary", ["response", "body", "failure", "failure-body"])
+@pytest.mark.parametrize("timed_out", [False, True])
+@pytest.mark.parametrize("cause", ["owned", "foreign"])
+def test_delayed_auto_reply_cannot_change_refusal_ownership(tmp_path, boundary, timed_out, cause):
+    options = {"deferSave": True} if boundary == "response" else {"deferBody": "save"}
+    if boundary.startswith("failure"):
+        options = {"deferPersistFailure": True}
+        if boundary == "failure-body":
+            options["deferBody"] = "save"
+    publish = {"kind": "command", "command": "save"}
+    ending = {"state": "editing", "reason": "save_timeout" if timed_out else None}
+    if not timed_out:
+        ending["last_committed_seq"] = 3
+    release = [{"kind": "releaseBody"}] if boundary == "body" else [{"kind": "releaseSave"}]
+    if boundary == "failure-body":
+        release.append({"kind": "releaseBody"})
+    result = _run(tmp_path, open=True, modify=[True], **options, actions=[
+        {"kind": "tick", "ms": 300000},
+        *([publish] if cause == "owned" else []),
+        {"kind": "status", "status": ending}, {"kind": "tick", "ms": 1000},
+        {"kind": "status", "status": {"state": "saving", "save_seq": 4, "reason": None}},
+        *([publish] if cause == "foreign" else []), *release,
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    expected = ["persist", "publish", "publish"] if cause == "owned" else ["persist", "publish"]
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
+    assert _states(result)[-1]["reason"] == (None if cause == "owned" else "session_not_editing")
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("value", ["missing", None, True, 0, -1, 3.5, "3", 9007199254740992])
+@pytest.mark.parametrize("response_kind", ["refusal", "failure"])
+def test_unusable_correlation_never_authorizes_a_publishing_retry(tmp_path, value, response_kind):
+    key = "blocking_save_seq" if response_kind == "refusal" else "save_seq"
+    options = {response_kind + "Correlation": {} if value == "missing" else {key: value}}
+    if response_kind == "failure":
+        options["deferPersistFailure"] = True
+    result = _run(tmp_path, open=True, modify=[True], **options, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        *([{"kind": "releaseSave"}] if response_kind == "failure" else []),
+        {"kind": "status", "status": {"state": "editing"}}, {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
+    assert _states(result)[-1]["reason"] == "session_not_editing"
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("superseding_command", [None, "save", "close"])
+def test_only_explicit_commands_supersede_pending_publication(tmp_path, superseding_command):
+    supersession = []
+    if superseding_command:
+        supersession.append({"kind": "command", "command": superseding_command})
+    if superseding_command == "save":
+        supersession.extend([
+            {"kind": "status", "status": {
+                "state": "editing", "save_seq": 5, "last_committed_seq": 5, "last_published_seq": 5,
+            }},
+            {"kind": "tick", "ms": 1000},
+        ])
+    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, deferRefusalBody=True, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000}, {"kind": "modify"},
+        {"kind": "tick", "ms": 300000},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
+        {"kind": "tick", "ms": 1000}, *supersession,
+        {"kind": "releaseRefusalBody"}, {"kind": "tick", "ms": 5000},
+    ])
+    expected = ["persist", "publish", "persist"] + ([] if superseding_command == "close" else ["publish"])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
+    assert all(state["reason"] is None for state in result["actionStates"])
+    if superseding_command == "close":
+        assert _states(result)[-1]["state"] == "closing" and result["destroyed"] == 1
+    elif superseding_command == "save":
+        assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+    else:
+        assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("blocking_sequence", [3, 5])
+def test_new_explicit_save_supersedes_an_installed_retry(tmp_path, blocking_sequence):
+    result = _run(tmp_path, open=True, modify=[True], deferPersist=True, holdStatusAfter=300,
+                  refusalCorrelation={"blocking_save_seq": blocking_sequence}, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+        {"kind": "command", "command": "save"}, {"kind": "releaseSave"},
+        {"kind": "status", "status": {
+            "state": "editing", "last_committed_seq": 4, "last_published_seq": 4,
+        }},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert result["actionStates"][0]["state"] == result["actionStates"][4]["state"] == "editing"
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
+        "persist", "publish", "publish",
+    ]
+    assert _states(result)[-1]["state"] == "editing"
+    assert _states(result)[-1]["dirty"] is False and _states(result)[-1]["reason"] is None
+
+
+@pytest.mark.parametrize("boundary", ["accepted", "response", "body", "failure", "failure-body"])
+@pytest.mark.parametrize("cause", ["owned", "foreign"])
+def test_auto_save_admitted_during_publish_flight_owns_its_refusal(tmp_path, boundary, cause):
+    options = {}
+    release = []
+    if boundary == "response":
+        options["deferPersist"] = True
+        release.append({"kind": "releaseSave"})
+    elif boundary == "body":
+        options["deferBody"] = "save"
+        release.append({"kind": "releaseBody"})
+    elif boundary.startswith("failure"):
+        options["deferPersistFailure"] = True
+        release.append({"kind": "releaseSave"})
+        if boundary == "failure-body":
+            options["deferBody"] = "save"
+            release.append({"kind": "releaseBody"})
+    foreign = [{"kind": "status", "status": {"state": "saving", "save_seq": 4}}] if cause == "foreign" else []
+    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, **options, actions=[
+        {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
+        {"kind": "tick", "ms": 1}, *foreign, {"kind": "releasePublishAdmission"}, *release,
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4 if foreign else 3}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert result["actionStates"][0]["state"] == "editing"
+    expected = ["publish", "persist"] + (["publish"] if cause == "owned" else [])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
+    assert _states(result)[-1]["reason"] == (None if cause == "owned" else "session_not_editing")
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("ending", ["close", "dispose"])
+def test_retirement_supersedes_publication_owned_by_a_newer_auto_save(tmp_path, ending):
+    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, deferPersist=True, actions=[
+        {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
+        {"kind": "tick", "ms": 1}, {"kind": "releasePublishAdmission"},
+        {"kind": "command", "command": "close"} if ending == "close" else {"kind": "dispose"},
+        {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["publish", "persist"]
+    assert result["destroyed"] == 1
+    if ending == "dispose":
+        assert result["actionResources"][4]["messages"] == result["actionResources"][-1]["messages"]
+        assert result["timers"] == result["listeners"] == 0
+
+
+def test_newer_auto_candidate_survives_replacement_before_refusal_delivery(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, deferRefusalBody=True, actions=[
+        {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
+        {"kind": "tick", "ms": 1}, {"kind": "releasePublishAdmission"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000}, {"kind": "modify"},
+        {"kind": "tick", "ms": 300000},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
+        {"kind": "tick", "ms": 1000}, {"kind": "releaseRefusalBody"},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
+        "publish", "persist", "persist", "publish",
+    ]
+    assert all(state["reason"] is None for state in result["actionStates"])
+    assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
