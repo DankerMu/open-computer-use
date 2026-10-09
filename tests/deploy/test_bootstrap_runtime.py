@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -215,6 +216,32 @@ class BootstrapRuntimeTests(unittest.TestCase):
             self.assertNotIn(runtime[name], report)
         self.assertNotIn(PROVIDER_SENTINEL, report)
 
+    def openssl_env(self, failure="none"):
+        commands = self.root / "commands"
+        commands.mkdir(exist_ok=True)
+        command = commands / "openssl"
+        command.write_text("""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+counter = Path(os.environ["FAKE_DOCKER_STATE"]) / "openssl-count"
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+if count == 6:
+    failure = os.environ["OCU_TEST_JWT_FAILURE"]
+    if failure == "empty":
+        raise SystemExit(0)
+    if failure == "failed":
+        print("jwt-generator-secret-canary", file=sys.stderr)
+        raise SystemExit(1)
+raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[1:]]).returncode)
+""", encoding="utf-8")
+        command.chmod(0o755)
+        return {"PATH": str(commands) + os.pathsep + self.env["PATH"],
+                "OCU_TEST_REAL_OPENSSL": shutil.which("openssl"),
+                "OCU_TEST_JWT_FAILURE": failure}
+
     def consumer_up_env(self, runtime):
         env = {
             "PATH": str(FAKE_DOCKER.parent) + os.pathsep + os.environ.get("PATH", ""),
@@ -332,6 +359,34 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertEqual(font.read_bytes(), b"OTTO organisation-owned fixture")
         self.assertEqual({path: (path.stat().st_mode, path.stat().st_mtime_ns, path.stat().st_ino)
                           for path in (fonts, font)}, before)
+
+    def test_failed_or_empty_jwt_generation_publishes_nothing(self):
+        for failure in ("empty", "failed"):
+            with self.subTest(failure=failure):
+                for path in (self.runtime_path(), self.credentials, self.state / "openssl-count"):
+                    if path.exists():
+                        path.unlink()
+                result = self.run_bootstrap(self.openssl_env(failure))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("OCU_OFFICE_JWT_SECRET", result.stderr)
+                self.assertEqual((self.state / "openssl-count").read_text(), "6")
+                self.assertNotIn("jwt-generator-secret-canary", self.combined(result))
+                self.assert_unpublished()
+
+    def test_missing_documentserver_reference_publishes_nothing(self):
+        original = json.loads(self.inventory.read_text())
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                payload = json.loads(json.dumps(original))
+                if missing:
+                    payload["images"]["documentserver"].pop("reference")
+                else:
+                    payload["images"]["documentserver"]["reference"] = ""
+                self.inventory.write_text(json.dumps(payload))
+                result = self.run_bootstrap()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("documentserver", result.stderr.lower())
+                self.assert_unpublished()
 
     def test_success_emits_consumer_visible_topology_and_shared_token(self):
         result = self.run_bootstrap(
@@ -532,6 +587,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 
     def test_existing_outputs_are_preserved(self):
+        generator = self.openssl_env()
         cases = (
             ("runtime", True, False),
             ("credentials", False, True),
@@ -548,7 +604,8 @@ class BootstrapRuntimeTests(unittest.TestCase):
                     self.runtime_path().write_text("EXISTING_RUNTIME=keep-me\n", encoding="utf-8")
                 if write_credentials:
                     self.credentials.write_text("EXISTING_ADMIN=keep-me\n", encoding="utf-8")
-                result = self.run_bootstrap()
+                result = self.run_bootstrap(generator)
+                self.assertFalse((self.state / "openssl-count").exists())
                 self.assertNotEqual(result.returncode, 0)
                 if write_runtime:
                     self.assertEqual(self.runtime_path().read_text(encoding="utf-8"), "EXISTING_RUNTIME=keep-me\n")

@@ -334,7 +334,11 @@ mcp_api_key=$(openssl rand -hex 32)
 postgres_password=$(openssl rand -hex 32)
 admin_password=$(openssl rand -hex 32)
 internal_token=$(openssl rand -hex 32)
-office_jwt_secret=$(openssl rand -hex 32)
+# Generator diagnostics must not expose credential bytes.
+office_jwt_secret=$(openssl rand -hex 32 2>/dev/null) || fail 'OCU_OFFICE_JWT_SECRET generation failed'
+if [ -z "$office_jwt_secret" ]; then
+    fail 'OCU_OFFICE_JWT_SECRET generation returned an empty value'
+fi
 
 runtime_tmp=$(mktemp "$runtime_dir/.runtime.env.XXXXXX")
 credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX")
