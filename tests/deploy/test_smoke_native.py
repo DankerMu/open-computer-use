@@ -364,7 +364,7 @@ class NativeSmokeTests(unittest.TestCase):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
         sock.close()
-        probe_tcp_refused("127.0.0.1", port)
+        probe_tcp_refused("127.0.0.1", port, "former OCU publication")
         listener = socket.socket()
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("127.0.0.1", 0))
@@ -372,7 +372,7 @@ class NativeSmokeTests(unittest.TestCase):
         live = listener.getsockname()[1]
         try:
             with self.assertRaises(SmokeError) as raised:
-                probe_tcp_refused("127.0.0.1", live, timeout=0.5)
+                probe_tcp_refused("127.0.0.1", live, "former OCU publication", timeout=0.5)
             self.assertIn("accepted", str(raised.exception))
         finally:
             listener.close()

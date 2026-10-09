@@ -11,6 +11,7 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -246,6 +247,10 @@ class OverlaySmokeCliTests(unittest.TestCase):
         self.former_reservation = socket.socket()
         self.former_reservation.bind(("127.0.0.1", 0))
         self.env["OCU_SMOKE_FORMER_URL"] = f"127.0.0.1:{self.former_reservation.getsockname()[1]}"
+        self.documentserver_reservation = socket.socket()
+        self.documentserver_reservation.bind(("127.0.0.1", 0))
+        self.env["OCU_SMOKE_DOCUMENTSERVER_URL"] = (
+            f"127.0.0.1:{self.documentserver_reservation.getsockname()[1]}")
         self.env["OCU_SMOKE_HOST_LAN_IPV4"] = "127.0.0.1"
         self.http = None
         self.thread = None
@@ -266,6 +271,8 @@ class OverlaySmokeCliTests(unittest.TestCase):
             thread.join(timeout=2)
         if self.former_reservation is not None:
             self.former_reservation.close()
+        if self.documentserver_reservation is not None:
+            self.documentserver_reservation.close()
         self.context.cleanup()
 
     def start_control_listeners(self):
@@ -302,6 +309,8 @@ class OverlaySmokeCliTests(unittest.TestCase):
         port = server.server_address[1]
         self.former_reservation.close()
         self.former_reservation = None
+        self.documentserver_reservation.close()
+        self.documentserver_reservation = None
         origin = f"http://127.0.0.1:{port}"
         self.env["OCU_WEBUI_ORIGIN"] = origin
         return port, origin
@@ -313,6 +322,7 @@ class OverlaySmokeCliTests(unittest.TestCase):
             "core",
             [
                 ps_row("computer-use-server", "cid-ocu"),
+                ps_row("documentserver", "cid-documentserver", publishers=extra_publishers.get("documentserver")),
                 ps_row("retention-guard", "cid-ret"),
                 ps_row("workspace", "cid-ws", state="exited"),
             ],
@@ -346,6 +356,7 @@ class OverlaySmokeCliTests(unittest.TestCase):
             self.state,
             [
                 control_container("cid-ocu", "ocu-test-computer-use-server", "computer-use-server", "127.0.0.1"),
+                control_container("cid-documentserver", "ocu-test-documentserver", "documentserver", "127.0.0.1"),
                 control_container("cid-webui", "ocu-test-open-webui", "open-webui", "127.0.0.1"),
                 control_container("cid-proxy", "ocu-test-proxy", "proxy", "127.0.0.1"),
                 control_container("cid-pg", "ocu-test-postgres", "postgres", "127.0.0.1"),
@@ -593,17 +604,94 @@ class OverlaySmokeCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cleanup", result.stderr)
 
-    def test_former_port_listener_is_not_absence(self):
+    def test_documentserver_membership_and_publication_in_both_flag_states(self):
+        self.start_http()
+        self.seed_probes()
+        for flag in ("false", "true"):
+            for defect, code, reason in (
+                ("healthy", 0, ""), ("missing", 2, "required service is missing"),
+                ("stopped", 1, "required service is not running"),
+                ("published", 1, "host publication is forbidden"),
+            ):
+                with self.subTest(flag=flag, defect=defect):
+                    self.seed_inventory()
+                    path = self.state / "ps/core.jsonl"
+                    rows = [json.loads(line) for line in path.read_text().splitlines()]
+                    if defect == "missing":
+                        rows = [row for row in rows if row["Service"] != "documentserver"]
+                    else:
+                        row = next(row for row in rows if row["Service"] == "documentserver")
+                        if defect == "stopped":
+                            row["State"] = "exited"
+                        elif defect == "published":
+                            row["Publishers"] = [publisher("18083", 80, url="127.0.0.1")]
+                    write_ps(self.state, "core", rows)
+                    result = self.run_smoke({"ENABLE_OCU_OFFICE_EDIT": flag})
+                    self.assertEqual(result.returncode, code, result.stderr)
+                    if reason:
+                        self.assertIn("documentserver: " + reason, result.stderr)
+
+    def test_direct_entries_cannot_certify_each_other_as_absent(self):
         port, _origin = self.start_http()
         self.seed_inventory()
         self.seed_probes()
-        sock = socket.create_connection(("127.0.0.1", port), timeout=1)
-        try:
-            result = self.run_smoke({"OCU_SMOKE_FORMER_URL": f"127.0.0.1:{port}"})
-        finally:
-            sock.close()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("former OCU publication accepted", result.stderr)
+        for name, label in (
+            ("OCU_SMOKE_FORMER_URL", "former OCU publication"),
+            ("OCU_SMOKE_DOCUMENTSERVER_URL", "direct DocumentServer publication (documentserver)"),
+        ):
+            with self.subTest(name=name):
+                result = self.run_smoke({name: f"127.0.0.1:{port}"})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(label + " accepted a connection", result.stderr)
+
+    def test_documentserver_target_is_an_explicit_valid_prerequisite(self):
+        name = "OCU_SMOKE_DOCUMENTSERVER_URL"
+        for value in (None, "", "docs.test:80", "127.0.0.1:0", "127.0.0.1:-1",
+                      "127.0.0.1:65536", "127.0.0.1:no", "http://127.0.0.1:no",
+                      "http://127.0.0.1:65536", "http://127.0.0.1:0",
+                      "https://127.0.0.1:80", "[::1]:80"):
+            with self.subTest(value=value):
+                self.env.pop(name, None)
+                if value is not None:
+                    self.env[name] = value
+                result = self.run_smoke()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(name, result.stderr)
+                self.assertEqual(ops(self.state), [])
+
+    def test_direct_refusal_timeout_and_unrelated_error_fail_in_cli(self):
+        self.start_http()
+        self.seed_inventory()
+        self.seed_probes()
+        program = """
+import errno, os, socket, sys
+import smoke_deployment
+original = socket.socket.connect
+port = int(os.environ[sys.argv[1]].rpartition(':')[2])
+def connect(sock, address):
+    if address == ('127.0.0.1', port):
+        if sys.argv[2] == 'timeout':
+            raise TimeoutError()
+        raise OSError(errno.ENETUNREACH, 'injected network failure')
+    return original(sock, address)
+socket.socket.connect = connect
+raise SystemExit(smoke_deployment.main(['smoke']))
+"""
+        for name, label in (
+            ("OCU_SMOKE_FORMER_URL", "former OCU publication"),
+            ("OCU_SMOKE_DOCUMENTSERVER_URL", "direct DocumentServer publication (documentserver)"),
+        ):
+            for fault, reason in (("timeout", "timed out rather than refusing"),
+                                  ("unreachable", "failed without ECONNREFUSED")):
+                with self.subTest(name=name, fault=fault):
+                    result = subprocess.run(
+                        [sys.executable, "-c", program, name, fault],
+                        cwd=ROOT / "deploy", env=self.env, capture_output=True,
+                        text=True, timeout=20,
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(label + " " + reason, result.stderr)
+                    self.assert_no_secrets(result)
 
     def test_dns_probe_is_not_isolation(self):
         self.start_http()

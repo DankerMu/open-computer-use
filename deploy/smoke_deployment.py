@@ -35,10 +35,11 @@ PREFIX = "overlay-smoke"
 PROXY = "proxy"
 WEBUI = "open-webui"
 OCU = "computer-use-server"
+DOCUMENTSERVER = "documentserver"
 POSTGRES = "postgres"
 RETENTION = "retention-guard"
 CLEANUP = "cleanup"
-REQUIRED_RUNNING = (OCU, WEBUI, PROXY, POSTGRES, RETENTION)
+REQUIRED_RUNNING = (OCU, WEBUI, PROXY, POSTGRES, RETENTION, DOCUMENTSERVER)
 PROXY_TARGET = "8082"
 OFFICE_PROXY_TARGET = "8083"
 OCU_TARGET = 8081
@@ -389,24 +390,24 @@ def parse_literal_url(name: str, raw: str) -> tuple[str, int, str]:
     return str(address), parts.port, path
 
 
-def former_target(raw: str) -> tuple[str, int]:
-    if "://" in raw:
-        host, port, _path = parse_literal_url("OCU_SMOKE_FORMER_URL", raw)
-        return host, port
-    if ":" in raw:
-        host, _, port_text = raw.rpartition(":")
-        try:
+def refusal_target(name: str, raw: str) -> tuple[str, int]:
+    try:
+        if "://" in raw:
+            host, port, _path = parse_literal_url(name, raw)
+        else:
+            host, _, port_text = raw.rpartition(":")
             address = ipaddress.ip_address(host)
-            port = int(port_text)
-        except ValueError:
-            fail("OCU_SMOKE_FORMER_URL is not an IPv4 host:port", 2)
-        if address.version != 4:
-            fail("OCU_SMOKE_FORMER_URL is not an IPv4 host:port", 2)
-        return str(address), port
-    fail("OCU_SMOKE_FORMER_URL is not an IPv4 host:port", 2)
+            if address.version != 4:
+                raise ValueError
+            host, port = str(address), int(port_text)
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        fail(f"{name} is not an IPv4 host:port", 2)
+    return host, port
 
 
-def probe_tcp_refused(host: str, port: int, *, timeout: float = CONNECT_TIMEOUT) -> None:
+def probe_tcp_refused(host: str, port: int, assertion: str, *, timeout: float = CONNECT_TIMEOUT) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
@@ -414,17 +415,17 @@ def probe_tcp_refused(host: str, port: int, *, timeout: float = CONNECT_TIMEOUT)
     except ConnectionRefusedError:
         return
     except TimeoutError:
-        fail("former OCU publication timed out rather than refusing")
+        fail(f"{assertion} timed out rather than refusing")
     except OSError as exc:
         if getattr(exc, "errno", None) == errno.ECONNREFUSED:
             return
-        fail(f"former OCU publication failed without ECONNREFUSED ({exc.errno or type(exc).__name__})")
+        fail(f"{assertion} failed without ECONNREFUSED ({exc.errno or type(exc).__name__})")
     else:
         try:
             sock.close()
         except OSError:
             pass
-        fail("former OCU publication accepted a connection")
+        fail(f"{assertion} accepted a connection")
     finally:
         try:
             sock.close()
@@ -626,6 +627,7 @@ def load_inputs() -> dict:
     former_raw = os.environ.get("OCU_SMOKE_FORMER_URL", "").strip()
     if not former_raw:
         fail("OCU_SMOKE_FORMER_URL is required", 2)
+    documentserver_raw = require_nonempty("OCU_SMOKE_DOCUMENTSERVER_URL")
     egress_raw = os.environ.get("OCU_SMOKE_EGRESS_URL", "").strip()
     if not egress_raw:
         fail("OCU_SMOKE_EGRESS_URL is required", 2)
@@ -639,7 +641,9 @@ def load_inputs() -> dict:
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 2
         raise SmokeError(str(exc), 2 if code == 1 else code) from exc
-    former_host, former_port = former_target(former_raw)
+    former_host, former_port = refusal_target("OCU_SMOKE_FORMER_URL", former_raw)
+    documentserver_host, documentserver_port = refusal_target(
+        "OCU_SMOKE_DOCUMENTSERVER_URL", documentserver_raw)
     egress_host, egress_port, egress_path = parse_literal_url("OCU_SMOKE_EGRESS_URL", egress_raw)
     egress_ip = ipaddress.ip_address(egress_host)
     if egress_ip in METADATA or egress_ip in control:
@@ -663,6 +667,8 @@ def load_inputs() -> dict:
         "token": token,
         "former_host": former_host,
         "former_port": former_port,
+        "documentserver_host": documentserver_host,
+        "documentserver_port": documentserver_port,
         "egress_url": f"http://{egress_host}:{egress_port}{egress_path}",
         "lan": str(lan),
     }
@@ -1052,7 +1058,9 @@ def run(argv: list[str]) -> int:
     judge_publications(inventory, inputs["published"], inputs["office_published"])
     sandbox = resolve_sandbox(inputs["chat_id"], inputs["sandbox_id"], inputs["sandbox_name"])
     endpoints = resolve_control_endpoints(inventory, inputs["private_name"])
-    probe_tcp_refused(inputs["former_host"], inputs["former_port"])
+    probe_tcp_refused(inputs["former_host"], inputs["former_port"], "former OCU publication")
+    probe_tcp_refused(inputs["documentserver_host"], inputs["documentserver_port"],
+                     "direct DocumentServer publication (documentserver)")
     control_urls = {
         OCU: f"http://{endpoints[OCU][0]}:{endpoints[OCU][1]}/",
         WEBUI: f"http://{endpoints[WEBUI][0]}:{endpoints[WEBUI][1]}/",
