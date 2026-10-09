@@ -213,6 +213,7 @@ if ! run_owned python3 - "$OCU_RELEASE_MANIFEST" "$CONFIG_DIR/core.json" "$CONFI
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -233,9 +234,20 @@ except release.ReleaseError as cop:
 except (OSError, json.JSONDecodeError) as cop:
     print(f"deploy: resolved compose documents are unreadable: {cop}", file=sys.stderr)
     raise SystemExit(1)
+
+services = docs["core.json"]["services"]
+documentserver = services.get("documentserver", {}).get("environment") or {}
+broker = services.get("computer-use-server", {}).get("environment") or {}
+if not isinstance(documentserver, dict) or documentserver.get("JWT_ENABLED") != "true":
+    raise SystemExit("deploy: documentserver JWT_ENABLED must be true")
+secret = documentserver.get("JWT_SECRET")
+if not isinstance(secret, str) or not secret.strip() or secret != os.environ["OCU_OFFICE_JWT_SECRET"]:
+    raise SystemExit("deploy: documentserver JWT_SECRET must match OCU_OFFICE_JWT_SECRET")
+if not isinstance(broker, dict) or broker.get("OCU_OFFICE_JWT_SECRET") != secret:
+    raise SystemExit("deploy: computer-use-server OCU_OFFICE_JWT_SECRET must match JWT_SECRET")
 PY
 then
-    printf '%s\n' 'deploy: resolved service image verification failed' >&2
+    printf '%s\n' 'deploy: resolved service configuration verification failed' >&2
     exit 1
 fi
 

@@ -673,7 +673,7 @@ class EgressGuardTests(unittest.TestCase):
         env["OCU_SANDBOX_EGRESS_ALLOW"] = ""
         env["OCU_SANDBOX_DNS"] = ""
         docs = intended_docs()
-        docs["core.json"]["services"][OCU_SERVICE]["environment"] = {"OCU_SANDBOX_DNS": ""}
+        docs["core.json"]["services"][OCU_SERVICE]["environment"]["OCU_SANDBOX_DNS"] = ""
         write_fake_configs(self.state, docs)
         result = self.up(env)
         self.assertEqual(result.returncode, 0, result.stderr)

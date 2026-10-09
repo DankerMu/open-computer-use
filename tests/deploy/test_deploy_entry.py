@@ -201,6 +201,43 @@ class DeployEntryTests(unittest.TestCase):
                     self.assertEqual(ops(self.state), [])
                     self.assertEqual(leftover_tmp(self.state), [])
 
+    def test_resolved_office_jwt_refuses_before_mutation(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        before_images = (self.state / "images.json").read_bytes()
+        before_networks = {path.name: path.read_bytes() for path in (self.state / "networks").iterdir()}
+        before_firewall = (self.state / "firewall.json").read_bytes()
+        cases = [("documentserver", "JWT_ENABLED", value)
+                 for value in (None, "", "false", "TRUE", "1", True)]
+        cases += [("documentserver", "JWT_SECRET", value)
+                  for value in (None, "", " ", "different-renderer-secret")]
+        cases += [(OCU_SERVICE, "OCU_OFFICE_JWT_SECRET", value)
+                  for value in (None, "", " ", "different-broker-secret")]
+        for flag in ("false", "true"):
+            for service, name, value in cases:
+                with self.subTest(flag=flag, service=service, name=name, value=value):
+                    docs = intended_docs()
+                    environment = docs["core.json"]["services"][service]["environment"]
+                    if value is None:
+                        environment.pop(name)
+                    else:
+                        environment[name] = value
+                    write_fake_configs(self.state, docs)
+                    before_ops = len(ops(self.state))
+                    result = run_script(script, {**env, "ENABLE_OCU_OFFICE_EDIT": flag})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(name, result.stderr)
+                    for secret in (env["OCU_OFFICE_JWT_SECRET"],
+                                   "different-renderer-secret", "different-broker-secret"):
+                        self.assertNotIn(secret, result.stdout + result.stderr)
+                    self.assertEqual(starts(self.state), [])
+                    self.assertEqual((self.state / "images.json").read_bytes(), before_images)
+                    self.assertEqual({path.name: path.read_bytes()
+                                      for path in (self.state / "networks").iterdir()}, before_networks)
+                    self.assertEqual((self.state / "firewall.json").read_bytes(), before_firewall)
+                    mutations = {"load", "pull", "build", "create", "up", "iptables-restore", "ip6tables-restore"}
+                    self.assertFalse(any(set(row.split()) & mutations for row in ops(self.state)[before_ops:]))
+                    self.assertEqual(leftover_tmp(self.state), [])
+
     def test_missing_sandbox_bridge_is_created_then_reinspected(self):
         result = run_script(PROVISION, self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -744,16 +781,18 @@ class DeployEntryTests(unittest.TestCase):
     def test_omitted_or_mismatched_resolved_dns_starts_no_service(self):
         self._seed_bridge()
         docs = intended_docs()
-        docs["core.json"]["services"][OCU_SERVICE].pop("environment", None)
+        docs["core.json"]["services"][OCU_SERVICE]["environment"].pop("OCU_SANDBOX_DNS")
         write_fake_configs(self.state, docs)
         result = self.up()
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OCU_SANDBOX_DNS", result.stderr)
         self.assertEqual(starts(self.state), [])
         self.assert_no_destructive()
 
         write_fake_configs(self.state, with_core_dns(intended_docs(), "1.1.1.1"))
         result = self.up()
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OCU_SANDBOX_DNS", result.stderr)
         self.assertEqual(starts(self.state), [])
         self.assert_no_destructive()
 
