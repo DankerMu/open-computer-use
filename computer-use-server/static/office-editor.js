@@ -237,6 +237,7 @@ export function createOfficeEditorHost({
     const requestedModification = modification;
     // Background persistence cannot supersede an unresolved explicit publication.
     const command = intent === 'persist' ? latestCommand : ++latestCommand;
+    if (intent === 'publish') queuedPublish = null;
     const autoOwner = intent === 'publish' ? autoSave : null;
     const attempt = intent === 'persist' ? { pending: true, sequence: null } : null;
     mutationEpoch++;

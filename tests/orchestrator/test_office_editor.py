@@ -108,7 +108,7 @@ const fetch=async(url,init={})=>{
     if(options.autoCommit)currentStatus={...currentStatus,state:'editing',last_committed_seq:currentStatus.save_seq,
       last_published_seq:options.equalPublished?currentStatus.save_seq:currentStatus.last_published_seq};
     const reply=response(202,{session_id:'session-id',save_seq:currentStatus.save_seq,intent:body.intent});
-    if(options.deferSave)return new Promise(resolve=>{resolveSave=()=>resolve(reply);});
+    if(options.deferSave||options.deferPersist&&body.intent==='persist')return new Promise(resolve=>{resolveSave=()=>resolve(reply);});
     return reply;
   }
   if(method==='POST'&&String(url).endsWith('/close')){
@@ -981,3 +981,24 @@ def test_only_explicit_commands_supersede_pending_publication(tmp_path, supersed
         assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
     else:
         assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("blocking_sequence", [3, 5])
+def test_new_explicit_save_supersedes_an_installed_retry(tmp_path, blocking_sequence):
+    result = _run(tmp_path, open=True, modify=[True], deferPersist=True, holdStatusAfter=300,
+                  refusalCorrelation={"blocking_save_seq": blocking_sequence}, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+        {"kind": "command", "command": "save"}, {"kind": "releaseSave"},
+        {"kind": "status", "status": {
+            "state": "editing", "last_committed_seq": 4, "last_published_seq": 4,
+        }},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert result["actionStates"][0]["state"] == result["actionStates"][4]["state"] == "editing"
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
+        "persist", "publish", "publish",
+    ]
+    assert _states(result)[-1]["state"] == "editing"
+    assert _states(result)[-1]["dirty"] is False and _states(result)[-1]["reason"] is None
