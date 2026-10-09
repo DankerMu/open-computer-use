@@ -7,6 +7,8 @@
 #   OCU_RELEASE_MANIFEST — imported release.json
 #   SOURCE_SHA — full 40-character commit matching the selected source checkout
 #   OCU_WEBUI_ORIGIN — absolute HTTP(S) origin, no path/credentials/query/fragment/slash
+#   OCU_OFFICE_DOCSERVER_ORIGIN — DocumentServer browser origin, distinct from WebUI
+#   ENABLE_OCU_OFFICE_EDIT — explicit true or false; does not change service settings
 #   OCU_SANDBOX_EGRESS_ALLOW — must be present; empty is deny-all
 #   OCU_SANDBOX_DNS — must be present; empty disables external sandbox DNS
 # Optional:
@@ -14,6 +16,7 @@
 #   OCU_PROXY_IMAGE POSTGRES_IMAGE DOCUMENTSERVER_IMAGE — inventory-bound references
 #   OCU_ADMIN_CREDENTIALS_FILE — isolated-test output path; default unchanged
 #   OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
+#   OCU_OFFICE_PROXY_PORT OCU_OFFICE_FONTS_DIR — port and operator-font directory
 
 
 set -euo pipefail
@@ -214,36 +217,50 @@ if offenders:
     raise SystemExit(1)
 PY
 
-require_nonempty OCU_WEBUI_ORIGIN
-safe_dotenv_value OCU_WEBUI_ORIGIN "$OCU_WEBUI_ORIGIN"
-python3 - "$OCU_WEBUI_ORIGIN" <<'PY' || fail 'OCU_WEBUI_ORIGIN must be an absolute HTTP(S) origin without path, credentials, query, fragment, or trailing slash'
+require_nonempty ENABLE_OCU_OFFICE_EDIT
+case "$ENABLE_OCU_OFFICE_EDIT" in
+    true|false) ;;
+    *) fail 'ENABLE_OCU_OFFICE_EDIT must be true or false' ;;
+esac
+for name in OCU_WEBUI_ORIGIN OCU_OFFICE_DOCSERVER_ORIGIN; do
+    require_nonempty "$name"
+    safe_dotenv_value "$name" "${!name}"
+done
+python3 - "$OCU_WEBUI_ORIGIN" "$OCU_OFFICE_DOCSERVER_ORIGIN" <<'PY'
 import sys
 from urllib.parse import urlsplit
 
-value = sys.argv[1]
-if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
-    raise SystemExit(1)
-if any(marker in value for marker in ("@", "?", "#")):
-    raise SystemExit(1)
-try:
-    parsed = urlsplit(value)
-    port = parsed.port
-except ValueError:
-    raise SystemExit(1)
-if (
-    parsed.scheme not in {"http", "https"}
-    or not parsed.hostname
-    or parsed.username
-    or parsed.password
-    or parsed.path
-    or parsed.query
-    or parsed.fragment
-    or value.endswith("/")
-    or parsed.netloc != parsed.netloc.lower()
-):
-    raise SystemExit(1)
-if port is not None and not (1 <= port <= 65535):
-    raise SystemExit(1)
+def origin(name, value):
+    error = f"{name} must be an absolute HTTP(S) origin without path, credentials, query, fragment, or trailing slash"
+    if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
+        raise SystemExit(error)
+    if any(marker in value for marker in ("@", "?", "#")):
+        raise SystemExit(error)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise SystemExit(error) from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or value.endswith("/")
+        or parsed.netloc != parsed.netloc.lower()
+    ):
+        raise SystemExit(error)
+    if port is not None and not (1 <= port <= 65535):
+        raise SystemExit(error)
+    return parsed.scheme, parsed.hostname, port or (443 if parsed.scheme == "https" else 80)
+
+webui = origin("OCU_WEBUI_ORIGIN", sys.argv[1])
+documentserver = origin("OCU_OFFICE_DOCSERVER_ORIGIN", sys.argv[2])
+if webui == documentserver:
+    raise SystemExit("OCU_OFFICE_DOCSERVER_ORIGIN must differ from OCU_WEBUI_ORIGIN")
 PY
 
 openwebui_version=${OPENWEBUI_VERSION:-0.11.3}
@@ -259,11 +276,30 @@ public_base_url="${OCU_WEBUI_ORIGIN}/ocu"
 internal_auth_url='http://open-webui:8080/api/v1/ocu/auth'
 chat_data_dir="$deploy_root/data/chat"
 skills_cache_dir="$deploy_root/data/skills-cache"
+office_proxy_port=${OCU_OFFICE_PROXY_PORT-8083}
+office_fonts_dir=${OCU_OFFICE_FONTS_DIR-"$deploy_root/data/office-fonts"}
+office_docserver_url='http://documentserver'
+office_self_url='http://computer-use-server:8081'
+if [ -z "$office_fonts_dir" ]; then
+    fail 'OCU_OFFICE_FONTS_DIR must name a directory'
+fi
+python3 - "$office_proxy_port" <<'PY'
+import sys
+value = sys.argv[1]
+try:
+    valid = value.isascii() and value.isdecimal() and 1 <= int(value) <= 65535
+except ValueError:
+    valid = False
+if not valid:
+    raise SystemExit("OCU_OFFICE_PROXY_PORT must be a decimal port in 1–65535")
+PY
 
 for pair in \
     POSTGRES_IMAGE:"$POSTGRES_IMAGE" \
     OPENWEBUI_VERSION:"$openwebui_version" \
     OCU_PROXY_PORT:"$proxy_port" \
+    OCU_OFFICE_PROXY_PORT:"$office_proxy_port" \
+    OCU_OFFICE_FONTS_DIR:"$office_fonts_dir" \
     OCU_PRIVATE_NETWORK:"$private_network" \
     OCU_PRIVATE_SUBNET:"$private_subnet" \
     OCU_PRIVATE_GATEWAY:"$private_gateway" \
@@ -286,6 +322,9 @@ fi
 
 install -d -m 0700 "$runtime_dir" "$deploy_root/backups"
 install -d -m 0755 "$deploy_root/data/chat" "$deploy_root/data/skills-cache"
+if [ ! -d "$office_fonts_dir" ]; then
+    install -d -m 0755 "$office_fonts_dir"
+fi
 if [ ! -d "$credentials_parent" ]; then
     install -d -m 0700 "$credentials_parent"
 fi
@@ -295,6 +334,11 @@ mcp_api_key=$(openssl rand -hex 32)
 postgres_password=$(openssl rand -hex 32)
 admin_password=$(openssl rand -hex 32)
 internal_token=$(openssl rand -hex 32)
+# Generator diagnostics must not expose credential bytes.
+office_jwt_secret=$(openssl rand -hex 32 2>/dev/null) || fail 'OCU_OFFICE_JWT_SECRET generation failed'
+if [ -z "$office_jwt_secret" ]; then
+    fail 'OCU_OFFICE_JWT_SECRET generation returned an empty value'
+fi
 
 runtime_tmp=$(mktemp "$runtime_dir/.runtime.env.XXXXXX")
 credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX")
@@ -335,6 +379,13 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' 'DMXAPI_BASE_URL=https://www.dmxapi.cn/v1'
     printf '%s\n' "OCU_CHAT_DATA_DIR=$chat_data_dir"
     printf '%s\n' "OCU_SKILLS_CACHE_DIR=$skills_cache_dir"
+    printf '%s\n' "OCU_OFFICE_JWT_SECRET=$office_jwt_secret"
+    printf '%s\n' "OCU_OFFICE_PROXY_PORT=$office_proxy_port"
+    printf '%s\n' "OCU_OFFICE_DOCSERVER_URL=$office_docserver_url"
+    printf '%s\n' "OCU_OFFICE_DOCSERVER_ORIGIN=$OCU_OFFICE_DOCSERVER_ORIGIN"
+    printf '%s\n' "OCU_OFFICE_SELF_URL=$office_self_url"
+    printf '%s\n' "OCU_OFFICE_FONTS_DIR=$office_fonts_dir"
+    printf '%s\n' "ENABLE_OCU_OFFICE_EDIT=$ENABLE_OCU_OFFICE_EDIT"
     printf '%s\n' 'ADMIN_EMAIL=admin@ai-test.local'
     printf '%s\n' "ADMIN_PASSWORD=$admin_password"
     printf '%s\n' "WEBUI_SECRET_KEY=$webui_secret"

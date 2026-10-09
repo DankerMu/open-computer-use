@@ -7,10 +7,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from support import (
     DEFAULT_RELEASE_IMAGES,
@@ -58,6 +60,7 @@ GENERATED_SECRETS = (
     "WEBUI_SECRET_KEY",
     "MCP_API_KEY",
     "POSTGRES_PASSWORD",
+    "OCU_OFFICE_JWT_SECRET",
 )
 REQUIRED_RUNTIME = (
     "COMPOSE_PROJECT_NAME",
@@ -142,6 +145,9 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.sha = committed_up_fixture(source, lock_dir=self.state / "image-store-lock")
         self.webui_sha = WEBUI_SYNTHETIC_SHA
         self.env = os.environ.copy()
+        # Ambient operator paths must never escape this fixture's owned root.
+        self.env.pop("OCU_OFFICE_PROXY_PORT", None)
+        self.env.pop("OCU_OFFICE_FONTS_DIR", None)
         self.env["PATH"] = str(FAKE_DOCKER.parent) + os.pathsep + self.env.get("PATH", "")
         self.env["FAKE_DOCKER_STATE"] = str(self.state)
         self.env["DOCKER_HOST"] = "unix://" + str(self.state / "docker.sock")
@@ -152,6 +158,8 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.env["OCU_ADMIN_CREDENTIALS_FILE"] = str(self.credentials)
         self.env["SOURCE_SHA"] = self.sha
         self.env["OCU_WEBUI_ORIGIN"] = ORIGIN
+        self.env["OCU_OFFICE_DOCSERVER_ORIGIN"] = "https://workbench.example.test:8083"
+        self.env["ENABLE_OCU_OFFICE_EDIT"] = "false"
         self.env["OCU_SANDBOX_EGRESS_ALLOW"] = "8.8.8.8/32"
         self.env["OCU_SANDBOX_DNS"] = ""
         self.env.update(IMAGES)
@@ -212,6 +220,32 @@ class BootstrapRuntimeTests(unittest.TestCase):
             self.assertNotIn(runtime[name], report)
         self.assertNotIn(PROVIDER_SENTINEL, report)
 
+    def openssl_env(self, failure="none"):
+        commands = self.root / "commands"
+        commands.mkdir(exist_ok=True)
+        command = commands / "openssl"
+        command.write_text("""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+counter = Path(os.environ["FAKE_DOCKER_STATE"]) / "openssl-count"
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+if count == 6:
+    failure = os.environ["OCU_TEST_JWT_FAILURE"]
+    if failure == "empty":
+        raise SystemExit(0)
+    if failure == "failed":
+        print("jwt-generator-secret-canary", file=sys.stderr)
+        raise SystemExit(1)
+raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[1:]]).returncode)
+""", encoding="utf-8")
+        command.chmod(0o755)
+        return {"PATH": str(commands) + os.pathsep + self.env["PATH"],
+                "OCU_TEST_REAL_OPENSSL": shutil.which("openssl"),
+                "OCU_TEST_JWT_FAILURE": failure}
+
     def consumer_up_env(self, runtime):
         env = {
             "PATH": str(FAKE_DOCKER.parent) + os.pathsep + os.environ.get("PATH", ""),
@@ -232,6 +266,149 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertIn("root", result.stderr)
         self.assert_unpublished()
         self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
+
+    def test_ambient_office_options_cannot_write_outside_fixture(self):
+        external = self.root / "ambient-fonts"
+        with patch.dict(os.environ, {"OCU_OFFICE_PROXY_PORT": "8444",
+                                     "OCU_OFFICE_FONTS_DIR": str(external)}):
+            isolated = BootstrapRuntimeTests()
+            isolated.setUp()
+            try:
+                result = isolated.run_bootstrap()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(external.exists())
+                runtime = parse_env_file(isolated.runtime_path())
+                self.assertEqual(runtime["OCU_OFFICE_PROXY_PORT"], "8083")
+                self.assertEqual(runtime["OCU_OFFICE_FONTS_DIR"],
+                                 str(isolated.deploy_root / "data/office-fonts"))
+            finally:
+                isolated.tearDown()
+
+    def test_office_flag_changes_only_visibility(self):
+        snapshots = []
+        for flag in ("true", "false"):
+            result = self.run_bootstrap({"ENABLE_OCU_OFFICE_EDIT": flag})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            runtime = parse_env_file(self.runtime_path())
+            office = {name: value for name, value in runtime.items()
+                      if name.startswith("OCU_OFFICE_") or name == "ENABLE_OCU_OFFICE_EDIT"}
+            self.assertEqual(set(office), {
+                "OCU_OFFICE_JWT_SECRET", "OCU_OFFICE_PROXY_PORT",
+                "OCU_OFFICE_DOCSERVER_URL", "OCU_OFFICE_DOCSERVER_ORIGIN",
+                "OCU_OFFICE_SELF_URL", "OCU_OFFICE_FONTS_DIR", "ENABLE_OCU_OFFICE_EDIT",
+            })
+            self.assertEqual(office["ENABLE_OCU_OFFICE_EDIT"], flag)
+            self.assertEqual(office["OCU_OFFICE_PROXY_PORT"], "8083")
+            self.assertEqual(office["OCU_OFFICE_DOCSERVER_URL"], "http://documentserver")
+            self.assertEqual(office["OCU_OFFICE_SELF_URL"], "http://computer-use-server:8081")
+            self.assertEqual(office["OCU_OFFICE_DOCSERVER_ORIGIN"],
+                             self.env["OCU_OFFICE_DOCSERVER_ORIGIN"])
+            fonts = self.deploy_root / "data/office-fonts"
+            self.assertEqual(office["OCU_OFFICE_FONTS_DIR"], str(fonts))
+            self.assertTrue(fonts.is_dir())
+            self.assertEqual(list(fonts.iterdir()), [])
+            self.assertNotIn("OCU_RELEASE_FONTS_DIR", runtime)
+            self.assertEqual(stat.S_IMODE(self.runtime_path().stat().st_mode), 0o600)
+            self.assert_generated_secrets_hidden(runtime, result)
+            self.assertNotIn(office["OCU_OFFICE_JWT_SECRET"], self.credentials.read_text())
+            snapshots.append(runtime)
+            self.runtime_path().replace(self.private / f"{flag}-runtime.txt")
+            self.credentials.replace(self.private / f"{flag}-admin.txt")
+        self.assertEqual(set(snapshots[0]), set(snapshots[1]))
+        for name in snapshots[0]:
+            if name in GENERATED_SECRETS:
+                self.assertNotEqual(snapshots[0][name], snapshots[1][name], name)
+            elif name != "ENABLE_OCU_OFFICE_EDIT":
+                self.assertEqual(snapshots[0][name], snapshots[1][name], name)
+
+    def test_invalid_office_choices_refuse_both_outputs(self):
+        flag_name = "ENABLE_OCU_OFFICE_EDIT"
+        origin_name = "OCU_OFFICE_DOCSERVER_ORIGIN"
+        cases = [(flag_name, value, {}) for value in (None, "", "TRUE", "0", "no")]
+        cases += [(origin_name, value, {}) for value in (
+            None, "", ORIGIN, ORIGIN + ":443", ORIGIN + "/",
+            ORIGIN + "/editor", "https://user:credential-canary@docs.example.test",
+            "https://docs.example.test?", "https://docs.example.test#",
+            "https://docs.example.test:abc", "https://docs.example.test:65536",
+        )]
+        cases += [(origin_name, ORIGIN, {"OCU_WEBUI_ORIGIN": ORIGIN + ":443"})]
+        for name, value, extra in cases:
+            with self.subTest(name=name, value=value):
+                for path in (self.runtime_path(), self.credentials):
+                    if path.exists():
+                        path.unlink()
+                unset = [name] if value is None else None
+                if value is not None:
+                    extra = {**extra, name: value}
+                result = self.run_bootstrap(extra, unset=unset)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stderr)
+                self.assertNotIn("credential-canary", self.combined(result))
+                self.assert_unpublished()
+
+    def test_invalid_optional_office_inputs_are_not_defaulted(self):
+        cases = [("OCU_OFFICE_PROXY_PORT", value)
+                 for value in ("", "abc", "0", "65536", "-1", "1.5")]
+        cases += [("OCU_OFFICE_FONTS_DIR", value)
+                  for value in ("", str(self.root / "font path"),
+                                str(self.root / "fonts\nINJECTED=1"))]
+        for name, value in cases:
+            with self.subTest(name=name, value=value):
+                for path in (self.runtime_path(), self.credentials):
+                    if path.exists():
+                        path.unlink()
+                result = self.run_bootstrap({name: value})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stderr)
+                self.assert_unpublished()
+
+    def test_operator_fonts_keep_existing_contents_and_metadata(self):
+        fonts = self.root / "operator-fonts"
+        fonts.mkdir(mode=0o750)
+        font = fonts / "organisation.otf"
+        font.write_bytes(b"OTTO organisation-owned fixture")
+        font.chmod(0o640)
+        os.utime(fonts, ns=(123456789, 123456789))
+        before = {path: (path.stat().st_mode, path.stat().st_mtime_ns, path.stat().st_ino)
+                  for path in (fonts, font)}
+        result = self.run_bootstrap({"OCU_OFFICE_FONTS_DIR": str(fonts),
+                                     "OCU_OFFICE_PROXY_PORT": "8444"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        self.assertEqual(runtime["OCU_OFFICE_FONTS_DIR"], str(fonts))
+        self.assertEqual(runtime["OCU_OFFICE_PROXY_PORT"], "8444")
+        self.assertEqual(list(fonts.iterdir()), [font])
+        self.assertEqual(font.read_bytes(), b"OTTO organisation-owned fixture")
+        self.assertEqual({path: (path.stat().st_mode, path.stat().st_mtime_ns, path.stat().st_ino)
+                          for path in (fonts, font)}, before)
+
+    def test_failed_or_empty_jwt_generation_publishes_nothing(self):
+        for failure in ("empty", "failed"):
+            with self.subTest(failure=failure):
+                for path in (self.runtime_path(), self.credentials, self.state / "openssl-count"):
+                    if path.exists():
+                        path.unlink()
+                result = self.run_bootstrap(self.openssl_env(failure))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("OCU_OFFICE_JWT_SECRET", result.stderr)
+                self.assertEqual((self.state / "openssl-count").read_text(), "6")
+                self.assertNotIn("jwt-generator-secret-canary", self.combined(result))
+                self.assert_unpublished()
+
+    def test_missing_documentserver_reference_publishes_nothing(self):
+        original = json.loads(self.inventory.read_text())
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                payload = json.loads(json.dumps(original))
+                if missing:
+                    payload["images"]["documentserver"].pop("reference")
+                else:
+                    payload["images"]["documentserver"]["reference"] = ""
+                self.inventory.write_text(json.dumps(payload))
+                result = self.run_bootstrap()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("documentserver", result.stderr.lower())
+                self.assert_unpublished()
 
     def test_success_emits_consumer_visible_topology_and_shared_token(self):
         result = self.run_bootstrap(
@@ -432,6 +609,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 
     def test_existing_outputs_are_preserved(self):
+        generator = self.openssl_env()
         cases = (
             ("runtime", True, False),
             ("credentials", False, True),
@@ -448,7 +626,8 @@ class BootstrapRuntimeTests(unittest.TestCase):
                     self.runtime_path().write_text("EXISTING_RUNTIME=keep-me\n", encoding="utf-8")
                 if write_credentials:
                     self.credentials.write_text("EXISTING_ADMIN=keep-me\n", encoding="utf-8")
-                result = self.run_bootstrap()
+                result = self.run_bootstrap(generator)
+                self.assertFalse((self.state / "openssl-count").exists())
                 self.assertNotEqual(result.returncode, 0)
                 if write_runtime:
                     self.assertEqual(self.runtime_path().read_text(encoding="utf-8"), "EXISTING_RUNTIME=keep-me\n")
