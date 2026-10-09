@@ -31,6 +31,7 @@ if [ -z "$manifest" ]; then
 fi
 openwebui_image=$(env_value OPENWEBUI_IMAGE)
 postgres_image=$(env_value POSTGRES_IMAGE)
+documentserver_image=$(env_value DOCUMENTSERVER_IMAGE)
 workspace_image=$(env_value DOCKER_IMAGE)
 server_image=$(env_value COMPUTER_USE_SERVER_IMAGE)
 retention_image=$(env_value RETENTION_GUARD_IMAGE)
@@ -72,6 +73,7 @@ PY
     printf -- '- Proxy image runtime ID: `%s` (`%s`)\n' "$proxy_image" "$(image_id "$proxy_image")"
     printf -- '- Open WebUI image runtime ID: `%s` (`%s`)\n' "$openwebui_image" "$(image_id "$openwebui_image")"
     printf -- '- PostgreSQL image runtime ID: `%s` (`%s`)\n' "$postgres_image" "$(image_id "$postgres_image")"
+    printf -- '- DocumentServer image runtime ID: `%s` (`%s`)\n' "$documentserver_image" "$(image_id "$documentserver_image")"
 
     printf -- '- Docker engine: `%s`\n' "$(docker version --format '{{.Server.Version}}')"
     printf -- '- Docker Compose: `%s`\n' "$(docker compose version --short)"

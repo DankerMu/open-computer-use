@@ -25,6 +25,7 @@ from support import (
     config_payload,
     copy_tracked,
     git_init_commit,
+    ops,
     prepare_up_context,
     seed_healthy_host,
     seed_images,
@@ -187,6 +188,7 @@ class RecoveryCliTests(unittest.TestCase):
             ("proxy", "OCU_PROXY_IMAGE"),
             ("open-webui", "OPENWEBUI_IMAGE"),
             ("postgres", "POSTGRES_IMAGE"),
+            ("documentserver", "DOCUMENTSERVER_IMAGE"),
         ):
             payload[name] = DEFAULT_RELEASE_IMAGES[role]
         self.runtime.write_text("\n".join(f"{k}={v}" for k, v in payload.items()) + "\n", encoding="utf-8")
@@ -1898,6 +1900,66 @@ class RecoveryCliTests(unittest.TestCase):
             any(any(item.endswith(":/recovery:ro") for item in row.get("mounts", [])) for row in helpers)
         )
 
+    def test_retained_version_one_refuses_restore_and_activation_without_mutation(self):
+        backup = self.root / "backup"
+        created = self.run_cli([
+            "backup", "--deploy-root", str(self.deploy_root),
+            "--destination", str(backup), "--runtime-file", str(self.runtime),
+        ])
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n")
+        os.chmod(provider, 0o600)
+        delivery, inventory, _source = self._write_retained_delivery()
+        inventory["format_version"] = 1
+        inventory["images"].pop("documentserver")
+        write_inventory(delivery / "release.json", inventory)
+        target_state = self.root / "historical-target"
+        target_state.mkdir()
+        seed_images(target_state)
+        (target_state / "docker-info.json").write_text(json.dumps({"ID": "target-daemon"}))
+        extra = {"FAKE_DOCKER_STATE": str(target_state)}
+        destination = self.root / "historical-restore"
+        restore = [
+            "restore", "--recovery-set", str(backup),
+            "--destination-root", str(destination), "--provider-file", str(provider),
+        ]
+
+        def snapshot(root):
+            return {
+                str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in root.rglob("*") if path.is_file() and path.name != "ops.log"
+            }
+
+        mutation_commands = {"load", "pull", "build", "create", "up", "run",
+                             "start", "stop", "rm", "iptables-restore", "ip6tables-restore"}
+        before_state = snapshot(target_state)
+        before_ops = len(ops(target_state))
+        refused = self.run_cli(restore + ["--retained-delivery", str(delivery)], extra=extra)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("format_version 1", refused.stderr)
+        self.assertFalse(destination.exists())
+        self.assertEqual(snapshot(target_state), before_state)
+        self.assertFalse(any(
+            set(row.split()) & mutation_commands for row in ops(target_state)[before_ops:]
+        ))
+
+        restored = self.run_cli(restore, extra=extra)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        before_state, before_destination = snapshot(target_state), snapshot(destination)
+        before_ops = len(ops(target_state))
+        refused = self.run_cli([
+            "activate", "--destination-root", str(destination),
+            "--retained-delivery", str(delivery),
+        ], extra=extra)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("format_version 1", refused.stderr)
+        self.assertEqual(snapshot(target_state), before_state)
+        self.assertEqual(snapshot(destination), before_destination)
+        self.assertFalse(any(
+            set(row.split()) & mutation_commands for row in ops(target_state)[before_ops:]
+        ))
+
     def test_restore_binds_selected_release_images_before_allocation(self):
         backup = self.root / "backup"
         created = self.run_cli(
@@ -1959,6 +2021,7 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(runtime["SOURCE_SHA"], payload["ocu_source_sha"])
         self.assertEqual(runtime["DOCKER_IMAGE"], previous["workspace"])
         self.assertEqual(runtime["OPENWEBUI_IMAGE"], previous["open-webui"])
+        self.assertEqual(runtime["DOCUMENTSERVER_IMAGE"], previous["documentserver"])
         self.assertNotEqual(runtime["DOCKER_IMAGE"], DEFAULT_RELEASE_IMAGES["workspace"])
         self.assertTrue((dest / ".restored").exists())
 

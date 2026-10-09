@@ -11,7 +11,7 @@
 #   OCU_SANDBOX_DNS — must be present; empty disables external sandbox DNS
 # Optional:
 #   OPENWEBUI_IMAGE DOCKER_IMAGE COMPUTER_USE_SERVER_IMAGE RETENTION_GUARD_IMAGE
-#   OCU_PROXY_IMAGE POSTGRES_IMAGE — may match or be derived from the inventory
+#   OCU_PROXY_IMAGE POSTGRES_IMAGE DOCUMENTSERVER_IMAGE — inventory-bound references
 #   OCU_ADMIN_CREDENTIALS_FILE — isolated-test output path; default unchanged
 #   OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
 
@@ -143,6 +143,7 @@ allowed = {
     "RETENTION_GUARD_IMAGE",
     "OCU_PROXY_IMAGE",
     "POSTGRES_IMAGE",
+    "DOCUMENTSERVER_IMAGE",
 }
 for line in assignments:
     name, value = line.split("=", 1)
@@ -163,10 +164,11 @@ while IFS=$'\t' read -r assign_name assign_value; do
         RETENTION_GUARD_IMAGE) RETENTION_GUARD_IMAGE=$assign_value ;;
         OCU_PROXY_IMAGE) OCU_PROXY_IMAGE=$assign_value ;;
         POSTGRES_IMAGE) POSTGRES_IMAGE=$assign_value ;;
+        DOCUMENTSERVER_IMAGE) DOCUMENTSERVER_IMAGE=$assign_value ;;
         *) fail "unexpected release assignment $assign_name" ;;
     esac
 done <<< "$release_assign_file"
-export SOURCE_SHA WEBUI_SOURCE_SHA OPENWEBUI_IMAGE DOCKER_IMAGE COMPUTER_USE_SERVER_IMAGE RETENTION_GUARD_IMAGE OCU_PROXY_IMAGE POSTGRES_IMAGE
+export SOURCE_SHA WEBUI_SOURCE_SHA OPENWEBUI_IMAGE DOCKER_IMAGE COMPUTER_USE_SERVER_IMAGE RETENTION_GUARD_IMAGE OCU_PROXY_IMAGE POSTGRES_IMAGE DOCUMENTSERVER_IMAGE
 
 
 
@@ -176,6 +178,7 @@ require_image COMPUTER_USE_SERVER_IMAGE
 require_image RETENTION_GUARD_IMAGE
 require_image OCU_PROXY_IMAGE
 require_image POSTGRES_IMAGE
+require_image DOCUMENTSERVER_IMAGE
 
 case "$DOCKER_IMAGE" in
     *open-computer-use*)
@@ -303,6 +306,7 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' "OPENWEBUI_VERSION=$openwebui_version"
     printf '%s\n' "OPENWEBUI_IMAGE=$OPENWEBUI_IMAGE"
     printf '%s\n' "POSTGRES_IMAGE=$POSTGRES_IMAGE"
+    printf '%s\n' "DOCUMENTSERVER_IMAGE=$DOCUMENTSERVER_IMAGE"
     printf '%s\n' "OCU_RELEASE_MANIFEST=$OCU_RELEASE_MANIFEST"
     # docker_manager identifies the production workspace path from this image
     # name. Keep "open-computer-use" in the tag so each workspace volume is

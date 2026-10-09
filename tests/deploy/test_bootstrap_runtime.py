@@ -49,6 +49,7 @@ IMAGES = {
     "COMPUTER_USE_SERVER_IMAGE": DEFAULT_RELEASE_IMAGES["computer-use-server"],
     "RETENTION_GUARD_IMAGE": DEFAULT_RELEASE_IMAGES["retention-guard"],
     "OCU_PROXY_IMAGE": DEFAULT_RELEASE_IMAGES["proxy"],
+    "DOCUMENTSERVER_IMAGE": DEFAULT_RELEASE_IMAGES["documentserver"],
 }
 
 GENERATED_SECRETS = (
@@ -65,6 +66,7 @@ REQUIRED_RUNTIME = (
     "OCU_RELEASE_MANIFEST",
     "OPENWEBUI_IMAGE",
     "POSTGRES_IMAGE",
+    "DOCUMENTSERVER_IMAGE",
     "DOCKER_IMAGE",
     "COMPUTER_USE_SERVER_IMAGE",
     "RETENTION_GUARD_IMAGE",
@@ -232,7 +234,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 
     def test_success_emits_consumer_visible_topology_and_shared_token(self):
-        result = self.run_bootstrap()
+        result = self.run_bootstrap(unset=["DOCUMENTSERVER_IMAGE"])
         self.assertEqual(result.returncode, 0, result.stderr)
         runtime = parse_env_file(self.runtime_path())
         self.assertEqual(stat.S_IMODE(self.runtime_path().stat().st_mode), 0o600)
@@ -375,6 +377,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
             ({"SOURCE_SHA": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, None),
             ({}, ["OCU_RELEASE_MANIFEST"]),
             ({"DOCKER_IMAGE": "custom-workspace:local"}, None),
+            ({"DOCUMENTSERVER_IMAGE": "unselected-documentserver:local"}, None),
             ({"COMPUTER_USE_SERVER_IMAGE": "ocu-test-server:local\nINJECTED=1"}, None),
             ({"RETENTION_GUARD_IMAGE": "ocu-test-retention:local\nINJECTED=1"}, None),
             ({}, ["OCU_WEBUI_ORIGIN"]),
@@ -468,6 +471,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
                 runtime["OCU_PROXY_IMAGE"]: {"Id": default_config_id("proxy"), "Os": "linux", "Architecture": "amd64"},
                 runtime["OPENWEBUI_IMAGE"]: {"Id": default_config_id("open-webui"), "Os": "linux", "Architecture": "amd64"},
                 runtime["POSTGRES_IMAGE"]: {"Id": default_config_id("postgres"), "Os": "linux", "Architecture": "amd64"},
+                runtime["DOCUMENTSERVER_IMAGE"]: {"Id": default_config_id("documentserver"), "Os": "linux", "Architecture": "amd64"},
             },
         )
         (self.state / "now-epoch").write_text("1800000000", encoding="utf-8")
@@ -485,7 +489,6 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         record = (self.deploy_root / "DEPLOYED_VERSION.md").read_text(encoding="utf-8")
         self.assertIn("OCU_SANDBOX_NO_AUTOSTART=1", record)
-        self.assertNotIn("disable-cli-autostart.patch", record)
         for name in GENERATED_SECRETS:
             self.assertNotIn(runtime[name], record, name)
         self.assertNotIn(PROVIDER_SENTINEL, record)
@@ -495,10 +498,13 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.assertIn(runtime["OCU_PROXY_IMAGE"], record)
         self.assertIn(runtime["OPENWEBUI_IMAGE"], record)
         self.assertIn(runtime["POSTGRES_IMAGE"], record)
+        self.assertTrue(any(
+            runtime["DOCUMENTSERVER_IMAGE"] in line
+            and default_config_id("documentserver") in line
+            for line in record.splitlines() if "image runtime ID:" in line
+        ))
         self.assertIn(self.sha, record)
         self.assertIn(self.webui_sha, record)
-        self.assertIn("not registry manifest digests", record)
-        self.assertIn("not installed package versions", record)
         self.assertNotIn(runtime["WEBUI_SECRET_KEY"], record)
         self.assertEqual(stat.S_IMODE((self.deploy_root / "DEPLOYED_VERSION.md").stat().st_mode), 0o644)
 

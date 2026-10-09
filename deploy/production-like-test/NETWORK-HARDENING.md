@@ -12,11 +12,18 @@ OCU_RELEASE_MANIFEST=<DEPLOY_ROOT>/release.json deploy/up.sh
 OCU_RELEASE_MANIFEST=<DEPLOY_ROOT>/release.json deploy/production-like-test/scripts/write-deployed-version.sh
 ```
 
-`build` 从干净的已提交 OCU/WebUI 快照构建五张源镜像并拉取选定的 PostgreSQL（已缓存且 identity 匹配的上游标签可复用，不覆盖不同内容；更新缓存上游标签是显式操作），导出 linux/amd64 命名归档和 OCU Git bundle。内容派生的 workspace 名称必须保留 `open-computer-use`，并使用完整 configuration digest 作为标签。清单记录两个完整源 SHA、所选源的 `source_consumer_contract`、六张镜像的命名引用与 configuration digest（Docker image `.Id`，不是 registry manifest digest）、归档 SHA-256、非密钥 build-arg 以及材料输入版本/哈希。输入哈希不是已安装软件包版本。缺少该契约常量的历史 checkout（例如 `f851621`）不是合格离线运行时。
+`build` 从干净的已提交 OCU/WebUI 快照构建五张源镜像并拉取选定的 PostgreSQL 和 DocumentServer（已缓存且 identity 匹配的上游引用可复用，不覆盖不同内容；更新缓存上游标签是显式操作），导出 linux/amd64 命名归档和 OCU Git bundle。内容派生的 workspace 名称必须保留 `open-computer-use`，并使用完整 configuration digest 作为标签。清单记录两个完整源 SHA、所选源的 `source_consumer_contract`、七张镜像的命名引用与 configuration digest（Docker image `.Id`，不是 registry manifest digest）、归档 SHA-256、非密钥 build-arg 以及材料输入版本/哈希。输入哈希不是已安装软件包版本。缺少该契约常量的历史 checkout（例如 `f851621`）不是合格离线运行时。
 
-`import` 在加载任何镜像前校验 schema、六角色集合、受约束的普通文件路径、全部校验和、归档内部 Docker/OCI 引用与配置字节、所选源消费者契约以及已有本地标签冲突。检查和 `docker load` 使用同一份私有暂存字节。合作构建/导入对同一本机 Docker 守护进程的镜像库写入通过 `/run/ocu-image-store/<daemon-id>.lock` 串行化；该 flock 文件在进程生命周期内持有、不在等待者仍引用其 inode 时 unlink。远程 Docker 守护进程协调不受支持。失败不发布安装根或成功记录；一旦尝试过 load，会披露可能残留的镜像缓存，但不会删除无关镜像。已有目标目录和竞争发布锁都会失败。任意外部 Docker 写者与宿主机管理员不在该保证内。
+`import` 在加载任何镜像前校验 schema、七角色集合、受约束的普通文件路径、全部校验和、归档内部 Docker/OCI 引用与配置字节、所选源消费者契约以及已有本地标签冲突。检查和 `docker load` 使用同一份私有暂存字节。合作构建/导入对同一本机 Docker 守护进程的镜像库写入通过 `/run/ocu-image-store/<daemon-id>.lock` 串行化；该 flock 文件在进程生命周期内持有、不在等待者仍引用其 inode 时 unlink。远程 Docker 守护进程协调不受支持。失败不发布安装根或成功记录；一旦尝试过 load，会披露可能残留的镜像缓存，但不会删除无关镜像。已有目标目录和竞争发布锁都会失败。任意外部 Docker 写者与宿主机管理员不在该保证内。
 
-`deploy/up.sh` 在任何网络/防火墙/容器变更前要求 `OCU_RELEASE_MANIFEST`，并核对本仓库 HEAD、被消费的 tracked 部署/initializer 字节、六张本地镜像以及解析后的服务镜像（含 `open-webui-init` 复用 `open-webui`）。无关 untracked 文件单独存在不是拒绝原因。冻结快照以 `up -d --no-build --pull never` 启动；缺少或被替换的本地镜像不会触发 build 或 pull。`bootstrap-test.sh` 仍保持 root-only、0600、不覆盖既有 runtime/凭证；镜像值可从清单安全派生，但不会执行生成的 shell 片段。
+`deploy/up.sh` 在任何网络/防火墙/容器变更前要求 `OCU_RELEASE_MANIFEST`，并核对本仓库 HEAD、被消费的 tracked 部署/initializer 字节、七张本地镜像以及解析后的服务镜像（含 `open-webui-init` 复用 `open-webui`）。无关 untracked 文件单独存在不是拒绝原因。冻结快照以 `up -d --no-build --pull never` 启动；缺少或被替换的本地镜像不会触发 build 或 pull。`bootstrap-test.sh` 仍保持 root-only、0600、不覆盖既有 runtime/凭证；镜像值可从清单安全派生，但不会执行生成的 shell 片段。
+
+Only release inventory `format_version` 2 is accepted; version 1 is refused by
+import, verify, startup and recovery. DocumentServer is pulled from the immutable
+upstream reference declared in the selected source's `deploy/release.py`, not built
+from a derived Dockerfile. Its existing provenance `build.dockerfile` field names
+that declaration file. The upstream index digest is distinct from the inspected
+linux/amd64 configuration digest and the exported archive checksum.
 
 WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` / 模型自动更新关闭开关，并保留已配置的 LAN OpenAI/RAG 端点与本地 Draw.io/Pyodide 材料。实际 Docker 引擎导入、平台/entrypoint 兼容和断网重启验收属于 #36；本源码阶段的 fake CLI 证据不能关闭 #33。
 

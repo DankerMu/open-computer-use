@@ -55,6 +55,7 @@ ROLE_ORDER = (
     "proxy",
     "open-webui",
     "postgres",
+    "documentserver",
 )
 RUNTIME_IMAGE_VARS = {
     "workspace": "DOCKER_IMAGE",
@@ -63,6 +64,7 @@ RUNTIME_IMAGE_VARS = {
     "proxy": "OCU_PROXY_IMAGE",
     "open-webui": "OPENWEBUI_IMAGE",
     "postgres": "POSTGRES_IMAGE",
+    "documentserver": "DOCUMENTSERVER_IMAGE",
 }
 DEFAULT_RELEASE_IMAGES = {
     "workspace": "open-computer-use:synthetic",
@@ -71,12 +73,13 @@ DEFAULT_RELEASE_IMAGES = {
     "proxy": "ocu-test-proxy:synthetic",
     "open-webui": "ocu-open-webui:synthetic",
     "postgres": "postgres:17-alpine",
+    "documentserver": "ocu-documentserver:synthetic",
 }
 DEFAULT_RELEASE_DIGESTS = {
     role: "sha256:" + hashlib.sha256(f"synthetic-{role}".encode("utf-8")).hexdigest()
     for role in ROLE_ORDER
 }
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 PLATFORM = "linux/amd64"
 WEBUI_SYNTHETIC_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 SOURCE_CONSUMER_CONTRACT = 1
@@ -84,6 +87,10 @@ HISTORICAL_INCOMPATIBLE_SOURCE = "f851621f7d425487c99b0f548dcb4dab06a9648e"
 OCI_LAYOUT_VERSION = "1.0.0"
 ANNOTATION_IMAGE_NAME = "io.containerd.image.name"
 ANNOTATION_REF_NAME = "org.opencontainers.image.ref.name"
+DOCUMENTSERVER_UPSTREAM = (
+    "onlyoffice/documentserver@sha256:"
+    "e3da62a847b9a5d51a11f73cfea1d9c13c3be3809614490d4edddcf01dcf919b"
+)
 
 
 UP_FIXTURE_PATHS = (
@@ -500,15 +507,20 @@ def tmp_dir():
 
 
 def empty_build(role: str) -> dict:
+    upstream = DOCUMENTSERVER_UPSTREAM if role == "documentserver" else None
     return {
-        "dockerfile": f"{role}.Dockerfile",
+        "dockerfile": "deploy/release.py" if upstream else f"{role}.Dockerfile",
         "dockerfile_sha256": hashlib.sha256(role.encode("utf-8")).hexdigest(),
         "context": ".",
-        "arguments": {},
-        "argument_defaults": {},
+        "arguments": {"DOCUMENTSERVER_IMAGE": upstream} if upstream else {},
+        "argument_defaults": {"DOCUMENTSERVER_IMAGE": upstream} if upstream else {},
         "argument_overrides": {},
         "input_manifest_sha256": hashlib.sha256(f"input-{role}".encode("utf-8")).hexdigest(),
-        "materials": [{"name": role, "requested": "synthetic", "kind": "test"}],
+        "materials": [{
+            "name": role,
+            "requested": upstream or "synthetic",
+            "kind": "upstream-image" if upstream else "test",
+        }],
     }
 
 
