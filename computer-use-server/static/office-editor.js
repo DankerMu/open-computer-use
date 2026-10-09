@@ -97,8 +97,7 @@ export function createOfficeEditorHost({
   let refreshAgain = false;
   let mutationEpoch = 0;
   let autoSave = null;
-  let queuedPublish = null;
-  let publishRequests = 0;
+  let publishIntent = null;
   let latestCommand = 0;
   let closeRequested = false;
   let closeAccepted = false;
@@ -160,7 +159,7 @@ export function createOfficeEditorHost({
     hostWindow.clearTimeout(pollTimer);
     hostWindow.clearTimeout(autoSaveTimer);
     pollTimer = autoSaveTimer = null;
-    queuedPublish = null;
+    publishIntent = null;
   }
 
   function syncAutoSave() {
@@ -178,13 +177,25 @@ export function createOfficeEditorHost({
   }
 
   function drainQueuedPublish() {
-    if (!queuedPublish || queuedPublish.attempt.pending || publishRequests || closeRequested || final()) return;
-    if (queuedPublish.attempt.sequence !== queuedPublish.blockingSequence) {
-      queuedPublish = null;
+    const pending = publishIntent;
+    if (!pending || pending.pending || pending.blockingSequence === null || closeRequested || final()) return;
+    if (pending.command !== latestCommand) {
+      publishIntent = null;
+      return;
+    }
+    let matches = false;
+    let unresolved = false;
+    for (const attempt of pending.attempts) {
+      matches ||= attempt.sequence === pending.blockingSequence;
+      unresolved ||= attempt.pending;
+    }
+    if (!matches && unresolved) return;
+    if (!matches) {
+      publishIntent = null;
       commandReason = 'session_not_editing';
       report();
     } else if (snapshot?.state === 'editing') {
-      queuedPublish = null;
+      publishIntent = null;
       void save();
     }
   }
@@ -237,12 +248,15 @@ export function createOfficeEditorHost({
     const requestedModification = modification;
     // Background persistence cannot supersede an unresolved explicit publication.
     const command = intent === 'persist' ? latestCommand : ++latestCommand;
-    if (intent === 'publish') queuedPublish = null;
-    const autoOwner = intent === 'publish' ? autoSave : null;
     const attempt = intent === 'persist' ? { pending: true, sequence: null } : null;
+    const publication = attempt ? null : {
+      command, pending: true, blockingSequence: null, attempts: new Set(autoSave ? [autoSave] : []),
+    };
     mutationEpoch++;
-    if (attempt) autoSave = attempt;
-    else publishRequests++;
+    if (attempt) {
+      autoSave = attempt;
+      if (publishIntent?.pending) publishIntent.attempts.add(attempt);
+    } else publishIntent = publication;
     try {
       const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/save`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent }), signal: lifetime.signal,
@@ -254,9 +268,9 @@ export function createOfficeEditorHost({
         if (attempt && response.status === 502 && body?.reason === 'documentserver_unavailable' &&
             Number.isSafeInteger(body.save_seq) && body.save_seq > 0) attempt.sequence = body.save_seq;
         if (command === latestCommand) {
-          if (autoOwner && response.status === 409 && body?.reason === 'session_not_editing' &&
+          if (publication && response.status === 409 && body?.reason === 'session_not_editing' &&
               Number.isSafeInteger(body.blocking_save_seq) && body.blocking_save_seq > 0) {
-            queuedPublish = { attempt: autoOwner, blockingSequence: body.blocking_save_seq };
+            publication.blockingSequence = body.blocking_save_seq;
           } else commandReason = reasonOf(body, 'save_failed');
         }
       } else if (response.status !== 202 || body?.session_id !== sessionId ||
@@ -274,7 +288,10 @@ export function createOfficeEditorHost({
     } finally {
       mutationEpoch++;
       if (attempt) attempt.pending = false;
-      else publishRequests--;
+      else {
+        publication.pending = false;
+        if (publishIntent === publication && publication.blockingSequence === null) publishIntent = null;
+      }
     }
     await refreshStatus();
   }
@@ -300,7 +317,7 @@ export function createOfficeEditorHost({
   async function close() {
     if (!sessionId || closeRequested || final()) return;
     closeRequested = true;
-    queuedPublish = null;
+    publishIntent = null;
     const command = ++latestCommand;
     mutationEpoch++;
     syncAutoSave();

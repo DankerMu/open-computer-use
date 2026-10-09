@@ -25,6 +25,7 @@ const listeners = new Map(), timers = new Map();
 let timerId = 0, attempts = 0, destroyed = 0, resolveCreate, resolveSave, resolveClose, resolveBody, resolveRefusalBody, pendingLoad;
 let now = 0, activeStatuses = 0, maxActiveStatuses = 0, statusReads = 0;
 const heldStatuses = [], signals = [];
+let releasePublishAdmission;
 const clone = value => JSON.parse(JSON.stringify(value));
 const signed = {documentType:'word', document:{key:'stable-key',url:'http://private.test/office/source/ticket',fileType:'docx',permissions:{edit:true}},editorConfig:{callbackUrl:'http://private.test/office/callback/chat/session',mode:'edit',customization:{forcesave:false}},token:'signed-configuration-token'};
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
@@ -85,6 +86,9 @@ const fetch=async(url,init={})=>{
   calls.push({url:String(url),method,headers,body});order.push('fetch:'+method);
   if(init.signal)signals.push(init.signal);
   if(method==='POST'&&String(url).endsWith('/save')){
+    if(body.intent==='publish'&&options.holdPublishAdmission)await new Promise(resolve=>{
+      releasePublishAdmission=()=>{options.holdPublishAdmission=false;resolve();};
+    });
     if(options.saveTransportError)throw new Error('save transport failed');
     if(currentStatus.state!=='editing'){
       const correlation=options.refusalCorrelation===undefined
@@ -183,6 +187,7 @@ for(const action of options.actions||[]){
   else if(action.kind==='releaseCreate')resolveCreate?.();
   else if(action.kind==='releaseBody'){options.deferBody=null;resolveBody?.();}
   else if(action.kind==='releaseRefusalBody'){options.deferRefusalBody=false;resolveRefusalBody();}
+  else if(action.kind==='releasePublishAdmission')releasePublishAdmission();
   else if(action.kind==='lateApi'){hostWindow.DocsAPI={DocEditor:class{constructor(){attempts++;}destroyEditor(){destroyed++;}}};pendingLoad?.();}
   else if(action.kind==='remount'){currentStatus=clone(initial);host=mount();dispatch(open);}
   else if(action.kind==='dispose')host.dispose();
@@ -1002,3 +1007,18 @@ def test_new_explicit_save_supersedes_an_installed_retry(tmp_path, blocking_sequ
     ]
     assert _states(result)[-1]["state"] == "editing"
     assert _states(result)[-1]["dirty"] is False and _states(result)[-1]["reason"] is None
+
+
+def test_auto_save_admitted_during_publish_flight_owns_its_refusal(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, actions=[
+        {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
+        {"kind": "tick", "ms": 1}, {"kind": "releasePublishAdmission"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 5000},
+    ])
+    assert result["actionStates"][0]["state"] == "editing"
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
+        "publish", "persist", "publish",
+    ]
+    assert all(state["reason"] is None for state in result["actionStates"])
+    assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
