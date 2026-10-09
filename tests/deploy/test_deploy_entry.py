@@ -238,6 +238,29 @@ class DeployEntryTests(unittest.TestCase):
                     self.assertFalse(any(set(row.split()) & mutations for row in ops(self.state)[before_ops:]))
                     self.assertEqual(leftover_tmp(self.state), [])
 
+    def test_operator_font_source_must_be_an_existing_directory(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        for kind in ("missing", "file", "dangling"):
+            with self.subTest(kind=kind):
+                path = self.state / f"invalid-font-{kind}"
+                if kind == "file":
+                    path.write_bytes(b"operator-owned")
+                elif kind == "dangling":
+                    path.symlink_to(self.state / "absent-font-target")
+                result = run_script(script, {**env, "OCU_OFFICE_FONTS_DIR": str(path)})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("OCU_OFFICE_FONTS_DIR", result.stderr)
+                self.assertNotIn(env["OCU_OFFICE_JWT_SECRET"], result.stdout + result.stderr)
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual(ops(self.state), [])
+                self.assertEqual(leftover_tmp(self.state), [])
+                if kind == "file":
+                    self.assertEqual(path.read_bytes(), b"operator-owned")
+                else:
+                    self.assertFalse(path.exists())
+                if kind != "missing":
+                    path.unlink()
+
     def test_missing_sandbox_bridge_is_created_then_reinspected(self):
         result = run_script(PROVISION, self.env)
         self.assertEqual(result.returncode, 0, result.stderr)

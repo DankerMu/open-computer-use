@@ -125,6 +125,10 @@ if os.environ["ENABLE_OCU_OFFICE_EDIT"] not in {"true", "false"}:
 port("OCU_OFFICE_PROXY_PORT", os.environ["OCU_OFFICE_PROXY_PORT"])
 origin("OCU_OFFICE_DOCSERVER_ORIGIN", os.environ["OCU_OFFICE_DOCSERVER_ORIGIN"])
 PY
+if [[ ! -d "$OCU_OFFICE_FONTS_DIR" ]]; then
+    printf '%s\n' 'deploy: OCU_OFFICE_FONTS_DIR must be an existing directory' >&2
+    exit 1
+fi
 if ! run_owned python3 - "$ROOT" "$OCU_RELEASE_MANIFEST" <<'PY'
 from __future__ import annotations
 

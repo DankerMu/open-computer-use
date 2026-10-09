@@ -1005,6 +1005,7 @@ def prepare_up_context(state_dir: Path, extra=None):
     lock_dir = state_dir / "image-store-lock"
     lock_dir.mkdir(parents=True, exist_ok=True)
     if not (source / ".git").exists():
+        (state_dir / "office-fonts").mkdir(exist_ok=True)
         source.mkdir(parents=True, exist_ok=True)
         sha = committed_up_fixture(source, lock_dir=lock_dir)
         inventory = write_release_for_sha(state_dir / "release.json", sha, WEBUI_SYNTHETIC_SHA)
