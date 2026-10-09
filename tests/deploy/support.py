@@ -264,6 +264,21 @@ def intended_docs():
         "proxy.json": intended_proxy(),
     }
 
+
+def font_mount_docs():
+    docs = intended_docs()
+    core = docs["core.json"]
+    core["__unresolved__"] = True
+    core["services"][DOCUMENTSERVER_SERVICE]["volumes"] = [
+        {"type": "bind", "source": f"${{{name}}}",
+         "target": f"/usr/share/fonts/truetype/{target}", "read_only": True,
+         "bind": {"create_host_path": False}}
+        for name, target in (("OCU_RELEASE_FONTS_DIR", "ocu-release"),
+                             ("OCU_OFFICE_FONTS_DIR", "ocu-operator"))
+    ]
+    return docs
+
+
 def intended_docs_for_images(images: dict) -> dict:
     docs = intended_docs()
     mapping = {
