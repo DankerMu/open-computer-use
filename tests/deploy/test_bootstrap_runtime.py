@@ -297,6 +297,42 @@ class BootstrapRuntimeTests(unittest.TestCase):
                 self.assertNotIn("credential-canary", self.combined(result))
                 self.assert_unpublished()
 
+    def test_invalid_optional_office_inputs_are_not_defaulted(self):
+        cases = [("OCU_OFFICE_PROXY_PORT", value)
+                 for value in ("", "abc", "0", "65536", "-1", "1.5")]
+        cases += [("OCU_OFFICE_FONTS_DIR", value)
+                  for value in ("", str(self.root / "font path"),
+                                str(self.root / "fonts\nINJECTED=1"))]
+        for name, value in cases:
+            with self.subTest(name=name, value=value):
+                for path in (self.runtime_path(), self.credentials):
+                    if path.exists():
+                        path.unlink()
+                result = self.run_bootstrap({name: value})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stderr)
+                self.assert_unpublished()
+
+    def test_operator_fonts_keep_existing_contents_and_metadata(self):
+        fonts = self.root / "operator-fonts"
+        fonts.mkdir(mode=0o750)
+        font = fonts / "organisation.otf"
+        font.write_bytes(b"OTTO organisation-owned fixture")
+        font.chmod(0o640)
+        os.utime(fonts, ns=(123456789, 123456789))
+        before = {path: (path.stat().st_mode, path.stat().st_mtime_ns, path.stat().st_ino)
+                  for path in (fonts, font)}
+        result = self.run_bootstrap({"OCU_OFFICE_FONTS_DIR": str(fonts),
+                                     "OCU_OFFICE_PROXY_PORT": "8444"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        self.assertEqual(runtime["OCU_OFFICE_FONTS_DIR"], str(fonts))
+        self.assertEqual(runtime["OCU_OFFICE_PROXY_PORT"], "8444")
+        self.assertEqual(list(fonts.iterdir()), [font])
+        self.assertEqual(font.read_bytes(), b"OTTO organisation-owned fixture")
+        self.assertEqual({path: (path.stat().st_mode, path.stat().st_mtime_ns, path.stat().st_ino)
+                          for path in (fonts, font)}, before)
+
     def test_success_emits_consumer_visible_topology_and_shared_token(self):
         result = self.run_bootstrap(
             extra={"OCU_RELEASE_FONTS_DIR": "/unselected/fonts"},

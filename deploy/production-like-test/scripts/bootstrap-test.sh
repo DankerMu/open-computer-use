@@ -280,11 +280,26 @@ office_proxy_port=${OCU_OFFICE_PROXY_PORT-8083}
 office_fonts_dir=${OCU_OFFICE_FONTS_DIR-"$deploy_root/data/office-fonts"}
 office_docserver_url='http://documentserver'
 office_self_url='http://computer-use-server:8081'
+if [ -z "$office_fonts_dir" ]; then
+    fail 'OCU_OFFICE_FONTS_DIR must name a directory'
+fi
+python3 - "$office_proxy_port" <<'PY'
+import sys
+value = sys.argv[1]
+try:
+    valid = value.isascii() and value.isdecimal() and 1 <= int(value) <= 65535
+except ValueError:
+    valid = False
+if not valid:
+    raise SystemExit("OCU_OFFICE_PROXY_PORT must be a decimal port in 1–65535")
+PY
 
 for pair in \
     POSTGRES_IMAGE:"$POSTGRES_IMAGE" \
     OPENWEBUI_VERSION:"$openwebui_version" \
     OCU_PROXY_PORT:"$proxy_port" \
+    OCU_OFFICE_PROXY_PORT:"$office_proxy_port" \
+    OCU_OFFICE_FONTS_DIR:"$office_fonts_dir" \
     OCU_PRIVATE_NETWORK:"$private_network" \
     OCU_PRIVATE_SUBNET:"$private_subnet" \
     OCU_PRIVATE_GATEWAY:"$private_gateway" \
