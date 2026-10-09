@@ -2,6 +2,8 @@
 # Invoke with the base compose file from the source checkout and the same
 # project name as the WebUI stack: docker compose -p ocu-test -f
 # docker-compose.yml -f deploy/production-like-test/compose.core.override.yml …
+# Manual Compose calls also need OCU_RELEASE_FONTS_DIR derived from the selected
+# inventory; up.sh and smoke.sh supply it (see NETWORK-HARDENING.md).
 # Host publications are removed; the proxy stack is the only publisher.
 
 services:
