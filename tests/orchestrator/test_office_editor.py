@@ -1009,16 +1009,65 @@ def test_new_explicit_save_supersedes_an_installed_retry(tmp_path, blocking_sequ
     assert _states(result)[-1]["dirty"] is False and _states(result)[-1]["reason"] is None
 
 
-def test_auto_save_admitted_during_publish_flight_owns_its_refusal(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, actions=[
+@pytest.mark.parametrize("boundary", ["accepted", "response", "body", "failure", "failure-body"])
+@pytest.mark.parametrize("cause", ["owned", "foreign"])
+def test_auto_save_admitted_during_publish_flight_owns_its_refusal(tmp_path, boundary, cause):
+    options = {}
+    release = []
+    if boundary == "response":
+        options["deferPersist"] = True
+        release.append({"kind": "releaseSave"})
+    elif boundary == "body":
+        options["deferBody"] = "save"
+        release.append({"kind": "releaseBody"})
+    elif boundary.startswith("failure"):
+        options["deferPersistFailure"] = True
+        release.append({"kind": "releaseSave"})
+        if boundary == "failure-body":
+            options["deferBody"] = "save"
+            release.append({"kind": "releaseBody"})
+    foreign = [{"kind": "status", "status": {"state": "saving", "save_seq": 4}}] if cause == "foreign" else []
+    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, **options, actions=[
         {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
-        {"kind": "tick", "ms": 1}, {"kind": "releasePublishAdmission"},
-        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1}, *foreign, {"kind": "releasePublishAdmission"}, *release,
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4 if foreign else 3}},
         {"kind": "tick", "ms": 5000},
     ])
     assert result["actionStates"][0]["state"] == "editing"
+    expected = ["publish", "persist"] + (["publish"] if cause == "owned" else [])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
+    assert _states(result)[-1]["reason"] == (None if cause == "owned" else "session_not_editing")
+    assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("ending", ["close", "dispose"])
+def test_retirement_supersedes_publication_owned_by_a_newer_auto_save(tmp_path, ending):
+    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, deferPersist=True, actions=[
+        {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
+        {"kind": "tick", "ms": 1}, {"kind": "releasePublishAdmission"},
+        {"kind": "command", "command": "close"} if ending == "close" else {"kind": "dispose"},
+        {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
+    ])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["publish", "persist"]
+    assert result["destroyed"] == 1
+    if ending == "dispose":
+        assert result["actionResources"][4]["messages"] == result["actionResources"][-1]["messages"]
+        assert result["timers"] == result["listeners"] == 0
+
+
+def test_newer_auto_candidate_survives_replacement_before_refusal_delivery(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, deferRefusalBody=True, actions=[
+        {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
+        {"kind": "tick", "ms": 1}, {"kind": "releasePublishAdmission"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000}, {"kind": "modify"},
+        {"kind": "tick", "ms": 300000},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
+        {"kind": "tick", "ms": 1000}, {"kind": "releaseRefusalBody"},
+        {"kind": "tick", "ms": 5000},
+    ])
     assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == [
-        "publish", "persist", "publish",
+        "publish", "persist", "persist", "publish",
     ]
     assert all(state["reason"] is None for state in result["actionStates"])
     assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
