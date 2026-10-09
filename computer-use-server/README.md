@@ -288,6 +288,10 @@ a delayed 202 or post-allocation 502 response. Confirmed user intent survives la
 foreign saves until editing resumes. Missing, malformed or mismatched correlation
 and unproven transport failures never create a generic retry.
 Background persistence cannot supersede an unresolved explicit publishing command.
+A newer explicit Save replaces an older queued intent. Each unresolved publishing
+intent retains only its candidate local auto-save attempts, including attempts
+started during its request flight; exact broker correlation decides ownership.
+Settling, superseding or retiring that intent releases its candidate references.
 
 A saving-state admission 409 includes `blocking_save_seq` captured under the
 rejecting chat lock; other `session_not_editing` refusals omit it. Save 502
