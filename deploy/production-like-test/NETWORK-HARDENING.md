@@ -63,8 +63,8 @@ image must match the release inventory before provisioning or startup.
 `OCU_OFFICE_PROXY_PORT`, `OCU_OFFICE_FONTS_DIR` and `ENABLE_OCU_OFFICE_EDIT`,
 even when editing is off. It rejects an invalid flag, nondecimal or out-of-range
 Office port, and an invalid browser origin using the same origin
-and port validators as bootstrap. `OCU_OFFICE_FONTS_DIR` must be nonempty;
-this preflight does not check its directory or mount it.
+and port validators as bootstrap. `OCU_OFFICE_FONTS_DIR` must name an existing
+directory before any engine mutation; missing paths, dangling links and files fail.
 
 DocumentServer receives `JWT_ENABLED=true` and `JWT_SECRET` from the bootstrap
 secret. The selected upstream entrypoint applies these controls to browser,
@@ -74,11 +74,30 @@ enablement and requires the resolved secret to match both the supplied
 setting without printing a credential, preserves engine state and removes owned
 temporary snapshots. Startup uses those checked snapshots, not a new resolution.
 
-DocumentServer's configured mounts are project-scoped named volumes:
+DocumentServer's own-data mounts are project-scoped named volumes:
 `documentserver-data` at `/var/www/onlyoffice/Data`, `documentserver-cache` at
 `/var/lib/onlyoffice`, and `documentserver-logs` at `/var/log/onlyoffice`.
-No Docker socket, chat, skills, workspace or other host bind is attached.
+Its only configured host binds are the two font directories below; no Docker
+socket, chat, skills or workspace bind is attached.
 The proxy remains the sole publisher, with one publication.
+
+The release font directory mounts at `/usr/share/fonts/truetype/ocu-release`;
+`OCU_OFFICE_FONTS_DIR` mounts at `/usr/share/fonts/truetype/ocu-operator`.
+Both binds are read-only and refuse automatic host-path creation. Empty operator
+directories and directory symlinks are accepted without modifying their contents
+or metadata.
+
+A relative operator path is relative to the `up.sh` invocation's working directory,
+not Compose's project directory. The entry exports its absolute spelling for
+checking and mounting; it does not rewrite stored configuration. Prefer an absolute
+stored path for repeatable activation. On a restored host the operator must make
+that configured directory available: it is not captured, remapped or created by
+recovery. Recovery invokes the entry from the restored source root, which becomes
+the base for any retained relative operator path.
+
+The release-font bind follows the verified manifest-adjacent `fonts` entry,
+including the selected-release link after activation. Do not store
+`OCU_RELEASE_FONTS_DIR` or substitute the operator directory for that release material.
 
 Overlay contract tests require a native Compose v2 resolver (`docker-compose` or
 the system `docker compose` plugin). They resolve all three stacks using
