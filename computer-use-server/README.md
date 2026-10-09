@@ -284,12 +284,13 @@ reason through ordinary editing polls until another command is accepted. Conflic
 and terminal reports use the broker's authoritative reason. Save timeout and
 callback refusal remain retryable. A publishing refusal queues a retry only when
 its `blocking_save_seq` matches the local auto-save's actual sequence, including
-a delayed202 or post-allocation502 response. Confirmed user intent survives later
+a delayed 202 or post-allocation 502 response. Confirmed user intent survives later
 foreign saves until editing resumes. Missing, malformed or mismatched correlation
 and unproven transport failures never create a generic retry.
+Background persistence cannot supersede an unresolved explicit publishing command.
 
-A saving-state admission409 includes `blocking_save_seq` captured under the
-rejecting chat lock; other `session_not_editing` refusals omit it. Save502
+A saving-state admission 409 includes `blocking_save_seq` captured under the
+rejecting chat lock; other `session_not_editing` refusals omit it. Save 502
 `documentserver_unavailable` includes that failed request's allocated `save_seq`,
 not a newer session allocation. This identifies contention only: a failed save
 does not cover modifications. Creation and restore error shapes are unchanged.

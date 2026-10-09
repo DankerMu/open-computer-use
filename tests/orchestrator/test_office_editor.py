@@ -22,7 +22,7 @@ const chat = options.chat;
 const file = options.file ?? 'document-id';
 const calls = [], messages = [], scripts = [], configs = [], order = [], actionStates = [], actionResources = [];
 const listeners = new Map(), timers = new Map();
-let timerId = 0, attempts = 0, destroyed = 0, resolveCreate, resolveSave, resolveClose, resolveBody, pendingLoad;
+let timerId = 0, attempts = 0, destroyed = 0, resolveCreate, resolveSave, resolveClose, resolveBody, resolveRefusalBody, pendingLoad;
 let now = 0, activeStatuses = 0, maxActiveStatuses = 0, statusReads = 0;
 const heldStatuses = [], signals = [];
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -30,6 +30,7 @@ const signed = {documentType:'word', document:{key:'stable-key',url:'http://priv
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
 let currentStatus = clone(initial);
 const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>{
+  if(status===409&&options.deferRefusalBody)return new Promise(resolve=>{resolveRefusalBody=()=>resolve(clone(body));});
   const kind=body?.editor_config!==undefined?'create':body?.workspace_changed!==undefined?'status':
     body?.intent||body?.reason==='documentserver_unavailable'&&body?.save_seq!==undefined?'save':body?.session_id&&body?.state?'close':null;
   if(kind&&options.deferBody===kind)return new Promise(resolve=>{resolveBody=()=>resolve(clone(body));});
@@ -181,6 +182,7 @@ for(const action of options.actions||[]){
   else if(action.kind==='pagehide')emit('pagehide');
   else if(action.kind==='releaseCreate')resolveCreate?.();
   else if(action.kind==='releaseBody'){options.deferBody=null;resolveBody?.();}
+  else if(action.kind==='releaseRefusalBody'){options.deferRefusalBody=false;resolveRefusalBody();}
   else if(action.kind==='lateApi'){hostWindow.DocsAPI={DocEditor:class{constructor(){attempts++;}destroyEditor(){destroyed++;}}};pendingLoad?.();}
   else if(action.kind==='remount'){currentStatus=clone(initial);host=mount();dispatch(open);}
   else if(action.kind==='dispose')host.dispose();
@@ -946,3 +948,36 @@ def test_unusable_correlation_never_authorizes_a_publishing_retry(tmp_path, valu
     assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == ["persist", "publish"]
     assert _states(result)[-1]["reason"] == "session_not_editing"
     assert _states(result)[-1]["dirty"] is True
+
+
+@pytest.mark.parametrize("superseding_command", [None, "save", "close"])
+def test_only_explicit_commands_supersede_pending_publication(tmp_path, superseding_command):
+    supersession = []
+    if superseding_command:
+        supersession.append({"kind": "command", "command": superseding_command})
+    if superseding_command == "save":
+        supersession.extend([
+            {"kind": "status", "status": {
+                "state": "editing", "save_seq": 5, "last_committed_seq": 5, "last_published_seq": 5,
+            }},
+            {"kind": "tick", "ms": 1000},
+        ])
+    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, deferRefusalBody=True, actions=[
+        {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
+        {"kind": "allowStatus"}, {"kind": "releaseStatus"},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
+        {"kind": "tick", "ms": 1000}, {"kind": "modify"},
+        {"kind": "tick", "ms": 300000},
+        {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
+        {"kind": "tick", "ms": 1000}, *supersession,
+        {"kind": "releaseRefusalBody"}, {"kind": "tick", "ms": 5000},
+    ])
+    expected = ["persist", "publish", "persist"] + ([] if superseding_command == "close" else ["publish"])
+    assert [row["body"]["intent"] for row in result["calls"] if row["url"].endswith("/save")] == expected
+    assert all(state["reason"] is None for state in result["actionStates"])
+    if superseding_command == "close":
+        assert _states(result)[-1]["state"] == "closing" and result["destroyed"] == 1
+    elif superseding_command == "save":
+        assert _states(result)[-1]["state"] == "editing" and _states(result)[-1]["dirty"] is False
+    else:
+        assert _states(result)[-1]["state"] == "saving" and _states(result)[-1]["dirty"] is True
