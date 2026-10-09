@@ -110,6 +110,11 @@ if [[ -z "${OCU_RELEASE_MANIFEST:-}" ]]; then
     printf '%s\n' 'deploy: OCU_RELEASE_MANIFEST is required' >&2
     exit 1
 fi
+for name in DOCUMENTSERVER_IMAGE OCU_OFFICE_JWT_SECRET OCU_OFFICE_DOCSERVER_URL \
+    OCU_OFFICE_DOCSERVER_ORIGIN OCU_OFFICE_SELF_URL OCU_OFFICE_PROXY_PORT \
+    OCU_OFFICE_FONTS_DIR ENABLE_OCU_OFFICE_EDIT; do
+    require "$name"
+done
 export PYTHONPATH="$ROOT/deploy${PYTHONPATH:+:$PYTHONPATH}"
 if ! run_owned python3 - "$ROOT" "$OCU_RELEASE_MANIFEST" <<'PY'
 from __future__ import annotations

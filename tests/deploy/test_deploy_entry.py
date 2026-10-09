@@ -159,6 +159,29 @@ class DeployEntryTests(unittest.TestCase):
         for verb in DESTRUCTIVE:
             self.assertNotIn(verb, recorded)
 
+    def test_office_settings_are_required_in_both_flag_states(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        names = ("DOCUMENTSERVER_IMAGE", "OCU_OFFICE_JWT_SECRET",
+                 "OCU_OFFICE_DOCSERVER_URL", "OCU_OFFICE_DOCSERVER_ORIGIN",
+                 "OCU_OFFICE_SELF_URL", "OCU_OFFICE_PROXY_PORT",
+                 "OCU_OFFICE_FONTS_DIR", "ENABLE_OCU_OFFICE_EDIT")
+        for flag in ("false", "true"):
+            for name in names:
+                for value in (None, ""):
+                    with self.subTest(flag=flag, name=name, empty=value == ""):
+                        invalid = {**env, "ENABLE_OCU_OFFICE_EDIT": flag}
+                        if value is None:
+                            invalid.pop(name)
+                        else:
+                            invalid[name] = value
+                        result = run_script(script, invalid)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f"deploy: {name} is required", result.stderr)
+                        self.assertNotIn(env["OCU_OFFICE_JWT_SECRET"], result.stdout + result.stderr)
+                        self.assertEqual(starts(self.state), [])
+                        self.assertEqual(ops(self.state), [])
+                        self.assertEqual(leftover_tmp(self.state), [])
+
     def test_missing_sandbox_bridge_is_created_then_reinspected(self):
         result = run_script(PROVISION, self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
