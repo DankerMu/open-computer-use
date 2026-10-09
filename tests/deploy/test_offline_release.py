@@ -31,6 +31,7 @@ from support import (
     fake_env,
     git_init_commit,
     image_id_for_config,
+    intended_docs,
     intended_docs_for_images,
     ops,
     prepare_up_context,
@@ -1060,7 +1061,7 @@ class OfflineReleaseTests(unittest.TestCase):
             self.assertEqual([row["kind"] for row in pulls], ["pull"])
             self.assertEqual(image["configuration_digest"], pulls[0]["id"])
 
-    def test_seven_image_release_starts_without_documentserver_compose_service(self):
+    def test_seven_image_release_starts_with_documentserver_compose_service(self):
         env, script, _source = prepare_up_context(self.state)
         write_fake_configs(self.state)
         seed_healthy_host(self.state)
@@ -1069,6 +1070,30 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertEqual((self.state / "starts.log").read_text().splitlines(),
                          ["core", "webui", "proxy"])
         self.assertFalse((self.state / "builds.json").exists())
+        self.assertEqual(json.loads((self.state / "running.json").read_text())["documentserver"], "core")
+
+    def test_documentserver_service_image_mismatch_refuses_before_mutation(self):
+        env, script, _source = prepare_up_context(self.state)
+        docs = intended_docs()
+        docs["core.json"]["services"]["documentserver"]["image"] = "unselected-documentserver:mutant"
+        write_fake_configs(self.state, docs)
+        seed_healthy_host(self.state)
+        write_network(self.state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+        write_network(self.state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+        before_images = (self.state / "images.json").read_bytes()
+        before_networks = {path.name: path.read_bytes() for path in (self.state / "networks").iterdir()}
+        before_firewall = (self.state / "firewall.json").read_bytes()
+        before_ops = len(ops(self.state))
+        result = run_script(script, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("documentserver", result.stderr)
+        self.assertFalse((self.state / "starts.log").exists())
+        self.assertEqual((self.state / "images.json").read_bytes(), before_images)
+        self.assertEqual({path.name: path.read_bytes() for path in (self.state / "networks").iterdir()},
+                         before_networks)
+        self.assertEqual((self.state / "firewall.json").read_bytes(), before_firewall)
+        mutations = {"load", "pull", "build", "create", "up", "iptables-restore", "ip6tables-restore"}
+        self.assertFalse(any(set(row.split()) & mutations for row in ops(self.state)[before_ops:]))
 
     def test_import_rejects_built_documentserver_before_loading_images(self):
         delivery, inventory, _sha = self.write_delivery()

@@ -78,6 +78,7 @@ SERVICE_IMAGE_VARS = {
     "open-webui": "OPENWEBUI_IMAGE",
     "postgres": "POSTGRES_IMAGE",
     "open-webui-init": "OPENWEBUI_IMAGE",
+    "documentserver": "DOCUMENTSERVER_IMAGE",
 }
 SOURCE_BIND_PATHS = (
     "deploy/production-like-test/init/run-init.sh",

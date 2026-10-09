@@ -45,6 +45,7 @@ SANDBOX_NETWORK = "ocu-sandbox"
 PROXY_SERVICE = "proxy"
 WEBUI_SERVICE = "open-webui"
 OCU_SERVICE = "computer-use-server"
+DOCUMENTSERVER_SERVICE = "documentserver"
 PROXY_TARGET = 8082
 PROXY_PUBLISHED = "8082"
 DEFAULT_ALLOW = "8.8.8.8/32,1.1.1.1/32"
@@ -192,6 +193,10 @@ def intended_core():
                 networks={"default": {}},
                 image=DEFAULT_RELEASE_IMAGES["retention-guard"],
             ),
+            DOCUMENTSERVER_SERVICE: service(
+                networks={"default": {}},
+                image=DEFAULT_RELEASE_IMAGES["documentserver"],
+            ),
         }
     )
 
@@ -265,12 +270,14 @@ def intended_docs_for_images(images: dict) -> dict:
         "open-webui": images["open-webui"]["reference"],
         "postgres": images["postgres"]["reference"],
         "proxy": images["proxy"]["reference"],
+        "documentserver": images["documentserver"]["reference"],
     }
     core = docs["core.json"]
     core["services"]["workspace"]["image"] = mapping["workspace"]
     core["services"][OCU_SERVICE]["image"] = mapping["computer-use-server"]
     core["services"][OCU_SERVICE]["environment"]["DOCKER_IMAGE"] = mapping["workspace"]
     core["services"]["retention-guard"]["image"] = mapping["retention-guard"]
+    core["services"][DOCUMENTSERVER_SERVICE]["image"] = mapping["documentserver"]
     webui = docs["webui.json"]
     webui["services"][WEBUI_SERVICE]["image"] = mapping["open-webui"]
     webui["services"]["postgres"]["image"] = mapping["postgres"]

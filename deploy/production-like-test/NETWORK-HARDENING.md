@@ -53,6 +53,22 @@ one fresh JWT secret in the mode0600 runtime file only. Existing runtime/admin
 outputs are never overwritten and no replacement secret is generated for them.
 These settings do not certify compose wiring or a running DocumentServer.
 
+The core stack includes `documentserver` regardless of the WebUI editing flag.
+It uses `DOCUMENTSERVER_IMAGE`, publishes no host port, and joins only the
+control-plane network. The port guard requires it exactly once; its resolved
+image must match the release inventory before provisioning or startup.
+
+DocumentServer's configured mounts are project-scoped named volumes:
+`documentserver-data` at `/var/www/onlyoffice/Data`, `documentserver-cache` at
+`/var/lib/onlyoffice`, and `documentserver-logs` at `/var/log/onlyoffice`.
+No Docker socket, chat, skills, workspace or other host bind is attached.
+The proxy remains the sole publisher, with one publication.
+
+Overlay contract tests require a native Compose v2 resolver (`docker-compose` or
+the system `docker compose` plugin). They resolve all three stacks using
+synthetic inputs and isolated configuration; no daemon or image execution is
+needed. Configuration checks do not certify runtime volume persistence.
+
 WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` / 模型自动更新关闭开关，并保留已配置的 LAN OpenAI/RAG 端点与本地 Draw.io/Pyodide 材料。实际 Docker 引擎导入、平台/entrypoint 兼容和断网重启验收属于 #36；本源码阶段的 fake CLI 证据不能关闭 #33。
 
 失败边界：损坏或越界归档、符号链接、未声明或冲突的归档内部标签、隐藏 OCI 别名、配置 digest 冲突、脏的 tracked 源、不兼容的源消费者契约、缺失/替换的本地镜像、错误平台、密钥 build-arg、已有安装根、不受支持的远程 Docker 守护进程。

@@ -480,6 +480,7 @@ class DeployEntryTests(unittest.TestCase):
                 "workspace",
                 "computer-use-server",
                 "retention-guard",
+                "documentserver",
                 "open-webui",
                 "postgres",
                 "open-webui-init",
@@ -501,7 +502,7 @@ class DeployEntryTests(unittest.TestCase):
         self.assertEqual(starts(self.state), ["core", "webui:failed"])
         self.assertEqual(
             {name for name, owner in running_services(self.state).items() if owner == "core"},
-            {"workspace", "computer-use-server", "retention-guard"},
+            {"workspace", "computer-use-server", "retention-guard", "documentserver"},
         )
         self.assertNotIn("proxy", starts(self.state))
         self.assertEqual(leftover_tmp(self.state), [])
