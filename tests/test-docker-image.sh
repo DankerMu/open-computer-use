@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 # Test Docker image for package availability, CLI tools, and correct npm layout.
-# Usage: ./tests/test-docker-image.sh [image-name]
+# Usage: ./tests/test-docker-image.sh [image-name] [--browser-relay-only]
 # Default image: ai-computer-use-test:latest
 #
 # Exit code: 0 = all tests passed, 1 = some tests failed
@@ -10,6 +10,11 @@
 set -euo pipefail
 
 IMAGE="${1:-ai-computer-use-test:latest}"
+MODE="${2:-}"
+if [ "$#" -gt 2 ] || { [ -n "$MODE" ] && [ "$MODE" != "--browser-relay-only" ]; }; then
+    echo "Usage: $0 [image-name] [--browser-relay-only]" >&2
+    exit 2
+fi
 PASSED=0
 FAILED=0
 FAILURES=""
@@ -43,6 +48,216 @@ run_in_container() {
 run_in_container_verbose() {
     docker run --rm --platform linux/amd64 --entrypoint=bash --user=assistant "$IMAGE" -c "$1" 2>&1
 }
+
+# Own a fresh container; cleanup also runs when setup or a bounded probe fails.
+run_browser_relay_regression() (
+    set -euo pipefail
+    work=$(mktemp -d) || exit
+    owner="ocu-browser-relay-${work##*/}"
+    launching=0
+    # Host Python bounds Docker calls, including startup and cleanup.
+    bounded_docker() {
+        python3 -c '
+import subprocess
+import sys
+
+try:
+    result = subprocess.run(["docker", *sys.argv[2:]], timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    print(f"Docker command exceeded {sys.argv[1]}s: {sys.argv[2:]}", file=sys.stderr)
+    sys.exit(124)
+sys.exit(result.returncode)
+' "$@"
+    }
+    cleanup() {
+        rc=$?
+        trap - EXIT
+        owned=""
+        if [ -s "$work/cid" ]; then
+            owned=$(cat "$work/cid") || rc=1
+        elif [ "$launching" -eq 1 ]; then
+            # A timed-out Docker client may not have written its cidfile.
+            owned=$(bounded_docker 30 ps -aq --filter "label=ocu.browser-relay-test-owner=$owner") || rc=1
+        fi
+        for container in $owned; do
+            if ! bounded_docker 30 rm -f "$container" >/dev/null; then
+                rc=1
+            fi
+        done
+        rm -rf "$work"
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    existing=$(bounded_docker 30 ps -aq --filter "label=ocu.browser-relay-test-owner=$owner") || exit
+    if [ -n "$existing" ]; then
+        echo "Refusing to reuse browser relay test ownership label: $owner" >&2
+        exit 1
+    fi
+    launching=1
+
+    bounded_docker 30 run -d --rm --platform linux/amd64 --user=assistant \
+        --cidfile "$work/cid" --entrypoint=bash \
+        --label "ocu.browser-relay-test-owner=$owner" \
+        -e PLAYWRIGHT_CLI_CONFIG=/tmp/relay-playwright.json \
+        "$IMAGE" -c 'exec sleep 180' >/dev/null || exit
+    cid=$(cat "$work/cid") || exit
+
+    bounded_docker 100 exec -i "$cid" timeout 90s bash -s <<'RELAY_SMOKE'
+set -euo pipefail
+
+# Use the image's installed Chromium without an external display or download.
+timeout 20s python3 - <<'CONFIG'
+import json
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as playwright:
+    executable = playwright.chromium.executable_path
+with open("/tmp/relay-playwright.json", "w") as config:
+    json.dump({
+        "outputDir": "/tmp/relay-output",
+        "browser": {
+            "browserName": "chromium",
+            "launchOptions": {
+                "executablePath": executable,
+                "headless": True,
+                "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+            },
+        },
+    }, config)
+CONFIG
+
+cat > /tmp/relay-probe.py <<'PROBE'
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+import urllib.parse
+import urllib.request
+
+from playwright.sync_api import sync_playwright
+
+
+def listeners():
+    result = {}
+    for row in Path("/proc/net/tcp").read_text().splitlines()[1:]:
+        fields = row.split()
+        if fields[3] != "0A":
+            continue
+        host, port = fields[1].split(":")
+        address = socket.inet_ntoa(bytes.fromhex(host)[::-1])
+        result[(address, int(port, 16))] = fields[9]
+    return result
+
+
+def relays():
+    result = {}
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            args = (process / "cmdline").read_bytes().split(b"\0")
+            if (os.path.basename(args[0]) == b"socat"
+                    and b"TCP-LISTEN:9222,fork,reuseaddr,bind=0.0.0.0" in args):
+                result[process.name] = args
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return result
+
+
+active = listeners()
+processes = relays()
+if sys.argv[1] == "before":
+    assert not processes, f"Expected no prior relay, found {processes}"
+    assert not any(port in (9222, 9223) for _, port in active), active
+    print("Fresh container: no prior relay or CDP listener")
+    sys.exit(0)
+
+assert ("0.0.0.0", 9222) in active, f"Missing all-interface relay: {active}"
+assert ("127.0.0.1", 9223) in active, f"Missing loopback Chromium: {active}"
+inode = f"socket:[{active[('0.0.0.0', 9222)]}]"
+owners = []
+for pid, args in processes.items():
+    assert b"TCP:127.0.0.1:9223" in args, args
+    try:
+        sockets = [os.readlink(fd) for fd in Path(f"/proc/{pid}/fd").iterdir()]
+    except (FileNotFoundError, ProcessLookupError):
+        continue
+    if inode in sockets:
+        owners.append(pid)
+assert len(owners) == 1, f"Expected one relay listener owner, found {owners}"
+pid = owners[0]
+if len(sys.argv) == 3:
+    assert pid == sys.argv[2], f"Relay replaced: {sys.argv[2]} -> {pid}"
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+versions = []
+pages = []
+for port in (9222, 9223):
+    base = f"http://127.0.0.1:{port}"
+    with opener.open(f"{base}/json/version", timeout=2) as response:
+        versions.append(json.load(response))
+    with opener.open(f"{base}/json/list", timeout=2) as response:
+        pages.append({(page["id"], page["url"]) for page in json.load(response)
+                      if page["type"] == "page"})
+assert pages[0] == pages[1] and any(url == "about:blank" for _, url in pages[0]), pages
+paths = [urllib.parse.urlsplit(version["webSocketDebuggerUrl"]).path
+         for version in versions]
+assert paths[0] == paths[1] and paths[0].startswith("/devtools/browser/"), paths
+assert versions[0]["Browser"] == versions[1]["Browser"], versions
+
+# Send a real CDP command through the relay, not just a discovery request.
+with sync_playwright() as playwright:
+    browser = playwright.chromium.connect_over_cdp("http://127.0.0.1:9222", timeout=3000)
+    session = browser.new_browser_cdp_session()
+    version = session.send("Browser.getVersion")
+    assert version["product"] == versions[1]["Browser"], version
+    session.detach()
+    browser.close()
+
+print(f"Live CDP via 0.0.0.0:9222 -> 127.0.0.1:9223; relay PID {pid}", file=sys.stderr)
+print(pid)
+PROBE
+
+timeout 15s python3 /tmp/relay-probe.py before
+relay_pid=""
+for attempt in 1 2; do
+    if output=$(timeout 15s bash -c "playwright-cli open about:blank 2>&1 | head -40"); then
+        status=0
+    else
+        status=$?
+    fi
+    printf 'Captured open %s: exit %s\n%s\n' "$attempt" "$status" "$output"
+    if [ "$status" -ne 0 ] || [[ "$output" != *opened* ]] || [[ "$output" != *about:blank* ]]; then
+        echo "Expected captured open to exit 0 and report an opened about:blank page" >&2
+        exit 1
+    fi
+    if [ "$attempt" -eq 1 ]; then
+        relay_pid=$(timeout 15s python3 /tmp/relay-probe.py after)
+    else
+        timeout 15s python3 /tmp/relay-probe.py after "$relay_pid"
+    fi
+done
+RELAY_SMOKE
+)
+
+test_browser_relay() {
+    echo ""
+    echo "[browser-relay] Captured open releases streams and preserves live CDP"
+    if RELAY_OUT=$(run_browser_relay_regression 2>&1); then
+        pass "captured browser open completes; live CDP relay is reused"
+    else
+        RELAY_EXIT=$?
+        fail "browser relay regression exited $RELAY_EXIT"
+    fi
+    printf '%s\n' "$RELAY_OUT"
+}
+
+if [ "$MODE" = "--browser-relay-only" ]; then
+    test_browser_relay
+    [ "$FAILED" -eq 0 ]
+    exit
+fi
 
 echo "=== Testing Docker image: $IMAGE ==="
 echo ""
@@ -439,6 +654,8 @@ if echo "$ENTRYPOINT_OUT" | grep -qF "NO_AUTOSTART=1 bash"; then
 else
     fail "entrypoint missing escape-hint line (NO_AUTOSTART=1 bash / touch /tmp/.no_autostart): $ENTRYPOINT_OUT"
 fi
+
+test_browser_relay
 
 # Summary
 echo ""
