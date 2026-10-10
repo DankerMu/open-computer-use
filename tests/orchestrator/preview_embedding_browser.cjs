@@ -273,6 +273,7 @@ const server = http.createServer(async (req, res) => {
           'drawio-pages-image', 'hostile-markdown'].includes(f.file_id));
         listed.push(
           { file_id: 'safe-markdown', path: 'guides/safe.md', type: 'markdown', mime: 'text/markdown' },
+          { file_id: 'compatibility-markdown', path: 'guides/compatibility.md', type: 'markdown', mime: 'text/markdown' },
           { file_id: 'matrix-markdown', path: 'matrix.md', type: 'markdown', mime: 'text/markdown' });
         if (standaloneFirstFile) {
           const index = listed.findIndex(file => file.path === standaloneFirstFile);
@@ -301,13 +302,17 @@ const server = http.createServer(async (req, res) => {
           url: `/ocu/files/${CHAT}/${encodeURIComponent(f.path)}`, ...f })) }));
     }
 
+    if (url.pathname === '/raw-root-chart.png') {
+      record.status = 200;
+      return respond(res, 200, bytes['guides/chart.png'], 'image/png');
+    }
     if ((prefix && url.pathname.startsWith(`${prefix}/files/${CHAT}/`)) ||
         (!prefix && url.pathname.startsWith(`/files/${CHAT}/`))) {
       const filesRoot = `${prefix || ''}/files/${CHAT}/`;
       if (url.pathname.endsWith('/slow.docx')) { held.push(res); slowRequested(); return; }
       if (url.pathname.endsWith('/slow.xlsx')) { heldSheets.push(res); sheetRequested(); return; }
       if (drawioHeldDocument && url.pathname.endsWith('/diagram.drawio')) { heldDrawio.push(res); return; }
-      const name = decodeURIComponent(url.pathname.slice(filesRoot.length));
+      const name = decodeURIComponent(url.pathname.slice(filesRoot.length)).replace(/\/{2,}/g, '/');
       if (!(name in bytes)) {
         requests[requests.length - 1].status = 404;
         return respond(res, 404, 'Not found', 'text/plain');
@@ -1054,6 +1059,26 @@ async function main() {
     for (const [format, data] of Object.entries(rasters))
       assert(data.startsWith(`data:image/${format};base64,`), `browser did not encode ${format}`);
     bytes['guides/pixel.png'] = Buffer.from(rasters.png.split(',')[1], 'base64');
+    bytes['guides/chart.png'] = bytes['guides/pixel.png'];
+    const compatibilityFragments = [
+      { label: 'Normal heading', fragment: 'ordinary-policy', target: 'Ordinary Policy' },
+      { label: 'Encoded normal heading', fragment: '%6Frdinary-policy', target: 'Ordinary Policy' },
+      { label: 'Prefixed heading', fragment: 'user-content-policy', target: 'User Content Policy' },
+      { label: 'Encoded prefixed heading', fragment: '%75ser-content-policy', target: 'User Content Policy' },
+      { label: 'Normal HTML ID', fragment: 'raw-section', target: 'Raw Policy' },
+      { label: 'Encoded normal HTML ID', fragment: '%72aw-section', target: 'Raw Policy' },
+      { label: 'Prefixed HTML ID', fragment: 'user-content-raw-policy', target: 'Prefixed Raw Policy' },
+      { label: 'Encoded prefixed HTML ID', fragment: '%75ser-content-raw-policy', target: 'Prefixed Raw Policy' },
+    ];
+    bytes['guides/compatibility.md'] = Buffer.from([
+      ...compatibilityFragments.map(({ label, fragment }) => `[${label}](#${fragment})`),
+      '![Nested token chart](/chart.png)',
+      '<img alt="Origin-root HTML chart" src="/raw-root-chart.png">',
+      ...Array.from({ length: 40 }, (_, index) => `Navigation spacing paragraph ${index + 1}.`),
+      '# Ordinary Policy', '# User Content Policy',
+      '<h2 id="raw-section">Raw Policy</h2>',
+      '<h2 id="user-content-raw-policy">Prefixed Raw Policy</h2>',
+    ].join('\n\n'));
     bytes['guides/safe.md'] = Buffer.from([
       '[Jump to heading](#safe-heading)',
       '<p><strong>Bold text</strong> <em>Italic text</em> <s>Struck text</s></p>',
@@ -1967,6 +1992,88 @@ async function main() {
       standaloneUploadedNote = false;
       await closeStandalone(panelSession);
     }
+
+    const compatibilityResults = [];
+    const compatibilityExpected = [];
+    const compatibilityErrors = [];
+    for (const prefix of ['', '/ocu', '/tools/ocu']) {
+      const session = await openStandalone(prefix);
+      try {
+        await selectStandaloneFile(session.page, 'guides/compatibility.md');
+        const body = session.page.locator('.preview-stage .markdown-body');
+        await body.locator('h1').getByText('User Content Policy', { exact: true }).waitFor();
+        const images = await body.locator('img').evaluateAll(async nodes => Promise.all(nodes.map(async node => {
+          let decoded = true;
+          try { await node.decode(); } catch { decoded = false; }
+          return { alt: node.alt, decoded, width: node.naturalWidth, height: node.naturalHeight, src: node.src };
+        })));
+        const fragments = [];
+        for (const { label, target } of compatibilityFragments) {
+          const link = body.locator('a').getByText(label, { exact: true });
+          await link.scrollIntoViewIfNeeded();
+          const start = await link.evaluate((node, text) => {
+            const preview = node.closest('.preview').getBoundingClientRect();
+            const top = Math.max(0, preview.top);
+            const bottom = Math.min(innerHeight, preview.bottom);
+            const heading = [...node.closest('.markdown-body').querySelectorAll('h1,h2')]
+              .find(element => element.textContent === text);
+            const targetBox = heading.getBoundingClientRect();
+            const linkBox = node.getBoundingClientRect();
+            return {
+              href: node.getAttribute('href'),
+              ready: linkBox.top >= top - 1 && linkBox.bottom <= bottom + 1 &&
+                (targetBox.bottom < top - 1 || targetBox.top > bottom + 1),
+            };
+          }, target);
+          let navigated = false;
+          if (start.href && start.ready) {
+            await link.click();
+            try {
+              await session.page.waitForFunction(text => {
+                const preview = document.querySelector('.preview').getBoundingClientRect();
+                const heading = [...document.querySelectorAll('.markdown-body h1,.markdown-body h2')]
+                  .find(element => element.textContent === text).getBoundingClientRect();
+                return heading.top >= Math.max(0, preview.top) - 1 &&
+                  heading.bottom <= Math.min(innerHeight, preview.bottom) + 1;
+              }, target, { timeout: 3000 });
+              navigated = true;
+            } catch (error) {
+              if (error.name !== 'TimeoutError') throw error;
+            }
+          }
+          fragments.push({ label, hrefPresent: start.href !== null, startReady: start.ready, navigated });
+        }
+        const tokenImage = images.find(image => image.alt === 'Nested token chart');
+        const rawImage = images.find(image => image.alt === 'Origin-root HTML chart');
+        compatibilityResults.push({
+          prefix, fragments,
+          tokenImage: {
+            decoded: tokenImage.decoded, width: tokenImage.width, height: tokenImage.height,
+            workspacePath: new URL(tokenImage.src).pathname.replace(/\/{2,}/g, '/') === `${prefix}/files/${CHAT}/guides/chart.png`,
+          },
+          rawImage: {
+            decoded: rawImage.decoded, width: rawImage.width, height: rawImage.height,
+            originRoot: rawImage.src === `${origin}/raw-root-chart.png`,
+          },
+        });
+        compatibilityExpected.push({
+          prefix,
+          fragments: compatibilityFragments.map(({ label }) => ({
+            label, hrefPresent: true, startReady: true, navigated: true,
+          })),
+          tokenImage: { decoded: true, width: 2, height: 2, workspacePath: true },
+          rawImage: { decoded: true, width: 2, height: 2, originRoot: true },
+        });
+        compatibilityErrors.push(...caseErrors(session));
+      } catch (error) {
+        await captureStandaloneFailure(session, 'markdown-compatibility');
+        throw error;
+      } finally { await closeStandalone(session); }
+    }
+    assert.deepEqual(compatibilityResults, compatibilityExpected,
+      'Markdown fragments and nested token resources must preserve consumer behavior');
+    assert.deepEqual(compatibilityErrors, [], 'Markdown compatibility produced unexpected console errors');
+    console.log(JSON.stringify({ markdownCompatibility: 'ok', prefixes: ['', '/ocu', '/tools/ocu'] }));
 
     const markdownSession = await openStandalone('/ocu');
     try {

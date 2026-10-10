@@ -361,7 +361,22 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
     const resp = await fetchOutput(file.url);
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000) + '\n\n... (truncated)';
+    const rasterImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/i;
+    const fileDir = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/') + 1) : '';
+    const base = new URL(FILES_BASE + '/' + fileDir, location.origin);
     const renderer = new marked.Renderer();
+    for (const kind of ['image', 'link']) {
+      const render = renderer[kind].bind(renderer);
+      renderer[kind] = function(token) {
+        const href = token.href?.trim();
+        if (href?.startsWith('/') && !href.startsWith('//')) {
+          // Token root paths belong to the workspace; raw HTML keeps origin-root semantics.
+          token.href = safeUrl(href, kind === 'image') === null ? ''
+            : FILES_BASE + '/' + fileDir + href;
+        }
+        return render(token);
+      };
+    }
     renderer.heading = function(token) {
       let text = token.text;
       let prev;
@@ -389,9 +404,6 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
       ALLOW_ARIA_ATTR: false,
       SANITIZE_NAMED_PROPS: true,
     });
-    const rasterImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/i;
-    const fileDir = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/') + 1) : '';
-    const base = new URL(FILES_BASE + '/' + fileDir, location.origin);
     const ids = new Set(Array.from(fragment.querySelectorAll('[id]'), node => node.id));
     function safeUrl(value, image) {
       const href = value.trim();
@@ -402,7 +414,8 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
       if (scheme && scheme !== 'http' && scheme !== 'https' && (image || scheme !== 'mailto')) return null;
       if (href.startsWith('#') && !image) {
         try {
-          const target = 'user-content-' + decodeURIComponent(href.slice(1));
+          const id = decodeURIComponent(href.slice(1));
+          const target = id.startsWith('user-content-') ? id : 'user-content-' + id;
           return ids.has(target) ? '#' + encodeURIComponent(target) : null;
         } catch { return null; }
       }
