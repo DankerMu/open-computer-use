@@ -843,6 +843,17 @@ body {
   flex-wrap: wrap;
 }
 
+.dash-upload-error {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-subtle);
+  color: var(--danger-fg);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .dash-btn-primary {
   display: inline-flex;
   align-items: center;
