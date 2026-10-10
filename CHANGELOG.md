@@ -3,6 +3,10 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Independent browser CDP relay lifetime.** Captured `playwright-cli` commands
+  complete while the detached relay retains browser viewer access. Rebuild the
+  image and recreate sandbox containers to apply the fix.
+
 - **Office callback persistence errors.** Ordinary filesystem failures during
   content and no-content callback persistence return HTTP 500 with JSON reason
   `state_corrupt`, without error-time state writes. Disk-full failures remain
