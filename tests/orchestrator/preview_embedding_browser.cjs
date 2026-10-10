@@ -1773,6 +1773,7 @@ async function main() {
     await waitUntil(() => requests.slice(beforeEmbedUpload).some(row =>
       row.method === 'GET' && row.path === `/ocu/terminal/${CHAT}/status`),
       'terminal embed upload dashboard refresh');
+    await frame().locator('.dash-btn-secondary').waitFor();
     const afterEmbedUpload = requests.slice(beforeEmbedUpload);
     assert.equal(await frame().locator('.dash-btn-secondary').count(), 1,
       'terminal embed upload dropped the upload action');
