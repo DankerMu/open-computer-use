@@ -35,13 +35,12 @@ run_in_container() {
     docker run --rm --platform linux/amd64 --entrypoint=bash --user=assistant "$IMAGE" -c "$1" 2>/dev/null
 }
 
-# Same run, but stderr is KEPT. run_in_container discards it, which is correct
-# for an assertion -- a tool's chatter is not the subject -- and useless the
-# moment something fails for a reason only stderr carries. #426 stalled exactly
-# there: the tsx probe failed in CI, the cause was suppressed, and diagnosing it
-# needed a machine that could build the image.
+# Offline, bounded tool probes retain diagnostics and the container's exit status.
 run_in_container_verbose() {
-    docker run --rm --platform linux/amd64 --entrypoint=bash --user=assistant "$IMAGE" -c "$1" 2>&1
+    # Kill stalled compilers/browser children before Docker removes the owned container.
+    docker run --rm --platform linux/amd64 --network=none \
+        --entrypoint=timeout --user=assistant "$IMAGE" \
+        --kill-after=10s 240s bash -euo pipefail -c "$1" 2>&1
 }
 
 echo "=== Testing Docker image: $IMAGE ==="
@@ -53,10 +52,130 @@ echo ""
 # Forcing the assignment to succeed (with empty content on docker error) lets
 # the existing grep-based pass/fail accounting handle the failure naturally.
 
-# 1. Node.js and Python versions
-echo "[1/14] Runtime versions"
-VERSIONS=$(run_in_container 'node --version && python3 --version') || VERSIONS=""
-echo "$VERSIONS" | grep -q "v22" && pass "Node.js v22" || fail "Node.js version"
+# 1. Runtime versions and executable Node tools
+echo "[1/14] Runtime versions and Node tools"
+NODE_PROBE=$(cat <<'PROBE'
+node <<'JS'
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const { execFileSync } = require("node:child_process");
+const semver = require("/usr/local/lib/node_modules/npm/node_modules/semver");
+const versions = { node: process.versions.node, npm: execFileSync("npm", ["--version"], { encoding: "utf8" }).trim() };
+console.log(JSON.stringify({ ...versions, platform: process.platform, arch: process.arch }));
+assert.equal(versions.node, "22.23.2");
+assert.equal(versions.npm, "10.9.8");
+assert.equal(process.platform, "linux");
+assert.equal(process.arch, "x64");
+const manifest = JSON.parse(fs.readFileSync("/tmp/package.json", "utf8"));
+assert.deepEqual(manifest.engines, { node: ">=22.20.0", npm: ">=10.9.3" });
+for (const [runtime, range] of Object.entries(manifest.engines)) {
+    assert(semver.satisfies(versions[runtime], range), `manifest ${runtime}: ${range}`);
+}
+for (const root of ["/home/node_modules", "/usr/local/lib/node_modules_global/lib/node_modules"]) {
+    for (const [name, range] of Object.entries(manifest.dependencies)) {
+        const pkg = JSON.parse(fs.readFileSync(`${root}/${name}/package.json`, "utf8"));
+        console.log(JSON.stringify({ root, name, version: pkg.version, engines: pkg.engines ?? {} }));
+        assert(semver.satisfies(pkg.version, range), `${root}/${name}: ${pkg.version} outside ${range}`);
+        for (const runtime of ["node", "npm"]) {
+            if (pkg.engines?.[runtime]) {
+                assert(semver.satisfies(versions[runtime], pkg.engines[runtime]), `${root}/${name}: incompatible ${runtime} ${pkg.engines[runtime]}`);
+            }
+        }
+    }
+}
+JS
+
+# Keep ESM fixtures under /home so they resolve the image's installed packages.
+work=$(mktemp -d /home/assistant/.node-probe.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+printf '{"type":"module"}\n' > package.json
+mkdir types
+cat > good.ts <<'TS'
+export const twice = (value: number): number => value * 2;
+console.log(twice(21));
+TS
+test "$(tsx good.ts)" = "42"
+echo "tsx: typed fixture = 42"
+tsc --strict --target es2022 --module es2022 --typeRoots "$work/types" --outDir compiled good.ts
+test "$(node compiled/good.js)" = "42"
+printf 'const value: number = "wrong";\n' > bad.ts
+if tsc --noEmit --strict --typeRoots "$work/types" bad.ts > bad-types.log 2>&1; then
+    echo "tsc accepted an ill-typed fixture" >&2
+    exit 1
+fi
+cat bad-types.log
+grep -q 'error TS2322' bad-types.log
+echo "tsc: emitted result = 42; invalid assignment rejected with TS2322"
+
+python3 <<'PY'
+import json
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    config = {"executablePath": p.chromium.executable_path, "args": ["--no-sandbox"]}
+with open("puppeteer.json", "w") as output:
+    json.dump(config, output)
+print("Mermaid browser configuration:", json.dumps(config))
+PY
+printf 'graph LR\n  input[RuntimeInput] --> output[RuntimeOutput]\n' > graph.mmd
+# Keep graph labels in SVG text rather than embedded HTML.
+printf '{"htmlLabels":false}\n' > mermaid.json
+mmdc -p puppeteer.json -c mermaid.json -i graph.mmd -o graph.svg
+python3 <<'PY'
+import json
+import xml.etree.ElementTree as ET
+root = ET.parse("graph.svg").getroot()
+ns = "{http://www.w3.org/2000/svg}"
+assert root.tag == ns + "svg", root.tag
+labels = ["".join(node.itertext()).strip() for node in root.iter(ns + "text")]
+assert "RuntimeInput" in labels and "RuntimeOutput" in labels, labels
+edges = [
+    node for node in root.iter(ns + "path")
+    if "flowchart-link" in node.get("class", "").split()
+]
+assert len(edges) == 1 and edges[0].get("d") and edges[0].get("marker-end")
+print("Mermaid SVG:", json.dumps({"labels": labels, "directed_edges": len(edges)}))
+PY
+
+# A different PDF implementation produces the input for pdfjs-dist.
+python3 <<'PY'
+from reportlab.pdfgen.canvas import Canvas
+pdf = Canvas("fixture.pdf", pagesize=(300, 200))
+pdf.drawString(30, 100, "Node runtime PDF fixture")
+pdf.showPage()
+pdf.save()
+PY
+cat > parse.mjs <<'JS'
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+const loadingTask = getDocument({
+    data: new Uint8Array(readFileSync("fixture.pdf")),
+    standardFontDataUrl: "/home/node_modules/pdfjs-dist/standard_fonts/"
+});
+try {
+    const pdf = await loadingTask.promise;
+    assert.equal(pdf.numPages, 1);
+    const page = await pdf.getPage(1);
+    const content = await page.getTextContent();
+    const text = content.items.map(item => item.str).join("");
+    assert.equal(text, "Node runtime PDF fixture");
+    console.log("pdfjs-dist:", JSON.stringify({ pages: pdf.numPages, text }));
+} finally {
+    await loadingTask.destroy();
+}
+JS
+node parse.mjs
+PROBE
+)
+if NODE_OUT=$(run_in_container_verbose "$NODE_PROBE"); then
+    pass "approved Node/npm, installed engines, Mermaid, tsx, tsc and PDF behavior"
+else
+    NODE_EXIT=$?
+    fail "Node runtime/tool verification exited $NODE_EXIT"
+fi
+printf '%s\n' "$NODE_OUT"
+VERSIONS=$(run_in_container 'python3 --version') || VERSIONS=""
 echo "$VERSIONS" | grep -q "Python 3" && pass "Python 3" || fail "Python version"
 
 # 2. CommonJS require()
@@ -77,15 +196,6 @@ done
 # CommonJS marked is installed and require() succeeds.
 RESULT=$(run_in_container "node --input-type=module -e \"import {marked} from 'marked'; const h=marked.parse('# t'); console.log(/<h1/.test(h)?'OK':'FAIL')\"") || RESULT=""
 echo "$RESULT" | grep -q "OK" && pass "marked renders a heading" || fail "marked render"
-
-# tsc COMPILES. The CLI loop below only proves --version exits 0, which a major
-# that changed type-checking would also satisfy. This compiles a strict file and
-# then asserts a deliberately ill-typed one is REJECTED, so the check cannot pass
-# by accepting everything.
-RESULT=$(run_in_container "d=\$(mktemp -d); printf 'export const twice = (x: number): number => x * 2;\\n' > \$d/a.ts; tsc --noEmit --strict \$d/a.ts >/dev/null 2>&1 && echo OK || echo FAIL") || RESULT=""
-echo "$RESULT" | grep -q "OK" && pass "tsc compiles a strict file" || fail "tsc compile"
-RESULT=$(run_in_container "d=\$(mktemp -d); printf 'const n: number = \\"nope\\";\\n' > \$d/b.ts; tsc --noEmit --strict \$d/b.ts >/dev/null 2>&1 && echo FAIL || echo OK") || RESULT=""
-echo "$RESULT" | grep -q "OK" && pass "tsc rejects an ill-typed file" || fail "tsc did not reject bad types"
 
 # 3. ES Modules import
 echo ""
@@ -117,29 +227,6 @@ for tool in mmdc tsc tsx claude codex opencode; do
     VRESULT=$(run_in_container "$tool --version >/dev/null 2>&1 && echo OK || echo FAIL") || VRESULT=""
     echo "$VRESULT" | grep -q "OK" && pass "$tool --version exit 0" || fail "$tool --version failed"
 done
-
-# tsx must RUN a file, not merely answer --version. #425 removed ts-node because
-# TypeScript 7 deletes the API it consumed, which leaves tsx as the only way a
-# skill executes TypeScript -- so "installed" stopped being a sufficient claim.
-#
-# On failure this prints the command's own stderr. The first attempt at this
-# check (#426) suppressed it, the CI failure said only "FAIL: tsx execution",
-# and finding the cause needed someone who could build and enter the image.
-# A check that cannot say why it failed defers the work rather than doing it.
-TSX_PROBE='cd /tmp && printf "console.log(\"tsx-ok\", 2*2);\n" > tsxprobe.ts && tsx tsxprobe.ts'
-# NOT `|| TSX_OUT="..."`: that fires on a NON-ZERO EXIT, which is exactly the
-# failing case, and overwrites the captured stderr with a placeholder. Probed --
-# it turned a real "Cannot find module" into "<docker run failed>", reproducing
-# the uninformative output this check exists to replace. Capture first, then
-# read the status separately.
-TSX_OUT=$(run_in_container_verbose "$TSX_PROBE"; echo "rc=$?")
-if echo "$TSX_OUT" | grep -q "tsx-ok 4"; then
-    pass "tsx executes a TypeScript file"
-else
-    fail "tsx cannot execute a TypeScript file"
-    echo "    the container said:"
-    echo "$TSX_OUT" | sed 's/^/      /' | head -20
-fi
 
 # list-subagent-models presence + executability (Phase 1 / Plan 01-05 install line)
 RESULT=$(run_in_container "which list-subagent-models >/dev/null 2>&1 && echo OK || echo MISSING") || RESULT=""
