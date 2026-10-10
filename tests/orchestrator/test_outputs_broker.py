@@ -836,8 +836,9 @@ def test_absent_outputs_root_does_not_consume_scan_directory_or_iterator_budget(
 
 
 @pytest.mark.parametrize("failure_kind", ["os-error", "base-exception"])
+@pytest.mark.parametrize("pressure", [False, True])
 def test_child_iterator_failure_releases_current_frontier_and_duplicate_but_not_root(
-    world, monkeypatch, failure_kind
+    world, monkeypatch, request, failure_kind, pressure
 ):
     broker_module, _docker_manager, data = world
     output_root = _outputs(data)
@@ -848,7 +849,29 @@ def test_child_iterator_failure_releases_current_frontier_and_duplicate_but_not_
     original_scandir = os.scandir
     acquired = []
     iterator_fds = []
+    native_iterators = []
+    pressure_handles = []
+    if pressure:
+        for _ in range(32):
+            handle = open(os.devnull, "rb")
+            request.addfinalizer(handle.close)
+            pressure_handles.append(handle)
+        for handle in pressure_handles[:4]:
+            handle.close()
     root_fd = original_open(output_root, broker_module._DIRECTORY_FLAGS)
+
+    def live_descriptors():
+        descriptors = {}
+        for name in os.listdir("/dev/fd"):
+            if not name.isdecimal():
+                continue
+            fd = int(name)
+            try:
+                descriptors[fd] = os.fstat(fd)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
+        return descriptors
 
     class ScanInterrupted(BaseException):
         pass
@@ -856,20 +879,12 @@ def test_child_iterator_failure_releases_current_frontier_and_duplicate_but_not_
     class FailingChildListing:
         def __init__(self, fd):
             identity = os.fstat(fd)
-            before = set()
-            for candidate in range(max([root_fd, *acquired]) + 2):
-                try:
-                    os.fstat(candidate)
-                    before.add(candidate)
-                except OSError:
-                    pass
+            before = live_descriptors()
             self.listing = original_scandir(fd)
-            for candidate in range(max([root_fd, *acquired]) + 2):
+            native_iterators.append(self.listing)
+            request.addfinalizer(self.listing.close)
+            for candidate, info in live_descriptors().items():
                 if candidate in before:
-                    continue
-                try:
-                    info = os.fstat(candidate)
-                except OSError:
                     continue
                 if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
                     iterator_fds.append(candidate)
@@ -903,6 +918,8 @@ def test_child_iterator_failure_releases_current_frontier_and_duplicate_but_not_
             with pytest.raises(expected):
                 broker_module.OutputsBroker()._scan_tree(root_fd, {})
         assert len(iterator_fds) == 1
+        if pressure:
+            assert iterator_fds[0] >= max([root_fd, *acquired]) + 2
         for fd in [*acquired, *iterator_fds]:
             with pytest.raises(OSError) as failure:
                 os.fstat(fd)

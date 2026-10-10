@@ -7,6 +7,27 @@
   complete while the detached relay retains browser viewer access. Rebuild the
   image and recreate sandbox containers to apply the fix.
 
+- **Workspace Node runtime.** The linux/amd64 image uses fixed Node.js 22.23.2
+  with bundled npm 10.9.8, satisfying the unchanged manifest engine floors.
+  The default image harness checks installed engines and executes offline
+  Mermaid rendering, typed tsx/tsc fixtures and local PDF parsing.
+
+- **Terminal upload failures.** Standalone and embedded dashboards show localized
+  filename/retry feedback for HTTP and connection failures and release the selected
+  temporary input. Selection stops at the first failure without retry or rollback;
+  complete success retains dashboard refresh and standalone Files refresh.
+
+- **Visible output ZIP contents.** Archives omit dot-prefixed files and files
+  beneath hidden directories, including upload staging residue. Completed visible
+  uploads retain their full bytes and actual collision names; hidden files remain
+  on disk. Outputs with no visible files return the existing no-files HTTP 404.
+
+- **Byte-bounded collision names.** Uploads and Office copies preserve the complete
+  last suffix and numbered tail within the destination's filename byte limit,
+  shortening only the stem on whole-character boundaries. Free upload names stay
+  unchanged; atomic claims preserve occupied files. An impossible collision name
+  returns upload HTTP 400 without a new file or attachment receipt.
+
 - **Office callback persistence errors.** Ordinary filesystem failures during
   content and no-content callback persistence return HTTP 500 with JSON reason
   `state_corrupt`, without error-time state writes. Disk-full failures remain

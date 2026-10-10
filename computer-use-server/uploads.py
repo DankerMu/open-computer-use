@@ -155,6 +155,38 @@ def ensure_workspace_directories(root_fd: int, parts: tuple[str, ...]) -> int:
         close_fd(current_fd)
 
 
+class NameCapacityError(OSError):
+    """A numbered filename cannot retain its suffix and a minimal stem."""
+
+
+def format_collision_name(requested_name: str, number: int, *, dst_dir_fd: int) -> str:
+    """Budget a numbered basename in filesystem bytes for the borrowed target fd."""
+    limit = os.fpathconf(dst_dir_fd, "PC_NAME_MAX")
+    if limit <= 0:
+        raise OSError(errno.EIO, "Destination filename limit is indeterminate")
+    requested = Path(requested_name)
+    tail = f" ({number}){requested.suffix}"
+    budget = limit - len(os.fsencode(tail))
+    if budget < len(os.fsencode("_")):
+        raise NameCapacityError(
+            errno.ENAMETOOLONG,
+            "Numbered filename cannot fit the destination name limit",
+            requested.name,
+        )
+    stem = requested.stem
+    if len(os.fsencode(stem)) > budget:
+        used = 0
+        kept = 0
+        for character in stem:
+            width = len(os.fsencode(character))
+            if used + width > budget:
+                break
+            used += width
+            kept += 1
+        stem = stem[:kept]
+    return (stem or "_") + tail
+
+
 def claim_file_no_replace(
     temporary: str,
     *,
@@ -184,7 +216,7 @@ def claim_file_no_replace(
             )
             return candidate
         except FileExistsError:
-            candidate = f"{requested.stem} ({number}){requested.suffix}"
+            candidate = format_collision_name(requested.name, number, dst_dir_fd=dst_dir_fd)
             number += 1
         except OSError as exc:
             if _is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:

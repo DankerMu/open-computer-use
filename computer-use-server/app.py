@@ -67,6 +67,7 @@ from docker_manager import (
 from security import sanitize_chat_id, safe_path
 from uploads import (
     CorruptReceiptsError,
+    NameCapacityError,
     claim_file_no_replace,
     close_fd,
     ensure_workspace_directories,
@@ -579,24 +580,6 @@ def classify_file(filename: str) -> tuple:
     return 'other', mime
 
 
-def format_size(size_bytes: int) -> str:
-    """Format file size for display."""
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    return f"{size_bytes / (1024 * 1024):.1f} MB"
-
-
-_FILE_ICONS = {
-    'html': '🌐', 'image': '🖼️', 'code': '📝', 'text': '📄',
-    'pdf': '📕', 'markdown': '📃', 'spreadsheet': '📊',
-    'docx': '📄', 'xlsx': '📊', 'pptx': '📊',
-    'audio': '🎵', 'video': '🎬', 'other': '📎',
-}
-
-
-
 @app.get("/", response_class=HTMLResponse, tags=["System"], include_in_schema=False)
 async def root():
     """Main page with MCP and File API documentation"""
@@ -729,6 +712,8 @@ async def upload_file(
         raise
     except CorruptReceiptsError:
         raise HTTPException(status_code=500, detail="import receipts are corrupt")
+    except NameCapacityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
@@ -764,9 +749,11 @@ async def download_archive(chat_id: str):
             detail="Path is not a directory"
         )
 
-    # Get all files in directory
-    files = list(outputs_dir.rglob("*"))
-    files = [f for f in files if f.is_file()]
+    files = [
+        path for path in outputs_dir.rglob("*")
+        if not any(part.startswith(".") for part in path.relative_to(outputs_dir).parts)
+        and path.is_file()
+    ]
 
     if not files:
         raise HTTPException(

@@ -312,6 +312,34 @@ def test_archive_keeps_zip_contents_without_cache_or_isolation_headers(client, o
         assert archive.read("nested/active.html") == b"<p>archived output</p>"
 
 
+@pytest.mark.parametrize("visible", (True, False), ids=("mixed", "hidden-only"))
+def test_archive_omits_hidden_paths_without_removing_them(client, output_dir, visible):
+    hidden = {
+        ".upload-stale": b"stale staging",
+        "nested/.upload-stale": b"nested staging",
+        ".private/visible.txt": b"hidden ancestor",
+    }
+    for name, body in hidden.items():
+        path = output_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+    if visible:
+        (output_dir / "nested" / "complete.txt").write_bytes(b"complete visible bytes")
+    with (output_dir / ".upload-active").open("wb") as active:
+        active.write(b"in-progress staging")
+        active.flush()
+        response = client.get(_file_url("archive"), headers=_auth_headers())
+        assert response.status_code == (200 if visible else 404)
+        if visible:
+            with zipfile.ZipFile(BytesIO(response.content)) as archive:
+                assert archive.namelist() == ["nested/complete.txt"]
+                assert archive.read("nested/complete.txt") == b"complete visible bytes"
+        else:
+            assert response.json() == {"detail": "No files found in outputs directory"}
+    hidden[".upload-active"] = b"in-progress staging"
+    assert {name: (output_dir / name).read_bytes() for name in hidden} == hidden
+
+
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_inline_html_uses_rfc5987_filename_encoding(client, output_dir, download):
     chinese = "简报.html"

@@ -164,6 +164,8 @@ def test_passthrough_isolation(
     pinned in the container Env so docker exec subprocesses inherit it
     (Pitfall 7 — entrypoint export alone is insufficient)."""
     overrides = {
+        "ENABLE_NETWORK": "true",
+        "SANDBOX_HOST_BIND_IP": "172.31.0.1",
         "SUBAGENT_CLI": cli,
         # Set ALL three families of auth env vars on the "host" (test process).
         "ANTHROPIC_AUTH_TOKEN": "sk-ant-stub",

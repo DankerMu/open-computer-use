@@ -1634,6 +1634,7 @@ function BrowserView({ chatId, browserActive, onBrowserViewerRef }) {
 function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSession, onResumeSession, onFilesRefresh }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [uploadError, setUploadError] = useState(null);
   const mountedRef = useRef(false);
   const requestRef = useRef(null);
 
@@ -1680,13 +1681,27 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
     input.style.display = 'none';
     document.body.appendChild(input);
     input.addEventListener('change', async () => {
-      for (const file of input.files) {
-        const formData = new FormData();
-        formData.append('file', file);
-        const response = await ocuFetch(`/api/uploads/${chatId}/${encodeURIComponent(file.name)}`, { method: 'POST', body: formData });
-        await response.text();
+      if (mountedRef.current) setUploadError(null);
+      try {
+        for (const file of input.files) {
+          try {
+            const formData = new FormData();
+            formData.append('file', file);
+            const response = await ocuFetch(`/api/uploads/${chatId}/${encodeURIComponent(file.name)}`, { method: 'POST', body: formData });
+            await response.text();
+            if (!response.ok) {
+              if (mountedRef.current) setUploadError(file.name);
+              return;
+            }
+          } catch(e) {
+            if (mountedRef.current) setUploadError(file.name);
+            return;
+          }
+        }
+      } finally {
+        input.remove();
       }
-      input.remove();
+      if (!mountedRef.current) return;
       fetchData();
       if (onFilesRefresh) onFilesRefresh();
     });
@@ -1732,6 +1747,9 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
             <span class="icon-inline" dangerouslySetInnerHTML=${{ __html: icon('book') }}></span> ${t('how_to_use')}
           </a>
         </div>
+        ${uploadError !== null && html`
+          <div class="dash-upload-error" role="alert">${t('upload_fail')} "${uploadError}". ${t('upload_retry')}</div>
+        `}
       </div>
 
       ${hasProcesses && html`

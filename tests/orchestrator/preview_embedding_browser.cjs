@@ -166,6 +166,12 @@ let standaloneUploadedNote = false;
 let standaloneFirstFile = null;
 let standaloneListing = null;
 let injectedListingFailure = false;
+const uploadFixtures = new Map();
+const retainedUploads = new Map();
+const uploadBodyCanary = '<img id="upload-body-canary" src=x onerror="window.__uploadCanary=1">';
+const uploadFailureOrder = process.env.OCU_PREVIEW_UPLOAD_FAILURE_ORDER || 'http-first';
+assert(['http-first', 'network-first'].includes(uploadFailureOrder),
+  'OCU_PREVIEW_UPLOAD_FAILURE_ORDER must be http-first or network-first');
 
 let drawioMissingViewer = false;
 let drawioCorruptViewer = false;
@@ -342,6 +348,16 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === `${prefix}/terminal/${CHAT}/processes`) return respond(res, 200, JSON.stringify({ processes: [] }));
     if (url.pathname === `${prefix}/terminal/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false }));
     if (url.pathname === `${prefix}/terminal/${CHAT}/sessions`) return respond(res, 200, JSON.stringify({ sessions: [] }));
+    if (url.pathname.startsWith(`${prefix}/api/uploads/${CHAT}/`) && req.method === 'POST' &&
+        uploadFixtures.has(url.pathname)) {
+      const status = uploadFixtures.get(url.pathname);
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      record.status = status;
+      if (status === 200) retainedUploads.set(url.pathname, Buffer.concat(chunks));
+      return respond(res, status, status === 200 ? '{"status":"success"}' : uploadBodyCanary,
+        'text/plain');
+    }
     if (url.pathname === `${prefix}/api/uploads/${CHAT}/note.txt` && req.method === 'POST') {
       record.status = 200;
       standaloneUploadedNote = true;
@@ -738,6 +754,8 @@ async function main() {
     const page = await context.newPage();
     page.setDefaultTimeout(10000);
     const consoleErrors = [];
+    const expectedOwnedErrors = [];
+    const uploadFaults = [];
     const observedBrowserSockets = [];
     page.on('websocket', socket => {
       const path = new URL(socket.url()).pathname;
@@ -778,6 +796,11 @@ async function main() {
     page.on('requestfailed', request => {
       const failure = request.failure()?.errorText || '';
       const url = request.url();
+      const uploadFault = uploadFaults.find(fault => fault.request === request && fault.kind === 'network');
+      if (uploadFault && failure === 'net::ERR_CONNECTION_RESET') {
+        uploadFault.failure = failure;
+        return;
+      }
       if (cspProbeTargets.has(url) &&
           (failure === 'csp' || failure.includes('ERR_BLOCKED_BY_CSP'))) {
         cspProbeTargets.delete(url);
@@ -1532,6 +1555,211 @@ async function main() {
       listingBeforeRuntime, 'terminal embed listed Files');
     assert.equal(requests.filter(row => /\/(restart-container|start-ttyd)$/.test(row.path)).length,
       launchBeforeRuntime, 'runtime embedding implicitly launched a sandbox');
+    const exerciseUploadFailures = async (target, surface, standalone) => {
+      const dashboard = surface.locator('.dash-scroll');
+      const captureUploadFailure = async label => {
+        const iframe = standalone ? null : target.locator('#preview');
+        const originalStyle = iframe ? await iframe.getAttribute('style') : null;
+        try {
+          if (iframe) await iframe.evaluate(node => {
+            node.style.width = '1000px';
+            node.style.height = '700px';
+          });
+          const alert = dashboard.getByRole('alert');
+          if (await alert.isVisible()) await alert.scrollIntoViewIfNeeded();
+          await target.screenshot({ path: path.join(artifacts, `${label}.png`) });
+        } finally {
+          if (iframe) await iframe.evaluate((node, style) => {
+            if (style === null) node.removeAttribute('style');
+            else node.setAttribute('style', style);
+          }, originalStyle);
+        }
+      };
+      const uploadPath = name => `/ocu/api/uploads/${CHAT}/${encodeURIComponent(name)}`;
+      const submitted = [];
+      const recordSubmission = request => {
+        if (request.method() === 'POST' && request.url().startsWith(`${origin}/ocu/api/uploads/${CHAT}/`))
+          submitted.push(request);
+      };
+      const recordStandaloneFailure = request => {
+        const fault = uploadFaults.find(candidate => candidate.request === request && candidate.kind === 'network');
+        const failure = request.failure()?.errorText || '';
+        if (fault && failure === 'net::ERR_CONNECTION_RESET') fault.failure = failure;
+        else unexpectedNetworkFailures.push(`${request.url()}: ${failure}`);
+      };
+      const settle = () => dashboard.evaluate(() => new Promise(resolve =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const choose = async names => {
+        const chooserPromise = target.waitForEvent('filechooser');
+        await surface.locator('.dash-btn-secondary').click();
+        const chooser = await chooserPromise;
+        const input = chooser.element();
+        await chooser.setFiles(names.map(name => ({
+          name, mimeType: 'text/plain', buffer: Buffer.from(`retained content: ${name}`),
+        })));
+        return input;
+      };
+      const waitInputRemoved = input => within(input.evaluate(node => new Promise(resolve => {
+        if (!node.isConnected) return resolve();
+        const observer = new MutationObserver(() => {
+          if (!node.isConnected) {
+            observer.disconnect();
+            resolve();
+          }
+        });
+        observer.observe(node.ownerDocument, { childList: true, subtree: true });
+      })), 'selected upload input removal');
+      const dashboardGets = after => requests.slice(after).filter(row =>
+        row.method === 'GET' && ['/status', '/sessions', '/processes'].some(suffix =>
+          row.path === `/ocu/terminal/${CHAT}${suffix}`));
+      const listingGets = after => requests.slice(after).filter(row =>
+        row.method === 'GET' && row.path === `/ocu/api/outputs/${CHAT}`);
+      const cases = uploadFailureOrder === 'network-first'
+        ? ['network', 'http4', 'http5'] : ['http4', 'http5', 'network'];
+      target.on('request', recordSubmission);
+      if (standalone) target.on('requestfailed', recordStandaloneFailure);
+      try {
+        for (const kind of cases) {
+          const label = `${standalone ? 'standalone' : 'embedded'}-terminal-upload-${kind}`;
+          const name = `${label}-<img src=x onerror=window.__uploadCanary=1>.txt`;
+          const priorName = `${label}-prior.txt`;
+          const laterName = `${label}-later.txt`;
+          const partial = kind === 'http5';
+          const pathname = uploadPath(name);
+          const url = origin + pathname;
+          const fault = { kind, url, status: kind === 'http4' ? 413 : 503, request: null, failure: null };
+          const names = partial ? [priorName, name, laterName] : [name];
+          for (const selected of names) uploadFixtures.set(uploadPath(selected), 200);
+          if (kind !== 'network') uploadFixtures.set(pathname, fault.status);
+          uploadFaults.push(fault);
+          const abortUpload = route => {
+            const request = route.request();
+            if (request.method() !== 'POST' || fault.request) return route.continue();
+            fault.request = request;
+            return route.abort('connectionreset');
+          };
+          if (kind === 'network') await target.route(url, abortUpload);
+          const before = requests.length;
+          const beforeSubmissions = submitted.length;
+          const beforeErrors = consoleErrors.length;
+          let input;
+          let retryInput;
+          try {
+            const outcome = kind === 'network'
+              ? target.waitForEvent('requestfailed', request =>
+                request.url() === url && request.method() === 'POST')
+              : target.waitForResponse(response =>
+                response.url() === url && response.request().method() === 'POST');
+            input = await choose(names);
+            const observed = await outcome;
+            if (kind === 'network') {
+              assert.equal(observed, fault.request, `${label} aborted a different request`);
+              assert.equal(fault.failure, 'net::ERR_CONNECTION_RESET', `${label} lacked the injected network failure`);
+              assert.equal(requests.slice(before).filter(row => row.path === pathname).length, 0,
+                `${label} aborted upload unexpectedly reached the recording server`);
+            } else {
+              fault.request = observed.request();
+              assert.equal(observed.status(), fault.status, `${label} lacked the real HTTP refusal`);
+              assert.equal(requests.slice(before).find(row => row.path === pathname)?.status, fault.status);
+            }
+            const alert = dashboard.getByRole('alert');
+            await alert.waitFor({ state: 'visible' });
+            const text = await alert.innerText();
+            assert(text.includes(name), `${label} feedback did not identify the failed filename`);
+            assert(/\bretry\b|\btry again\b|повтор|снова/i.test(text), `${label} feedback omitted retry guidance`);
+            await waitInputRemoved(input);
+            await settle();
+            assert.deepEqual(dashboardGets(before), [], `${label} falsely refreshed the successful dashboard`);
+            assert.deepEqual(listingGets(before), [], `${label} falsely called successful Files refresh`);
+            assert.deepEqual(submitted.slice(beforeSubmissions).map(request => new URL(request.url()).pathname),
+              partial ? [uploadPath(priorName), pathname] : [pathname],
+              `${label} retried or attempted a file after the first failure`);
+            assert.equal(retainedUploads.has(pathname), false, `${label} accepted the refused upload`);
+            const retainedPrior = retainedUploads.get(uploadPath(priorName));
+            if (partial) {
+              assert(retainedPrior?.includes(Buffer.from(`retained content: ${priorName}`)),
+                `${label} lost the earlier successful upload`);
+              assert.equal(retainedUploads.has(uploadPath(laterName)), false, `${label} uploaded the later file`);
+            }
+            assert.equal(await dashboard.locator('img, #upload-body-canary').count(), 0,
+              `${label} interpreted the filename or server body as HTML`);
+            assert.equal(await dashboard.evaluate(() => window.__uploadCanary), undefined,
+              `${label} executed upload error HTML`);
+            assert(!text.includes(uploadBodyCanary), `${label} exposed the raw server body`);
+            await captureUploadFailure(label);
+            const owned = consoleErrors.slice(beforeErrors);
+            const nativeDiagnostic = error => error.url === url &&
+              (kind === 'network'
+                ? error.text === 'Failed to load resource: net::ERR_CONNECTION_RESET' &&
+                  fault.failure === 'net::ERR_CONNECTION_RESET'
+                : error.text.startsWith('Failed to load resource: the server responded with a status of ') &&
+                  error.text.includes(` ${fault.status} `));
+            assert.deepEqual(owned.filter(error => !nativeDiagnostic(error)), [],
+              `${label} produced unhandled page errors or unrelated console diagnostics`);
+            assert(owned.length <= 1, `${label} produced duplicate native diagnostics`);
+            expectedOwnedErrors.push(...owned);
+            if (kind === 'network') await target.unroute(url, abortUpload);
+            uploadFixtures.set(pathname, 200);
+            const beforeRetry = requests.length;
+            const beforeRetrySubmissions = submitted.length;
+            const beforeRetryErrors = consoleErrors.length;
+            const retryResponse = target.waitForResponse(response =>
+              response.url() === url && response.request().method() === 'POST');
+            retryInput = await choose([name]);
+            assert.equal((await retryResponse).status(), 200, `${label} retry was not accepted`);
+            await waitInputRemoved(retryInput);
+            await surface.locator('.dash-btn-secondary').waitFor({ state: 'visible' });
+            await alert.waitFor({ state: 'hidden' });
+            await waitUntil(() => dashboardGets(beforeRetry).length === 3, `${label} retry dashboard refresh`);
+            if (standalone)
+              await waitUntil(() => listingGets(beforeRetry).length === 1, `${label} retry Files callback`);
+            await settle();
+            assert.deepEqual(dashboardGets(beforeRetry).map(row => row.path).sort(),
+              ['processes', 'sessions', 'status'].map(endpoint => `/ocu/terminal/${CHAT}/${endpoint}`),
+              `${label} retry did not refresh the dashboard once`);
+            assert.equal(listingGets(beforeRetry).length, standalone ? 1 : 0,
+              `${label} retry violated standalone-only Files refresh`);
+            assert.deepEqual(submitted.slice(beforeRetrySubmissions).map(request => new URL(request.url()).pathname),
+              [pathname], `${label} successful retry unexpectedly repeated another upload`);
+            assert(retainedUploads.get(pathname)?.includes(Buffer.from(`retained content: ${name}`)),
+              `${label} successful retry lost its uploaded content`);
+            if (partial)
+              assert.equal(retainedUploads.get(uploadPath(priorName)), retainedPrior,
+                `${label} retry replaced or rolled back the earlier successful upload`);
+            assert.deepEqual(consoleErrors.slice(beforeRetryErrors), [], `${label} retry produced browser errors`);
+            const uploadCalls = requests.slice(before).filter(row => row.path.startsWith(`/ocu/api/uploads/${CHAT}/`));
+            assert(uploadCalls.every(row => row.method === 'POST' && names.some(selected =>
+              row.path === uploadPath(selected))), `${label} requested rollback, list or manifest`);
+            if (!standalone) {
+              assert.equal(await surface.locator('.file-selector-btn, .view-tabs').count(), 0,
+                `${label} mounted Files inside terminal embedding`);
+              assert.equal(listingGets(before).length, 0, `${label} terminal embedding requested Files`);
+            }
+            console.log(JSON.stringify({ uploadFeedback: label, status: kind === 'network' ? fault.failure : fault.status,
+              failedSelection: partial ? ['prior-success', 'failed', 'later-unattempted'] : ['failed'],
+              retry: 'ok' }));
+          } catch (error) {
+            await captureUploadFailure(`fail-${label}`);
+            console.error(JSON.stringify({ uploadFeedback: label, requests: requests.slice(before),
+              errors: consoleErrors.slice(beforeErrors), failure: fault.failure,
+              observedStatus: kind === 'network' ? null :
+                requests.slice(before).find(row => row.path === pathname)?.status }));
+            throw error;
+          } finally {
+            if (kind === 'network') await target.unroute(url, abortUpload);
+            if (input) await input.dispose();
+            if (retryInput) await retryInput.dispose();
+            for (const selected of names) {
+              uploadFixtures.delete(uploadPath(selected));
+              retainedUploads.delete(uploadPath(selected));
+            }
+          }
+        }
+      } finally {
+        target.off('request', recordSubmission);
+        if (standalone) target.off('requestfailed', recordStandaloneFailure);
+      }
+    };
     await page.screenshot({ path: path.join(artifacts, 'embedded-terminal-dashboard.png') });
     const beforeEmbedUpload = requests.length;
     const beforeEmbedUploadErrors = consoleErrors.length;
@@ -1545,6 +1773,7 @@ async function main() {
     await waitUntil(() => requests.slice(beforeEmbedUpload).some(row =>
       row.method === 'GET' && row.path === `/ocu/terminal/${CHAT}/status`),
       'terminal embed upload dashboard refresh');
+    await frame().locator('.dash-btn-secondary').waitFor();
     const afterEmbedUpload = requests.slice(beforeEmbedUpload);
     assert.equal(await frame().locator('.dash-btn-secondary').count(), 1,
       'terminal embed upload dropped the upload action');
@@ -1558,6 +1787,7 @@ async function main() {
       listingBeforeRuntime, 'terminal embed upload listed Files');
     assert.deepEqual(consoleErrors.slice(beforeEmbedUploadErrors), [],
       'terminal embed upload produced unexpected console errors');
+    await exerciseUploadFailures(page, frame(), false);
     await retireFrame();
     const runtimeCalls = () => requests.filter(row =>
       /\/(?:browser|terminal)\/|\/api\/uploads\//.test(row.path)).length;
@@ -1747,7 +1977,6 @@ async function main() {
     browserFixture = 'inactive';
     listMode = 'standalone';
 
-    const expectedOwnedErrors = [];
     const attachDrawioConsole = (target) => {
       target.on('pageerror', error => consoleErrors.push({ text: String(error), url: '' }));
       target.on('console', message => {
@@ -2025,7 +2254,11 @@ async function main() {
         .filter({ hasText: 'note.txt' }).count(), 1,
         'standalone upload did not appear in the Files dropdown');
 
-      assert.deepEqual(caseErrors(panelSession), [], 'standalone panel produced unexpected console errors');
+      await panelSession.page.locator('.view-tab').filter({ hasText: 'Sub-agent' }).click();
+      await panelSession.page.locator('.dash-btn-secondary').waitFor();
+      await exerciseUploadFailures(panelSession.page, panelSession.page, true);
+      assert.deepEqual(caseErrors(panelSession).filter(error => !expectedOwnedErrors.includes(error)), [],
+        'standalone panel produced unexpected console errors');
     } catch (error) {
       await captureStandaloneFailure(panelSession, 'standalone-panel');
       throw error;

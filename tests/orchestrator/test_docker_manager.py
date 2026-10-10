@@ -130,7 +130,17 @@ def _clear_gateway_env():
         os.environ.pop(k, None)
 
 
-class TestDockerManagerEnvInjection(unittest.TestCase):
+class _RuntimeEnvironmentCase(unittest.TestCase):
+    def setUp(self):
+        # Keep ambient runtime selection from changing these fixtures' branches.
+        self.enterContext(patch.dict(os.environ, {
+            "ENABLE_NETWORK": "true",
+            "SANDBOX_HOST_BIND_IP": "172.31.0.1",
+            "SUBAGENT_CLI": "claude",
+        }))
+
+
+class TestDockerManagerEnvInjection(_RuntimeEnvironmentCase):
     """Three-path env-injection matrix + empty-string guard + ANTHROPIC_CUSTOM_HEADERS regression."""
 
     def _reload_docker_manager(self, overrides):
@@ -289,7 +299,7 @@ class TestContextVarAnthropicBaseUrlDefault(unittest.TestCase):
         self.assertIsNone(value)
 
 
-class TestBuildMcpConfigBaseUrlFallback(unittest.TestCase):
+class TestBuildMcpConfigBaseUrlFallback(_RuntimeEnvironmentCase):
     """Regression guard: build_mcp_config must accept None/empty base_url.
 
     Before the fix, callers in sub_agent (mcp_tools.py) and _create_container
@@ -343,7 +353,7 @@ class TestBuildMcpConfigBaseUrlFallback(unittest.TestCase):
         )
 
 
-class TestAnthropicBaseUrlEmptyStringHandling(unittest.TestCase):
+class TestAnthropicBaseUrlEmptyStringHandling(_RuntimeEnvironmentCase):
     """Empty env vars from compose ${VAR:-} must not override the module default."""
 
     def test_empty_env_treats_as_unset_for_anthropic_base_url(self):
