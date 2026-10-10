@@ -164,6 +164,7 @@ const waitUntil = async (condition, label) => {
 let listMode = 'normal';
 let standaloneUploadedNote = false;
 let standaloneFirstFile = null;
+let standaloneListing = null;
 let injectedListingFailure = false;
 
 let drawioMissingViewer = false;
@@ -267,7 +268,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (listMode === 'timeout') { heldListings.push(res); return; }
       if (listMode === 'standalone') {
-        const listed = files.filter(f => ['hostile', 'drawio', 'drawio-empty', 'drawio-lazy', 'drawio-broken',
+        let listed = files.filter(f => ['hostile', 'drawio', 'drawio-empty', 'drawio-lazy', 'drawio-broken',
           'drawio-compressed', 'drawio-image', 'drawio-math', 'drawio-missing',
           'drawio-bpmn', 'drawio-er', 'drawio-pages', 'drawio-pages-missing', 'drawio-corrupt-lazy',
           'drawio-pages-image', 'hostile-markdown'].includes(f.file_id));
@@ -283,6 +284,7 @@ const server = http.createServer(async (req, res) => {
         if (standaloneUploadedNote) {
           listed.push({ file_id: 'note', path: 'note.txt', type: 'text', mime: 'text/plain' });
         }
+        if (standaloneListing) listed = standaloneListing;
         return respond(res, 200, JSON.stringify({
           chat_id: CHAT, files: listed.map(f => ({
             name: f.path, size: 128, revision: 1,
@@ -717,6 +719,7 @@ async function main() {
         if (delay === 120000) window.__heartbeatTimers.add(timer);
         // App visible/hidden poll delays in preview.js (setInterval(poll, 3000/15000)).
         if (delay === 3000 || delay === 15000) window.__pollIntervals.add(timer);
+        if (delay === 3000 || delay === 15000) window.__runAppPoll = callback;
         return timer;
       };
       window.clearInterval = timer => {
@@ -1880,6 +1883,44 @@ async function main() {
       await session.page.locator('body').getByTitle('Next Page: Image', { exact: true }).click();
       return lightbox;
     };
+    const activateStandaloneFile = async (session, name) => {
+      // Fullscreen covers the pointer region; these clicks use the mounted selector's actual handlers.
+      await session.page.locator('.file-selector-btn').evaluate(node => node.click());
+      await session.page.locator('.dropdown-menu.open .item-name')
+        .getByText(name, { exact: true }).evaluate(node => node.click());
+      await session.page.waitForFunction(expected =>
+        document.querySelector('.file-selector-btn .selector-name')?.textContent === expected, name);
+    };
+    const captureFullscreenNodes = async (session, content) => {
+      const diagram = session.page.locator('body > .geDiagramContainer');
+      await diagram.getByText(content, { exact: true }).waitFor();
+      const nodes = await diagram.evaluateHandle((diagram) => {
+        const children = [...document.body.children];
+        return [
+          { role: 'diagram', node: diagram },
+          { role: 'close', node: children.find(node => node.matches('img.geAdaptiveAsset') && node.style.position === 'fixed') },
+          { role: 'toolbar', node: children.find(node => node.querySelector('[title="Close (Escape)"]')) },
+          { role: 'backdrop', node: children.findLast(node => node !== diagram && node.tagName === 'DIV' &&
+            node.style.position === 'fixed' && node.childElementCount === 0 &&
+            ['top', 'left', 'bottom', 'right'].every(edge => node.style[edge] === '0px')) },
+        ];
+      });
+      assert.deepEqual(await nodes.evaluate(nodes =>
+        nodes.filter(({ node }) => node?.parentNode === document.body).map(({ role }) => role).sort()),
+      ['backdrop', 'close', 'diagram', 'toolbar'], `${content} did not mount its complete fullscreen UI`);
+      return nodes;
+    };
+    const assertFullscreenRetired = async (session, nodes, overflow, label) => {
+      await session.page.waitForFunction(nodes =>
+        nodes.every(({ node }) => !node.isConnected), nodes);
+      assert.deepEqual(await nodes.evaluate(nodes =>
+        nodes.filter(({ node }) => node.isConnected).map(({ role }) => role).sort()), [],
+      `${label} retained old fullscreen nodes`);
+      assert.equal(await session.page.locator('body > .geDiagramContainer').count(), 0,
+        `${label} retained a fullscreen diagram`);
+      assert.equal(await session.page.evaluate(() => document.body.style.overflow), overflow,
+        `${label} did not restore body scrolling`);
+    };
     const assertStandaloneChrome = async (session, label) => {
       assert.equal(await session.page.locator('#app').count(), 1, `${label} lost #app`);
       assert.equal(await session.page.locator('.file-selector').count(), 1, `${label} lost .file-selector`);
@@ -2967,6 +3008,244 @@ async function main() {
       throw error;
     } finally {
       await closeStandalone(pagesSession);
+    }
+
+    const fullscreenSelectionSession = await openStandalone('/ocu');
+    let oldFullscreenNodes;
+    try {
+      await selectStandaloneFile(fullscreenSelectionSession.page, 'diagram.drawio');
+      await fullscreenSelectionSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      await clickViewerToolbar(fullscreenSelectionSession, 'Fullscreen');
+      oldFullscreenNodes = await captureFullscreenNodes(fullscreenSelectionSession, 'Local shape');
+      await fullscreenSelectionSession.page.screenshot({ path: path.join(artifacts, 'fullscreen-selection-a.png') });
+
+      await activateStandaloneFile(fullscreenSelectionSession, 'pages.drawio');
+      await fullscreenSelectionSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      const transition = await fullscreenSelectionSession.page.evaluate((nodes) => ({
+        selected: document.querySelector('.file-selector-btn .selector-name').textContent,
+        replacementRendered: document.querySelector('.drawio-host').textContent.includes('Page one'),
+        oldFullscreenContent: nodes.find(({ role }) => role === 'diagram').node.textContent,
+        remaining: nodes.filter(({ node }) => node.isConnected).map(({ role }) => role).sort(),
+      }), oldFullscreenNodes);
+      await fullscreenSelectionSession.page.screenshot({ path: path.join(artifacts, 'fullscreen-selection-b.png') });
+      assert.deepEqual(transition.remaining, [],
+        `selecting diagram B left diagram A's body-owned fullscreen UI: ${JSON.stringify(transition)}`);
+      await clickNextPage(fullscreenSelectionSession);
+      await fullscreenSelectionSession.page.locator('.drawio-host').getByText('AND', { exact: true }).waitFor();
+      await assertAndGeometry(fullscreenSelectionSession, 'diagram B after fullscreen retirement');
+      assert.deepEqual(caseErrors(fullscreenSelectionSession), [],
+        'fullscreen selection retirement produced unexpected console errors');
+    } catch (error) {
+      await captureStandaloneFailure(fullscreenSelectionSession, 'fullscreen-selection');
+      throw error;
+    } finally {
+      await oldFullscreenNodes?.dispose();
+      await closeStandalone(fullscreenSelectionSession);
+    }
+
+    const fullscreenA = files.find(file => file.file_id === 'drawio');
+    const fullscreenB = files.find(file => file.file_id === 'drawio-pages');
+    const fullscreenListingCases = [
+      { label: 'auto-new', initial: [fullscreenA], next: [fullscreenA, fullscreenB],
+        selected: 'pages.drawio', content: 'Page one' },
+      { label: 'rename', initial: [fullscreenA, fullscreenB],
+        next: [{ ...fullscreenA, path: 'renamed/renamed.drawio' }, fullscreenB],
+        selected: 'renamed/renamed.drawio', content: 'Local shape' },
+      { label: 'revision', initial: [fullscreenA, fullscreenB],
+        next: [{ ...fullscreenA, revision: 2 }, fullscreenB],
+        selected: 'diagram.drawio', content: 'Compressed shape' },
+      { label: 'removal-fallback', initial: [fullscreenA, fullscreenB], next: [fullscreenB],
+        selected: 'pages.drawio', content: 'Page one' },
+      { label: 'empty', initial: [fullscreenA], next: [], selected: null },
+    ];
+    for (const scenario of fullscreenListingCases) {
+      standaloneListing = scenario.initial;
+      const session = await openStandalone('/ocu');
+      let nodes;
+      let oldStage;
+      const originalDiagram = bytes['diagram.drawio'];
+      try {
+        await session.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+        await session.page.evaluate(() => { document.body.style.overflow = 'auto'; });
+        await clickViewerToolbar(session, 'Fullscreen');
+        nodes = await captureFullscreenNodes(session, 'Local shape');
+        oldStage = await session.page.locator('.preview-stage').elementHandle();
+        standaloneListing = scenario.next;
+        if (scenario.label === 'rename') bytes['renamed/renamed.drawio'] = originalDiagram;
+        if (scenario.label === 'revision') bytes['diagram.drawio'] = bytes['compressed.drawio'];
+        const beforeRefresh = requests.length;
+        await session.page.evaluate(() => window.__runAppPoll());
+        assert.equal(requests.slice(beforeRefresh).filter(row =>
+          row.method === 'GET' && row.path === '/ocu/api/outputs/' + CHAT).length, 1,
+        `${scenario.label} did not use one actual listing refresh`);
+        await session.page.waitForFunction(stage => !stage.isConnected, oldStage);
+        if (scenario.selected) {
+          await session.page.waitForFunction(expected =>
+            document.querySelector('.file-selector-btn .selector-name')?.textContent === expected, scenario.selected);
+          await session.page.locator('.drawio-host').getByText(scenario.content, { exact: true }).waitFor();
+        } else {
+          await session.page.locator('.preview .empty-state').waitFor();
+          assert.equal(await session.page.locator('.drawio-host, .file-selector').count(), 0,
+            'empty listing retained a selected preview or selector');
+        }
+        await assertFullscreenRetired(session, nodes, 'auto', scenario.label);
+        if (scenario.selected) {
+          const beforeZoom = await session.page.locator('.drawio-host svg').evaluate(svg => svg.getBoundingClientRect().width);
+          await clickViewerToolbar(session, 'Zoom In');
+          const afterZoom = await session.page.locator('.drawio-host svg').evaluate(svg => svg.getBoundingClientRect().width);
+          assert(afterZoom > beforeZoom, `${scenario.label} replacement viewer did not accept Zoom In`);
+        } else {
+          standaloneListing = [fullscreenB];
+          await session.page.evaluate(() => window.__runAppPoll());
+          await session.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+          await clickNextPage(session);
+          await session.page.locator('.drawio-host').getByText('AND', { exact: true }).waitFor();
+          await assertAndGeometry(session, 'viewer recovered after empty listing');
+        }
+        assert.deepEqual(caseErrors(session), [], `${scenario.label} retirement produced unexpected console errors`);
+        await session.page.screenshot({ path: path.join(artifacts, `fullscreen-listing-${scenario.label}.png`) });
+      } catch (error) {
+        await captureStandaloneFailure(session, `fullscreen-listing-${scenario.label}`);
+        throw error;
+      } finally {
+        standaloneListing = null;
+        bytes['diagram.drawio'] = originalDiagram;
+        delete bytes['renamed/renamed.drawio'];
+        await nodes?.dispose();
+        await oldStage?.dispose();
+        await closeStandalone(session);
+      }
+    }
+
+    const fullscreenCyclesSession = await openStandalone('/ocu');
+    const cycleNodes = [];
+    try {
+      await selectStandaloneFile(fullscreenCyclesSession.page, 'diagram.drawio');
+      await fullscreenCyclesSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      await fullscreenCyclesSession.page.evaluate(() => { document.body.style.overflow = 'scroll'; });
+      for (let cycle = 0; cycle < 3; cycle++) {
+        await clickViewerToolbar(fullscreenCyclesSession, 'Fullscreen');
+        const retired = await captureFullscreenNodes(fullscreenCyclesSession, 'Local shape');
+        cycleNodes.push(retired);
+        await activateStandaloneFile(fullscreenCyclesSession, 'pages.drawio');
+        await fullscreenCyclesSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+        await assertFullscreenRetired(fullscreenCyclesSession, retired, 'scroll', `retirement cycle ${cycle}`);
+        for (const closePath of ['button', 'Escape']) {
+          await clickViewerToolbar(fullscreenCyclesSession, 'Fullscreen');
+          const closed = await captureFullscreenNodes(fullscreenCyclesSession, 'Page one');
+          cycleNodes.push(closed);
+          if (closePath === 'button')
+            await fullscreenCyclesSession.page.locator('body > img.geAdaptiveAsset[style*="position: fixed"]').click();
+          else await fullscreenCyclesSession.page.keyboard.press('Escape');
+          await fullscreenCyclesSession.page.locator('body > .geDiagramContainer').waitFor({ state: 'detached' });
+          await assertFullscreenRetired(fullscreenCyclesSession, closed, 'scroll', `${closePath} cycle ${cycle}`);
+        }
+        await clickNextPage(fullscreenCyclesSession);
+        await fullscreenCyclesSession.page.locator('.drawio-host').getByText('AND', { exact: true }).waitFor();
+        await assertAndGeometry(fullscreenCyclesSession, `reopened viewer cycle ${cycle}`);
+        await selectStandaloneFile(fullscreenCyclesSession.page, 'diagram.drawio');
+        await fullscreenCyclesSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      }
+      assert.deepEqual(caseErrors(fullscreenCyclesSession), [], 'repeated fullscreen cycles produced unexpected console errors');
+      await fullscreenCyclesSession.page.screenshot({ path: path.join(artifacts, 'fullscreen-cycles.png') });
+    } catch (error) {
+      await captureStandaloneFailure(fullscreenCyclesSession, 'fullscreen-cycles');
+      throw error;
+    } finally {
+      for (const nodes of cycleNodes) await nodes.dispose();
+      await closeStandalone(fullscreenCyclesSession);
+    }
+
+    for (const newerFullscreen of [false, true]) {
+      const label = newerFullscreen ? 'deferred-newer' : 'deferred-retirement';
+      const session = await openStandalone('/ocu');
+      let pendingNodes;
+      let newerNodes;
+      try {
+        await selectStandaloneFile(session.page, 'diagram.drawio');
+        await session.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+        await session.page.evaluate(() => { document.body.style.overflow = 'auto'; });
+        await revealViewerToolbar(session);
+        pendingNodes = await session.page.getByTitle('Fullscreen', { exact: true }).evaluateHandle(button => {
+          const before = new Set(document.body.children);
+          const schedule = window.setTimeout;
+          const pending = [];
+          // Hold every zero-delay callback from this actual click, including ownership settlement.
+          window.setTimeout = (callback, delay, ...args) => {
+            if (delay !== 0) return schedule(callback, delay, ...args);
+            const timer = schedule(() => {}, 60000);
+            pending.push({ callback, args, timer });
+            return timer;
+          };
+          try { button.click(); } finally { window.setTimeout = schedule; }
+          window.__releaseFullscreenMount = () => {
+            const added = [];
+            const observer = new MutationObserver(() => {});
+            observer.observe(document.body, { childList: true });
+            for (const { callback, args, timer } of pending.splice(0)) {
+              window.clearTimeout(timer);
+              callback.apply(window, args);
+            }
+            for (const record of observer.takeRecords()) added.push(...record.addedNodes);
+            observer.disconnect();
+            return added.filter(node => node.nodeType === 1 && node.isConnected)
+              .map(node => ({ tag: node.tagName, class: node.className }));
+          };
+          return [...document.body.children].filter(node => !before.has(node));
+        });
+        assert.equal(await session.page.locator('body > .geDiagramContainer').count(), 0,
+          `${label} fullscreen mounted before the controlled deferred boundary`);
+        assert.equal(await pendingNodes.evaluate(nodes => nodes.some(node =>
+          node.style.position === 'fixed' && node.style.backgroundColor === 'rgb(0, 0, 0)')), true,
+        `${label} did not open the real fullscreen backdrop`);
+        await activateStandaloneFile(session, 'pages.drawio');
+        await session.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+        if (newerFullscreen) {
+          // A's pending backdrop still covers B; dispatch the real mounted toolbar control.
+          await session.page.locator('.drawio-host').dispatchEvent('mousemove');
+          await session.page.locator('.drawio-host').dispatchEvent('mouseenter');
+          await session.page.getByTitle('Fullscreen', { exact: true }).evaluate(node => node.click());
+          newerNodes = await captureFullscreenNodes(session, 'Page one');
+        }
+        const resurrected = await session.page.evaluate(() => window.__releaseFullscreenMount());
+        assert.deepEqual(resurrected, [], `${label} resurrected deferred A fullscreen nodes`);
+        assert.equal(await pendingNodes.evaluate(nodes => nodes.some(node => node.isConnected)), false,
+          `${label} retained A's pending body UI`);
+        if (newerFullscreen) {
+          assert.deepEqual(await newerNodes.evaluate(nodes =>
+            nodes.filter(({ node }) => node.isConnected).map(({ role }) => role).sort()),
+          ['backdrop', 'close', 'diagram', 'toolbar'], 'old deferred cleanup removed newer fullscreen UI');
+          assert.equal(await session.page.evaluate(() => document.body.style.overflow), 'hidden',
+            'old deferred cleanup unlocked scrolling underneath newer fullscreen');
+          await clickFullscreenNextAnd(session);
+          await session.page.locator('body > .geDiagramContainer').getByText('AND', { exact: true }).waitFor();
+          await session.page.keyboard.press('Escape');
+          await session.page.locator('body > .geDiagramContainer').waitFor({ state: 'detached' });
+          await assertFullscreenRetired(session, newerNodes, 'auto', label);
+        } else {
+          assert.equal(await session.page.evaluate(() => document.body.style.overflow), 'auto',
+            'deferred retirement did not restore scrolling');
+          await clickNextPage(session);
+          await session.page.locator('.drawio-host').getByText('AND', { exact: true }).waitFor();
+          await assertAndGeometry(session, label);
+        }
+        assert.deepEqual(caseErrors(session), [], `${label} produced unexpected console errors`);
+        await session.page.screenshot({ path: path.join(artifacts, `fullscreen-${label}.png`) });
+      } catch (error) {
+        await captureStandaloneFailure(session, label);
+        throw error;
+      } finally {
+        try {
+          await session.page.evaluate(() => {
+            window.__releaseFullscreenMount?.();
+            delete window.__releaseFullscreenMount;
+          });
+        } finally {
+          await pendingNodes?.dispose();
+          await newerNodes?.dispose();
+          await closeStandalone(session);
+        }
+      }
     }
 
     drawioMissingLazy = true;
