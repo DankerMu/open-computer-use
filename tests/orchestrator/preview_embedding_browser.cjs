@@ -130,6 +130,7 @@ const files = [
   { file_id: 'plusxml', path: 'suffix.docx', type: 'docx', mime: 'application/vnd.example+xml' },
   { file_id: 'foreign', path: 'foreign.docx', type: 'docx', mime: OFFICE_MIME.docx, url: 'https://example.invalid/foreign.docx' },
   { file_id: 'cross-chat', path: 'cross-chat.docx', type: 'docx', mime: OFFICE_MIME.docx, url: '/ocu/files/another-chat/cross-chat.docx' },
+  { file_id: 'hostile-markdown', path: 'hostile.md', type: 'markdown', mime: 'text/markdown' },
 ];
 const requests = [];
 let slowRequested;
@@ -162,6 +163,7 @@ const waitUntil = async (condition, label) => {
 };
 let listMode = 'normal';
 let standaloneUploadedNote = false;
+let standaloneFirstFile = null;
 let injectedListingFailure = false;
 
 let drawioMissingViewer = false;
@@ -268,7 +270,15 @@ const server = http.createServer(async (req, res) => {
         const listed = files.filter(f => ['hostile', 'drawio', 'drawio-empty', 'drawio-lazy', 'drawio-broken',
           'drawio-compressed', 'drawio-image', 'drawio-math', 'drawio-missing',
           'drawio-bpmn', 'drawio-er', 'drawio-pages', 'drawio-pages-missing', 'drawio-corrupt-lazy',
-          'drawio-pages-image'].includes(f.file_id));
+          'drawio-pages-image', 'hostile-markdown'].includes(f.file_id));
+        listed.push(
+          { file_id: 'safe-markdown', path: 'guides/safe.md', type: 'markdown', mime: 'text/markdown' },
+          { file_id: 'matrix-markdown', path: 'matrix.md', type: 'markdown', mime: 'text/markdown' });
+        if (standaloneFirstFile) {
+          const index = listed.findIndex(file => file.path === standaloneFirstFile);
+          assert(index >= 0, 'unknown first standalone fixture');
+          listed.unshift(...listed.splice(index, 1));
+        }
         if (standaloneUploadedNote) {
           listed.push({ file_id: 'note', path: 'note.txt', type: 'text', mime: 'text/plain' });
         }
@@ -1030,6 +1040,63 @@ async function main() {
     bytes['short-header.xls'] = raw3.subarray(0, firstRecordEnd + 2);
     bytes['not-a-workbook.xls'] = Buffer.from('name,value\\nfalse,positive');
     bytes['broken.pptx'] = Buffer.from('not an Office ZIP');
+    const rasters = await page.evaluate(() => {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 2;
+      canvas.getContext('2d').fillRect(0, 0, 2, 2);
+      return {
+        png: canvas.toDataURL('image/png'),
+        jpeg: canvas.toDataURL('image/jpeg'),
+        webp: canvas.toDataURL('image/webp'),
+        gif: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+      };
+    });
+    for (const [format, data] of Object.entries(rasters))
+      assert(data.startsWith(`data:image/${format};base64,`), `browser did not encode ${format}`);
+    bytes['guides/pixel.png'] = Buffer.from(rasters.png.split(',')[1], 'base64');
+    bytes['guides/safe.md'] = Buffer.from([
+      '[Jump to heading](#safe-heading)',
+      '<p><strong>Bold text</strong> <em>Italic text</em> <s>Struck text</s></p>',
+      '~~Deleted text~~',
+      '<blockquote>Quoted text</blockquote>', '- First item\n- Second item',
+      '| Column | Value |\n| --- | --- |\n| Answer | 42 |',
+      '<details><summary>Folded content</summary><p>Visible when opened</p></details>',
+      '[Relative Office](../hostile.docx)', '[HTTPS destination](https://links.example.test/approved)',
+      '[HTTP destination](http://links.example.test/approved)', '[Send mail](mailto:reader@example.test)',
+      '![Relative raster](pixel.png)', '<img alt="Raw relative raster" src="pixel.png">',
+      '![HTTPS raster](https://images.example.test/pixel.png)',
+      '![HTTP raster](http://images.example.test/pixel.png)',
+      ...Object.entries(rasters).map(([format, data]) => `![Inline ${format}](${data})`),
+      '```javascript\nconst answer = 42;\n```',
+      '```mermaid\ngraph TD\n  A[Alpha] --> B[Beta]\n```',
+      '# Safe heading', 'Inline math $x^2$ and display math $$E=mc^2$$',
+    ].join('\n\n'));
+    bytes['matrix.md'] = Buffer.from([
+      '<p><strong>Allowed matrix neighbor</strong><span style="position:fixed" onclick="document.documentElement.dataset.markdownMatrixCanary=\'executed\'">Clean span</span></p>',
+      '<script>document.documentElement.dataset.markdownMatrixCanary="executed"</script>',
+      '<style>body { display:none }</style><link rel="stylesheet" href="data:text/css,body{}">',
+      '<meta name="matrix-probe" content="blocked"><base href="https://base.example.test/">',
+      '<form><input value="blocked"><button>Blocked control</button><textarea>Blocked textarea</textarea><select><option>Blocked option</option></select></form>',
+      '<iframe srcdoc="<p>blocked frame</p>"></iframe><object data="data:text/plain,blocked"></object><embed src="data:text/plain,blocked">',
+      '<svg><text>Raw SVG forbidden</text></svg><math><mi>Raw math forbidden</mi></math>',
+      '<audio></audio><video></video>',
+      '<p id="DOMPurify">Namespaced content</p><a name="__OCU_OFFICE_PURIFY">Named anchor</a>',
+      '<a href="javascript:document.documentElement.dataset.markdownMatrixCanary=\'executed\'">Script scheme</a>',
+      '<a href="jav&#x09;ascript:alert(1)">Obfuscated scheme</a><a href="vbscript:msgbox(1)">VB scheme</a>',
+      '<a href="file:///etc/passwd">File scheme</a><a href="blob:https://example.test/id">Blob scheme</a>',
+      '<a href="data:text/html,blocked">Data link</a><a href="unknown:blocked">Unknown scheme</a>',
+      '[Token script](javascript:alert%281%29)', '[Token unknown](unknown:blocked)',
+      '<a href="#%E0%A4%A">Malformed fragment</a>',
+      '<img alt="Forbidden SVG image" src="data:image/svg+xml;base64,PHN2Zy8+">',
+      '<img alt="Forbidden mail image" src="mailto:reader@example.test">',
+      '<img alt="Forbidden data image" src="data:text/plain;base64,YQ==">',
+      '<img alt="Allowed matrix raster" src="' + rasters.png + '" srcset="https://images.example.test/other.png 2x">',
+    ].join('\n\n'));
+    bytes['hostile.md'] = Buffer.from(
+      '<p><strong>Safe Markdown neighbor</strong></p>\n\n' +
+      '<img alt="Markdown event canary" ' +
+      'src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=" ' +
+      'onload="document.documentElement.dataset.markdownEventCanary = \'executed\'">\n');
 
     await page.evaluate(() => window.mount());
     await page.waitForFunction(() => window.states.some(row => row.type === 'ocu:preview-ready'), null, { timeout: 10000 });
@@ -1280,9 +1347,17 @@ async function main() {
       await waitState(generation, 'error');
       await frame().locator('.preview-stage .empty-state').waitFor();
     }
+    await page.evaluate(() => window.select('hostile-markdown', 37));
+    await waitState(37, 'unsupported');
+    assert.equal(requests.filter(row => row.path.endsWith('/hostile.md')).length, 0,
+      'Office-only embedding fetched Markdown bytes');
+    assert.equal(await frame().locator('.preview-stage .markdown-body').count(), 0,
+      'Office-only embedding rendered Markdown');
+    assert.equal(await page.locator('#preview').getAttribute('sandbox'),
+      'allow-scripts allow-same-origin allow-forms');
     const secondSlow = new Promise(resolve => { slowRequested = resolve; });
-    await page.evaluate(() => window.select('slow', 37));
-    await waitState(37, 'loading');
+    await page.evaluate(() => window.select('slow', 38));
+    await waitState(38, 'loading');
     await within(secondSlow, 'unmounted Office fetch');
     const beforeUnmount = await page.evaluate(() => window.states.length);
     const abortedFetch = page.waitForEvent('requestfailed', {
@@ -1654,14 +1729,20 @@ async function main() {
     };
     const selectStandaloneFile = async (target, name) => {
       await target.locator('.file-selector-btn').click();
+      for (const folder of name.split('/').slice(0, -1))
+        await target.locator('.dropdown-menu.open .item-name').getByText(folder, { exact: true }).click();
       await target.locator('.dropdown-menu.open .item-name').getByText(name, { exact: true }).click();
     };
-    const openStandalone = async (prefix) => {
+    const openStandalone = async (prefix, options = {}) => {
       const isolated = await browser.newContext();
       isolated.setDefaultTimeout(10000);
       await isolated.addInitScript(freezePollingClock);
       await isolated.route('**/*', route => {
         const url = route.request().url();
+        if (options.images && /^https?:\/\/images\.example\.test\/pixel\.png$/.test(url))
+          return route.fulfill({ status: 200, contentType: 'image/png', body: bytes['guides/pixel.png'] });
+        if (options.sanitizerRoute && url.endsWith('/static/purify.min.js'))
+          return options.sanitizerRoute(route);
         if (/^https?:/.test(url) && !url.startsWith(origin + '/')) {
           externalRequests.push(url);
           return route.abort();
@@ -1672,7 +1753,13 @@ async function main() {
       attachDrawioConsole(page);
       const before = requests.length;
       const beforeErrors = consoleErrors.length;
-      await page.goto(`${origin}${prefix}/preview/${CHAT}`);
+      standaloneFirstFile = options.firstFile || null;
+      try {
+        await page.goto(`${origin}${prefix}/preview/${CHAT}`, {
+          waitUntil: options.sanitizerRoute ? 'domcontentloaded' : 'load',
+        });
+        await page.locator('.file-selector-btn').waitFor();
+      } finally { standaloneFirstFile = null; }
       await page.evaluate(() => window.__freezePollingClock());
       await page.locator('.file-selector-btn').waitFor();
       return { isolated, page, before, beforeErrors, prefix };
@@ -1694,6 +1781,15 @@ async function main() {
     const closeStandalone = async (session) => {
       await session.page.close();
       await session.isolated.close();
+    };
+    const assertLocalShapeGeometry = async (session) => {
+      const boxes = await session.page.locator('.drawio-host svg').evaluate(svg =>
+        [...svg.querySelectorAll('path,rect')].map(node => {
+          const box = node.getBBox();
+          return { width: Math.round(box.width), height: Math.round(box.height) };
+        }));
+      assert(boxes.some(box => box.width === 120 && box.height === 60),
+        'Drawio lost the fixture’s 120×60 shape geometry after renderer switching');
     };
     const andGeometryOf = async (session) => session.page.locator('.drawio-host svg').evaluate((svg) => {
       const paths = [...svg.querySelectorAll('path')].map((path) => path.getAttribute('d') || '');
@@ -1870,6 +1966,315 @@ async function main() {
     } finally {
       standaloneUploadedNote = false;
       await closeStandalone(panelSession);
+    }
+
+    const markdownSession = await openStandalone('/ocu');
+    try {
+      await markdownSession.page.locator('.preview').evaluate((host) => {
+        window.__markdownInsertions = [];
+        const isCanary = (node) => node.nodeType === Node.ELEMENT_NODE &&
+          node.matches('img[alt="Markdown event canary"]');
+        const recordCanary = (node) => {
+          if (isCanary(node) && node.hasAttribute('onload'))
+            window.__markdownInsertions.push({ kind: 'inserted', value: node.getAttribute('onload') });
+        };
+        // Observe the live preview boundary, including attributes stripped after insertion.
+        const observer = new MutationObserver((records) => {
+          for (const record of records) {
+            if (record.type === 'attributes' && record.attributeName === 'onload' &&
+                isCanary(record.target) && record.oldValue !== null)
+              window.__markdownInsertions.push({ kind: 'changed', value: record.oldValue });
+            for (const node of record.addedNodes) {
+              recordCanary(node);
+              if (node.nodeType === Node.ELEMENT_NODE)
+                node.querySelectorAll('img[alt="Markdown event canary"]').forEach(recordCanary);
+            }
+          }
+        });
+        observer.observe(host, { childList: true, subtree: true, attributes: true, attributeOldValue: true });
+      });
+      await selectStandaloneFile(markdownSession.page, 'hostile.md');
+      const body = markdownSession.page.locator('.preview-stage .markdown-body');
+      await body.locator('strong').getByText('Safe Markdown neighbor', { exact: true }).waitFor();
+      const image = body.locator('img[alt="Markdown event canary"]');
+      const decoded = await image.evaluate(async (node) => {
+        await node.decode();
+        return { width: node.naturalWidth, height: node.naturalHeight };
+      });
+      assert.deepEqual(decoded, { width: 1, height: 1 }, 'harmless Markdown raster did not decode');
+      const boundary = await markdownSession.page.evaluate(async () => {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return {
+          executed: document.documentElement.getAttribute('data-markdown-event-canary'),
+          insertions: window.__markdownInsertions,
+        };
+      });
+      assert.deepEqual(boundary, { executed: null, insertions: [] },
+        'hostile Markdown event content crossed the trusted preview boundary');
+      assert.deepEqual(caseErrors(markdownSession), [], 'hostile Markdown produced unexpected console errors');
+    } catch (error) {
+      await captureStandaloneFailure(markdownSession, 'hostile-markdown');
+      throw error;
+    } finally {
+      await closeStandalone(markdownSession);
+    }
+
+    const matrixSession = await openStandalone('/ocu');
+    try {
+      await matrixSession.page.locator('.preview').evaluate((host) => {
+        window.__matrixInsertions = [];
+        const prohibited = 'script,style,link,meta,base,form,input,button,textarea,select,option,iframe,object,embed,svg,math,audio,video,[style],[srcset],[name]';
+        const inspect = (node, inMarkdown) => {
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const bodies = inMarkdown || node.matches('.markdown-body') || node.closest('.markdown-body')
+            ? [node] : [...node.querySelectorAll('.markdown-body')];
+          for (const body of bodies) {
+            for (const element of [body, ...body.querySelectorAll('*')]) {
+              if (element.matches(prohibited) || [...element.attributes].some(attribute => /^on/i.test(attribute.name)))
+                window.__matrixInsertions.push(element.outerHTML);
+              for (const attribute of ['href', 'src']) {
+                const value = (element.getAttribute(attribute) || '').replace(/[\u0000-\u0020\u007f-\u009f]/g, '');
+                if (/^(?:javascript|vbscript|file|blob|unknown):/i.test(value) ||
+                    attribute === 'src' && /^data:(?!image\/(?:png|jpeg|gif|webp);base64,)/i.test(value))
+                  window.__matrixInsertions.push(value);
+              }
+            }
+          }
+        };
+        const observer = new MutationObserver(records => {
+          for (const record of records) {
+            if (record.type === 'attributes' && record.oldValue !== null &&
+                /^(?:on.*|style|srcset|name)$/i.test(record.attributeName))
+              window.__matrixInsertions.push(record.attributeName + '=' + record.oldValue);
+            record.addedNodes.forEach(node => inspect(node, Boolean(record.target.closest('.markdown-body'))));
+          }
+        });
+        observer.observe(host, { childList: true, subtree: true, attributes: true, attributeOldValue: true });
+      });
+      await selectStandaloneFile(matrixSession.page, 'matrix.md');
+      const matrixBody = matrixSession.page.locator('.preview-stage .markdown-body');
+      await matrixBody.locator('strong').getByText('Allowed matrix neighbor', { exact: true }).waitFor();
+      await matrixBody.getByText('Clean span', { exact: true }).click();
+      for (const label of ['Script scheme', 'Obfuscated scheme', 'VB scheme', 'File scheme', 'Blob scheme',
+        'Data link', 'Unknown scheme', 'Token script', 'Token unknown', 'Malformed fragment']) {
+        const link = matrixBody.locator('a').getByText(label, { exact: true });
+        assert.equal(await link.getAttribute('href'), null, `${label} remained navigable`);
+        await link.click();
+      }
+      assert.equal(await matrixBody.locator('img[alt^="Forbidden"]').count(), 0);
+      assert.equal(await matrixBody.locator('[id="user-content-DOMPurify"]').count(), 1);
+      assert.deepEqual(await matrixSession.page.evaluate(() => ({
+        executed: document.documentElement.getAttribute('data-markdown-matrix-canary'),
+        insertions: window.__matrixInsertions,
+        clobbered: window.DOMPurify instanceof Element || window.__OCU_OFFICE_PURIFY instanceof Element,
+      })), { executed: null, insertions: [], clobbered: false },
+      'prohibited Markdown content reached the live preview');
+      assert.deepEqual(caseErrors(matrixSession), [], 'hostile matrix produced unexpected console errors');
+    } catch (error) {
+      await captureStandaloneFailure(matrixSession, 'markdown-matrix');
+      throw error;
+    } finally { await closeStandalone(matrixSession); }
+
+    for (const prefix of ['', '/ocu', '/tools/ocu']) {
+      const safeSession = await openStandalone(prefix, { firstFile: 'hostile.md', images: true });
+      try {
+        await selectStandaloneFile(safeSession.page, 'guides/safe.md');
+        const body = safeSession.page.locator('.preview-stage .markdown-body');
+        await body.locator('.katex-display .katex-html').waitFor();
+        assert.equal(await body.locator('strong').getByText('Bold text', { exact: true }).count(), 1);
+        assert.equal(await body.locator('em').getByText('Italic text', { exact: true }).count(), 1);
+        assert.equal(await body.locator('s').getByText('Struck text', { exact: true }).count(), 1);
+        assert.equal(await body.locator('del').getByText('Deleted text', { exact: true }).count(), 1);
+        assert.equal(await body.locator('blockquote').innerText(), 'Quoted text');
+        assert.deepEqual(await body.locator('li').allTextContents(), ['First item', 'Second item']);
+        assert.deepEqual(await body.locator('tbody td').allTextContents(), ['Answer', '42']);
+        await body.locator('summary').click();
+        assert.equal(await body.locator('details').evaluate(node => node.open), true);
+        await body.getByText('Visible when opened', { exact: true }).waitFor();
+        for (const [label, size] of [
+          ['Relative raster', 2], ['Raw relative raster', 2], ['HTTPS raster', 2], ['HTTP raster', 2],
+          ['Inline png', 2], ['Inline jpeg', 2], ['Inline webp', 2], ['Inline gif', 1],
+        ]) {
+          const decoded = await body.locator(`img[alt="${label}"]`).evaluate(async node => {
+            await node.decode();
+            return { width: node.naturalWidth, height: node.naturalHeight };
+          });
+          assert.deepEqual(decoded, { width: size, height: size }, `${label} did not decode`);
+        }
+        assert(caseRequests(safeSession).some(row => row.path === `${prefix}/files/${CHAT}/guides/pixel.png`),
+          'relative Markdown image did not resolve within the document directory');
+        assert.equal(await body.locator('pre code.language-javascript .hljs-keyword').innerText(), 'const');
+        const diagram = body.locator('.mermaid svg');
+        await diagram.waitFor();
+        assert.equal(await diagram.getByText('Alpha', { exact: true }).count(), 1);
+        assert.equal(await diagram.getByText('Beta', { exact: true }).count(), 1);
+        assert.equal(await diagram.locator('.edgePaths path').evaluateAll(nodes =>
+          nodes.some(node => /[ML]/.test(node.getAttribute('d') || ''))), true,
+        'Markdown Mermaid did not render connecting geometry');
+        assert((await body.locator('.katex-html').allTextContents()).some(text => text.includes('E') && text.includes('mc')),
+          'Markdown math did not render formula glyphs');
+        const heading = body.locator('h1').getByText('Safe heading', { exact: true });
+        assert.equal(await heading.getAttribute('id'), 'user-content-safe-heading');
+        const headingLink = body.getByText('Jump to heading', { exact: true });
+        await headingLink.scrollIntoViewIfNeeded();
+        const beforeNavigation = await headingLink.evaluate(link => {
+          const preview = link.closest('.preview').getBoundingClientRect();
+          const top = Math.max(0, preview.top);
+          const bottom = Math.min(window.innerHeight, preview.bottom);
+          const linkBox = link.getBoundingClientRect();
+          const headingBox = document.getElementById('user-content-safe-heading').getBoundingClientRect();
+          return {
+            linkVisible: linkBox.top >= top - 1 && linkBox.bottom <= bottom + 1,
+            headingOutside: headingBox.bottom < top - 1 || headingBox.top > bottom + 1,
+          };
+        });
+        assert.deepEqual(beforeNavigation, { linkVisible: true, headingOutside: true },
+          'heading navigation did not start from a visible link and an offscreen target');
+        await headingLink.click();
+        await safeSession.page.waitForFunction(() => {
+          const preview = document.querySelector('.preview').getBoundingClientRect();
+          const heading = document.getElementById('user-content-safe-heading').getBoundingClientRect();
+          const top = Math.max(0, preview.top);
+          const bottom = Math.min(window.innerHeight, preview.bottom);
+          return heading.top >= top - 1 && heading.bottom <= bottom + 1;
+        });
+        for (const [label, destination] of [
+          ['HTTPS destination', 'https://links.example.test/approved'],
+          ['HTTP destination', 'http://links.example.test/approved'],
+        ]) {
+          await body.getByText(label, { exact: true }).click();
+          await safeSession.page.locator('#__ext_link_dialog').getByText(destination, { exact: true }).waitFor();
+          await safeSession.page.locator('#__ext_link_dialog').getByText('Cancel', { exact: true }).click();
+        }
+        // Observe native mailto dispatch, then stop at the operating-system boundary.
+        await safeSession.page.evaluate(() => document.addEventListener('click', event => {
+          const link = event.target.closest('a');
+          if (link?.getAttribute('href')?.startsWith('mailto:')) {
+            window.__mailDispatch = { href: link.href, prevented: event.defaultPrevented };
+            event.preventDefault();
+          }
+        }));
+        await body.getByText('Send mail', { exact: true }).click();
+        assert.deepEqual(await safeSession.page.evaluate(() => window.__mailDispatch),
+          { href: 'mailto:reader@example.test', prevented: false }, 'mailto became a workspace file link');
+        await safeSession.page.screenshot({ path: path.join(artifacts, `markdown-safe-${prefix.replaceAll('/', '-') || 'root'}.png`) });
+        await body.getByText('Relative Office', { exact: true }).click();
+        await safeSession.page.locator('.preview-stage').getByText('Table cell', { exact: true }).waitFor();
+        const unsafe = safeSession.page.locator('.preview-stage a').getByText('Unsafe link', { exact: true });
+        assert.equal(await unsafe.getAttribute('href'), null, 'Markdown policy leaked into Office');
+        // Converted-markup seam proof: Office must still reject Markdown-approved remote images.
+        const officeImages = await safeSession.page.locator('.preview-stage').evaluate(async (stage, inline) => {
+          const { safeOfficeHtml } = await import(new URL('../static/preview.js', document.baseURI).href);
+          const fragment = safeOfficeHtml('<img src="https://images.example.test/pixel.png" alt="remote">' +
+            '<img src="' + inline + '" alt="inline">');
+          const probe = document.createElement('div');
+          probe.appendChild(fragment);
+          stage.appendChild(probe);
+          const images = [...probe.querySelectorAll('img')];
+          await Promise.all(images.map(image => image.decode()));
+          const output = images.map(image => ({
+            src: image.getAttribute('src'), width: image.naturalWidth, height: image.naturalHeight,
+          }));
+          probe.remove();
+          return output;
+        }, rasters.png);
+        assert.deepEqual(officeImages, [{ src: rasters.png, width: 2, height: 2 }],
+          'Markdown remote-image allowance leaked into Office');
+        await selectStandaloneFile(safeSession.page, 'diagram.drawio');
+        await safeSession.page.locator('.drawio-host svg').waitFor();
+        await safeSession.page.getByText('Local shape', { exact: true }).waitFor();
+        await assertLocalShapeGeometry(safeSession);
+        await selectStandaloneFile(safeSession.page, 'guides/safe.md');
+        await body.locator('img[alt="HTTPS raster"]').evaluate(node => node.decode());
+        await body.locator('.katex-display .katex-html').waitFor();
+        assert.deepEqual(caseErrors(safeSession), [], 'safe Markdown consumers produced unexpected console errors');
+      } catch (error) {
+        await captureStandaloneFailure(safeSession, `markdown-safe-${prefix.replaceAll('/', '-') || 'root'}`);
+        throw error;
+      } finally { await closeStandalone(safeSession); }
+    }
+
+    const reverseSession = await openStandalone('/ocu', { firstFile: 'diagram.drawio', images: true });
+    try {
+      await reverseSession.page.locator('.drawio-host svg').waitFor();
+      await reverseSession.page.getByText('Local shape', { exact: true }).waitFor();
+      await assertLocalShapeGeometry(reverseSession);
+      await selectStandaloneFile(reverseSession.page, 'guides/safe.md');
+      await reverseSession.page.locator('.markdown-body img[alt="HTTPS raster"]').evaluate(node => node.decode());
+      await reverseSession.page.locator('.markdown-body .katex-display .katex-html').waitFor();
+      await selectStandaloneFile(reverseSession.page, 'hostile.docx');
+      const link = reverseSession.page.locator('.preview-stage a').getByText('Unsafe link', { exact: true });
+      await link.waitFor();
+      assert.equal(await link.getAttribute('href'), null);
+      await reverseSession.page.locator('.preview-stage').getByText('Table cell', { exact: true }).waitFor();
+      await selectStandaloneFile(reverseSession.page, 'diagram.drawio');
+      await reverseSession.page.getByText('Local shape', { exact: true }).waitFor();
+      await assertLocalShapeGeometry(reverseSession);
+      assert.deepEqual(caseErrors(reverseSession), [], 'Drawio-first Markdown policy isolation failed');
+    } catch (error) {
+      await captureStandaloneFailure(reverseSession, 'markdown-drawio-first');
+      throw error;
+    } finally { await closeStandalone(reverseSession); }
+
+    for (const mode of ['missing', 'invalid']) {
+      let requested = false;
+      const failureSession = await openStandalone('/ocu', {
+        firstFile: 'hostile.md',
+        sanitizerRoute: route => {
+          requested = true;
+          return route.fulfill(mode === 'missing'
+            ? { status: 404, contentType: 'text/plain', body: 'missing sanitizer' }
+            : { status: 200, contentType: 'text/javascript', body: 'window.DOMPurify = {isSupported:false};' });
+        },
+      });
+      try {
+        await failureSession.page.locator('.preview-stage .empty-state').getByText('Failed to load file', { exact: true }).waitFor();
+        assert.equal(requested, true, 'failure fixture did not request the sanitizer');
+        assert.equal(await failureSession.page.locator('.preview-stage .markdown-body').count(), 0);
+        assert.equal(await failureSession.page.getByText('Safe Markdown neighbor', { exact: true }).count(), 0);
+        assert.equal(await failureSession.page.evaluate(() =>
+          document.documentElement.getAttribute('data-markdown-event-canary')), null);
+        const sanitizerPath = '/ocu/static/purify.min.js';
+        assert(caseErrors(failureSession).some(error => error.text.includes('Markdown render error:')),
+          'sanitizer failure did not report a Markdown load error');
+        acceptOwnedErrors(failureSession, error => error.text.includes('Markdown render error:') ||
+          mode === 'missing' && isExpected404(error, sanitizerPath));
+      } catch (error) {
+        await captureStandaloneFailure(failureSession, `markdown-sanitizer-${mode}`);
+        throw error;
+      } finally { await closeStandalone(failureSession); }
+    }
+
+    let heldSanitizer;
+    let sanitizerRequested;
+    const sanitizerArrival = new Promise(resolve => { sanitizerRequested = resolve; });
+    const supersededSession = await openStandalone('/ocu', {
+      firstFile: 'hostile.md', images: true,
+      sanitizerRoute: route => { heldSanitizer = route; sanitizerRequested(); },
+    });
+    try {
+      await within(sanitizerArrival, 'held Markdown sanitizer');
+      await selectStandaloneFile(supersededSession.page, 'guides/safe.md');
+      assert.equal(await supersededSession.page.locator('.preview-stage .markdown-body').count(), 0,
+        'pending sanitizer inserted unsanitized Markdown');
+      await heldSanitizer.fulfill({
+        status: 200, contentType: 'text/javascript', body: await fs.readFile(path.join(STATIC, 'purify.min.js')),
+      });
+      heldSanitizer = null;
+      await supersededSession.page.locator('.markdown-body .katex-display .katex-html').waitFor();
+      await supersededSession.page.locator('.markdown-body img[alt="HTTPS raster"]').evaluate(node => node.decode());
+      assert.equal(await supersededSession.page.getByText('Safe Markdown neighbor', { exact: true }).count(), 0,
+        'superseded Markdown overwrote the current selection');
+      assert.equal(await supersededSession.page.locator('.preview-stage').count(), 1);
+      assert.equal(await supersededSession.page.evaluate(() =>
+        document.documentElement.getAttribute('data-markdown-event-canary')), null);
+      assert.deepEqual(caseErrors(supersededSession), [], 'retired Markdown produced unexpected console errors');
+    } catch (error) {
+      await captureStandaloneFailure(supersededSession, 'markdown-superseded');
+      throw error;
+    } finally {
+      if (heldSanitizer) await heldSanitizer.abort();
+      await closeStandalone(supersededSession);
     }
 
 

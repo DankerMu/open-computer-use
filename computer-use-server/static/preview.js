@@ -189,7 +189,8 @@ function parseCSV(text, delimiter) {
 function handleLinkClick(href, resolvedUrl, files, selectedFile, onSelectFile) {
   if (!href) return;
   if (href.startsWith('#')) {
-    const targetId = decodeURIComponent(href.substring(1));
+    let targetId;
+    try { targetId = decodeURIComponent(href.substring(1)); } catch { return; }
     let el = document.getElementById(targetId);
     if (!el) { try { el = document.querySelector(href); } catch(e) {} }
     if (el) el.scrollIntoView({ behavior: 'smooth' });
@@ -361,8 +362,6 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000) + '\n\n... (truncated)';
     const renderer = new marked.Renderer();
-    const origImage = renderer.image.bind(renderer);
-    const origLink = renderer.link.bind(renderer);
     renderer.heading = function(token) {
       let text = token.text;
       let prev;
@@ -372,24 +371,73 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
         .replace(/\s+/g, '-');
       return `<h${token.depth} id="${slug}">${token.text}</h${token.depth}>\n`;
     };
-    function resolveUrl(href) {
-      if (href && !href.startsWith('http') && !href.startsWith('//') && !href.startsWith('data:') && !href.startsWith('#')) {
-        const fileDir = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/')) : '';
-        const base = fileDir ? FILES_BASE + '/' + fileDir : FILES_BASE;
-        return base + '/' + href;
+    const sanitizer = await ensureOfficeSanitizer();
+    if (!container.isConnected) return;
+    const fragment = sanitizer.sanitize(marked.parse(text, { renderer }), {
+      RETURN_DOM_FRAGMENT: true,
+      ALLOWED_TAGS: ['p', 'div', 'span', 'br', 'strong', 'em', 'b', 'i', 'u', 's', 'del',
+        'sub', 'sup', 'blockquote', 'pre', 'code', 'ul', 'ol', 'li', 'h1', 'h2',
+        'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tfoot', 'tr',
+        'th', 'td', 'caption', 'a', 'img', 'hr', 'details', 'summary'],
+      ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'colspan', 'rowspan', 'id',
+        'scope', 'class', 'open', 'start', 'reversed', 'value'],
+      FORBID_TAGS: ['script', 'style', 'svg', 'math', 'iframe', 'object', 'embed',
+        'form', 'input', 'button', 'textarea', 'select', 'option', 'link', 'meta',
+        'base', 'audio', 'video'],
+      FORBID_ATTR: ['style', 'srcset'],
+      ALLOW_DATA_ATTR: false,
+      ALLOW_ARIA_ATTR: false,
+      SANITIZE_NAMED_PROPS: true,
+    });
+    const rasterImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/i;
+    const fileDir = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/') + 1) : '';
+    const base = new URL(FILES_BASE + '/' + fileDir, location.origin);
+    const ids = new Set(Array.from(fragment.querySelectorAll('[id]'), node => node.id));
+    function safeUrl(value, image) {
+      const href = value.trim();
+      if (!href) return null;
+      const compact = href.replace(/[\u0000-\u0020\u007f-\u009f]/g, '');
+      const scheme = compact.match(/^([a-z][a-z\d+.-]*):/i)?.[1].toLowerCase();
+      if (scheme === 'data') return image && rasterImage.test(href) ? href : null;
+      if (scheme && scheme !== 'http' && scheme !== 'https' && (image || scheme !== 'mailto')) return null;
+      if (href.startsWith('#') && !image) {
+        try {
+          const target = 'user-content-' + decodeURIComponent(href.slice(1));
+          return ids.has(target) ? '#' + encodeURIComponent(target) : null;
+        } catch { return null; }
       }
-      return href;
+      try {
+        const url = new URL(href, base);
+        if (url.protocol !== 'http:' && url.protocol !== 'https:' && (image || url.protocol !== 'mailto:')) return null;
+        if (scheme || href.startsWith('//')) return url.href;
+        return url.pathname + url.search + url.hash;
+      } catch { return null; }
     }
-    renderer.image = function(token) { token.href = resolveUrl(token.href); return origImage(token); };
-    renderer.link = function(token) { token.href = resolveUrl(token.href); return origLink(token); };
-    const htmlContent = marked.parse(text, { renderer });
-    container.innerHTML = `<div class="markdown-body">${htmlContent}</div>`;
-    const mdBody = container.querySelector('.markdown-body');
+    for (const node of fragment.querySelectorAll('[class]')) {
+      const languages = node.tagName === 'CODE'
+        ? Array.from(node.classList).filter(name => /^language-[\w-]+$/.test(name)) : [];
+      if (languages.length) node.className = languages.join(' ');
+      else node.removeAttribute('class');
+    }
+    for (const link of fragment.querySelectorAll('a[href]')) {
+      const href = safeUrl(link.getAttribute('href'), false);
+      if (href === null) link.removeAttribute('href');
+      else link.setAttribute('href', href);
+    }
+    for (const image of fragment.querySelectorAll('img')) {
+      const src = image.hasAttribute('src') ? safeUrl(image.getAttribute('src'), true) : null;
+      if (src === null) image.remove();
+      else image.setAttribute('src', src);
+    }
+    const mdBody = document.createElement('div');
+    mdBody.className = 'markdown-body';
+    mdBody.appendChild(fragment);
+    container.replaceChildren(mdBody);
 
     // Link interception
     mdBody.addEventListener('click', function(e) {
       const a = e.target.closest('a');
-      if (!a) return;
+      if (!a || a.getAttribute('href')?.startsWith('mailto:')) return;
       e.preventDefault();
       handleLinkClick(a.getAttribute('href'), a.href, files, file, onSelectFile);
     });
@@ -404,6 +452,7 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
     if (mermaidBlocks.length > 0) {
       try {
         await loadScript(moduleAssetUrl('mermaid.min.js'));
+        if (!container.isConnected) return;
         mermaid.initialize({ startOnLoad: false, theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default' });
         mermaidBlocks.forEach(codeEl => {
           const pre = codeEl.parentElement;
@@ -412,7 +461,7 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
           div.textContent = codeEl.textContent;
           pre.replaceWith(div);
         });
-        await mermaid.run({ querySelector: '.mermaid' });
+        await mermaid.run({ nodes: Array.from(mdBody.querySelectorAll('.mermaid')) });
       } catch (e) { console.warn('Mermaid:', e); }
     }
 
@@ -420,6 +469,7 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
     try {
       await loadScript(moduleAssetUrl('katex/katex.min.js'));
       await loadScript(moduleAssetUrl('katex/auto-render.min.js'));
+      if (!container.isConnected) return;
       renderMathInElement(mdBody, {
         delimiters: [
           { left: '$$', right: '$$', display: true },
@@ -429,6 +479,7 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
       });
     } catch (e) { console.warn('KaTeX:', e); }
   } catch (err) {
+    if (!container.isConnected) return;
     console.error('Markdown render error:', err);
     container.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
   }
