@@ -447,6 +447,606 @@ def test_active_file_and_file_size_limits_preserve_prior_index_bytes(world):
     assert _index(data, OTHER_CHAT).read_bytes() == before_size
 
 
+def test_wide_tree_beyond_default_scan_descriptor_budget_preserves_predecessor(world):
+    broker_module, _docker_manager, data = world
+    _put(data, "keep.txt", b"keep original identity")
+    broker = broker_module.OutputsBroker()
+    initial = broker.reconcile(CHAT)
+    initial_entry = _entry_by_path(initial, "keep.txt")
+    before_bytes = _index(data).read_bytes()
+    before_index = _read_index(data)
+
+    excess_directories = [_outputs(data) / f"wide-{number:03d}" for number in range(500)]
+    for directory in excess_directories:
+        directory.mkdir()
+
+    with pytest.raises(broker_module.LimitExceededError) as failure:
+        broker.reconcile(CHAT)
+
+    message = str(failure.value).lower()
+    assert "scan" in message
+    assert "descriptor" in message
+    assert _index(data).read_bytes() == before_bytes
+    preserved = _read_index(data)
+    assert preserved["counter"] == before_index["counter"]
+    assert preserved["active"]["keep.txt"] == before_index["active"]["keep.txt"]
+    assert broker.current_revision(CHAT) == initial["revision"]
+
+    for directory in excess_directories:
+        directory.rmdir()
+
+    restored = broker.reconcile(CHAT)
+    restored_entry = _entry_by_path(restored, "keep.txt")
+    assert restored["unchanged"] is True
+    assert restored["total"] == 1
+    assert restored["revision"] == initial["revision"]
+    assert restored_entry["file_id"] == initial_entry["file_id"]
+    assert restored_entry["revision"] == initial_entry["revision"]
+    assert _read_index(data)["counter"] == before_index["counter"]
+    assert _index(data).read_bytes() == before_bytes
+
+
+@pytest.mark.parametrize(
+    "name,ceiling",
+    [
+        ("max_scan_entries", 50_000),
+        ("max_scan_directories", 10_000),
+        ("max_scan_directory_fds", 256),
+    ],
+)
+@pytest.mark.parametrize("invalid", [0, -1, True, False, 1.5, "1", None, "above-ceiling"])
+def test_scan_constructor_rejects_invalid_or_widened_bounds(world, name, ceiling, invalid):
+    broker_module, _docker_manager, _data = world
+    value = ceiling + 1 if invalid == "above-ceiling" else invalid
+    with pytest.raises(ValueError, match=name):
+        broker_module.OutputsBroker(**{name: value})
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "hidden-file", "hidden-directory", "symlink", "fifo"])
+def test_scan_entry_budget_counts_filtered_entries_and_excludes_hidden_subtrees(world, kind):
+    broker_module, _docker_manager, data = world
+    _put(data, "keep.txt", b"keep")
+    broker = broker_module.OutputsBroker(max_scan_entries=2)
+    initial = broker.reconcile(CHAT)
+    extra = _outputs(data) / "extra"
+    if kind == "file":
+        extra.write_bytes(b"extra")
+    elif kind == "directory":
+        extra.mkdir()
+    elif kind == "hidden-file":
+        extra = _outputs(data) / ".hidden"
+        extra.write_bytes(b"hidden")
+    elif kind == "hidden-directory":
+        extra = _outputs(data) / ".hidden"
+        extra.mkdir()
+        for number in range(3):
+            (extra / f"unvisited-{number}").write_bytes(b"hidden")
+    elif kind == "symlink":
+        extra.symlink_to(_outputs(data) / "keep.txt")
+    else:
+        os.mkfifo(extra)
+
+    exact = broker.reconcile(CHAT)
+    assert [entry["path"] for entry in exact["entries"]] == (
+        ["extra", "keep.txt"] if kind == "file" else ["keep.txt"]
+    )
+    before = _index(data).read_bytes()
+    excess = _outputs(data) / ".excess"
+    excess.write_bytes(b"invisible but counted")
+    with pytest.raises(broker_module.LimitExceededError, match="scan.*entr"):
+        broker.reconcile(CHAT)
+    assert _index(data).read_bytes() == before
+    excess.unlink()
+    restored = broker.reconcile(CHAT)
+    assert restored["unchanged"] is True
+    assert restored["revision"] == exact["revision"]
+    assert _entry_by_path(restored, "keep.txt")["file_id"] == _entry_by_path(initial, "keep.txt")["file_id"]
+    assert _index(data).read_bytes() == before
+
+
+def test_excess_scan_entry_is_not_inspected_or_opened(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    _put(data, "keep.txt", b"keep")
+    broker = broker_module.OutputsBroker(max_scan_entries=1)
+    broker.reconcile(CHAT)
+    before = _index(data).read_bytes()
+    original_scandir = os.scandir
+    original_open = os.open
+    output_root = _outputs(data)
+    root_identity = (output_root.stat().st_dev, output_root.stat().st_ino)
+    opened_children = []
+
+    class ExcessEntry:
+        name = "excess"
+
+        def stat(self, **_kwargs):
+            raise AssertionError("the excess entry must not be inspected")
+
+    class OrderedListing:
+        def __init__(self, fd):
+            self.listing = original_scandir(fd)
+
+        def __enter__(self):
+            self.listing.__enter__()
+            return self
+
+        def __iter__(self):
+            yield from self.listing
+            yield ExcessEntry()
+
+        def __exit__(self, *args):
+            return self.listing.__exit__(*args)
+
+    def ordered_scandir(fd):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == root_identity:
+            return OrderedListing(fd)
+        return original_scandir(fd)
+
+    def observe_open(path, flags, *args, **kwargs):
+        if path == "excess":
+            opened_children.append(path)
+            raise AssertionError("the excess entry must not be opened")
+        return original_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patches:
+        patches.setattr(broker_module.os, "scandir", ordered_scandir)
+        patches.setattr(broker_module.os, "open", observe_open)
+        with pytest.raises(broker_module.LimitExceededError, match="scan.*entr"):
+            broker.reconcile(CHAT)
+    assert opened_children == []
+    assert _index(data).read_bytes() == before
+    assert broker.reconcile(CHAT)["unchanged"] is True
+
+
+def test_scan_directory_budget_includes_root_and_refuses_before_child_open(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    output_root = _outputs(data)
+    output_root.mkdir(parents=True)
+    broker = broker_module.OutputsBroker(max_scan_directories=1)
+    initial = broker.reconcile(CHAT)
+    assert initial["entries"] == []
+    before = _index(data).read_bytes()
+    child = output_root / "child"
+    child.mkdir()
+    original_open = os.open
+
+    def forbid_child_open(path, flags, *args, **kwargs):
+        if path == "child" and kwargs.get("dir_fd") is not None:
+            raise AssertionError("directory budget must be checked before opening the child")
+        return original_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patches:
+        patches.setattr(broker_module.os, "open", forbid_child_open)
+        with pytest.raises(broker_module.LimitExceededError, match="scan.*director"):
+            broker.reconcile(CHAT)
+    assert _index(data).read_bytes() == before
+    exact = broker_module.OutputsBroker(max_scan_directories=2).reconcile(CHAT)
+    assert exact["unchanged"] is True
+    child.rmdir()
+    assert broker.reconcile(CHAT)["unchanged"] is True
+    assert _index(data).read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "shape,paths,exact_fds",
+    [
+        ("wide", ["a", "b", "c"], 5),
+        ("deep", ["a/b/c"], 3),
+        ("mixed", ["a/leaf", "b/leaf"], 4),
+    ],
+)
+def test_scan_descriptor_budget_allows_exact_shape_and_releases_owned_fds(
+    world, monkeypatch, shape, paths, exact_fds
+):
+    broker_module, _docker_manager, data = world
+    output_root = _outputs(data)
+    output_root.mkdir(parents=True)
+    for path in paths:
+        (output_root / path).mkdir(parents=True)
+    original_open = os.open
+    acquired = []
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if flags & os.O_DIRECTORY:
+            acquired.append(fd)
+        return fd
+
+    root_fd = original_open(output_root, broker_module._DIRECTORY_FLAGS)
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(broker_module.os, "open", track_open)
+            broker_module.OutputsBroker(max_scan_directory_fds=exact_fds)._scan_tree(root_fd, {})
+        os.fstat(root_fd)
+        for fd in acquired:
+            with pytest.raises(OSError) as failure:
+                os.fstat(fd)
+            assert failure.value.errno == errno.EBADF
+        acquired.clear()
+        with monkeypatch.context() as patches:
+            patches.setattr(broker_module.os, "open", track_open)
+            with pytest.raises(broker_module.LimitExceededError, match="scan.*descriptor"):
+                broker_module.OutputsBroker(max_scan_directory_fds=exact_fds - 1)._scan_tree(root_fd, {})
+        os.fstat(root_fd)
+        for fd in acquired:
+            with pytest.raises(OSError) as failure:
+                os.fstat(fd)
+            assert failure.value.errno == errno.EBADF
+    finally:
+        os.close(root_fd)
+
+
+def test_scan_descriptor_budget_checks_iterator_duplicate_before_acquisition(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    _put(data, "keep.txt", b"keep")
+    broker = broker_module.OutputsBroker()
+    initial = broker.reconcile(CHAT)
+    before = _index(data).read_bytes()
+
+    def forbid_iterator(_fd):
+        raise AssertionError("the duplicate iterator descriptor exceeds the budget")
+
+    with monkeypatch.context() as patches:
+        patches.setattr(broker_module.os, "scandir", forbid_iterator)
+        with pytest.raises(broker_module.LimitExceededError, match="scan.*descriptor"):
+            broker_module.OutputsBroker(max_scan_directory_fds=1).reconcile(CHAT)
+    assert _index(data).read_bytes() == before
+    restored = broker_module.OutputsBroker(max_scan_directory_fds=2).reconcile(CHAT)
+    assert restored["unchanged"] is True
+    assert restored["entries"] == initial["entries"]
+
+
+def test_scan_descriptor_budget_refuses_frontier_acquisition_before_open(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    output_root = _outputs(data)
+    output_root.mkdir(parents=True)
+    for name in ("a", "b", "c"):
+        (output_root / name).mkdir()
+    original_open = os.open
+    original_close = os.close
+    owned = set()
+
+    def track_open(path, flags, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None and flags & os.O_DIRECTORY:
+            assert len(owned) < 2, "the third child must be refused before acquisition"
+            fd = original_open(path, flags, *args, **kwargs)
+            owned.add(fd)
+            return fd
+        return original_open(path, flags, *args, **kwargs)
+
+    def track_close(fd):
+        original_close(fd)
+        owned.discard(fd)
+
+    root_fd = original_open(output_root, broker_module._DIRECTORY_FLAGS)
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(broker_module.os, "open", track_open)
+            patches.setattr(broker_module.os, "close", track_close)
+            with pytest.raises(broker_module.LimitExceededError, match="scan.*descriptor"):
+                broker_module.OutputsBroker(max_scan_directory_fds=3)._scan_tree(root_fd, {})
+        assert owned == set()
+        os.fstat(root_fd)
+    finally:
+        original_close(root_fd)
+
+
+@pytest.mark.parametrize("error_number", [errno.EMFILE, errno.ENFILE])
+@pytest.mark.parametrize("stage", ["root", "child", "iterator-create", "iterator-advance"])
+def test_scan_os_descriptor_exhaustion_preserves_authority_and_recovers(
+    world, monkeypatch, stage, error_number
+):
+    broker_module, _docker_manager, data = world
+    _put(data, "keep.txt", b"keep")
+    broker = broker_module.OutputsBroker()
+    initial = broker.reconcile(CHAT)
+    before = _index(data).read_bytes()
+    output_root = _outputs(data)
+    (output_root / "child").mkdir()
+    original_open = os.open
+    original_scandir = os.scandir
+    acquired = []
+
+    def failing_open(path, flags, *args, **kwargs):
+        if (stage == "root" and path == output_root) or (
+            stage == "child" and path == "child" and kwargs.get("dir_fd") is not None
+        ):
+            raise OSError(error_number, "injected directory descriptor exhaustion")
+        fd = original_open(path, flags, *args, **kwargs)
+        if flags & os.O_DIRECTORY:
+            acquired.append(fd)
+        return fd
+
+    class FailingListing:
+        def __init__(self, fd):
+            self.listing = original_scandir(fd)
+
+        def __enter__(self):
+            self.listing.__enter__()
+            return self
+
+        def __iter__(self):
+            raise OSError(error_number, "injected enumeration descriptor exhaustion")
+            yield
+
+        def __exit__(self, *args):
+            return self.listing.__exit__(*args)
+
+    def failing_scandir(fd):
+        if stage == "iterator-create":
+            raise OSError(error_number, "injected iterator descriptor exhaustion")
+        if stage == "iterator-advance":
+            return FailingListing(fd)
+        return original_scandir(fd)
+
+    with monkeypatch.context() as patches:
+        patches.setattr(broker_module.os, "open", failing_open)
+        patches.setattr(broker_module.os, "scandir", failing_scandir)
+        with pytest.raises(broker_module.LimitExceededError, match="scan.*descriptor"):
+            broker.reconcile(CHAT)
+        for fd in acquired:
+            with pytest.raises(OSError) as failure:
+                os.fstat(fd)
+            assert failure.value.errno == errno.EBADF
+    assert _index(data).read_bytes() == before
+    assert broker.current_revision(CHAT) == initial["revision"]
+    restored = broker.reconcile(CHAT)
+    assert restored["unchanged"] is True
+    assert restored["entries"] == initial["entries"]
+    assert _index(data).read_bytes() == before
+
+
+@pytest.mark.parametrize("error_number", [errno.EMFILE, errno.ENFILE])
+@pytest.mark.parametrize("stage", ["root", "child"])
+def test_registration_directory_errors_remain_unstable_outside_scan(
+    world, monkeypatch, stage, error_number
+):
+    broker_module, _docker_manager, data = world
+    _put(data, "child/keep.txt", b"keep")
+    broker = broker_module.OutputsBroker(max_scan_entries=1, max_scan_directories=1, max_scan_directory_fds=1)
+    initial = broker.register_host_write(CHAT, "child/keep.txt")
+    before = _index(data).read_bytes()
+    output_root = _outputs(data)
+    original_open = os.open
+
+    def failing_open(path, flags, *args, **kwargs):
+        if (stage == "root" and path == output_root) or (
+            stage == "child" and path == "child" and kwargs.get("dir_fd") is not None
+        ):
+            raise OSError(error_number, "injected non-scan directory exhaustion")
+        return original_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patches:
+        patches.setattr(broker_module.os, "open", failing_open)
+        with pytest.raises(broker_module.UnstableReadError):
+            broker.register_host_write(CHAT, "child/keep.txt")
+    assert _index(data).read_bytes() == before
+    recovered = broker.register_host_write(CHAT, "child/keep.txt")
+    assert recovered["file_id"] == initial["file_id"]
+
+
+def test_absent_outputs_root_does_not_consume_scan_directory_or_iterator_budget(world):
+    broker_module, _docker_manager, _data = world
+    listing = broker_module.OutputsBroker(
+        max_scan_entries=1, max_scan_directories=1, max_scan_directory_fds=1
+    ).reconcile(CHAT)
+    assert listing["entries"] == []
+    assert listing["revision"] == 0
+
+
+@pytest.mark.parametrize("failure_kind", ["os-error", "base-exception"])
+def test_child_iterator_failure_releases_current_frontier_and_duplicate_but_not_root(
+    world, monkeypatch, failure_kind
+):
+    broker_module, _docker_manager, data = world
+    output_root = _outputs(data)
+    output_root.mkdir(parents=True)
+    for name in ("a", "b", "c"):
+        (output_root / name).mkdir()
+    original_open = os.open
+    original_scandir = os.scandir
+    acquired = []
+    iterator_fds = []
+    root_fd = original_open(output_root, broker_module._DIRECTORY_FLAGS)
+
+    class ScanInterrupted(BaseException):
+        pass
+
+    class FailingChildListing:
+        def __init__(self, fd):
+            identity = os.fstat(fd)
+            before = set()
+            for candidate in range(max([root_fd, *acquired]) + 2):
+                try:
+                    os.fstat(candidate)
+                    before.add(candidate)
+                except OSError:
+                    pass
+            self.listing = original_scandir(fd)
+            for candidate in range(max([root_fd, *acquired]) + 2):
+                if candidate in before:
+                    continue
+                try:
+                    info = os.fstat(candidate)
+                except OSError:
+                    continue
+                if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+                    iterator_fds.append(candidate)
+
+        def __enter__(self):
+            self.listing.__enter__()
+            return self
+
+        def __iter__(self):
+            if failure_kind == "os-error":
+                raise OSError(errno.EMFILE, "child enumeration descriptor exhaustion")
+            raise ScanInterrupted()
+            yield
+
+        def __exit__(self, *args):
+            return self.listing.__exit__(*args)
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        acquired.append(fd)
+        return fd
+
+    def failing_scandir(fd):
+        return original_scandir(fd) if fd == root_fd else FailingChildListing(fd)
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(broker_module.os, "open", track_open)
+            patches.setattr(broker_module.os, "scandir", failing_scandir)
+            expected = broker_module.LimitExceededError if failure_kind == "os-error" else ScanInterrupted
+            with pytest.raises(expected):
+                broker_module.OutputsBroker()._scan_tree(root_fd, {})
+        assert len(iterator_fds) == 1
+        for fd in [*acquired, *iterator_fds]:
+            with pytest.raises(OSError) as failure:
+                os.fstat(fd)
+            assert failure.value.errno == errno.EBADF
+        os.fstat(root_fd)
+        observations = {}
+        broker_module.OutputsBroker()._scan_tree(root_fd, observations)
+        assert observations == {}
+    finally:
+        os.close(root_fd)
+
+
+_SCAN_RLIMIT_PROBE = r'''
+import errno
+import fcntl
+import json
+import os
+import resource
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+os.environ["BASE_DATA_DIR"] = os.environ["OCU_BASE"]
+os.environ["DOCKER_HOST"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
+os.environ["DOCKER_SOCKET"] = "unix:///tmp/ocu-acceptance-no-docker.sock"
+import outputs_broker
+
+chat = os.environ["OCU_CHAT"]
+root = Path(os.environ["OCU_BASE"]) / chat / "outputs"
+root.mkdir(parents=True)
+(root / "keep.txt").write_bytes(b"keep")
+broker = outputs_broker.OutputsBroker()
+initial = broker.reconcile(chat)
+index = root.parent / ".ocu" / "index.json"
+before_bytes = index.read_bytes()
+directories = [root / ("wide-%03d" % number) for number in range(100)]
+for directory in directories:
+    directory.mkdir()
+_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+mode = os.environ["OCU_SCAN_PROBE_MODE"]
+if mode == "policy":
+    broker = outputs_broker.OutputsBroker(max_scan_directory_fds=8)
+identities = {(path.stat().st_dev, path.stat().st_ino) for path in [root, *directories]}
+peak = 0
+
+def live_fds():
+    live = set()
+    for fd in range(64):
+        try:
+            fcntl.fcntl(fd, fcntl.F_GETFD)
+            live.add(fd)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+    return live
+
+def sample_scan_fds():
+    global peak
+    count = 0
+    for fd in live_fds():
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) in identities:
+            count += 1
+    peak = max(peak, count)
+
+original_open = os.open
+original_scandir = os.scandir
+
+def sampled_open(*args, **kwargs):
+    fd = original_open(*args, **kwargs)
+    sample_scan_fds()
+    return fd
+
+def sampled_scandir(*args, **kwargs):
+    listing = original_scandir(*args, **kwargs)
+    sample_scan_fds()
+    return listing
+
+before_fds = live_fds()
+assert len(before_fds) < 64
+os.open = sampled_open
+os.scandir = sampled_scandir
+try:
+    broker.reconcile(chat)
+except outputs_broker.LimitExceededError as exc:
+    cause = exc.__cause__
+    if mode == "os":
+        assert isinstance(cause, OSError)
+        assert cause.errno == errno.EMFILE
+        assert 8 < peak <= 64
+    else:
+        assert cause is None
+        assert peak == 8
+    assert "scan" in str(exc).lower() and "descriptor" in str(exc).lower()
+else:
+    raise AssertionError("native descriptor exhaustion must refuse reconciliation")
+finally:
+    os.open = original_open
+    os.scandir = original_scandir
+assert live_fds() == before_fds
+assert index.read_bytes() == before_bytes
+assert broker.current_revision(chat) == initial["revision"]
+for directory in directories:
+    directory.rmdir()
+restored = broker.reconcile(chat)
+assert restored["unchanged"] is True
+assert restored["entries"] == initial["entries"]
+assert index.read_bytes() == before_bytes
+assert live_fds() == before_fds
+print(json.dumps({"error": "LimitExceededError", "errno": errno.EMFILE if mode == "os" else None, "preserved": True, "recovered": True}))
+'''
+
+
+@pytest.mark.parametrize("mode", ["policy", "os"])
+def test_native_low_nofile_scan_exhaustion_releases_resources_and_preserves_identity(world, mode):
+    _broker_module, _docker_manager, data = world
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "OCU_SERVER_DIR": str(SERVER_DIR),
+            "OCU_BASE": str(data),
+            "OCU_CHAT": CHAT,
+            "OCU_SCAN_PROBE_MODE": mode,
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", _SCAN_RLIMIT_PROBE],
+        cwd=str(SERVER_DIR),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert json.loads(completed.stdout.strip().splitlines()[-1]) == {
+        "error": "LimitExceededError",
+        "errno": errno.EMFILE if mode == "os" else None,
+        "preserved": True,
+        "recovered": True,
+    }
+
+
 def test_successor_index_size_limit_preserves_valid_predecessor(world):
     broker_module, _docker_manager, data = world
     broker_module.OutputsBroker().reconcile(CHAT)
