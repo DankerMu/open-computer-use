@@ -1211,15 +1211,54 @@ function attachRenderedPageGuard(owner, target, file, tracker, lifetime) {
   check();
 }
 
+const drawioFullscreenClosures = new Set();
+let drawioFullscreenOverflow;
+let drawioFullscreenResizeSensor;
+
 function attachLocalLightboxGuard(viewer, Viewer, host, file, parentLifetime) {
   if (typeof viewer.showLocalLightbox !== 'function') return;
   const previous = Viewer.prototype.showLocalLightbox;
   viewer.showLocalLightbox = function() {
+    if (!parentLifetime?.current()) return null;
+    const overflow = document.body.style.overflow;
+    const resizeSensor = Viewer.resizeSensorEnabled;
     const ui = previous.apply(this, arguments);
-    if (ui && parentLifetime?.current()) {
+    if (ui) {
       const uiTracker = installStencilLoadTracker();
       const uiLifetime = createDrawioLifetime(host, parentLifetime);
       attachRenderedPageGuard(ui, host, file, uiTracker, uiLifetime);
+      const destroy = ui.destroy;
+      let requested = false;
+      let mounted = false;
+      let completed = false;
+      const finish = () => {
+        if (completed || !requested || !mounted) return;
+        completed = true;
+        drawioFullscreenClosures.delete(close);
+        try { destroy.call(ui); }
+        finally {
+          document.body.style.overflow = drawioFullscreenClosures.size ? 'hidden' : drawioFullscreenOverflow;
+          Viewer.resizeSensorEnabled = drawioFullscreenClosures.size ? false : drawioFullscreenResizeSensor;
+        }
+      };
+      const close = () => {
+        if (requested) return;
+        requested = true;
+        uiLifetime.dispose();
+        finish();
+      };
+      if (!drawioFullscreenClosures.size) {
+        drawioFullscreenOverflow = overflow;
+        drawioFullscreenResizeSensor = resizeSensor;
+      }
+      drawioFullscreenClosures.add(close);
+      ui.destroy = close;
+      uiLifetime.addCleanup(close);
+      // The pinned viewer queues body attachment before returning; destroy requires that mount to settle.
+      window.setTimeout(() => {
+        mounted = true;
+        finish();
+      }, 0);
     }
     return ui;
   };
