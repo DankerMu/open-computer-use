@@ -30,6 +30,9 @@ MAX_PAGE_LIMIT = 1_000
 MAX_ACTIVE_FILES = 10_000
 MAX_FILE_SIZE = 100 * 1024 * 1024
 MAX_INDEX_SIZE = 64 * 1024 * 1024
+MAX_SCAN_ENTRIES = 50_000
+MAX_SCAN_DIRECTORIES = 10_000
+MAX_SCAN_DIRECTORY_FDS = 256
 HASH_CHUNK_SIZE = 1024 * 1024
 
 _NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -106,11 +109,17 @@ class OutputsBroker:
         max_active_files: int = MAX_ACTIVE_FILES,
         max_file_size: int = MAX_FILE_SIZE,
         max_index_size: int = MAX_INDEX_SIZE,
+        max_scan_entries: int = MAX_SCAN_ENTRIES,
+        max_scan_directories: int = MAX_SCAN_DIRECTORIES,
+        max_scan_directory_fds: int = MAX_SCAN_DIRECTORY_FDS,
     ) -> None:
         self.max_page_limit = self._positive("max_page_limit", max_page_limit, MAX_PAGE_LIMIT)
         self.max_active_files = self._positive("max_active_files", max_active_files, MAX_ACTIVE_FILES)
         self.max_file_size = self._positive("max_file_size", max_file_size, MAX_FILE_SIZE)
         self.max_index_size = self._positive("max_index_size", max_index_size, MAX_INDEX_SIZE)
+        self.max_scan_entries = self._positive("max_scan_entries", max_scan_entries, MAX_SCAN_ENTRIES)
+        self.max_scan_directories = self._positive("max_scan_directories", max_scan_directories, MAX_SCAN_DIRECTORIES)
+        self.max_scan_directory_fds = self._positive("max_scan_directory_fds", max_scan_directory_fds, MAX_SCAN_DIRECTORY_FDS)
         if not _NO_FOLLOW or not _DIRECTORY or not _NONBLOCK:
             raise RuntimeError("outputs broker requires O_NOFOLLOW, O_DIRECTORY and O_NONBLOCK support")
 
@@ -451,49 +460,69 @@ class OutputsBroker:
             raise UnsafePathError(f"outputs root is a symlink: {output_root}")
         if not stat.S_ISDIR(output_stat.st_mode):
             raise UnsafePathError(f"outputs root is not a directory: {output_root}")
-        root_fd = self._open_directory_path(output_root, "outputs root")
         observations: dict[str, _Observation] = {}
+        root_fd = self._open_directory_path(output_root, "outputs root", scan=True)
         try:
             self._scan_tree(root_fd, observations)
         finally:
             os.close(root_fd)
         return observations
 
-    def _open_directory_path(self, path: Path, label: str) -> int:
+    def _open_directory_path(self, path: Path, label: str, *, scan: bool = False) -> int:
         try:
             directory_fd = os.open(path, _DIRECTORY_FLAGS)
         except OSError as exc:
+            if scan and exc.errno in (errno.EMFILE, errno.ENFILE):
+                raise LimitExceededError("scan directory descriptor resources exhausted while opening root") from exc
             if self._is_nofollow_error(exc):
                 raise UnsafePathError(f"{label} is a symlink: {path}") from exc
             if self._is_missing(exc):
                 raise UnstableReadError(f"{label} disappeared while opening: {path}") from exc
             raise UnstableReadError(f"cannot safely open {label}: {path}") from exc
-        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+        try:
+            if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+                raise UnsafePathError(f"{label} is not a directory: {path}")
+            return directory_fd
+        except BaseException:
             os.close(directory_fd)
-            raise UnsafePathError(f"{label} is not a directory: {path}")
-        return directory_fd
+            raise
 
-    def _open_child_directory(self, parent_fd: int, name: str) -> int:
+    def _open_child_directory(self, parent_fd: int, name: str, *, scan: bool = False) -> int:
         try:
             child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
         except OSError as exc:
+            if scan and exc.errno in (errno.EMFILE, errno.ENFILE):
+                raise LimitExceededError("scan directory descriptor resources exhausted while opening child") from exc
             if self._is_nofollow_error(exc) or self._is_missing(exc):
                 raise UnstableReadError(f"output directory changed while traversing: {name}") from exc
             raise UnstableReadError(f"cannot safely traverse output directory: {name}") from exc
-        if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+        try:
+            if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                raise UnstableReadError(f"output directory changed while traversing: {name}")
+            return child_fd
+        except BaseException:
             os.close(child_fd)
-            raise UnstableReadError(f"output directory changed while traversing: {name}")
-        return child_fd
+            raise
 
     def _scan_tree(self, root_fd: int, observations: dict[str, _Observation]) -> None:
         stack: list[tuple[int, tuple[str, ...], bool]] = [(root_fd, (), False)]
+        entries = 0
+        directories = 1
+        directory_fds = 1
         try:
             while stack:
                 directory_fd, prefix, owned = stack.pop()
                 try:
+                    # scandir duplicates its borrowed FD; no children are opened
+                    # until the iterator context has released that duplicate.
+                    if directory_fds >= self.max_scan_directory_fds:
+                        raise LimitExceededError("scan directory descriptor count exceeds configured limit")
                     with os.scandir(directory_fd) as listing:
                         children = []
                         for entry in listing:
+                            entries += 1
+                            if entries > self.max_scan_entries:
+                                raise LimitExceededError("scan entry count exceeds configured limit")
                             name = entry.name
                             if name.startswith("."):
                                 continue
@@ -509,7 +538,7 @@ class OutputsBroker:
                             if stat.S_ISLNK(mode):
                                 continue
                             if stat.S_ISDIR(mode):
-                                children.append((name, relative_path, True, item_stat))
+                                children.append(name)
                                 continue
                             if not stat.S_ISREG(mode):
                                 continue
@@ -524,14 +553,27 @@ class OutputsBroker:
                             )
                             if len(observations) > self.max_active_files:
                                 raise LimitExceededError("output file count exceeds configured active-file limit")
-                        for name, relative_path, _is_dir, _stat in reversed(children):
-                            child_fd = self._open_child_directory(directory_fd, name)
+                    for name in reversed(children):
+                        if directories >= self.max_scan_directories:
+                            raise LimitExceededError("scan directory count exceeds configured limit")
+                        if directory_fds >= self.max_scan_directory_fds:
+                            raise LimitExceededError("scan directory descriptor count exceeds configured limit")
+                        child_fd = self._open_child_directory(directory_fd, name, scan=True)
+                        try:
                             stack.append((child_fd, (*prefix, name), True))
+                        except BaseException:
+                            os.close(child_fd)
+                            raise
+                        directories += 1
+                        directory_fds += 1
                 except OSError as exc:
+                    if exc.errno in (errno.EMFILE, errno.ENFILE):
+                        raise LimitExceededError("scan directory descriptor resources exhausted while enumerating") from exc
                     raise UnstableReadError("outputs directory changed while enumerating") from exc
                 finally:
                     if owned:
                         os.close(directory_fd)
+                        directory_fds -= 1
         except BaseException:
             while stack:
                 directory_fd, _prefix, owned = stack.pop()
