@@ -67,6 +67,7 @@ from docker_manager import (
 from security import sanitize_chat_id, safe_path
 from uploads import (
     CorruptReceiptsError,
+    NameCapacityError,
     claim_file_no_replace,
     close_fd,
     ensure_workspace_directories,
@@ -729,6 +730,8 @@ async def upload_file(
         raise
     except CorruptReceiptsError:
         raise HTTPException(status_code=500, detail="import receipts are corrupt")
+    except NameCapacityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 

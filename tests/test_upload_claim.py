@@ -107,6 +107,116 @@ def test_collision_preserves_original_and_reports_relative_stored_name(upload_se
     ]
 
 
+@pytest.mark.parametrize("kind", ("ascii", "multibyte", "last-suffix"))
+def test_native_name_limit_collision_preserves_longest_prefix_and_receipt(
+        upload_server, kind):
+    client, uploads = upload_server
+    destination = uploads / "nested"
+    destination.mkdir(parents=True)
+    limit = os.pathconf(destination, "PC_NAME_MAX")
+    if kind == "ascii":
+        name = "a" * limit
+        expected = "a" * (limit - 4) + " (2)"
+    elif kind == "multibyte":
+        name = "界" * ((limit - 4) // 3) + "a" * ((limit - 4) % 3) + ".txt"
+        expected = "界" * ((limit - 8) // 3) + " (2).txt"
+    else:
+        name = "a" * (limit - 7) + ".tar.gz"
+        expected = "a" * (limit - 7) + " (2).gz"
+    body = b"complete-collision-payload" * 4096
+    assert _upload(client, "nested/" + name, b"original", "F1").status_code == 200
+    response = _upload(client, "nested/" + name, body, "F2")
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "status": "success", "filename": "nested/" + expected,
+        "size": len(body), "md5": hashlib.md5(body).hexdigest(),
+    }
+    assert len(os.fsencode(expected)) <= limit
+    assert (destination / name).read_bytes() == b"original"
+    assert (destination / expected).read_bytes() == body
+    assert {path.name for path in destination.iterdir()} == {name, expected}
+    assert _receipts(uploads)["F2"]["stored_name"] == "nested/" + expected
+
+
+def test_native_multibyte_collision_rebudgets_number_ten(upload_server):
+    client, uploads = upload_server
+    uploads.mkdir(parents=True)
+    limit = os.pathconf(uploads, "PC_NAME_MAX")
+    leading = "a" * ((limit - 4) % 3)
+    prefix = leading + "界" * ((limit - 4) // 3)
+    name = prefix + "界"
+    (uploads / name).write_bytes(b"original")
+    occupied = {prefix + f" ({number})" for number in range(2, 10)}
+    for candidate in occupied:
+        (uploads / candidate).write_bytes(b"occupied")
+    expected = leading + "界" * (((limit - 4) // 3) - 1) + " (10)"
+    response = _upload(client, name, b"tenth payload")
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == expected
+    assert (uploads / expected).read_bytes() == b"tenth payload"
+    assert (uploads / name).read_bytes() == b"original"
+    assert all((uploads / candidate).read_bytes() == b"occupied" for candidate in occupied)
+    assert {path.name for path in uploads.iterdir()} == occupied | {name, expected}
+
+
+@pytest.mark.parametrize("minimum_fits", (True, False), ids=("underscore", "impossible-suffix"))
+def test_native_suffix_budget_preserves_original_and_cleans_private_stage(
+        upload_server, minimum_fits):
+    client, uploads = upload_server
+    uploads.mkdir(parents=True)
+    limit = os.pathconf(uploads, "PC_NAME_MAX")
+    suffix = "." + "x" * (limit - (6 if minimum_fits else 5))
+    name = "界" + suffix
+    assert _upload(client, name, b"original", "F1").status_code == 200
+    receipts_before = _receipts(uploads)
+    response = _upload(client, name, b"new payload", "F2")
+    assert response.status_code == (200 if minimum_fits else 400), response.text
+    assert (uploads / name).read_bytes() == b"original"
+    if minimum_fits:
+        expected = "_ (2)" + suffix
+        assert response.json()["filename"] == expected
+        assert len(os.fsencode(expected)) == limit
+        assert (uploads / expected).read_bytes() == b"new payload"
+        assert {path.name for path in uploads.iterdir()} == {name, expected}
+        assert _receipts(uploads)["F2"]["stored_name"] == expected
+    else:
+        assert {path.name for path in uploads.iterdir()} == {name}
+        assert _receipts(uploads) == receipts_before
+        assert _imports(client).json() == {"ids": ["F1"]}
+    assert not list((uploads.parent / ".ocu").glob(".upload-*"))
+
+
+@pytest.mark.parametrize("limit", (0, -1, "lookup-error"), ids=("zero", "indeterminate", "lookup-error"))
+def test_unknown_target_name_limit_fails_without_publication_or_receipt(
+        upload_server, monkeypatch, limit):
+    client, uploads = upload_server
+    destination = uploads / "nested"
+    destination.mkdir(parents=True)
+    assert _upload(client, "nested/report.txt", b"original", "F1").status_code == 200
+    receipts_before = _receipts(uploads)
+    target = destination.stat()
+    query = os.fpathconf
+    queried = []
+
+    def unknown(fd, key):
+        if key == "PC_NAME_MAX":
+            info = os.fstat(fd)
+            queried.append((info.st_dev, info.st_ino))
+            if limit == "lookup-error":
+                raise OSError("target name limit unavailable")
+            return limit
+        return query(fd, key)
+
+    monkeypatch.setattr(os, "fpathconf", unknown)
+    response = _upload(client, "nested/report.txt", b"new", "F2")
+    assert response.status_code == 500, response.text
+    assert set(queried) == {(target.st_dev, target.st_ino)}
+    assert (destination / "report.txt").read_bytes() == b"original"
+    assert {path.name for path in destination.iterdir()} == {"report.txt"}
+    assert _receipts(uploads) == receipts_before
+    assert not list((uploads.parent / ".ocu").glob(".upload-*"))
+
+
 def test_reimported_attachment_id_keeps_edited_file_and_reports_original_metadata(
         upload_server):
     client, uploads = upload_server
@@ -297,14 +407,25 @@ def test_upload_creates_writable_parents_and_preserves_existing_directory_modes(
         os.umask(previous_umask)
 
 
-def test_free_name_preserves_response_fields_and_outputs_destination(upload_server):
+@pytest.mark.parametrize("headroom", (None, 3, 2, 1, 0),
+                         ids=("short", "near-limit-3", "near-limit-2", "near-limit-1", "limit"))
+def test_free_name_preserves_response_fields_and_outputs_destination(
+        upload_server, monkeypatch, headroom):
     client, uploads = upload_server
-    response = _upload(client, "brief.docx", b"new")
+    uploads.mkdir(parents=True)
+    limit = min(255, os.pathconf(uploads, "PC_NAME_MAX"))
+    name = "brief.docx" if headroom is None else "a" * (limit - headroom - 5) + ".docx"
+
+    def unavailable(fd, key):
+        raise OSError("free original must not need a collision budget")
+
+    monkeypatch.setattr(os, "fpathconf", unavailable)
+    response = _upload(client, name, b"new")
     assert response.status_code == 200
-    assert response.json() == {"status": "success", "filename": "brief.docx",
+    assert response.json() == {"status": "success", "filename": name,
                                "size": 3, "md5": "22af645d1859cb5ca6da0c484f1f37ea"}
-    assert (uploads / "brief.docx").read_bytes() == b"new"
-    assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx"]
+    assert (uploads / name).read_bytes() == b"new"
+    assert sorted(path.name for path in uploads.iterdir()) == [name]
     assert not (uploads.parent / "uploads").exists()
 
 
@@ -388,8 +509,23 @@ def test_all_occupied_entries_advance_to_next_free_number(upload_server, kind):
     ]
 
 
-def test_unlocked_writer_wins_claim_without_losing_either_payload(upload_server, monkeypatch):
+@pytest.mark.parametrize("near_limit", (False, True), ids=("short", "bounded-symlink-race"))
+def test_unlocked_writer_wins_claim_without_losing_either_payload(
+        upload_server, monkeypatch, near_limit):
     client, uploads = upload_server
+    uploads.mkdir(parents=True)
+    limit = os.pathconf(uploads, "PC_NAME_MAX")
+    name = "a" * (limit - 4) + ".txt" if near_limit else "report.txt"
+    prefix = "a" * (limit - 8) if near_limit else "report"
+    second, third, fourth = (prefix + f" ({number}).txt" for number in (2, 3, 4))
+    body = b"new" * (100_000 if near_limit else 1)
+    winner = third if near_limit else name
+    expected = fourth if near_limit else second
+    if near_limit:
+        (uploads / name).write_bytes(b"original")
+        target = uploads.parent / "untouched.txt"
+        target.write_bytes(b"symlink target")
+        (uploads / second).symlink_to(target)
     link = os.link
     attempted = []
 
@@ -406,14 +542,14 @@ def test_unlocked_writer_wins_claim_without_losing_either_payload(upload_server,
                 payload = os.read(reader, info.st_size)
             finally:
                 os.close(reader)
-            assert payload == b"new"
+            assert payload == body
         else:
-            assert Path(source).read_bytes() == b"new"
+            assert Path(source).read_bytes() == body
         with (uploads.parent / ".lifecycle.lock").open("a+") as lock_file:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         attempted.append(dest_name)
-        if dest_name == "report.txt":
+        if dest_name == winner:
             if dst_dir_fd is not None:
                 competitor = os.open(
                     dest_name,
@@ -432,13 +568,18 @@ def test_unlocked_writer_wins_claim_without_losing_either_payload(upload_server,
         return link(source, destination, *args, **kwargs)
 
     monkeypatch.setattr(os, "link", competing_link)
-    response = _upload(client, "report.txt", b"new")
-    assert response.status_code == 200
-    assert response.json()["filename"] == "report (2).txt"
-    assert attempted == ["report.txt", "report (2).txt"]
-    assert (uploads / "report.txt").read_bytes() == b"unlocked writer"
-    assert (uploads / "report (2).txt").read_bytes() == b"new"
-    assert sorted(path.name for path in uploads.iterdir()) == ["report (2).txt", "report.txt"]
+    response = _upload(client, name, body)
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == expected
+    assert attempted == ([name, second, third, fourth] if near_limit else [name, second])
+    assert (uploads / winner).read_bytes() == b"unlocked writer"
+    assert (uploads / expected).read_bytes() == body
+    if near_limit:
+        assert (uploads / name).read_bytes() == b"original"
+        assert (uploads / second).is_symlink()
+        assert (uploads / second).readlink() == target
+        assert target.read_bytes() == b"symlink target"
+    assert {path.name for path in uploads.iterdir()} == set(attempted)
 
 
 @pytest.mark.parametrize("name", ["%2e%2e/outside.txt", "nested/%2e%2e/outside.txt", "escape/outside.txt"])

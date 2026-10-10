@@ -8,10 +8,9 @@ import os
 import stat
 import sys
 import uuid
-from pathlib import Path
 
 from outputs_broker import LimitExceededError, OutputsBrokerError
-from uploads import claim_file_no_replace
+from uploads import claim_file_no_replace, format_collision_name
 
 from . import config, versions, workspace
 from .store import StateCorruptError, _FILE_FLAGS
@@ -592,10 +591,9 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
                 entry = store.update(chat, renew)["journal"][journal_id]
                 stage.entry = entry
                 identity = stage.allocate(journal_id, content, fence)
-            requested = Path(binding["basename"])
             for number in range(2, _MAX_CANDIDATES):
                 fence.checkpoint()
-                name = f"{requested.stem} ({number}){requested.suffix}"
+                name = format_collision_name(binding["basename"], number, dst_dir_fd=parent)
                 if _join(binding["destination"], name) in active:
                     continue
                 try:
