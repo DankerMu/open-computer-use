@@ -95,10 +95,12 @@ cat > good.ts <<'TS'
 export const twice = (value: number): number => value * 2;
 console.log(twice(21));
 TS
-test "$(tsx good.ts)" = "42"
+TSX_RESULT=$(tsx good.ts)
+test "$TSX_RESULT" = "42"
 echo "tsx: typed fixture = 42"
 tsc --strict --target es2022 --module es2022 --typeRoots "$work/types" --outDir compiled good.ts
-test "$(node compiled/good.js)" = "42"
+COMPILED_RESULT=$(node compiled/good.js)
+test "$COMPILED_RESULT" = "42"
 printf 'const value: number = "wrong";\n' > bad.ts
 if tsc --noEmit --strict --typeRoots "$work/types" bad.ts > bad-types.log 2>&1; then
     echo "tsc accepted an ill-typed fixture" >&2
