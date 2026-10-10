@@ -1906,6 +1906,44 @@ def test_retirement_engine_refusal_does_not_mint_evidence(world):
     assert docker_manager.read_idle_state(CHAT) is None
 
 
+@pytest.mark.parametrize("status", ["running", "restarting"])
+def test_launch_retirement_engine_refusal_is_migration_required(world, status):
+    docker_manager, client, _clock, _tmp = world
+    container = _put(client, f"owui-chat-{CHAT}", status, container_id="launch-retire-api")
+    if status == "restarting":
+        original_reload = container.reload.side_effect
+        calls = {"n": 0}
+
+        def reload():
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                container.status = "running"
+            original_reload()
+
+        container.reload.side_effect = reload
+
+    def boom(cmd, detach=False, user=None, **kwargs):
+        assert container.status == "running"
+        raise APIError(
+            "exec failed",
+            response=MagicMock(status_code=409, url="http://docker.test", reason="error"),
+            explanation=b"exec failed",
+        )
+
+    container.exec_run.side_effect = boom
+    with pytest.raises(docker_manager.MigrationRequired) as caught:
+        docker_manager.launch_sandbox(CHAT)
+    assert caught.value.status_code == 409
+    assert caught.value.reason == MIGRATION_REQUIRED
+    assert container.status == "running"
+    container.exec_run.assert_called_once()
+    client.containers.create.assert_not_called()
+    container.remove.assert_not_called()
+    container.start.assert_not_called()
+    container.unpause.assert_not_called()
+    container.stop.assert_not_called()
+
+
 def test_retirement_script_keeps_marker_until_child_dies(tmp_path):
     script = textwrap.dedent(
         r"""
@@ -2129,7 +2167,22 @@ def test_restart_wait_uses_monotonic_deadline(world, monkeypatch):
     container.remove.assert_not_called()
 
 
-def test_unpause_and_lookup_failures_are_structured(world):
+def test_launch_lookup_failure_is_structured_without_engine_mutation(world):
+    docker_manager, client, _clock, _tmp = world
+    container = _put(client, f"owui-chat-{CHAT}", "running")
+    container.reload.side_effect = docker_sdk.errors.DockerException("engine unavailable")
+
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        docker_manager.launch_sandbox(CHAT)
+    assert caught.value.status_code == 500
+    assert caught.value.reason == "launch_failed"
+    client.containers.create.assert_not_called()
+    container.remove.assert_not_called()
+    container.start.assert_not_called()
+    container.unpause.assert_not_called()
+
+
+def test_unpause_failure_is_structured(world):
     docker_manager, client, clock, _tmp = world
     container = _put(client, f"owui-chat-{CHAT}", "paused", container_id="unpause-fail")
     docker_manager.mark_sleeper_retired(CHAT, container, now=clock.time())
