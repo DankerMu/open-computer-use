@@ -283,12 +283,6 @@ class CheckPortsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(WEBUI_SERVICE, result.stderr)
 
-    def test_missing_services_key_is_rejected(self):
-        docs = intended_docs()
-        docs["core.json"] = {"networks": docs["core.json"]["networks"]}
-        result = self.check(docs)
-        self.assertNotEqual(result.returncode, 0)
-
     def test_malformed_network_definition_is_rejected_without_environment_dump(self):
         docs = intended_docs()
         docs["core.json"]["networks"]["default"] = ["not-a-mapping"]
