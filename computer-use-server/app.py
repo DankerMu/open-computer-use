@@ -767,9 +767,11 @@ async def download_archive(chat_id: str):
             detail="Path is not a directory"
         )
 
-    # Get all files in directory
-    files = list(outputs_dir.rglob("*"))
-    files = [f for f in files if f.is_file()]
+    files = [
+        path for path in outputs_dir.rglob("*")
+        if not any(part.startswith(".") for part in path.relative_to(outputs_dir).parts)
+        and path.is_file()
+    ]
 
     if not files:
         raise HTTPException(

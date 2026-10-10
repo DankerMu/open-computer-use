@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Visible output ZIP contents.** Archives omit dot-prefixed files and files
+  beneath hidden directories, including upload staging residue. Completed visible
+  uploads retain their full bytes and actual collision names; hidden files remain
+  on disk. Outputs with no visible files return the existing no-files HTTP 404.
+
 - **Byte-bounded collision names.** Uploads and Office copies preserve the complete
   last suffix and numbered tail within the destination's filename byte limit,
   shortening only the stem on whole-character boundaries. Free upload names stay

@@ -13,8 +13,10 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 
 import httpx
@@ -105,6 +107,12 @@ def test_collision_preserves_original_and_reports_relative_stored_name(upload_se
     assert sorted(path.name for path in (uploads / "nested").iterdir()) == [
         "report (2).txt", "report.txt",
     ]
+    response = client.get(f"/files/{CHAT}/archive", headers=HEADERS)
+    assert response.status_code == 200
+    with zipfile.ZipFile(BytesIO(response.content)) as archive:
+        assert set(archive.namelist()) == {"nested/report.txt", "nested/report (2).txt"}
+        assert archive.read("nested/report.txt") == b"old"
+        assert archive.read("nested/report (2).txt") == b"new"
 
 
 @pytest.mark.parametrize("kind", ("ascii", "multibyte", "last-suffix"))
