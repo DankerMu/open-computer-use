@@ -1749,10 +1749,7 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
     if status == "running":
         _prepare_existing_container(container, mutate=False)
         if not _migration_verified(state, container):
-            try:
-                retire_legacy_sleeper(chat_id, container)
-            except docker.errors.APIError as exc:
-                raise LaunchFailed(500, f"engine refused retirement: {exc}") from exc
+            retire_legacy_sleeper(chat_id, container)
         else:
             note_running_activity(chat_id, container)
         return {"state": "running"}
@@ -1779,10 +1776,7 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
         _prepare_existing_container(container, mutate=False)
         if not _wait_until_running(container):
             raise LaunchFailed(504, "restart readiness timed out")
-        try:
-            retire_legacy_sleeper(chat_id, container)
-        except docker.errors.APIError as exc:
-            raise LaunchFailed(500, f"engine refused retirement: {exc}") from exc
+        retire_legacy_sleeper(chat_id, container)
         return {"state": "running"}
     if status == "dead":
         raise LaunchFailed(500, "sandbox is dead")
