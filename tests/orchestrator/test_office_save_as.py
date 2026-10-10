@@ -214,11 +214,22 @@ def test_final_missing_copy_conserves_source_receipt_key_and_replay(office_world
     assert _snapshot(data) == frozen
 
 
-@pytest.mark.parametrize("collision", ("file", "symlink", "stale-index", "unlocked-writer"))
-def test_final_copy_skips_occupied_or_indexed_numbered_name(office_world, monkeypatch, collision):
-    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
-    root = _outputs(data)
-    first = root / "report (2).docx"
+@pytest.mark.parametrize("collision,near_limit", (
+    ("file", False), ("symlink", False), ("stale-index", False), ("unlocked-writer", False),
+    ("symlink", True), ("stale-index", True), ("unlocked-writer", True),
+), ids=("file", "symlink", "stale-index", "unlocked-writer", "bounded-symlink", "bounded-index", "bounded-race"))
+def test_final_copy_skips_occupied_or_indexed_numbered_name(
+        office_world, monkeypatch, collision, near_limit):
+    root = _outputs(office_world[1])
+    root.mkdir(parents=True, exist_ok=True)
+    limit = os.pathconf(root, "PC_NAME_MAX")
+    name = "a" * (limit - 5) + ".docx" if near_limit else "report.docx"
+    prefix = "a" * (limit - 9) if near_limit else "report"
+    first_name, expected = prefix + " (2).docx", prefix + " (3).docx"
+    http, data, _origin, _manager, broker, _body, session = (
+        _nested(office_world, name) if near_limit else _opened(office_world)
+    )
+    first = root / first_name
     outside = data.parent / "outside-copy"
     outside.write_bytes(b"foreign")
     if collision == "symlink":
@@ -232,15 +243,15 @@ def test_final_copy_skips_occupied_or_indexed_numbered_name(office_world, monkey
         original = os.link
         won = []
         def competing(source, destination, *args, **kwargs):
-            if destination == "report (2).docx" and not won:
+            if destination == first_name and not won:
                 won.append(True)
                 first.write_bytes(b"foreign")
             return original(source, destination, *args, **kwargs)
         monkeypatch.setattr(os, "link", competing)
-    (root / "report.docx").unlink()
+    (root / name).unlink()
     response, _payload_value = _final(http, session, monkeypatch)
     assert response.status_code == 200
-    _copy_outcome(http, data, broker, session, "report (3).docx")
+    _copy_outcome(http, data, broker, session, expected)
     assert outside.read_bytes() == b"foreign"
     if collision == "symlink":
         assert first.is_symlink()
@@ -248,7 +259,12 @@ def test_final_copy_skips_occupied_or_indexed_numbered_name(office_world, monkey
         assert not first.exists()
     else:
         assert first.read_bytes() == b"foreign"
-    assert not (root / "report (2) (2).docx").exists()
+    if near_limit:
+        assert {path.name for path in root.iterdir()} == (
+            {expected} if collision == "stale-index" else {first_name, expected}
+        )
+    else:
+        assert not (root / "report (2) (2).docx").exists()
 
 
 @pytest.mark.parametrize("name,removed", (("nested/report.docx", False), ("nested/report.docx", True), ("one/two/report.docx", True)))
@@ -380,16 +396,27 @@ def test_final_unusable_workspace_creates_nothing_and_retains_content(office_wor
     assert state["journal"] == {}
 
 
-@pytest.mark.parametrize("cut", ("claim-before-return", "registration-before-return", "office-before-replace", "office-after-replace"))
+@pytest.mark.parametrize("cut", (
+    "claim-before-return", "registration-before-return", "office-before-replace",
+    "office-after-replace", "shortened-claim-before-return",
+))
 def test_copy_fault_recovers_same_inode_identity_and_single_registration(office_world, monkeypatch, cut):
-    http, data, _origin, _manager, broker, _body, session = _opened(office_world)
-    (_outputs(data) / "report.docx").unlink()
+    root = _outputs(office_world[1])
+    root.mkdir(parents=True, exist_ok=True)
+    limit = os.pathconf(root, "PC_NAME_MAX")
+    shortened = cut == "shortened-claim-before-return"
+    name = "a" * (limit - 5) + ".docx" if shortened else "report.docx"
+    expected = "a" * (limit - 9) + " (2).docx" if shortened else "report (2).docx"
+    http, data, _origin, _manager, broker, _body, session = (
+        _nested(office_world, name) if shortened else _opened(office_world)
+    )
+    (root / name).unlink()
     revision = broker.OutputsBroker().current_revision(CHAT)
     real_link, real_replace = os.link, os.replace
     stopped = []
     def linked(source, destination, *args, **kwargs):
         answer = real_link(source, destination, *args, **kwargs)
-        if cut == "claim-before-return" and destination == "report (2).docx" and not stopped:
+        if cut.endswith("claim-before-return") and destination == expected and not stopped:
             stopped.append(True)
             raise OSError(errno.EIO, "claim return interrupted")
         return answer
@@ -419,7 +446,7 @@ def test_copy_fault_recovers_same_inode_identity_and_single_registration(office_
         response, payload = _final(http, session, boundary)
     assert response.status_code == 500
     assert stopped == [True]
-    copied = _outputs(data) / "report (2).docx"
+    copied = root / expected
     inode = copied.stat().st_ino
     state_before = _read(data)
     source_before = state_before["documents"][session["file_id"]]
@@ -431,9 +458,10 @@ def test_copy_fault_recovers_same_inode_identity_and_single_registration(office_
     recover_publications(CHAT)
     assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
     assert copied.stat().st_ino == inode
-    state, _status_value = _copy_outcome(http, data, broker, session, "report (2).docx")
+    state, _status_value = _copy_outcome(http, data, broker, session, expected)
     assert state["documents"][session["file_id"]] == source_before
     assert state["receipts"] == receipts_before
+    assert {path.name for path in root.iterdir()} == {expected}
     frozen = _snapshot(data)
     recover_publications(CHAT)
     assert _post(http, session, payload).json() == {"error": 0}

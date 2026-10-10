@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Byte-bounded collision names.** Uploads and Office copies preserve the complete
+  last suffix and numbered tail within the destination's filename byte limit,
+  shortening only the stem on whole-character boundaries. Free upload names stay
+  unchanged; atomic claims preserve occupied files. An impossible collision name
+  returns upload HTTP 400 without a new file or attachment receipt.
+
 - **Office callback persistence errors.** Ordinary filesystem failures during
   content and no-content callback persistence return HTTP 500 with JSON reason
   `state_corrupt`, without error-time state writes. Disk-full failures remain

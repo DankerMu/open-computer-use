@@ -21,7 +21,9 @@ import pytest
 from tests.orchestrator._office_recorded_callbacks import recorded_status_4_payload
 from tests.orchestrator._office_store import SERVER_DIR, _child_env, _stop_child, _wait_marker
 from tests.orchestrator.test_office_callback_publish import _read, _running
-from tests.orchestrator.test_office_save_as import _nested, _fresh_files
+from tests.orchestrator.test_office_save_as import (
+    _nested, _fresh_files, _final, _copy_outcome, _assert_private_reclaimed,
+)
 from tests.orchestrator.test_office_save_close import _forcesave, _save
 from tests.orchestrator.test_office_session_lifecycle import _info, _created
 from tests.orchestrator.test_office_sessions import _assert_refusal, _create, _snapshot, _put, _index_file
@@ -163,6 +165,105 @@ def _assert_resolved(data, session, *, ended=False, content=CHANGED):
     latest = state["documents"][record["file_id"]]["versions"][-1]
     assert latest["sha256"] == _sha(content) and latest["published"] is True
     return state
+
+
+def test_explicit_save_as_reports_native_byte_bounded_copy_identity(
+        office_world, monkeypatch):
+    root = _outputs(office_world[1])
+    root.mkdir(parents=True, exist_ok=True)
+    limit = os.pathconf(root, "PC_NAME_MAX")
+    name = "界" * ((limit - 5) // 3) + "a" * ((limit - 5) % 3) + ".docx"
+    expected = "界" * ((limit - 9) // 3) + " (2).docx"
+    http, data, _origin, _manager, broker, original, session = _conflict(
+        office_world, monkeypatch, name=name,
+    )
+    before = _read(data)
+    response = _resolve(http, session)
+    assert response.status_code == 200, response.text
+    new_id = response.json()["file_id"]
+    assert response.json() == {
+        "session_id": session["session_id"], "state": "editing",
+        "file_id": new_id, "path": expected,
+    }
+    assert new_id != session["file_id"]
+    state = _assert_resolved(data, session)
+    assert state["sessions"][session["session_id"]]["saved_as"] == {"file_id": new_id, "path": expected}
+    assert state["documents"][session["file_id"]] == before["documents"][session["file_id"]]
+    assert state["receipts"] == before["receipts"]
+    assert (root / name).read_bytes() == original + b"agent-workspace"
+    assert (root / expected).read_bytes() == CHANGED
+    assert {path.name for path in root.iterdir()} == {name, expected}
+    identities = {entry["path"]: entry["file_id"] for entry in broker.OutputsBroker().reconcile(CHAT)["entries"]}
+    assert identities == {name: session["file_id"], expected: new_id}
+
+
+@pytest.mark.parametrize("explicit", (True, False), ids=("explicit-released", "automatic-release-failed"))
+def test_shared_naming_refusal_keeps_version_and_owned_recovery_responsibility(
+        office_world, monkeypatch, explicit):
+    opened = _conflict(office_world, monkeypatch) if explicit else _opened(office_world)
+    http, data, _origin, manager, broker, _original, session = opened
+    root = _outputs(data)
+    if not explicit:
+        (root / "report.docx").unlink()
+    before = _read(data)
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    target = root.stat()
+    container = _running(manager)
+    unpause = container.unpause.side_effect
+    query = os.fpathconf
+    queried = []
+
+    def insufficient(fd, key):
+        if key == "PC_NAME_MAX":
+            info = os.fstat(fd)
+            queried.append((fd, info.st_dev, info.st_ino))
+            return 8
+        return query(fd, key)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "fpathconf", insufficient)
+        fault.setattr(http._transport, "raise_server_exceptions", False)
+        if not explicit:
+            container.unpause.side_effect = OSError(errno.EIO, "release refused")
+        response = _resolve(http, session) if explicit else _final(http, session, fault)[0]
+    assert response.status_code == 500, response.text
+    assert {(device, inode) for _fd, device, inode in queried} == {(target.st_dev, target.st_ino)}
+    for fd, _device, _inode in queried:
+        with pytest.raises(OSError) as closed:
+            os.fstat(fd)
+        assert closed.value.errno == errno.EBADF
+    state = _read(data)
+    record = state["sessions"][session["session_id"]]
+    assert record["file_id"] == session["file_id"] and record.get("saved_as") is None
+    assert record["last_published_seq"] == 0
+    assert state["documents"][session["file_id"]]["versions"][-1]["sha256"] == _sha(CHANGED)
+    assert state["documents"][session["file_id"]]["versions"][-1]["published"] is False
+    assert (_versions(data) / _sha(CHANGED)).read_bytes() == CHANGED
+    assert set(state["documents"]) == {session["file_id"]}
+    entry, = state["journal"].values()
+    assert entry["requester"] == ("resolve" if explicit else "final")
+    assert "claimed_name" not in entry["copy"] and "registered_file_id" not in entry["copy"]
+    assert {path.name for path in root.iterdir()} == ({"report.docx"} if explicit else set())
+    if explicit:
+        assert state["documents"] == before["documents"] and state["receipts"] == before["receipts"]
+    assert broker.OutputsBroker().current_revision(CHAT) == revision
+    marker = data / CHAT / ".ocu" / "office" / "fence.json"
+    assert marker.exists() is (not explicit)
+    assert container.status == ("running" if explicit else "paused")
+    container.unpause.assert_called_once()
+    container.unpause.side_effect = unpause
+    from office.publish import recover_publications
+    recover_publications(
+        CHAT, now=None if explicit else json.loads(marker.read_text())["pause_started_at"] + 6,
+    )
+    assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
+    if explicit:
+        _assert_resolved(data, session)
+        assert (root / "report (2).docx").read_bytes() == CHANGED
+    else:
+        _copy_outcome(http, data, broker, session, "report (2).docx")
+    assert not marker.exists()
+    _assert_private_reclaimed(data)
 
 
 @pytest.mark.parametrize("body", (b"", b'{"unrelated":true}'))
