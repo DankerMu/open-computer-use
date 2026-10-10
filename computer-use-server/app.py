@@ -580,24 +580,6 @@ def classify_file(filename: str) -> tuple:
     return 'other', mime
 
 
-def format_size(size_bytes: int) -> str:
-    """Format file size for display."""
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    return f"{size_bytes / (1024 * 1024):.1f} MB"
-
-
-_FILE_ICONS = {
-    'html': '🌐', 'image': '🖼️', 'code': '📝', 'text': '📄',
-    'pdf': '📕', 'markdown': '📃', 'spreadsheet': '📊',
-    'docx': '📄', 'xlsx': '📊', 'pptx': '📊',
-    'audio': '🎵', 'video': '🎬', 'other': '📎',
-}
-
-
-
 @app.get("/", response_class=HTMLResponse, tags=["System"], include_in_schema=False)
 async def root():
     """Main page with MCP and File API documentation"""
