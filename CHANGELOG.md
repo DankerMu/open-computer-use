@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Workspace Node runtime.** The linux/amd64 image uses fixed Node.js 22.23.2
+  with bundled npm 10.9.8, satisfying the unchanged manifest engine floors.
+  The default image harness checks installed engines and executes offline
+  Mermaid rendering, typed tsx/tsc fixtures and local PDF parsing.
+
 - **Terminal upload failures.** Standalone and embedded dashboards show localized
   filename/retry feedback for HTTP and connection failures and release the selected
   temporary input. Selection stops at the first failure without retry or rollback;
