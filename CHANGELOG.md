@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Terminal upload failures.** Standalone and embedded dashboards show localized
+  filename/retry feedback for HTTP and connection failures and release the selected
+  temporary input. Selection stops at the first failure without retry or rollback;
+  complete success retains dashboard refresh and standalone Files refresh.
+
 - **Visible output ZIP contents.** Archives omit dot-prefixed files and files
   beneath hidden directories, including upload staging residue. Completed visible
   uploads retain their full bytes and actual collision names; hidden files remain
