@@ -8,6 +8,8 @@ Run: python -m pytest tests/test_tools.py -v
 import sys
 import unittest
 import asyncio
+import errno
+import os
 import urllib.parse
 import json
 import socket
@@ -244,6 +246,8 @@ class _GuardedOCU:
 
         self.requests = []
         self.uploads = []
+        self.upload_responses = []
+        self.bash_gate = None
         self.commands = []
         self.calls = []
         self.imports_mode = imports_mode
@@ -278,6 +282,8 @@ class _GuardedOCU:
         async def bash_tool(command: str, description: str) -> str:
             self.commands.append({"command": command, "uploads": list(self.uploads)})
             self.calls.append(("bash_tool", command))
+            if self.bash_gate is not None:
+                await self.bash_gate(command)
             return f"ran:{command}"
 
         @self.mcp.tool()
@@ -356,6 +362,7 @@ class _GuardedOCU:
                 )
             except HTTPException as exc:
                 return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            self.upload_responses.append(result)
             return JSONResponse(result)
 
         app = Starlette(
@@ -691,6 +698,164 @@ def test_public_tools_sync_new_attachment_before_command(monkeypatch, tmp_path, 
         assert ocu.requests.index(imports[0]) < ocu.requests.index(upload[0])
         assert ocu.requests.index(upload[0]) < ocu.requests.index(calls[0])
         assert not _records(ocu, f"/api/uploads/{chat_id}/manifest")
+
+
+def _fail_directory_enumeration(monkeypatch, root):
+    identity = root.stat()
+    scandir = os.scandir
+
+    def failed_scan(path):
+        info = os.fstat(path) if isinstance(path, int) else os.stat(path)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            raise OSError(errno.EIO, "private-host-path-canary")
+        return scandir(path)
+
+    monkeypatch.setattr(os, "scandir", failed_scan)
+
+
+@pytest.mark.parametrize(
+    "method", ("bash_tool", "str_replace", "create_file", "view", "sub_agent")
+)
+def test_public_tools_report_committed_upload_discovery_warning_without_retry(
+    monkeypatch, tmp_path, method
+):
+    source = tmp_path / "brief.tmp"
+    source.write_bytes(b"attachment original")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+    chat_id = f"discovery-{method.replace('_', '-')}"
+    files = [_attachment("F1", "brief.docx", "attachment-source")]
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        root = ocu.chat_uploads(chat_id)
+        root.mkdir(parents=True)
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        with monkeypatch.context() as faults:
+            _fail_directory_enumeration(faults, root)
+            result = asyncio.run(_invoke_public_tool(tools, method, chat_id, files))
+            repeated = asyncio.run(_invoke_public_tool(tools, method, chat_id, files))
+
+        assert ocu.upload_responses[0]["discovery"] == {
+            "status": "failed", "reason": "io_error"
+        }
+        assert ocu.stored_files(chat_id) == {"brief.docx": b"attachment original"}
+        assert ocu.uploads == [{"filename": "brief.docx", "attachment_id": "F1"}]
+        assert len(_records(ocu, f"/api/uploads/{chat_id}/brief.docx")) == 1
+        expected_calls = {
+            "bash_tool": ("echo ready", "ran:echo ready"),
+            "str_replace": ("/home/assistant/a.txt", "edited:/home/assistant/a.txt"),
+            "create_file": ("/home/assistant/a.txt", "created:/home/assistant/a.txt"),
+            "view": ("/home/assistant/notes.txt", "viewed:/home/assistant/notes.txt"),
+            "sub_agent": ("inspect attachment", "delegated:inspect attachment"),
+        }
+        argument, output = expected_calls[method]
+        assert ocu.calls == [(method, argument)] * 2
+        assert output in result
+        assert repeated == output
+        assert "discovery" in result.lower()
+        assert "io_error" in result
+        assert "stored" in result.lower()
+        assert "warning" in result.lower()
+        assert "private-host-path-canary" not in result
+        assert str(tmp_path) not in result
+        assert "discovery" not in repeated.lower(), "warning must not leak into a receipted call"
+
+
+def test_tool_discovery_warning_identifies_collision_stored_filename(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "brief.tmp"
+    source.write_bytes(b"attachment original")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+    files = [_attachment("F1", "brief.docx", "attachment-source")]
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        root = ocu.chat_uploads("collision-warning")
+        root.mkdir(parents=True)
+        (root / "brief.docx").write_bytes(b"existing edited file")
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+        with monkeypatch.context() as faults:
+            _fail_directory_enumeration(faults, root)
+            result = asyncio.run(_invoke_public_tool(
+                tools, "bash_tool", "collision-warning", files
+            ))
+            repeated = asyncio.run(_invoke_public_tool(
+                tools, "bash_tool", "collision-warning", files
+            ))
+
+        assert ocu.upload_responses[0]["filename"] == "brief (2).docx"
+        assert ocu.upload_responses[0]["discovery"] == {
+            "status": "failed", "reason": "io_error"
+        }
+        assert ocu.stored_files("collision-warning") == {
+            "brief.docx": b"existing edited file",
+            "brief (2).docx": b"attachment original",
+        }
+        assert len(_records(ocu, "/api/uploads/collision-warning/brief.docx")) == 1
+        assert ocu.uploads == [{"filename": "brief.docx", "attachment_id": "F1"}]
+        assert repeated == "ran:echo ready"
+        assert "ran:echo ready" in result
+        assert "io_error" in result
+        assert "brief (2).docx" in result, "warning must identify the actual stored file"
+
+
+def test_overlapping_tool_calls_keep_discovery_warning_on_its_own_result(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "brief.tmp"
+    source.write_bytes(b"attachment original")
+    _install_storage(monkeypatch, {"attachment-source": source})
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        root = ocu.chat_uploads("warning-chat")
+        root.mkdir(parents=True)
+        reached = threading.Event()
+        release = threading.Event()
+
+        async def gate(command):
+            if command == "echo held":
+                reached.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.01)
+
+        ocu.bash_gate = gate
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = ocu.url
+
+        async def overlap():
+            warning_call = asyncio.create_task(_invoke_public_tool(
+                tools, "bash_tool", "warning-chat",
+                [_attachment("F1", "brief.docx", "attachment-source")], "echo held"
+            ))
+            try:
+                assert await asyncio.to_thread(reached.wait, 10), "warning call never reached MCP"
+                clean_result = await asyncio.wait_for(_invoke_public_tool(
+                    tools, "bash_tool", "clean-chat", [], "echo clean"
+                ), 10)
+            finally:
+                release.set()
+            return await asyncio.wait_for(warning_call, 10), clean_result
+
+        with monkeypatch.context() as faults:
+            _fail_directory_enumeration(faults, root)
+            warning_result, clean_result = asyncio.run(overlap())
+        assert clean_result == "ran:echo clean"
+        assert "ran:echo held" in warning_result
+        assert "discovery" in warning_result.lower()
+        assert "io_error" in warning_result
+        assert "stored" in warning_result.lower()
+        assert len(_records(ocu, "/api/uploads/warning-chat/brief.docx")) == 1
+        assert ocu.stored_files("warning-chat") == {"brief.docx": b"attachment original"}
 
 
 def test_imported_edited_attachment_is_not_posted_again(monkeypatch, tmp_path):

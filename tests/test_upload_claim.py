@@ -115,6 +115,48 @@ def test_collision_preserves_original_and_reports_relative_stored_name(upload_se
         assert archive.read("nested/report (2).txt") == b"new"
 
 
+def test_committed_upload_reports_real_discovery_overflow_without_losing_receipt(
+        upload_server):
+    from pydantic import AnyUrl
+
+    client, uploads = upload_server
+    seeded = _upload(client, "report.txt", b"old", attachment_id="F-before")
+    assert seeded.status_code == 200
+    assert "discovery" not in seeded.json()
+    import mcp_tools
+
+    before = {
+        str(resource.uri)
+        for resource in asyncio.run(mcp_tools.mcp.list_resources())
+    }
+    assert before == {f"file://uploads/{CHAT}/report.txt"}
+    for index in range(9_999):
+        (uploads / f"occupied-{index:05d}.txt").write_bytes(b"occupied")
+
+    response = _upload(client, "report.txt", b"new", attachment_id="F-overflow")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert {key: payload[key] for key in ("status", "filename", "size", "md5")} == {
+        "status": "success", "filename": "report (2).txt", "size": 3,
+        "md5": "22af645d1859cb5ca6da0c484f1f37ea",
+    }
+    assert (uploads / "report.txt").read_bytes() == b"old"
+    assert (uploads / "report (2).txt").read_bytes() == b"new"
+    receipts = _receipts(uploads)
+    assert receipts["F-before"]["stored_name"] == "report.txt"
+    assert receipts["F-overflow"]["stored_name"] == "report (2).txt"
+    assert _imports(client).json() == {"ids": ["F-before", "F-overflow"]}
+    after = {
+        str(resource.uri)
+        for resource in asyncio.run(mcp_tools.mcp.list_resources())
+    }
+    assert after == before
+    chunks = list(asyncio.run(mcp_tools.mcp.read_resource(
+        AnyUrl(f"file://uploads/{CHAT}/report.txt"))))
+    assert chunks[0].content == "old"
+    assert payload.get("discovery") == {"status": "failed", "reason": "file_limit"}
+
+
 @pytest.mark.parametrize("kind", ("ascii", "multibyte", "last-suffix"))
 def test_native_name_limit_collision_preserves_longest_prefix_and_receipt(
         upload_server, kind):

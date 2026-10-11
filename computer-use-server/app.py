@@ -23,7 +23,7 @@ import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Literal
 from urllib.parse import quote, urlsplit
 
 import aiohttp
@@ -67,6 +67,7 @@ from docker_manager import (
 from security import sanitize_chat_id, safe_path
 from uploads import (
     CorruptReceiptsError,
+    DiscoveryError,
     NameCapacityError,
     claim_file_no_replace,
     close_fd,
@@ -336,12 +337,21 @@ class MCPInfo(BaseModel):
     headers: Dict[str, List[str]]
 
 
+class DiscoveryFailureResponse(BaseModel):
+    status: Literal["failed"] = "failed"
+    reason: Literal[
+        "busy", "file_limit", "registry_limit", "entry_limit",
+        "directory_limit", "descriptor_limit", "io_error", "internal_error",
+    ]
+
+
 class UploadResponse(BaseModel):
     """File upload response"""
     status: str
     filename: str
     size: int
     md5: str
+    discovery: Optional[DiscoveryFailureResponse] = None
 
 
 # =============================================================================
@@ -663,7 +673,8 @@ async def get_upload_imports(chat_id: str):
         raise HTTPException(status_code=500, detail="import receipts are corrupt")
 
 
-@app.post("/api/uploads/{chat_id}/{filename:path}", tags=["Files"], response_model=UploadResponse)
+@app.post("/api/uploads/{chat_id}/{filename:path}", tags=["Files"],
+          response_model=UploadResponse, response_model_exclude_none=True)
 async def upload_file(
     chat_id: str,
     filename: str,
@@ -692,22 +703,26 @@ async def upload_file(
             _store_upload, chat_id, filename, content, attachment_id
         )
 
-        # Tier 6 — refresh MCP resources for this chat so the new file
-        # appears in resources/list without reconnecting. Swallow errors
-        # so the upload itself succeeds even if MCP resource sync fails.
+        # Publication is already committed. Discovery reports a separate outcome,
+        # never a false save failure or a reason to publish the bytes again.
+        discovery = None
         try:
             from mcp_resources import sync_chat_resources
             await sync_chat_resources(chat_id)
+        except DiscoveryError as exc:
+            discovery = {"status": "failed", "reason": exc.reason}
         except Exception:
-            import traceback
-            print(f"[uploads] sync_chat_resources failed for chat {chat_id}:\n{traceback.format_exc()}")
+            discovery = {"status": "failed", "reason": "internal_error"}
 
-        return {
+        result = {
             "status": "success",
             "filename": stored_name,
             "size": size,
-            "md5": md5_hash
+            "md5": md5_hash,
         }
+        if discovery is not None:
+            result["discovery"] = discovery
+        return result
     except HTTPException:
         raise
     except CorruptReceiptsError:

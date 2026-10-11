@@ -36,6 +36,10 @@ const EMBED_MODE = embedParams.length === 0 ? 'standalone'
     && window.parent !== window ? embedParams[0] : 'invalid';
 const EMBED_PAGES = 100;
 const EMBED_DEADLINE_MS = 10000;
+const DISCOVERY_REASONS = new Set([
+  'busy', 'file_limit', 'registry_limit', 'entry_limit', 'directory_limit',
+  'descriptor_limit', 'io_error', 'internal_error',
+]);
 
 // =============================================================================
 // Utilities
@@ -1635,6 +1639,7 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [uploadError, setUploadError] = useState(null);
+  const [discoveryWarnings, setDiscoveryWarnings] = useState([]);
   const mountedRef = useRef(false);
   const requestRef = useRef(null);
 
@@ -1681,17 +1686,28 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
     input.style.display = 'none';
     document.body.appendChild(input);
     input.addEventListener('change', async () => {
-      if (mountedRef.current) setUploadError(null);
+      if (mountedRef.current) {
+        setUploadError(null);
+        setDiscoveryWarnings([]);
+      }
       try {
         for (const file of input.files) {
           try {
             const formData = new FormData();
             formData.append('file', file);
             const response = await ocuFetch(`/api/uploads/${chatId}/${encodeURIComponent(file.name)}`, { method: 'POST', body: formData });
-            await response.text();
+            const body = await response.text();
             if (!response.ok) {
               if (mountedRef.current) setUploadError(file.name);
               return;
+            }
+            let payload;
+            try { payload = JSON.parse(body); } catch { payload = null; }
+            if (payload?.discovery?.status === 'failed' && mountedRef.current) {
+              const reason = DISCOVERY_REASONS.has(payload.discovery.reason)
+                ? payload.discovery.reason : 'internal_error';
+              const filename = typeof payload.filename === 'string' ? payload.filename : file.name;
+              setDiscoveryWarnings(warnings => [...warnings, { filename, reason }]);
             }
           } catch(e) {
             if (mountedRef.current) setUploadError(file.name);
@@ -1749,6 +1765,15 @@ function TerminalDashboard({ chatId, dangerousMode, onToggleDangerous, onStartSe
         </div>
         ${uploadError !== null && html`
           <div class="dash-upload-error" role="alert">${t('upload_fail')} "${uploadError}". ${t('upload_retry')}</div>
+        `}
+        ${discoveryWarnings.length > 0 && html`
+          <div class="dash-upload-error" role="alert">
+            ${discoveryWarnings.map(warning => html`
+              <div>${t('upload_stored_discovery_failed', {
+                filename: warning.filename, reason: warning.reason,
+              })}</div>
+            `)}
+          </div>
         `}
       </div>
 

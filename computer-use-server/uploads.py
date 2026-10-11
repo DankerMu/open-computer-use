@@ -47,6 +47,29 @@ _WORKSPACE_DIR_MODE = 0o777
 _CONTROL_DIR_MODE = 0o700
 _TRAVERSAL_DENIED = "Access denied: path traversal detected"
 
+# Fixed discovery budgets; these do not change publication or content reads.
+MAX_DISCOVERY_FILES = 10_000
+MAX_DISCOVERY_ENTRIES = 50_000
+MAX_DISCOVERY_DIRECTORIES = 10_000
+MAX_DISCOVERY_DIRECTORY_FDS = 256
+
+
+class DiscoveryError(Exception):
+    """A failed discovery with a stable reason and no filesystem details."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Workspace file discovery failed: {reason}")
+
+
+def _discovery_io_error(error: OSError) -> DiscoveryError:
+    reason = (
+        "descriptor_limit"
+        if error.errno in (errno.EMFILE, errno.ENFILE)
+        else "io_error"
+    )
+    return DiscoveryError(reason)
+
 
 def _is_nofollow_error(error: OSError) -> bool:
     return error.errno in (errno.ELOOP, errno.EMLINK)
@@ -342,54 +365,72 @@ def _open_outputs_root(chat_id: str) -> int | None:
 
 
 def _scan_visible_files(root_fd: int) -> list[UploadEntry]:
+    """Scan a borrowed root; every owned child/iterator is released on failure."""
     entries: list[UploadEntry] = []
     stack: list[tuple[int, tuple[str, ...], bool]] = [(root_fd, (), False)]
+    enumerated = 0
+    directories = 1
+    directory_fds = 1
     try:
+        if directories > MAX_DISCOVERY_DIRECTORIES:
+            raise DiscoveryError("directory_limit")
         while stack:
             directory_fd, prefix, owned = stack.pop()
             try:
+                # scandir duplicates its input FD. Close that duplicate before
+                # acquiring children so both kinds share one exact FD budget.
+                if directory_fds >= MAX_DISCOVERY_DIRECTORY_FDS:
+                    raise DiscoveryError("descriptor_limit")
                 with os.scandir(directory_fd) as listing:
                     children = []
                     for entry in listing:
+                        enumerated += 1
+                        if enumerated > MAX_DISCOVERY_ENTRIES:
+                            raise DiscoveryError("entry_limit")
                         name = entry.name
-                        if name.startswith("."):
+                        if name.startswith(".") or entry.is_symlink():
                             continue
-                        relative_path = "/".join((*prefix, name))
-                        try:
-                            item_stat = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            continue
-                        mode = item_stat.st_mode
-                        if stat.S_ISLNK(mode):
-                            continue
-                        if stat.S_ISDIR(mode):
+                        if entry.is_dir(follow_symlinks=False):
+                            if directories >= MAX_DISCOVERY_DIRECTORIES:
+                                raise DiscoveryError("directory_limit")
+                            directories += 1
                             children.append(name)
                             continue
-                        if not stat.S_ISREG(mode):
+                        if not entry.is_file(follow_symlinks=False):
+                            # Type predicates can hide a disappeared entry.
+                            # Stat it so IO failure never becomes an omission.
+                            entry.stat(follow_symlinks=False)
                             continue
+                        if len(entries) >= MAX_DISCOVERY_FILES:
+                            raise DiscoveryError("file_limit")
+                        item_stat = entry.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(item_stat.st_mode):
+                            raise DiscoveryError("io_error")
                         entries.append(UploadEntry(
                             name=name,
-                            rel_path=relative_path,
+                            rel_path="/".join((*prefix, name)),
                             size=item_stat.st_size,
                             modified=item_stat.st_mtime,
                             mime_type=_guess_mime(name),
                         ))
-                    for name in reversed(children):
-                        try:
-                            child_fd = os.open(
-                                name, _DIRECTORY_FLAGS, dir_fd=directory_fd,
-                            )
-                        except OSError:
-                            continue
-                        if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
-                            close_fd(child_fd)
-                            continue
+                for name in reversed(children):
+                    if directory_fds >= MAX_DISCOVERY_DIRECTORY_FDS:
+                        raise DiscoveryError("descriptor_limit")
+                    child_fd = _open_child_directory(directory_fd, name)
+                    try:
                         stack.append((child_fd, (*prefix, name), True))
-            except OSError:
-                pass
+                    except BaseException:
+                        close_fd(child_fd)
+                        raise
+                    directory_fds += 1
+            except OSError as exc:
+                raise _discovery_io_error(exc) from None
+            except HTTPException:
+                raise DiscoveryError("io_error") from None
             finally:
                 if owned:
                     close_fd(directory_fd)
+                    directory_fds -= 1
     except BaseException:
         while stack:
             directory_fd, _prefix, owned = stack.pop()
@@ -409,7 +450,10 @@ def list_chat_uploads(chat_id: str) -> list[UploadEntry]:
     modification time, newest first.
     """
     chat_id = sanitize_chat_id(chat_id)
-    outputs_fd = _open_outputs_root(chat_id)
+    try:
+        outputs_fd = _open_outputs_root(chat_id)
+    except OSError as exc:
+        raise _discovery_io_error(exc) from None
     if outputs_fd is None:
         return []
     try:

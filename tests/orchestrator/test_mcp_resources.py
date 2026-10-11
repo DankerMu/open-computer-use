@@ -17,6 +17,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -136,26 +137,93 @@ class McpResourcesContract(unittest.TestCase):
         demob_uris = [r for r in resources if "demob" in str(r.uri)]
         self.assertEqual(len(demob_uris), 1, "re-sync must not duplicate entries")
 
+    def test_file_limit_rejects_replacement_and_preserves_actual_registry(self):
+        from pydantic import AnyUrl
+
+        chat_id = "file-limit-predecessor"
+        chat_root = Path(self._tmp) / chat_id
+
+        def cleanup():
+            shutil.rmtree(chat_root, ignore_errors=True)
+            asyncio.run(self.mcp_resources.sync_chat_resources(chat_id))
+
+        self.addCleanup(cleanup)
+        self._make_upload(chat_id, "predecessor.txt", "previously registered")
+        self.assertEqual(
+            asyncio.run(self.mcp_resources.sync_chat_resources(chat_id)), 1)
+        predecessor_uri = f"file://uploads/{chat_id}/predecessor.txt"
+        before = {
+            str(resource.uri)
+            for resource in asyncio.run(self.mcp_tools.mcp.list_resources())
+        }
+        self.assertIn(predecessor_uri, before)
+
+        outputs = chat_root / "outputs"
+        for index in range(10_000):
+            (outputs / f"added-{index:05d}.txt").write_bytes(b"new")
+
+        failure = None
+        result = None
+        try:
+            result = asyncio.run(self.mcp_resources.sync_chat_resources(chat_id))
+        except Exception as exc:
+            failure = exc
+
+        after = {
+            str(resource.uri)
+            for resource in asyncio.run(self.mcp_tools.mcp.list_resources())
+        }
+        with self.subTest("failed replacement preserves all actual MCP membership"):
+            self.assertTrue(
+                after == before,
+                f"Registry changed from {len(before)} to {len(after)} resources "
+                "after discovery of 10,001 visible files")
+        with self.subTest("overflow is an explicit file_limit failure"):
+            self.assertIsNotNone(
+                failure, f"Discovery incorrectly succeeded with result {result}")
+            self.assertEqual(getattr(failure, "reason", None), "file_limit")
+        with self.subTest("predecessor remains readable through actual MCP"):
+            chunks = list(asyncio.run(self.mcp_tools.mcp.read_resource(
+                AnyUrl(predecessor_uri))))
+            self.assertEqual(chunks[0].content, "previously registered")
+
     def test_concurrent_sync_and_list(self):
-        """Stress: sync + list in parallel. Without the lock around the
-        clear-then-rebuild, `dict changed size during iteration` fires."""
         self._make_upload("democ", "a.txt", "A")
         self._make_upload("democ", "b.txt", "B")
+        asyncio.run(self.mcp_resources.sync_chat_resources("democ"))
+        release = threading.Event()
+        original = os.scandir
+
+        def gated_scandir(fd):
+            if not release.wait(10):
+                raise AssertionError("test did not release scan")
+            return original(fd)
 
         async def _stress():
-            await self.mcp_resources.sync_chat_resources("democ")
             tasks = []
             for _ in range(20):
-                tasks.append(self.mcp_resources.sync_chat_resources("democ"))
-                tasks.append(self.mcp_tools.mcp.list_resources())
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    raise r
-            return len(results)
+                tasks.append(asyncio.create_task(
+                    self.mcp_resources.sync_chat_resources("democ")))
+                tasks.append(asyncio.create_task(self.mcp_tools.mcp.list_resources()))
+            try:
+                await asyncio.sleep(0)
+            finally:
+                release.set()
+            return await asyncio.gather(*tasks, return_exceptions=True)
 
-        n = asyncio.run(_stress())
-        self.assertEqual(n, 40)
+        with patch("os.scandir", gated_scandir):
+            results = asyncio.run(_stress())
+        registered = [result for result in results if isinstance(result, int)]
+        failures = [result for result in results if isinstance(result, Exception)]
+        self.assertEqual(registered, [2])
+        self.assertEqual(len(failures), 19)
+        self.assertEqual(
+            [getattr(error, "reason", None) for error in failures], ["busy"] * 19)
+        for resources in (result for result in results if isinstance(result, list)):
+            self.assertEqual(
+                {str(resource.uri) for resource in resources
+                 if str(resource.uri).startswith("file://uploads/democ/")},
+                {"file://uploads/democ/a.txt", "file://uploads/democ/b.txt"})
 
     def test_list_changed_notification_skipped_outside_request_context(self):
         """sync_chat_resources is called from docker_manager._create_container

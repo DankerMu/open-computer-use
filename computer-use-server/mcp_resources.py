@@ -18,13 +18,11 @@ Design decisions:
   .venv/.../mcp/server/fastmcp/resources/templates.py:88), so nested
   paths wouldn't match `{rel}` — we flatten via percent-encoding.
 
-- Dynamic per-chat list: FastMCP's `ResourceManager._resources` is a plain
-  dict with no `remove_resource` public API. `sync_chat_resources(chat_id)`
-  clears-then-re-adds under an asyncio.Lock to avoid "dict changed size
-  during iteration" when resources/list is concurrent with a new upload.
-  Private-API access (`mcp._resource_manager._resources.pop`) is justified
-  because the alternative is a full ResourceManager subclass. `mcp`
-  version is pinned in requirements.txt to guard against attribute renames.
+- Dynamic per-chat list: the pinned FastMCP readers copy one dictionary's
+  values or perform one lookup, without taking a writer lock. Discovery
+  prepares a complete replacement off-loop and rebinds the private
+  `ResourceManager._resources` attribute once. Published dictionaries are
+  never mutated. The existing mcp version pin guards this private API.
 
 - Called from two places:
     * docker_manager._create_container — initial sync when the chat's
@@ -44,7 +42,7 @@ from mcp.server.fastmcp.resources import FunctionResource  # verified path
 
 from mcp_tools import mcp
 from security import sanitize_chat_id
-from uploads import UploadEntry, list_chat_uploads, read_chat_upload
+from uploads import DiscoveryError, UploadEntry, list_chat_uploads, read_chat_upload
 
 
 # MIMEs that should round-trip as text (UTF-8 decoded) rather than as bytes.
@@ -60,16 +58,10 @@ _TEXT_MIMES = frozenset({
 })
 
 
-# threading.Lock instead of asyncio.Lock — sync_chat_resources_sync runs in
-# a worker thread (asyncio.to_thread) under its own asyncio.run() loop, while
-# the request-path sync_chat_resources runs on the main server loop. An
-# asyncio.Lock binds to the loop that first awaits it; once bound, the other
-# loop's await would either deadlock or silently no-op. The critical section
-# below contains NO `await` (all dict ops are synchronous), so a plain
-# threading.Lock serializes both paths correctly.
-_resource_lock = threading.Lock()
-# chat_id → set of URIs we registered for that chat, so we can remove them
-# on the next sync without sweeping the whole _resources dict.
+# Admission is process-wide across request loops and synchronous worker callers.
+# Acquire before executor submission; only the admitted worker releases it.
+_discovery_admission = threading.Lock()
+MAX_WORKSPACE_RESOURCES = 20_000
 _chat_uris: dict[str, set[str]] = {}
 
 
@@ -99,72 +91,91 @@ def _build_function_resource(chat_id: str, entry: UploadEntry) -> FunctionResour
     )
 
 
-async def sync_chat_resources(chat_id: str) -> int:
-    """
-    Clear previously-registered workspace-file resources for `chat_id` and re-register
-    from the current filesystem state. Returns the count of registered entries.
+def _discover_and_publish(chat_id: str) -> tuple[int, bool]:
+    """Run one admitted transaction; readers see the old or new dictionary."""
+    global _chat_uris
+    try:
+        entries = list_chat_uploads(chat_id)
+        stale = _chat_uris.get(chat_id, set())
+        retained = sum(len(uris) for uris in _chat_uris.values()) - len(stale)
+        if retained + len(entries) > MAX_WORKSPACE_RESOURCES:
+            raise DiscoveryError("registry_limit")
 
-    Holds _resource_lock so a concurrent list_resources() won't see a dict
-    mutating mid-iteration. Private-API access into
-    mcp._resource_manager._resources is covered by the mcp version pin.
-
-    Emits notifications/resources/list_changed when the set of URIs for this
-    chat actually changed AND a request-scoped session is available
-    (`request_ctx` ContextVar set). Skipped silently outside a request context
-    (e.g. _create_container from a worker thread) — clients still see the
-    fresh list on their next resources/list call.
-    """
-    # Normalize at the boundary so case/whitespace variants of chat_id
-    # share the same _chat_uris entry (files in uploads.py are also keyed
-    # by sanitized chat_id, so out-of-band variants would otherwise leak
-    # stale registrations).
-    chat_id = sanitize_chat_id(chat_id)
-
-    # Build new resources OUTSIDE the lock — list_chat_uploads scans the
-    # filesystem and may be slow. We only need the lock to protect the
-    # registry mutation window. Doing the FS scan + resource construction
-    # under the lock would block all other syncs (and any future
-    # list_resources callers that take the same lock) for the scan duration.
-    new_entries = list_chat_uploads(chat_id)
-    new_resources = [(_build_function_resource(chat_id, e)) for e in new_entries]
-    fresh: set[str] = {str(r.uri) for r in new_resources}
-
-    changed = False
-    # Critical section: must contain NO `await` so list_resources() (which
-    # currently does NOT take this lock) cannot observe a half-swapped
-    # registry. The window is now O(len(stale) + len(fresh)) dict ops only.
-    # threading.Lock works across event loops — see _resource_lock comment.
-    with _resource_lock:
-        stale = _chat_uris.pop(chat_id, set())
-        registry = mcp._resource_manager._resources
-        # Remove stale entries that are NOT in the fresh set (idempotent
-        # re-sync should not flap visible URIs).
-        for uri in stale - fresh:
+        registry = mcp._resource_manager._resources.copy()
+        for uri in stale:
             registry.pop(uri, None)
-        for resource in new_resources:
-            registry[str(resource.uri)] = resource
-        _chat_uris[chat_id] = fresh
-        changed = fresh != stale
+        fresh: set[str] = set()
+        for entry in entries:
+            resource = _build_function_resource(chat_id, entry)
+            uri = str(resource.uri)
+            registry[uri] = resource
+            fresh.add(uri)
+
+        chats = _chat_uris.copy()
+        if fresh:
+            chats[chat_id] = fresh
+        else:
+            chats.pop(chat_id, None)
+        result = (len(fresh), fresh != stale)
+
+        # All potentially failing preparation precedes publication. SDK readers
+        # retain one dictionary; writer bookkeeping is private to this admission.
+        mcp._resource_manager._resources = registry
+        _chat_uris = chats
+        return result
+    except DiscoveryError:
+        raise
+    except Exception:
+        raise DiscoveryError("internal_error") from None
+    finally:
+        _discovery_admission.release()
+
+
+def _observe_worker_result(future: asyncio.Future) -> None:
+    # A cancelled caller can abandon shielded work. Observe its eventual failure
+    # without altering the result for active awaiters or changing lock ownership.
+    if not future.cancelled():
+        future.exception()
+
+
+async def sync_chat_resources(chat_id: str) -> int:
+    """Publish a complete bounded membership snapshot; return its file count.
+
+    Admission is immediate, not an executor backlog. Once submitted, discovery
+    owns admission even if its caller cancels before the worker starts.
+    Request-scoped list-change notification remains separate from publication.
+    """
+    chat_id = sanitize_chat_id(chat_id)
+    if not _discovery_admission.acquire(blocking=False):
+        raise DiscoveryError("busy")
+    try:
+        future = asyncio.get_running_loop().run_in_executor(
+            None, _discover_and_publish, chat_id)
+    except Exception:
+        _discovery_admission.release()
+        raise DiscoveryError("internal_error") from None
+    except BaseException:
+        _discovery_admission.release()
+        raise
+    future.add_done_callback(_observe_worker_result)
+    count, changed = await asyncio.shield(future)
 
     if changed:
         try:
             session = mcp._mcp_server.request_context.session
             await session.send_resource_list_changed()
         except LookupError:
-            # No active request context (e.g. called from docker_manager
-            # during container creation in a worker thread). Skip —
-            # clients will see the updated list next time they poll.
+            # No request context: polling clients still see the published list.
             pass
-        except Exception as e:
-            print(f"[MCP] resource list_changed notification failed: {e}")
-
-    return len(fresh)
+        except Exception:
+            print("[MCP] resource list_changed notification failed")
+    return count
 
 
 def sync_chat_resources_sync(chat_id: str) -> int:
-    """
-    Sync wrapper for worker-thread callers (docker_manager._create_container).
-    Same asyncio.run() justification as render_system_prompt_sync:
-    _create_container runs inside asyncio.to_thread — no running loop → safe.
-    """
-    return asyncio.run(sync_chat_resources(chat_id))
+    """Use the same discovery transaction directly from synchronous callers."""
+    chat_id = sanitize_chat_id(chat_id)
+    if not _discovery_admission.acquire(blocking=False):
+        raise DiscoveryError("busy")
+    count, _changed = _discover_and_publish(chat_id)
+    return count
