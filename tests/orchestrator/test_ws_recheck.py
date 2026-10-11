@@ -72,6 +72,7 @@ def _reload_server():
             "security",
             "system_prompt",
             "skill_manager",
+            "file_response",
         } or name.startswith(("mcp_resources", "cli_adapters")):
             sys.modules.pop(name, None)
     return importlib.import_module("app")

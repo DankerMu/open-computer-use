@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Pinned file downloads.** Inline and forced-download responses stream bounded
+  chunks from one verified workspace descriptor; size and validators describe that
+  same opened file. Path replacement cannot redirect the response. Disconnect,
+  cancellation and failures release ownership after active reads complete.
+
 - **Confined output archives.** ZIP payloads use the workspace no-follow reader,
   preventing symlink targets outside the requested chat from being downloaded.
   Symlink candidates, including in-tree aliases, fail closed; ordinary relative

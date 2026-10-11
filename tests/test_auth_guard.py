@@ -144,6 +144,7 @@ def app_module(monkeypatch):
             "system_prompt",
             "skill_manager",
             "uploads",
+            "file_response",
             "office",
             "office.config",
             "office.router",

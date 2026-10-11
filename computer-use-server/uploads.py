@@ -503,12 +503,11 @@ def _read_fd_bytes(file_fd: int) -> bytes:
     return b"".join(chunks)
 
 
-def read_chat_upload(chat_id: str, rel_path: str) -> tuple[bytes, str]:
-    """Read a single workspace file. Returns (bytes, mime_type).
+def open_chat_upload(chat_id: str, rel_path: str) -> int:
+    """Return an owned regular-file descriptor acquired under the requested chat.
 
-    ``rel_path`` is whatever list_chat_uploads reported (may contain "/").
-    Ancestors and the leaf are opened with O_NOFOLLOW from the chat root;
-    the bytes are read from the verified regular-file descriptor.
+    The caller must close it. Root, ancestor and leaf acquisition never follows
+    symlinks; all intermediate descriptors are released before ownership returns.
     """
     chat_id = sanitize_chat_id(chat_id)
     relative = Path(rel_path)
@@ -520,15 +519,20 @@ def read_chat_upload(chat_id: str, rel_path: str) -> tuple[bytes, str]:
     if outputs_fd is None:
         raise FileNotFoundError(f"No such upload: {chat_id}/{rel_path}")
     try:
-        file_fd = _open_regular_relative(outputs_fd, parts)
-        try:
-            return _read_fd_bytes(file_fd), _guess_mime(parts[-1])
-        finally:
-            close_fd(file_fd)
+        return _open_regular_relative(outputs_fd, parts)
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"No such upload: {chat_id}/{rel_path}") from exc
     finally:
         close_fd(outputs_fd)
+
+
+def read_chat_upload(chat_id: str, rel_path: str) -> tuple[bytes, str]:
+    """Read a workspace file; preserve the shared bytes/MIME caller contract."""
+    file_fd = open_chat_upload(chat_id, rel_path)
+    try:
+        return _read_fd_bytes(file_fd), _guess_mime(Path(rel_path).name)
+    finally:
+        close_fd(file_fd)
 
 
 class CorruptReceiptsError(RuntimeError):

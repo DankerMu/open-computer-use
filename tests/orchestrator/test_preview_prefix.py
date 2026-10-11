@@ -48,6 +48,7 @@ _APP_MODULES = (
     "skill_manager",
     "cli_runtime",
     "uploads",
+    "file_response",
     "docs_html",
     "office",
     "office.config",

@@ -218,6 +218,7 @@ APP_MODULES = {
     "app", "auth_guard", "ws_recheck", "mcp_tools", "docker_manager",
     "outputs_broker", "context_vars", "security", "system_prompt",
     "skill_manager", "cli_runtime", "uploads", "docs_html",
+    "file_response",
 }
 
 

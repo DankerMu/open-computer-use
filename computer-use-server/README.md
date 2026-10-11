@@ -13,6 +13,7 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 | Module | Purpose |
 |--------|---------|
 | `app.py` | FastAPI application: guarded MCP endpoint, file serving, browser/terminal proxy, system prompt API |
+| `file_response.py` | Descriptor-bound single-file streaming, metadata and cancellation-safe ownership |
 | `auth_guard.py` | Fail-closed startup validation, service auth, peer denial and CORS policy |
 | `ws_recheck.py` | Captured-session CDP/ttyd authorization re-check and revocation shutdown |
 | `mcp_tools.py` | MCP tool definitions: `bash_tool`, `view`, `create_file`, `str_replace`, `sub_agent` |
@@ -237,12 +238,18 @@ successful response or a fabricated rollback.
   SVG, XHTML, and XML responses are isolated with
   `Content-Security-Policy: sandbox allow-scripts allow-forms`,
   `X-Content-Type-Options: nosniff`, and Starlette
-  `FileResponse(..., content_disposition_type="inline", filename=...)`
-  (RFC 5987 `filename*` for non-Latin-1 names). `?download=1` still forces
+  framework-encoded inline disposition (RFC 5987 `filename*` for encoded names).
+  `?download=1` still forces
   `attachment`. Every successful file GET, inline or forced download, carries
   exactly one `Cache-Control: no-store` header. The SPA HTML renderer uses the
   same sandbox tokens on `srcdoc` and `src` iframes and does not add
   `allow-same-origin`.
+  Payload bytes and Content-Length/ETag/Last-Modified come from the same securely
+  opened workspace descriptor. Reads use bounded chunks; path replacements cannot
+  redirect the stream. Safely resolved in-root aliases retain target naming/MIME.
+  The response owns acquisition through completion, failure or disconnect and
+  waits for active reads before closing. Same-inode writes are not snapshots.
+  The pinned stack rejects HEAD with405 and ignores Range, returning the full file.
 - `GET /files/{chat_id}/archive` — Download visible regular workspace files as ZIP.
   Hidden path components are excluded. Payload reads reject symlinks at the chat
   root, outputs root, ancestors and leaves, including in-tree aliases; an unsafe
