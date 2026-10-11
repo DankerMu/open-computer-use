@@ -1666,7 +1666,7 @@ async function main() {
             await alert.waitFor({ state: 'visible' });
             const text = await alert.innerText();
             assert(text.includes(name), `${label} feedback did not identify the failed filename`);
-            assert(/\bretry\b|\btry again\b|повтор|снова/i.test(text), `${label} feedback omitted retry guidance`);
+            assert(/\bretry\b|\btry again\b|\u043f\u043e\u0432\u0442\u043e\u0440|\u0441\u043d\u043e\u0432\u0430/i.test(text), `${label} feedback omitted retry guidance`);
             await waitInputRemoved(input);
             await settle();
             assert.deepEqual(dashboardGets(before), [], `${label} falsely refreshed the successful dashboard`);
