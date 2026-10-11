@@ -3,6 +3,7 @@
 """HTTP upload publication preserves occupied names and complete bytes."""
 import asyncio
 import datetime
+import errno
 import fcntl
 import hashlib
 import json
@@ -963,6 +964,377 @@ def test_waiting_for_chat_lock_keeps_health_requests_responsive(upload_server):
 
 def _same_inode(left, right):
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def test_upload_control_creation_syncs_chat_parent_before_return(tmp_path, monkeypatch):
+    import descriptor_io
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    existing = chat_dir / "existing.txt"
+    existing.write_bytes(b"pre-existing upload bytes")
+    control = chat_dir / ".ocu"
+    chat_fd = descriptor_io.open_directory(chat_dir)
+    chat_info = os.fstat(chat_fd)
+    control_fd = None
+    fsync = os.fsync
+    synced = []
+
+    def recording_fsync(fd):
+        info = os.fstat(fd)
+        entry_present = control.is_dir()
+        fsync(fd)
+        synced.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+                       entry_present))
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    previous_umask = os.umask(0o077)
+    try:
+        control_fd = uploads.open_control_directory(chat_fd)
+        assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR, True) in synced
+        assert _same_inode(os.fstat(control_fd), control.stat())
+        assert stat.S_IMODE(os.fstat(control_fd).st_mode) == 0o700
+        assert _same_inode(os.fstat(chat_fd), chat_info)
+        assert existing.read_bytes() == b"pre-existing upload bytes"
+    finally:
+        os.umask(previous_umask)
+        if control_fd is not None:
+            os.close(control_fd)
+        os.close(chat_fd)
+
+
+@pytest.mark.parametrize("existing_control", (False, True), ids=("new", "existing"))
+def test_upload_control_parent_sync_failure_preserves_descriptor_ownership(
+        tmp_path, monkeypatch, existing_control):
+    import descriptor_io
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    existing = chat_dir / "existing.txt"
+    existing.write_bytes(b"pre-existing upload bytes")
+    control = chat_dir / ".ocu"
+    if existing_control:
+        control.mkdir(mode=0o700)
+        (control / "marker").write_bytes(b"pre-existing control bytes")
+    chat_fd = descriptor_io.open_directory(chat_dir)
+    chat_info = os.fstat(chat_fd)
+    opened = os.open
+    fsync = os.fsync
+    owned = []
+    attempted = []
+    error = OSError(errno.EIO, "chat parent durability failure")
+
+    def recording_open(*args, **kwargs):
+        fd = opened(*args, **kwargs)
+        info = os.fstat(fd)
+        if control.is_dir() and _same_inode(info, control.stat()):
+            owned.append((fd, info))
+        return fd
+
+    def failing_fsync(fd):
+        info = os.fstat(fd)
+        attempted.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)))
+        if _same_inode(info, chat_info):
+            raise error
+        return fsync(fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    try:
+        with pytest.raises(OSError) as failure:
+            uploads.open_control_directory(chat_fd)
+        assert failure.value is error
+        assert failure.value.errno == errno.EIO
+        assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR) in attempted
+        assert _same_inode(os.fstat(chat_fd), chat_info)
+        assert control.is_dir()
+        assert stat.S_IMODE(control.stat().st_mode) == 0o700
+        assert existing.read_bytes() == b"pre-existing upload bytes"
+        if existing_control:
+            assert (control / "marker").read_bytes() == b"pre-existing control bytes"
+        else:
+            assert list(control.iterdir()) == []
+        for fd, info in owned:
+            try:
+                current = os.fstat(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
+            else:
+                assert not _same_inode(current, info), "owned control descriptor leaked"
+    finally:
+        for fd, info in owned:
+            try:
+                current = os.fstat(fd)
+            except OSError:
+                continue
+            if _same_inode(current, info):
+                os.close(fd)
+        os.close(chat_fd)
+
+
+def test_upload_control_retry_requires_parent_sync_after_interrupted_creation(
+        tmp_path, monkeypatch):
+    import descriptor_io
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    control = chat_dir / ".ocu"
+    chat_fd = descriptor_io.open_directory(chat_dir)
+    chat_info = os.fstat(chat_fd)
+    control_fd = None
+    fsync = os.fsync
+    synced = []
+    fail_parent = True
+    error = OSError(errno.EIO, "chat parent durability failure")
+
+    def controlled_fsync(fd):
+        info = os.fstat(fd)
+        if fail_parent and _same_inode(info, chat_info):
+            raise error
+        fsync(fd)
+        synced.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)))
+
+    monkeypatch.setattr(os, "fsync", controlled_fsync)
+    try:
+        with pytest.raises(OSError) as first_failure:
+            control_fd = uploads.open_control_directory(chat_fd)
+        assert first_failure.value is error
+        control_info = control.stat()
+        (control / "marker").write_bytes(b"surviving interrupted creation")
+
+        with pytest.raises(OSError) as next_failure:
+            control_fd = uploads.open_control_directory(chat_fd)
+        assert next_failure.value is error
+        assert _same_inode(control.stat(), control_info)
+        assert _same_inode(os.fstat(chat_fd), chat_info)
+        assert (control / "marker").read_bytes() == b"surviving interrupted creation"
+
+        fail_parent = False
+        control_fd = uploads.open_control_directory(chat_fd)
+        assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR) in synced
+        assert _same_inode(os.fstat(control_fd), control_info)
+        assert stat.S_IMODE(os.fstat(control_fd).st_mode) == 0o700
+        assert (control / "marker").read_bytes() == b"surviving interrupted creation"
+    finally:
+        if control_fd is not None:
+            os.close(control_fd)
+        os.close(chat_fd)
+
+
+def test_upload_control_symlink_rejection_preserves_target_and_borrowed_parent(tmp_path):
+    from fastapi import HTTPException
+    import descriptor_io
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    outside_info = outside.stat()
+    sentinel = outside / "marker"
+    sentinel.write_bytes(b"outside control bytes")
+    control = chat_dir / ".ocu"
+    control.symlink_to(outside, target_is_directory=True)
+    chat_fd = descriptor_io.open_directory(chat_dir)
+    chat_info = os.fstat(chat_fd)
+    control_fd = None
+    try:
+        with pytest.raises(HTTPException) as failure:
+            control_fd = uploads.open_control_directory(chat_fd)
+        assert failure.value.status_code == 403
+        assert _same_inode(os.fstat(chat_fd), chat_info)
+        assert control.is_symlink() and control.readlink() == outside
+        assert sentinel.read_bytes() == b"outside control bytes"
+        assert stat.S_IMODE(outside.stat().st_mode) == stat.S_IMODE(outside_info.st_mode)
+        assert sorted(path.name for path in outside.iterdir()) == ["marker"]
+    finally:
+        if control_fd is not None:
+            os.close(control_fd)
+        os.close(chat_fd)
+
+
+def test_direct_receipt_creation_syncs_chat_parent_and_persisted_state(
+        tmp_path, monkeypatch):
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    chat_info = chat_dir.stat()
+    existing = chat_dir / "existing.txt"
+    existing.write_bytes(b"pre-existing upload bytes")
+    control = chat_dir / ".ocu"
+    destination = control / "imports.json"
+    receipts = {"F1": {
+        "stored_name": "brief.docx", "size": 3, "md5": "f97c5d29941bfb1b2fdab0874906ab82",
+        "imported_at": "2026-10-11T00:00:00Z",
+    }}
+    fsync = os.fsync
+    synced = []
+
+    def recording_fsync(fd):
+        info = os.fstat(fd)
+        entry_present = control.is_dir()
+        receipt_present = destination.exists()
+        fsync(fd)
+        synced.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+                       entry_present, receipt_present))
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    previous_umask = os.umask(0o077)
+    try:
+        uploads.write_import_receipts(chat_dir, receipts)
+    finally:
+        os.umask(previous_umask)
+
+    assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR, True, False) in synced
+    control_info = control.stat()
+    receipt_info = destination.stat()
+    assert (receipt_info.st_dev, receipt_info.st_ino, stat.S_IFREG, True, False) in synced
+    assert (control_info.st_dev, control_info.st_ino, stat.S_IFDIR, True, True) in synced
+    assert stat.S_IMODE(control_info.st_mode) == 0o700
+    assert destination.read_bytes() == (
+        b'{"F1":{"imported_at":"2026-10-11T00:00:00Z",'
+        b'"md5":"f97c5d29941bfb1b2fdab0874906ab82","size":3,"stored_name":"brief.docx"}}')
+    assert uploads.read_import_receipts(chat_dir) == receipts
+    assert existing.read_bytes() == b"pre-existing upload bytes"
+    assert sorted(path.name for path in control.iterdir()) == ["imports.json"]
+
+
+@pytest.mark.parametrize("existing_control", (False, True), ids=("new", "existing"))
+def test_direct_receipt_parent_sync_failure_preserves_state_and_owned_descriptors(
+        tmp_path, monkeypatch, existing_control):
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    chat_info = chat_dir.stat()
+    existing = chat_dir / "existing.txt"
+    existing.write_bytes(b"pre-existing upload bytes")
+    control = chat_dir / ".ocu"
+    destination = control / "imports.json"
+    prior_bytes = (
+        b'{"F0":{"stored_name":"prior.txt","size":5,"md5":"prior-md5",'
+        b'"imported_at":"2026-10-10T00:00:00Z"}}\n')
+    if existing_control:
+        control.mkdir(mode=0o700)
+        destination.write_bytes(prior_bytes)
+        (control / "marker").write_bytes(b"pre-existing control bytes")
+    receipts = {"F1": {
+        "stored_name": "brief.docx", "size": 3, "md5": "f97c5d29941bfb1b2fdab0874906ab82",
+        "imported_at": "2026-10-11T00:00:00Z",
+    }}
+    opened = os.open
+    fsync = os.fsync
+    owned = []
+    attempted = []
+    error = OSError(errno.EIO, "receipt chat parent durability failure")
+
+    def recording_open(*args, **kwargs):
+        fd = opened(*args, **kwargs)
+        owned.append((fd, os.fstat(fd)))
+        return fd
+
+    def failing_fsync(fd):
+        info = os.fstat(fd)
+        attempted.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+                          control.is_dir()))
+        if _same_inode(info, chat_info):
+            raise error
+        return fsync(fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    try:
+        with pytest.raises(OSError) as failure:
+            uploads.write_import_receipts(chat_dir, receipts)
+        assert failure.value is error
+        assert failure.value.errno == errno.EIO
+        assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR, True) in attempted
+        assert _same_inode(chat_dir.stat(), chat_info)
+        assert control.is_dir()
+        assert stat.S_IMODE(control.stat().st_mode) == 0o700
+        assert existing.read_bytes() == b"pre-existing upload bytes"
+        if existing_control:
+            assert destination.read_bytes() == prior_bytes
+            assert uploads.read_import_receipts(chat_dir) == {"F0": {
+                "stored_name": "prior.txt", "size": 5, "md5": "prior-md5",
+                "imported_at": "2026-10-10T00:00:00Z",
+            }}
+            assert (control / "marker").read_bytes() == b"pre-existing control bytes"
+            assert sorted(path.name for path in control.iterdir()) == ["imports.json", "marker"]
+        else:
+            assert not destination.exists()
+            assert list(control.iterdir()) == []
+        for fd, info in owned:
+            try:
+                current = os.fstat(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
+            else:
+                assert not _same_inode(current, info), "owned receipt descriptor leaked"
+    finally:
+        for fd, info in owned:
+            try:
+                current = os.fstat(fd)
+            except OSError:
+                continue
+            if _same_inode(current, info):
+                os.close(fd)
+
+
+def test_direct_receipt_retry_requires_parent_sync_after_interrupted_creation(
+        tmp_path, monkeypatch):
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    chat_info = chat_dir.stat()
+    control = chat_dir / ".ocu"
+    destination = control / "imports.json"
+    receipts = {"F1": {
+        "stored_name": "brief.docx", "size": 3, "md5": "f97c5d29941bfb1b2fdab0874906ab82",
+        "imported_at": "2026-10-11T00:00:00Z",
+    }}
+    fsync = os.fsync
+    synced = []
+    fail_parent = True
+    error = OSError(errno.EIO, "receipt chat parent durability failure")
+
+    def controlled_fsync(fd):
+        info = os.fstat(fd)
+        if fail_parent and _same_inode(info, chat_info):
+            raise error
+        fsync(fd)
+        synced.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)))
+
+    monkeypatch.setattr(os, "fsync", controlled_fsync)
+    with pytest.raises(OSError) as first_failure:
+        uploads.write_import_receipts(chat_dir, receipts)
+    assert first_failure.value is error
+    assert not destination.exists()
+    control_info = control.stat()
+    marker = control / "marker"
+    marker.write_bytes(b"surviving interrupted receipt creation")
+
+    with pytest.raises(OSError) as next_failure:
+        uploads.write_import_receipts(chat_dir, receipts)
+    assert next_failure.value is error
+    assert _same_inode(control.stat(), control_info)
+    assert not destination.exists()
+    assert marker.read_bytes() == b"surviving interrupted receipt creation"
+    assert sorted(path.name for path in control.iterdir()) == ["marker"]
+
+    fail_parent = False
+    uploads.write_import_receipts(chat_dir, receipts)
+    assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR) in synced
+    assert _same_inode(control.stat(), control_info)
+    assert stat.S_IMODE(control.stat().st_mode) == 0o700
+    assert uploads.read_import_receipts(chat_dir) == receipts
+    assert marker.read_bytes() == b"surviving interrupted receipt creation"
+    assert sorted(path.name for path in control.iterdir()) == ["imports.json", "marker"]
 
 
 def _matches_path(target, args, kwargs, *, directory_keys=("dir_fd",)):

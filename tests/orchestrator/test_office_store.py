@@ -321,7 +321,7 @@ def test_eio_on_control_lstat_is_corrupt_for_read_and_update(world, monkeypatch)
 
 
 def test_eio_on_data_root_open_is_corrupt_for_read_and_update(world, monkeypatch):
-    store_mod, _docker_manager, data = world
+    store_mod, docker_manager, data = world
     original_open = store_mod.os.open
 
     def fail_data_root_open(name, flags, *args, **kwargs):
@@ -329,10 +329,12 @@ def test_eio_on_data_root_open_is_corrupt_for_read_and_update(world, monkeypatch
             raise OSError(errno.EIO, "injected data root open fault")
         return original_open(name, flags, *args, **kwargs)
 
-    def inject():
-        monkeypatch.setattr(store_mod.os, "open", fail_data_root_open)
+    with docker_manager._combined_lock(CHAT):
+        with monkeypatch.context() as patches:
+            def inject():
+                patches.setattr(store_mod.os, "open", fail_data_root_open)
 
-    _assert_storage_oserror_is_corrupt(store_mod, data, inject)
+            _assert_storage_oserror_is_corrupt(store_mod, data, inject)
 
 
 
@@ -476,11 +478,11 @@ def _record_fsync_roles(store_mod, data, original_fsync, fail_role=None):
         if not stat.S_ISDIR(info.st_mode):
             observed.append("temp")
             return original_fsync(fd)
-        roles = _role_inodes(data)
+        roles = _role_inodes(data) if "temp" in observed else {"base": _inode(data)}
         for role, inode in roles.items():
             if identity == inode:
                 observed.append(role)
-                if role == fail_role:
+                if role == fail_role and "temp" in observed:
                     raise OSError(errno.EIO, f"injected {role} fsync fault")
                 return original_fsync(fd)
         raise AssertionError(("unexpected fsync descriptor", identity, roles))
@@ -495,7 +497,7 @@ def test_first_update_syncs_owned_directory_ancestry_before_success(world, monke
     observed, spy = _record_fsync_roles(store_mod, data, original_fsync)
     monkeypatch.setattr(store_mod.os, "fsync", spy)
     store_mod.OfficeStore().update(CHAT, lambda state: state["documents"].__setitem__("first", {"id": "first"}))
-    assert observed == ["temp", "base", "root", "ocu", "office"]
+    assert observed[observed.index("temp"):] == ["temp", "base", "root", "ocu", "office"]
     persisted = _run_child(data, OCU_CHILD_OP="read")
     assert persisted["documents"]["first"] == {"id": "first"}
 
@@ -514,7 +516,7 @@ def test_pre_replace_ancestor_sync_failure_keeps_predecessor_and_retries_existin
                 CHAT, lambda state: state["sessions"].__setitem__("lost", {"id": "lost"})
             )
     assert error.value.errno == errno.EIO
-    assert role in failed
+    assert role in failed[failed.index("temp"):]
     assert "office" not in failed
     assert _state(data).read_bytes() == before
     assert not list(_state(data).parent.glob("*.tmp"))
@@ -524,7 +526,7 @@ def test_pre_replace_ancestor_sync_failure_keeps_predecessor_and_retries_existin
     snapshot = store_mod.OfficeStore().update(
         CHAT, lambda state: state["sessions"].__setitem__("kept", {"id": "kept"})
     )
-    assert retried == ["temp", "base", "root", "ocu", "office"]
+    assert retried[retried.index("temp"):] == ["temp", "base", "root", "ocu", "office"]
     assert snapshot["documents"]["keep"] == {"id": "keep"}
     assert snapshot["sessions"]["kept"] == {"id": "kept"}
     assert _run_child(data, OCU_CHILD_OP="read") == snapshot

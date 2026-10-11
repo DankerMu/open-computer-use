@@ -255,26 +255,51 @@ class OutputsBroker:
 
     def _control_fd(self, chat: str, *, create: bool) -> int | None:
         control = self._chat_root(chat) / ".ocu"
+        parent_fd = None
         try:
-            control_stat = os.lstat(control)
-        except FileNotFoundError:
-            if not create:
-                return None
+            if create:
+                try:
+                    parent_fd = os.open(control.parent, descriptor_io.DIRECTORY_FLAGS)
+                except OSError as exc:
+                    if is_nofollow_error(exc):
+                        raise UnsafePathError(
+                            f"chat control root became a symlink: {control.parent}") from exc
+                    raise UnstableReadError(
+                        f"cannot safely open chat control root: {control.parent}") from exc
+                try:
+                    os.mkdir(".ocu", 0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
             try:
-                os.mkdir(control, 0o700)
-            except FileExistsError:
-                pass
-            control_stat = os.lstat(control)
-        if stat.S_ISLNK(control_stat.st_mode):
-            raise UnsafePathError(f"broker control directory is a symlink: {control}")
-        if not stat.S_ISDIR(control_stat.st_mode):
-            raise UnsafePathError(f"broker control path is not a directory: {control}")
-        try:
-            return os.open(control, descriptor_io.DIRECTORY_FLAGS)
-        except OSError as exc:
-            if is_nofollow_error(exc):
-                raise UnsafePathError(f"broker control directory became a symlink: {control}") from exc
-            raise UnstableReadError(f"cannot safely open broker control directory: {control}") from exc
+                control_stat = (
+                    os.lstat(".ocu", dir_fd=parent_fd) if parent_fd is not None
+                    else os.lstat(control))
+            except FileNotFoundError:
+                if not create:
+                    return None
+                raise
+            if stat.S_ISLNK(control_stat.st_mode):
+                raise UnsafePathError(f"broker control directory is a symlink: {control}")
+            if not stat.S_ISDIR(control_stat.st_mode):
+                raise UnsafePathError(f"broker control path is not a directory: {control}")
+            try:
+                control_fd = (
+                    os.open(".ocu", descriptor_io.DIRECTORY_FLAGS, dir_fd=parent_fd)
+                    if parent_fd is not None else os.open(control, descriptor_io.DIRECTORY_FLAGS))
+            except OSError as exc:
+                if is_nofollow_error(exc):
+                    raise UnsafePathError(f"broker control directory became a symlink: {control}") from exc
+                raise UnstableReadError(f"cannot safely open broker control directory: {control}") from exc
+            try:
+                if parent_fd is not None:
+                    os.fsync(parent_fd)
+                return control_fd
+            except BaseException:
+                os.close(control_fd)
+                raise
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     def _read_index(self, chat: str) -> dict[str, Any] | None:
         control_fd = self._control_fd(chat, create=False)

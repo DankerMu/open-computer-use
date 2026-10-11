@@ -9,9 +9,11 @@ spec, not from recomputing the implementation.
 
 from __future__ import annotations
 
+import errno
 import importlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import textwrap
@@ -1001,8 +1003,18 @@ import docker
 import docker_manager
 
 if os.environ.get("OCU_BROKEN_FLOCK") == "1":
-    _orig_control = docker_manager._control_dir
-    docker_manager._control_dir = lambda chat_id: _orig_control(chat_id) / str(os.getpid())
+    import fcntl
+    original_flock = fcntl.flock
+    lifecycle_lock = Path(os.environ["OCU_BASE"]) / os.environ["OCU_CHAT"] / ".lifecycle.lock"
+
+    def without_lifecycle_flock(fd, operation):
+        info = os.fstat(fd)
+        lock_info = lifecycle_lock.stat()
+        if (info.st_dev, info.st_ino) == (lock_info.st_dev, lock_info.st_ino):
+            return None
+        return original_flock(fd, operation)
+
+    fcntl.flock = without_lifecycle_flock
 
 docker.errors.NotFound = type("NotFound", (Exception,), {})
 class _Response:
@@ -1636,6 +1648,213 @@ def test_nested_existing_and_ordinary_lock_modes_share_one_flock(world):
             assert docker_manager._FLOCK_DEPTH[CHAT] == 2
         assert docker_manager._FLOCK_DEPTH[CHAT] == 1
     assert docker_manager._FLOCK_DEPTH.get(CHAT, 0) == 0
+    assert list(root.iterdir()) == [root / ".lifecycle.lock"]
+
+
+def _same_inode(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+@pytest.mark.parametrize("base_kind", ("existing", "missing", "configured-symlink"))
+def test_lock_chat_creation_syncs_configured_parent_before_admission(world, monkeypatch, base_kind):
+    docker_manager, _client, _clock, tmp_path = world
+    base = docker_manager.BASE_DATA_DIR
+    if base_kind == "existing":
+        base.mkdir()
+    elif base_kind == "configured-symlink":
+        target = tmp_path / "configured-data"
+        target.mkdir()
+        base.symlink_to(target, target_is_directory=True)
+    root = base / CHAT
+    fsync = os.fsync
+    synced = []
+
+    def recording_fsync(fd):
+        info = os.fstat(fd)
+        entry_present = root.is_dir()
+        fsync(fd)
+        synced.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), entry_present))
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    with docker_manager._combined_lock(CHAT.upper()) as held:
+        base_info = base.stat()
+        assert (base_info.st_dev, base_info.st_ino, stat.S_IFDIR, True) in synced
+        assert held is not None
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+        assert (root / ".lifecycle.lock").is_file()
+        entry_names = {entry.name for entry in base.iterdir()}
+        assert CHAT in entry_names
+        assert CHAT.upper() not in entry_names
+        (root / "marker").write_bytes(b"protected operation admitted")
+
+    assert (root / "marker").read_bytes() == b"protected operation admitted"
+    assert CHAT not in docker_manager._FLOCK_DEPTH
+    if base_kind == "configured-symlink":
+        assert base.is_symlink() and base.readlink() == target
+        assert _same_inode(base.stat(), target.stat())
+
+
+def test_lock_parent_sync_failure_refuses_admission_and_releases_owned_resources(
+        world, monkeypatch):
+    docker_manager, _client, _clock, _tmp_path = world
+    base = docker_manager.BASE_DATA_DIR
+    base.mkdir()
+    base_info = base.stat()
+    root = base / CHAT
+    opened = os.open
+    fsync = os.fsync
+    owned = []
+    attempted = []
+    admitted = []
+    error = OSError(errno.EIO, "lock data root durability failure")
+
+    def recording_open(*args, **kwargs):
+        fd = opened(*args, **kwargs)
+        owned.append((fd, os.fstat(fd)))
+        return fd
+
+    def failing_fsync(fd):
+        info = os.fstat(fd)
+        attempted.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), root.is_dir()))
+        if _same_inode(info, base_info):
+            raise error
+        return fsync(fd)
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "open", recording_open)
+            patches.setattr(os, "fsync", failing_fsync)
+            with pytest.raises(OSError) as failure:
+                with docker_manager._combined_lock(CHAT):
+                    admitted.append("unexpected protected operation")
+            assert failure.value is error
+            assert failure.value.errno == errno.EIO
+            assert admitted == []
+            assert CHAT not in docker_manager._FLOCK_DEPTH
+            assert (base_info.st_dev, base_info.st_ino, stat.S_IFDIR, True) in attempted
+            assert root.is_dir()
+            for fd, info in owned:
+                try:
+                    current = os.fstat(fd)
+                except OSError as exc:
+                    assert exc.errno == errno.EBADF
+                else:
+                    assert not _same_inode(current, info), "owned lock descriptor leaked"
+
+        acquired = threading.Event()
+        errors = []
+
+        def other():
+            try:
+                with docker_manager._combined_lock(CHAT):
+                    acquired.set()
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=other, daemon=True)
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive(), "parent sync failure stranded the process lock"
+        assert errors == []
+        assert acquired.is_set()
+        assert CHAT not in docker_manager._FLOCK_DEPTH
+    finally:
+        for fd, info in owned:
+            try:
+                current = os.fstat(fd)
+            except OSError:
+                continue
+            if _same_inode(current, info):
+                os.close(fd)
+
+
+def test_lock_retry_requires_parent_sync_after_interrupted_chat_creation(world, monkeypatch):
+    docker_manager, _client, _clock, _tmp_path = world
+    base = docker_manager.BASE_DATA_DIR
+    base.mkdir()
+    base_info = base.stat()
+    root = base / CHAT
+    fsync = os.fsync
+    synced = []
+    admitted = []
+    fail_parent = True
+    error = OSError(errno.EIO, "lock data root durability failure")
+
+    def controlled_fsync(fd):
+        info = os.fstat(fd)
+        if fail_parent and _same_inode(info, base_info):
+            raise error
+        fsync(fd)
+        synced.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)))
+
+    monkeypatch.setattr(os, "fsync", controlled_fsync)
+    with pytest.raises(OSError) as first_failure:
+        with docker_manager._combined_lock(CHAT):
+            admitted.append("unexpected first admission")
+    assert first_failure.value is error
+    assert admitted == []
+    assert CHAT not in docker_manager._FLOCK_DEPTH
+    root_info = root.stat()
+    marker = root / "marker"
+    marker.write_bytes(b"surviving interrupted chat creation")
+
+    with pytest.raises(OSError) as next_failure:
+        with docker_manager._combined_lock(CHAT.upper()):
+            admitted.append("unexpected existing-entry admission")
+    assert next_failure.value is error
+    assert admitted == []
+    assert CHAT not in docker_manager._FLOCK_DEPTH
+    assert _same_inode(root.stat(), root_info)
+    assert marker.read_bytes() == b"surviving interrupted chat creation"
+
+    fail_parent = False
+    with docker_manager._combined_lock(CHAT):
+        assert (base_info.st_dev, base_info.st_ino, stat.S_IFDIR) in synced
+        admitted.append("durable admission")
+    assert admitted == ["durable admission"]
+    assert CHAT not in docker_manager._FLOCK_DEPTH
+    assert _same_inode(root.stat(), root_info)
+    assert marker.read_bytes() == b"surviving interrupted chat creation"
+
+
+def test_lock_parent_durability_preserves_reentrant_and_noncreating_acquisition(
+        world, monkeypatch):
+    docker_manager, _client, _clock, _tmp_path = world
+    base = docker_manager.BASE_DATA_DIR
+    base.mkdir()
+    root = base / CHAT
+
+    def forbidden_fsync(_fd):
+        raise AssertionError("noncreating or already admitted acquisition synchronized again")
+
+    with monkeypatch.context() as patches:
+        patches.setattr(os, "fsync", forbidden_fsync)
+        with docker_manager._combined_lock(CHAT, create=False) as held:
+            assert held is None
+        assert not root.exists()
+        assert list(base.iterdir()) == []
+        assert CHAT not in docker_manager._FLOCK_DEPTH
+
+    with docker_manager._combined_lock(CHAT) as outer:
+        assert outer is not None
+        assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "fsync", forbidden_fsync)
+            with docker_manager._combined_lock(CHAT.upper()) as inner:
+                assert inner is not None
+                assert docker_manager._FLOCK_DEPTH[CHAT] == 2
+            with docker_manager._combined_lock(CHAT, create=False) as inner:
+                assert inner is not None
+                assert docker_manager._FLOCK_DEPTH[CHAT] == 2
+            assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+    assert CHAT not in docker_manager._FLOCK_DEPTH
+
+    with monkeypatch.context() as patches:
+        patches.setattr(os, "fsync", forbidden_fsync)
+        with docker_manager._combined_lock(CHAT, create=False) as held:
+            assert held is not None
+            assert docker_manager._FLOCK_DEPTH[CHAT] == 1
+    assert CHAT not in docker_manager._FLOCK_DEPTH
     assert list(root.iterdir()) == [root / ".lifecycle.lock"]
 
 

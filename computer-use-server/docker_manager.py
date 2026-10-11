@@ -33,6 +33,7 @@ import aiohttp
 import docker
 from docker.utils.socket import frames_iter, demux_adaptor, consume_socket_output
 
+import descriptor_io
 import skill_manager
 from context_vars import (
     current_chat_id, current_user_email, current_user_name,
@@ -212,7 +213,22 @@ class _CombinedLock:
                     return None
             path = root / ".lifecycle.lock"
             if self._create:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                parent_fd = os.open(
+                    BASE_DATA_DIR, descriptor_io.DIRECTORY_FLAGS & ~descriptor_io.NO_FOLLOW)
+                try:
+                    try:
+                        os.mkdir(self.chat_id, dir_fd=parent_fd)
+                    except FileExistsError:
+                        pass
+                    root_fd = os.open(
+                        self.chat_id, descriptor_io.DIRECTORY_FLAGS, dir_fd=parent_fd)
+                    try:
+                        os.fsync(parent_fd)
+                    finally:
+                        os.close(root_fd)
+                finally:
+                    os.close(parent_fd)
             try:
                 handle = path.open("a+")
             except FileNotFoundError:
