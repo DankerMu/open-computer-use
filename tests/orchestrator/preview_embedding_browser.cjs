@@ -359,11 +359,12 @@ const server = http.createServer(async (req, res) => {
       for await (const chunk of req) chunks.push(chunk);
       record.status = status;
       if (status === 200) retainedUploads.set(url.pathname, Buffer.concat(chunks));
-      const filename = decodeURIComponent(url.pathname.split('/').pop());
+      const discoveryFixture = uploadDiscoveryFixtures.get(url.pathname);
+      const filename = discoveryFixture?.filename || decodeURIComponent(url.pathname.split('/').pop());
       const body = status === 200 ? JSON.stringify({
         status: 'success', filename, size: 5, md5: '0',
-        ...(uploadDiscoveryFixtures.has(url.pathname)
-          ? { discovery: { status: 'failed', reason: uploadDiscoveryFixtures.get(url.pathname) } }
+        ...(discoveryFixture
+          ? { discovery: { status: 'failed', reason: discoveryFixture.reason } }
           : {}),
       }) : uploadBodyCanary;
       return respond(res, status, body, status === 200 ? 'application/json' : 'text/plain');
@@ -1790,6 +1791,7 @@ async function main() {
       const dashboard = surface.locator('.dash-scroll');
       const label = `${standalone ? 'standalone' : 'embedded'}-stored-discovery-failed`;
       const name = `${label}-{reason}-$&-<img src=x onerror=window.__uploadCanary=1>.txt`;
+      const storedName = `${label}-{reason}-$&-<img src=x onerror=window.__uploadCanary=1>-collision-1.txt`;
       const later = `${label}-later.txt`;
       const pathname = `/ocu/api/uploads/${CHAT}/${encodeURIComponent(name)}`;
       const laterPath = `/ocu/api/uploads/${CHAT}/${encodeURIComponent(later)}`;
@@ -1798,7 +1800,7 @@ async function main() {
       try {
         uploadFixtures.set(pathname, 200);
         uploadFixtures.set(laterPath, 200);
-        uploadDiscoveryFixtures.set(pathname, 'file_limit');
+        uploadDiscoveryFixtures.set(pathname, { reason: 'file_limit', filename: storedName });
         const chooserPromise = target.waitForEvent('filechooser');
         await surface.locator('.dash-btn-secondary').click();
         const chooser = await chooserPromise;
@@ -1810,7 +1812,10 @@ async function main() {
         })));
         const response = await responsePromise;
         assert.equal(response.status(), 200);
-        assert.deepEqual((await response.json()).discovery, { status: 'failed', reason: 'file_limit' });
+        const payload = await response.json();
+        assert.equal(payload.filename, storedName, `${label} response omitted the actual stored filename`);
+        assert.notEqual(payload.filename, name, `${label} response did not distinguish the collision filename`);
+        assert.deepEqual(payload.discovery, { status: 'failed', reason: 'file_limit' });
         await waitUntil(() => requests.slice(before).some(row =>
           row.method === 'GET' && row.path === `/ocu/terminal/${CHAT}/status`),
           `${label} completed dashboard refresh`);
@@ -1820,7 +1825,8 @@ async function main() {
         const alert = dashboard.getByRole('alert');
         assert.equal(await alert.count(), 1, `${label} omitted the stored-but-discovery-failed warning`);
         const text = await alert.innerText();
-        assert(text.includes(name), `${label} warning omitted the stored filename`);
+        assert(text.includes(storedName), `${label} warning omitted the actual stored filename`);
+        assert(!text.includes(name), `${label} warning reported the requested filename instead of the stored filename`);
         assert(/stored|saved|\u0441\u043e\u0445\u0440\u0430\u043d/i.test(text), `${label} falsely reported a file-save failure`);
         assert(/discovery|\u043e\u0431\u043d\u0430\u0440\u0443\u0436|\u0440\u0435\u0441\u0443\u0440\u0441/i.test(text), `${label} omitted the distinct discovery failure`);
         assert(text.includes('file_limit'), `${label} omitted the stable discovery reason`);
@@ -1842,6 +1848,7 @@ async function main() {
           standalone ? 1 : 0, `${label} violated the standalone-only Files refresh`);
         await captureUploadFeedback(target, surface, standalone, label, true);
         console.log(JSON.stringify({ uploadFeedback: label, stored: true,
+          requestedFilename: name, storedFilename: payload.filename,
           discovery: 'file_limit', publicationRequests: 2, retry: false }));
       } finally {
         if (input) await input.dispose();
