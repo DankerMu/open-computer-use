@@ -9,19 +9,13 @@ These tests verify that:
 2. safe_path() provides defense-in-depth at the application level
 3. Normal operations continue to work correctly
 """
-import sys
-from pathlib import Path
-
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "computer-use-server"))
-
-from fastapi.testclient import TestClient
+from tests.orchestrator.test_outputs_endpoint import INTERNAL, _client, _isolated_app
 
 
 VALID_CHAT_ID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 UNKNOWN_CHAT_ID = "c3d4e5f6-a7b8-9012-cdef-123456789012"
-INTERNAL_TOKEN = "ocu-test-internal-token"
 UPLOAD_READ_PATHS = ("manifest", "list")
 # MD5 of the seeded outputs/uploaded.txt bytes b"world".
 
@@ -30,30 +24,31 @@ SEEDED_UPLOAD_NAME = "uploaded.txt"
 
 
 @pytest.fixture
-def tmp_data(tmp_path):
-    """Create temporary data directory with test files."""
-    chat_dir = tmp_path / VALID_CHAT_ID
+def isolated_app(tmp_path):
+    """Keep the canonical application isolation active through client teardown."""
+    with _isolated_app(tmp_path, prefix="") as isolated:
+        yield isolated
+
+
+@pytest.fixture
+def tmp_data(isolated_app):
+    """Create test files in the isolated application's data directory."""
+    _loaded, _manager, _broker, data = isolated_app
+    chat_dir = data / VALID_CHAT_ID
     outputs = chat_dir / "outputs"
     outputs.mkdir(parents=True)
     (outputs / "test.txt").write_text("hello")
     (outputs / "uploaded.txt").write_text("world")
-    return tmp_path
+    return data
 
 
 
 @pytest.fixture
-def client(tmp_data, monkeypatch):
-    """TestClient with patched BASE_DATA_DIR and a valid service token."""
-    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
-    for name in ("app", "docker_manager", "outputs_broker"):
-        sys.modules.pop(name, None)
-    import app as app_module
-    import docker_manager
-
-    monkeypatch.setattr(app_module, "BASE_DATA_DIR", tmp_data)
-    monkeypatch.setattr(docker_manager, "BASE_DATA_DIR", tmp_data)
-    http = TestClient(app_module.app)
-    http.headers.update({"Authorization": f"Bearer {INTERNAL_TOKEN}"})
+def client(isolated_app, tmp_data):
+    """TestClient with seeded isolated data and a valid service token."""
+    loaded, _manager, _broker, _data = isolated_app
+    http = _client(loaded)
+    http.headers.update({"Authorization": f"Bearer {INTERNAL}"})
     try:
         yield http
     finally:

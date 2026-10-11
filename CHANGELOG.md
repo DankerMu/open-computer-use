@@ -3,6 +3,10 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Security app fixture isolation.** Output security tests share the canonical
+  app/Office module and data-root lifetime, closing the client before restoring
+  prior modules and environment. Endpoint and security assertions are unchanged.
+
 - **Callback DNS deadline evidence.** The regression uses aiohttp's real threaded
   resolver and proves callback failure before resolver release, with bounded
   worker cleanup. Production resolver selection and deadlines are unchanged.
