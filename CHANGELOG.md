@@ -3,6 +3,10 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Independent browser CDP relay lifetime.** Captured `playwright-cli` commands
+  complete while the detached relay retains browser viewer access. Rebuild the
+  image and recreate sandbox containers to apply the fix.
+
 - **Workspace Node runtime.** The linux/amd64 image uses fixed Node.js 22.23.2
   with bundled npm 10.9.8, satisfying the unchanged manifest engine floors.
   The default image harness checks installed engines and executes offline

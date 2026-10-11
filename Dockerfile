@@ -258,7 +258,7 @@ RUN sudo -u assistant bash -c "npm install -g @playwright/cli@0.1.1" && \
 # to connect CDP and enable Fetch.authRequired interception before navigation starts
 RUN ORIG=$(which playwright-cli) && \
     mv "$ORIG" "${ORIG}-orig" && \
-    printf '#!/bin/bash\nexport PLAYWRIGHT_CLI_CONFIG="${PLAYWRIGHT_CLI_CONFIG:-/home/assistant/playwright-cli.json}"\nif ! pgrep -f "socat.*TCP-LISTEN:9222" >/dev/null 2>&1; then\n  socat TCP-LISTEN:9222,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9223 &\nfi\nif [ "$1" = "open" ] && [ -n "$2" ] && [[ "$2" == http* ]]; then\n  URL="$2"\n  shift 2\n  playwright-cli-orig open "$@"\n  sleep 3\n  exec playwright-cli-orig goto "$URL"\nfi\nexec playwright-cli-orig "$@"\n' > "$ORIG" && \
+    printf '#!/bin/bash\nexport PLAYWRIGHT_CLI_CONFIG="${PLAYWRIGHT_CLI_CONFIG:-/home/assistant/playwright-cli.json}"\nif ! pgrep -f "socat.*TCP-LISTEN:9222" >/dev/null 2>&1; then\n  nohup socat TCP-LISTEN:9222,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9223 </dev/null >/dev/null 2>&1 &\nfi\nif [ "$1" = "open" ] && [ -n "$2" ] && [[ "$2" == http* ]]; then\n  URL="$2"\n  shift 2\n  playwright-cli-orig open "$@"\n  sleep 3\n  exec playwright-cli-orig goto "$URL"\nfi\nexec playwright-cli-orig "$@"\n' > "$ORIG" && \
     chmod +x "$ORIG"
 
 # Install ttyd (WebSocket terminal server) — download binary for reliability
