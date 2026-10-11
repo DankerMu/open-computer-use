@@ -3,6 +3,10 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Callback DNS deadline evidence.** The regression uses aiohttp's real threaded
+  resolver and proves callback failure before resolver release, with bounded
+  worker cleanup. Production resolver selection and deadlines are unchanged.
+
 - **Independent browser CDP relay lifetime.** Captured `playwright-cli` commands
   complete while the detached relay retains browser viewer access. Rebuild the
   image and recreate sandbox containers to apply the fix.

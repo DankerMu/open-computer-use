@@ -935,6 +935,9 @@ def test_callback_dns_stall_returns_before_resolver_executor_shutdown(office_wor
     import socket
     import time
 
+    import aiohttp.connector
+    import aiohttp.resolver
+
     import office.commands as commands
 
     http, data, origin, _docker, _broker, content, session = _open_session(office_world)
@@ -948,35 +951,101 @@ def test_callback_dns_stall_returns_before_resolver_executor_shutdown(office_wor
     before = json.loads(_state(data).read_bytes())
     before_versions = list(before["documents"][session["file_id"]]["versions"])
     before_receipts = json.loads(json.dumps(before["receipts"]))
-    monkeypatch.setattr(commands, "HTTP_TIMEOUT_SECONDS", 0.05)
+    configured_timeout = commands.HTTP_TIMEOUT_SECONDS
+    deadline_allowance = 0.15
+    readiness_timeout = 5
+    cleanup_timeout = 5
     original = socket.getaddrinfo
     calls = []
+    entered = threading.Event()
     release = threading.Event()
+    returned = threading.Event()
+    escaped = threading.Event()
+    started = threading.Event()
+    completed = threading.Event()
+    entered_or_completed = threading.Event()
+    timestamps = {}
+    outcome = {}
+    failures = []
 
     def delayed(host, port, *args, **kwargs):
         if str(host) == "slow-resolution.example":
             calls.append(str(host))
-            release.wait(0.3)
-            return original("127.0.0.1", port, *args, **kwargs)
+            timestamps["entered"] = time.monotonic()
+            entered.set()
+            entered_or_completed.set()
+            try:
+                if not release.wait(configured_timeout + 2 * cleanup_timeout):
+                    escaped.set()
+                    raise TimeoutError("resolver emergency escape invalidates DNS-stall evidence")
+                return original("127.0.0.1", port, *args, **kwargs)
+            except BaseException as exc:
+                failures.append(exc)
+                raise
+            finally:
+                timestamps["returned"] = time.monotonic()
+                returned.set()
         return original(host, port, *args, **kwargs)
 
+    # This scenario covers executor shutdown, not the native async DNS backend.
+    monkeypatch.setattr(aiohttp.connector, "DefaultResolver", aiohttp.resolver.ThreadedResolver)
     monkeypatch.setattr(socket, "getaddrinfo", delayed)
-    try:
-        with (
-            _content_origin({"/cache/ok.docx": CHANGED}) as server,
-            _bind_internal(monkeypatch, f"http://slow-resolution.example:{urlsplit(server.url).port}") as host_url,
-        ):
-            payload = recorded_status_6_payload(
-                document_key=session["document_key"],
-                url=host_url + "/cache/ok.docx",
-                save_seq=1,
-                intent="persist",
+    with (
+        _content_origin({"/cache/ok.docx": CHANGED}) as server,
+        _bind_internal(monkeypatch, f"http://slow-resolution.example:{urlsplit(server.url).port}") as host_url,
+    ):
+        payload = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=host_url + "/cache/ok.docx",
+            save_seq=1,
+            intent="persist",
+        )
+
+        def request():
+            try:
+                timestamps["started"] = time.monotonic()
+                started.set()
+                response = _post(http, session, payload)
+                timestamps["responded"] = time.monotonic()
+                outcome.update(
+                    response=response,
+                    entered=entered.is_set(),
+                    released=release.is_set(),
+                    returned=returned.is_set(),
+                    escaped=escaped.is_set(),
+                )
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                completed.set()
+                entered_or_completed.set()
+
+        worker = threading.Thread(target=request, name="office-dns-stall-request")
+        try:
+            worker.start()
+            assert started.wait(readiness_timeout), "callback request worker did not start"
+            deadline = timestamps["started"] + configured_timeout + deadline_allowance
+            assert entered_or_completed.wait(max(0, deadline - time.monotonic())), (
+                "resolver did not enter before the original callback deadline"
             )
-            started = time.monotonic()
-            response = _post(http, session, payload)
-            elapsed = time.monotonic() - started
-            assert elapsed < 0.2
-            _assert_refusal(response, 502, "download_failed")
+            if failures:
+                raise failures[0]
+            assert entered.is_set(), "callback responded before resolver entry; invalid DNS-stall setup"
+            assert completed.wait(max(0, deadline - time.monotonic())), (
+                "callback did not return before its configured deadline plus 150 ms while DNS remained blocked"
+            )
+            if failures:
+                raise failures[0]
+            assert outcome["entered"] and timestamps["entered"] <= timestamps["responded"], (
+                "callback responded before resolver entry; invalid DNS-stall setup"
+            )
+            elapsed = timestamps["responded"] - timestamps["started"]
+            assert elapsed <= configured_timeout + deadline_allowance
+            assert not outcome["released"] and not outcome["returned"] and not outcome["escaped"], (
+                "callback response did not precede resolver release/return"
+            )
+            assert not release.is_set() and not returned.is_set() and not escaped.is_set()
+            _assert_refusal(outcome["response"], 502, "download_failed")
             assert calls == ["slow-resolution.example"]
             after = json.loads(_state(data).read_bytes())
             record = after["sessions"][session["session_id"]]
@@ -986,8 +1055,17 @@ def test_callback_dns_stall_returns_before_resolver_executor_shutdown(office_wor
             assert after["documents"][session["file_id"]]["versions"] == before_versions
             assert (_outputs(data) / "report.docx").read_bytes() == content
             assert server.hits == 0
-    finally:
-        release.set()
+        finally:
+            timestamps["released"] = time.monotonic()
+            release.set()
+            if worker.ident is not None:
+                worker.join(timeout=cleanup_timeout)
+            resolver_finished = not entered.is_set() or returned.wait(cleanup_timeout)
+            assert not worker.is_alive(), "callback request worker did not finish after resolver release"
+            assert resolver_finished, "resolver invocation did not finish after explicit release"
+            if failures:
+                raise failures[0]
+            assert not escaped.is_set(), "resolver emergency escape invalidates DNS-stall evidence"
     assert origin.hits == 0
 
 
