@@ -45,17 +45,19 @@ TypeError: 'NoneType' object is not callable
 
 ---
 
-## 4. File/preview endpoints have no per-user auth
+## 4. Direct service credentials are not per-user authorization
 
-**Severity:** Medium (known limitation, planned fix)
+**Severity:** Medium (direct-service trust limitation)
 
-**Issue:** Endpoints like `/files/{chat_id}/`, `/api/outputs/{chat_id}`, `/browser/{chat_id}/`, `/terminal/{chat_id}/` are accessible to anyone who knows the chat ID UUID. There is no per-user authentication — only `MCP_API_KEY` protects the MCP endpoint itself.
+**Browser gateway:** The [documented proxy](../deploy/proxy/README.md#trust-and-route-behavior) protects outputs, files, browser and terminal chat routes using the WebUI session Cookie and a route-derived `X-Chat-Id`. WebUI checks that the authenticated user owns that chat. Knowing its UUID alone does not authorize access through this gateway.
 
-**Impact:** In a multi-user deployment without network isolation, one user could access another user's files if they know the chat ID.
+**Direct OCU access:** Guarded REST requests and WebSocket handshakes require `Authorization: Bearer` with the shared `OCU_INTERNAL_TOKEN`. This authenticates a service, not the requesting user's ownership of a chat. MCP instead requires that token in `X-OCU-Internal-Token`; when `MCP_API_KEY` is configured, MCP also requires it as a separate Bearer credential. Neither credential substitutes for the other.
 
-**Current mitigation:** Chat IDs are UUIDs (hard to guess). Tested in production with 1000+ users on Open WebUI — acceptable risk for self-hosted deployments behind a firewall.
+**Residual risk:** A shared service credential is not a per-user access boundary. Keep the direct service network-isolated and the credential private; browser access belongs behind the owner-checking gateway. UUID unguessability is not the gateway's access control. See [Security Notes](../README.md#security-notes).
 
-**Planned fix:** Per-session signed tokens for all file/preview/terminal endpoints. See Security Roadmap in README.
+**Roadmap:** Per-session signed tokens for file/preview/terminal endpoints remain a [planned direct-service hardening measure](../README.md#security-roadmap), not a shipped replacement for these boundaries.
+
+**Scope:** These authorization boundaries do not establish file-serving containment or response pinning; the separate [archive](https://github.com/DankerMu/open-webui/issues/200) and [single-file](https://github.com/DankerMu/open-webui/issues/201) security work is not fixed by this documentation update.
 
 ---
 
