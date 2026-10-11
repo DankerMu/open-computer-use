@@ -11,6 +11,17 @@
   resolver and proves callback failure before resolver release, with bounded
   worker cleanup. Production resolver selection and deadlines are unchanged.
 
+- **Bounded MCP workspace discovery.** Complete resource replacements are prepared
+  off-loop and published as atomic membership snapshots. Fixed ceilings allow
+  10,000 visible files per chat, 20,000 process-wide workspace resources, 50,000
+  enumerated entries, 10,000 visited directories and 256 simultaneous scan
+  directory descriptors. Capacity, IO and busy failures preserve the prior
+  listing; cancelled callers leave admission held until worker completion.
+  Committed uploads retain HTTP 200, bytes and receipts while reporting a separate
+  discovery failure. Preview dashboards and all five WebUI tool results expose
+  stored-file warnings without republishing. Initial discovery failure returns
+  `launch_failed` HTTP 503 before Docker creation/start or conflict adoption.
+
 - **Independent browser CDP relay lifetime.** Captured `playwright-cli` commands
   complete while the detached relay retains browser viewer access. Rebuild the
   image and recreate sandbox containers to apply the fix.

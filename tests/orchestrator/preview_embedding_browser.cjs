@@ -168,6 +168,10 @@ let standaloneListing = null;
 let injectedListingFailure = false;
 const uploadFixtures = new Map();
 const retainedUploads = new Map();
+const uploadDiscoveryFixtures = new Map();
+const discoverySurface = process.env.OCU_PREVIEW_DISCOVERY_SURFACE || 'both';
+assert(['both', 'embedded', 'standalone'].includes(discoverySurface),
+  'OCU_PREVIEW_DISCOVERY_SURFACE must be both, embedded or standalone');
 const uploadBodyCanary = '<img id="upload-body-canary" src=x onerror="window.__uploadCanary=1">';
 const uploadFailureOrder = process.env.OCU_PREVIEW_UPLOAD_FAILURE_ORDER || 'http-first';
 assert(['http-first', 'network-first'].includes(uploadFailureOrder),
@@ -355,8 +359,14 @@ const server = http.createServer(async (req, res) => {
       for await (const chunk of req) chunks.push(chunk);
       record.status = status;
       if (status === 200) retainedUploads.set(url.pathname, Buffer.concat(chunks));
-      return respond(res, status, status === 200 ? '{"status":"success"}' : uploadBodyCanary,
-        'text/plain');
+      const filename = decodeURIComponent(url.pathname.split('/').pop());
+      const body = status === 200 ? JSON.stringify({
+        status: 'success', filename, size: 5, md5: '0',
+        ...(uploadDiscoveryFixtures.has(url.pathname)
+          ? { discovery: { status: 'failed', reason: uploadDiscoveryFixtures.get(url.pathname) } }
+          : {}),
+      }) : uploadBodyCanary;
+      return respond(res, status, body, status === 200 ? 'application/json' : 'text/plain');
     }
     if (url.pathname === `${prefix}/api/uploads/${CHAT}/note.txt` && req.method === 'POST') {
       record.status = 200;
@@ -1555,26 +1565,40 @@ async function main() {
       listingBeforeRuntime, 'terminal embed listed Files');
     assert.equal(requests.filter(row => /\/(restart-container|start-ttyd)$/.test(row.path)).length,
       launchBeforeRuntime, 'runtime embedding implicitly launched a sandbox');
+    const captureUploadFeedback = async (target, surface, standalone, label, requireAlert = false) => {
+      const iframe = standalone ? null : target.locator('#preview');
+      const originalStyle = iframe ? await iframe.getAttribute('style') : null;
+      try {
+        if (iframe) await iframe.evaluate(node => {
+          node.style.width = '1000px';
+          node.style.height = '700px';
+        });
+        const alert = surface.locator('.dash-scroll').getByRole('alert');
+        if (await alert.isVisible()) await alert.scrollIntoViewIfNeeded();
+        if (requireAlert) {
+          assert(await alert.isVisible(), `${label} feedback was not visible for capture`);
+          assert(await alert.evaluate(node => {
+            const bounds = node.getBoundingClientRect();
+            const scrollport = node.closest('.dash-scroll').getBoundingClientRect();
+            return bounds.top >= Math.max(0, scrollport.top) &&
+              bounds.bottom <= Math.min(window.innerHeight, scrollport.bottom) &&
+              bounds.left >= Math.max(0, scrollport.left) &&
+              bounds.right <= Math.min(window.innerWidth, scrollport.right);
+          }), `${label} feedback was clipped inside the captured surface`);
+        }
+        await target.screenshot({
+          path: path.join(artifacts, `${label}.png`), ...(requireAlert ? { fullPage: true } : {}),
+        });
+      } finally {
+        if (iframe) await iframe.evaluate((node, style) => {
+          if (style === null) node.removeAttribute('style');
+          else node.setAttribute('style', style);
+        }, originalStyle);
+      }
+    };
     const exerciseUploadFailures = async (target, surface, standalone) => {
       const dashboard = surface.locator('.dash-scroll');
-      const captureUploadFailure = async label => {
-        const iframe = standalone ? null : target.locator('#preview');
-        const originalStyle = iframe ? await iframe.getAttribute('style') : null;
-        try {
-          if (iframe) await iframe.evaluate(node => {
-            node.style.width = '1000px';
-            node.style.height = '700px';
-          });
-          const alert = dashboard.getByRole('alert');
-          if (await alert.isVisible()) await alert.scrollIntoViewIfNeeded();
-          await target.screenshot({ path: path.join(artifacts, `${label}.png`) });
-        } finally {
-          if (iframe) await iframe.evaluate((node, style) => {
-            if (style === null) node.removeAttribute('style');
-            else node.setAttribute('style', style);
-          }, originalStyle);
-        }
-      };
+      const captureUploadFailure = label => captureUploadFeedback(target, surface, standalone, label);
       const uploadPath = name => `/ocu/api/uploads/${CHAT}/${encodeURIComponent(name)}`;
       const submitted = [];
       const recordSubmission = request => {
@@ -1760,6 +1784,74 @@ async function main() {
         if (standalone) target.off('requestfailed', recordStandaloneFailure);
       }
     };
+    const exerciseDiscoveryWarning = async (target, surface, standalone) => {
+      if (discoverySurface !== 'both' && discoverySurface !== (standalone ? 'standalone' : 'embedded'))
+        return;
+      const dashboard = surface.locator('.dash-scroll');
+      const label = `${standalone ? 'standalone' : 'embedded'}-stored-discovery-failed`;
+      const name = `${label}-{reason}-$&-<img src=x onerror=window.__uploadCanary=1>.txt`;
+      const later = `${label}-later.txt`;
+      const pathname = `/ocu/api/uploads/${CHAT}/${encodeURIComponent(name)}`;
+      const laterPath = `/ocu/api/uploads/${CHAT}/${encodeURIComponent(later)}`;
+      const before = requests.length;
+      let input;
+      try {
+        uploadFixtures.set(pathname, 200);
+        uploadFixtures.set(laterPath, 200);
+        uploadDiscoveryFixtures.set(pathname, 'file_limit');
+        const chooserPromise = target.waitForEvent('filechooser');
+        await surface.locator('.dash-btn-secondary').click();
+        const chooser = await chooserPromise;
+        input = chooser.element();
+        const responsePromise = target.waitForResponse(response =>
+          response.url() === origin + pathname && response.request().method() === 'POST');
+        await chooser.setFiles([name, later].map(filename => ({
+          name: filename, mimeType: 'text/plain', buffer: Buffer.from(`stored: ${filename}`),
+        })));
+        const response = await responsePromise;
+        assert.equal(response.status(), 200);
+        assert.deepEqual((await response.json()).discovery, { status: 'failed', reason: 'file_limit' });
+        await waitUntil(() => requests.slice(before).some(row =>
+          row.method === 'GET' && row.path === `/ocu/terminal/${CHAT}/status`),
+          `${label} completed dashboard refresh`);
+        await surface.locator('.dash-btn-secondary').waitFor({ state: 'visible' });
+        await dashboard.evaluate(() => new Promise(resolve =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const alert = dashboard.getByRole('alert');
+        assert.equal(await alert.count(), 1, `${label} omitted the stored-but-discovery-failed warning`);
+        const text = await alert.innerText();
+        assert(text.includes(name), `${label} warning omitted the stored filename`);
+        assert(/stored|saved|\u0441\u043e\u0445\u0440\u0430\u043d/i.test(text), `${label} falsely reported a file-save failure`);
+        assert(/discovery|\u043e\u0431\u043d\u0430\u0440\u0443\u0436|\u0440\u0435\u0441\u0443\u0440\u0441/i.test(text), `${label} omitted the distinct discovery failure`);
+        assert(text.includes('file_limit'), `${label} omitted the stable discovery reason`);
+        assert(!/retry|try again|\u043f\u043e\u0432\u0442\u043e\u0440|\u0441\u043d\u043e\u0432\u0430/i.test(text), `${label} invited duplicate publication`);
+        assert.equal(await alert.locator('button, a, img').count(), 0,
+          `${label} offered re-upload or interpreted the filename as HTML`);
+        assert.equal(await dashboard.evaluate(() => window.__uploadCanary), undefined,
+          `${label} executed filename HTML`);
+        assert.equal(await input.evaluate(node => node.isConnected), false,
+          `${label} retained the selected file input`);
+        assert.deepEqual(requests.slice(before).filter(row =>
+          row.method === 'POST' && row.path.startsWith(`/ocu/api/uploads/${CHAT}/`))
+          .map(row => row.path), [pathname, laterPath],
+          `${label} retried a committed upload or abandoned the remaining selection`);
+        assert(retainedUploads.get(pathname)?.includes(Buffer.from(`stored: ${name}`)));
+        assert(retainedUploads.get(laterPath)?.includes(Buffer.from(`stored: ${later}`)));
+        assert.equal(requests.slice(before).filter(row =>
+          row.method === 'GET' && row.path === `/ocu/api/outputs/${CHAT}`).length,
+          standalone ? 1 : 0, `${label} violated the standalone-only Files refresh`);
+        await captureUploadFeedback(target, surface, standalone, label, true);
+        console.log(JSON.stringify({ uploadFeedback: label, stored: true,
+          discovery: 'file_limit', publicationRequests: 2, retry: false }));
+      } finally {
+        if (input) await input.dispose();
+        for (const uploadPath of [pathname, laterPath]) {
+          uploadFixtures.delete(uploadPath);
+          uploadDiscoveryFixtures.delete(uploadPath);
+          retainedUploads.delete(uploadPath);
+        }
+      }
+    };
     await page.screenshot({ path: path.join(artifacts, 'embedded-terminal-dashboard.png') });
     const beforeEmbedUpload = requests.length;
     const beforeEmbedUploadErrors = consoleErrors.length;
@@ -1788,6 +1880,7 @@ async function main() {
     assert.deepEqual(consoleErrors.slice(beforeEmbedUploadErrors), [],
       'terminal embed upload produced unexpected console errors');
     await exerciseUploadFailures(page, frame(), false);
+    await exerciseDiscoveryWarning(page, frame(), false);
     await retireFrame();
     const runtimeCalls = () => requests.filter(row =>
       /\/(?:browser|terminal)\/|\/api\/uploads\//.test(row.path)).length;
@@ -2257,6 +2350,7 @@ async function main() {
       await panelSession.page.locator('.view-tab').filter({ hasText: 'Sub-agent' }).click();
       await panelSession.page.locator('.dash-btn-secondary').waitFor();
       await exerciseUploadFailures(panelSession.page, panelSession.page, true);
+      await exerciseDiscoveryWarning(panelSession.page, panelSession.page, true);
       assert.deepEqual(caseErrors(panelSession).filter(error => !expectedOwnedErrors.includes(error)), [],
         'standalone panel produced unexpected console errors');
     } catch (error) {

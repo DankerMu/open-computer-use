@@ -682,10 +682,10 @@ class Tools:
                 pass
         return headers
 
-    async def _sync_files_if_needed(self, chat_id: str, __files__: list = None):
+    async def _sync_files_if_needed(self, chat_id: str, __files__: list = None) -> str:
         """Sync attached files before the MCP command, independent of path text."""
         if not __files__:
-            return
+            return ""
         try:
             sync_result = await asyncio.to_thread(
                 _sync_uploaded_files,
@@ -697,8 +697,10 @@ class Tools:
             )
             if sync_result.get("synced", 0) > 0:
                 print(f"Synced {sync_result['synced']} file(s)")
+            return "\n".join(sync_result.get("warnings", []))
         except Exception as e:
             print(f"[SYNC] Error: {e}")
+            return ""
 
     async def _run_tool(
         self,
@@ -712,6 +714,7 @@ class Tools:
         ok_desc: str,
         err_desc: str,
         timeout: int = CLIENT_HTTP_TIMEOUT,
+        sync_warning: str = "",
     ) -> str:
         """One transport-aware MCP call with consistent SSE status events.
 
@@ -734,7 +737,7 @@ class Tools:
                 else "Computer Use configuration error"
             )
             await self._emit_terminal_error(emitter, description)
-            return error
+            return f"{error}\n\n{sync_warning}" if sync_warning else error
 
         async def emit(description: str, status: str, done: bool):
             if not emitter:
@@ -763,7 +766,7 @@ class Tools:
             result = f"[Error] {tool_name} wrapper crashed: {type(e).__name__}: {e}"
         if invoked:
             await self._emit_workspace_hint(emitter, chat_id)
-        return result
+        return f"{result}\n\n{sync_warning}" if sync_warning else result
 
     # =========================================================================
     # Tool methods — delegate to computer-use-orchestrator via MCP Streamable HTTP
@@ -789,12 +792,13 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
         return await self._run_tool(
             "bash_tool", {"command": command, "description": description},
             chat_id, __event_emitter__, __request__, __user__,
             in_progress_desc=description or "Executing bash command...",
             ok_desc="Command completed", err_desc="Command failed",
+            sync_warning=sync_warning,
         )
 
     async def str_replace(
@@ -823,12 +827,13 @@ class Tools:
             return error
         if old_str == new_str:
             return "Error: old_str and new_str are identical."
-        await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
         return await self._run_tool(
             "str_replace", {"description": description, "old_str": old_str, "path": path, "new_str": new_str},
             chat_id, __event_emitter__, __request__, __user__,
             in_progress_desc=description or f"Editing {path}...",
             ok_desc="File edited", err_desc="Edit failed",
+            sync_warning=sync_warning,
         )
 
     async def create_file(
@@ -853,12 +858,13 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
         return await self._run_tool(
             "create_file", {"description": description, "file_text": file_text, "path": path},
             chat_id, __event_emitter__, __request__, __user__,
             in_progress_desc=description or f"Creating {path}...",
             ok_desc="File created", err_desc="Creation failed",
+            sync_warning=sync_warning,
         )
 
     async def view(
@@ -883,7 +889,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
         args = {"description": description, "path": path}
         if view_range:
             args["view_range"] = view_range
@@ -892,6 +898,7 @@ class Tools:
             chat_id, __event_emitter__, __request__, __user__,
             in_progress_desc=description or f"Reading {path}...",
             ok_desc="Read complete", err_desc="Read failed",
+            sync_warning=sync_warning,
         )
 
     async def sub_agent(
@@ -924,7 +931,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
         args = {
             "task": task, "description": description, "model": model,
             "max_turns": max_turns, "working_directory": working_directory,
@@ -937,6 +944,7 @@ class Tools:
             in_progress_desc=description or f"Starting sub-agent ({model})...",
             ok_desc="Sub-agent completed", err_desc="Sub-agent failed",
             timeout=SUB_AGENT_CLIENT_TIMEOUT,
+            sync_warning=sync_warning,
         )
 
 
@@ -979,6 +987,12 @@ def _imported_attachment_ids(orchestrator_url, chat_id, headers):
     return set(ids)
 
 
+_DISCOVERY_REASONS = frozenset({
+    "busy", "file_limit", "registry_limit", "entry_limit", "directory_limit",
+    "descriptor_limit", "io_error", "internal_error",
+})
+
+
 def _sync_uploaded_files(
     orchestrator_url: str,
     chat_id: str,
@@ -1003,6 +1017,7 @@ def _sync_uploaded_files(
         imports_readable = False
 
     synced, skipped, errors = 0, 0, 0
+    warnings = []
 
     for file_info in files:
         temp_file_path = None
@@ -1059,6 +1074,20 @@ def _sync_uploaded_files(
                     )
                 resp.raise_for_status()
             synced += 1
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {}
+            discovery = payload.get("discovery") if isinstance(payload, dict) else None
+            if isinstance(discovery, dict) and discovery.get("status") == "failed":
+                reason = discovery.get("reason")
+                if not isinstance(reason, str) or reason not in _DISCOVERY_REASONS:
+                    reason = "internal_error"
+                stored_filename = payload.get("filename", filename)
+                warnings.append(
+                    f"[DISCOVERY WARNING] File {stored_filename!r} was stored, but workspace "
+                    f"file discovery failed ({reason}). Do not upload it again."
+                )
         except Exception:
             errors += 1
         finally:
@@ -1068,4 +1097,7 @@ def _sync_uploaded_files(
                 except Exception:
                     pass
 
-    return {"synced": synced, "skipped": skipped, "errors": errors}
+    result = {"synced": synced, "skipped": skipped, "errors": errors}
+    if warnings:
+        result["warnings"] = warnings
+    return result

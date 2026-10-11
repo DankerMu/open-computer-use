@@ -52,6 +52,7 @@ export const TRANSLATIONS = {
     upload_file: 'Загрузить файл',
     upload_fail: 'Не удалось загрузить файл',
     upload_retry: 'Выберите файл снова, чтобы повторить загрузку.',
+    upload_stored_discovery_failed: 'Файл "{filename}" сохранён, но обнаружение ресурсов MCP не выполнено ({reason}).',
     how_to_use: 'Как пользоваться',
     running_now: 'Сейчас работает',
     claude_running: 'Claude Code работает',
@@ -152,6 +153,7 @@ export const TRANSLATIONS = {
     upload_file: 'Upload file',
     upload_fail: 'Failed to upload',
     upload_retry: 'Select the file again to retry.',
+    upload_stored_discovery_failed: 'File "{filename}" was stored, but MCP file discovery failed ({reason}).',
     how_to_use: 'How to use',
     running_now: 'Currently running',
     claude_running: 'Claude Code running',
@@ -225,9 +227,8 @@ export function createT(lang) {
   return function t(key, params) {
     let msg = dict[key] || TRANSLATIONS.en[key] || key;
     if (params) {
-      for (const [k, v] of Object.entries(params)) {
-        msg = msg.replace(`{${k}}`, String(v));
-      }
+      msg = msg.replace(/\{([^{}]+)\}/g, (placeholder, name) =>
+        Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : placeholder);
     }
     return msg;
   };

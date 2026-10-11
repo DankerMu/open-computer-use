@@ -613,6 +613,67 @@ def test_launch_corrupt_metadata_preserves_file(world):
     assert client._created == []
 
 
+@pytest.mark.parametrize("initiator", ["tool", "launch", "conflict"])
+def test_discovery_failure_prevents_create_start_and_conflict_adoption(
+    world, monkeypatch, initiator
+):
+    docker_manager, client, _clock, tmp_path = world
+    import uploads
+
+    monkeypatch.setattr(uploads, "BASE_DATA_DIR", docker_manager.BASE_DATA_DIR)
+    root = tmp_path / "data" / CHAT / "outputs"
+    root.mkdir(parents=True)
+    for index in range(10_001):
+        (root / f"visible-{index:05d}.txt").touch()
+    if initiator == "launch":
+        _meta(docker_manager, CHAT)
+    winner = _container(f"owui-chat-{CHAT}", "running", container_id="race-winner")
+    if initiator == "conflict":
+        def conflict(**config):
+            client._store[config["name"]] = winner
+            raise APIError("Conflict", response=type("R", (), {"status_code": 409})())
+
+        client.containers.create.side_effect = conflict
+
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        if initiator == "launch":
+            docker_manager.launch_sandbox(CHAT)
+        else:
+            docker_manager._get_or_create_container(CHAT)
+    assert caught.value.status_code == 503
+    assert caught.value.reason == "launch_failed"
+    assert "file_limit" in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+    client.containers.create.assert_not_called()
+    assert client._created == []
+    winner.start.assert_not_called()
+    winner.remove.assert_not_called()
+
+
+def test_launch_http_reports_discovery_failure_without_creating_or_starting(
+    world, app_module, monkeypatch
+):
+    docker_manager, client, _clock, tmp_path = world
+    import uploads
+
+    monkeypatch.setattr(uploads, "BASE_DATA_DIR", docker_manager.BASE_DATA_DIR)
+    root = tmp_path / "data" / CHAT / "outputs"
+    root.mkdir(parents=True)
+    for index in range(10_001):
+        (root / f"visible-{index:05d}.txt").touch()
+    _meta(docker_manager, CHAT)
+    response = app_module._lifecycle_client.post(
+        f"/internal/launch/{CHAT}", headers={"Authorization": f"Bearer {INTERNAL}"}
+    )
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["reason"] == "launch_failed"
+    assert "file_limit" in detail["detail"]
+    assert str(tmp_path) not in response.text
+    client.containers.create.assert_not_called()
+    assert client._created == []
+
+
 def test_launch_recreates_absent_container_from_server_fallbacks_only(world, monkeypatch):
     docker_manager, client, _clock, _tmp = world
     _meta(docker_manager, CHAT, user_email="saved@example", user_name="Saved")
@@ -678,14 +739,28 @@ def test_concurrent_first_use_creates_one_container(world):
     assert found[0] is found[1] is client._created[0]
 
 
-def test_separate_request_contexts_do_not_cross_credentials(world):
+def test_separate_request_contexts_do_not_cross_credentials(world, monkeypatch):
     docker_manager, client, _clock, _tmp = world
+    import mcp_resources
+
     barrier = threading.Barrier(2)
+    errors = []
+
+    # Isolate credential contexts; real discovery admission is covered separately.
+    def discovery(_chat_id):
+        barrier.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(mcp_resources, "sync_chat_resources_sync", discovery)
 
     def create(chat_id, token):
-        barrier.wait(timeout=5)
-        docker_manager.current_gitlab_token.set(token)
-        docker_manager._get_or_create_container(chat_id)
+        context_token = docker_manager.current_gitlab_token.set(token)
+        try:
+            docker_manager._get_or_create_container(chat_id)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            docker_manager.current_gitlab_token.reset(context_token)
 
     threads = [
         threading.Thread(target=create, args=(CHAT, "token-a")),
@@ -695,6 +770,8 @@ def test_separate_request_contexts_do_not_cross_credentials(world):
         thread.start()
     for thread in threads:
         thread.join(timeout=5)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
     envs = {item.name: _env_of(item) for item in client._created}
     assert envs[f"owui-chat-{CHAT}"]["GITLAB_TOKEN"] == "token-a"
     assert envs[f"owui-chat-{CHAT_B}"]["GITLAB_TOKEN"] == "token-b"

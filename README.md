@@ -192,6 +192,43 @@ The server speaks standard MCP over Streamable HTTP. Point any MCP client at you
   ```
   Full self-host integration guide (LiteLLM, Claude Desktop, custom clients): [docs/MCP.md](docs/MCP.md). The per-chat system prompt rides **six redundant MCP-native channels** (tool descriptions, `/home/assistant/README.md` in the sandbox, `InitializeResult.instructions`, `resources/list` for uploaded files, plus an HTTP `/system-prompt` endpoint for legacy integrations) — full map in [docs/system-prompt.md](docs/system-prompt.md).
 
+### Workspace-file discovery
+
+MCP workspace resources use `file://uploads/{chat_id}/{encoded-relative-path}`.
+Discovery prepares a complete replacement outside the request event loop and
+publishes resource membership atomically. Failures retain the preceding listing;
+content reads still read the filesystem, not a versioned copy of file bytes.
+
+Fixed limits apply to each scan and the process:
+
+| Budget | Ceiling |
+| --- | --- |
+| Visible regular files per chat | 10,000 |
+| Registered workspace resources across chats | 20,000 |
+| Enumerated entries, including filtered entries | 50,000 |
+| Visited directories, including an existing root | 10,000 |
+| Simultaneous scan directory descriptors, including root and iterator duplicates | 256 |
+
+Hidden entries, symlinks and special files consume the entry budget but are not
+registered; hidden directories are not traversed. Exact limits are accepted.
+Only one discovery preparation is admitted process-wide. Overlapping requests
+fail with `busy` instead of queuing. Other stable reasons are `file_limit`,
+`registry_limit`, `entry_limit`, `directory_limit`, `descriptor_limit`,
+`io_error` and `internal_error`.
+
+A committed upload remains HTTP 200 with its existing `status`, `filename`,
+`size` and `md5`. If discovery fails, the response adds
+`"discovery": {"status": "failed", "reason": "<stable reason>"}`; successful
+discovery omits that field. Stored bytes and attachment receipts remain committed.
+Standalone/embedded preview dashboards show a separate stored-file warning, and
+all five Open WebUI tools include it in their returned text. Neither consumer
+retries file publication for a discovery failure.
+
+Initial discovery runs after files-root preparation and before Docker create or
+start, including create-conflict adoption. Failure reaches the initiator as
+`launch_failed` HTTP 503 with a safe discovery reason. A later Docker failure
+does not roll back file resources whose authority is the filesystem.
+
 ## Configuration
 
 All settings via `.env`:

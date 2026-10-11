@@ -86,7 +86,7 @@ Beyond the five tools, the server exposes three more native primitives of the St
 | Primitive | What you get | How |
 |---|---|---|
 | `InitializeResult.instructions` | The per-chat system prompt as a string, delivered in the handshake | Dynamic — re-rendered each stateless request from `X-Chat-Id` / `X-User-Email` headers |
-| `resources/list` + `resources/read` | Chat's uploaded files as `file://uploads/{chat_id}/{url-encoded-rel-path}` | Auto-registered on container create + on every `POST /api/uploads` |
+| `resources/list` + `resources/read` | Registered workspace files as `file://uploads/{chat_id}/{url-encoded-rel-path}` | Complete bounded replacement before container creation and after upload; failures preserve the prior listing ([contract](../README.md#workspace-file-discovery)) |
 
 In addition, `/home/assistant/README.md` inside the sandbox carries the same prompt text, so any model that runs the `view` tool can recover its environment even if the client stripped every MCP handshake field. Full map: `docs/system-prompt.md`.
 

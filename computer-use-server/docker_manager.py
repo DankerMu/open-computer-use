@@ -1080,8 +1080,19 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
                 # writable, which is the case when a previous run created it.
                 if not os.access(path, os.W_OK):
                     raise
-    except Exception as e:
-        print(f"[MCP] Warning: Failed to create directories: {e}")
+    except OSError as exc:
+        raise LaunchFailed(503, "Workspace file discovery failed: io_error") from exc
+    # Discovery must precede Docker creation, including conflict adoption.
+    from uploads import DiscoveryError
+    from mcp_resources import sync_chat_resources_sync
+
+    try:
+        n = sync_chat_resources_sync(chat_id)
+    except DiscoveryError as exc:
+        raise LaunchFailed(503, f"Workspace file discovery failed: {exc.reason}") from exc
+    if n:
+        print(f"[MCP] Registered {n} upload resource(s) for chat {chat_id}")
+
     # Check if using custom image (has entrypoint) or standard image
     use_entrypoint = "computer-use" in DOCKER_IMAGE or "open-computer-use" in DOCKER_IMAGE
 
@@ -1201,16 +1212,6 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
         print(f"[MCP] Wrote {workdir}/README.md ({len(readme_text)} chars)")
     except Exception as e:
         print(f"[MCP] Warning: README.md write failed: {e}")
-
-    # Tier 6 — initial sync of uploaded files into MCP resources registry.
-    # Lazy import to avoid circular (mcp_resources → mcp_tools → docker_manager).
-    try:
-        from mcp_resources import sync_chat_resources_sync
-        n = sync_chat_resources_sync(chat_id)
-        if n:
-            print(f"[MCP] Registered {n} upload resource(s) for chat {chat_id}")
-    except Exception as e:
-        print(f"[MCP] Warning: MCP resources sync failed: {e}")
 
     # Pitfall 7 defense — scrub OpenCode auth.json from volume on container
     # creation (handles resurrected containers from previous opencode-auth-login

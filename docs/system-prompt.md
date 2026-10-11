@@ -14,7 +14,7 @@ The Computer Use Server delivers the same per-session system prompt through **si
 | 2 | `/home/assistant/README.md` | Rendered into the sandbox on container creation via `put_archive` | Any model that runs the `view` tool |
 | 3 | Static `instructions=` hint | FastMCP constructor, one-line pointer to README + `resources/list` | Claude Desktop, MCP Inspector; Agents SDK exposes via `server.server_initialize_result` |
 | 4 | Dynamic `InitializeResult.instructions` | Per-request ContextVar, swapped onto `mcp._mcp_server` as a `@property` | Same clients as #3, with chat-specific content |
-| 5 | `resources/list` + `resources/read` | Uploaded files surfaced as `FunctionResource` per chat, URI `file://uploads/{chat_id}/{rel_path}` | Agents SDK, Inspector, Claude Desktop |
+| 5 | `resources/list` + `resources/read` | Registered workspace files per chat, URI `file://uploads/{chat_id}/{rel_path}` | Agents SDK, Inspector, Claude Desktop |
 | 6 | `GET /system-prompt` HTTP | Backward-compat endpoint with header > query priority | Open WebUI filter; external integrations (n8n) |
 
 ## Tier 1 — Tool description nudges
@@ -29,7 +29,7 @@ Deliberately **not** "read this first" — the system prompt itself (Tiers 3/4) 
 
 When `docker_manager._create_container` spins up a chat's workspace container, it calls `render_system_prompt_sync(chat_id, user_email)` and writes the result to `/home/assistant/README.md` (or `/root/README.md` for the test image) via `container.put_archive`. The file survives across container removals because it lives in the chat's persistent workspace volume (`chat-{chat_id}-workspace`).
 
-Does **not** enumerate uploaded files — those are Tier 5's responsibility and are refreshed on every upload. README is static-per-container and changes only when `user_email` changes (which doesn't happen mid-chat).
+Does **not** enumerate workspace files — Tier 5 owns their bounded discovery. Uploads request a refresh and report discovery failure separately from committed storage. README is static-per-container and changes only when `user_email` changes (which doesn't happen mid-chat).
 
 ## Tier 3 — Static `instructions=`
 
@@ -52,17 +52,18 @@ Mechanism:
 
 **Private-API caveat.** We touch `mcp._mcp_server` and `_resource_manager._resources`. Pin `mcp` narrowly in `computer-use-server/requirements.txt` — an SDK minor bump requires re-verifying these attribute shapes.
 
-## Tier 5 — Uploaded files as MCP resources
+## Tier 5 — Workspace files as MCP resources
 
-`resources/list` returns a `FunctionResource` per uploaded file with URI `file://uploads/{chat_id}/{url-encoded rel_path}`. `resources/read` fetches the content — text for `text/*` and a short MIME allowlist, base64 blob otherwise.
+`resources/list` returns the registered workspace files with URI `file://uploads/{chat_id}/{url-encoded rel_path}`. `resources/read` fetches current filesystem content — text for `text/*` and a short MIME allowlist, base64 blob otherwise.
 
 Why `chat_id` embedded in the URI: Agents SDK and Inspector don't re-send `X-Chat-Id` on per-resource calls, so URIs must be self-contained.
 
 Why URL-encoding: FastMCP's `ResourceTemplate.matches` (verified at `.venv/.../templates.py:88`) uses `[^/]+` per template param — it blocks nested paths. Flattening via `urllib.parse.quote` sidesteps the limitation cleanly without forking the SDK.
 
-Dynamic registration: `sync_chat_resources(chat_id)` clears previously-registered entries for that chat, re-adds from the current filesystem state, under an `asyncio.Lock` to avoid "dict changed size during iteration" when a concurrent `resources/list` runs during an upload. Called from:
-- `docker_manager._create_container` — initial sync when the container spins up.
-- `app.py:upload_file` — after `POST /api/uploads/{chat_id}/{filename}` saves a new file.
+Dynamic registration prepares a complete bounded replacement off the request loop, then atomically replaces the pinned SDK's registry dictionary. Readers need no writer lock; a failed discovery retains the prior membership. Capacity, admission and consumer failure semantics live in the [workspace-file discovery contract](../README.md#workspace-file-discovery).
+
+- `docker_manager._create_container` discovers before Docker create/start; failure reaches the lifecycle initiator.
+- `app.py:upload_file` discovers after atomic file publication; a failed refresh does not undo stored bytes or receipts.
 
 Upload itself stays on HTTP — **MCP has no upload primitive.** Community consensus is out-of-band HTTP alongside the MCP server.
 
