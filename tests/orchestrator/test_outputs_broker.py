@@ -1240,6 +1240,274 @@ def test_precommit_replace_failure_keeps_predecessor_and_cleans_temporary_files(
     assert not list(_index(data).parent.glob("*.tmp"))
 
 
+def _same_inode(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+@pytest.mark.parametrize("operation", ("reconcile", "register"))
+def test_broker_control_creation_syncs_chat_parent_and_index(world, monkeypatch, operation):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    output = _put(data, "a.txt", b"a")
+    chat_info = (data / CHAT).stat()
+    destination = _index(data)
+    control = destination.parent
+    fsync = os.fsync
+    synced = []
+
+    def recording_fsync(fd):
+        info = os.fstat(fd)
+        entry_present = control.is_dir()
+        index_present = destination.exists()
+        fsync(fd)
+        synced.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+                       entry_present, index_present))
+
+    # Admit the real outer transaction before tracing the broker's own boundary.
+    with docker_manager._combined_lock(CHAT):
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "fsync", recording_fsync)
+            if operation == "reconcile":
+                listing = broker.reconcile(CHAT)
+                assert listing["revision"] == 1
+                assert listing["total"] == 1
+                entry = _entry_by_path(listing, "a.txt")
+            else:
+                entry = broker.register_host_write(CHAT, "a.txt")
+
+    assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR, True, False) in synced
+    control_info = control.stat()
+    index_info = destination.stat()
+    assert (index_info.st_dev, index_info.st_ino, stat.S_IFREG, True, False) in synced
+    assert (control_info.st_dev, control_info.st_ino, stat.S_IFDIR, True, True) in synced
+    assert stat.S_IMODE(control_info.st_mode) == 0o700
+    assert entry["path"] == "a.txt"
+    assert entry["size"] == 1
+    assert entry["revision"] == 1
+    assert entry["hash"] == "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+    _assert_uuid(entry["file_id"])
+    persisted = _read_index(data)
+    assert persisted["counter"] == 1
+    assert sorted(persisted["active"]) == ["a.txt"]
+    assert persisted["active"]["a.txt"] == entry
+    assert output.read_bytes() == b"a"
+    assert sorted(path.name for path in control.iterdir()) == ["index.json"]
+
+
+@pytest.mark.parametrize(
+    "prior_index,operation", ((False, "reconcile"), (True, "register")),
+    ids=("new-reconcile", "existing-register"))
+def test_broker_control_parent_sync_failure_preserves_state_and_owned_descriptors(
+        world, monkeypatch, prior_index, operation):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    first = _put(data, "a.txt", b"a")
+    destination = _index(data)
+    control = destination.parent
+    before = None
+    if prior_index:
+        broker.reconcile(CHAT)
+        before = destination.read_bytes()
+    second = _put(data, "b.txt", b"b")
+    chat_info = (data / CHAT).stat()
+    opened = os.open
+    fsync = os.fsync
+    owned = []
+    attempted = []
+    error = OSError(errno.EIO, "broker chat parent durability failure")
+
+    def recording_open(*args, **kwargs):
+        fd = opened(*args, **kwargs)
+        owned.append((fd, os.fstat(fd)))
+        return fd
+
+    def failing_fsync(fd):
+        info = os.fstat(fd)
+        attempted.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+                          control.is_dir()))
+        if _same_inode(info, chat_info):
+            raise error
+        return fsync(fd)
+
+    try:
+        with docker_manager._combined_lock(CHAT):
+            with monkeypatch.context() as patches:
+                patches.setattr(os, "open", recording_open)
+                patches.setattr(os, "fsync", failing_fsync)
+                with pytest.raises(OSError) as failure:
+                    if operation == "reconcile":
+                        broker.reconcile(CHAT)
+                    else:
+                        broker.register_host_write(CHAT, "b.txt")
+                assert failure.value is error
+                assert failure.value.errno == errno.EIO
+                assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR, True) in attempted
+                if prior_index:
+                    assert destination.read_bytes() == before
+                    assert _read_index(data)["counter"] == 1
+                    assert sorted(_read_index(data)["active"]) == ["a.txt"]
+                    assert sorted(path.name for path in control.iterdir()) == ["index.json"]
+                else:
+                    assert not destination.exists()
+                    assert list(control.iterdir()) == []
+                assert first.read_bytes() == b"a"
+                assert second.read_bytes() == b"b"
+                assert stat.S_IMODE(control.stat().st_mode) == 0o700
+                for fd, info in owned:
+                    try:
+                        current = os.fstat(fd)
+                    except OSError as exc:
+                        assert exc.errno == errno.EBADF
+                    else:
+                        assert not _same_inode(current, info), "owned broker descriptor leaked"
+    finally:
+        for fd, info in owned:
+            try:
+                current = os.fstat(fd)
+            except OSError:
+                continue
+            if _same_inode(current, info):
+                os.close(fd)
+
+
+def test_broker_control_retry_requires_parent_sync_after_interrupted_creation(world, monkeypatch):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    output = _put(data, "a.txt", b"a")
+    chat_info = (data / CHAT).stat()
+    destination = _index(data)
+    control = destination.parent
+    fsync = os.fsync
+    synced = []
+    fail_parent = True
+    error = OSError(errno.EIO, "broker chat parent durability failure")
+
+    def controlled_fsync(fd):
+        info = os.fstat(fd)
+        if fail_parent and _same_inode(info, chat_info):
+            raise error
+        fsync(fd)
+        synced.append((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)))
+
+    with docker_manager._combined_lock(CHAT):
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "fsync", controlled_fsync)
+            with pytest.raises(OSError) as first_failure:
+                broker.reconcile(CHAT)
+            assert first_failure.value is error
+            assert not destination.exists()
+            control_info = control.stat()
+            marker = control / "marker"
+            marker.write_bytes(b"surviving interrupted broker creation")
+
+            with pytest.raises(OSError) as next_failure:
+                broker.register_host_write(CHAT, "a.txt")
+            assert next_failure.value is error
+            assert _same_inode(control.stat(), control_info)
+            assert not destination.exists()
+            assert marker.read_bytes() == b"surviving interrupted broker creation"
+            assert sorted(path.name for path in control.iterdir()) == ["marker"]
+
+            fail_parent = False
+            entry = broker.register_host_write(CHAT, "a.txt")
+
+    assert (chat_info.st_dev, chat_info.st_ino, stat.S_IFDIR) in synced
+    assert _same_inode(control.stat(), control_info)
+    assert stat.S_IMODE(control.stat().st_mode) == 0o700
+    assert entry["revision"] == 1
+    assert entry["path"] == "a.txt"
+    assert entry["hash"] == "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+    assert _read_index(data)["counter"] == 1
+    assert _read_index(data)["active"]["a.txt"] == entry
+    assert output.read_bytes() == b"a"
+    assert marker.read_bytes() == b"surviving interrupted broker creation"
+    assert sorted(path.name for path in control.iterdir()) == ["index.json", "marker"]
+
+
+@pytest.mark.parametrize(
+    "prior_index,operation", ((False, "reconcile"), (True, "register")),
+    ids=("new-reconcile", "existing-register"))
+def test_broker_parent_close_failure_preserves_state_and_closes_untransferred_control(
+        world, monkeypatch, prior_index, operation):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    first = _put(data, "a.txt", b"a")
+    destination = _index(data)
+    control = destination.parent
+    before = None
+    if prior_index:
+        broker.reconcile(CHAT)
+        before = destination.read_bytes()
+    second = _put(data, "b.txt", b"b")
+    chat_info = (data / CHAT).stat()
+    opened = os.open
+    closed = os.close
+    owned_control = []
+    parent_close_attempts = []
+    invalid_close_attempts = []
+    error = OSError(errno.EIO, "broker chat parent close failure")
+
+    def recording_open(*args, **kwargs):
+        fd = opened(*args, **kwargs)
+        info = os.fstat(fd)
+        if control.is_dir() and _same_inode(info, control.stat()):
+            owned_control.append((fd, info))
+        return fd
+
+    def close_then_fail_parent(fd):
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            invalid_close_attempts.append(fd)
+            return closed(fd)
+        parent = _same_inode(info, chat_info)
+        if parent:
+            parent_close_attempts.append((info.st_dev, info.st_ino))
+        closed(fd)
+        if parent:
+            raise error
+
+    with docker_manager._combined_lock(CHAT):
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "open", recording_open)
+            patches.setattr(os, "close", close_then_fail_parent)
+            try:
+                with pytest.raises(OSError) as failure:
+                    if operation == "reconcile":
+                        broker.reconcile(CHAT)
+                    else:
+                        broker.register_host_write(CHAT, "b.txt")
+                assert failure.value is error
+                assert failure.value.errno == errno.EIO
+                assert parent_close_attempts == [(chat_info.st_dev, chat_info.st_ino)]
+                assert invalid_close_attempts == []
+                if prior_index:
+                    assert destination.read_bytes() == before
+                    assert _read_index(data)["counter"] == 1
+                    assert sorted(_read_index(data)["active"]) == ["a.txt"]
+                    assert sorted(path.name for path in control.iterdir()) == ["index.json"]
+                else:
+                    assert not destination.exists()
+                    assert list(control.iterdir()) == []
+                assert first.read_bytes() == b"a"
+                assert second.read_bytes() == b"b"
+                for fd, info in owned_control:
+                    try:
+                        current = os.fstat(fd)
+                    except OSError as exc:
+                        assert exc.errno == errno.EBADF
+                    else:
+                        assert not _same_inode(current, info), "untransferred control descriptor leaked"
+            finally:
+                for fd, info in owned_control:
+                    try:
+                        current = os.fstat(fd)
+                    except OSError:
+                        continue
+                    if _same_inode(current, info):
+                        closed(fd)
+
+
 def test_postcommit_durability_failure_reports_complete_successor(world, monkeypatch):
     broker_module, _docker_manager, data = world
     broker = broker_module.OutputsBroker()
@@ -1248,9 +1516,10 @@ def test_postcommit_durability_failure_reports_complete_successor(world, monkeyp
     before = _index(data).read_bytes()
     _put(data, "b.txt", b"b")
     original_fsync = broker_module.os.fsync
+    control_info = _index(data).parent.stat()
 
     def fail_directory_sync(fd):
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
+        if _same_inode(os.fstat(fd), control_info):
             raise OSError("controlled directory fsync failure")
         return original_fsync(fd)
 
@@ -2195,9 +2464,10 @@ def test_register_postcommit_durability_failure_is_not_rollback(world, monkeypat
     before = _index(data).read_bytes()
     _put(data, "b.docx", b"b")
     original_fsync = broker_module.os.fsync
+    control_info = _index(data).parent.stat()
 
     def fail_directory_sync(fd):
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
+        if _same_inode(os.fstat(fd), control_info):
             raise OSError("controlled directory fsync failure")
         return original_fsync(fd)
 

@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Durable chat and control directory entries.** Outer create-capable chat locks
+  synchronize the configured data-root directory before admission. Broker and upload
+  receipt preparation, including direct receipt writes, synchronize the chat
+  parent before success, including existing entries. Parent-sync errors prevent
+  successful acknowledgement; state-file and containing-directory syncs remain.
+
 - **Shared descriptor acquisition.** Upload/MCP readers and the outputs broker use
   one no-follow open/type-check implementation. Caller-specific HTTP, unstable-read
   and scan-resource errors, descriptor cleanup and publication behavior are unchanged.

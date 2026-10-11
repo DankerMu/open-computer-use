@@ -254,6 +254,7 @@ def open_control_directory(chat_fd: int) -> int:
     try:
         if created:
             os.fchmod(control_fd, _CONTROL_DIR_MODE)
+        os.fsync(chat_fd)
         return control_fd
     except BaseException:
         close_fd(control_fd)
@@ -544,17 +545,38 @@ def _lstat_or_none(path: Path) -> os.stat_result | None:
 
 
 def _require_control_directory(control: Path, *, create: bool) -> os.stat_result | None:
+    if create:
+        try:
+            parent_fd = os.open(control.parent, descriptor_io.DIRECTORY_FLAGS)
+        except OSError as exc:
+            if is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
+                raise CorruptReceiptsError("import receipts are corrupt") from exc
+            raise
+        try:
+            try:
+                os.mkdir(control.name, _CONTROL_DIR_MODE, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            try:
+                control_fd = os.open(
+                    control.name, descriptor_io.DIRECTORY_FLAGS, dir_fd=parent_fd)
+            except OSError as exc:
+                if is_nofollow_error(exc) or is_missing(exc):
+                    raise CorruptReceiptsError("import receipts are corrupt") from exc
+                raise
+            try:
+                info = os.fstat(control_fd)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise CorruptReceiptsError("import receipts are corrupt")
+                os.fsync(parent_fd)
+                return info
+            finally:
+                os.close(control_fd)
+        finally:
+            os.close(parent_fd)
     info = _lstat_or_none(control)
     if info is None:
-        if not create:
-            return None
-        try:
-            os.mkdir(control, 0o700)
-        except FileExistsError:
-            pass
-        info = _lstat_or_none(control)
-        if info is None:
-            raise CorruptReceiptsError("import receipts are corrupt")
+        return None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise CorruptReceiptsError("import receipts are corrupt")
     return info

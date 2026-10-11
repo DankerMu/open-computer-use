@@ -224,6 +224,16 @@ Standalone/embedded preview dashboards show a separate stored-file warning, and
 all five Open WebUI tools include it in their returned text. Neither consumer
 retries file publication for a discovery failure.
 
+Outer create-capable chat-lock acquisition synchronizes the configured data-root
+directory before admitting the protected operation. Broker-index and upload-receipt
+preparation, including direct receipt writes, synchronize the chat parent naming
+`.ocu` before acknowledging persisted state, alongside state-file and `.ocu`
+synchronization. These create-capable paths also synchronize existing entries:
+existence alone does not prove an interrupted creator completed synchronization.
+Parent-sync failures propagate without successful acknowledgement and preserve
+prior committed receipts and indexes. These requirements do not certify host
+power-loss recovery or any LAN deployment.
+
 Initial discovery runs after files-root preparation and before Docker create or
 start, including create-conflict adoption. Failure reaches the initiator as
 `launch_failed` HTTP 503 with a safe discovery reason. A later Docker failure
