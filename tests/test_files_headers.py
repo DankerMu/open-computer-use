@@ -68,6 +68,9 @@ def client(app_module, output_dir, monkeypatch):
     import docker_manager
 
     monkeypatch.setattr(docker_manager, "BASE_DATA_DIR", output_dir.parents[1])
+    import uploads
+
+    monkeypatch.setattr(uploads, "BASE_DATA_DIR", output_dir.parents[1])
     with TestClient(app_module.app) as http:
         yield http
 
@@ -338,6 +341,140 @@ def test_archive_omits_hidden_paths_without_removing_them(client, output_dir, vi
             assert response.json() == {"detail": "No files found in outputs directory"}
     hidden[".upload-active"] = b"in-progress staging"
     assert {name: (output_dir / name).read_bytes() for name in hidden} == hidden
+
+
+def _assert_confined_archive(response, expected, canaries, optional=()):
+    if response.status_code != 200:
+        assert 400 <= response.status_code < 500
+        return
+
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["content-disposition"] == f"attachment; filename=chat-{CHAT}-outputs.zip"
+    assert response.headers.get_list("cache-control") == []
+    _assert_headers_absent(response)
+    with zipfile.ZipFile(BytesIO(response.content)) as archive:
+        members = [(entry.filename, archive.read(entry)) for entry in archive.infolist()]
+    for name, contents in members:
+        for canary in canaries:
+            assert canary not in contents, f"Archive member {name!r} disclosed a canary"
+        assert name in expected, f"Unexpected archive member {name!r}"
+        assert contents == expected[name]
+    names = [name for name, _ in members]
+    assert len(names) == len(set(names))
+    assert set(expected) - set(optional) <= set(names)
+
+
+@pytest.mark.parametrize(
+    "link_kind", ("external-canary", "sibling-canary", "internal-leaflink", "directorylink")
+)
+def test_archive_does_not_follow_workspace_links(client, output_dir, tmp_path, link_kind):
+    expected = {"nested/ordinary.txt": b"exact ordinary archived bytes"}
+    ordinary = output_dir / "nested" / "ordinary.txt"
+    ordinary.parent.mkdir()
+    ordinary.write_bytes(expected["nested/ordinary.txt"])
+    canary = b"benign archive link target canary"
+
+    if link_kind == "internal-leaflink":
+        target = output_dir / "internal.txt"
+        expected["internal.txt"] = b"ordinary internal target bytes"
+        target.write_bytes(expected["internal.txt"])
+    elif link_kind == "sibling-canary":
+        target = tmp_path / "sibling-chat" / "outputs" / "canary.txt"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(canary)
+    else:
+        target = tmp_path / "outside-outputs" / "canary.txt"
+        target.parent.mkdir()
+        target.write_bytes(canary)
+
+    if link_kind == "directorylink":
+        (output_dir / "linked-directory").symlink_to(target.parent, target_is_directory=True)
+    else:
+        (output_dir / "linked.txt").symlink_to(target)
+
+    response = client.get(_file_url("archive"), headers=_auth_headers())
+
+    _assert_confined_archive(response, expected, (canary,))
+
+
+@pytest.mark.parametrize("aliased_root", ("chat-root", "output-root"))
+def test_archive_does_not_follow_preexisting_sibling_root_alias(
+    client, output_dir, tmp_path, aliased_root
+):
+    expected = {"nested/ordinary.txt": b"exact ordinary archived bytes"}
+    canary = b"benign sibling root alias canary"
+    ordinary = output_dir / "nested" / "ordinary.txt"
+    ordinary.parent.mkdir()
+    ordinary.write_bytes(expected["nested/ordinary.txt"])
+    sibling_chat = tmp_path / "sibling-chat"
+    sibling_outputs = sibling_chat / "outputs"
+    (sibling_outputs / "nested").mkdir(parents=True)
+    (sibling_outputs / "nested" / "ordinary.txt").write_bytes(expected["nested/ordinary.txt"])
+    (sibling_outputs / "canary.txt").write_bytes(canary)
+
+    if aliased_root == "chat-root":
+        output_dir.parent.rename(tmp_path / "parked-chat")
+        output_dir.parent.symlink_to(sibling_chat, target_is_directory=True)
+    else:
+        output_dir.rename(output_dir.parent / "parked-outputs")
+        output_dir.symlink_to(sibling_outputs, target_is_directory=True)
+
+    response = client.get(_file_url("archive"), headers=_auth_headers())
+
+    _assert_confined_archive(response, expected, (canary,))
+
+
+@pytest.mark.parametrize("replaced_path", ("leaf", "ancestor", "chat-root", "output-root"))
+def test_archive_does_not_read_symlink_replacement_after_selection(
+    client, output_dir, tmp_path, monkeypatch, replaced_path
+):
+    expected = {
+        "ordinary.txt": b"exact ordinary archived bytes",
+        "nested/victim.txt": b"original selected regular file bytes",
+    }
+    for name, contents in expected.items():
+        path = output_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    canary = b"benign selection to open replacement canary"
+    replacement_chat = tmp_path / "replacement-chat"
+    replacement_outputs = replacement_chat / "outputs"
+    for name in expected:
+        path = replacement_outputs / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(canary)
+
+    if replaced_path == "leaf":
+        selected = output_dir / "nested" / "victim.txt"
+        replacement = replacement_outputs / "nested" / "victim.txt"
+    elif replaced_path == "ancestor":
+        selected = output_dir / "nested"
+        replacement = replacement_outputs / "nested"
+    elif replaced_path == "chat-root":
+        selected = output_dir.parent
+        replacement = replacement_chat
+    else:
+        selected = output_dir
+        replacement = replacement_outputs
+
+    original_rglob = Path.rglob
+    enumeration_root = output_dir.resolve()
+    swaps = []
+
+    def rglob_then_swap(path, pattern, *args, **kwargs):
+        yield from original_rglob(path, pattern, *args, **kwargs)
+        if path in (output_dir, enumeration_root) and pattern == "*" and not swaps:
+            selected.rename(tmp_path / "parked-selected")
+            selected.symlink_to(replacement, target_is_directory=replaced_path != "leaf")
+            swaps.append(selected)
+
+    # Exhausting the genuine iterator selects baseline candidates before the swap.
+    monkeypatch.setattr(Path, "rglob", rglob_then_swap)
+    response = client.get(_file_url("archive"), headers=_auth_headers())
+
+    assert swaps == [selected], "Selection/open filesystem swap did not fire exactly once"
+    assert selected.is_symlink()
+    _assert_confined_archive(response, expected, (canary,), optional=("nested/victim.txt",))
 
 
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))

@@ -75,6 +75,7 @@ from uploads import (
     import_receipt,
     open_control_directory,
     open_directory_path,
+    read_chat_upload,
     read_import_receipts,
     stage_upload_bytes,
     unlink_relative,
@@ -745,7 +746,7 @@ async def download_archive(chat_id: str):
         StreamingResponse with zip archive
 
     Raises:
-        404: Directory not found or empty
+        404: Directory or selected file not found, or directory empty
     """
     chat_id = sanitize_chat_id(chat_id)
     # Construct outputs directory path
@@ -781,9 +782,13 @@ async def download_archive(chat_id: str):
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for file_path in files:
-            # Add file to zip with relative path
-            arcname = file_path.relative_to(outputs_dir)
-            zip_file.write(file_path, arcname=str(arcname))
+            arcname = str(file_path.relative_to(outputs_dir))
+            # Read verified descriptors, never reopen the selected workspace path.
+            try:
+                contents, _ = read_chat_upload(chat_id, arcname)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=f"File not found: {arcname}") from exc
+            zip_file.writestr(arcname, contents)
 
     # Seek to beginning of buffer
     zip_buffer.seek(0)

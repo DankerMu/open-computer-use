@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Confined output archives.** ZIP payloads use the workspace no-follow reader,
+  preventing symlink targets outside the requested chat from being downloaded.
+  Symlink candidates, including in-tree aliases, fail closed; ordinary relative
+  names and bytes remain intact. ZIP entries do not preserve filesystem timestamps
+  or permission attributes.
+
 - **Security app fixture isolation.** Output security tests share the canonical
   app/Office module and data-root lifetime, closing the client before restoring
   prior modules and environment. Endpoint and security assertions are unchanged.
