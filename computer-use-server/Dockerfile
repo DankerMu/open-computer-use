@@ -19,6 +19,7 @@ COPY ./file_response.py .
 COPY ./mcp_tools.py .
 COPY ./mcp_resources.py .
 COPY ./uploads.py .
+COPY ./descriptor_io.py .
 COPY ./system_prompt.py .
 COPY ./skill_manager.py .
 COPY ./docker_manager.py .

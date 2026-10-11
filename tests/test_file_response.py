@@ -37,6 +37,7 @@ def workspace(monkeypatch, tmp_path):
         if name in {
             "app", "auth_guard", "mcp_tools", "docker_manager", "outputs_broker",
             "context_vars", "security", "system_prompt", "skill_manager", "file_response",
+            "descriptor_io",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)
     import app

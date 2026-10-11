@@ -21,7 +21,7 @@ from pydantic import AnyUrl
 
 SERVER = Path(__file__).resolve().parents[2] / "computer-use-server"
 MODULES = {
-    "uploads", "mcp_resources", "mcp_tools", "docker_manager", "security",
+    "uploads", "descriptor_io", "mcp_resources", "mcp_tools", "docker_manager", "security",
     "context_vars", "system_prompt", "skill_manager", "cli_runtime", "outputs_broker",
 }
 
@@ -223,7 +223,7 @@ def test_directory_and_descriptor_exact_limits_unwind_owned_fds(
     for path in paths:
         (root / path).mkdir(parents=True)
     directories = 1 + sum(1 for path in root.rglob("*") if path.is_dir())
-    root_fd = os.open(root, w.uploads._DIRECTORY_FLAGS)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     before_fds = fd_inventory()
     try:
         with monkeypatch.context() as patches:
@@ -618,7 +618,7 @@ def test_child_iterator_failure_releases_duplicate_and_frontier_not_borrowed_roo
     root = put(w, "bounded", "keep.txt").parent
     for name in ("a", "b", "c"):
         (root / name).mkdir()
-    root_fd = os.open(root, w.uploads._DIRECTORY_FLAGS)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     inventory = fd_inventory()
     original = os.scandir
     duplicates = []
@@ -723,7 +723,7 @@ def sampled_scandir(*args, **kwargs):
     iterator = scandir(*args, **kwargs)
     sample()
     return iterator
-borrowed = opened(root, uploads._DIRECTORY_FLAGS)
+borrowed = opened(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 before_fds = inventory()
 os.open, os.scandir = sampled_open, sampled_scandir
 reason = None

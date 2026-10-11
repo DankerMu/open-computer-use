@@ -3,6 +3,10 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Shared descriptor acquisition.** Upload/MCP readers and the outputs broker use
+  one no-follow open/type-check implementation. Caller-specific HTTP, unstable-read
+  and scan-resource errors, descriptor cleanup and publication behavior are unchanged.
+
 - **Pinned file downloads.** Inline and forced-download responses stream bounded
   chunks from one verified workspace descriptor; size and validators describe that
   same opened file. Path replacement cannot redirect the response. Disconnect,

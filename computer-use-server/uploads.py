@@ -27,6 +27,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
+import descriptor_io
+from descriptor_io import CLOSE_ON_EXEC, NO_FOLLOW, is_missing, is_nofollow_error
 from security import sanitize_chat_id
 
 
@@ -34,14 +36,8 @@ from security import sanitize_chat_id
 BASE_DATA_DIR = Path(os.getenv("BASE_DATA_DIR", "/data"))
 
 
-_NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
-_CLOSE_ON_EXEC = getattr(os, "O_CLOEXEC", 0)
-_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
-_DIRECTORY_FLAGS = os.O_RDONLY | _DIRECTORY | _NO_FOLLOW | _CLOSE_ON_EXEC
-_FILE_FLAGS = os.O_RDONLY | _NO_FOLLOW | _NONBLOCK | _CLOSE_ON_EXEC
 _STAGING_FLAGS = (
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NO_FOLLOW | _CLOSE_ON_EXEC
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | NO_FOLLOW | CLOSE_ON_EXEC
 )
 _WORKSPACE_DIR_MODE = 0o777
 _CONTROL_DIR_MODE = 0o700
@@ -71,14 +67,6 @@ def _discovery_io_error(error: OSError) -> DiscoveryError:
     return DiscoveryError(reason)
 
 
-def _is_nofollow_error(error: OSError) -> bool:
-    return error.errno in (errno.ELOOP, errno.EMLINK)
-
-
-def _is_missing(error: OSError) -> bool:
-    return error.errno in (errno.ENOENT, errno.ENOTDIR)
-
-
 def _deny_traversal(error: OSError | None = None) -> HTTPException:
     exception = HTTPException(status_code=403, detail=_TRAVERSAL_DENIED)
     if error is not None:
@@ -97,35 +85,34 @@ def close_fd(fd: int | None) -> None:
 
 def open_directory_path(path: Path) -> int:
     try:
-        directory_fd = os.open(path, _DIRECTORY_FLAGS)
-    except OSError as exc:
-        if _is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
-            raise _deny_traversal(exc)
-        raise
-    try:
-        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
-            raise _deny_traversal()
-        return directory_fd
-    except BaseException:
-        close_fd(directory_fd)
-        raise
+        return descriptor_io.open_directory(path, ignore_close_errors=True)
+    except descriptor_io.DescriptorOpenError as failure:
+        error = failure.error
+    except descriptor_io.DescriptorTypeError:
+        error = None
+    # Translate outside the neutral exception handler to retain caller chains.
+    if error is None:
+        raise _deny_traversal()
+    if is_nofollow_error(error) or error.errno == errno.ENOTDIR:
+        raise _deny_traversal(error)
+    raise error
 
 
 
 def _open_child_directory(parent_fd: int, name: str) -> int:
     try:
-        child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
-    except OSError as exc:
-        if _is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
-            raise _deny_traversal(exc)
-        raise
-    try:
-        if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
-            raise _deny_traversal()
-        return child_fd
-    except BaseException:
-        close_fd(child_fd)
-        raise
+        return descriptor_io.open_directory(
+            name, dir_fd=parent_fd, ignore_close_errors=True,
+        )
+    except descriptor_io.DescriptorOpenError as failure:
+        error = failure.error
+    except descriptor_io.DescriptorTypeError:
+        error = None
+    if error is None:
+        raise _deny_traversal()
+    if is_nofollow_error(error) or error.errno == errno.ENOTDIR:
+        raise _deny_traversal(error)
+    raise error
 
 
 def _lexical_parts(relative: Path) -> tuple[str, ...]:
@@ -159,7 +146,7 @@ def ensure_workspace_directories(root_fd: int, parts: tuple[str, ...]) -> int:
             except FileExistsError:
                 pass
             except OSError as exc:
-                if _is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
+                if is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
                     raise _deny_traversal(exc)
                 raise
             next_fd = _open_child_directory(current_fd, part)
@@ -242,7 +229,7 @@ def claim_file_no_replace(
             candidate = format_collision_name(requested.name, number, dst_dir_fd=dst_dir_fd)
             number += 1
         except OSError as exc:
-            if _is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
+            if is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
                 raise _deny_traversal(exc)
             raise
 
@@ -260,7 +247,7 @@ def open_control_directory(chat_fd: int) -> int:
     except FileExistsError:
         pass
     except OSError as exc:
-        if _is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
+        if is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
             raise _deny_traversal(exc)
         raise
     control_fd = _open_child_directory(chat_fd, ".ocu")
@@ -287,7 +274,7 @@ def stage_upload_bytes(control_fd: int, content: bytes) -> tuple[int, str]:
             staging_name, _STAGING_FLAGS, 0o600, dir_fd=control_fd,
         )
     except OSError as exc:
-        if _is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
+        if is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
             raise _deny_traversal(exc)
         raise
     try:
@@ -337,27 +324,29 @@ def _open_outputs_root(chat_id: str) -> int | None:
         return None
     chat_fd = None
     try:
-        chat_fd = os.open(chat_dir, _DIRECTORY_FLAGS)
-        if not stat.S_ISDIR(os.fstat(chat_fd).st_mode):
-            return None
         try:
-            outputs_fd = os.open("outputs", _DIRECTORY_FLAGS, dir_fd=chat_fd)
-        except FileNotFoundError:
+            chat_fd = descriptor_io.open_directory(chat_dir, ignore_close_errors=True)
+        except descriptor_io.DescriptorOpenError as failure:
+            error = failure.error
+        except descriptor_io.DescriptorTypeError:
             return None
-        except OSError as exc:
-            if _is_nofollow_error(exc) or _is_missing(exc):
-                return None
-            raise
+        else:
+            error = None
+        if error is not None:
+            raise error
         try:
-            if not stat.S_ISDIR(os.fstat(outputs_fd).st_mode):
-                close_fd(outputs_fd)
-                return None
-            return outputs_fd
-        except BaseException:
-            close_fd(outputs_fd)
-            raise
+            return descriptor_io.open_directory(
+                "outputs", dir_fd=chat_fd, ignore_close_errors=True,
+            )
+        except descriptor_io.DescriptorOpenError as failure:
+            error = failure.error
+        except descriptor_io.DescriptorTypeError:
+            return None
+        if isinstance(error, FileNotFoundError):
+            return None
+        raise error
     except OSError as exc:
-        if _is_nofollow_error(exc) or _is_missing(exc):
+        if is_nofollow_error(exc) or is_missing(exc):
             return None
         raise
     finally:
@@ -472,23 +461,22 @@ def _open_regular_relative(root_fd: int, parts: tuple[str, ...]) -> int:
             close_fd(parent_fd)
             parent_fd = next_fd
         try:
-            file_fd = os.open(parts[-1], _FILE_FLAGS, dir_fd=parent_fd)
-        except OSError as exc:
-            if _is_nofollow_error(exc) or exc.errno == errno.ENOTDIR:
-                raise _deny_traversal(exc)
-            if exc.errno in (errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK):
-                raise _deny_traversal(exc)
-            if _is_missing(exc):
-                raise FileNotFoundError("No such upload") from exc
-            raise
-        try:
-            opened = os.fstat(file_fd)
-            if not stat.S_ISREG(opened.st_mode):
-                raise _deny_traversal()
-            return file_fd
-        except BaseException:
-            close_fd(file_fd)
-            raise
+            return descriptor_io.open_regular(
+                parts[-1], dir_fd=parent_fd, ignore_close_errors=True,
+            )
+        except descriptor_io.DescriptorOpenError as failure:
+            error = failure.error
+        except descriptor_io.DescriptorTypeError:
+            error = None
+        if error is None:
+            raise _deny_traversal()
+        if is_nofollow_error(error) or error.errno == errno.ENOTDIR:
+            raise _deny_traversal(error)
+        if error.errno in (errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK):
+            raise _deny_traversal(error)
+        if is_missing(error):
+            raise FileNotFoundError("No such upload") from error
+        raise error
     finally:
         close_fd(parent_fd)
 

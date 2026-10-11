@@ -22,7 +22,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import descriptor_io
 import docker_manager
+from descriptor_io import CLOSE_ON_EXEC, NO_FOLLOW, is_missing, is_nofollow_error
 
 SCHEMA_VERSION = 1
 DEFAULT_PAGE_LIMIT = 100
@@ -35,13 +37,7 @@ MAX_SCAN_DIRECTORIES = 10_000
 MAX_SCAN_DIRECTORY_FDS = 256
 HASH_CHUNK_SIZE = 1024 * 1024
 
-_NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
-_CLOSE_ON_EXEC = getattr(os, "O_CLOEXEC", 0)
-_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
-_DIRECTORY_FLAGS = os.O_RDONLY | _DIRECTORY | _NO_FOLLOW | _CLOSE_ON_EXEC
-_FILE_FLAGS = os.O_RDONLY | _NO_FOLLOW | _NONBLOCK | _CLOSE_ON_EXEC
-_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NO_FOLLOW | _CLOSE_ON_EXEC
+_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | NO_FOLLOW | CLOSE_ON_EXEC
 _CURSOR = re.compile(r"(0|[1-9][0-9]*):(0|[1-9][0-9]*)\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -120,7 +116,7 @@ class OutputsBroker:
         self.max_scan_entries = self._positive("max_scan_entries", max_scan_entries, MAX_SCAN_ENTRIES)
         self.max_scan_directories = self._positive("max_scan_directories", max_scan_directories, MAX_SCAN_DIRECTORIES)
         self.max_scan_directory_fds = self._positive("max_scan_directory_fds", max_scan_directory_fds, MAX_SCAN_DIRECTORY_FDS)
-        if not _NO_FOLLOW or not _DIRECTORY or not _NONBLOCK:
+        if not descriptor_io.NO_FOLLOW or not descriptor_io.DIRECTORY or not descriptor_io.NONBLOCK:
             raise RuntimeError("outputs broker requires O_NOFOLLOW, O_DIRECTORY and O_NONBLOCK support")
 
     @staticmethod
@@ -241,14 +237,6 @@ class OutputsBroker:
             file_stat.st_ctime_ns,
         )
 
-    @staticmethod
-    def _is_missing(error: OSError) -> bool:
-        return error.errno in (errno.ENOENT, errno.ENOTDIR)
-
-    @staticmethod
-    def _is_nofollow_error(error: OSError) -> bool:
-        return error.errno in (errno.ELOOP, errno.EMLINK)
-
     def _chat_root(self, chat: str) -> Path:
         return Path(docker_manager.BASE_DATA_DIR) / chat
 
@@ -282,9 +270,9 @@ class OutputsBroker:
         if not stat.S_ISDIR(control_stat.st_mode):
             raise UnsafePathError(f"broker control path is not a directory: {control}")
         try:
-            return os.open(control, _DIRECTORY_FLAGS)
+            return os.open(control, descriptor_io.DIRECTORY_FLAGS)
         except OSError as exc:
-            if self._is_nofollow_error(exc):
+            if is_nofollow_error(exc):
                 raise UnsafePathError(f"broker control directory became a symlink: {control}") from exc
             raise UnstableReadError(f"cannot safely open broker control directory: {control}") from exc
 
@@ -306,9 +294,9 @@ class OutputsBroker:
             try:
                 index_fd = self._open_regular("index.json", dir_fd=control_fd, label="broker index")
             except OSError as exc:
-                if self._is_nofollow_error(exc):
+                if is_nofollow_error(exc):
                     raise UnsafePathError("broker index became a symlink") from exc
-                if self._is_missing(exc):
+                if is_missing(exc):
                     raise UnstableReadError("broker index disappeared while opening") from exc
                 raise UnstableReadError("cannot safely open broker index") from exc
             try:
@@ -470,39 +458,37 @@ class OutputsBroker:
 
     def _open_directory_path(self, path: Path, label: str, *, scan: bool = False) -> int:
         try:
-            directory_fd = os.open(path, _DIRECTORY_FLAGS)
-        except OSError as exc:
-            if scan and exc.errno in (errno.EMFILE, errno.ENFILE):
-                raise LimitExceededError("scan directory descriptor resources exhausted while opening root") from exc
-            if self._is_nofollow_error(exc):
-                raise UnsafePathError(f"{label} is a symlink: {path}") from exc
-            if self._is_missing(exc):
-                raise UnstableReadError(f"{label} disappeared while opening: {path}") from exc
-            raise UnstableReadError(f"cannot safely open {label}: {path}") from exc
-        try:
-            if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
-                raise UnsafePathError(f"{label} is not a directory: {path}")
-            return directory_fd
-        except BaseException:
-            os.close(directory_fd)
-            raise
+            return descriptor_io.open_directory(path)
+        except descriptor_io.DescriptorOpenError as failure:
+            error = failure.error
+        except descriptor_io.DescriptorTypeError as failure:
+            type_failure = failure
+            error = None
+        if error is None:
+            type_failure.raise_as(UnsafePathError(f"{label} is not a directory: {path}"))
+        if scan and error.errno in (errno.EMFILE, errno.ENFILE):
+            raise LimitExceededError("scan directory descriptor resources exhausted while opening root") from error
+        if is_nofollow_error(error):
+            raise UnsafePathError(f"{label} is a symlink: {path}") from error
+        if is_missing(error):
+            raise UnstableReadError(f"{label} disappeared while opening: {path}") from error
+        raise UnstableReadError(f"cannot safely open {label}: {path}") from error
 
     def _open_child_directory(self, parent_fd: int, name: str, *, scan: bool = False) -> int:
         try:
-            child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
-        except OSError as exc:
-            if scan and exc.errno in (errno.EMFILE, errno.ENFILE):
-                raise LimitExceededError("scan directory descriptor resources exhausted while opening child") from exc
-            if self._is_nofollow_error(exc) or self._is_missing(exc):
-                raise UnstableReadError(f"output directory changed while traversing: {name}") from exc
-            raise UnstableReadError(f"cannot safely traverse output directory: {name}") from exc
-        try:
-            if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
-                raise UnstableReadError(f"output directory changed while traversing: {name}")
-            return child_fd
-        except BaseException:
-            os.close(child_fd)
-            raise
+            return descriptor_io.open_directory(name, dir_fd=parent_fd)
+        except descriptor_io.DescriptorOpenError as failure:
+            error = failure.error
+        except descriptor_io.DescriptorTypeError as failure:
+            type_failure = failure
+            error = None
+        if error is None:
+            type_failure.raise_as(UnstableReadError(f"output directory changed while traversing: {name}"))
+        if scan and error.errno in (errno.EMFILE, errno.ENFILE):
+            raise LimitExceededError("scan directory descriptor resources exhausted while opening child") from error
+        if is_nofollow_error(error) or is_missing(error):
+            raise UnstableReadError(f"output directory changed while traversing: {name}") from error
+        raise UnstableReadError(f"cannot safely traverse output directory: {name}") from error
 
     def _scan_tree(self, root_fd: int, observations: dict[str, _Observation]) -> None:
         stack: list[tuple[int, tuple[str, ...], bool]] = [(root_fd, (), False)]
@@ -531,7 +517,7 @@ class OutputsBroker:
                             try:
                                 item_stat = entry.stat(follow_symlinks=False)
                             except OSError as exc:
-                                if self._is_missing(exc):
+                                if is_missing(exc):
                                     raise UnstableReadError(f"output disappeared while enumerating: {relative_path}") from exc
                                 raise UnstableReadError(f"cannot inspect output entry: {relative_path}") from exc
                             mode = item_stat.st_mode
@@ -606,9 +592,9 @@ class OutputsBroker:
             except FileNotFoundError as exc:
                 raise UnstableReadError(f"output is missing: {relative_path}") from exc
             except OSError as exc:
-                if self._is_nofollow_error(exc):
+                if is_nofollow_error(exc):
                     raise UnsafePathError(f"output path is a symlink: {relative_path}") from exc
-                if self._is_missing(exc):
+                if is_missing(exc):
                     raise UnstableReadError(f"output is missing: {relative_path}") from exc
                 raise UnstableReadError(f"cannot inspect output: {relative_path}") from exc
             if stat.S_ISLNK(item_stat.st_mode):
@@ -643,7 +629,7 @@ class OutputsBroker:
             try:
                 file_fd = self._open_regular(components[-1], dir_fd=parent_fd, label=observation.path)
             except OSError as exc:
-                if self._is_nofollow_error(exc) or self._is_missing(exc) or exc.errno in (errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK):
+                if is_nofollow_error(exc) or is_missing(exc) or exc.errno in (errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK):
                     raise UnstableReadError(f"output changed before safe read: {observation.path}") from exc
                 raise UnstableReadError(f"cannot safely open output: {observation.path}") from exc
             try:
@@ -900,16 +886,14 @@ class OutputsBroker:
 
     def _open_regular(self, name: str, *, dir_fd: int, label: str) -> int:
         try:
-            file_fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
-        except OSError as exc:
-            if exc.errno in (errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK):
-                raise UnstableReadError(f"{label} is not a stable regular file") from exc
-            raise
-        try:
-            opened = os.fstat(file_fd)
-            if not stat.S_ISREG(opened.st_mode):
-                raise UnstableReadError(f"{label} is not a stable regular file")
-            return file_fd
-        except BaseException:
-            os.close(file_fd)
-            raise
+            return descriptor_io.open_regular(name, dir_fd=dir_fd)
+        except descriptor_io.DescriptorOpenError as failure:
+            error = failure.error
+        except descriptor_io.DescriptorTypeError as failure:
+            type_failure = failure
+            error = None
+        if error is None:
+            type_failure.raise_as(UnstableReadError(f"{label} is not a stable regular file"))
+        if error.errno in (errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK):
+            raise UnstableReadError(f"{label} is not a stable regular file") from error
+        raise error
