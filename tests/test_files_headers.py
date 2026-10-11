@@ -47,6 +47,7 @@ def app_module(monkeypatch):
             "system_prompt",
             "skill_manager",
             "file_response",
+            "descriptor_io",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)
 

@@ -653,7 +653,7 @@ def test_scan_descriptor_budget_allows_exact_shape_and_releases_owned_fds(
             acquired.append(fd)
         return fd
 
-    root_fd = original_open(output_root, broker_module._DIRECTORY_FLAGS)
+    root_fd = original_open(output_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         with monkeypatch.context() as patches:
             patches.setattr(broker_module.os, "open", track_open)
@@ -675,6 +675,81 @@ def test_scan_descriptor_budget_allows_exact_shape_and_releases_owned_fds(
             assert failure.value.errno == errno.EBADF
     finally:
         os.close(root_fd)
+
+
+@pytest.mark.parametrize("boundary", ["root", "child", "regular"])
+def test_type_rejection_with_cleanup_failure_preserves_caller_context_and_ownership(
+    world, monkeypatch, boundary
+):
+    broker_module, _docker_manager, data = world
+    root = _outputs(data)
+    root.mkdir(parents=True)
+    (root / "child").mkdir()
+    (root / "leaf").write_bytes(b"benign")
+    original_open, original_fstat, original_close = os.open, os.fstat, os.close
+    borrowed = original_open(root, os.O_RDONLY | os.O_DIRECTORY)
+    borrowed_identity = original_fstat(borrowed)
+    acquired, closed = [], []
+    close_error = OSError(errno.EIO, "controlled close failure")
+    broker = broker_module.OutputsBroker()
+    if boundary == "root":
+        operation = lambda: broker._open_directory_path(root / "child", "root")
+        context_class = broker_module.UnsafePathError
+        context_message = f"root is not a directory: {root / 'child'}"
+    elif boundary == "child":
+        operation = lambda: broker._open_child_directory(borrowed, "child")
+        context_class = broker_module.UnstableReadError
+        context_message = "output directory changed while traversing: child"
+    else:
+        operation = lambda: broker._open_regular("leaf", dir_fd=borrowed, label="leaf")
+        context_class = broker_module.UnstableReadError
+        context_message = "leaf is not a stable regular file"
+
+    def track_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        acquired.append(fd)
+        return fd
+
+    def wrong_type(fd):
+        actual = list(original_fstat(fd))
+        actual[0] = stat.S_IFDIR if boundary == "regular" else stat.S_IFREG
+        return os.stat_result(actual)
+
+    def close_then_fail(fd):
+        original_close(fd)
+        closed.append(fd)
+        raise close_error
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "open", track_open)
+            patches.setattr(os, "fstat", wrong_type)
+            patches.setattr(os, "close", close_then_fail)
+            with pytest.raises(OSError) as failure:
+                operation()
+        assert failure.value is close_error
+        assert failure.value.errno == errno.EIO
+        assert failure.value.__cause__ is None
+        assert not failure.value.__suppress_context__
+        context = failure.value.__context__
+        assert type(context) is context_class
+        assert str(context) == context_message
+        assert context.__cause__ is None
+        assert context.__context__ is None
+        assert len(acquired) == 1
+        assert closed == acquired
+        assert borrowed not in closed
+        with pytest.raises(OSError) as released:
+            original_fstat(acquired[0])
+        assert released.value.errno == errno.EBADF
+        same = original_fstat(borrowed)
+        assert (same.st_dev, same.st_ino) == (
+            borrowed_identity.st_dev, borrowed_identity.st_ino
+        )
+        recovered = operation()
+        original_close(recovered)
+    finally:
+        original_close(borrowed)
 
 
 def test_scan_descriptor_budget_checks_iterator_duplicate_before_acquisition(world, monkeypatch):
@@ -719,7 +794,7 @@ def test_scan_descriptor_budget_refuses_frontier_acquisition_before_open(world, 
         original_close(fd)
         owned.discard(fd)
 
-    root_fd = original_open(output_root, broker_module._DIRECTORY_FLAGS)
+    root_fd = original_open(output_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         with monkeypatch.context() as patches:
             patches.setattr(broker_module.os, "open", track_open)
@@ -858,7 +933,7 @@ def test_child_iterator_failure_releases_current_frontier_and_duplicate_but_not_
             pressure_handles.append(handle)
         for handle in pressure_handles[:4]:
             handle.close()
-    root_fd = original_open(output_root, broker_module._DIRECTORY_FLAGS)
+    root_fd = original_open(output_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 
     def live_descriptors():
         descriptors = {}

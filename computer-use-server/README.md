@@ -14,6 +14,7 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 |--------|---------|
 | `app.py` | FastAPI application: guarded MCP endpoint, file serving, browser/terminal proxy, system prompt API |
 | `file_response.py` | Descriptor-bound single-file streaming, metadata and cancellation-safe ownership |
+| `descriptor_io.py` | Shared no-follow read/directory acquisition; caller wrappers retain error and cleanup policy |
 | `auth_guard.py` | Fail-closed startup validation, service auth, peer denial and CORS policy |
 | `ws_recheck.py` | Captured-session CDP/ttyd authorization re-check and revocation shutdown |
 | `mcp_tools.py` | MCP tool definitions: `bash_tool`, `view`, `create_file`, `str_replace`, `sub_agent` |
