@@ -3,6 +3,7 @@
 """Ownership contracts of the actual single-file route response."""
 from __future__ import annotations
 
+import asyncio
 import builtins
 import os
 import sys
@@ -124,6 +125,15 @@ class _FileIO:
         self.setup_faults = []
         self.read_faults = []
         self.worker_errors = []
+        self.setup_seam = None
+        self.setup_entered = threading.Event()
+        self.release_setup = threading.Event()
+        self.setup_boundary_finished = threading.Event()
+        self.opener_metadata_finished = threading.Event()
+        self.active_setup = set()
+        self.setup_entries = []
+        self.target_fstats = []
+        self.target_stat_results = []
         self.recycle = False
         self.sentinel_fds = []
         self.reused = []
@@ -158,7 +168,9 @@ class _FileIO:
 
     def os_open(self, *args, **kwargs):
         fd = self.real_os_open(*args, **kwargs)
-        self.acquire(fd)
+        if self.acquire(fd) and self.setup_seam == "acquisition":
+            with self.setup_worker(fd):
+                return fd
         return fd
 
     def dup(self, fd):
@@ -166,8 +178,42 @@ class _FileIO:
         self.acquire(duplicate)
         return duplicate
 
+    @contextmanager
+    def setup_worker(self, fd):
+        with self.lock:
+            self.active_setup.add(fd)
+            self.setup_entries.append((self.setup_seam, fd, len(self.target_fstats)))
+        self.setup_entered.set()
+        try:
+            if not self.release_setup.wait(WAIT_SECONDS):
+                self.emergency_releases.append(("setup", fd))
+                self.release_setup.set()
+            yield
+        except BaseException as exc:
+            self.worker_errors.append(exc)
+            raise
+        finally:
+            with self.lock:
+                self.active_setup.remove(fd)
+            self.setup_boundary_finished.set()
+
     def fstat(self, fd):
-        item = self.real_fstat(fd)
+        target = fd in self.live_files
+        if target:
+            self.target_fstats.append(fd)
+        ordinal = len(self.target_fstats)
+        if target and self.setup_seam == "response-fstat" and ordinal == 2:
+            with self.setup_worker(fd):
+                item = self.real_fstat(fd)
+                self.target_stat_results.append((item.st_dev, item.st_ino))
+        else:
+            try:
+                item = self.real_fstat(fd)
+                if target:
+                    self.target_stat_results.append((item.st_dev, item.st_ino))
+            finally:
+                if target and ordinal == 1:
+                    self.opener_metadata_finished.set()
         if self.fail_setup and (item.st_dev, item.st_ino) == self.identity:
             self.setup_faults.append("fstat")
             raise BoundaryFailure("injected descriptor metadata failure")
@@ -209,7 +255,7 @@ class _FileIO:
     def close(self, fd, operation):
         with self.lock:
             self.close_attempts.append(fd)
-            if fd in self.active_reads:
+            if fd in self.active_reads or fd in self.active_setup:
                 self.premature_closes.append(fd)
         operation()
         self.closed.append(fd)
@@ -260,6 +306,7 @@ class _FileIO:
 
     def cleanup(self):
         self.release_read.set()
+        self.release_setup.set()
         sentinel_stat = self.real_stat(self.sentinel)
         sentinel_identity = (sentinel_stat.st_dev, sentinel_stat.st_ino)
         for fd in self.sentinel_fds:
@@ -523,3 +570,171 @@ def test_file_response_termination_waits_for_real_read_before_close(
     assert len(file_io.acquired) == 1
     file_io.assert_closed()
     file_io.assert_reused_descriptor_survives()
+
+
+async def _wait_for_observation(predicate):
+    deadline = asyncio.get_running_loop().time() + WAIT_SECONDS
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.001)
+    return True
+
+
+async def _native_setup_cancellation(workspace, file_io, download, full_app):
+    messages = []
+    evidence = {"entrypoint": "full-app" if full_app else "response"}
+
+    async def send(message):
+        messages.append(message)
+
+    if full_app:
+        app, _, _ = workspace
+        scope = _scope()
+        scope["raw_path"] = scope["path"].encode("ascii")
+        scope["query_string"] = b"download=1" if download else b""
+        scope["headers"] = [
+            (b"authorization", b"Bearer ocu-response-lifecycle-test-token"),
+        ]
+        request_delivered = False
+
+        async def receive():
+            nonlocal request_delivered
+            if not request_delivered:
+                request_delivered = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await _receive_until_cancelled()
+
+        task = asyncio.create_task(app.app(scope, receive, send))
+    else:
+        response = await _response(workspace, download)
+        task = asyncio.create_task(response(_scope(), _receive_until_cancelled, send))
+
+    try:
+        evidence["entered"] = await _wait_for_observation(file_io.setup_entered.is_set)
+        if evidence["entered"]:
+            evidence["cancel_requested"] = task.cancel()
+            # asyncio.wait observes completion without a second cancellation.
+            await asyncio.wait({task}, timeout=0.25)
+            evidence["while_blocked"] = {
+                "done": task.done(),
+                "closed": list(file_io.closed),
+                "close_attempts": list(file_io.close_attempts),
+                "active_setup": list(file_io.active_setup),
+                "boundary_finished": file_io.setup_boundary_finished.is_set(),
+                "released": file_io.release_setup.is_set(),
+            }
+    finally:
+        # Never let the expected semantic RED strand a real worker or owned FD.
+        file_io.release_setup.set()
+        done, _ = await asyncio.wait({task}, timeout=WAIT_SECONDS)
+        evidence["drained"] = bool(done)
+        if not done:
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=WAIT_SECONDS)
+            evidence["drained_after_emergency_cancel"] = bool(done)
+        evidence["setup_io_drained"] = await _wait_for_observation(
+            lambda: (
+                file_io.setup_boundary_finished.is_set()
+                and file_io.opener_metadata_finished.is_set()
+                and not file_io.active_directories
+                and len(file_io.directory_closed) == len(file_io.directory_acquired)
+            )
+        )
+        if task.done():
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                evidence["outcome"] = "cancelled"
+            except BaseException as exc:
+                evidence["outcome"] = (type(exc).__name__, str(exc))
+            else:
+                evidence["outcome"] = "returned"
+        else:
+            evidence["outcome"] = "pending"
+
+    if full_app:
+        middleware = app.app.middleware_stack
+        evidence["middleware"] = []
+        while middleware is not None:
+            evidence["middleware"].append(type(middleware).__name__)
+            middleware = getattr(middleware, "app", None)
+    return messages, evidence
+
+
+def _assert_native_setup_ownership(file_io, messages, evidence, seam, record_property):
+    sentinel_results = []
+    for fd in file_io.reused:
+        try:
+            sentinel_results.append((fd, os.pread(fd, 128, 0)))
+        except OSError as exc:
+            sentinel_results.append((fd, repr(exc)))
+    evidence.update({
+        "setup_entries": list(file_io.setup_entries),
+        "target_fstats": list(file_io.target_fstats),
+        "stat_identities": list(file_io.target_stat_results),
+        "acquired": list(file_io.acquired),
+        "closed": list(file_io.closed),
+        "close_attempts": list(file_io.close_attempts),
+        "premature_closes": list(file_io.premature_closes),
+        "live_files": list(file_io.live_files),
+        "reused": list(file_io.reused),
+        "emergency_releases": list(file_io.emergency_releases),
+        "sentinel_results": sentinel_results,
+        "opener_metadata_finished": file_io.opener_metadata_finished.is_set(),
+        "directory_acquired": list(file_io.directory_acquired),
+        "directory_closed": list(file_io.directory_closed),
+        "active_directories": list(file_io.active_directories),
+        "worker_errors": [repr(error) for error in file_io.worker_errors],
+        "body_messages": [message for message in messages if message["type"] == "http.response.body"],
+    })
+    record_property("native_setup_cancellation", repr(evidence))
+    diagnostic = f"Native setup cancellation evidence: {evidence!r}"
+    assert evidence["entered"], diagnostic
+    assert len(file_io.acquired) == 1, diagnostic
+    fd = file_io.acquired[0]
+    # Ordinal zero means the genuine leaf open has not delivered its integer;
+    # ordinal two is the response metadata call, after the opener's real fstat.
+    ordinal = 0 if seam == "acquisition" else 2
+    assert file_io.setup_entries == [(seam, fd, ordinal)], diagnostic
+    assert evidence["cancel_requested"], diagnostic
+    blocked = evidence["while_blocked"]
+    assert blocked["active_setup"] == [fd], diagnostic
+    assert not blocked["boundary_finished"] and not blocked["released"], diagnostic
+    assert not blocked["done"] and not blocked["close_attempts"] and not blocked["closed"], (
+        "Response completed/closed while its genuine setup worker was pending. " + diagnostic
+    )
+    assert evidence["drained"] and evidence["setup_io_drained"], diagnostic
+    assert evidence["outcome"] == "cancelled", diagnostic
+    assert not evidence["body_messages"], diagnostic
+    assert file_io.target_stat_results and all(
+        identity == file_io.identity for identity in file_io.target_stat_results
+    ), diagnostic
+    file_io.assert_closed()
+    file_io.assert_reused_descriptor_survives()
+
+
+@pytest.mark.parametrize("seam", ("acquisition", "response-fstat"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_native_file_response_cancellation_waits_for_setup_ownership(
+    workspace, file_io, download, seam, record_property
+):
+    file_io.setup_seam = seam
+    file_io.recycle = True
+    messages, evidence = anyio.run(
+        _native_setup_cancellation, workspace, file_io, download, False
+    )
+    _assert_native_setup_ownership(file_io, messages, evidence, seam, record_property)
+
+
+@pytest.mark.parametrize("seam", ("acquisition", "response-fstat"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_native_full_app_cancellation_waits_for_setup_ownership(
+    workspace, file_io, download, seam, record_property
+):
+    file_io.setup_seam = seam
+    file_io.recycle = True
+    messages, evidence = anyio.run(
+        _native_setup_cancellation, workspace, file_io, download, True
+    )
+    _assert_native_setup_ownership(file_io, messages, evidence, seam, record_property)

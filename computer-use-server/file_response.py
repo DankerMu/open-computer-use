@@ -8,6 +8,7 @@ from collections.abc import Mapping
 
 import anyio
 from fastapi import HTTPException
+from starlette._utils import collapse_excgroups
 from starlette.responses import FileResponse
 from starlette.types import Receive, Scope, Send
 
@@ -38,11 +39,18 @@ class WorkspaceFileResponse(FileResponse):
         self.requested_filename = requested_filename
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Native caller cancellation becomes scope cancellation of this child;
+        # group exit joins its non-abandoned setup workers before cleanup.
+        with collapse_excgroups():
+            async with anyio.create_task_group() as owner:
+                owner.start_soon(self._run_response, scope, receive, send)
+
+    async def _run_response(self, scope: Scope, receive: Receive, send: Send) -> None:
         file_fd = None
         try:
             try:
-                # Non-abandoning workers return ownership before cancellation can
-                # reach another checkpoint; the finally also owns setup failures.
+                # The owned child retains the worker's result through scope
+                # cancellation; the finally also owns setup failures.
                 file_fd = await anyio.to_thread.run_sync(
                     open_chat_upload, self.chat_id, self.rel_path
                 )
@@ -87,6 +95,6 @@ class WorkspaceFileResponse(FileResponse):
                         break
                     await anyio.lowlevel.checkpoint()
         finally:
-            # Task-group exit waits for non-abandoned reads before releasing this
-            # sole owner, so no pending worker can touch a closed or recycled FD.
+            # Non-abandoned setup workers finish before this child reaches cleanup;
+            # the inner group also joins reads before releasing the sole FD owner.
             close_fd(file_fd)
