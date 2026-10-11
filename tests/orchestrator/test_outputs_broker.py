@@ -1424,6 +1424,90 @@ def test_broker_control_retry_requires_parent_sync_after_interrupted_creation(wo
     assert sorted(path.name for path in control.iterdir()) == ["index.json", "marker"]
 
 
+@pytest.mark.parametrize(
+    "prior_index,operation", ((False, "reconcile"), (True, "register")),
+    ids=("new-reconcile", "existing-register"))
+def test_broker_parent_close_failure_preserves_state_and_closes_untransferred_control(
+        world, monkeypatch, prior_index, operation):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    first = _put(data, "a.txt", b"a")
+    destination = _index(data)
+    control = destination.parent
+    before = None
+    if prior_index:
+        broker.reconcile(CHAT)
+        before = destination.read_bytes()
+    second = _put(data, "b.txt", b"b")
+    chat_info = (data / CHAT).stat()
+    opened = os.open
+    closed = os.close
+    owned_control = []
+    parent_close_attempts = []
+    invalid_close_attempts = []
+    error = OSError(errno.EIO, "broker chat parent close failure")
+
+    def recording_open(*args, **kwargs):
+        fd = opened(*args, **kwargs)
+        info = os.fstat(fd)
+        if control.is_dir() and _same_inode(info, control.stat()):
+            owned_control.append((fd, info))
+        return fd
+
+    def close_then_fail_parent(fd):
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            invalid_close_attempts.append(fd)
+            return closed(fd)
+        parent = _same_inode(info, chat_info)
+        if parent:
+            parent_close_attempts.append((info.st_dev, info.st_ino))
+        closed(fd)
+        if parent:
+            raise error
+
+    with docker_manager._combined_lock(CHAT):
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "open", recording_open)
+            patches.setattr(os, "close", close_then_fail_parent)
+            try:
+                with pytest.raises(OSError) as failure:
+                    if operation == "reconcile":
+                        broker.reconcile(CHAT)
+                    else:
+                        broker.register_host_write(CHAT, "b.txt")
+                assert failure.value is error
+                assert failure.value.errno == errno.EIO
+                assert parent_close_attempts == [(chat_info.st_dev, chat_info.st_ino)]
+                assert invalid_close_attempts == []
+                if prior_index:
+                    assert destination.read_bytes() == before
+                    assert _read_index(data)["counter"] == 1
+                    assert sorted(_read_index(data)["active"]) == ["a.txt"]
+                    assert sorted(path.name for path in control.iterdir()) == ["index.json"]
+                else:
+                    assert not destination.exists()
+                    assert list(control.iterdir()) == []
+                assert first.read_bytes() == b"a"
+                assert second.read_bytes() == b"b"
+                for fd, info in owned_control:
+                    try:
+                        current = os.fstat(fd)
+                    except OSError as exc:
+                        assert exc.errno == errno.EBADF
+                    else:
+                        assert not _same_inode(current, info), "untransferred control descriptor leaked"
+            finally:
+                for fd, info in owned_control:
+                    try:
+                        current = os.fstat(fd)
+                    except OSError:
+                        continue
+                    if _same_inode(current, info):
+                        closed(fd)
+
+
 def test_postcommit_durability_failure_reports_complete_successor(world, monkeypatch):
     broker_module, _docker_manager, data = world
     broker = broker_module.OutputsBroker()
