@@ -41,7 +41,7 @@ from ws_recheck import (
     forward_ttyd_client,
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -65,6 +65,7 @@ from docker_manager import (
     _combined_lock,
 )
 from security import sanitize_chat_id, safe_path
+from file_response import WorkspaceFileResponse
 from uploads import (
     CorruptReceiptsError,
     DiscoveryError,
@@ -813,7 +814,7 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
         filename: File name (can include subdirectories)
 
     Returns:
-        FileResponse with the requested file
+        WorkspaceFileResponse with the requested file
 
     Raises:
         404: File not found
@@ -822,6 +823,7 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
     # Construct full path with traversal protection
     outputs_dir = safe_path(BASE_DATA_DIR, chat_id, "outputs")
     file_path = safe_path(outputs_dir, filename)
+    relative_path = file_path.relative_to(outputs_dir).as_posix()
 
     # Check if file exists
     if not file_path.exists():
@@ -841,8 +843,10 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
     # default → serve with real MIME type (browser displays inline)
     headers = {"Cache-Control": "no-store"}
     if download:
-        return FileResponse(
-            path=file_path,
+        return WorkspaceFileResponse(
+            chat_id=chat_id,
+            rel_path=relative_path,
+            requested_filename=filename,
             filename=file_path.name,
             media_type="application/octet-stream",
             headers=headers,
@@ -861,8 +865,10 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
                 "Content-Security-Policy": "sandbox allow-scripts allow-forms",
                 "X-Content-Type-Options": "nosniff",
             })
-        return FileResponse(
-            path=file_path,
+        return WorkspaceFileResponse(
+            chat_id=chat_id,
+            rel_path=relative_path,
+            requested_filename=filename,
             filename=file_path.name if isolated else None,
             content_disposition_type="inline",
             media_type=mime_type,

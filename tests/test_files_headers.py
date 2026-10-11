@@ -3,6 +3,7 @@
 """HTTP contract for generated-content headers on output files."""
 from __future__ import annotations
 
+import builtins
 import mimetypes
 import os
 import sys
@@ -45,6 +46,7 @@ def app_module(monkeypatch):
             "security",
             "system_prompt",
             "skill_manager",
+            "file_response",
         } or name.startswith("mcp_resources"):
             sys.modules.pop(name, None)
 
@@ -61,7 +63,12 @@ def output_dir(tmp_path):
 
 
 @pytest.fixture
-def client(app_module, output_dir, monkeypatch):
+def response_start_hooks():
+    return {}
+
+
+@pytest.fixture
+def client(app_module, output_dir, monkeypatch, response_start_hooks):
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr(app_module, "BASE_DATA_DIR", output_dir.parents[1])
@@ -71,6 +78,25 @@ def client(app_module, output_dir, monkeypatch):
     import uploads
 
     monkeypatch.setattr(uploads, "BASE_DATA_DIR", output_dir.parents[1])
+
+    file_route = next(
+        route for route in app_module.app.routes
+        if getattr(route, "path", None) == "/files/{chat_id}/{filename:path}"
+    )
+    real_route_app = file_route.app
+
+    async def route_with_send_hook(scope, receive, send):
+        async def send_with_hook(message):
+            if scope["type"] == "http" and message["type"] == "http.response.start":
+                hook = response_start_hooks.get(scope["path"])
+                if hook is not None:
+                    hook()
+            await send(message)
+
+        await real_route_app(scope, receive, send_with_hook)
+
+    # Observe the response before the HTTP normalizer can buffer response-start.
+    monkeypatch.setattr(file_route, "app", route_with_send_hook)
     with TestClient(app_module.app) as http:
         yield http
 
@@ -277,6 +303,253 @@ def test_inline_plain_text_replacement_is_fresh_and_no_store(client, output_dir,
     _assert_headers_absent(second)
     assert first.headers.get_list("cache-control") == ["no-store"]
     assert second.headers.get_list("cache-control") == ["no-store"]
+
+
+def _assert_confined_file(response, original, canary):
+    assert canary not in response.content
+    if response.status_code == 200:
+        assert response.content == original
+        assert response.headers.get_list("cache-control") == ["no-store"]
+    else:
+        assert response.status_code in (403, 404)
+        _assert_headers_absent(response)
+
+
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_ancestor_replacement_cannot_redirect_to_outside_bytes(
+    client, output_dir, tmp_path, response_start_hooks, download
+):
+    original = b"original in-root response bytes"
+    canary = b"benign outside response-start canary"
+    nested = output_dir / "nested"
+    nested.mkdir()
+    (nested / "victim.txt").write_bytes(original)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.txt").write_bytes(canary)
+    swaps = []
+
+    def swap_before_body():
+        assert not swaps, "Response-start swap fired more than once"
+        nested.rename(output_dir / "parked-nested")
+        nested.symlink_to(outside, target_is_directory=True)
+        swaps.append(nested)
+
+    # This send boundary runs synchronously before FileResponse's late open.
+    response_start_hooks[_file_url("nested/victim.txt")] = swap_before_body
+    response = client.get(
+        _file_url("nested/victim.txt"),
+        headers=_auth_headers(),
+        params={"download": 1} if download else None,
+    )
+
+    assert swaps == [nested], "Actual response-start filesystem swap did not fire"
+    assert nested.is_symlink()
+    _assert_confined_file(response, original, canary)
+
+
+@pytest.mark.parametrize("replaced_path", ("leaf", "ancestor"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_response_keeps_original_bytes_and_metadata_after_path_replacement(
+    client, output_dir, tmp_path, response_start_hooks, replaced_path, download
+):
+    original = b"original descriptor bytes"
+    victim = output_dir / "nested" / "victim.txt"
+    victim.parent.mkdir()
+    victim.write_bytes(original)
+    os.utime(victim, (1700000000, 1700000000))
+    assert victim.stat().st_size == 25
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    replacement_leaf = replacement / "victim.txt"
+    replacement_leaf.write_bytes(b"different replacement inode bytes and length")
+    os.utime(replacement_leaf, (1800000000, 1800000000))
+    selected = victim if replaced_path == "leaf" else victim.parent
+    redirect = replacement_leaf if replaced_path == "leaf" else replacement
+    swaps = []
+
+    def swap_before_body():
+        assert not swaps, "Response-start swap fired more than once"
+        selected.rename(tmp_path / "parked-selected")
+        selected.symlink_to(redirect, target_is_directory=replaced_path == "ancestor")
+        swaps.append(selected)
+
+    response_start_hooks[_file_url("nested/victim.txt")] = swap_before_body
+    response = client.get(
+        _file_url("nested/victim.txt"),
+        headers=_auth_headers(),
+        params={"download": 1} if download else None,
+    )
+
+    assert swaps == [selected], "Actual response-start filesystem swap did not fire"
+    assert selected.is_symlink()
+    assert response.status_code == 200
+    assert response.content == original
+    # Literal validators identify the original 25-byte object at the fixed mtime.
+    assert response.headers["content-length"] == "25"
+    assert response.headers["etag"] == '"3f2348dd2177119a98a73b4ce6735534"'
+    assert response.headers["last-modified"] == "Tue, 14 Nov 2023 22:13:20 GMT"
+    assert response.headers.get_list("cache-control") == ["no-store"]
+
+
+@pytest.mark.parametrize("replaced_root", ("chat-root", "output-root"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_root_replacement_at_acquisition_cannot_redirect_bytes(
+    client, output_dir, tmp_path, monkeypatch, record_property, replaced_root, download
+):
+    original = b"original requested chat bytes"
+    canary = b"benign root acquisition replacement canary"
+    victim = output_dir / "nested" / "victim.txt"
+    victim.parent.mkdir()
+    victim.write_bytes(original)
+    replacement_chat = tmp_path / "replacement-chat"
+    replacement_outputs = replacement_chat / "outputs"
+    (replacement_outputs / "nested").mkdir(parents=True)
+    (replacement_outputs / "nested" / "victim.txt").write_bytes(canary)
+    selected = output_dir.parent if replaced_root == "chat-root" else output_dir
+    redirect = replacement_chat if replaced_root == "chat-root" else replacement_outputs
+    chat_stat = output_dir.parent.stat()
+    real_open = builtins.open
+    real_os_open = os.open
+    swaps = []
+
+    def swap_at_acquisition(boundary):
+        selected.rename(tmp_path / "parked-root")
+        selected.symlink_to(redirect, target_is_directory=True)
+        swaps.append(boundary)
+        record_property("acquisition_boundary", boundary)
+
+    def open_then_acquire(path, *args, **kwargs):
+        if not swaps and not isinstance(path, int) and os.fspath(path) == str(victim):
+            swap_at_acquisition("builtins.open(file)")
+        return real_open(path, *args, **kwargs)
+
+    def os_open_then_acquire(path, flags, *args, **kwargs):
+        if not swaps:
+            pathname = os.fsdecode(path)
+            is_selected_root = pathname == str(selected)
+            if replaced_root == "output-root" and pathname == "outputs":
+                parent_fd = kwargs.get("dir_fd")
+                if parent_fd is not None:
+                    parent_stat = os.fstat(parent_fd)
+                    is_selected_root = (
+                        parent_stat.st_dev == chat_stat.st_dev
+                        and parent_stat.st_ino == chat_stat.st_ino
+                    )
+            if is_selected_root:
+                swap_at_acquisition("os.open(root)")
+            elif pathname == str(victim):
+                swap_at_acquisition("os.open(file)")
+        return real_os_open(path, flags, *args, **kwargs)
+
+    # Baseline AnyIO uses builtins.open; descriptor acquisition uses os.open.
+    # Both wrappers retain the genuine acquisition, including its no-follow flags.
+    monkeypatch.setattr(builtins, "open", open_then_acquire)
+    monkeypatch.setattr(os, "open", os_open_then_acquire)
+    response = client.get(
+        _file_url("nested/victim.txt"),
+        headers=_auth_headers(),
+        params={"download": 1} if download else None,
+    )
+
+    assert len(swaps) == 1, "No real root/file acquisition filesystem swap was observed"
+    assert selected.is_symlink()
+    _assert_confined_file(response, original, canary)
+
+
+@pytest.mark.parametrize("link_kind", ("outside-leaf", "chat-root", "output-root"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_rejects_preexisting_outside_or_sibling_root_links(
+    client, output_dir, tmp_path, link_kind, download
+):
+    canary = b"benign static outside or sibling root canary"
+    sibling_chat = tmp_path / "sibling-chat"
+    sibling_outputs = sibling_chat / "outputs"
+    sibling_outputs.mkdir(parents=True)
+    target = sibling_outputs / "victim.txt"
+    target.write_bytes(canary)
+    if link_kind == "outside-leaf":
+        (output_dir / "victim.txt").symlink_to(target)
+    elif link_kind == "chat-root":
+        output_dir.parent.rename(tmp_path / "parked-chat")
+        output_dir.parent.symlink_to(sibling_chat, target_is_directory=True)
+    else:
+        output_dir.rename(output_dir.parent / "parked-outputs")
+        output_dir.symlink_to(sibling_outputs, target_is_directory=True)
+
+    response = client.get(
+        _file_url("victim.txt"),
+        headers=_auth_headers(),
+        params={"download": 1} if download else None,
+    )
+
+    assert canary not in response.content
+    assert response.status_code in (403, 404)
+    _assert_headers_absent(response)
+
+
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_safe_in_root_alias_preserves_target_mime_and_disposition(
+    client, output_dir, download
+):
+    contents = b"<p>safe in-root target</p>"
+    target = output_dir / "nested" / "target.html"
+    target.parent.mkdir()
+    target.write_bytes(contents)
+    (output_dir / "alias.txt").symlink_to(target)
+
+    response = client.get(
+        _file_url("alias.txt"),
+        headers=_auth_headers(),
+        params={"download": 1} if download else None,
+    )
+
+    _assert_target_response(response, "text/html", contents, download)
+    disposition = "attachment" if download else "inline"
+    assert response.headers["content-disposition"] == f'{disposition}; filename="target.html"'
+
+
+# Literal validators below use the fixed mtime and each fixture's byte length.
+@pytest.mark.parametrize(
+    "contents, expected_length, expected_etag",
+    (
+        (b"", "0", '"e7d53fbff452d442c477af2510b0e0b0"'),
+        (
+            b"0123456789abcdef" * (128 * 1024) + b"tail",
+            "2097156",
+            '"69c1476782e5783776d96540a5a7d719"',
+        ),
+    ),
+    ids=("zero-byte", "multi-chunk"),
+)
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_zero_byte_and_multi_chunk_responses_preserve_bytes_and_metadata(
+    client, output_dir, contents, expected_length, expected_etag, download
+):
+    target = output_dir / "nested" / "payload.txt"
+    target.parent.mkdir()
+    target.write_bytes(contents)
+    os.utime(target, (1700000000, 1700000000))
+
+    response = client.get(
+        _file_url("nested/payload.txt"),
+        headers=_auth_headers(),
+        params={"download": 1} if download else None,
+    )
+
+    assert response.status_code == 200
+    assert response.content == contents
+    assert response.headers["content-length"] == expected_length
+    assert response.headers["etag"] == expected_etag
+    assert response.headers["last-modified"] == "Tue, 14 Nov 2023 22:13:20 GMT"
+    assert response.headers.get_list("cache-control") == ["no-store"]
+    expected_mime = "application/octet-stream" if download else "text/plain; charset=utf-8"
+    assert response.headers["content-type"] == expected_mime
+    if download:
+        assert response.headers["content-disposition"] == 'attachment; filename="payload.txt"'
+    else:
+        assert "content-disposition" not in response.headers
+    _assert_headers_absent(response)
 
 
 def test_file_errors_have_no_cache_or_isolation_headers(client, output_dir):

@@ -319,7 +319,7 @@ def app_module():
     snapshot = {
         name: sys.modules[name]
         for name in list(sys.modules)
-        if name in {"app", "mcp_tools"} or name.startswith("mcp_resources")
+        if name in {"app", "mcp_tools", "file_response"} or name.startswith("mcp_resources")
     }
     for name in list(snapshot):
         sys.modules.pop(name, None)
@@ -358,7 +358,7 @@ def app_module():
                 assert loaded.LifecycleError is saved["LifecycleError"]
     finally:
         for name in list(sys.modules):
-            if name in {"app", "mcp_tools"} or name.startswith("mcp_resources"):
+            if name in {"app", "mcp_tools", "file_response"} or name.startswith("mcp_resources"):
                 sys.modules.pop(name, None)
         sys.modules.update(snapshot)
         for key in ("OCU_INTERNAL_TOKEN", "PUBLIC_BASE_URL", "MCP_API_KEY"):
