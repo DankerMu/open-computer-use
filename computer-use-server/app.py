@@ -28,11 +28,13 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
+from starlette.concurrency import run_in_threadpool
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from office.router import OfficeAvailabilityMiddleware, create_office_router
 from office import config as office_config
 from office.control_plane import install_source_access_log_filter
 from office.sweep import sweep_office_publications, sweep_office_sessions
+from office.save_workers import save_worker_lifespan
 from ws_recheck import (
     admit,
     forward_cdp_backend,
@@ -401,6 +403,7 @@ curl -s -X POST "http://localhost:8081/mcp" \\
 from contextlib import asynccontextmanager
 
 async def _idle_reaper(stop_idle: asyncio.Event):
+    loop = asyncio.get_running_loop()
     try:
         await asyncio.to_thread(startup_idle_sweep)
     except asyncio.CancelledError:
@@ -425,7 +428,7 @@ async def _idle_reaper(stop_idle: asyncio.Event):
             except Exception as exc:
                 print(f"[IDLE] reap tick failed: {exc}")
             try:
-                await asyncio.to_thread(sweep_office_sessions)
+                await run_in_threadpool(sweep_office_sessions, loop=loop)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -457,19 +460,22 @@ async def lifespan(app):
     import mcp_resources  # noqa: F401
     if _mcp_server._session_manager is None:
         _mcp_server.streamable_http_app()
-    stop_idle = asyncio.Event()
-    reaper = asyncio.create_task(_idle_reaper(stop_idle))
     async with _mcp_server.session_manager.run():
         print("[MCP] session_manager.run() entered — /mcp endpoint is live")
         try:
-            yield
+            async with save_worker_lifespan(app):
+                stop_idle = asyncio.Event()
+                reaper = asyncio.create_task(_idle_reaper(stop_idle))
+                try:
+                    yield
+                finally:
+                    stop_idle.set()
+                    reaper.cancel()
+                    try:
+                        await reaper
+                    except asyncio.CancelledError:
+                        pass
         finally:
-            stop_idle.set()
-            reaper.cancel()
-            try:
-                await reaper
-            except asyncio.CancelledError:
-                pass
             print("[MCP] session_manager.run() exiting")
 
 app = FastAPI(

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import hmac
 import json
 import socket
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from anyio.from_thread import start_blocking_portal
 from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
@@ -377,3 +379,61 @@ def test_cancellation_propagates_and_secrets_stay_out_of_errors(monkeypatch, cap
         extra = f"{excinfo.value!s} {excinfo.value!r}"
         _assert_no_secrets(capsys, caplog, JWT_SECRET, INTERNAL_TOKEN, extra=extra)
         release.set()
+
+
+@pytest.mark.parametrize("closed", (False, True))
+@pytest.mark.parametrize("kind", ("forcesave", "lookup"))
+def test_command_bridge_closes_unsubmitted_operation_when_loop_unavailable(closed, kind):
+    import office.commands as live_commands
+
+    loop = asyncio.new_event_loop()
+    if closed:
+        loop.close()
+    operation = (
+        live_commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT)
+        if kind == "forcesave" else live_commands.lookup_key(DOCUMENT_KEY)
+    )
+    unreachable = (
+        live_commands.ForceSaveOutcome.UNREACHABLE
+        if kind == "forcesave" else live_commands.KeyLookupOutcome.UNREACHABLE
+    )
+    try:
+        assert live_commands.run_command(operation, loop, unreachable=unreachable) is unreachable
+        assert inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED
+    finally:
+        operation.close()
+        loop.close()
+
+
+@pytest.mark.parametrize("kind", ("forcesave", "lookup"))
+def test_command_bridge_maps_submitted_cancellation_to_matching_unreachable(kind):
+    import office.commands as live_commands
+
+    async def cancelled():
+        raise asyncio.CancelledError()
+
+    unreachable = (
+        live_commands.ForceSaveOutcome.UNREACHABLE
+        if kind == "forcesave" else live_commands.KeyLookupOutcome.UNREACHABLE
+    )
+    with start_blocking_portal() as portal:
+        loop = portal.call(asyncio.get_running_loop)
+        assert live_commands.run_command(cancelled(), loop, unreachable=unreachable) is unreachable
+
+
+@pytest.mark.parametrize("error_type", (ValueError, TimeoutError))
+def test_command_bridge_propagates_operation_errors_including_timeout(error_type):
+    import office.commands as live_commands
+
+    failure = error_type("command operation failed")
+
+    async def fail():
+        raise failure
+
+    with start_blocking_portal() as portal:
+        loop = portal.call(asyncio.get_running_loop)
+        with pytest.raises(error_type) as caught:
+            live_commands.run_command(
+                fail(), loop, unreachable=live_commands.KeyLookupOutcome.UNREACHABLE,
+            )
+        assert caught.value is failure

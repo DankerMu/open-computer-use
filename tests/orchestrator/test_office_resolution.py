@@ -3,6 +3,7 @@
 """Explicit conflict resolution through authenticated HTTP and durable state."""
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import os
@@ -33,7 +34,7 @@ from tests.orchestrator.test_office_callback_publish import (
     CHANGED, _allocate, _bind_internal, _content_origin, _opened, _payload, _post, _sha,
 )
 from tests.orchestrator.test_office_session_lifecycle import _status
-from tests.orchestrator.test_office_sessions import _outputs, _versions, office_world
+from tests.orchestrator.test_office_sessions import _outputs, _versions, office_world as office_world
 from tests.orchestrator.test_outputs_endpoint import CHAT, _auth
 
 
@@ -752,8 +753,11 @@ os.replace, os.link, os.fsync = replaced, linked, synced
 mode = os.environ.get("RESOLVE_MODE", "request")
 if mode == "http":
     import uvicorn
+    from office.save_workers import save_worker_lifespan
+    # Own save transactions without unrelated MCP, reaper or recovery startup.
+    app.app.router.lifespan_context = save_worker_lifespan
     uvicorn.run(app.app, host="127.0.0.1", port=int(os.environ["OCU_PORT"]),
-                lifespan="off", log_level="warning")
+                lifespan="on", log_level="warning")
 elif mode == "recover":
     recover_publications(os.environ["OCU_CHAT"])
 elif mode == "startup":
@@ -1195,7 +1199,10 @@ def _late_save_conflict(world, monkeypatch, intent):
     _allocate(http, session, monkeypatch)
     started = _read(data)["sessions"][session["session_id"]]["saving_started_at"]
     with _info(monkeypatch, session["document_key"]):
-        sweep_office_sessions(now=started + config.SAVE_CALLBACK_TIMEOUT_SECONDS + 1)
+        sweep_office_sessions(
+            now=started + config.SAVE_CALLBACK_TIMEOUT_SECONDS + 1,
+            loop=http.portal.call(asyncio.get_running_loop),
+        )
     timed_out = _read(data)["sessions"][session["session_id"]]
     assert (timed_out["state"], timed_out["reason"]) == ("editing", "save_timeout")
     with _forcesave(monkeypatch, session["document_key"]):
@@ -1396,7 +1403,10 @@ def test_stale_issued_callback_without_receipt_cannot_finish_resolve(office_worl
     _allocate(http, session, monkeypatch)
     started = _read(data)["sessions"][session["session_id"]]["saving_started_at"]
     with _info(monkeypatch, session["document_key"]):
-        sweep_office_sessions(now=started + config.SAVE_CALLBACK_TIMEOUT_SECONDS + 1)
+        sweep_office_sessions(
+            now=started + config.SAVE_CALLBACK_TIMEOUT_SECONDS + 1,
+            loop=http.portal.call(asyncio.get_running_loop),
+        )
     with _forcesave(monkeypatch, session["document_key"]):
         assert _save(http, session["session_id"]).json()["save_seq"] == 2
     (_outputs(data) / "report.docx").write_bytes(original + b"agent-workspace")
@@ -1606,7 +1616,10 @@ def _timeout_first_save(world, monkeypatch):
     _allocate(http, session, monkeypatch)
     started = _read(data)["sessions"][session["session_id"]]["saving_started_at"]
     with _info(monkeypatch, session["document_key"]):
-        sweep_office_sessions(now=started + config.SAVE_CALLBACK_TIMEOUT_SECONDS + 1)
+        sweep_office_sessions(
+            now=started + config.SAVE_CALLBACK_TIMEOUT_SECONDS + 1,
+            loop=http.portal.call(asyncio.get_running_loop),
+        )
     record = _read(data)["sessions"][session["session_id"]]
     assert (record["state"], record["save_seq"], record["last_committed_seq"]) == ("editing", 1, 0)
     return opened

@@ -3,6 +3,7 @@
 """Shared lifecycle lock safety through the public Office sweep."""
 from __future__ import annotations
 
+import asyncio
 import errno
 import importlib
 import io
@@ -17,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from anyio.from_thread import start_blocking_portal
 from tests.orchestrator._office_store import CHAT, ROOT, _child_env, _inode, _seed, _stop_child
 from tests.orchestrator.test_lifecycle import _container, _docker
 
@@ -53,9 +55,11 @@ def test_office_sweep_never_opens_or_flocks_canary_after_lock_precheck(world, mo
 
     try:
         with _lock_observations(manager, monkeypatch) as observed:
-            with monkeypatch.context() as boundary:
+            with monkeypatch.context() as boundary, start_blocking_portal() as portal:
                 boundary.setattr(sweep, "_has_state", swap_after_precheck)
-                sweep.sweep_office_sessions(now=1_700_000_000.25)
+                sweep.sweep_office_sessions(
+                    now=1_700_000_000.25, loop=portal.call(asyncio.get_running_loop),
+                )
 
             # Keep the oracle outside the sweep's per-chat Exception isolation.
             assert events == ["real-precheck-succeeded", "canary-symlink-installed"]

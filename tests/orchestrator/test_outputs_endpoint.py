@@ -64,6 +64,7 @@ _APP_MODULES = (
     "office.epoch",
     "office.tokens",
     "office.commands",
+    "office.save_workers",
     "office.sessions",
     "office.notice",
     "office.ooxml",

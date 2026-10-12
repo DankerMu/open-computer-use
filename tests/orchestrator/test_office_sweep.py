@@ -21,7 +21,7 @@ from tests.orchestrator.test_office_save_close import _child_env, _close, _comma
 from tests.orchestrator.test_office_session_lifecycle import _asgi, _change, _created, _status
 from tests.orchestrator.test_office_sessions import (
     JWT_SECRET, SERVER_DIR, _assert_refusal, _create, _oracle_verify,
-    _snapshot, _state, _versions, office_world,
+    _snapshot, _state, _versions, office_world as office_world,
 )
 from tests.orchestrator.test_outputs_endpoint import CHAT, CHAT_B, INTERNAL, _auth
 
@@ -30,7 +30,7 @@ ELIGIBLE = ("opening", "editing", "saving", "closing")
 EXCLUDED = ("conflict", "closed", "error", "orphaned")
 
 
-def _poll(monkeypatch, *, sandbox_error=False):
+def _poll(monkeypatch, *, sandbox_error=False, loop_runner=None):
     import app
 
     async def tick():
@@ -51,7 +51,10 @@ def _poll(monkeypatch, *, sandbox_error=False):
             await asyncio.wait_for(app._idle_reaper(stop), 15)
         assert calls == ["sandbox"]
 
-    asyncio.run(tick())
+    if loop_runner is None:
+        asyncio.run(tick())
+    else:
+        loop_runner(tick)
 
 
 @contextmanager
@@ -576,8 +579,9 @@ def test_two_process_sweeps_hold_flock_through_lookup_and_retain_real_store_comm
     entered, release = threading.Event(), threading.Event()
     contended = data.parent / "sweep-worker-contended"
     source = r'''
-import fcntl, json, os
+import asyncio, fcntl, json, os
 from pathlib import Path
+from anyio.from_thread import start_blocking_portal
 from office.store import OfficeStore
 from office.sweep import sweep_office_sessions
 chat = os.environ["OCU_CHAT"]
@@ -599,7 +603,8 @@ else:
             raise AssertionError("sweep released canonical flock during info lookup")
         return original(fd, operation)
     fcntl.flock = contend
-sweep_office_sessions(float(os.environ["NOW"]))
+with start_blocking_portal() as portal:
+    sweep_office_sessions(float(os.environ["NOW"]), loop=portal.call(asyncio.get_running_loop))
 print(json.dumps(store.read(chat)))
 '''
     first = second = None
