@@ -3,6 +3,13 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Bounded Office callback admission.** Any present Authorization header is
+  authoritative without body reception or body JSON parsing. Absent-header
+  body-token requests accept at most 1 MiB (1,048,576 raw bytes) inclusively;
+  overflow returns HTTP 413 with `{"error":1,"reason":"callback_body_too_large"}`
+  before parsing or further reception, without download or Office state/file
+  changes. The bound does not limit separately downloaded document content.
+
 - **Descriptor-pinned lifecycle locks.** Shared Office sweep and sandbox reap
   acquisition opens chat and lock entries without following symlinks and verifies
   a regular lock before flock. Concurrent first creation, parent synchronization

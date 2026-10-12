@@ -23,6 +23,7 @@ from .store import OfficeStore, StateCorruptError
 
 _LOG = logging.getLogger("ocu.office")
 _BEARER = "bearer "
+_CALLBACK_BODY_LIMIT = 1_048_576
 
 
 class InvalidTicketError(ValueError):
@@ -97,10 +98,14 @@ async def admit_callback(request: Request) -> JSONResponse:
         chat = canonical_chat_id(presented_chat)
     except AuthGuardError:
         return _error(400, "invalid_chat_id")
-    body = await request.body()
-    payload, reason = _verified_callback_object(request, body)
+    payload, reason = await _verified_callback_object(request)
     if payload is None:
         _log_callback_rejection(chat, presented_session, reason)
+        if reason == "callback_body_too_large":
+            return JSONResponse(
+                status_code=413,
+                content={"error": 1, "reason": "callback_body_too_large"},
+            )
         return _error(401, "invalid_token")
     loop = asyncio.get_running_loop()
     return await run_in_threadpool(
@@ -181,7 +186,7 @@ def _require_callback_binding(state: dict[str, Any], session_id: str, payload: d
         raise InvalidCallbackTokenError()
 
 
-def _verified_callback_object(request: Request, body: bytes) -> tuple[dict[str, Any] | None, str]:
+async def _verified_callback_object(request: Request) -> tuple[dict[str, Any] | None, str]:
     headers = {
         key.decode("latin-1").lower(): value.decode("latin-1")
         for key, value in request.scope.get("headers") or []
@@ -198,6 +203,11 @@ def _verified_callback_object(request: Request, body: bytes) -> tuple[dict[str, 
         if not isinstance(nested, dict):
             return None, "invalid_token"
         return nested, "invalid_token"
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _CALLBACK_BODY_LIMIT:
+            return None, "callback_body_too_large"
+        body.extend(chunk)
     if not body:
         return None, "invalid_token"
     try:

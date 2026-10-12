@@ -28,7 +28,7 @@ from tests.orchestrator.test_office_sessions import (
     _snapshot,
     _ticket_key,
     _versions,
-    office_world,
+    office_world as office_world,
 )
 from tests.orchestrator.test_office_workspace import _forbid_inode_open
 from tests.orchestrator.test_outputs_endpoint import CHAT, _auth
@@ -307,6 +307,61 @@ def test_callback_body_token_admits_and_unsigned_fields_are_ignored(office_world
     assert after["sessions"][session["session_id"]]["state"] == "editing"
     assert after["documents"][session["file_id"]] == before["documents"][session["file_id"]]
     assert after["receipts"] == {}
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize("header_kind", ("valid", "invalid", "empty", "whitespace", "non_bearer"))
+def test_present_callback_header_authenticates_without_receiving_body(office_world, header_kind):
+    http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
+    from office.store import OfficeStore
+
+    before_state = OfficeStore().read(CHAT)
+    before_files = _snapshot(data)
+    assert before_state["sessions"][session["session_id"]]["state"] == "opening"
+    authorization = {
+        "valid": "Bearer " + _header_jwt(session, status=1),
+        "invalid": "Bearer not-a-jwt",
+        "empty": "",
+        "whitespace": " \t ",
+        "non_bearer": "Basic not-a-jwt",
+    }[header_kind]
+    request_event = {
+        "type": "http.request",
+        "body": json.dumps({"token": _body_jwt(session, status=1)}).encode("utf-8"),
+        "more_body": False,
+    }
+    receive_calls = 0
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        raise AssertionError("present Authorization must not receive " + request_event["type"])
+
+    status, response_body = _raw_office(
+        http.app,
+        _callback_path(session),
+        [
+            (b"authorization", authorization.encode("latin-1")),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(request_event["body"])).encode("ascii")),
+        ],
+        method="POST",
+        body=request_event["body"],
+        receive=receive,
+    )
+    assert receive_calls == 0
+    after_state = OfficeStore().read(CHAT)
+    if header_kind == "valid":
+        assert status == 200
+        assert response_body == {"error": 0}
+        assert after_state["sessions"][session["session_id"]]["state"] == "editing"
+        assert after_state["documents"] == before_state["documents"]
+        assert after_state["receipts"] == before_state["receipts"]
+    else:
+        assert status == 401
+        assert response_body == {"reason": "invalid_token"}
+        assert after_state == before_state
+        assert _snapshot(data) == before_files
     assert origin.hits == 0
 
 
