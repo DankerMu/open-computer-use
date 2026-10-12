@@ -9,11 +9,12 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 from anyio.from_thread import start_blocking_portal
+
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
@@ -29,7 +30,7 @@ class _DownloadOrigin:
         self.requests = []
         parent = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(OriginRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def log_message(self, format, *args):
@@ -50,27 +51,21 @@ class _DownloadOrigin:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._lifetime = HttpOriginLifetime(Handler)
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        return self._lifetime.url
 
     def close(self):
-        self._server.shutdown()
-        self._thread.join(timeout=2)
-        self._server.server_close()
+        self._lifetime.stop()
 
 
 @contextmanager
 def _origin(responder):
     server = _DownloadOrigin(responder)
-    try:
+    with server._lifetime:
         yield server
-    finally:
-        server.close()
 
 
 @contextmanager
@@ -176,7 +171,7 @@ def test_timeout_is_download_failed(office_env, monkeypatch):
     monkeypatch.setattr("office.commands.HTTP_TIMEOUT_SECONDS", 0.05)
 
     def responder(_handler):
-        time.sleep(0.3)
+        _handler.server.owner.pause(0.3)
         return 200, {}, intact_docx()
 
     with _origin(responder) as server:
@@ -198,7 +193,7 @@ def test_cancelled_submitted_download_future_is_download_failed(office_env, monk
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", track)
 
     def responder(_handler):
-        time.sleep(2)
+        _handler.server.owner.pause(2)
         return 200, {}, intact_docx()
 
     with _origin(responder) as server:
@@ -209,7 +204,7 @@ def test_cancelled_submitted_download_future_is_download_failed(office_env, monk
                 while not submitted:
                     if time.monotonic() >= deadline:
                         return
-                    time.sleep(0.005)
+                    server._lifetime.pause(0.005)
                 submitted[0].cancel()
 
             canceller = threading.Thread(target=cancel_submitted)
@@ -250,7 +245,7 @@ def test_redirect_chain_obeys_single_total_deadline(office_env, monkeypatch):
 
     def responder(handler):
         hops["n"] += 1
-        time.sleep(0.08)
+        handler.server.owner.pause(0.08)
         if handler.path == "/one":
             return 302, {"Location": "/two"}, b""
         return 200, {}, b"too-late"

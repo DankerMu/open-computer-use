@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Owned Office test HTTP origins.** Command, recording, content and download
+  fixtures drain admitted handlers and close accepted/listening sockets within a
+  bounded teardown. Held responses are released on exceptional exit; unexpected
+  handler failures reach the owning test. Accepted sockets use blocking streams
+  so fragmented requests retain their framing. Production behavior is unchanged.
+
 - **Durable chat and control directory entries.** Outer create-capable chat locks
   synchronize the configured data-root directory before admission. Broker and upload
   receipt preparation, including direct receipt writes, synchronize the chat

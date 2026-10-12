@@ -111,11 +111,6 @@ def _persisted_inventory(data):
     return OfficeStore().read(CHAT), _snapshot(data)
 
 
-def _raise_first(errors):
-    if errors:
-        raise errors[0]
-
-
 def _hold_save(http, monkeypatch, first, *, forcesave_code=0, info_code=0):
     entered, release = threading.Event(), threading.Event()
     box = _command_box(
@@ -130,8 +125,17 @@ def _hold_save(http, monkeypatch, first, *, forcesave_code=0, info_code=0):
     saver = threading.Thread(
         target=lambda: setattr(saver, "response", _save(http, first["session_id"], "publish"))
     )
-    saver.start()
-    assert entered.wait(5), "forcesave command did not arrive"
+    try:
+        saver.start()
+        assert entered.wait(5), "forcesave command did not arrive"
+    except BaseException:
+        # The caller has no box to close if readiness fails after acquiring the origin.
+        try:
+            box.__exit__(*sys.exc_info())
+        finally:
+            if saver.ident is not None:
+                saver.join(timeout=10)
+        raise
     return origin, seen, infos, saver, release, box
 
 
@@ -160,48 +164,40 @@ def _command_box(
 ):
     seen = []
     infos = []
-    origin_errors = []
 
     def responder(handler, body, _parent):
-        try:
-            assert handler.path == "/command"
-            payload = json.loads(body)
-            token = _independent_verify(payload["token"], JWT_SECRET)
-            assert token["key"] == key
-            if token["c"] == "info":
-                assert set(token) == {"c", "key"}
-                infos.append(token)
-                return (
-                    info_status,
-                    {"Content-Type": "application/json"},
-                    json.dumps({"error": info_code}).encode(),
-                )
-            if token["c"] != "forcesave":
-                raise AssertionError(("unexpected command", token))
-            userdata = json.loads(token["userdata"])
-            seen.append(userdata)
-            if observe is not None:
-                observe(userdata)
-            if entered is not None:
-                entered.set()
-            if release is not None:
-                assert release.wait(5), "save test did not release its HTTP responder"
+        assert handler.path == "/command"
+        payload = json.loads(body)
+        token = _independent_verify(payload["token"], JWT_SECRET)
+        assert token["key"] == key
+        if token["c"] == "info":
+            assert set(token) == {"c", "key"}
+            infos.append(token)
             return (
-                forcesave_status,
+                info_status,
                 {"Content-Type": "application/json"},
-                json.dumps({"error": forcesave_code}).encode(),
+                json.dumps({"error": info_code}).encode(),
             )
-        except Exception as extra:
-            origin_errors.append(extra)
-            raise
+        if token["c"] != "forcesave":
+            raise AssertionError(("unexpected command", token))
+        userdata = json.loads(token["userdata"])
+        seen.append(userdata)
+        if observe is not None:
+            observe(userdata)
+        if entered is not None:
+            entered.set()
+        if release is not None:
+            assert release.wait(5), "save test did not release its HTTP responder"
+        return (
+            forcesave_status,
+            {"Content-Type": "application/json"},
+            json.dumps({"error": forcesave_code}).encode(),
+        )
 
-    with _command_origin(responder) as origin:
+    with _command_origin(responder, release=release) as origin:
         with monkeypatch.context() as env:
             env.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
-            try:
-                yield origin, seen, infos
-            finally:
-                _raise_first(origin_errors)
+            yield origin, seen, infos
 
 
 @contextmanager
@@ -221,30 +217,21 @@ def _forcesave(monkeypatch, key, *, code=0, status=200, entered=None, release=No
 
 @contextmanager
 def _lookup(monkeypatch, key, *, code=0, status=200, entered=None, release=None):
-    origin_errors = []
-
     def responder(handler, body, _parent):
-        try:
-            assert handler.path == "/command"
-            payload = json.loads(body)
-            token = _independent_verify(payload["token"], JWT_SECRET)
-            assert token == {"c": "info", "key": key}
-            if entered is not None:
-                entered.set()
-            if release is not None:
-                assert release.wait(5), "close test did not release its HTTP responder"
-            return status, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode()
-        except Exception as extra:
-            origin_errors.append(extra)
-            raise
+        assert handler.path == "/command"
+        payload = json.loads(body)
+        token = _independent_verify(payload["token"], JWT_SECRET)
+        assert token == {"c": "info", "key": key}
+        if entered is not None:
+            entered.set()
+        if release is not None:
+            assert release.wait(5), "close test did not release its HTTP responder"
+        return status, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode()
 
-    with _command_origin(responder) as origin:
+    with _command_origin(responder, release=release) as origin:
         with monkeypatch.context() as env:
             env.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
-            try:
-                yield origin
-            finally:
-                _raise_first(origin_errors)
+            yield origin
 
 
 def _child_env(data, origin_url, **extra):
@@ -1109,7 +1096,7 @@ def test_delayed_accepted_save_keeps_concurrent_close(office_world, monkeypatch)
         release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
     assert recording.hits == 0
 
 
@@ -1261,7 +1248,7 @@ def test_delayed_unknown_key_orphans_live_close_and_conflict(office_world, monke
         release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
 
     _file_id, live = _created(office_world, "editing", name="live.docx")
     origin, seen, infos, saver, release, box = _hold_save(
@@ -1286,7 +1273,7 @@ def test_delayed_unknown_key_orphans_live_close_and_conflict(office_world, monke
         release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
     assert recording.hits == 0
 
 
@@ -1322,7 +1309,7 @@ def test_delayed_unknown_key_does_not_orphan_ended_conflict(office_world, monkey
         release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
     assert recording.hits == 0
 
 
@@ -1351,7 +1338,7 @@ def test_delayed_nothing_new_does_not_touch_completed_callback(office_world, mon
         release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
     assert recording.hits == 0
 
 
@@ -1401,7 +1388,7 @@ def test_delayed_stale_save_does_not_touch_newer_real_save(office_world, monkeyp
         second_release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
     assert recording.hits == 0
 
 
@@ -1438,7 +1425,7 @@ def test_delayed_save_does_not_touch_completed_terminal_sessions(
         release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
     assert recording.hits == 0
 
 
@@ -1483,7 +1470,7 @@ def test_delayed_save_does_not_touch_terminal_sessions_with_matching_pending(
         release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
     assert recording.hits == 0
 
 
@@ -1527,7 +1514,7 @@ def test_delayed_save_does_not_touch_status_epoch_orphan_with_matching_pending(
         release.set()
         if saver.is_alive():
             saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
     assert recording.hits == 0
 
 

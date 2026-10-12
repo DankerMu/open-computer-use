@@ -7,11 +7,11 @@ import hashlib
 import json
 import threading
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 import pytest
 
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
 from tests.orchestrator._office_recorded_callbacks import (
     recorded_status_1_payload,
     recorded_status_2_payload,
@@ -55,7 +55,7 @@ class _ContentOrigin:
         self._trap = trap
         parent = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(OriginRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def log_message(self, format, *args):
@@ -73,9 +73,7 @@ class _ContentOrigin:
                 if parent._trap is not None:
                     parent._trap()
                 if parent._delay:
-                    import time
-
-                    time.sleep(parent._delay)
+                    parent._lifetime.pause(parent._delay)
                 if parent._redirect is not None and self.path == parent._redirect[0]:
                     self.send_response(302)
                     self.send_header("Location", parent._redirect[1])
@@ -92,26 +90,21 @@ class _ContentOrigin:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._lifetime = HttpOriginLifetime(Handler)
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        return self._lifetime.url
 
     def close(self):
-        self._server.shutdown()
-        self._thread.join(timeout=2)
+        self._lifetime.stop()
 
 
 @contextmanager
 def _content_origin(bodies, **kwargs):
     server = _ContentOrigin(bodies, **kwargs)
-    try:
+    with server._lifetime:
         yield server
-    finally:
-        server.close()
 
 
 def _sha(body: bytes) -> str:
@@ -1278,7 +1271,7 @@ def test_gzip_negotiating_origin_persists_identity_ooxml(office_world, monkeypat
             self.hits = 0
             parent = self
 
-            class Handler(BaseHTTPRequestHandler):
+            class Handler(OriginRequestHandler):
                 protocol_version = "HTTP/1.1"
 
                 def log_message(self, format, *args):
@@ -1302,12 +1295,10 @@ def test_gzip_negotiating_origin_persists_identity_ooxml(office_world, monkeypat
                     self.end_headers()
                     self.wfile.write(body)
 
-            self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-            self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-            self._thread.start()
+            self._lifetime = HttpOriginLifetime(Handler)
 
     server = EncodingOrigin()
-    try:
+    with server._lifetime:
         with _bind_internal(monkeypatch, server.url):
             payload = recorded_status_6_payload(
                 document_key=session["document_key"],
@@ -1321,8 +1312,6 @@ def test_gzip_negotiating_origin_persists_identity_ooxml(office_world, monkeypat
             assert listed[-1]["sha256"] == _sha(CHANGED)
             assert listed[-1]["sha256"] != _sha(packed)
             assert server.requests[0]["headers"].get("accept-encoding") == "identity"
-    finally:
-        server.close()
     assert origin.hits == 0
 
 

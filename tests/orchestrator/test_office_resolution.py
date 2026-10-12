@@ -1656,24 +1656,20 @@ def test_two_http_workers_nothing_new_command_settles_sigkill_resolve_before_com
         office_world, monkeypatch,
     )
     entered, release = threading.Event(), threading.Event()
-    command_errors, seen = [], []
+    seen = []
     held_at = []
 
     def responder(handler, body, _parent):
-        try:
-            assert handler.path == "/command"
-            payload = _independent_verify(json.loads(body)["token"], JWT_SECRET)
-            assert payload["key"] == session["document_key"] and payload["c"] == "forcesave"
-            seen.append(json.loads(payload["userdata"]))
-            held_at.append(time.monotonic())
-            entered.set()
-            assert release.wait(8), "command response was not released within its production timeout"
-            return 200, {"Content-Type": "application/json"}, b'{"error":4}'
-        except Exception as extra:
-            command_errors.append(extra)
-            raise
+        assert handler.path == "/command"
+        payload = _independent_verify(json.loads(body)["token"], JWT_SECRET)
+        assert payload["key"] == session["document_key"] and payload["c"] == "forcesave"
+        seen.append(json.loads(payload["userdata"]))
+        held_at.append(time.monotonic())
+        entered.set()
+        assert release.wait(8), "command response was not released within its production timeout"
+        return 200, {"Content-Type": "application/json"}, b'{"error":4}'
 
-    with _command_origin(responder, trap=(200, {}, CHANGED)) as origin:
+    with _command_origin(responder, trap=(200, {}, CHANGED), release=release) as origin:
         with _resolve_http_worker(data, session, action, origin.url) as (live, _live_child, _marker, _environment), \
                 _resolve_http_worker(data, session, action, origin.url, cut="accepted") as (resolver, child, marker, environment):
             results = {}
@@ -1719,7 +1715,7 @@ def test_two_http_workers_nothing_new_command_settles_sigkill_resolve_before_com
                 assert time.monotonic() - held_at[0] < 10
                 release.set()
                 saver.join(timeout=10)
-                assert not saver.is_alive() and not command_errors
+                assert not saver.is_alive()
                 response = results["save"]
                 assert response.status_code == 202, response.text
                 assert response.json() == {"session_id": session["session_id"], "save_seq": 2, "intent": intent}

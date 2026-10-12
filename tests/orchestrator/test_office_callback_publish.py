@@ -6,6 +6,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import sys
 import time
 from contextlib import contextmanager
 
@@ -468,7 +469,7 @@ def test_delayed_nothing_new_save_preserves_live_ownership_and_final_outcomes(of
     finally:
         release.set()
         saver.join(timeout=10)
-        box.__exit__(None, None, None)
+        box.__exit__(*sys.exc_info())
 
 
 def test_nothing_new_publish_save_publishes_retained_autosave(office_world, monkeypatch):

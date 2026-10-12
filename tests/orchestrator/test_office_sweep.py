@@ -56,37 +56,27 @@ def _poll(monkeypatch, *, sandbox_error=False):
 
 @contextmanager
 def _info_origin(monkeypatch, expected_keys, *, code=0, status=200, entered=None, release=None):
-    errors, seen = [], []
+    seen = []
 
     def respond(handler, body, _parent):
-        try:
-            assert handler.path == "/command"
-            envelope = json.loads(body)
-            assert set(envelope) == {"token"}
-            command = _oracle_verify(envelope["token"], JWT_SECRET)
-            assert command["c"] == "info"
-            assert set(command) == {"c", "key"}
-            assert command["key"] in expected_keys
-            seen.append(command)
-            if entered is not None:
-                entered.set()
-            if release is not None:
-                assert release.wait(10), "info response barrier was not released"
-            return status, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode()
-        except BaseException as exc:
-            errors.append(exc)
-            return 500, {}, b""
+        assert handler.path == "/command"
+        envelope = json.loads(body)
+        assert set(envelope) == {"token"}
+        command = _oracle_verify(envelope["token"], JWT_SECRET)
+        assert command["c"] == "info"
+        assert set(command) == {"c", "key"}
+        assert command["key"] in expected_keys
+        seen.append(command)
+        if entered is not None:
+            entered.set()
+        if release is not None:
+            assert release.wait(10), "info response barrier was not released"
+        return status, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode()
 
-    with _command_origin(respond) as origin:
+    with _command_origin(respond, release=release) as origin:
         with monkeypatch.context() as patch:
             patch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
-            try:
-                yield origin, seen
-            finally:
-                if release is not None:
-                    release.set()
-    if errors:
-        raise errors[0]
+            yield origin, seen
 
 
 def _aged(world, state, *, chat=CHAT, name="brief.docx", **fields):
@@ -830,27 +820,21 @@ def test_poll_completes_publication_before_documentserver_can_orphan_session(
             "status": 6, "version": selected["number"], "sha256": digest, "answer": {"error": 0},
         }}
     store.update(CHAT, seed)
-    errors, seen = [], []
+    seen = []
     def respond(handler, body, _parent):
-        try:
-            command = _oracle_verify(json.loads(body)["token"], JWT_SECRET)
-            assert command == {"c": "info", "key": created["document_key"]}
-            assert (data / CHAT / "outputs" / "brief.docx").read_bytes() == b"recovered-v2"
-            state = json.loads(_state(data).read_bytes())
-            assert state["journal"] == {}
-            assert state["documents"][file_id]["published_sha256"] == digest
-            assert state["sessions"][session_id]["state"] == "editing"
-            seen.append(command)
-            return 200, {"Content-Type": "application/json"}, b'{"error":1}'
-        except BaseException as exc:
-            errors.append(exc)
-            return 500, {}, b""
+        command = _oracle_verify(json.loads(body)["token"], JWT_SECRET)
+        assert command == {"c": "info", "key": created["document_key"]}
+        assert (data / CHAT / "outputs" / "brief.docx").read_bytes() == b"recovered-v2"
+        state = json.loads(_state(data).read_bytes())
+        assert state["journal"] == {}
+        assert state["documents"][file_id]["published_sha256"] == digest
+        assert state["sessions"][session_id]["state"] == "editing"
+        seen.append(command)
+        return 200, {"Content-Type": "application/json"}, b'{"error":1}'
     with _command_origin(respond) as origin:
         with monkeypatch.context() as patch:
             patch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
             _poll(patch)
-    if errors:
-        raise errors[0]
     assert seen == [{"c": "info", "key": created["document_key"]}]
     after = store.read(CHAT)
     assert after["sessions"][session_id]["state"] == "orphaned"
