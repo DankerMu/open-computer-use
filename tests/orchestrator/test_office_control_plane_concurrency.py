@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tests.orchestrator.test_office_control_plane import _callback_path, _header_jwt, _open_session
-from tests.orchestrator.test_office_sessions import SERVER_DIR, office_world
+from tests.orchestrator.test_office_sessions import SERVER_DIR, office_world as office_world
 from tests.orchestrator.test_outputs_endpoint import CHAT
 
 
@@ -78,15 +78,19 @@ def test_callback_lock_keeps_same_loop_health_responsive(office_world):
             assert callback.status_code == 200
             assert callback.json() == {"error": 0}
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        holder = pool.submit(_hold_chat_lock, docker, CHAT, held, release, expired)
-        assert held.wait(5)
-        try:
-            asyncio.run(exercise())
-        finally:
-            release.set()
-            holder.result(timeout=5)
-            docker._combined_lock = original_lock
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            holder = None
+            try:
+                holder = pool.submit(_hold_chat_lock, docker, CHAT, held, release, expired)
+                assert held.wait(5)
+                asyncio.run(exercise())
+            finally:
+                release.set()
+                if holder is not None:
+                    holder.result(timeout=5)
+    finally:
+        docker._combined_lock = original_lock
     assert not expired.is_set()
     state = json.loads((data / CHAT / ".ocu" / "office" / "state.json").read_bytes())
     assert state["sessions"][session["session_id"]]["state"] == "editing"
@@ -238,7 +242,8 @@ print("released")
         restore_patches()
         release_holder()
         _stop_child(holder)
-        watching.join(timeout=2)
+        if watching.ident is not None:
+            watching.join(timeout=2)
     assert not watchdog_released.is_set()
     state = json.loads((data / CHAT / ".ocu" / "office" / "state.json").read_bytes())
     assert state["sessions"][session["session_id"]]["state"] == "editing"

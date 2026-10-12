@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Office contention startup cleanup.** Controlled startup/readiness failures
+  retain their initiating exception while acquired holders are released and
+  observed, child pipes are closed, only started watchdogs are joined, and
+  temporary lock patches are restored. Production behavior is unchanged.
+
 - **Bounded Office callback admission.** Any present Authorization header is
   authoritative without body reception or body JSON parsing. Absent-header
   body-token requests accept at most 1 MiB (1,048,576 raw bytes) inclusively;
