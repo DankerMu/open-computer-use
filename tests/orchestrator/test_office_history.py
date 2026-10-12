@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import os
+import sys
 from urllib.parse import quote
 
 import pytest
@@ -163,7 +164,7 @@ def test_versions_refuses_symlinked_chat_root_without_external_mutation(office_w
     assert origin.hits == 0
 
 
-@pytest.mark.parametrize("removed_at", ("availability", "lock_open"))
+@pytest.mark.parametrize("removed_at", ("availability", "chat_open"))
 def test_versions_does_not_recreate_chat_removed_during_admission(office_world, monkeypatch, removed_at):
     from pathlib import Path
 
@@ -172,7 +173,7 @@ def test_versions_does_not_recreate_chat_removed_during_admission(office_world, 
     root = data / CHAT
     detached = data.parent / "removed-chat"
     before = _snapshot(root)
-    real_is_dir, real_open, real_lstat = Path.is_dir, Path.open, os.lstat
+    real_is_dir, real_open, real_lstat = Path.is_dir, os.open, os.lstat
     removed = False
     lock_unavailable = False
 
@@ -184,17 +185,20 @@ def test_versions_does_not_recreate_chat_removed_during_admission(office_world, 
             removed = True
         return result
 
-    def opened(path, *args, **kwargs):
+    def opened(name, *args, **kwargs):
         nonlocal removed, lock_unavailable
-        if path == root / ".lifecycle.lock" and not removed:
+        if (
+            os.fsdecode(name) == CHAT and not removed
+            and sys._getframe(1).f_code is _manager._CombinedLock._open_file.__code__
+        ):
             root.rename(detached)
             removed = True
             try:
-                return real_open(path, *args, **kwargs)
+                return real_open(name, *args, **kwargs)
             except FileNotFoundError:
                 lock_unavailable = True
                 raise
-        return real_open(path, *args, **kwargs)
+        return real_open(name, *args, **kwargs)
 
     def inspected(path, *args, **kwargs):
         if lock_unavailable and os.fspath(path) == os.fspath(root):
@@ -205,13 +209,13 @@ def test_versions_does_not_recreate_chat_removed_during_admission(office_world, 
         if removed_at == "availability":
             boundary.setattr(Path, "is_dir", checked_directory)
         else:
-            boundary.setattr(Path, "open", opened)
+            boundary.setattr(os, "open", opened)
             boundary.setattr(os, "lstat", inspected)
         response = _listing(http, file_id)
 
     _assert_refusal(response, 404, "unknown_file")
     assert removed
-    if removed_at == "lock_open":
+    if removed_at == "chat_open":
         assert lock_unavailable
     assert not root.exists()
     assert not (root / ".lifecycle.lock").exists()

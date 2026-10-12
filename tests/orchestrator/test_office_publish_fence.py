@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
 import stat
@@ -509,6 +510,8 @@ def test_marker_durability_failure_cannot_request_pause_and_closes_descriptors(w
     fixture = _running(world)
     real_open, real_close, real_write, real_sync = os.open, os.close, os.write, os.fsync
     opened_fds, marker_fds = set(), set()
+    real_fstat = os.fstat
+    opened_identities = {}
     office_identity = fixture.marker.parent.stat()
 
     def fail():
@@ -519,14 +522,17 @@ def test_marker_durability_failure_cannot_request_pause_and_closes_descriptors(w
             fail()
         fd = real_open(path, flags, *args, **kwargs)
         opened_fds.add(fd)
+        info = real_fstat(fd)
+        opened_identities[fd] = (info.st_dev, info.st_ino)
+        marker_fds.discard(fd)
         if isinstance(path, str) and path.startswith(".fence."):
             marker_fds.add(fd)
         return fd
 
     def closed(fd):
-        opened_fds.discard(fd)
+        result = real_close(fd)
         marker_fds.discard(fd)
-        return real_close(fd)
+        return result
 
     def write(fd, body):
         if fd in marker_fds and phase == "write":
@@ -542,20 +548,34 @@ def test_marker_durability_failure_cannot_request_pause_and_closes_descriptors(w
             fail()
         return real_sync(fd)
 
-    with monkeypatch.context() as boundary:
-        boundary.setattr(os, "open", opened)
-        boundary.setattr(os, "close", closed)
-        boundary.setattr(os, "write", write)
-        boundary.setattr(os, "fsync", sync)
-        with pytest.raises(OSError, match=f"marker {phase} failed"):
-            _publish()
-    assert opened_fds == set()
-    fixture.container.pause.assert_not_called()
-    fixture.container.unpause.assert_not_called()
-    assert fixture.target.read_bytes() == BASELINE
-    assert fixture.store.read(CHAT)["journal"][OBLIGATION]["target_path"] == "report.docx"
-    assert not fixture.marker.exists()
-    assert not list(fixture.marker.parent.glob(".fence.*"))
+    try:
+        with monkeypatch.context() as boundary:
+            boundary.setattr(os, "open", opened)
+            boundary.setattr(os, "close", closed)
+            boundary.setattr(os, "write", write)
+            boundary.setattr(os, "fsync", sync)
+            with pytest.raises(OSError, match=f"marker {phase} failed"):
+                _publish()
+        # File-object closes can bypass os.close; inspect every acquired descriptor.
+        for fd in opened_fds:
+            with pytest.raises(OSError) as retired:
+                real_fstat(fd)
+            assert retired.value.errno == errno.EBADF
+        fixture.container.pause.assert_not_called()
+        fixture.container.unpause.assert_not_called()
+        assert fixture.target.read_bytes() == BASELINE
+        assert fixture.store.read(CHAT)["journal"][OBLIGATION]["target_path"] == "report.docx"
+        assert not fixture.marker.exists()
+        assert not list(fixture.marker.parent.glob(".fence.*"))
+    finally:
+        # Retire genuine survivors after assertions without closing recycled numbers.
+        for fd, identity in opened_identities.items():
+            try:
+                info = real_fstat(fd)
+                if (info.st_dev, info.st_ino) == identity:
+                    real_close(fd)
+            except OSError:
+                pass
 
 
 @pytest.mark.parametrize("failure", ["unlink", "directory-sync"])

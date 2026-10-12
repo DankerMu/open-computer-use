@@ -14,6 +14,7 @@ Extracted from mcp_tools.py to reduce file size and separate concerns.
 """
 
 import os
+import errno
 import ipaddress
 import sys
 import re
@@ -194,6 +195,82 @@ class _CombinedLock:
         self._create = create
         self._acquired = False
 
+    def _open_file(self):
+        owned = []
+
+        def close_fd(fd):
+            owned.remove(fd)
+            os.close(fd)
+
+        def missing():
+            while owned:
+                close_fd(owned[-1])
+            return None
+
+        try:
+            if self._create:
+                BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                parent_fd = os.open(
+                    BASE_DATA_DIR, descriptor_io.DIRECTORY_FLAGS & ~descriptor_io.NO_FOLLOW)
+            except FileNotFoundError:
+                if not self._create:
+                    return None
+                raise
+            owned.append(parent_fd)
+            if self._create:
+                try:
+                    os.mkdir(self.chat_id, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+            try:
+                root_fd = os.open(
+                    self.chat_id, descriptor_io.DIRECTORY_FLAGS, dir_fd=parent_fd)
+            except OSError as exc:
+                if not self._create and (
+                    descriptor_io.is_missing(exc) or descriptor_io.is_nofollow_error(exc)
+                ):
+                    return missing()
+                raise
+            owned.append(root_fd)
+            if self._create:
+                os.fsync(parent_fd)
+            flags = (
+                os.O_RDWR | descriptor_io.NO_FOLLOW | descriptor_io.NONBLOCK
+                | descriptor_io.CLOSE_ON_EXEC
+            )
+            try:
+                try:
+                    lock_fd = os.open(".lifecycle.lock", flags, dir_fd=root_fd)
+                except FileNotFoundError:
+                    try:
+                        lock_fd = os.open(
+                            ".lifecycle.lock", flags | os.O_CREAT | os.O_EXCL,
+                            0o666, dir_fd=root_fd)
+                    except FileExistsError:
+                        lock_fd = os.open(".lifecycle.lock", flags, dir_fd=root_fd)
+            except FileNotFoundError:
+                if not self._create:
+                    return missing()
+                raise
+            owned.append(lock_fd)
+            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                raise OSError(errno.EINVAL, "lifecycle lock is not a regular file")
+            close_fd(root_fd)
+            close_fd(parent_fd)
+            handle = os.fdopen(lock_fd, "r+")
+            owned.remove(lock_fd)
+            return handle
+        except BaseException:
+            # Only a failure in this acquisition permits best-effort retirement.
+            while owned:
+                fd = owned.pop()
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+
     def __enter__(self):
         self._acquired = False
         self._thread_lock.acquire()
@@ -203,38 +280,9 @@ class _CombinedLock:
                 _FLOCK_DEPTH[self.chat_id] = depth + 1
                 self._acquired = True
                 return self
-            root = _control_dir(self.chat_id)
-            if not self._create:
-                try:
-                    info = os.lstat(root)
-                except FileNotFoundError:
-                    return None
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                    return None
-            path = root / ".lifecycle.lock"
-            if self._create:
-                BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-                parent_fd = os.open(
-                    BASE_DATA_DIR, descriptor_io.DIRECTORY_FLAGS & ~descriptor_io.NO_FOLLOW)
-                try:
-                    try:
-                        os.mkdir(self.chat_id, dir_fd=parent_fd)
-                    except FileExistsError:
-                        pass
-                    root_fd = os.open(
-                        self.chat_id, descriptor_io.DIRECTORY_FLAGS, dir_fd=parent_fd)
-                    try:
-                        os.fsync(parent_fd)
-                    finally:
-                        os.close(root_fd)
-                finally:
-                    os.close(parent_fd)
-            try:
-                handle = path.open("a+")
-            except FileNotFoundError:
-                if not self._create:
-                    return None
-                raise
+            handle = self._open_file()
+            if handle is None:
+                return None
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             except BaseException:
