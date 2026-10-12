@@ -28,7 +28,7 @@ from tests.orchestrator.test_office_sessions import (
     _snapshot,
     _ticket_key,
     _versions,
-    office_world,
+    office_world as office_world,
 )
 from tests.orchestrator.test_office_workspace import _forbid_inode_open
 from tests.orchestrator.test_outputs_endpoint import CHAT, _auth

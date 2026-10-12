@@ -9,7 +9,7 @@ import pytest
 
 from tests.orchestrator.test_office_control_plane import _body_jwt, _callback_path, _open_session
 from tests.orchestrator.test_office_router import SANDBOX_PEER, _raw_office
-from tests.orchestrator.test_office_sessions import _snapshot, office_world
+from tests.orchestrator.test_office_sessions import _snapshot, office_world as office_world
 from tests.orchestrator.test_outputs_endpoint import CHAT
 
 
