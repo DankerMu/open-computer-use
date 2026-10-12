@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import selectors
 import socket
 import sys
 import threading
@@ -160,8 +161,6 @@ class HttpOriginLifetime:
             self.server.server_bind()
             self.server.server_activate()
             self.server.socket.setblocking(False)
-            # A short poll bounds idle admission-loop exit without shutdown()'s handshake.
-            self.server.timeout = 0.05
             self._thread = threading.Thread(
                 target=self._serve, daemon=True, name="office-http-origin",
             )
@@ -195,8 +194,13 @@ class HttpOriginLifetime:
 
     def _serve(self):
         try:
-            while not self._cancel.is_set():
-                self.server.handle_request()
+            with selectors.DefaultSelector() as selector:
+                selector.register(self.server.socket, selectors.EVENT_READ)
+                while not self._cancel.is_set():
+                    # A positive wait avoids handle_request's zero-timeout spin and bounds stop latency.
+                    ready = selector.select(timeout=0.05)
+                    if ready and not self._cancel.is_set():
+                        self.server._handle_request_noblock()
         except BaseException as error:
             self._record_error(error)
 
