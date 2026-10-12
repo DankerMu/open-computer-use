@@ -45,6 +45,29 @@ Collection success is not a test pass: then execute the same canonical selected
 scope without `--collect-only` and record execution separately. Do not trim an
 evolving corpus to match an old count.
 
+### Office contention startup ownership
+
+The owners in `orchestrator/test_office_control_plane_concurrency.py` release and
+observe acquired holders and restore temporary lock patches before `office_world`
+teardown, including controlled startup/readiness failures. The regressions in
+`orchestrator/test_office_contention_startup.py` invoke those actual owners with
+real acquired child/thread holders. They require the injected exception itself
+at top level; emergency rescue cannot satisfy the owner-cleanup assertions.
+
+Run the owning scope using the same discovery root:
+
+```bash
+uv run --no-project --with pytest \
+  --with-requirements computer-use-server/requirements.txt -- \
+  python -m pytest tests/ -q \
+  --import-mode=importlib --ignore=tests/integration \
+  -k 'test_office_contention_startup.py or test_office_control_plane_concurrency.py or test_office_control_plane.py'
+```
+
+This scope covers controlled startup faults and the successful contention paths,
+not request cancellation, arbitrary simultaneous cleanup failures, deployment
+behavior, or cross-platform leak freedom. Production locks and callbacks are unchanged.
+
 ## Test Scripts
 
 | Script | What it validates | Docker required |
