@@ -23,6 +23,7 @@ from .store import OfficeStore, StateCorruptError
 
 _LOG = logging.getLogger("ocu.office")
 _BEARER = "bearer "
+_CALLBACK_BODY_LIMIT = 1_048_576
 
 
 class InvalidTicketError(ValueError):
@@ -100,6 +101,11 @@ async def admit_callback(request: Request) -> JSONResponse:
     payload, reason = await _verified_callback_object(request)
     if payload is None:
         _log_callback_rejection(chat, presented_session, reason)
+        if reason == "callback_body_too_large":
+            return JSONResponse(
+                status_code=413,
+                content={"error": 1, "reason": "callback_body_too_large"},
+            )
         return _error(401, "invalid_token")
     loop = asyncio.get_running_loop()
     return await run_in_threadpool(
@@ -197,7 +203,11 @@ async def _verified_callback_object(request: Request) -> tuple[dict[str, Any] | 
         if not isinstance(nested, dict):
             return None, "invalid_token"
         return nested, "invalid_token"
-    body = await request.body()
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _CALLBACK_BODY_LIMIT:
+            return None, "callback_body_too_large"
+        body.extend(chunk)
     if not body:
         return None, "invalid_token"
     try:

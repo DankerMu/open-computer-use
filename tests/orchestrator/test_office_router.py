@@ -202,11 +202,11 @@ NEWLINE_ENCODED = f"/api/office/{CHAT}/unknown%0Asegment"
 NEWLINE_DECODED = f"/api/office/{CHAT}/unknown\nsegment"
 
 
-def _raw_office(app, path, headers, method="GET", client=("testclient", 50000), body=b""):
+def _raw_office(app, path, headers, method="GET", client=("testclient", 50000), body=b"", *, receive=None):
     messages = []
     received = False
 
-    async def receive():
+    async def receive_body():
         nonlocal received
         if received:
             return {"type": "http.disconnect"}
@@ -230,7 +230,7 @@ def _raw_office(app, path, headers, method="GET", client=("testclient", 50000), 
         "server": ("testserver", 80),
         "root_path": "",
     }
-    asyncio.run(app(scope, receive, send))
+    asyncio.run(app(scope, receive if receive is not None else receive_body, send))
     start = next(message for message in messages if message["type"] == "http.response.start")
     payload = b"".join(
         message.get("body") or b""

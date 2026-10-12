@@ -3,7 +3,6 @@
 """Public HTTP seam for DocumentServer source tickets and callback admission."""
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -331,7 +330,6 @@ def test_present_callback_header_authenticates_without_receiving_body(office_wor
         "body": json.dumps({"token": _body_jwt(session, status=1)}).encode("utf-8"),
         "more_body": False,
     }
-    messages = []
     receive_calls = 0
 
     async def receive():
@@ -339,45 +337,28 @@ def test_present_callback_header_authenticates_without_receiving_body(office_wor
         receive_calls += 1
         raise AssertionError("present Authorization must not receive " + request_event["type"])
 
-    async def send(message):
-        messages.append(message)
-
-    path = _callback_path(session)
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "http",
-        "path": path,
-        "raw_path": path.encode("utf-8"),
-        "query_string": b"",
-        "headers": [
+    status, response_body = _raw_office(
+        http.app,
+        _callback_path(session),
+        [
             (b"authorization", authorization.encode("latin-1")),
             (b"content-type", b"application/json"),
             (b"content-length", str(len(request_event["body"])).encode("ascii")),
         ],
-        "client": ("testclient", 50000),
-        "server": ("testserver", 80),
-        "root_path": "",
-    }
-    asyncio.run(http.app(scope, receive, send))
+        method="POST",
+        body=request_event["body"],
+        receive=receive,
+    )
     assert receive_calls == 0
-    start = next(message for message in messages if message["type"] == "http.response.start")
-    response_body = json.loads(b"".join(
-        message.get("body") or b""
-        for message in messages
-        if message["type"] == "http.response.body"
-    ))
     after_state = OfficeStore().read(CHAT)
     if header_kind == "valid":
-        assert start["status"] == 200
+        assert status == 200
         assert response_body == {"error": 0}
         assert after_state["sessions"][session["session_id"]]["state"] == "editing"
         assert after_state["documents"] == before_state["documents"]
         assert after_state["receipts"] == before_state["receipts"]
     else:
-        assert start["status"] == 401
+        assert status == 401
         assert response_body == {"reason": "invalid_token"}
         assert after_state == before_state
         assert _snapshot(data) == before_files
