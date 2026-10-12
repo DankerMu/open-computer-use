@@ -3,6 +3,7 @@
 """Callback publication and recovery through real HTTP, store and broker seams."""
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import os
@@ -28,7 +29,7 @@ from tests.orchestrator.test_office_publish import _on_staging_sync
 from tests.orchestrator.test_office_save_close import _close, _forcesave, _hold_save, _lookup, _save
 from tests.orchestrator.test_office_session_lifecycle import _change, _status
 from tests.orchestrator.test_office_sessions import (
-    _assert_refusal, _create, _outputs, _snapshot, _state, _versions, office_world,
+    _assert_refusal, _create, _outputs, _snapshot, _state, _versions, office_world as office_world,
 )
 from tests.orchestrator.test_outputs_endpoint import CHAT
 
@@ -808,7 +809,7 @@ def test_forgotten_surviving_save_is_completed_before_orphaning(office_world, mo
                 _assert_refusal(response, 409, "unpublished_version")
         else:
             from office.sweep import sweep_office_sessions
-            sweep_office_sessions(now=1_700_000_000)
+            sweep_office_sessions(now=1_700_000_000, loop=http.portal.call(asyncio.get_running_loop))
     persisted = _read(data)
     record = persisted["sessions"][session["session_id"]]
     assert (record["state"], record["reason"]) == ("orphaned", "editor_state_lost")
@@ -830,7 +831,7 @@ def test_final_recovery_outcomes_are_not_orphaned_by_sweep(office_world, monkeyp
     _change(session["session_id"], last_activity_at=0)
     with _lookup(monkeypatch, session["document_key"], code=1) as origin:
         from office.sweep import sweep_office_sessions
-        sweep_office_sessions(now=1_700_000_000)
+        sweep_office_sessions(now=1_700_000_000, loop=http.portal.call(asyncio.get_running_loop))
         assert origin.requests == []
     persisted = _read(data)
     record = persisted["sessions"][session["session_id"]]
@@ -987,7 +988,7 @@ def test_unresolved_publication_blocks_orphan_transition(office_world, monkeypat
         with _lookup(monkeypatch, session["document_key"], code=1) as origin:
             if trigger == "sweep":
                 from office.sweep import sweep_office_sessions
-                sweep_office_sessions(now=1_700_000_000)
+                sweep_office_sessions(now=1_700_000_000, loop=http.portal.call(asyncio.get_running_loop))
                 assert origin.requests == []
             else:
                 with pytest.raises(SandboxStateError):

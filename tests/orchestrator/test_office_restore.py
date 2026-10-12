@@ -3,6 +3,7 @@
 """Public HTTP seam for restoring immutable Office history to the workspace."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import errno
 import os
@@ -20,7 +21,7 @@ from tests.orchestrator.test_office_callback_publish import (
     _bind_internal, _content_origin, _opened, _payload, _post,
 )
 from tests.orchestrator.test_office_sessions import (
-    _outputs, _put, _snapshot, _versions, office_world,
+    _outputs, _put, _snapshot, _versions, office_world as office_world,
 )
 from tests.orchestrator.test_outputs_endpoint import CHAT, _auth
 
@@ -631,7 +632,7 @@ def test_index_failure_after_replace_retains_obligation_and_unpublished_restore(
         elif recovery == "startup":
             sweep_office_publications()
         else:
-            sweep_office_sessions()
+            sweep_office_sessions(loop=http.portal.call(asyncio.get_running_loop))
         unresolved = _read(data)
         assert set(unresolved["journal"]) == {journal_id}
         assert {key: unresolved["journal"][journal_id][key] for key in binding} == binding

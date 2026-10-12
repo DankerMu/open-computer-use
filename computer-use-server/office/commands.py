@@ -6,8 +6,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
+from collections.abc import Coroutine
+from concurrent.futures import CancelledError, TimeoutError as FutureTimeoutError
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
 
 import aiohttp
 
@@ -30,6 +33,38 @@ class KeyLookupOutcome(Enum):
     KNOWN = "known"
     KEY_UNKNOWN = "key_unknown"
     UNREACHABLE = "unreachable"
+
+
+_Outcome = TypeVar("_Outcome", ForceSaveOutcome, KeyLookupOutcome)
+
+
+def run_command(
+    operation: Coroutine[Any, Any, _Outcome],
+    loop: asyncio.AbstractEventLoop,
+    *,
+    unreachable: _Outcome,
+) -> _Outcome:
+    deadline = time.monotonic() + HTTP_TIMEOUT_SECONDS
+    if loop.is_closed() or not loop.is_running():
+        operation.close()
+        return unreachable
+    try:
+        future = asyncio.run_coroutine_threadsafe(operation, loop)
+    except RuntimeError:
+        operation.close()
+        if loop.is_closed() or not loop.is_running():
+            return unreachable
+        raise
+    try:
+        return future.result(timeout=max(0, deadline - time.monotonic()))
+    except FutureTimeoutError as extra:
+        # Future.result also raises an operation's own TimeoutError, which must propagate.
+        if future.done() and not future.cancelled() and future.exception() is extra:
+            raise
+        future.cancel()
+        return unreachable
+    except CancelledError:
+        return unreachable
 
 
 async def forcesave(document_key: str, save_seq: int, intent: str) -> ForceSaveOutcome:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 import os
 import stat
 import time
@@ -18,8 +19,10 @@ from .store import OfficeStore, StateCorruptError, StateDurabilityError
 _ELIGIBLE = frozenset({"opening", "editing", "saving", "closing"})
 
 
-def sweep_office_sessions(now: float | None = None) -> None:
-    _sweep(_sweep_chat, now)
+def sweep_office_sessions(
+    now: float | None = None, *, loop: asyncio.AbstractEventLoop,
+) -> None:
+    _sweep(partial(_sweep_chat, loop=loop), now)
 
 
 def sweep_office_publications(now: float | None = None) -> None:
@@ -83,7 +86,9 @@ def _recover_chat(store, chat, current):
     recover_publications(chat, now=current)
 
 
-def _sweep_chat(store: OfficeStore, chat: str, current: float) -> None:
+def _sweep_chat(
+    store: OfficeStore, chat: str, current: float, *, loop: asyncio.AbstractEventLoop,
+) -> None:
     store._assert_chat_root_safe(chat, allow_missing=False)
     with docker_manager._combined_lock(chat, create=False) as lock:
         if lock is None or not _has_state(store, chat):
@@ -117,7 +122,10 @@ def _sweep_chat(store: OfficeStore, chat: str, current: float) -> None:
             )
             if record["state"] not in _ELIGIBLE and not recovered_conflict:
                 continue
-            outcome = asyncio.run(commands.lookup_key(record["document_key"]))
+            outcome = commands.run_command(
+                commands.lookup_key(record["document_key"]), loop,
+                unreachable=commands.KeyLookupOutcome.UNREACHABLE,
+            )
             if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
                 _orphan_session(store, chat, session_id, "editor_state_lost")
             elif (

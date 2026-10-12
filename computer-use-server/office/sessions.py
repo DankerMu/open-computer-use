@@ -17,9 +17,11 @@ import docker_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from outputs_broker import CorruptIndexError, FileIdNotFoundError, OutputsBroker, OutputsBrokerError
+from starlette.concurrency import run_in_threadpool
 
 from . import commands, config, epoch, notice, ooxml, tokens, versions
 from .epoch import RestoreEpochError
+from .save_workers import run_save_worker
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
 from .versions import StorageLowError
 from .workspace import FileTooLargeError, UnsafePathError
@@ -82,9 +84,12 @@ class InvalidRequestError(ValueError):
     reason = "invalid_request"
 
 
-def create_session(request: Request) -> JSONResponse:
+async def create_session(request: Request) -> JSONResponse:
+    loop = asyncio.get_running_loop()
     try:
-        created = _create_session(request.scope["ocu_chat_id"], request.path_params["file_id"])
+        created = await run_in_threadpool(
+            _create_session, request.scope["ocu_chat_id"], request.path_params["file_id"], loop=loop,
+        )
     except FileIdNotFoundError:
         return _error(404, "unknown_file")
     except UnsupportedTypeError:
@@ -114,13 +119,15 @@ def create_session(request: Request) -> JSONResponse:
 
 
 async def save_session(request: Request) -> JSONResponse:
+    loop = asyncio.get_running_loop()
     try:
         intent = _save_intent(await request.body())
-        saved = await asyncio.to_thread(
-            _save_session,
+        saved = await run_save_worker(
+            request.app, _save_session,
             request.scope["ocu_chat_id"],
             request.path_params["session_id"],
             intent,
+            loop=loop,
         )
     except InvalidRequestError:
         return _error(422, "invalid_request")
@@ -149,10 +156,11 @@ async def save_session(request: Request) -> JSONResponse:
     return JSONResponse(status_code=202, content=saved)
 
 
-def close_session(request: Request) -> JSONResponse:
+async def close_session(request: Request) -> JSONResponse:
+    loop = asyncio.get_running_loop()
     try:
-        closed = _close_session(
-            request.scope["ocu_chat_id"], request.path_params["session_id"]
+        closed = await run_in_threadpool(
+            _close_session, request.scope["ocu_chat_id"], request.path_params["session_id"], loop=loop,
         )
     except UnknownSessionError:
         return _error(404, "unknown_session")
@@ -169,7 +177,9 @@ def close_session(request: Request) -> JSONResponse:
     return JSONResponse(status_code=202, content=closed)
 
 
-def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
+def _create_session(
+    chat_id: str, file_id: str, *, loop: asyncio.AbstractEventLoop,
+) -> dict[str, Any]:
     chat = docker_manager.canonical_lock_chat_id(chat_id)
     if not isinstance(file_id, str) or not file_id or "\x00" in file_id:
         raise FileIdNotFoundError("file_id is not an active persisted identity")
@@ -183,7 +193,9 @@ def _create_session(chat_id: str, file_id: str) -> dict[str, Any]:
         if document_type is None:
             raise UnsupportedTypeError()
         state = store.read(chat)
-        state, active, restore_epoch, orphaned_here = _reopen_session(store, chat, file_id, state)
+        state, active, restore_epoch, orphaned_here = _reopen_session(
+            store, chat, file_id, state, loop=loop,
+        )
         if any(entry.get("requester") == "restore" and entry.get("session_id") is None
                and entry.get("file_id") == file_id for entry in state["journal"].values()):
             from .publish import RecoveryRequiredError, SandboxStateError, recover_publications
@@ -381,7 +393,7 @@ def _final_receipt(state, session_id) -> tuple[int, dict[str, Any]] | None:
     return found
 
 
-def _reopen_session(store, chat, file_id, state):
+def _reopen_session(store, chat, file_id, state, *, loop: asyncio.AbstractEventLoop):
     """Apply the canonical create/reopen decision while the caller holds the chat lock."""
     active = _open_session(state, file_id)
     restore_epoch = epoch.current_epoch()
@@ -394,7 +406,10 @@ def _reopen_session(store, chat, file_id, state):
         if active["restore_epoch"] != restore_epoch:
             reason = "restore_epoch_changed"
         elif active["state"] != "opening" and not ended:
-            outcome = asyncio.run(commands.lookup_key(active["document_key"]))
+            outcome = commands.run_command(
+                commands.lookup_key(active["document_key"]), loop,
+                unreachable=commands.KeyLookupOutcome.UNREACHABLE,
+            )
             if outcome is commands.KeyLookupOutcome.UNREACHABLE:
                 raise DocumentServerUnavailableError()
             if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
@@ -671,7 +686,7 @@ def _maybe_orphan_epoch(store, chat, record, session_id):
     return None
 
 
-def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
+def _save_session(chat_id, session_id, intent, *, loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
     from .publish import RecoveryRequiredError, SandboxStateError
 
     chat, store = _load_session(chat_id, session_id)
@@ -709,7 +724,10 @@ def _save_session(chat_id, session_id, intent) -> dict[str, Any]:
 
         prepared = {}
         store.update(chat, mutate)
-    outcome = asyncio.run(commands.forcesave(prepared["document_key"], prepared["save_seq"], intent))
+    outcome = commands.run_command(
+        commands.forcesave(prepared["document_key"], prepared["save_seq"], intent), loop,
+        unreachable=commands.ForceSaveOutcome.UNREACHABLE,
+    )
     try:
         return _reconcile_save(store, chat, session_id, prepared["save_seq"], intent, document_key, outcome)
     except (RecoveryRequiredError, SandboxStateError) as extra:
@@ -813,7 +831,7 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
     raise DocumentServerUnavailableError(save_seq=save_seq)
 
 
-def _close_session(chat_id, session_id) -> dict[str, Any]:
+def _close_session(chat_id, session_id, *, loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
     chat, store = _load_session(chat_id, session_id)
     with docker_manager._combined_lock(chat):
         state = store.read(chat)
@@ -851,7 +869,10 @@ def _close_session(chat_id, session_id) -> dict[str, Any]:
                 "state": "conflict",
             }
         if record["state"] in ("editing", "saving"):
-            outcome = asyncio.run(commands.lookup_key(record["document_key"]))
+            outcome = commands.run_command(
+                commands.lookup_key(record["document_key"]), loop,
+                unreachable=commands.KeyLookupOutcome.UNREACHABLE,
+            )
             if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
                 _orphan_session(store, chat, session_id, "editor_state_lost")
                 raise SessionNotOpenError()

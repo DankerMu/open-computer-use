@@ -3,6 +3,7 @@
 """Surviving publication obligations through the existing Office sweep."""
 from __future__ import annotations
 
+import asyncio
 import copy
 import errno
 import hashlib
@@ -15,6 +16,7 @@ import time
 
 import pytest
 from docker.errors import NotFound
+from anyio.from_thread import start_blocking_portal
 
 from tests.orchestrator._office_store import CHAT, _outputs
 from tests.orchestrator.test_lifecycle import _bind_outputs_broker, _container, _docker
@@ -84,7 +86,8 @@ def test_sweep_publishes_unstarted_obligation_in_office_only_chat(world, monkeyp
     assert not (data / CHAT / ".meta.json").exists()
     assert not (data / CHAT / ".idle.json").exists()
 
-    sweep_office_sessions(now=now)
+    with start_blocking_portal() as portal:
+        sweep_office_sessions(now=now, loop=portal.call(asyncio.get_running_loop))
 
     assert target.read_bytes() == b"published-v2"
     expected = copy.deepcopy(before)

@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Bounded Office command completion.** DocumentServer lookup and force-save
+  retain the 10-second command budget despite held DNS, with existing caller
+  outcomes and lock/state behavior. Lifespan-owned save workers preserve induced
+  callback progress, request-context isolation, queued/running cancellation
+  semantics and cleanup of admitted transactions.
+
 - **Office contention startup cleanup.** Controlled startup/readiness failures
   retain their initiating exception while acquired holders are released and
   observed, child pipes are closed, only started watchdogs are joined, and

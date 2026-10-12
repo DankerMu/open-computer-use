@@ -14,6 +14,7 @@ import docker_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from outputs_broker import FileIdNotFoundError, OutputsBroker, OutputsBrokerError
+from starlette.concurrency import run_in_threadpool
 
 from . import config, publish, sessions, versions, workspace
 from .epoch import RestoreEpochError
@@ -64,10 +65,12 @@ def _admit_path(chat, path, max_bytes):
 
 
 async def restore_version(request: Request) -> JSONResponse:
+    loop = asyncio.get_running_loop()
     try:
         number = _number(await request.body())
-        result = await asyncio.to_thread(
+        result = await run_in_threadpool(
             _restore_version, request.scope["ocu_chat_id"], request.path_params["file_id"], number,
+            loop=loop,
         )
     except sessions.InvalidRequestError:
         return sessions._error(422, "invalid_request")
@@ -92,7 +95,7 @@ async def restore_version(request: Request) -> JSONResponse:
     return JSONResponse(status_code=200, content=result)
 
 
-def _restore_version(chat_id, file_id, number):
+def _restore_version(chat_id, file_id, number, *, loop: asyncio.AbstractEventLoop):
     chat = docker_manager.canonical_lock_chat_id(chat_id)
     store, broker = OfficeStore(), OutputsBroker()
     store._assert_chat_root_safe(chat, allow_missing=True)
@@ -102,7 +105,9 @@ def _restore_version(chat_id, file_id, number):
         broker.resolve_file_id(chat, file_id)
         state = store.read(chat)
         _selected(state, file_id, number)
-        state, _active, _epoch, _orphaned = sessions._reopen_session(store, chat, file_id, state)
+        state, _active, _epoch, _orphaned = sessions._reopen_session(
+            store, chat, file_id, state, loop=loop,
+        )
         # Reopen recovery can move a session to a successor; never follow it.
         broker.resolve_file_id(chat, file_id)
         if sessions._open_session(state, file_id) is not None:

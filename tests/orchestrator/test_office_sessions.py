@@ -1107,33 +1107,38 @@ def test_creation_holds_chat_lock_through_signing_and_preserves_other_document(o
         "RELEASE": str(release),
     })
     source = r'''
-import fcntl, json, os, time
+import asyncio, fcntl, json, os, time
 from pathlib import Path
+from anyio.from_thread import start_blocking_portal
 from office.sessions import _create_session
-if os.environ["ROLE"] == "holder":
-    clock = time.time
-    def hold_signing():
-        time.time = clock
-        Path(os.environ["ENTERED"]).write_text("signing")
-        fd = os.open(os.environ["RELEASE"], os.O_RDONLY)
-        os.close(fd)
-        return clock()
-    time.time = hold_signing
-else:
-    original = fcntl.flock
-    def observe_contention(fd, operation):
-        if operation == fcntl.LOCK_EX:
-            try:
-                original(fd, operation | fcntl.LOCK_NB)
-            except BlockingIOError:
-                Path(os.environ["CONTENDED"]).write_text("blocked")
-                fcntl.flock = original
-                return original(fd, operation)
-            original(fd, fcntl.LOCK_UN)
-            raise AssertionError("creation released the chat lock before signing")
-        return original(fd, operation)
-    fcntl.flock = observe_contention
-result = _create_session(os.environ["CHAT"], os.environ["FILE"])
+with start_blocking_portal() as portal:
+    loop = portal.call(asyncio.get_running_loop)
+    if os.environ["ROLE"] == "holder":
+        clock = time.time
+        def hold_signing():
+            time.time = clock
+            Path(os.environ["ENTERED"]).write_text("signing")
+            fd = os.open(os.environ["RELEASE"], os.O_RDONLY)
+            os.close(fd)
+            return clock()
+        time.time = hold_signing
+    else:
+        original = fcntl.flock
+        def observe_contention(fd, operation):
+            if operation == fcntl.LOCK_EX:
+                try:
+                    original(fd, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    Path(os.environ["CONTENDED"]).write_text("blocked")
+                    fcntl.flock = original
+                    return original(fd, operation)
+                original(fd, fcntl.LOCK_UN)
+                raise AssertionError("creation released the chat lock before signing")
+            return original(fd, operation)
+        fcntl.flock = observe_contention
+    result = _create_session(
+        os.environ["CHAT"], os.environ["FILE"], loop=loop,
+    )
 print(json.dumps({"session_id": result["session_id"], "file_id": result["file_id"]}))
 '''
     holder = waiter = None

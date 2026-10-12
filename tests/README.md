@@ -68,6 +68,45 @@ This scope covers controlled startup faults and the successful contention paths,
 not request cancellation, arbitrary simultaneous cleanup failures, deployment
 behavior, or cross-platform leak freedom. Production locks and callbacks are unchanged.
 
+### Office command deadlines and save-worker ownership
+
+Run the focused command protocol and ownership scope with the canonical discovery root:
+
+```bash
+uv run --no-project --with pytest \
+  --with-requirements computer-use-server/requirements.txt -- \
+  python -m pytest tests/ -q \
+  --import-mode=importlib --ignore=tests/integration \
+  -k 'test_office_commands.py or test_office_command_deadline.py or test_office_save_workers.py'
+```
+
+The regressions cover:
+
+- Real held threaded DNS for join/reopen, close, save and the Office poll. Timing
+  starts before caller submission with the unchanged 10-second command budget
+  and a 150 ms test scheduling allowance. Caller completion and lookup-lock
+  release must precede resolver release/return; force-save waits outside the lock.
+- Healthy real DNS with one default-executor worker, including history restore's
+  known-key `409 session_open` admission and unchanged persisted bytes.
+- Authenticated command-induced callback completion with one available AnyIO
+  worker before an accepted force-save response is released and save returns `202`.
+- Cancelled queued saves without allocation or commands, and cancelled running
+  requests whose admitted transactions finish outcome-specific reconciliation.
+- Fresh request-context isolation through workers and loop submission; lifespan
+  failures before/after supervisor acquisition, publication and shutdown; draining
+  real workers through repeated asyncio and AnyIO cancellation while both shared
+  worker domains remain occupied.
+
+Commands execute on the service loop. Whole synchronous save transactions use a
+lifespan-owned executor separate from DNS and callback workers; cleanup drains
+actual admitted work before releasing lifecycle dependencies.
+
+This selected scope is not all Office or deployment coverage. Runtime fault
+probes must record the selected event-loop backend and observe actual resolver
+entry; a healthy auto-selected backend run does not prove held-threaded-DNS
+behavior. The scheduling allowance is not a production timeout or SLA, and
+worker draining supplies neither forced thread termination nor a shutdown deadline.
+
 ## Test Scripts
 
 | Script | What it validates | Docker required |
