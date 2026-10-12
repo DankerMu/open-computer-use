@@ -1577,16 +1577,16 @@ def test_short_pause_inside_idle_window_does_not_stop(world):
 
 def test_lock_open_failure_releases_thread_lock_for_other_thread(world, monkeypatch):
     docker_manager, _client, _clock, tmp_path = world
-    original_open = Path.open
+    original_open = os.open
     failures = {"n": 0}
 
-    def open_maybe(self, *args, **kwargs):
-        if self.name == ".lifecycle.lock" and failures["n"] == 0:
+    def open_maybe(name, *args, **kwargs):
+        if os.fsdecode(name) == ".lifecycle.lock" and failures["n"] == 0:
             failures["n"] += 1
             raise OSError("disk full")
-        return original_open(self, *args, **kwargs)
+        return original_open(name, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", open_maybe)
+    monkeypatch.setattr(os, "open", open_maybe)
     with pytest.raises(OSError):
         with docker_manager._combined_lock(CHAT):
             pass

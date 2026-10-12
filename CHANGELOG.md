@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Descriptor-pinned lifecycle locks.** Shared Office sweep and sandbox reap
+  acquisition opens chat and lock entries without following symlinks and verifies
+  a regular lock before flock. Concurrent first creation, parent synchronization
+  and configured data-root aliases remain supported; non-creating acquisition
+  does not create an absent chat.
+
 - **Owned Office test HTTP origins.** Command, recording, content and download
   fixtures drain admitted handlers and close accepted/listening sockets within a
   bounded teardown. Held responses are released on exceptional exit; unexpected

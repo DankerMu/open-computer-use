@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 from urllib.parse import quote, urlsplit
 
 import pytest
@@ -414,31 +415,34 @@ def test_removed_chat_callback_is_unknown_session_without_create(office_world, m
     assert origin.hits == 0
 
 
-def _disappearing_lock_open(monkeypatch, data):
-    from pathlib import Path
+def _disappearing_chat_open(monkeypatch, data):
+    import docker_manager
 
-    original_open = Path.open
+    original_open = os.open
 
-    def disappearing_open(path, *args, **kwargs):
-        if path == data / CHAT / ".lifecycle.lock":
+    def disappearing_open(name, *args, **kwargs):
+        if (
+            os.fsdecode(name) == CHAT
+            and sys._getframe(1).f_code is docker_manager._CombinedLock._open_file.__code__
+        ):
             shutil.rmtree(data / CHAT)
-        return original_open(path, *args, **kwargs)
+        return original_open(name, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", disappearing_open)
+    monkeypatch.setattr(os, "open", disappearing_open)
 
 
-def test_source_chat_removed_between_lstat_and_lock_open_is_invalid_ticket(office_world, monkeypatch):
+def test_source_chat_removed_before_directory_admission_is_invalid_ticket(office_world, monkeypatch):
     http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
-    _disappearing_lock_open(monkeypatch, data)
+    _disappearing_chat_open(monkeypatch, data)
     response = http.get(_source_path(session))
     _assert_refusal(response, 401, "invalid_ticket")
     assert not (data / CHAT).exists()
     assert origin.hits == 0
 
 
-def test_callback_chat_removed_between_lstat_and_lock_open_is_unknown_session(office_world, monkeypatch):
+def test_callback_chat_removed_before_directory_admission_is_unknown_session(office_world, monkeypatch):
     http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
-    _disappearing_lock_open(monkeypatch, data)
+    _disappearing_chat_open(monkeypatch, data)
     response = http.post(
         _callback_path(session),
         headers={"Authorization": "Bearer " + _header_jwt(session)},
