@@ -97,7 +97,7 @@ def _info(monkeypatch, key, *, code=0, status=200, entered=None, release=None):
         if release is not None:
             assert release.wait(5), "lookup test did not release its HTTP responder"
         return status, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode()
-    with _command_origin(responder) as origin:
+    with _command_origin(responder, release=release) as origin:
         with monkeypatch.context() as env:
             env.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
             yield origin

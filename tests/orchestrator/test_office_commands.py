@@ -11,12 +11,12 @@ import json
 import socket
 import sys
 import threading
-import time
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
@@ -79,7 +79,7 @@ class _CommandOrigin:
         self._lock = threading.Lock()
         parent = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(OriginRequestHandler):
             def log_message(self, format, *args):
                 return
 
@@ -109,7 +109,7 @@ class _CommandOrigin:
                         self.wfile.write(chunk)
                         self.wfile.flush()
                         if index + 1 < len(payload):
-                            time.sleep(0.05)
+                            parent._lifetime.pause(0.05)
                 else:
                     self.wfile.write(payload)
 
@@ -123,27 +123,22 @@ class _CommandOrigin:
                 self.end_headers()
                 self.wfile.write(payload)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._lifetime = HttpOriginLifetime(Handler)
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        return self._lifetime.url
 
     def stop(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-        self._thread.join(timeout=2)
+        self._lifetime.stop()
 
 
 @contextmanager
-def _command_origin(responder, trap=None):
+def _command_origin(responder, trap=None, *, release=None):
     origin = _CommandOrigin(responder, trap=trap)
-    try:
+    with origin._lifetime:
+        origin._lifetime.release_on_close(release)
         yield origin
-    finally:
-        origin.stop()
 
 
 def _json_error(code):
@@ -265,7 +260,7 @@ def test_timeout_is_unreachable_and_does_not_follow_redirects(monkeypatch):
 
     def sleeper(_handler, _body, _parent):
         started.set()
-        time.sleep(1)
+        _parent._lifetime.pause(1)
         return 200, {"Content-Type": "application/json"}, b'{"error":0}'
 
     def redirect(handler, _body, parent):
@@ -376,7 +371,7 @@ def test_cancellation_propagates_and_secrets_stay_out_of_errors(monkeypatch, cap
             await task
         return excinfo
 
-    with _command_origin(blocker) as origin:
+    with _command_origin(blocker, release=release) as origin:
         monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
         excinfo = _run(cancelled())
         extra = f"{excinfo.value!s} {excinfo.value!r}"

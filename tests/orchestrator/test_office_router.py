@@ -6,13 +6,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import threading
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
 import pytest
+
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
@@ -56,7 +56,7 @@ class _RecordingOrigin:
         self.hits = 0
         parent = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(OriginRequestHandler):
             def log_message(self, format, *args):
                 return
 
@@ -74,27 +74,21 @@ class _RecordingOrigin:
             def do_OPTIONS(self):
                 self._record()
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._lifetime = HttpOriginLifetime(Handler)
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        return self._lifetime.url
 
     def stop(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-        self._thread.join(timeout=2)
+        self._lifetime.stop()
 
 
 @contextmanager
 def _recording_origin():
     origin = _RecordingOrigin()
-    try:
+    with origin._lifetime:
         yield origin
-    finally:
-        origin.stop()
 
 
 def _inventory(root: Path):
