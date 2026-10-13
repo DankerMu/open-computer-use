@@ -384,7 +384,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from docker.errors import NotFound
 import docker_manager
-from office.publish import publish, recover_publications
+from office.publish import RecoveryRequiredError, publish, recover_publications
 
 data, chat = Path(os.environ["OCU_BASE"]), os.environ["OCU_CHAT"]
 office = data / chat / ".ocu" / "office"
@@ -513,11 +513,22 @@ def synced(fd):
         pending_sync = None
     return answer
 os.open, os.link, os.replace, os.unlink, os.fsync = opened, linked, replaced, unlinked, synced
-if mode == "publish":
-    publish(chat, "publish-save-3")
+if mode == "publish-result":
+    result = publish(chat, "publish-save-3")
+    print(json.dumps({"outcome": result.outcome, "reason": result.reason}), flush=True)
+elif mode == "recover-pending":
+    try:
+        recover_publications(chat)
+    except RecoveryRequiredError:
+        print("pending", flush=True)
+    else:
+        print("completed", flush=True)
 else:
-    recover_publications(chat)
-print("completed", flush=True)
+    if mode == "publish":
+        publish(chat, "publish-save-3")
+    else:
+        recover_publications(chat)
+    print("completed", flush=True)
 '''
 
 
@@ -557,6 +568,91 @@ def _fresh_recover(fixture, engine_state=None, *, wall_time=106.0):
     )
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
     assert completed.stdout.strip() == "completed"
+
+
+def test_killed_replaced_publication_retains_index_outage_and_recovers_once(world):
+    fixture = _prepared(world, "absent")
+    office = fixture.data / CHAT / ".ocu" / "office"
+    index = office.parent / "index.json"
+    healthy_index = index.read_bytes()
+    original_inode = fixture.target.stat().st_ino
+    versions = _snapshot(office / "versions")
+
+    _crash(fixture, "replace-after")
+    assert fixture.target.read_bytes() == SAVED
+    inode = fixture.target.stat().st_ino
+    assert inode != original_inode
+    before = fixture.store.read(CHAT)
+    assert OBLIGATION in before["journal"]
+    assert before["documents"] == fixture.before["documents"]
+    assert before["sessions"] == fixture.before["sessions"]
+    assert before["receipts"] == fixture.before["receipts"]
+
+    corrupt_index = b"{unavailable-index"
+    index.write_bytes(corrupt_index)
+
+    def run(mode):
+        completed = subprocess.run(
+            [sys.executable, "-c", _CRASH_WORKER],
+            env=_child_env(
+                fixture.data, CRASH_MARKER=str(fixture.data.parent / "unused-marker"),
+                CRASH_MODE=mode,
+            ),
+            capture_output=True, text=True, timeout=15,
+        )
+        assert completed.returncode == 0, (completed.stdout, completed.stderr)
+        return completed.stdout.strip()
+
+    result = json.loads(run("publish-result"))
+    pending = fixture.store.read(CHAT)
+    assert (result, OBLIGATION in pending["journal"]) == (
+        {"outcome": "interrupted", "reason": "index_unavailable"}, True,
+    )
+    assert pending["documents"] == before["documents"]
+    assert pending["sessions"] == before["sessions"]
+    assert pending["receipts"] == before["receipts"]
+    assert fixture.target.read_bytes() == SAVED
+    assert fixture.target.stat().st_ino == inode
+    assert _snapshot(office / "versions") == versions
+    assert index.read_bytes() == corrupt_index
+
+    assert run("recover-pending") == "pending"
+    pending = fixture.store.read(CHAT)
+    assert OBLIGATION in pending["journal"]
+    assert pending["documents"] == before["documents"]
+    assert pending["sessions"] == before["sessions"]
+    assert pending["receipts"] == before["receipts"]
+    assert fixture.target.read_bytes() == SAVED
+    assert fixture.target.stat().st_ino == inode
+    assert _snapshot(office / "versions") == versions
+    assert index.read_bytes() == corrupt_index
+
+    index.write_bytes(healthy_index)
+    _fresh_recover(fixture)
+    registered = json.loads(index.read_bytes())
+    assert registered["counter"] == fixture.indexed["revision"] + 1
+    active = registered["active"]["report.docx"]
+    assert active["file_id"] == fixture.file_id
+    assert active["hash"] == _sha(SAVED)
+    assert active["size"] == len(SAVED)
+    assert active["revision"] == fixture.indexed["revision"] + 1
+
+    expected = copy.deepcopy(fixture.before)
+    expected["documents"][fixture.file_id]["versions"][1]["published"] = True
+    expected["documents"][fixture.file_id]["published_version"] = 2
+    expected["documents"][fixture.file_id]["published_sha256"] = _sha(SAVED)
+    expected["sessions"][SESSION]["baseline_sha256"] = _sha(SAVED)
+    expected["sessions"][SESSION]["last_published_seq"] = 3
+    del expected["journal"][OBLIGATION]
+    assert fixture.store.read(CHAT) == expected
+    assert fixture.target.read_bytes() == SAVED
+    assert fixture.target.stat().st_ino == inode
+    assert _snapshot(office / "versions") == versions
+
+    completed = _snapshot(fixture.data)
+    _fresh_recover(fixture)
+    assert _snapshot(fixture.data) == completed
+    assert fixture.target.stat().st_ino == inode
 
 
 @pytest.mark.parametrize("cut", [

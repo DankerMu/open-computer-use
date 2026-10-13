@@ -694,6 +694,8 @@ def test_workspace_permission_failure_retains_obligation_before_replace(world, m
     obligation = after["journal"][OBLIGATION]
     assert obligation["target_path"] == "report.docx"
     assert obligation["temporary_name"].startswith(".office-publish.")
+    assert obligation["initial_revision"] == fixture.indexed["revision"]
+    del obligation["initial_revision"]
     del obligation["target_path"]
     del obligation["temporary_name"]
     obligation.pop("staging", None)

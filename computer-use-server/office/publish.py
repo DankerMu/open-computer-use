@@ -421,6 +421,10 @@ def _remove_owned(parent_fd, name, identity):
 
 
 def _prepared_fields(entry):
+    if entry.get("requester") in ("save", "final") and "initial_revision" in entry:
+        if (("copy" not in entry and "target_path" not in entry)
+                or type(entry["initial_revision"]) is not int or entry["initial_revision"] < 0):
+            raise StateCorruptError("publish registration revision binding is invalid")
     if "copy" in entry:
         if (entry.get("requester") != "final"
                 and not (entry.get("requester") == "resolve" and entry.get("action") == "save_as")
@@ -453,6 +457,20 @@ def _prepared_fields(entry):
             or not isinstance(binding.get("witness_name"), str)
             or not re.fullmatch(r"\.publish-owner\.[0-9a-f]{32}", binding["witness_name"])):
         raise StateCorruptError("publish ownership binding is invalid")
+    progress = ("replacement_started", "target_device", "target_inode")
+    if any(key in binding for key in progress):
+        if (not _retains_replacement(entry)
+                or type(binding.get("replacement_started")) is not bool
+                or any(type(binding.get(key)) is not int or binding[key] < 0
+                       for key in ("target_device", "target_inode"))):
+            raise StateCorruptError("publish replacement progress binding is invalid")
+
+
+def _retains_replacement(entry):
+    return ("copy" not in entry and (
+        entry["requester"] in ("save", "final")
+        or entry["requester"] == "resolve" and entry["action"] == "overwrite"
+    ))
 
 
 class _Stage:
@@ -514,6 +532,76 @@ class _Stage:
         if binding.get("retired", False):
             return None
         return identity if found else None
+
+    def replacement_state(self, parent, target_name, *, absent_parent=None):
+        """Classify an index outage without retiring its ownership evidence."""
+        identity = self.inspect()
+        binding = self.entry.get("staging")
+        if absent_parent is not None:
+            absent_parent.confirm()
+            if binding is None or binding.get("replacement_started") is False:
+                return "before"
+            return "uncertain"
+        try:
+            shared = os.lstat(self.entry["temporary_name"], dir_fd=parent)
+        except FileNotFoundError:
+            shared = None
+        if shared is not None and (
+                identity is None or not stat.S_ISREG(shared.st_mode)
+                or _identity(shared) != identity):
+            return "uncertain"
+        if binding is None:
+            return "before"
+        if identity is None:
+            # False intent survives native pre-replacement retirement. Retired
+            # inode numbers themselves never authorize ownership or deletion.
+            if binding.get("retired", False) and binding.get("replacement_started") is False:
+                return "before"
+            return "uncertain"
+        pin = None
+        try:
+            for name in (binding["witness_name"], binding["anchor_name"]):
+                try:
+                    pin = os.open(name, _FILE_FLAGS, dir_fd=self.directory)
+                except FileNotFoundError:
+                    continue
+                info = os.fstat(pin)
+                if not stat.S_ISREG(info.st_mode) or _identity(info) != identity:
+                    return "uncertain"
+                break
+            if pin is None:
+                return "uncertain"
+            try:
+                target = os.lstat(target_name, dir_fd=parent)
+            except FileNotFoundError:
+                return "before" if binding.get("replacement_started") is False else "uncertain"
+            if not stat.S_ISREG(target.st_mode):
+                return "uncertain"
+            private_links = 0
+            for name in (binding["anchor_name"], binding["witness_name"]):
+                try:
+                    private = os.lstat(name, dir_fd=self.directory)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(private.st_mode) or _identity(private) != identity:
+                    return "uncertain"
+                private_links += 1
+            owned_links = private_links + (shared is not None) + (_identity(target) == identity)
+            if os.fstat(pin).st_nlink != owned_links:
+                return "uncertain"
+            if _identity(target) == identity:
+                if shared is None and binding.get("replacement_started") is not False:
+                    return "replaced"
+                return "uncertain"
+            original = binding.get("target_device"), binding.get("target_inode")
+            if (_identity(target) == original and (
+                    binding.get("replacement_started") is False
+                    or binding.get("replacement_started") is True and shared is not None)):
+                return "before"
+            return "uncertain"
+        finally:
+            if pin is not None:
+                os.close(pin)
 
     def remove_shared(self, parent):
         identity = self.inspect()
@@ -578,7 +666,7 @@ class _Stage:
                 except OSError:
                     _record("Office publication workspace cleanup failed", chat_id=self.chat)
 
-    def allocate(self, journal_id, content, fence):
+    def allocate(self, journal_id, content, fence, *, target_identity=None):
         name = self.entry["temporary_name"]
         witness = f".publish-owner.{uuid.uuid4().hex}"
         fd = os.open(name, _WRITE_FLAGS, 0o600, dir_fd=self.directory)
@@ -596,6 +684,9 @@ class _Stage:
                 "schema_version": 1, "anchor_name": name, "witness_name": witness,
                 "device": identity[0], "inode": identity[1], "retired": False,
             }
+            if target_identity is not None:
+                binding.update(replacement_started=False,
+                               target_device=target_identity[0], target_inode=target_identity[1])
             def bind(state):
                 state["journal"][journal_id]["staging"] = binding
             self.store.update(self.chat, bind)
@@ -961,6 +1052,8 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
     fence = _Fence(store, chat, container)
     held, stage = [], None
     replaced, result = False, None
+    retain_replacement = _retains_replacement(entry)
+    preserve_stage = False
     writer_excluded = container is None or container.status == "exited" or paused
     try:
         path = None
@@ -985,9 +1078,7 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
             if writer_excluded:
                 result = save_as_mod.drive(store, broker, chat, journal_id, entry, selected, fence, None)
                 return result
-        # Recorded replacement paths remain obligations if the index moved them.
-        # Cleanup and retirement precede identity-missing copy classification so
-        # an older prepared witness is not abandoned when the source is already tombstoned.
+        # Classify live ownership before cleanup can retire replacement proof.
         if "target_path" in entry:
             if not writer_excluded:
                 if not fence.acquire():
@@ -997,6 +1088,23 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
             previous, absent = _prepared_parents(chat, workspace._parts(entry["target_path"]))
             try:
                 stage = _Stage(store, chat, journal_id, entry)
+                if (retain_replacement and result is not None
+                        and result.reason == "index_unavailable"):
+                    try:
+                        replacement = stage.replacement_state(
+                            previous[-1] if absent is None else None,
+                            workspace._parts(entry["target_path"])[-1], absent_parent=absent,
+                        )
+                    except RecoveryRequiredError:
+                        replacement = "uncertain"
+                    if replacement != "before":
+                        preserve_stage = True
+                        result = PublishResult("interrupted", "index_unavailable")
+                        return result
+                elif (retain_replacement and "initial_revision" not in entry
+                        and entry.get("staging") is not None
+                        and entry["staging"].get("replacement_started") is not False):
+                    raise RecoveryRequiredError("legacy publication registration is uncertain")
                 stage.cleanup(previous[-1] if absent is None else None, absent_parent=absent)
                 stage.close()
                 stage = None
@@ -1065,13 +1173,14 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
         if result is None:
             parts = workspace._parts(path)
             temporary = f".office-publish.{uuid.uuid4().hex}.tmp"
-            initial_revision = broker.current_revision(chat) if entry["requester"] in ("resolve", "restore") else None
+            initial_revision = entry.get("initial_revision")
+            if initial_revision is None:
+                initial_revision = broker.current_revision(chat)
             def prepare(working):
                 live = working["journal"][journal_id]
                 live.update(target_path=path, temporary_name=temporary)
                 live.pop("staging", None)
-                if initial_revision is not None:
-                    live.setdefault("initial_revision", initial_revision)
+                live.setdefault("initial_revision", initial_revision)
             fence.checkpoint()
             entry = store.update(chat, prepare)["journal"][journal_id]
             try:
@@ -1194,7 +1303,10 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                 if not already_replaced:
                     stage = _Stage(store, chat, journal_id, entry)
                     fence.checkpoint()
-                    owned = stage.allocate(journal_id, content, fence)
+                    owned = stage.allocate(
+                        journal_id, content, fence,
+                        target_identity=_identity(target) if retain_replacement else None,
+                    )
                     fence.checkpoint()
                     try:
                         _revalidate(chat, parts, held, _identity(target))
@@ -1210,6 +1322,12 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                         result = PublishResult("failed", "unsafe_path")
                     fence.checkpoint()
                     if result is None:
+                        if retain_replacement:
+                            def start(working):
+                                working["journal"][journal_id]["staging"]["replacement_started"] = True
+                            entry = store.update(chat, start)["journal"][journal_id]
+                            stage.entry = entry
+                            fence.checkpoint()
                         os.replace(temporary, parts[-1], src_dir_fd=held[-1], dst_dir_fd=held[-1])
                         replaced = True
                         fence.checkpoint()
@@ -1217,9 +1335,11 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                         fence.checkpoint()
                 if result is None:
                     registered = None
-                    if entry["requester"] in ("resolve", "restore") and already_replaced:
+                    if (already_replaced and "initial_revision" in entry
+                            and (retain_replacement or entry["requester"] == "restore")):
                         active = save_as_mod._index(broker, chat).get(path)
                         if (active is not None and active["file_id"] == entry["file_id"]
+                                and active["path"] == path
                                 and active["hash"] == selected["sha256"]
                                 and active["size"] == selected["size"]
                                 and active["revision"] > entry["initial_revision"]):
@@ -1265,7 +1385,7 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
         cleanup_error = None
         retirement_error = None
         try:
-            if stage is not None and held and writer_excluded:
+            if stage is not None and held and writer_excluded and not preserve_stage:
                 persisted = store.read(chat)["journal"].get(journal_id)
                 if persisted is not None:
                     stage.entry = persisted
