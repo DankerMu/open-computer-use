@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Missing-root Office save-as recovery.** Retire and sync only journal-proven
+  private names before clearing responsibility, preserving an existing durable
+  failure reason when outputs disappears. Proven partial unlink and durably
+  completed retirement resume without recreating outputs or collecting unrelated
+  private content.
+
 - **Bounded Office command completion.** DocumentServer lookup and force-save
   retain the 10-second command budget despite held DNS, with existing caller
   outcomes and lock/state behavior. Lifespan-owned save workers preserve induced
