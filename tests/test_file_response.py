@@ -556,17 +556,21 @@ def test_file_response_termination_before_first_body_releases_ownership(
     workspace, file_io, termination, download, method
 ):
     messages = []
+    cancellation_requests = []
     file_io.recycle = True
 
     async def scenario():
         response = await _response(workspace, download)
         async def receive():
+            if termination == "cancel":
+                await _receive_until_cancelled()
             return {"type": "http.disconnect"}
         with anyio.CancelScope() as scope:
             async def send(message):
                 messages.append(message)
                 if termination == "cancel" and message["type"] == "http.response.start":
                     scope.cancel()
+                    cancellation_requests.append(scope.cancel_called)
                     await anyio.lowlevel.checkpoint()
             with anyio.fail_after(WAIT_SECONDS):
                 await response(_scope(method), receive, send)
@@ -579,6 +583,11 @@ def test_file_response_termination_before_first_body_releases_ownership(
         file_io.assert_reused_descriptor_survives()
     if method == "HEAD":
         assert file_io.read_sizes == []
+    if termination == "cancel":
+        assert sum(message["type"] == "http.response.start" for message in messages) == 1, (
+            "Response-start cancellation boundary was never reached"
+        )
+        assert cancellation_requests == [True], "Response-start did not request scope cancellation"
 
 
 @pytest.mark.parametrize("termination", ("disconnect", "cancel"))
