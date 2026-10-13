@@ -3,6 +3,13 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Confined ordinary-file HEAD.** GET and explicit HEAD use one validated
+  workspace descriptor for file metadata and existing MIME, isolation,
+  disposition, validator and no-store policy. HEAD sends no payload and performs
+  no payload reads; completion, failure and cancellation release owned resources.
+  The reserved archive URI remains GET-only with HEAD returning 405; ordinary
+  in-root aliases to a file named `archive` remain supported.
+
 - **Office publication index-outage recovery.** Retain non-copy save, final and
   resolve-overwrite obligations after possible workspace replacement. Recovery
   preserves selected bytes and reuses committed registration without duplicate

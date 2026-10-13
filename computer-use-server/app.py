@@ -811,6 +811,7 @@ async def download_archive(chat_id: str):
 
 
 @app.get("/files/{chat_id}/{filename:path}", tags=["Files"])
+@app.head("/files/{chat_id}/{filename:path}", tags=["Files"])
 async def download_file(chat_id: str, filename: str, download: Optional[int] = None):
     """
     Download a specific file from chat outputs directory.
@@ -825,6 +826,12 @@ async def download_file(chat_id: str, filename: str, download: Optional[int] = N
     Raises:
         404: File not found
     """
+    if filename == "archive":
+        raise HTTPException(
+            status_code=405,
+            detail="Method Not Allowed",
+            headers={"Allow": "GET"},
+        )
     chat_id = sanitize_chat_id(chat_id)
     # Construct full path with traversal protection
     outputs_dir = safe_path(BASE_DATA_DIR, chat_id, "outputs")

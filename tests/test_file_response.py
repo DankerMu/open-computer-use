@@ -123,6 +123,7 @@ class _FileIO:
         self.block_read = False
         self.fail_read = False
         self.fail_setup = False
+        self.fail_setup_ordinal = None
         self.setup_faults = []
         self.read_faults = []
         self.worker_errors = []
@@ -215,7 +216,8 @@ class _FileIO:
             finally:
                 if target and ordinal == 1:
                     self.opener_metadata_finished.set()
-        if self.fail_setup and (item.st_dev, item.st_ino) == self.identity:
+        if (self.fail_setup and (item.st_dev, item.st_ino) == self.identity
+                and (self.fail_setup_ordinal is None or ordinal == self.fail_setup_ordinal)):
             self.setup_faults.append("fstat")
             raise BoundaryFailure("injected descriptor metadata failure")
         return item
@@ -342,10 +344,10 @@ def file_io(workspace, monkeypatch):
         observer.cleanup()
 
 
-def _scope():
+def _scope(method="GET"):
     return {
         "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
-        "http_version": "1.1", "method": "GET", "scheme": "http",
+        "http_version": "1.1", "method": method, "scheme": "http",
         "path": f"/files/{CHAT}/victim.txt", "raw_path": b"/files/victim.txt",
         "query_string": b"", "headers": [], "root_path": "",
         "server": ("testserver", 80), "client": ("127.0.0.1", 12345),
@@ -418,9 +420,61 @@ def test_completed_file_response_bounds_reads_and_closes_its_descriptor(
     file_io.assert_closed()
 
 
+@pytest.mark.parametrize("empty", (True, False), ids=("empty", "multi-chunk"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
-def test_file_response_metadata_failure_closes_any_acquired_descriptor(workspace, file_io, download):
+def test_completed_head_fstats_without_reads_and_closes_after_terminal_send(
+    workspace, file_io, empty, download
+):
+    _, victim, _ = workspace
+    victim.write_bytes(b"" if empty else b"0123456789abcdef" * (128 * 1024) + b"tail")
+    os.utime(victim, (1700000000, 1700000000))
+    file_io.fail_read = True
+    file_io.recycle = True
     messages = []
+    send_states = []
+
+    async def scenario():
+        response = await _response(workspace, download)
+        async def send(message):
+            messages.append(message)
+            send_states.append((message["type"], list(file_io.closed), list(file_io.live_files)))
+        with anyio.fail_after(WAIT_SECONDS):
+            await response(_scope("HEAD"), _receive_until_cancelled, send)
+
+    anyio.run(scenario)
+    assert len(file_io.acquired) == 1
+    fd = file_io.acquired[0]
+    assert file_io.target_fstats == [fd, fd]
+    assert all(identity == file_io.identity for identity in file_io.target_stat_results)
+    assert file_io.read_sizes == []
+    assert file_io.read_faults == []
+    assert [message["status"] for message in messages if message["type"] == "http.response.start"] == [200]
+    bodies = [message for message in messages if message["type"] == "http.response.body"]
+    assert bodies == [{"type": "http.response.body", "body": b"", "more_body": False}]
+    assert send_states == [
+        ("http.response.start", [], [fd]), ("http.response.body", [], [fd]),
+    ]
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    headers = dict(start["headers"])
+    assert headers[b"content-length"] == (b"0" if empty else b"2097156")
+    assert headers[b"etag"] == (
+        b'"e7d53fbff452d442c477af2510b0e0b0"' if empty
+        else b'"69c1476782e5783776d96540a5a7d719"'
+    )
+    assert headers[b"last-modified"] == b"Tue, 14 Nov 2023 22:13:20 GMT"
+    file_io.assert_closed()
+    file_io.assert_reused_descriptor_survives()
+
+
+@pytest.mark.parametrize("metadata_at", (1, 2), ids=("validation", "response"))
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_response_metadata_failure_closes_any_acquired_descriptor(
+    workspace, file_io, download, method, metadata_at
+):
+    messages = []
+    file_io.fail_setup_ordinal = metadata_at
+    file_io.recycle = True
 
     async def scenario():
         response = await _response(workspace, download)
@@ -428,12 +482,16 @@ def test_file_response_metadata_failure_closes_any_acquired_descriptor(workspace
         async def send(message):
             messages.append(message)
         with _expect_boundary_failure("metadata failure"), anyio.fail_after(WAIT_SECONDS):
-            await response(_scope(), _receive_until_cancelled, send)
+            await response(_scope(method), _receive_until_cancelled, send)
 
     anyio.run(scenario)
     assert file_io.setup_faults, "No genuine metadata boundary was faulted"
     assert messages == []
     file_io.assert_closed()
+    assert len(file_io.acquired) == 1
+    file_io.assert_reused_descriptor_survives()
+    if method == "HEAD":
+        assert file_io.read_sizes == []
 
 
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
@@ -458,9 +516,12 @@ def test_file_response_read_failure_closes_without_a_second_response(workspace, 
     file_io.assert_reused_descriptor_survives()
 
 
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize("failure_at", ("start", "body"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
-def test_file_response_send_failure_releases_ownership(workspace, file_io, failure_at, download):
+def test_file_response_send_failure_releases_ownership(
+    workspace, file_io, failure_at, download, method
+):
     file_io.recycle = True
     messages = []
     failures = []
@@ -473,7 +534,7 @@ def test_file_response_send_failure_releases_ownership(workspace, file_io, failu
                 failures.append(message["type"])
                 raise BoundaryFailure("injected ASGI send failure")
         with _expect_boundary_failure("ASGI send failure"), anyio.fail_after(WAIT_SECONDS):
-            await response(_scope(), _receive_until_cancelled, send)
+            await response(_scope(method), _receive_until_cancelled, send)
 
     anyio.run(scenario)
     assert failures == [f"http.response.{failure_at}"]
@@ -483,28 +544,36 @@ def test_file_response_send_failure_releases_ownership(workspace, file_io, failu
     file_io.assert_closed()
     if file_io.acquired:
         file_io.assert_reused_descriptor_survives()
+    if method == "HEAD":
+        assert file_io.read_sizes == []
+        assert not any(message.get("body") for message in messages)
 
 
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize("termination", ("disconnect", "cancel"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_file_response_termination_before_first_body_releases_ownership(
-    workspace, file_io, termination, download
+    workspace, file_io, termination, download, method
 ):
     messages = []
+    cancellation_requests = []
     file_io.recycle = True
 
     async def scenario():
         response = await _response(workspace, download)
         async def receive():
+            if termination == "cancel":
+                await _receive_until_cancelled()
             return {"type": "http.disconnect"}
         with anyio.CancelScope() as scope:
             async def send(message):
                 messages.append(message)
                 if termination == "cancel" and message["type"] == "http.response.start":
                     scope.cancel()
+                    cancellation_requests.append(scope.cancel_called)
                     await anyio.lowlevel.checkpoint()
             with anyio.fail_after(WAIT_SECONDS):
-                await response(_scope(), receive, send)
+                await response(_scope(method), receive, send)
 
     anyio.run(scenario)
     assert not any(message.get("body") for message in messages), "Body published after termination"
@@ -512,6 +581,13 @@ def test_file_response_termination_before_first_body_releases_ownership(
     file_io.assert_closed()
     if file_io.acquired:
         file_io.assert_reused_descriptor_survives()
+    if method == "HEAD":
+        assert file_io.read_sizes == []
+    if termination == "cancel":
+        assert sum(message["type"] == "http.response.start" for message in messages) == 1, (
+            "Response-start cancellation boundary was never reached"
+        )
+        assert cancellation_requests == [True], "Response-start did not request scope cancellation"
 
 
 @pytest.mark.parametrize("termination", ("disconnect", "cancel"))
@@ -582,7 +658,7 @@ async def _wait_for_observation(predicate):
     return True
 
 
-async def _native_setup_cancellation(workspace, file_io, download, full_app):
+async def _native_setup_cancellation(workspace, file_io, download, full_app, method="GET"):
     messages = []
     evidence = {"entrypoint": "full-app" if full_app else "response"}
 
@@ -591,7 +667,7 @@ async def _native_setup_cancellation(workspace, file_io, download, full_app):
 
     if full_app:
         app, _, _ = workspace
-        scope = _scope()
+        scope = _scope(method)
         scope["raw_path"] = scope["path"].encode("ascii")
         scope["query_string"] = b"download=1" if download else b""
         scope["headers"] = [
@@ -609,7 +685,7 @@ async def _native_setup_cancellation(workspace, file_io, download, full_app):
         task = asyncio.create_task(app.app(scope, receive, send))
     else:
         response = await _response(workspace, download)
-        task = asyncio.create_task(response(_scope(), _receive_until_cancelled, send))
+        task = asyncio.create_task(response(_scope(method), _receive_until_cancelled, send))
 
     try:
         evidence["entered"] = await _wait_for_observation(file_io.setup_entered.is_set)
@@ -715,27 +791,116 @@ def _assert_native_setup_ownership(file_io, messages, evidence, seam, record_pro
     file_io.assert_reused_descriptor_survives()
 
 
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize("seam", ("acquisition", "response-fstat"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_native_file_response_cancellation_waits_for_setup_ownership(
-    workspace, file_io, download, seam, record_property
+    workspace, file_io, download, seam, record_property, method
 ):
     file_io.setup_seam = seam
     file_io.recycle = True
     messages, evidence = anyio.run(
-        _native_setup_cancellation, workspace, file_io, download, False
+        _native_setup_cancellation, workspace, file_io, download, False, method
     )
     _assert_native_setup_ownership(file_io, messages, evidence, seam, record_property)
+    if method == "HEAD":
+        assert file_io.read_sizes == []
 
 
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize("seam", ("acquisition", "response-fstat"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_native_full_app_cancellation_waits_for_setup_ownership(
-    workspace, file_io, download, seam, record_property
+    workspace, file_io, download, seam, record_property, method
 ):
     file_io.setup_seam = seam
     file_io.recycle = True
     messages, evidence = anyio.run(
-        _native_setup_cancellation, workspace, file_io, download, True
+        _native_setup_cancellation, workspace, file_io, download, True, method
     )
     _assert_native_setup_ownership(file_io, messages, evidence, seam, record_property)
+    if method == "HEAD":
+        assert file_io.read_sizes == []
+
+
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+@pytest.mark.parametrize(
+    "target_kind, expected_status",
+    (
+        ("missing", 404), ("directory", 400), ("fifo", 400),
+        ("outside", 403), ("sibling-leaf", 403), ("private-alias", 403),
+        ("private-traversal", 403), ("chat-root", 404), ("output-root", 404),
+        ("unauthorized", 401),
+    ),
+)
+def test_refused_file_requests_disclose_no_target_metadata_and_release_descriptors(
+    workspace, file_io, tmp_path, method, download, target_kind, expected_status
+):
+    from fastapi.testclient import TestClient
+
+    app, victim, _ = workspace
+    outputs = victim.parent
+    filename = "refused.txt"
+    canary = b"benign private refusal canary with distinct size"
+    selected = None
+    if target_kind == "directory":
+        selected = outputs / filename
+        selected.mkdir()
+    elif target_kind == "fifo":
+        selected = outputs / filename
+        os.mkfifo(selected)
+    elif target_kind in ("outside", "sibling-leaf", "private-alias", "private-traversal"):
+        directory = {
+            "outside": tmp_path / "outside",
+            "sibling-leaf": tmp_path / "sibling-chat" / "outputs",
+            "private-alias": outputs.parent / ".ocu",
+            "private-traversal": outputs.parent / ".ocu",
+        }[target_kind]
+        directory.mkdir(parents=True)
+        selected = directory / filename
+        selected.write_bytes(canary)
+        os.utime(selected, (1800000000, 1800000000))
+        if target_kind == "private-traversal":
+            filename = "%2E%2E%2F.ocu%2Frefused.txt"
+        else:
+            (outputs / filename).symlink_to(selected)
+    elif target_kind in ("chat-root", "output-root"):
+        sibling_chat = tmp_path / "sibling-chat"
+        sibling_outputs = sibling_chat / "outputs"
+        sibling_outputs.mkdir(parents=True)
+        selected = sibling_outputs / filename
+        selected.write_bytes(canary)
+        root = outputs.parent if target_kind == "chat-root" else outputs
+        redirect = sibling_chat if target_kind == "chat-root" else sibling_outputs
+        root.rename(tmp_path / "parked-root")
+        root.symlink_to(redirect, target_is_directory=True)
+    elif target_kind == "unauthorized":
+        filename = victim.name
+        selected = victim
+    if selected is not None:
+        item = file_io.real_stat(selected)
+        file_io.identity = (item.st_dev, item.st_ino)
+    file_io.fail_read = True
+    headers = (
+        {} if target_kind == "unauthorized"
+        else {"Authorization": "Bearer ocu-response-lifecycle-test-token"}
+    )
+
+    with TestClient(app.app) as http:
+        response = http.request(
+            method, f"/files/{CHAT}/{filename}", headers=headers,
+            params={"download": 1} if download else None,
+        )
+
+    assert response.status_code == expected_status
+    assert canary not in response.content
+    if method == "HEAD":
+        assert response.content == b""
+    for header in ("etag", "last-modified", "content-disposition",
+                   "content-security-policy", "x-content-type-options", "cache-control"):
+        assert header not in response.headers
+    if target_kind == "unauthorized":
+        assert response.headers.get_list("www-authenticate") == ["Bearer"]
+    assert file_io.read_sizes == []
+    file_io.assert_closed()

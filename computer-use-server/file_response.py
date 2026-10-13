@@ -71,6 +71,13 @@ class WorkspaceFileResponse(FileResponse):
                             "status": self.status_code,
                             "headers": self.raw_headers,
                         })
+                        if scope["method"] == "HEAD":
+                            await send({
+                                "type": "http.response.body",
+                                "body": b"",
+                                "more_body": False,
+                            })
+                            return
                         while True:
                             chunk = await anyio.to_thread.run_sync(os.read, file_fd, self.chunk_size)
                             # A disconnect/cancellation during a shielded read must
