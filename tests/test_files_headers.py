@@ -10,6 +10,7 @@ import sys
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -69,7 +70,12 @@ def response_start_hooks():
 
 
 @pytest.fixture
-def client(app_module, output_dir, monkeypatch, response_start_hooks):
+def response_body_hooks():
+    return {}
+
+
+@pytest.fixture
+def client(app_module, output_dir, monkeypatch, response_start_hooks, response_body_hooks):
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr(app_module, "BASE_DATA_DIR", output_dir.parents[1])
@@ -80,24 +86,28 @@ def client(app_module, output_dir, monkeypatch, response_start_hooks):
 
     monkeypatch.setattr(uploads, "BASE_DATA_DIR", output_dir.parents[1])
 
-    file_route = next(
-        route for route in app_module.app.routes
-        if getattr(route, "path", None) == "/files/{chat_id}/{filename:path}"
-    )
-    real_route_app = file_route.app
+    def observe_route(real_route_app):
+        async def route_with_send_hook(scope, receive, send):
+            async def send_with_hook(message):
+                if scope["type"] == "http":
+                    if message["type"] == "http.response.start":
+                        hook = response_start_hooks.get(scope["path"])
+                        if hook is not None:
+                            hook()
+                    elif message["type"] == "http.response.body":
+                        hook = response_body_hooks.get((scope["method"], scope["path"]))
+                        if hook is not None:
+                            hook(message.copy())
+                await send(message)
 
-    async def route_with_send_hook(scope, receive, send):
-        async def send_with_hook(message):
-            if scope["type"] == "http" and message["type"] == "http.response.start":
-                hook = response_start_hooks.get(scope["path"])
-                if hook is not None:
-                    hook()
-            await send(message)
+            await real_route_app(scope, receive, send_with_hook)
 
-        await real_route_app(scope, receive, send_with_hook)
+        return route_with_send_hook
 
     # Observe the response before the HTTP normalizer can buffer response-start.
-    monkeypatch.setattr(file_route, "app", route_with_send_hook)
+    for route in app_module.app.routes:
+        if getattr(route, "path", None) == "/files/{chat_id}/{filename:path}":
+            monkeypatch.setattr(route, "app", observe_route(route.app))
     with TestClient(app_module.app) as http:
         yield http
 
@@ -148,6 +158,132 @@ def _force_mime_type(monkeypatch, app_module, filename, mime_type):
     monkeypatch.setattr(app_module.mimetypes, "guess_type", guess_type)
 
 
+def _request_file(client, response_body_hooks, method, filename, download=False, headers=None):
+    url = _file_url(filename)
+    frames = []
+    response_body_hooks[(method, unquote(url))] = frames.append
+    response = client.request(
+        method, url, headers=_auth_headers() if headers is None else headers,
+        params={"download": 1} if download else None,
+    )
+    if method == "HEAD" and response.status_code == 200:
+        assert response.content == b""
+        assert frames, "Successful HEAD did not reach the ordinary-file body observer"
+        assert all(frame.get("body", b"") == b"" for frame in frames)
+        assert not frames[-1].get("more_body", False)
+    return response
+
+
+def _assert_original_metadata(response):
+    assert response.headers["content-length"] == "25"
+    assert response.headers["etag"] == '"3f2348dd2177119a98a73b4ce6735534"'
+    assert response.headers["last-modified"] == "Tue, 14 Nov 2023 22:13:20 GMT"
+
+
+@pytest.mark.parametrize(
+    "filename, target_name, mime_type, isolated",
+    (
+        ("generated.html", "generated.html", "text/html", True),
+        ("generated.svg", "generated.svg", "image/svg+xml", True),
+        ("generated.xhtml", "generated.xhtml", "application/xhtml+xml", True),
+        ("text.xml", "text.xml", "text/xml", True),
+        ("application.xml", "application.xml", "application/xml", True),
+        ("note.txt", "note.txt", "text/plain", False),
+        ("image.png", "image.png", "image/png", False),
+        ("document.docx", "document.docx",
+         "application/vnd.openxmlformats-officedocument.wordprocessingml.document", False),
+        ("unknown", "unknown", "application/octet-stream", False),
+        ("%E7%AE%80%E6%8A%A5.html", "简报.html", "text/html", True),
+        ("quote%22name.html", 'quote"name.html', "text/html", True),
+    ),
+)
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_head_metadata_and_policy_match_known_get(
+    app_module, client, output_dir, monkeypatch, response_body_hooks,
+    filename, target_name, mime_type, isolated, download
+):
+    contents = {
+        "image/svg+xml": b"<svg>generated data</svg>",
+        "text/xml": b"<?xml version='1.0'?><a/>",
+        "application/xml": b"<?xml version='1.0'?><a/>",
+        "text/plain": b"original descriptor bytes",
+        "image/png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 17,
+        "application/octet-stream": b"\x00" * 25,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            b"PK\x03\x04" + b"\x00" * 21,
+    }.get(mime_type, b"<p>generated ordinary</p>")
+    target = output_dir / target_name
+    target.write_bytes(contents)
+    os.utime(target, (1700000000, 1700000000))
+    if mime_type in XML_MIME_TYPES:
+        _force_mime_type(monkeypatch, app_module, target_name, mime_type)
+
+    get_response = _request_file(client, response_body_hooks, "GET", filename, download)
+    head_response = _request_file(client, response_body_hooks, "HEAD", filename, download)
+
+    assert get_response.status_code == 200
+    assert get_response.content == contents
+    assert head_response.status_code == 200
+    for response in (get_response, head_response):
+        _assert_original_metadata(response)
+        assert response.headers.get_list("cache-control") == ["no-store"]
+        expected_mime = "application/octet-stream" if download else mime_type
+        assert response.headers["content-type"].split(";", 1)[0] == expected_mime
+        if isolated and not download:
+            _assert_mirror_headers(response)
+        else:
+            _assert_headers_absent(response)
+        if isolated or download:
+            disposition = "attachment" if download else "inline"
+            filename_parameter = {
+                "简报.html": "filename*=utf-8''%E7%AE%80%E6%8A%A5.html",
+                'quote"name.html': "filename*=utf-8''quote%22name.html",
+            }.get(target_name, f'filename="{target_name}"')
+            expected = f"{disposition}; {filename_parameter}"
+            assert response.headers["content-disposition"] == expected
+        else:
+            assert "content-disposition" not in response.headers
+    for header in ("content-type", "content-disposition", "content-security-policy",
+                   "x-content-type-options", "cache-control", "etag",
+                   "last-modified", "content-length"):
+        assert head_response.headers.get_list(header) == get_response.headers.get_list(header)
+
+
+@pytest.mark.parametrize("alias_kind", ("leaf", "ancestor"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_file_head_safe_alias_preserves_selected_target_metadata(
+    client, output_dir, response_body_hooks, alias_kind, download
+):
+    target = output_dir / "nested" / "target.html"
+    target.parent.mkdir()
+    contents = b"<p>generated ordinary</p>"
+    target.write_bytes(contents)
+    os.utime(target, (1700000000, 1700000000))
+    if alias_kind == "leaf":
+        (output_dir / "alias.txt").symlink_to(target)
+        filename = "alias.txt"
+    else:
+        (output_dir / "alias-dir").symlink_to(target.parent, target_is_directory=True)
+        filename = "alias-dir/target.html"
+
+    get_response = _request_file(client, response_body_hooks, "GET", filename, download)
+    head_response = _request_file(client, response_body_hooks, "HEAD", filename, download)
+
+    _assert_target_response(get_response, "text/html", contents, download)
+    assert head_response.status_code == 200
+    disposition = "attachment" if download else "inline"
+    for response in (get_response, head_response):
+        _assert_original_metadata(response)
+        assert response.headers["content-disposition"] == f'{disposition}; filename="target.html"'
+        assert response.headers.get_list("cache-control") == ["no-store"]
+        if download:
+            assert response.headers["content-type"] == "application/octet-stream"
+            _assert_headers_absent(response)
+        else:
+            assert response.headers["content-type"].split(";", 1)[0] == "text/html"
+            _assert_mirror_headers(response)
+
+
 @pytest.mark.parametrize(
     ("filename", "mime_type", "contents"),
     (
@@ -169,6 +305,49 @@ def test_active_content_file_responses_are_isolated(
     )
 
     _assert_target_response(response, mime_type, contents, download)
+
+
+def test_generated_file_head_preserves_get_headers_without_payload(
+    client, output_dir, response_body_hooks
+):
+    contents = b"<p>generated ordinary</p>"
+    target = output_dir / "generated.html"
+    target.write_bytes(contents)
+    os.utime(target, (1700000000, 1700000000))
+    url = _file_url("generated.html")
+    body_frames = []
+    response_body_hooks[("GET", url)] = body_frames.append
+    response_body_hooks[("HEAD", url)] = body_frames.append
+
+    get_response = client.get(url, headers=_auth_headers())
+
+    _assert_target_response(get_response, "text/html", contents, False)
+    assert get_response.headers["content-length"] == "25"
+    assert get_response.headers["etag"] == '"3f2348dd2177119a98a73b4ce6735534"'
+    assert get_response.headers["last-modified"] == "Tue, 14 Nov 2023 22:13:20 GMT"
+    assert get_response.headers["content-disposition"] == 'inline; filename="generated.html"'
+    assert b"".join(frame.get("body", b"") for frame in body_frames) == contents
+    assert not body_frames[-1].get("more_body", False)
+    body_frames.clear()
+
+    head_response = client.head(url, headers=_auth_headers())
+
+    assert head_response.status_code == 200
+    assert head_response.content == b""
+    assert body_frames, "HEAD must reach the ordinary-file ASGI body observer"
+    assert all(frame.get("body", b"") == b"" for frame in body_frames)
+    assert not body_frames[-1].get("more_body", False)
+    for header in (
+        "content-type",
+        "content-length",
+        "last-modified",
+        "etag",
+        "content-security-policy",
+        "x-content-type-options",
+        "content-disposition",
+        "cache-control",
+    ):
+        assert head_response.headers.get_list(header) == get_response.headers.get_list(header)
 
 
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
@@ -306,25 +485,142 @@ def test_inline_plain_text_replacement_is_fresh_and_no_store(client, output_dir,
     assert second.headers.get_list("cache-control") == ["no-store"]
 
 
-def _assert_confined_file(response, original, canary):
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+@pytest.mark.parametrize("range_value", (None, "bytes=0-3", "bytes=9999999-99999999"),
+                         ids=("no-range", "satisfiable", "unsatisfiable"))
+def test_file_replacement_metadata_is_fresh_with_stale_conditions_and_ignored_range(
+    client, output_dir, response_body_hooks, method, download, range_value
+):
+    target = output_dir / "fresh.html"
+    target.write_bytes(b"")
+    os.utime(target, (1600000000, 1600000000))
+    first = _request_file(client, response_body_hooks, method, "fresh.html", download)
+    assert first.status_code == 200
+    assert first.headers["content-length"] == "0"
+    assert first.headers["last-modified"] == "Sun, 13 Sep 2020 12:26:40 GMT"
+    contents = b"<p>generated ordinary</p>"
+    staged = output_dir / "staged.html"
+    staged.write_bytes(contents)
+    os.utime(staged, (1700000000, 1700000000))
+    os.replace(staged, target)
+    headers = {
+        **_auth_headers(),
+        "If-None-Match": first.headers["etag"],
+        "If-Modified-Since": first.headers["last-modified"],
+    }
+    if range_value is not None:
+        headers["Range"] = range_value
+
+    response = _request_file(
+        client, response_body_hooks, method, "fresh.html", download, headers
+    )
+
+    assert response.status_code == 200
+    assert response.content == (contents if method == "GET" else b"")
+    _assert_original_metadata(response)
+    assert "content-range" not in response.headers
+    assert response.headers.get_list("cache-control") == ["no-store"]
+    disposition = "attachment" if download else "inline"
+    assert response.headers["content-disposition"] == f'{disposition}; filename="fresh.html"'
+    if download:
+        assert response.headers["content-type"] == "application/octet-stream"
+        _assert_headers_absent(response)
+    else:
+        assert response.headers["content-type"].split(";", 1)[0] == "text/html"
+        _assert_mirror_headers(response)
+
+
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+@pytest.mark.parametrize("replaced_path", ("leaf", "ancestor", "output-root", "chat-root"))
+def test_file_metadata_uses_validated_descriptor_after_pre_metadata_path_swap(
+    client, output_dir, tmp_path, monkeypatch, response_body_hooks,
+    method, download, replaced_path
+):
+    victim = output_dir / "nested" / "victim.txt"
+    victim.parent.mkdir()
+    original = b"original descriptor bytes"
+    victim.write_bytes(original)
+    os.utime(victim, (1700000000, 1700000000))
+    identity = (victim.stat().st_dev, victim.stat().st_ino)
+    replacement_chat = tmp_path / "replacement-chat"
+    replacement_outputs = replacement_chat / "outputs"
+    replacement_leaf = replacement_outputs / "nested" / "victim.txt"
+    replacement_leaf.parent.mkdir(parents=True)
+    canary = b"benign outside metadata swap canary with distinct size"
+    replacement_leaf.write_bytes(canary)
+    os.utime(replacement_leaf, (1800000000, 1800000000))
+    selected, redirect = {
+        "leaf": (victim, replacement_leaf),
+        "ancestor": (victim.parent, replacement_leaf.parent),
+        "output-root": (output_dir, replacement_outputs),
+        "chat-root": (output_dir.parent, replacement_chat),
+    }[replaced_path]
+    real_fstat = os.fstat
+    real_os_open = os.open
+    target_fds = set()
+    target_fstats = []
+    swaps = []
+
+    def open_and_observe(*args, **kwargs):
+        fd = real_os_open(*args, **kwargs)
+        item = real_fstat(fd)
+        if (item.st_dev, item.st_ino) == identity:
+            target_fds.add(fd)
+        return fd
+
+    def fstat_after_validation(fd):
+        if fd in target_fds:
+            target_fstats.append(fd)
+            if len(target_fstats) == 2:
+                selected.rename(tmp_path / "parked-selected")
+                selected.symlink_to(redirect, target_is_directory=replaced_path != "leaf")
+                swaps.append(selected)
+        return real_fstat(fd)
+
+    monkeypatch.setattr(os, "fstat", fstat_after_validation)
+    monkeypatch.setattr(os, "open", open_and_observe)
+    response = _request_file(
+        client, response_body_hooks, method, "nested/victim.txt", download
+    )
+
+    assert swaps == [selected], "Swap before response descriptor metadata did not fire"
+    assert len(target_fstats) == 2
+    assert selected.is_symlink()
+    assert response.status_code == 200
+    assert response.content == (original if method == "GET" else b"")
+    assert canary not in response.content
+    _assert_original_metadata(response)
+    assert response.headers.get_list("cache-control") == ["no-store"]
+
+
+def _assert_confined_file(response, original, canary, method="GET"):
     assert canary not in response.content
     if response.status_code == 200:
-        assert response.content == original
+        assert response.content == (original if method == "GET" else b"")
+        if method == "HEAD":
+            assert response.headers["content-length"] == str(len(original))
+            assert response.headers["last-modified"] == "Tue, 14 Nov 2023 22:13:20 GMT"
         assert response.headers.get_list("cache-control") == ["no-store"]
     else:
         assert response.status_code in (403, 404)
         _assert_headers_absent(response)
+        for header in ("etag", "last-modified", "content-disposition"):
+            assert header not in response.headers
 
 
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_file_ancestor_replacement_cannot_redirect_to_outside_bytes(
-    client, output_dir, tmp_path, response_start_hooks, download
+    client, output_dir, tmp_path, response_start_hooks, response_body_hooks, download, method
 ):
     original = b"original in-root response bytes"
     canary = b"benign outside response-start canary"
     nested = output_dir / "nested"
     nested.mkdir()
     (nested / "victim.txt").write_bytes(original)
+    os.utime(nested / "victim.txt", (1700000000, 1700000000))
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "victim.txt").write_bytes(canary)
@@ -338,21 +634,21 @@ def test_file_ancestor_replacement_cannot_redirect_to_outside_bytes(
 
     # This send boundary runs synchronously before FileResponse's late open.
     response_start_hooks[_file_url("nested/victim.txt")] = swap_before_body
-    response = client.get(
-        _file_url("nested/victim.txt"),
-        headers=_auth_headers(),
-        params={"download": 1} if download else None,
+    response = _request_file(
+        client, response_body_hooks, method, "nested/victim.txt", download
     )
 
     assert swaps == [nested], "Actual response-start filesystem swap did not fire"
     assert nested.is_symlink()
-    _assert_confined_file(response, original, canary)
+    _assert_confined_file(response, original, canary, method)
 
 
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize("replaced_path", ("leaf", "ancestor"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_file_response_keeps_original_bytes_and_metadata_after_path_replacement(
-    client, output_dir, tmp_path, response_start_hooks, replaced_path, download
+    client, output_dir, tmp_path, response_start_hooks, response_body_hooks,
+    replaced_path, download, method
 ):
     original = b"original descriptor bytes"
     victim = output_dir / "nested" / "victim.txt"
@@ -376,16 +672,14 @@ def test_file_response_keeps_original_bytes_and_metadata_after_path_replacement(
         swaps.append(selected)
 
     response_start_hooks[_file_url("nested/victim.txt")] = swap_before_body
-    response = client.get(
-        _file_url("nested/victim.txt"),
-        headers=_auth_headers(),
-        params={"download": 1} if download else None,
+    response = _request_file(
+        client, response_body_hooks, method, "nested/victim.txt", download
     )
 
     assert swaps == [selected], "Actual response-start filesystem swap did not fire"
     assert selected.is_symlink()
     assert response.status_code == 200
-    assert response.content == original
+    assert response.content == (original if method == "GET" else b"")
     # Literal validators identify the original 25-byte object at the fixed mtime.
     assert response.headers["content-length"] == "25"
     assert response.headers["etag"] == '"3f2348dd2177119a98a73b4ce6735534"'
@@ -393,16 +687,19 @@ def test_file_response_keeps_original_bytes_and_metadata_after_path_replacement(
     assert response.headers.get_list("cache-control") == ["no-store"]
 
 
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize("replaced_root", ("chat-root", "output-root"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_file_root_replacement_at_acquisition_cannot_redirect_bytes(
-    client, output_dir, tmp_path, monkeypatch, record_property, replaced_root, download
+    client, output_dir, tmp_path, monkeypatch, record_property, response_body_hooks,
+    replaced_root, download, method
 ):
     original = b"original requested chat bytes"
     canary = b"benign root acquisition replacement canary"
     victim = output_dir / "nested" / "victim.txt"
     victim.parent.mkdir()
     victim.write_bytes(original)
+    os.utime(victim, (1700000000, 1700000000))
     replacement_chat = tmp_path / "replacement-chat"
     replacement_outputs = replacement_chat / "outputs"
     (replacement_outputs / "nested").mkdir(parents=True)
@@ -447,21 +744,20 @@ def test_file_root_replacement_at_acquisition_cannot_redirect_bytes(
     # Both wrappers retain the genuine acquisition, including its no-follow flags.
     monkeypatch.setattr(builtins, "open", open_then_acquire)
     monkeypatch.setattr(os, "open", os_open_then_acquire)
-    response = client.get(
-        _file_url("nested/victim.txt"),
-        headers=_auth_headers(),
-        params={"download": 1} if download else None,
+    response = _request_file(
+        client, response_body_hooks, method, "nested/victim.txt", download
     )
 
     assert len(swaps) == 1, "No real root/file acquisition filesystem swap was observed"
     assert selected.is_symlink()
-    _assert_confined_file(response, original, canary)
+    _assert_confined_file(response, original, canary, method)
 
 
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize("link_kind", ("outside-leaf", "chat-root", "output-root"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_file_rejects_preexisting_outside_or_sibling_root_links(
-    client, output_dir, tmp_path, link_kind, download
+    client, output_dir, tmp_path, response_body_hooks, link_kind, download, method
 ):
     canary = b"benign static outside or sibling root canary"
     sibling_chat = tmp_path / "sibling-chat"
@@ -478,15 +774,17 @@ def test_file_rejects_preexisting_outside_or_sibling_root_links(
         output_dir.rename(output_dir.parent / "parked-outputs")
         output_dir.symlink_to(sibling_outputs, target_is_directory=True)
 
-    response = client.get(
-        _file_url("victim.txt"),
-        headers=_auth_headers(),
-        params={"download": 1} if download else None,
+    response = _request_file(
+        client, response_body_hooks, method, "victim.txt", download
     )
 
     assert canary not in response.content
     assert response.status_code in (403, 404)
     _assert_headers_absent(response)
+    for header in ("etag", "last-modified", "content-disposition"):
+        assert header not in response.headers
+    if method == "HEAD":
+        assert response.content == b""
 
 
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
@@ -511,6 +809,7 @@ def test_file_safe_in_root_alias_preserves_target_mime_and_disposition(
 
 
 # Literal validators below use the fixed mtime and each fixture's byte length.
+@pytest.mark.parametrize("method", ("GET", "HEAD"))
 @pytest.mark.parametrize(
     "contents, expected_length, expected_etag",
     (
@@ -525,21 +824,20 @@ def test_file_safe_in_root_alias_preserves_target_mime_and_disposition(
 )
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_file_zero_byte_and_multi_chunk_responses_preserve_bytes_and_metadata(
-    client, output_dir, contents, expected_length, expected_etag, download
+    client, output_dir, response_body_hooks,
+    contents, expected_length, expected_etag, download, method
 ):
     target = output_dir / "nested" / "payload.txt"
     target.parent.mkdir()
     target.write_bytes(contents)
     os.utime(target, (1700000000, 1700000000))
 
-    response = client.get(
-        _file_url("nested/payload.txt"),
-        headers=_auth_headers(),
-        params={"download": 1} if download else None,
+    response = _request_file(
+        client, response_body_hooks, method, "nested/payload.txt", download
     )
 
     assert response.status_code == 200
-    assert response.content == contents
+    assert response.content == (contents if method == "GET" else b"")
     assert response.headers["content-length"] == expected_length
     assert response.headers["etag"] == expected_etag
     assert response.headers["last-modified"] == "Tue, 14 Nov 2023 22:13:20 GMT"
@@ -587,6 +885,51 @@ def test_archive_keeps_zip_contents_without_cache_or_isolation_headers(client, o
         assert sorted(archive.namelist()) == ["nested/active.html", "note.txt"]
         assert archive.read("note.txt") == b"plain output"
         assert archive.read("nested/active.html") == b"<p>archived output</p>"
+
+
+@pytest.mark.parametrize("filename", ("archive", "%61rchive"), ids=("literal", "encoded"))
+@pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
+def test_reserved_archive_head_does_not_serve_ordinary_file(
+    client, output_dir, filename, download
+):
+    marker = b"ordinary file named archive must remain an archive member"
+    (output_dir / "archive").write_bytes(marker)
+    url = _file_url(filename)
+    params = {"download": 1} if download else None
+
+    get_response = client.get(url, headers=_auth_headers(), params=params)
+
+    assert get_response.status_code == 200
+    _assert_confined_archive(get_response, {"archive": marker}, ())
+
+    alias = output_dir / "archive-alias.bin"
+    alias.symlink_to(output_dir / "archive")
+    alias_url = _file_url(alias.name)
+    alias_get = client.get(alias_url, headers=_auth_headers(), params=params)
+    alias_head = client.head(alias_url, headers=_auth_headers(), params=params)
+
+    assert alias_get.status_code == 200
+    assert alias_get.content == marker
+    assert alias_get.headers.get_list("cache-control") == ["no-store"]
+    _assert_headers_absent(alias_get)
+    assert alias_head.status_code == 200
+    assert alias_head.content == b""
+    for header in (
+        "content-type", "content-length", "etag", "last-modified",
+        "content-disposition", "cache-control",
+    ):
+        assert alias_head.headers.get_list(header) == alias_get.headers.get_list(header)
+    _assert_headers_absent(alias_head)
+
+    head_response = client.head(url, headers=_auth_headers(), params=params)
+
+    assert head_response.status_code == 405
+    assert head_response.content == b""
+    assert head_response.headers.get_list("allow") == ["GET"]
+    for header in ("etag", "last-modified", "content-disposition"):
+        assert header not in head_response.headers
+    assert head_response.headers.get_list("cache-control") == []
+    _assert_headers_absent(head_response)
 
 
 @pytest.mark.parametrize("visible", (True, False), ids=("mixed", "hidden-only"))
