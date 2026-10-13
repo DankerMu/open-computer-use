@@ -285,11 +285,14 @@ async function renderHtmlPreview(container, file) {
   try {
     const resp = await fetchOutput(file.url);
     let text = await resp.text();
-    const fileDir = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/')) : '';
-    const baseUrl = fileDir ? FILES_BASE + '/' + fileDir + '/' : FILES_BASE + '/';
-    const baseTag = `<base href="${baseUrl}">`;
+    const base = document.createElement('base');
+    base.setAttribute('href', new URL('.', resp.url).href);
+    const baseTag = base.outerHTML;
+    const canonicalUrl = JSON.stringify(new URL(file.url, window.location.origin).href)
+      .replace(/</g, '\\u003c');
     const linkInterceptScript = '<scr' + 'ipt>'
       + '(function(){'
+      + 'var canonicalUrl=' + canonicalUrl + ';'
       + 'document.addEventListener("click",function(e){'
       + 'var a=e.target.closest("a");'
       + 'if(!a)return;'
@@ -297,19 +300,21 @@ async function renderHtmlPreview(container, file) {
       + 'if(!href)return;'
       + 'e.preventDefault();'
       + 'e.stopPropagation();'
+      + 'var resolvedUrl;'
+      + 'try{resolvedUrl=new URL(href,canonicalUrl).href;}catch(e){return;}'
       + 'window.parent.postMessage({'
       + 'type:"iframe-link-click",'
       + 'href:href,'
-      + 'resolvedUrl:a.href'
+      + 'resolvedUrl:resolvedUrl'
       + '},"*");'
       + '},true);'
       + '})();'
       + '</scr' + 'ipt>';
     const injection = baseTag + linkInterceptScript;
     if (text.includes('<head>')) {
-      text = text.replace('<head>', '<head>' + injection);
+      text = text.replace('<head>', () => '<head>' + injection);
     } else if (text.includes('<html>')) {
-      text = text.replace('<html>', '<html><head>' + injection + '</head>');
+      text = text.replace('<html>', () => '<html><head>' + injection + '</head>');
     } else {
       text = injection + text;
     }
