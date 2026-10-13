@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Generated HTML resource base.** Relative resources use the final fetched
+  document directory; link messages, file selection and downloads retain
+  canonical workspace URLs. The opaque-origin `allow-scripts allow-forms`
+  sandbox and existing Office, Drawio and Markdown consumers remain unchanged.
+
 - **Confined ordinary-file HEAD.** GET and explicit HEAD use one validated
   workspace descriptor for file metadata and existing MIME, isolation,
   disposition, validator and no-store policy. HEAD sends no payload and performs

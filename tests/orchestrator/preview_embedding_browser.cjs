@@ -189,6 +189,8 @@ let drawioHeldViewer = false;
 const heldDrawio = [];
 const heldViewer = [];
 const heldImages = [];
+const htmlFixtures = new Map();
+const heldHtml = [];
 const bytes = {};
 const contentTypes = {
   '.js': 'text/javascript',
@@ -317,6 +319,20 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/raw-root-chart.png') {
       record.status = 200;
       return respond(res, 200, bytes['guides/chart.png'], 'image/png');
+    }
+    const htmlFixture = htmlFixtures.get(url.pathname);
+    if (htmlFixture) {
+      if (htmlFixture.redirect) {
+        record.status = 302;
+        return respond(res, 302, '', 'text/plain', { Location: htmlFixture.redirect });
+      }
+      if (htmlFixture.hold) {
+        heldHtml.push({ res, record, fixture: htmlFixture });
+        return;
+      }
+      record.status = 200;
+      return respond(res, 200, bytes[htmlFixture.key], htmlFixture.type,
+        { 'Access-Control-Allow-Origin': 'null' });
     }
     if ((prefix && url.pathname.startsWith(`${prefix}/files/${CHAT}/`)) ||
         (!prefix && url.pathname.startsWith(`/files/${CHAT}/`))) {
@@ -2312,6 +2328,358 @@ async function main() {
         'missing bundled image did not fail visibly');
       acceptOwnedErrors(session, isMissingImageError, after);
     };
+
+    const htmlResults = [];
+    const configureHtmlFixture = (prefix, redirected) => {
+      const filePath = `reports/space "'&<img id="html-injected-element" onerror="window.__htmlUnexpectedEffect=true" src=x>.html`;
+      const canonicalPath = `${prefix}/files/${CHAT}/reports/space%20%22%27%26%3Cimg%20id%3D%22html-injected-element%22%20onerror%3D%22window.__htmlUnexpectedEffect%3Dtrue%22%20src%3Dx%3E.html`;
+      const canonicalDirectory = `${prefix}/files/${CHAT}/reports/`;
+      const resourceDirectory = redirected
+        ? `${prefix}/public-preview-resource-canary/$&/` : canonicalDirectory;
+      const documentPath = redirected ? resourceDirectory + 'report.html' : canonicalPath;
+      const neighborPath = `${prefix}/files/${CHAT}/neighbor.txt`;
+      bytes['html-matrix/document'] = Buffer.from(`<!doctype html><html><head>
+        <link rel="stylesheet" href="style.css"></head><body>
+        <h1 id="redirect-resource">HTML resource directory</h1>
+        <img id="resource-image" src="pixel.png" alt="Known local image">
+        <p id="script-effect">Script pending</p><p id="data-effect">Data pending</p>
+        <p id="section">Canonical section</p>
+        <p><a href="#section">Same document</a></p>
+        <p><a href="https://example.invalid/document">External document</a></p>
+        <p><a id="malformed-link" href="http://[">Malformed document</a></p>
+        <p><a href="../neighbor.txt?view=one#part">Canonical neighbor</a></p>
+        <script>
+          const denials = {};
+          try { parent.document.getElementById('html-parent-canary').textContent; denials.parentDom = 'allowed'; }
+          catch (error) { denials.parentDom = error.name; }
+          try { parent.localStorage.getItem('html-parent-canary'); denials.parentStorage = 'allowed'; }
+          catch (error) { denials.parentStorage = error.name; }
+          try { localStorage.getItem('html-parent-canary'); denials.ownStorage = 'allowed'; }
+          catch (error) { denials.ownStorage = error.name; }
+          parent.postMessage({ type: 'html-isolation', denials }, '*');
+          document.addEventListener('click', event => {
+            if (event.target.closest('a')?.id === 'malformed-link')
+              parent.postMessage({ type: 'html-malformed-click' }, '*');
+          }, true);
+        </script><script src="effect.js"></script></body></html>`);
+      bytes['html-matrix/style.css'] = Buffer.from('#redirect-resource { color: rgb(17, 85, 153); }');
+      bytes['html-matrix/wrong.css'] = Buffer.from('#redirect-resource { color: rgb(80, 80, 80); }');
+      bytes['html-matrix/pixel.png'] = bytes['guides/pixel.png'];
+      bytes['html-matrix/wrong.png'] = Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XwN8AAAAASUVORK5CYII=', 'base64');
+      bytes['html-matrix/effect.js'] = Buffer.from(`
+        document.getElementById('script-effect').textContent = 'Classic script from resource directory';
+        fetch('data.json', { credentials: 'omit' }).then(response => response.json()).then(data => {
+          document.getElementById('data-effect').textContent = data.value;
+        });`);
+      bytes['html-matrix/wrong.js'] = Buffer.from(`
+        document.getElementById('script-effect').textContent = 'Wrong canonical script';
+        fetch('data.json', { credentials: 'omit' }).then(response => response.json()).then(data => {
+          document.getElementById('data-effect').textContent = data.value;
+        });`);
+      bytes['html-matrix/data.json'] = Buffer.from('{"value":"Relative JSON from resource directory"}');
+      bytes['html-matrix/wrong.json'] = Buffer.from('{"value":"Wrong canonical JSON"}');
+      bytes['html-matrix/neighbor.txt'] = Buffer.from('Canonical neighbor content from the workspace.');
+      htmlFixtures.set(documentPath, { key: 'html-matrix/document', type: 'text/html' });
+      htmlFixtures.set(neighborPath, { key: 'html-matrix/neighbor.txt', type: 'text/plain' });
+      if (redirected) htmlFixtures.set(canonicalPath, { redirect: documentPath });
+      for (const [name, key, wrongKey, type] of [
+        ['style.css', 'style.css', 'wrong.css', 'text/css'],
+        ['pixel.png', 'pixel.png', 'wrong.png', 'image/png'],
+        ['effect.js', 'effect.js', 'wrong.js', 'text/javascript'],
+        ['data.json', 'data.json', 'wrong.json', 'application/json'],
+      ]) {
+        htmlFixtures.set(resourceDirectory + name, { key: `html-matrix/${key}`, type });
+        if (redirected)
+          htmlFixtures.set(canonicalDirectory + name, { key: `html-matrix/${wrongKey}`, type });
+      }
+      standaloneListing = [
+        files.find(file => file.file_id === 'hostile-markdown'),
+        { file_id: 'redirect-neighbor', path: 'neighbor.txt', type: 'text', mime: 'text/plain',
+          url: neighborPath },
+        { file_id: 'redirect-html', path: filePath, type: 'html', mime: 'text/html',
+          url: canonicalPath },
+      ];
+      return { filePath, canonicalPath, canonicalDirectory, resourceDirectory, documentPath, neighborPath };
+    };
+    const clearHtmlFixture = () => {
+      standaloneListing = null;
+      for (const pending of heldHtml.splice(0)) pending.res.destroy();
+      htmlFixtures.clear();
+      for (const key of Object.keys(bytes))
+        if (key.startsWith('html-matrix/')) delete bytes[key];
+    };
+    const prepareHtmlSession = async (session) => {
+      session.failures = [];
+      session.page.on('requestfailed', request => session.failures.push({
+        request, url: request.url(), failure: request.failure()?.errorText,
+      }));
+      await session.page.evaluate(() => {
+        const marker = document.createElement('div');
+        marker.id = 'html-parent-canary';
+        marker.textContent = 'Benign parent DOM marker';
+        marker.hidden = true;
+        document.body.appendChild(marker);
+        localStorage.setItem('html-parent-canary', 'Benign parent storage marker');
+        window.__htmlLinkMessages = [];
+        window.__htmlIsolation = [];
+        window.__htmlMalformedClicks = 0;
+        window.__htmlGeneratedWindow = null;
+        window.__htmlUnexpectedEffect = false;
+        window.addEventListener('message', event => {
+          const generatedWindow = window.__htmlGeneratedWindow ||
+            document.querySelector('.preview-stage iframe')?.contentWindow;
+          if (event.source !== generatedWindow) return;
+          if (event.data?.type === 'html-isolation') {
+            window.__htmlGeneratedWindow = event.source;
+            window.__htmlIsolation.push({ origin: event.origin, denials: event.data.denials });
+          }
+          if (event.data?.type === 'iframe-link-click')
+            window.__htmlLinkMessages.push({
+              href: event.data.href, resolvedUrl: event.data.resolvedUrl, origin: event.origin,
+            });
+          if (event.data?.type === 'html-malformed-click') window.__htmlMalformedClicks++;
+        });
+      });
+    };
+    const closeHtmlDropdown = async (session) => {
+      if (await session.page.locator('.dropdown-menu.open').count())
+        await session.page.locator('.file-selector-btn').click();
+    };
+    const assertHtmlSelection = async (session, name, canonicalPath) => {
+      assert.equal(await session.page.locator('.file-selector-btn .selector-name').innerText(), name);
+      assert.equal(await session.page.locator('.toolbar-right a[download]').first().evaluate(node => node.href),
+        `${origin}${canonicalPath}?download=1`, 'HTML navigation changed the canonical download URL');
+    };
+    for (const prefix of ['', '/ocu', '/tools/ocu']) {
+      for (const redirected of [true, false]) {
+        const fixture = configureHtmlFixture(prefix, redirected);
+        const label = `html-${redirected ? 'redirect' : 'direct'}-${prefix.replaceAll('/', '-') || 'root'}`;
+        let session;
+        try {
+          session = await openStandalone(prefix);
+          await prepareHtmlSession(session);
+          const finalResponsePromise = session.page.waitForResponse(response =>
+            response.url() === `${origin}${fixture.documentPath}`);
+          await selectStandaloneFile(session.page, fixture.filePath);
+          const finalResponse = await finalResponsePromise;
+          assert.equal(finalResponse.status(), 200);
+          const canonicalRequest = finalResponse.request().redirectedFrom();
+          if (redirected) {
+            assert(canonicalRequest, 'generated HTML fetch did not follow a real redirect');
+            assert.equal(canonicalRequest.url(), `${origin}${fixture.canonicalPath}`);
+            const canonicalResponse = await canonicalRequest.response();
+            assert.equal(canonicalResponse.status(), 302);
+            assert.equal(canonicalResponse.headers().location, fixture.documentPath);
+          } else {
+            assert.equal(canonicalRequest, null, 'direct HTML fixture unexpectedly redirected');
+          }
+          const iframe = session.page.locator('.preview-stage iframe');
+          const generated = session.page.frameLocator('.preview-stage iframe');
+          const marker = generated.locator('#redirect-resource');
+          await marker.waitFor();
+          const color = await marker.evaluate(async node => {
+            if (document.readyState !== 'complete')
+              await new Promise(resolve => window.addEventListener('load', resolve, { once: true }));
+            return getComputedStyle(node).color;
+          });
+          await generated.getByText('Classic script from resource directory', { exact: true }).waitFor();
+          await generated.getByText('Relative JSON from resource directory', { exact: true }).waitFor();
+          const dimensions = await generated.locator('#resource-image').evaluate(async node => {
+            await node.decode();
+            return { width: node.naturalWidth, height: node.naturalHeight };
+          });
+          await session.page.waitForFunction(() => window.__htmlIsolation.length === 1);
+          const isolation = await session.page.evaluate(() => window.__htmlIsolation);
+          assert.deepEqual(isolation, [{ origin: 'null', denials: {
+            parentDom: 'SecurityError', parentStorage: 'SecurityError', ownStorage: 'SecurityError',
+          } }], 'generated HTML acquired parent DOM or storage authority');
+          assert.deepEqual(await session.page.evaluate(() => ({
+            dom: document.getElementById('html-parent-canary').textContent,
+            storage: localStorage.getItem('html-parent-canary'),
+            effect: window.__htmlUnexpectedEffect,
+            injected: document.querySelectorAll('#html-injected-element').length,
+          })), { dom: 'Benign parent DOM marker', storage: 'Benign parent storage marker',
+            effect: false, injected: 0 });
+          assert.deepEqual(await marker.evaluate(() => ({
+            injected: document.querySelectorAll('#html-injected-element').length,
+            effect: Boolean(window.__htmlUnexpectedEffect),
+          })), { injected: 0, effect: false }, 'encoded filename injected markup or script into generated HTML');
+          await assertHtmlSelection(session, fixture.filePath, fixture.canonicalPath);
+          assert.equal(await iframe.getAttribute('sandbox'), 'allow-scripts allow-forms');
+          await closeHtmlDropdown(session);
+          await session.page.screenshot({ path: path.join(artifacts, `${label}-resources.png`) });
+          assert.equal(color, 'rgb(17, 85, 153)',
+            'relative HTML stylesheet did not use the final response directory');
+          assert.deepEqual(dimensions, { width: 2, height: 2 });
+          for (const name of ['style.css', 'pixel.png', 'effect.js', 'data.json'])
+            assert(caseRequests(session).some(row =>
+              row.path === fixture.resourceDirectory + name && row.status === 200),
+            `HTML resource was not fetched from the final directory: ${name}`);
+          if (redirected) {
+            assert(caseRequests(session).some(row =>
+              row.path === fixture.canonicalPath && row.status === 302));
+            assert(caseRequests(session).some(row =>
+              row.path === fixture.documentPath && row.status === 200));
+            assert.deepEqual(caseRequests(session).filter(row =>
+              row.path.startsWith(fixture.canonicalDirectory) && row.path !== fixture.canonicalPath), [],
+            'redirected HTML loaded resources from its canonical directory');
+          }
+          const topUrl = session.page.url();
+          await generated.getByRole('link', { name: 'Same document', exact: true }).click();
+          await session.page.waitForFunction(() => window.__htmlLinkMessages.length === 1);
+          assert.deepEqual(await session.page.evaluate(() => window.__htmlLinkMessages), [{
+            href: '#section', resolvedUrl: `${origin}${fixture.canonicalPath}#section`, origin: 'null',
+          }]);
+          await assertHtmlSelection(session, fixture.filePath, fixture.canonicalPath);
+          assert.equal(session.page.url(), topUrl, 'fragment changed the trusted top-level location');
+          const openedPages = [];
+          session.isolated.on('page', openedPage => openedPages.push(openedPage.url()));
+          const beforeExternal = externalRequests.length;
+          await generated.getByRole('link', { name: 'External document', exact: true }).click();
+          const dialog = session.page.locator('#__ext_link_dialog');
+          await dialog.getByText('https://example.invalid/document', { exact: true }).waitFor();
+          assert.deepEqual(await session.page.evaluate(() => window.__htmlLinkMessages[1]), {
+            href: 'https://example.invalid/document',
+            resolvedUrl: 'https://example.invalid/document', origin: 'null',
+          });
+          assert.equal(externalRequests.length, beforeExternal, 'external link fetched before confirmation');
+          assert.deepEqual(openedPages, [], 'external link opened a window before confirmation');
+          await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+          await dialog.waitFor({ state: 'detached' });
+          await assertHtmlSelection(session, fixture.filePath, fixture.canonicalPath);
+          await generated.getByRole('link', { name: 'Malformed document', exact: true }).click();
+          await session.page.waitForFunction(() => window.__htmlMalformedClicks === 1);
+          assert.equal(await session.page.evaluate(() => window.__htmlLinkMessages.length), 2,
+            'malformed absolute link emitted a navigation message');
+          assert.equal(session.page.url(), topUrl, 'malformed link navigated the trusted top-level page');
+          await assertHtmlSelection(session, fixture.filePath, fixture.canonicalPath);
+          await generated.getByRole('link', { name: 'Canonical neighbor', exact: true }).click();
+          await session.page.waitForFunction(() => window.__htmlLinkMessages.length === 3);
+          assert.deepEqual(await session.page.evaluate(() => window.__htmlLinkMessages[2]), {
+            href: '../neighbor.txt?view=one#part',
+            resolvedUrl: `${origin}${fixture.neighborPath}?view=one#part`, origin: 'null',
+          }, 'generated HTML link message leaked the temporary resource URL');
+          await session.page.locator('.preview-stage')
+            .getByText('Canonical neighbor content from the workspace.', { exact: true }).waitFor();
+          await assertHtmlSelection(session, 'neighbor.txt', fixture.neighborPath);
+          assert.equal(session.page.url(), topUrl);
+          assert.equal(externalRequests.length, beforeExternal);
+          assert.deepEqual(openedPages, []);
+          assert.deepEqual(caseErrors(session), [], `${label} produced unexpected browser errors`);
+          assert.deepEqual(session.failures, [], `${label} produced unexpected network failures`);
+          await closeHtmlDropdown(session);
+          await session.page.screenshot({ path: path.join(artifacts, `${label}-canonical-neighbor.png`) });
+          htmlResults.push({ prefix, mode: redirected ? 'redirect' : 'direct', color, dimensions,
+            script: 'Classic script from resource directory', data: 'Relative JSON from resource directory',
+            canonicalMessages: ['fragment', 'external', 'neighbor'], malformed: 'no navigation',
+            selected: 'neighbor.txt', download: 'canonical', isolation: isolation[0],
+            unexpectedErrors: 0 });
+        } catch (error) {
+          if (session) await captureStandaloneFailure(session, label);
+          throw error;
+        } finally {
+          if (session) await closeStandalone(session);
+          clearHtmlFixture();
+        }
+      }
+    }
+    for (const transition of ['superseded', 'fallback']) {
+      const fixture = configureHtmlFixture('/ocu', true);
+      let session;
+      let oldStage;
+      let abortFirstFetch;
+      let abortedRequest;
+      try {
+        session = await openStandalone('/ocu');
+        await prepareHtmlSession(session);
+        if (transition === 'superseded') {
+          const heldFixture = htmlFixtures.get(fixture.documentPath);
+          heldFixture.hold = true;
+          await selectStandaloneFile(session.page, fixture.filePath);
+          await waitUntil(() => heldHtml.length === 1, 'held redirected HTML response');
+          oldStage = await session.page.locator('.preview-stage').elementHandle();
+          await selectStandaloneFile(session.page, 'neighbor.txt');
+          await session.page.locator('.preview-stage')
+            .getByText('Canonical neighbor content from the workspace.', { exact: true }).waitFor();
+          await assertHtmlSelection(session, 'neighbor.txt', fixture.neighborPath);
+          const pending = heldHtml.shift();
+          heldFixture.hold = false;
+          pending.record.status = 200;
+          respond(pending.res, 200, bytes[pending.fixture.key], pending.fixture.type,
+            { 'Access-Control-Allow-Origin': 'null' });
+          await session.page.waitForFunction(stage => Boolean(stage.querySelector('iframe')), oldStage);
+          assert.equal(await oldStage.evaluate(stage => stage.isConnected), false);
+          await session.page.locator('.preview-stage')
+            .getByText('Canonical neighbor content from the workspace.', { exact: true }).waitFor();
+          await assertHtmlSelection(session, 'neighbor.txt', fixture.neighborPath);
+          assert.equal(await session.page.locator('.preview-stage iframe').count(), 0,
+            'late redirected HTML replaced the current neighbor preview');
+          assert.deepEqual(session.failures, []);
+          assert.deepEqual(caseErrors(session), []);
+        } else {
+          abortFirstFetch = async route => {
+            if (!abortedRequest && route.request().resourceType() === 'fetch') {
+              abortedRequest = route.request();
+              return route.abort('connectionreset');
+            }
+            return route.continue();
+          };
+          await session.page.route(`${origin}${fixture.canonicalPath}`, abortFirstFetch);
+          const fallbackResponsePromise = session.page.waitForResponse(response =>
+            response.url() === `${origin}${fixture.documentPath}` &&
+            response.request().resourceType() === 'document');
+          await selectStandaloneFile(session.page, fixture.filePath);
+          const fallbackResponse = await fallbackResponsePromise;
+          assert.equal(fallbackResponse.status(), 200);
+          assert(abortedRequest, 'fallback case did not abort the first canonical fetch');
+          assert.equal(abortedRequest.url(), `${origin}${fixture.canonicalPath}`);
+          const iframe = session.page.locator('.preview-stage iframe');
+          const generated = session.page.frameLocator('.preview-stage iframe');
+          const marker = generated.locator('#redirect-resource');
+          await marker.waitFor();
+          await marker.evaluate(async () => {
+            if (document.readyState !== 'complete')
+              await new Promise(resolve => window.addEventListener('load', resolve, { once: true }));
+          });
+          await generated.getByText('Relative JSON from resource directory', { exact: true }).waitFor();
+          assert.equal(await iframe.getAttribute('src'), fixture.canonicalPath);
+          assert.equal(await iframe.getAttribute('srcdoc'), null);
+          assert.equal(await iframe.getAttribute('sandbox'), 'allow-scripts allow-forms');
+          assert.equal(fallbackResponse.request().redirectedFrom().url(), `${origin}${fixture.canonicalPath}`);
+          await assertHtmlSelection(session, fixture.filePath, fixture.canonicalPath);
+          await waitUntil(() => session.failures.some(row => row.request === abortedRequest) &&
+            caseErrors(session).some(error => error.url === `${origin}${fixture.canonicalPath}` &&
+              error.text === 'Failed to load resource: net::ERR_CONNECTION_RESET'),
+          'first-fetch fallback diagnostic');
+          assert.deepEqual(session.failures.map(({ request, ...row }) => row), [{
+            url: `${origin}${fixture.canonicalPath}`, failure: 'net::ERR_CONNECTION_RESET',
+          }], 'fallback produced an unrelated network failure');
+          assert.equal(session.failures[0].request, abortedRequest);
+          const errors = caseErrors(session);
+          assert.equal(errors.length, 1, 'fallback produced an unrelated browser error');
+          assert.equal(errors[0].url, `${origin}${fixture.canonicalPath}`);
+          assert.equal(errors[0].text, 'Failed to load resource: net::ERR_CONNECTION_RESET');
+          expectedOwnedErrors.push(errors[0]);
+        }
+        await closeHtmlDropdown(session);
+        await session.page.screenshot({ path: path.join(artifacts, `html-${transition}.png`) });
+        htmlResults.push({ prefix: '/ocu', mode: transition,
+          selected: transition === 'superseded' ? 'neighbor.txt' : fixture.filePath,
+          download: 'canonical', unexpectedErrors: 0 });
+      } catch (error) {
+        if (session) await captureStandaloneFailure(session, `html-${transition}`);
+        throw error;
+      } finally {
+        if (session && abortFirstFetch)
+          await session.page.unroute(`${origin}${fixture.canonicalPath}`, abortFirstFetch);
+        await oldStage?.dispose();
+        for (const pending of heldHtml.splice(0)) pending.res.destroy();
+        if (session) await closeStandalone(session);
+        clearHtmlFixture();
+      }
+    }
+    console.log(JSON.stringify({ htmlResourceBase: 'ok', cases: htmlResults }));
 
     const panelSession = await openStandalone('/ocu');
     try {
