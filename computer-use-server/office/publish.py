@@ -421,6 +421,11 @@ def _remove_owned(parent_fd, name, identity):
 
 
 def _prepared_fields(entry):
+    if "replacement_possible" in entry and (
+            type(entry["replacement_possible"]) is not bool
+            or "copy" not in entry and (
+                not _retains_replacement(entry) or "target_path" not in entry)):
+        raise StateCorruptError("publish replacement progress target binding is invalid")
     if entry.get("requester") in ("save", "final") and "initial_revision" in entry:
         if (("copy" not in entry and "target_path" not in entry)
                 or type(entry["initial_revision"]) is not int or entry["initial_revision"] < 0):
@@ -534,7 +539,9 @@ class _Stage:
         return identity if found else None
 
     def replacement_state(self, parent, target_name, *, absent_parent=None):
-        """Classify an index outage without retiring its ownership evidence."""
+        """Observe replacement progress without retiring its ownership evidence."""
+        if self.entry.get("replacement_possible", False):
+            return "uncertain"
         identity = self.inspect()
         binding = self.entry.get("staging")
         if absent_parent is not None:
@@ -1054,6 +1061,7 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
     replaced, result = False, None
     retain_replacement = _retains_replacement(entry)
     preserve_stage = False
+    possible_replacement = False
     writer_excluded = container is None or container.status == "exited" or paused
     try:
         path = None
@@ -1102,9 +1110,18 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
                         result = PublishResult("interrupted", "index_unavailable")
                         return result
                 elif (retain_replacement and "initial_revision" not in entry
-                        and entry.get("staging") is not None
-                        and entry["staging"].get("replacement_started") is not False):
+                        and (entry.get("replacement_possible", False)
+                             or entry.get("staging") is not None
+                             and entry["staging"].get("replacement_started") is not False)):
                     raise RecoveryRequiredError("legacy publication registration is uncertain")
+                if retain_replacement and entry.get("staging") is not None:
+                    try:
+                        possible_replacement = stage.replacement_state(
+                            previous[-1] if absent is None else None,
+                            workspace._parts(entry["target_path"])[-1], absent_parent=absent,
+                        ) != "before"
+                    except RecoveryRequiredError:
+                        possible_replacement = True
                 stage.cleanup(previous[-1] if absent is None else None, absent_parent=absent)
                 stage.close()
                 stage = None
@@ -1179,6 +1196,9 @@ def _publish_locked(store, broker, chat, journal_id, *, recovering):
             def prepare(working):
                 live = working["journal"][journal_id]
                 live.update(target_path=path, temporary_name=temporary)
+                if possible_replacement:
+                    # Carry uncertainty atomically with discarding the old stage.
+                    live["replacement_possible"] = True
                 live.pop("staging", None)
                 live.setdefault("initial_revision", initial_revision)
             fence.checkpoint()

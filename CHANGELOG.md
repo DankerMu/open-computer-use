@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Office publication index-outage recovery.** Retain non-copy save, final and
+  resolve-overwrite obligations after possible workspace replacement. Recovery
+  preserves selected bytes and reuses committed registration without duplicate
+  publication revisions, receipts or history.
+
 - **Missing-root Office save-as recovery.** Retire and sync only journal-proven
   private names before clearing responsibility, preserving an existing durable
   failure reason when outputs disappears. Proven partial unlink and durably
