@@ -840,6 +840,102 @@ def test_final_recovery_outcomes_are_not_orphaned_by_sweep(office_world, monkeyp
     assert persisted["journal"] == {}
 
 
+@pytest.mark.parametrize("final", (False, True), ids=("save", "final"))
+@pytest.mark.parametrize("envelope", ("current", "old-different", "old-malformed"))
+def test_index_outage_http_callback_recovers_only_accepted_publication(
+    office_world, monkeypatch, final, envelope,
+):
+    from types import SimpleNamespace
+    from office.publish import RecoveryRequiredError
+    from tests.orchestrator.test_office_publish_recovery import _crash
+
+    http, data, _origin, _manager, broker, _content, session = _opened(office_world)
+    if not final:
+        _allocate(http, session, monkeypatch)
+    with _content_origin({
+        "/save.docx": CHANGED, "/rejected.docx": CHANGED + b"rejected",
+    }) as origin, _bind_internal(monkeypatch, origin.url):
+        payload = _surviving(http, data, session, monkeypatch, origin, final=final)
+        accepted = _read(data)
+        journal_id, = accepted["journal"]
+        index = data / CHAT / ".ocu" / "index.json"
+        revision = json.loads(index.read_bytes())["counter"]
+        _crash(SimpleNamespace(data=data, journal_id=journal_id), "replace-after")
+        healthy_index = index.read_bytes()
+        target = _outputs(data) / "report.docx"
+        inode = target.stat().st_ino
+        before = _read(data)
+        versions = _snapshot(_versions(data))
+        assert target.read_bytes() == CHANGED
+        old_epoch = envelope != "current"
+        if old_epoch:
+            (data / ".office-restore-epoch").write_text("new-recovery-epoch\n")
+            payload["url"] = origin.url + "/rejected.docx"
+            if envelope == "old-malformed":
+                payload.update(status="malformed", userdata="invalid-rejected-envelope")
+        index.write_bytes(b"{unavailable-index")
+        hits = origin.hits
+        if old_epoch:
+            with pytest.raises(RecoveryRequiredError):
+                _post(http, session, payload)
+        else:
+            response = _post(http, session, payload)
+            assert response.status_code == 200
+            assert response.json() == {"error": 0}
+        assert origin.hits - hits == (0 if old_epoch or final else 1)
+        assert _read(data) == before
+        assert journal_id in _read(data)["journal"]
+        assert target.read_bytes() == CHANGED
+        assert target.stat().st_ino == inode
+        assert _snapshot(_versions(data)) == versions
+        assert index.read_bytes() == b"{unavailable-index"
+
+        index.write_bytes(healthy_index)
+        hits = origin.hits
+        response = _post(http, session, payload)
+        if old_epoch:
+            _assert_refusal(response, 409, "session_not_open")
+        else:
+            assert response.status_code == 200
+            assert response.json() == {"error": 0}
+        assert origin.hits - hits == (0 if old_epoch or final else 1)
+        after = _read(data)
+        record = after["sessions"][session["session_id"]]
+        assert (record["state"], record["reason"]) == (
+            "closed" if final else "orphaned" if old_epoch else "editing",
+            "restore_epoch_changed" if old_epoch and not final else None,
+        )
+        assert record["last_published_seq"] == 1
+        assert record["baseline_sha256"] == _sha(CHANGED)
+        assert after["journal"] == {}
+        assert after["receipts"] == before["receipts"]
+        assert len(after["documents"][session["file_id"]]["versions"]) == 2
+        assert after["documents"][session["file_id"]]["published_version"] == 2
+        assert after["documents"][session["file_id"]]["versions"][1]["published"] is True
+        active = json.loads(index.read_bytes())
+        assert active["counter"] == revision + 1
+        assert (active["active"]["report.docx"]["file_id"],
+                active["active"]["report.docx"]["hash"],
+                active["active"]["report.docx"]["revision"]) == (
+            session["file_id"], _sha(CHANGED), revision + 1,
+        )
+        assert target.read_bytes() == CHANGED
+        assert target.stat().st_ino == inode
+        assert _snapshot(_versions(data)) == versions
+        frozen = _snapshot(data)
+        hits = origin.hits
+        replay = _post(http, session, payload)
+        if envelope == "old-malformed":
+            _assert_refusal(replay, 409, "session_not_open")
+        elif envelope == "old-different" and not final:
+            _assert_refusal(replay, 409, "stale_save_seq")
+        else:
+            assert replay.status_code == 200
+            assert replay.json() == {"error": 0}
+        assert origin.hits - hits == (0 if final or envelope == "old-malformed" else 1)
+        assert _snapshot(data) == frozen
+
+
 @pytest.mark.parametrize("trigger", ("save", "close", "status_epoch", "callback_epoch"))
 def test_request_recovers_owned_publication_before_epoch_orphan(office_world, monkeypatch, trigger):
     http, data, _origin, _manager, _broker, _content, session = _opened(office_world)

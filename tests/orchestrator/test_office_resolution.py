@@ -716,7 +716,9 @@ def replaced(source, destination, *args, **kwargs):
             os.close(fd)
         live = [entry for entry in successor["journal"].values() if entry["requester"] == "resolve"]
         if live:
-            if "restore_version" in live[0]:
+            if live[0].get("staging", {}).get("retired") is True:
+                phase = "retirement"
+            elif "restore_version" in live[0]:
                 phase = "lineage"
             elif "target_path" not in live[0] and "copy" not in live[0]:
                 phase = "accepted"
@@ -812,6 +814,140 @@ def _fresh_resolve(environment, *, mode="recover"):
     assert child.returncode == 0, (child.stdout, child.stderr)
     assert child.stdout.strip().splitlines()[-1] == "completed"
     return child
+
+
+@pytest.mark.parametrize("ended", (False, True), ids=("live-editor", "ended-editor"))
+@pytest.mark.parametrize("cut", ("replacement", "registration", "retirement"))
+def test_index_outage_native_resolve_overwrite_completes_once(
+    office_world, monkeypatch, ended, cut,
+):
+    from office.publish import RecoveryRequiredError, recover_publications
+
+    _http, data, _origin, _manager, broker, _original, session = _conflict(
+        office_world, monkeypatch, final=ended,
+    )
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    environment = _kill_resolve(data, session, "overwrite", cut)
+    index = data / CHAT / ".ocu" / "index.json"
+    healthy_index = index.read_bytes()
+    before = _read(data)
+    journal_id, = before["journal"]
+    target = _outputs(data) / "report.docx"
+    inode = target.stat().st_ino
+    versions = _snapshot(_versions(data))
+    assert target.read_bytes() == CHANGED
+    assert [v["source"] for v in before["documents"][session["file_id"]]["versions"]] == [
+        "workspace", "close" if ended else "save", "workspace", "restore",
+    ]
+    index.write_bytes(b"{unavailable-index")
+    with pytest.raises(RecoveryRequiredError):
+        recover_publications(CHAT)
+    assert _read(data) == before
+    assert journal_id in _read(data)["journal"]
+    assert target.read_bytes() == CHANGED
+    assert target.stat().st_ino == inode
+    assert _snapshot(_versions(data)) == versions
+    assert index.read_bytes() == b"{unavailable-index"
+
+    index.write_bytes(healthy_index)
+    _fresh_resolve(environment)
+    after = _assert_resolved(data, session, ended=ended)
+    assert after["receipts"] == before["receipts"]
+    assert [dict(v, published=False) for v in after["documents"][session["file_id"]]["versions"]] == [
+        dict(v, published=False) for v in before["documents"][session["file_id"]]["versions"]
+    ]
+    assert _snapshot(_versions(data)) == versions
+    assert target.read_bytes() == CHANGED
+    assert target.stat().st_ino == inode
+    current = json.loads(index.read_bytes())
+    assert current["counter"] == revision + 1
+    active = current["active"]["report.docx"]
+    assert (active["file_id"], active["path"], active["hash"], active["size"], active["revision"]) == (
+        session["file_id"], "report.docx", _sha(CHANGED), len(CHANGED), revision + 1,
+    )
+    frozen = _snapshot(data)
+    _fresh_resolve(environment)
+    assert _snapshot(data) == frozen
+
+
+@pytest.mark.parametrize("ended", (False, True), ids=("live-editor", "ended-editor"))
+@pytest.mark.parametrize("envelope", ("current", "old-different", "old-malformed"))
+def test_index_outage_http_callback_preserves_pending_resolve_before_epoch_projection(
+    office_world, monkeypatch, ended, envelope,
+):
+    from office.publish import RecoveryRequiredError
+    from tests.orchestrator._office_recorded_callbacks import recorded_status_1_payload
+
+    http, data, _origin, _manager, broker, _original, session = _conflict(
+        office_world, monkeypatch, final=ended,
+    )
+    revision = broker.OutputsBroker().current_revision(CHAT)
+    _kill_resolve(data, session, "overwrite", "replacement")
+    index = data / CHAT / ".ocu" / "index.json"
+    healthy_index = index.read_bytes()
+    before = _read(data)
+    versions = _snapshot(_versions(data))
+    target = _outputs(data) / "report.docx"
+    inode = target.stat().st_ino
+    old_epoch = envelope != "current"
+    with _content_origin({"/rejected.docx": CHANGED + b"rejected"}) as origin, _bind_internal(monkeypatch, origin.url):
+        if old_epoch:
+            (data / ".office-restore-epoch").write_text("new-recovery-epoch\n")
+            payload = _payload(session, origin.url + "/rejected.docx", final=ended)
+            if envelope == "old-malformed":
+                payload.update(status="malformed", userdata="invalid-rejected-envelope")
+        else:
+            payload = recorded_status_1_payload(document_key=session["document_key"])
+        index.write_bytes(b"{unavailable-index")
+        if old_epoch:
+            with pytest.raises(RecoveryRequiredError):
+                _post(http, session, payload)
+        else:
+            _assert_refusal(_post(http, session, payload), 503, "publish_pending")
+        assert origin.hits == 0
+        assert _read(data) == before
+        assert _snapshot(_versions(data)) == versions
+        assert target.read_bytes() == CHANGED
+        assert target.stat().st_ino == inode
+
+        index.write_bytes(healthy_index)
+        response = _post(http, session, payload)
+        if old_epoch or ended:
+            _assert_refusal(response, 409, "session_not_open")
+        else:
+            assert response.status_code == 200
+            assert response.json() == {"error": 0}
+        after = _read(data)
+        record = after["sessions"][session["session_id"]]
+        assert (record["state"], record["reason"]) == (
+            "closed" if ended else "orphaned" if old_epoch else "editing",
+            "restore_epoch_changed" if old_epoch and not ended else None,
+        )
+        assert after["journal"] == {}
+        assert after["receipts"] == before["receipts"]
+        assert after["documents"][session["file_id"]]["published_version"] == 4
+        assert after["documents"][session["file_id"]]["versions"][3]["published"] is True
+        assert len(after["documents"][session["file_id"]]["versions"]) == 4
+        assert record["last_published_seq"] == 1
+        assert json.loads(index.read_bytes())["counter"] == revision + 1
+        assert origin.hits == 0
+        assert _snapshot(_versions(data)) == versions
+        assert target.stat().st_ino == inode
+        frozen = _snapshot(data)
+        from office.publish import recover_publications
+        recover_publications(CHAT)
+        assert _snapshot(data) == frozen
+        if old_epoch:
+            replay = _post(http, session, payload)
+            if envelope == "old-malformed":
+                _assert_refusal(replay, 409, "session_not_open")
+            elif ended:
+                assert replay.status_code == 200
+                assert replay.json() == {"error": 0}
+            else:
+                _assert_refusal(replay, 409, "stale_save_seq")
+            assert _snapshot(data) == frozen
+            assert origin.hits == (0 if ended or envelope == "old-malformed" else 1)
 
 
 @pytest.mark.parametrize("ended", (False, True), ids=("live-editor", "ended-editor"))

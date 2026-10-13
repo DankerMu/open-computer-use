@@ -156,7 +156,7 @@ def test_recovery_finishes_matching_successor_without_rewriting_workspace(world)
     assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 1
 
 
-def test_recovery_re_registers_visible_index_commit_without_rewriting(world):
+def test_unattributed_registration_before_publication_preparation_is_not_reused(world):
     fixture = _prepared(world, "absent")
     fixture.target.write_bytes(SAVED)
     fixture.broker.register_host_write(CHAT, "report.docx")
@@ -384,13 +384,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from docker.errors import NotFound
 import docker_manager
-from office.publish import publish, recover_publications
+from office.publish import RecoveryRequiredError, publish, recover_publications
 
 data, chat = Path(os.environ["OCU_BASE"]), os.environ["OCU_CHAT"]
 office = data / chat / ".ocu" / "office"
 marker = Path(os.environ["CRASH_MARKER"])
 cut = os.environ.get("CRASH_CUT", "")
 mode = os.environ.get("CRASH_MODE", "publish")
+journal_id = os.environ.get("CRASH_JOURNAL", "publish-save-3")
 def stop(point):
     if point == cut:
         marker.write_text(point)
@@ -467,7 +468,7 @@ def replaced(source, destination, *args, **kwargs):
     if destination == "state.json":
         successor = json.loads((office / source).read_bytes())
         journal = successor["journal"]
-        binding = journal.get("publish-save-3", {}).get("staging")
+        binding = journal.get(journal_id, {}).get("staging")
         point = "completion" if not journal else "retirement" if binding and binding.get("retired") else "binding" if binding else "preparation"
     elif destination == "report.docx":
         point = "replace"
@@ -513,11 +514,22 @@ def synced(fd):
         pending_sync = None
     return answer
 os.open, os.link, os.replace, os.unlink, os.fsync = opened, linked, replaced, unlinked, synced
-if mode == "publish":
-    publish(chat, "publish-save-3")
+if mode == "publish-result":
+    result = publish(chat, journal_id)
+    print(json.dumps({"outcome": result.outcome, "reason": result.reason}), flush=True)
+elif mode == "recover-pending":
+    try:
+        recover_publications(chat)
+    except RecoveryRequiredError:
+        print("pending", flush=True)
+    else:
+        print("completed", flush=True)
 else:
-    recover_publications(chat)
-print("completed", flush=True)
+    if mode == "publish":
+        publish(chat, journal_id)
+    else:
+        recover_publications(chat)
+    print("completed", flush=True)
 '''
 
 
@@ -527,6 +539,7 @@ def _crash(fixture, cut, *, mode="publish", engine_state=None):
     child = subprocess.Popen(
         [sys.executable, "-c", _CRASH_WORKER],
         env=_child_env(fixture.data, CRASH_MARKER=str(marker), CRASH_CUT=cut, CRASH_MODE=mode,
+                       CRASH_JOURNAL=getattr(fixture, "journal_id", OBLIGATION),
                        ENGINE_STATE=str(engine_state) if engine_state else ""),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
@@ -541,6 +554,7 @@ def _crash(fixture, cut, *, mode="publish", engine_state=None):
         assert marker.read_text() == cut
         child.kill()
         child.communicate(timeout=5)
+        assert child.returncode == -9
     finally:
         if child.poll() is None:
             child.kill()
@@ -557,6 +571,436 @@ def _fresh_recover(fixture, engine_state=None, *, wall_time=106.0):
     )
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
     assert completed.stdout.strip() == "completed"
+
+
+def _publication_result(fixture):
+    completed = subprocess.run(
+        [sys.executable, "-c", _CRASH_WORKER],
+        env=_child_env(
+            fixture.data, CRASH_MARKER=str(fixture.data.parent / "unused-marker"),
+            CRASH_MODE="publish-result", CRASH_JOURNAL=getattr(fixture, "journal_id", OBLIGATION),
+        ),
+        capture_output=True, text=True, timeout=15,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.parametrize("requester", ("save", "final"))
+@pytest.mark.parametrize("cut", (
+    "replace-after", "registration-durability-after", "retirement-after",
+))
+def test_index_outage_native_publication_boundaries_complete_once(world, requester, cut):
+    from office.publish import RecoveryRequiredError
+
+    fixture = _prepared(world, "absent")
+    if requester == "final":
+        def closing(state):
+            state["journal"][OBLIGATION]["requester"] = "final"
+            state["sessions"][SESSION].update(
+                state="closing", pending_save_seq=3, pending_close_seq=3,
+            )
+            state["receipts"][SESSION]["3"]["status"] = 2
+        fixture.before = fixture.store.update(CHAT, closing)
+    _crash(fixture, cut)
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    healthy_index = index.read_bytes()
+    before = fixture.store.read(CHAT)
+    versions = _snapshot(index.parent / "office" / "versions")
+    inode = fixture.target.stat().st_ino
+    assert fixture.target.read_bytes() == SAVED
+    index.write_bytes(b"{unavailable-index")
+
+    assert _publication_result(fixture) == {"outcome": "interrupted", "reason": "index_unavailable"}
+    with pytest.raises(RecoveryRequiredError):
+        _recover()
+    assert fixture.store.read(CHAT) == before
+    assert fixture.target.read_bytes() == SAVED
+    assert fixture.target.stat().st_ino == inode
+    assert _snapshot(index.parent / "office" / "versions") == versions
+    assert index.read_bytes() == b"{unavailable-index"
+
+    index.write_bytes(healthy_index)
+    _fresh_recover(fixture)
+    expected = copy.deepcopy(fixture.before)
+    document = expected["documents"][fixture.file_id]
+    document["versions"][1]["published"] = True
+    document.update(published_version=2, published_sha256=_sha(SAVED))
+    expected["sessions"][SESSION].update(baseline_sha256=_sha(SAVED), last_published_seq=3)
+    if requester == "final":
+        expected["sessions"][SESSION].update(
+            state="closed", reason=None, pending_save_seq=None, pending_close_seq=None,
+        )
+    del expected["journal"][OBLIGATION]
+    assert fixture.store.read(CHAT) == expected
+    active = json.loads(index.read_bytes())
+    assert active["counter"] == fixture.indexed["revision"] + 1
+    registered = active["active"]["report.docx"]
+    assert (registered["file_id"], registered["path"], registered["hash"],
+            registered["size"], registered["revision"]) == (
+        fixture.file_id, "report.docx", _sha(SAVED), len(SAVED), fixture.indexed["revision"] + 1,
+    )
+    assert fixture.target.stat().st_ino == inode
+    assert fixture.target.read_bytes() == SAVED
+    assert _snapshot(index.parent / "office" / "versions") == versions
+    frozen = _snapshot(fixture.data)
+    _fresh_recover(fixture)
+    assert _snapshot(fixture.data) == frozen
+
+
+@pytest.mark.parametrize("second_cut", (
+    "anchor-cleanup-before", "registration-durability-after", "completion-before",
+))
+def test_index_outage_after_recovery_is_killed_again_retains_publication(world, second_cut):
+    fixture = _prepared(world, "absent")
+    _crash(fixture, "replace-after")
+    _crash(fixture, second_cut, mode="recover")
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    healthy_index = index.read_bytes()
+    before = fixture.store.read(CHAT)
+    inode = fixture.target.stat().st_ino
+    versions = _snapshot(index.parent / "office" / "versions")
+    assert OBLIGATION in before["journal"]
+    assert fixture.target.read_bytes() == SAVED
+    index.write_bytes(b"{unavailable-index")
+    assert _publication_result(fixture) == {"outcome": "interrupted", "reason": "index_unavailable"}
+    assert fixture.store.read(CHAT) == before
+    assert fixture.target.stat().st_ino == inode
+    assert fixture.target.read_bytes() == SAVED
+    assert _snapshot(index.parent / "office" / "versions") == versions
+    index.write_bytes(healthy_index)
+    _fresh_recover(fixture)
+    after = fixture.store.read(CHAT)
+    assert after["journal"] == {}
+    assert after["receipts"] == before["receipts"]
+    assert after["documents"][fixture.file_id]["versions"][1]["published"] is True
+    assert after["sessions"][SESSION]["last_published_seq"] == 3
+    assert json.loads(index.read_bytes())["counter"] == fixture.indexed["revision"] + 1
+    assert fixture.target.stat().st_ino == inode
+    frozen = _snapshot(fixture.data)
+    _fresh_recover(fixture)
+    assert _snapshot(fixture.data) == frozen
+
+
+@pytest.mark.parametrize("cut", (
+    "unstarted", "preparation-after", "binding-after", "exposure-after", "replace-before",
+    "pre-replacement-retired",
+))
+def test_index_outage_native_pre_replacement_remains_terminal(world, cut):
+    fixture = _prepared(world, "absent")
+    if cut == "pre-replacement-retired":
+        _crash(fixture, "exposure-after")
+        _crash(fixture, "anchor-cleanup-after", mode="recover")
+    elif cut != "unstarted":
+        _crash(fixture, cut)
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    healthy_index = index.read_bytes()
+    before = fixture.store.read(CHAT)
+    inode = fixture.target.stat().st_ino
+    versions = _snapshot(index.parent / "office" / "versions")
+    index.write_bytes(b"{unavailable-index")
+    assert _publication_result(fixture) == {"outcome": "failed", "reason": "index_unavailable"}
+    after = fixture.store.read(CHAT)
+    assert after["journal"] == {}
+    assert after["documents"] == before["documents"]
+    assert after["receipts"] == before["receipts"]
+    assert after["sessions"][SESSION]["reason"] == "index_unavailable"
+    assert after["sessions"]["sibling-session"] == before["sessions"]["sibling-session"]
+    assert fixture.target.read_bytes() == BASELINE
+    assert fixture.target.stat().st_ino == inode
+    assert _snapshot(index.parent / "office" / "versions") == versions
+    assert not list(fixture.target.parent.glob(".office-publish.*"))
+    index.write_bytes(healthy_index)
+    frozen = _snapshot(fixture.data)
+    _fresh_recover(fixture)
+    assert _snapshot(fixture.data) == frozen
+    assert json.loads(index.read_bytes())["counter"] == fixture.indexed["revision"]
+
+
+@pytest.mark.parametrize("cut", ("replace-after", "retirement-after"))
+def test_index_outage_legacy_missing_or_retired_proof_remains_pending(world, cut):
+    fixture = _prepared(world, "absent")
+    _crash(fixture, cut)
+    entry = fixture.store.read(CHAT)["journal"][OBLIGATION]
+    if cut == "replace-after":
+        staging = fixture.data / CHAT / ".ocu" / "office" / "staging"
+        for name in (entry["staging"]["anchor_name"], entry["staging"]["witness_name"]):
+            (staging / name).unlink()
+    def legacy(state):
+        live = state["journal"][OBLIGATION]
+        live.pop("initial_revision", None)
+        for field in ("replacement_started", "target_device", "target_inode"):
+            live["staging"].pop(field, None)
+    fixture.store.update(CHAT, legacy)
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    index.write_bytes(b"{unavailable-index")
+    before = _snapshot(fixture.data)
+    assert _publication_result(fixture) == {"outcome": "interrupted", "reason": "index_unavailable"}
+    assert _snapshot(fixture.data) == before
+
+
+@pytest.mark.parametrize("field,value", (
+    ("initial_revision", True), ("initial_revision", -1), ("initial_revision", "1"),
+    ("replacement_started", 1), ("replacement_started", None),
+    ("target_device", True), ("target_inode", -1), ("target_inode", "1"),
+    ("target_inode", None),
+    ("replacement_possible", 1), ("replacement_possible", None), ("replacement_possible", "true"),
+))
+def test_index_outage_invalid_optional_progress_refuses_before_mutation(world, field, value):
+    fixture = _prepared(world, "absent")
+    _crash(fixture, "replace-before")
+    def damage(state):
+        live = state["journal"][OBLIGATION]
+        destination = live if field in ("initial_revision", "replacement_possible") else live["staging"]
+        if field == "target_inode" and value is None:
+            destination.pop(field)
+        else:
+            destination[field] = value
+    fixture.store.update(CHAT, damage)
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    index.write_bytes(b"{unavailable-index")
+    before = _snapshot(fixture.data)
+    with pytest.raises(world[0].StateCorruptError):
+        _recover()
+    assert _snapshot(fixture.data) == before
+
+
+@pytest.mark.parametrize("possible", (False, True))
+def test_index_outage_unbound_possible_replacement_refuses_before_mutation(world, possible):
+    fixture = _prepared(world, "absent")
+    fixture.store.update(
+        CHAT, lambda state: state["journal"][OBLIGATION].update(replacement_possible=possible),
+    )
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    index.write_bytes(b"{unavailable-index")
+    before = _snapshot(fixture.data)
+    with pytest.raises(world[0].StateCorruptError):
+        _recover()
+    assert _snapshot(fixture.data) == before
+
+
+def test_index_outage_possible_replacement_without_revision_remains_pending(world):
+    from office.publish import RecoveryRequiredError
+
+    fixture = _prepared(world, "absent")
+    _crash(fixture, "replace-after")
+    _crash(fixture, "registration-durability-after", mode="recover")
+    def forget_revision(state):
+        state["journal"][OBLIGATION].pop("initial_revision")
+    fixture.store.update(CHAT, forget_revision)
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    healthy_index = index.read_bytes()
+    index.write_bytes(b"{unavailable-index")
+    before = _snapshot(fixture.data)
+    assert _publication_result(fixture) == {"outcome": "interrupted", "reason": "index_unavailable"}
+    assert _snapshot(fixture.data) == before
+    index.write_bytes(healthy_index)
+    before = _snapshot(fixture.data)
+    with pytest.raises(RecoveryRequiredError):
+        _recover()
+    assert _snapshot(fixture.data) == before
+
+
+
+@pytest.mark.parametrize("damage", (
+    "equal-target", "equal-anchor", "equal-witness", "symlink-target", "symlink-parent",
+    "extra-link", "missing-private-pins",
+))
+def test_index_outage_foreign_or_missing_ownership_preserves_responsibility(world, damage):
+    fixture = _prepared(world, "absent")
+    _crash(fixture, "replace-after")
+    entry = fixture.store.read(CHAT)["journal"][OBLIGATION]
+    staging = fixture.data / CHAT / ".ocu" / "office" / "staging"
+    foreign = fixture.data.parent / "foreign-selected"
+    foreign.write_bytes(SAVED)
+    if damage == "equal-target":
+        replacement = fixture.target.with_name("foreign.docx")
+        replacement.write_bytes(SAVED)
+        replacement.replace(fixture.target)
+    elif damage in ("equal-anchor", "equal-witness"):
+        name = entry["staging"]["anchor_name" if damage == "equal-anchor" else "witness_name"]
+        private = staging / name
+        private.unlink()
+        private.write_bytes(SAVED)
+    elif damage == "symlink-target":
+        fixture.target.unlink()
+        fixture.target.symlink_to(foreign)
+    elif damage == "symlink-parent":
+        outputs = fixture.target.parent
+        moved = outputs.with_name("held-outputs")
+        outputs.rename(moved)
+        outputs.symlink_to(moved, target_is_directory=True)
+    elif damage == "extra-link":
+        os.link(fixture.target, fixture.data.parent / "foreign-link")
+    else:
+        for name in (entry["staging"]["anchor_name"], entry["staging"]["witness_name"]):
+            (staging / name).unlink()
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    index.write_bytes(b"{unavailable-index")
+    before = _snapshot(fixture.data)
+    objects = [foreign, fixture.target, fixture.data.parent / "foreign-link"]
+    objects.extend(staging / entry["staging"][key] for key in ("anchor_name", "witness_name"))
+    identities = {
+        path: (path.lstat().st_dev, path.lstat().st_ino)
+        for path in objects if path.exists() or path.is_symlink()
+    }
+    from office.publish import RecoveryRequiredError
+    with pytest.raises((RecoveryRequiredError, OSError)):
+        _recover()
+    assert _snapshot(fixture.data) == before
+    assert {path: (path.lstat().st_dev, path.lstat().st_ino) for path in identities} == identities
+    assert foreign.read_bytes() == SAVED
+    assert OBLIGATION in fixture.store.read(CHAT)["journal"]
+
+
+@pytest.mark.parametrize("foreign_identity", (False, True), ids=("unrelated-path", "wrong-file-id"))
+def test_index_outage_equal_content_index_entry_cannot_complete_another_identity(world, foreign_identity):
+    fixture = _prepared(world, "absent")
+    _crash(fixture, "replace-after")
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    unrelated = fixture.target.with_name("unrelated.docx")
+    unrelated.write_bytes(SAVED)
+    registered = fixture.broker.register_host_write(CHAT, "unrelated.docx")
+    healthy = json.loads(index.read_bytes())
+    if foreign_identity:
+        healthy["active"]["report.docx"] = dict(registered, path="report.docx", name="report.docx")
+        del healthy["active"]["unrelated.docx"]
+        healthy["fingerprints"] = {f"{len(SAVED)}:{_sha(SAVED)}": [registered["file_id"]]}
+        index.write_text(json.dumps(healthy))
+    healthy_index = index.read_bytes()
+    before = fixture.store.read(CHAT)
+    inode = fixture.target.stat().st_ino
+    index.write_bytes(b"{unavailable-index")
+    assert _publication_result(fixture) == {"outcome": "interrupted", "reason": "index_unavailable"}
+    assert fixture.store.read(CHAT) == before
+    index.write_bytes(healthy_index)
+    _fresh_recover(fixture)
+    after = fixture.store.read(CHAT)
+    assert after["receipts"] == before["receipts"]
+    assert fixture.target.stat().st_ino == inode
+    assert fixture.target.read_bytes() == SAVED
+    assert unrelated.read_bytes() == SAVED
+    current = json.loads(index.read_bytes())
+    if foreign_identity:
+        assert after["documents"][fixture.file_id]["versions"][1]["published"] is False
+        assert after["documents"][fixture.file_id]["published_version"] == 1
+        assert after["sessions"][SESSION]["reason"] == "path_missing"
+        assert index.read_bytes() == healthy_index
+    else:
+        assert after["documents"][fixture.file_id]["versions"][1]["published"] is True
+        assert current["counter"] == fixture.indexed["revision"] + 2
+        assert current["active"]["unrelated.docx"] == registered
+        assert current["active"]["report.docx"]["file_id"] == fixture.file_id
+        assert current["active"]["report.docx"]["revision"] == fixture.indexed["revision"] + 2
+
+
+def test_index_outage_committed_registration_survives_metadata_only_target_change(world):
+    fixture = _prepared(world, "absent")
+    _crash(fixture, "registration-durability-after")
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    healthy_index = index.read_bytes()
+    info = fixture.target.stat()
+    os.utime(fixture.target, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+    index.write_bytes(b"{unavailable-index")
+    before = fixture.store.read(CHAT)
+    assert _publication_result(fixture) == {"outcome": "interrupted", "reason": "index_unavailable"}
+    assert fixture.store.read(CHAT) == before
+    index.write_bytes(healthy_index)
+    _fresh_recover(fixture)
+    assert fixture.target.stat().st_ino == info.st_ino
+    assert fixture.target.stat().st_mtime_ns == info.st_mtime_ns + 1_000_000_000
+    assert fixture.target.read_bytes() == SAVED
+    assert index.read_bytes() == healthy_index
+    after = fixture.store.read(CHAT)
+    assert after["documents"][fixture.file_id]["versions"][1]["published"] is True
+    assert after["receipts"] == before["receipts"]
+    assert after["journal"] == {}
+
+
+
+def test_killed_replaced_publication_retains_index_outage_and_recovers_once(world):
+    fixture = _prepared(world, "absent")
+    office = fixture.data / CHAT / ".ocu" / "office"
+    index = office.parent / "index.json"
+    healthy_index = index.read_bytes()
+    original_inode = fixture.target.stat().st_ino
+    versions = _snapshot(office / "versions")
+
+    _crash(fixture, "replace-after")
+    assert fixture.target.read_bytes() == SAVED
+    inode = fixture.target.stat().st_ino
+    assert inode != original_inode
+    before = fixture.store.read(CHAT)
+    assert OBLIGATION in before["journal"]
+    assert before["documents"] == fixture.before["documents"]
+    assert before["sessions"] == fixture.before["sessions"]
+    assert before["receipts"] == fixture.before["receipts"]
+
+    corrupt_index = b"{unavailable-index"
+    index.write_bytes(corrupt_index)
+
+    def run(mode):
+        completed = subprocess.run(
+            [sys.executable, "-c", _CRASH_WORKER],
+            env=_child_env(
+                fixture.data, CRASH_MARKER=str(fixture.data.parent / "unused-marker"),
+                CRASH_MODE=mode,
+            ),
+            capture_output=True, text=True, timeout=15,
+        )
+        assert completed.returncode == 0, (completed.stdout, completed.stderr)
+        return completed.stdout.strip()
+
+    result = json.loads(run("publish-result"))
+    pending = fixture.store.read(CHAT)
+    assert (result, OBLIGATION in pending["journal"]) == (
+        {"outcome": "interrupted", "reason": "index_unavailable"}, True,
+    )
+    assert pending["documents"] == before["documents"]
+    assert pending["sessions"] == before["sessions"]
+    assert pending["receipts"] == before["receipts"]
+    assert fixture.target.read_bytes() == SAVED
+    assert fixture.target.stat().st_ino == inode
+    assert _snapshot(office / "versions") == versions
+    assert index.read_bytes() == corrupt_index
+
+    assert run("recover-pending") == "pending"
+    pending = fixture.store.read(CHAT)
+    assert OBLIGATION in pending["journal"]
+    assert pending["documents"] == before["documents"]
+    assert pending["sessions"] == before["sessions"]
+    assert pending["receipts"] == before["receipts"]
+    assert fixture.target.read_bytes() == SAVED
+    assert fixture.target.stat().st_ino == inode
+    assert _snapshot(office / "versions") == versions
+    assert index.read_bytes() == corrupt_index
+
+    index.write_bytes(healthy_index)
+    _fresh_recover(fixture)
+    registered = json.loads(index.read_bytes())
+    assert registered["counter"] == fixture.indexed["revision"] + 1
+    active = registered["active"]["report.docx"]
+    assert active["file_id"] == fixture.file_id
+    assert active["hash"] == _sha(SAVED)
+    assert active["size"] == len(SAVED)
+    assert active["revision"] == fixture.indexed["revision"] + 1
+
+    expected = copy.deepcopy(fixture.before)
+    expected["documents"][fixture.file_id]["versions"][1]["published"] = True
+    expected["documents"][fixture.file_id]["published_version"] = 2
+    expected["documents"][fixture.file_id]["published_sha256"] = _sha(SAVED)
+    expected["sessions"][SESSION]["baseline_sha256"] = _sha(SAVED)
+    expected["sessions"][SESSION]["last_published_seq"] = 3
+    del expected["journal"][OBLIGATION]
+    assert fixture.store.read(CHAT) == expected
+    assert fixture.target.read_bytes() == SAVED
+    assert fixture.target.stat().st_ino == inode
+    assert _snapshot(office / "versions") == versions
+
+    completed = _snapshot(fixture.data)
+    _fresh_recover(fixture)
+    assert _snapshot(fixture.data) == completed
+    assert fixture.target.stat().st_ino == inode
 
 
 @pytest.mark.parametrize("cut", [
