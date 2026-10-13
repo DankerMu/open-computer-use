@@ -25,7 +25,7 @@ from tests.orchestrator.test_office_callback_publish import (
 from tests.orchestrator.test_office_control_plane import _open_session
 from tests.orchestrator.test_office_session_lifecycle import _status
 from tests.orchestrator.test_office_sessions import (
-    _assert_refusal, _create, _index_file, _office, _outputs, _put, _snapshot, _versions, office_world,
+    _assert_refusal, _create, _index_file, _office, _outputs, _put, _snapshot, _versions, office_world as office_world,
 )
 from tests.orchestrator.test_outputs_endpoint import CHAT, INTERNAL, _auth
 from tests.orchestrator.test_office_router import _raw_office
@@ -612,6 +612,15 @@ def stop(point):
             time.sleep(0.02)
 real_open, real_link, real_replace, real_unlink, real_sync = os.open, os.link, os.replace, os.unlink, os.fsync
 staged = {}
+real_write = os.write
+def written(fd, body):
+    if cut == "partial-content" and fd in staged and body:
+        size = real_write(fd, body[:7])
+        os.fsync(fd)
+        stop("partial-content")
+        return size
+    return real_write(fd, body)
+os.write = written
 def opened(name, flags, *args, **kwargs):
     anchor = isinstance(name, str) and name.startswith(".office-publish.") and flags & os.O_CREAT
     if anchor:
@@ -1793,8 +1802,9 @@ def missing(identity):
     raise NotFound(identity)
 docker_manager._docker_client = SimpleNamespace(containers=SimpleNamespace(get=missing))
 timeout = os.environ.get("RETIRE_PRECLAIM_TIMEOUT") == "1"
+slow_cleanup = os.environ.get("RETIRE_SLOW_CLEANUP") == "1"
 elapsed = [0.0]
-if timeout:
+if timeout or slow_cleanup:
     container = SimpleNamespace(id="retirement-budget-sandbox", status="running", attrs={"State": {"Paused": False}})
     def pause():
         container.status, container.attrs["State"]["Paused"] = "paused", True
@@ -1818,6 +1828,10 @@ def stop(point):
             time.sleep(0.02)
 real_replace, real_sync, real_unlink = os.replace, os.fsync, os.unlink
 pending = {}
+rebound = set()
+drop_armed = bool(os.environ.get("RETIRE_DROP_ROOT"))
+unlinked_private = False
+slow_advanced = False
 def replaced(source, destination, *args, **kwargs):
     point = None
     if destination == "state.json":
@@ -1832,16 +1846,40 @@ def replaced(source, destination, *args, **kwargs):
     answer = real_replace(source, destination, *args, **kwargs)
     if point:
         pending[kwargs["dst_dir_fd"]] = point
+    if drop_armed and destination == "state.json" and entries and entries[0].get("copy", {}).get("destination") == "":
+        rebound.add(kwargs["dst_dir_fd"])
     if timeout and destination == "state.json" and entries and "attempt" in entries[0].get("copy", {}):
         elapsed[0] = 6.0
     return answer
 def synced(fd):
+    global drop_armed, slow_advanced
+    if os.environ.get("RETIRE_SYNC_FAIL"):
+        private = Path(os.environ["OCU_BASE"]) / os.environ["OCU_CHAT"] / ".ocu" / "office" / "staging"
+        info, expected = os.fstat(fd), private.stat()
+        if unlinked_private and (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino):
+            Path(os.environ["RETIRE_FAULT_MARKER"]).write_text("staging-sync-after-unlink")
+            raise OSError(5, "private retirement durability refused")
     answer = real_sync(fd)
+    if slow_cleanup and not slow_advanced:
+        private = Path(os.environ["OCU_BASE"]) / os.environ["OCU_CHAT"] / ".ocu" / "office" / "staging"
+        info, expected = os.fstat(fd), private.stat()
+        names = (os.environ["RETIRE_ANCHOR"], os.environ["RETIRE_WITNESS"])
+        if (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino) and all(not (private / name).exists() for name in names):
+            elapsed[0] += 6.0
+            slow_advanced = True
+            Path(os.environ["RETIRE_FAULT_MARKER"]).write_text("completed-private-sync-crossed-budget")
+    if fd in rebound:
+        rebound.remove(fd)
+        root = Path(os.environ["OCU_BASE"]) / os.environ["OCU_CHAT"] / "outputs"
+        root.rmdir()
+        drop_armed = False
+        Path(os.environ["RETIRE_FAULT_MARKER"]).write_text("durable-rebind-root-removed")
     point = pending.pop(fd, None)
     if point:
         stop(point)
     return answer
 def unlinked(name, *args, **kwargs):
+    global unlinked_private
     point = "shared-unlink" if name == "report (2).docx" else (
         "anchor-unlink" if isinstance(name, str) and name.startswith(".office-publish.") else (
             "witness-unlink" if isinstance(name, str) and name.startswith(".publish-owner.") else ""
@@ -1849,6 +1887,8 @@ def unlinked(name, *args, **kwargs):
     )
     stop(point + "-before")
     answer = real_unlink(name, *args, **kwargs)
+    if os.environ.get("RETIRE_SYNC_FAIL") and name == os.environ["RETIRE_ANCHOR"]:
+        unlinked_private = True
     stop(point + "-after")
     return answer
 os.replace, os.fsync, os.unlink = replaced, synced, unlinked
@@ -1858,7 +1898,19 @@ if timeout:
     publish.publish(os.environ["OCU_CHAT"], journal_id)
 else:
     recover_now = os.environ.get("OCU_RECOVER_NOW")
-    publish.recover_publications(os.environ["OCU_CHAT"], now=None if recover_now is None else float(recover_now))
+    try:
+        publish.recover_publications(os.environ["OCU_CHAT"], now=None if recover_now is None else float(recover_now))
+    except publish.RecoveryRequiredError as error:
+        assert os.environ.get("RETIRE_EXPECT_ERROR") == "ownership", repr(error)
+        print("ownership-refused", flush=True)
+    except OSError as error:
+        assert os.environ.get("RETIRE_EXPECT_ERROR") == "sync" and error.errno == 5, repr(error)
+        print("sync-refused", flush=True)
+    else:
+        assert not os.environ.get("RETIRE_EXPECT_ERROR"), "recovery unexpectedly completed"
+        if slow_cleanup:
+            assert slow_advanced and elapsed[0] == 6.0
+            assert container.status == "running" and container.attrs["State"]["Paused"] is False
 '''
 
 
@@ -2099,9 +2151,10 @@ def test_capacity_retirement_does_not_collect_unbound_private_content(office_wor
     assert {path.name for path in private.iterdir()} == {unbound.name, witness.name}
 
 
+@pytest.mark.parametrize("missing_root", (False, True), ids=("root-present", "root-missing"))
 @pytest.mark.parametrize("cut", ("retained-intent", "private-retirement", "anchor-unlink-after", "witness-unlink-after"))
 def test_killed_preclaim_timeout_reclaims_private_content_without_publishing(
-    office_world, monkeypatch, cut,
+    office_world, monkeypatch, cut, missing_root,
 ):
     from tests.orchestrator.test_office_callback_publish import _surviving
     http, data, _origin, _manager, _broker, _body, session = _opened(office_world)
@@ -2120,11 +2173,17 @@ def test_killed_preclaim_timeout_reclaims_private_content_without_publishing(
     assert "retained_name" not in entry["copy"]
     assert "claimed_name" not in entry["copy"]
     assert list(_outputs(data).iterdir()) == []
+    blobs_before = _snapshot(_versions(data))
+    if missing_root:
+        _outputs(data).rmdir()
     started = json.loads((_office(data) / "fence.json").read_bytes())["pause_started_at"]
+    recovery_environment = {
+        **environment, "COPY_CUT": "", "RETIRE_PRECLAIM_TIMEOUT": "",
+        "OCU_RECOVER_NOW": str(started + 5.001),
+    }
     fresh = subprocess.run(
         [sys.executable, "-c", _RETIREMENT_WORKER], cwd=str(SERVER_DIR),
-        env={**environment, "COPY_CUT": "", "RETIRE_PRECLAIM_TIMEOUT": "",
-             "OCU_RECOVER_NOW": str(started + 5.001)},
+        env=recovery_environment,
         capture_output=True, text=True, timeout=15,
     )
     assert fresh.returncode == 0, (fresh.stdout, fresh.stderr)
@@ -2135,5 +2194,292 @@ def test_killed_preclaim_timeout_reclaims_private_content_without_publishing(
     assert state["documents"] == before["documents"]
     assert state["receipts"] == before["receipts"]
     assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
-    assert list(_outputs(data).iterdir()) == []
+    assert _snapshot(_versions(data)) == blobs_before
+    if missing_root:
+        assert not _outputs(data).exists()
+    else:
+        assert list(_outputs(data).iterdir()) == []
     _assert_private_reclaimed(data)
+    private = _office(data) / "staging"
+    for name in (entry["staging"]["anchor_name"], entry["staging"]["witness_name"]):
+        assert not (private / name).exists()
+    completed = _snapshot(data)
+    replay = subprocess.run(
+        [sys.executable, "-c", _RETIREMENT_WORKER], cwd=str(SERVER_DIR),
+        env=recovery_environment, capture_output=True, text=True, timeout=15,
+    )
+    assert replay.returncode == 0, (replay.stdout, replay.stderr)
+    assert _snapshot(data) == completed
+    if missing_root:
+        assert not _outputs(data).exists()
+    else:
+        assert list(_outputs(data).iterdir()) == []
+
+
+def _pending_missing_root_copy(
+    office_world, monkeypatch, *, retained=True, allocation="full", nested=False, retirement_cut="retained-intent",
+):
+    from tests.orchestrator.test_office_callback_publish import _surviving
+    http, data, _origin, _manager, _broker, _body, session = (
+        _nested(office_world, "nested/report.docx") if nested else _opened(office_world)
+    )
+    (_outputs(data) / ("nested/report.docx" if nested else "report.docx")).unlink()
+    with _content_origin({"/save.docx": CHANGED}) as origin, _bind_internal(monkeypatch, origin.url):
+        _surviving(http, data, session, monkeypatch, origin, final=True)
+    if retained:
+        environment = _kill_worker_at(
+            data, _RETIREMENT_WORKER, retirement_cut, session, RETIRE_PRECLAIM_TIMEOUT="1",
+        )
+    else:
+        cut = {"empty": "binding-after", "partial": "partial-content", "full": "content-durability-after"}[allocation]
+        environment = _kill_worker_at(data, _COPY_WORKER, cut, session)
+    entry = next(iter(_read(data)["journal"].values()))
+    assert entry["staging"]["retired"] is (retained and retirement_cut == "private-retirement")
+    assert "claimed_name" not in entry["copy"]
+    assert "registered_file_id" not in entry["copy"]
+    expected = {"empty": b"", "partial": CHANGED[:7], "full": CHANGED}[allocation]
+    for field in ("anchor_name", "witness_name"):
+        path = _office(data) / "staging" / entry["staging"][field]
+        assert path.read_bytes() == expected
+        assert (path.stat().st_dev, path.stat().st_ino) == (
+            entry["staging"]["device"], entry["staging"]["inode"],
+        )
+        assert path.stat().st_nlink == 2
+    if retained:
+        assert entry["copy"]["retained_reason"] == "publish_timeout"
+    else:
+        assert "retained_reason" not in entry["copy"]
+        assert not entry["copy"].get("retained")
+    return data, session, environment
+
+
+def _missing_root_recovery_environment(data, environment, **settings):
+    fresh = {**environment, "COPY_CUT": "", "RETIRE_PRECLAIM_TIMEOUT": "", **settings}
+    fence = _office(data) / "fence.json"
+    if fence.exists():
+        fresh["OCU_RECOVER_NOW"] = str(json.loads(fence.read_bytes())["pause_started_at"] + 5.001)
+    return fresh
+
+
+def _run_missing_root_recovery(data, environment, **settings):
+    result = subprocess.run(
+        [sys.executable, "-c", _RETIREMENT_WORKER], cwd=str(SERVER_DIR),
+        env=_missing_root_recovery_environment(data, environment, **settings),
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    return result
+
+
+def _assert_missing_root_conserved(data, before, index_before, blobs_before):
+    state = _read(data)
+    assert state["documents"] == before["documents"]
+    assert state["receipts"] == before["receipts"]
+    assert (data / CHAT / ".ocu" / "index.json").read_bytes() == index_before
+    assert _snapshot(_versions(data)) == blobs_before
+    assert not _outputs(data).exists()
+    return state
+
+
+def _assert_missing_root_completed(data, session, before, index_before, blobs_before, environment, reason):
+    state = _assert_missing_root_conserved(data, before, index_before, blobs_before)
+    record = state["sessions"][session["session_id"]]
+    assert (record["state"], record["reason"], record["saved_as"]) == ("error", reason, None)
+    assert record["file_id"] == session["file_id"]
+    assert state["journal"] == {}
+    entry = next(iter(before["journal"].values()))
+    for field in ("anchor_name", "witness_name"):
+        assert not (_office(data) / "staging" / entry["staging"][field]).exists()
+    completed = _snapshot(data)
+    _run_missing_root_recovery(data, environment)
+    assert _snapshot(data) == completed
+    assert not _outputs(data).exists()
+
+
+@pytest.mark.parametrize("allocation", ("empty", "partial", "full"))
+def test_missing_root_without_retained_reason_retires_unexposed_allocation(
+    office_world, monkeypatch, allocation,
+):
+    data, session, environment = _pending_missing_root_copy(
+        office_world, monkeypatch, retained=False, allocation=allocation,
+    )
+    before = _read(data)
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    blobs_before = _snapshot(_versions(data))
+    _outputs(data).rmdir()
+    _run_missing_root_recovery(data, environment)
+    _assert_missing_root_completed(
+        data, session, before, index_before, blobs_before, environment, "workspace_missing",
+    )
+
+
+@pytest.mark.parametrize("retained", (False, True), ids=("workspace-missing", "retained-timeout"))
+def test_root_disappears_after_durable_nested_fallback_retires_current_copy(
+    office_world, monkeypatch, retained,
+):
+    data, session, environment = _pending_missing_root_copy(
+        office_world, monkeypatch, retained=retained, nested=True,
+    )
+    before = _read(data)
+    assert next(iter(before["journal"].values()))["copy"]["destination"] == "nested"
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    blobs_before = _snapshot(_versions(data))
+    (_outputs(data) / "nested").rmdir()
+    marker = data.parent / "root-drop-marker"
+    _run_missing_root_recovery(
+        data, environment, RETIRE_DROP_ROOT="1", RETIRE_FAULT_MARKER=str(marker),
+    )
+    assert marker.read_text() == "durable-rebind-root-removed"
+    _assert_missing_root_completed(
+        data, session, before, index_before, blobs_before, environment,
+        "publish_timeout" if retained else "workspace_missing",
+    )
+
+
+@pytest.mark.parametrize("cut", ("private-retirement", "anchor-unlink-after", "witness-unlink-after"))
+def test_killed_missing_root_recovery_resumes_private_retirement(
+    office_world, monkeypatch, cut,
+):
+    data, session, environment = _pending_missing_root_copy(office_world, monkeypatch)
+    before = _read(data)
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    blobs_before = _snapshot(_versions(data))
+    _outputs(data).rmdir()
+    settings = _missing_root_recovery_environment(data, environment)
+    environment = _kill_worker_at(
+        data, _RETIREMENT_WORKER, cut, session,
+        OCU_RECOVER_NOW=settings["OCU_RECOVER_NOW"],
+    )
+    pending = _assert_missing_root_conserved(data, before, index_before, blobs_before)
+    entry = next(iter(pending["journal"].values()))
+    assert entry["copy"]["retained_reason"] == "publish_timeout"
+    assert entry["staging"]["retired"] is True
+    names = [_office(data) / "staging" / entry["staging"][field] for field in ("anchor_name", "witness_name")]
+    assert [path.exists() for path in names] == {
+        "private-retirement": [True, True],
+        "anchor-unlink-after": [False, True],
+        "witness-unlink-after": [False, False],
+    }[cut]
+    _run_missing_root_recovery(data, environment)
+    _assert_missing_root_completed(
+        data, session, before, index_before, blobs_before, environment, "publish_timeout",
+    )
+
+
+@pytest.mark.parametrize("mutation", (
+    "foreign-anchor", "foreign-witness", "symlink-anchor", "symlink-witness",
+    "extra-link", "retired-extra-link", "unproven-absence",
+))
+def test_missing_root_refuses_unproven_private_ownership_without_losing_responsibility(
+    office_world, monkeypatch, mutation,
+):
+    data, session, environment = _pending_missing_root_copy(
+        office_world, monkeypatch,
+        retirement_cut="private-retirement" if mutation == "retired-extra-link" else "retained-intent",
+    )
+    before = _read(data)
+    entry = next(iter(before["journal"].values()))
+    private = _office(data) / "staging"
+    anchor, witness = (private / entry["staging"][field] for field in ("anchor_name", "witness_name"))
+    foreign = data.parent / "foreign-private-target"
+    foreign.write_bytes(CHANGED)
+    if mutation.startswith(("foreign-", "symlink-")):
+        victim = anchor if mutation.endswith("anchor") else witness
+        if mutation.startswith("foreign-"):
+            replacement = data.parent / "foreign-replacement"
+            replacement.write_bytes(CHANGED)
+            replacement.replace(victim)
+        else:
+            victim.unlink()
+            victim.symlink_to(foreign)
+    elif mutation in ("extra-link", "retired-extra-link"):
+        os.link(anchor, data.parent / "extra-private-owner")
+    else:
+        anchor.unlink()
+        witness.unlink()
+    _outputs(data).rmdir()
+    preserved = _snapshot(private)
+    paths = [path for path in (anchor, witness, foreign, data.parent / "extra-private-owner") if path.exists() or path.is_symlink()]
+    identities = {path: (path.lstat().st_dev, path.lstat().st_ino) for path in paths}
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    blobs_before = _snapshot(_versions(data))
+    refused = _run_missing_root_recovery(data, environment, RETIRE_EXPECT_ERROR="ownership")
+    assert refused.stdout.strip() == "ownership-refused"
+    pending = _assert_missing_root_conserved(data, before, index_before, blobs_before)
+    assert pending["journal"] == before["journal"]
+    assert pending["sessions"][session["session_id"]] == before["sessions"][session["session_id"]]
+    assert _snapshot(private) == preserved
+    assert foreign.read_bytes() == CHANGED
+    if mutation in ("extra-link", "retired-extra-link"):
+        assert (data.parent / "extra-private-owner").read_bytes() == CHANGED
+    assert {path: (path.lstat().st_dev, path.lstat().st_ino) for path in paths} == identities
+
+
+def test_missing_root_private_sync_failure_keeps_retirement_resumable(office_world, monkeypatch):
+    data, session, environment = _pending_missing_root_copy(office_world, monkeypatch)
+    before = _read(data)
+    entry = next(iter(before["journal"].values()))
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    blobs_before = _snapshot(_versions(data))
+    _outputs(data).rmdir()
+    marker = data.parent / "private-sync-marker"
+    refused = _run_missing_root_recovery(
+        data, environment, RETIRE_SYNC_FAIL="1", RETIRE_EXPECT_ERROR="sync",
+        RETIRE_ANCHOR=entry["staging"]["anchor_name"], RETIRE_FAULT_MARKER=str(marker),
+    )
+    assert refused.stdout.strip() == "sync-refused"
+    assert marker.read_text() == "staging-sync-after-unlink"
+    pending = _assert_missing_root_conserved(data, before, index_before, blobs_before)
+    live = next(iter(pending["journal"].values()))
+    assert live["copy"] == entry["copy"]
+    assert live["staging"]["retired"] is True
+    assert pending["sessions"][session["session_id"]] == before["sessions"][session["session_id"]]
+    private = _office(data) / "staging"
+    assert not (private / entry["staging"]["anchor_name"]).exists()
+    assert (private / entry["staging"]["witness_name"]).read_bytes() == CHANGED
+    _run_missing_root_recovery(data, environment)
+    _assert_missing_root_completed(
+        data, session, before, index_before, blobs_before, environment, "publish_timeout",
+    )
+
+
+def test_missing_root_retirement_preserves_unbound_and_unrelated_private_files(office_world, monkeypatch):
+    data, session, environment = _pending_missing_root_copy(office_world, monkeypatch)
+    before = _read(data)
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    blobs_before = _snapshot(_versions(data))
+    private = _office(data) / "staging"
+    unbound = private / (".office-publish." + "a" * 32 + ".tmp")
+    witness = private / (".publish-owner." + "b" * 32)
+    unrelated = private / "unrelated-private"
+    unbound.write_bytes(CHANGED)
+    os.link(unbound, witness)
+    unrelated.write_bytes(b"unrelated sentinel")
+    sentinels = (unbound, witness, unrelated)
+    identities = {path.name: (path.stat().st_dev, path.stat().st_ino) for path in sentinels}
+    preserved = {path.name: path.read_bytes() for path in sentinels}
+    _outputs(data).rmdir()
+    _run_missing_root_recovery(data, environment)
+    _assert_missing_root_completed(
+        data, session, before, index_before, blobs_before, environment, "publish_timeout",
+    )
+    assert _snapshot(private) == preserved
+    assert {path.name: (path.stat().st_dev, path.stat().st_ino) for path in sentinels} == identities
+
+
+def test_missing_root_slow_private_cleanup_completes_retained_timeout_without_retry(office_world, monkeypatch):
+    data, session, environment = _pending_missing_root_copy(office_world, monkeypatch)
+    before = _read(data)
+    entry = next(iter(before["journal"].values()))
+    index_before = (data / CHAT / ".ocu" / "index.json").read_bytes()
+    blobs_before = _snapshot(_versions(data))
+    _outputs(data).rmdir()
+    marker = data.parent / "slow-private-cleanup-marker"
+    _run_missing_root_recovery(
+        data, environment, RETIRE_SLOW_CLEANUP="1", RETIRE_FAULT_MARKER=str(marker),
+        RETIRE_ANCHOR=entry["staging"]["anchor_name"], RETIRE_WITNESS=entry["staging"]["witness_name"],
+    )
+    assert marker.read_text() == "completed-private-sync-crossed-budget"
+    _assert_missing_root_completed(
+        data, session, before, index_before, blobs_before, environment, "publish_timeout",
+    )

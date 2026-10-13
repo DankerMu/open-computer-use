@@ -452,6 +452,16 @@ def _retain_unregistered(store, broker, chat, journal_id, entry, selected, fence
     return _finish(store, chat, journal_id, PublishResult("failed", reason), entry, selected)
 
 
+def _finish_missing_root(stage, selected, fence):
+    from .publish import PublishResult, _finish
+    reason = stage.entry["copy"].get("retained_reason", "workspace_missing")
+    fence.checkpoint()
+    entry = _retire_private(stage)
+    return _finish(
+        stage.store, stage.chat, stage.journal_id, PublishResult("failed", reason), entry, selected,
+    )
+
+
 def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
     """Complete the copy with its witness retained through the atomic Office successor."""
     from .publish import (
@@ -478,8 +488,7 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
             if _shared_exposure(stage, identity):
                 raise RecoveryRequiredError("publish copy destination is missing")
             if absent.prefix == (chat,) and absent.missing == "outputs":
-                fence.checkpoint()
-                result = _finish(store, chat, journal_id, PublishResult("failed", "workspace_missing"), entry, selected)
+                result = _finish_missing_root(stage, selected, fence)
                 return result
             if "claimed_name" in binding or "registered_file_id" in binding or binding["destination"] == "":
                 raise RecoveryRequiredError("publish copy destination is missing")
@@ -493,6 +502,7 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
                     live.pop("parent_identities", None)
                     live.pop("attempt", None)
                 entry = store.update(chat, rebind)["journal"][journal_id]
+                stage.entry = entry
                 fence.checkpoint()
                 binding = entry["copy"]
                 components = (chat, "outputs")
@@ -504,8 +514,7 @@ def drive(store, broker, chat, journal_id, entry, selected, fence, destination):
                 if _shared_exposure(stage, identity):
                     raise RecoveryRequiredError("publish copy destination is missing")
                 if absent.prefix == (chat,) and absent.missing == "outputs":
-                    fence.checkpoint()
-                    result = _finish(store, chat, journal_id, PublishResult("failed", "workspace_missing"), entry, selected)
+                    result = _finish_missing_root(stage, selected, fence)
                     return result
                 raise RecoveryRequiredError("publish copy destination is missing")
         parents = [list(_identity(os.fstat(fd))) for fd in held]
