@@ -191,6 +191,45 @@ class RenderTests(unittest.TestCase):
                         self.render(table=table)
                 self.assertEqual(self.output.read_bytes(), original)
 
+    def test_file_authority_classification_refuses_matching_but_unsafe_inventory(self):
+        self.render()
+        original = self.output.read_bytes()
+        fixture = json.loads((RENDERER.parent / "routes.json").read_text())
+        cases = (
+            ("canonical chat bypass", "files/{chat}/{path}", {"auth": "chat"}),
+            ("canonical forwarding bypass", "files/{chat}/{path}", {"kind": "http"}),
+            ("canonical missing HEAD", "files/{chat}/{path}", {"methods": ["GET"]}),
+            ("canonical mutation", "files/{chat}/{path}", {"mutating": True}),
+            ("grant chat bypass", "f/{grant}/{chat}/{path}", {"auth": "chat", "prefix": "strip"}),
+            ("grant forwarding bypass", "f/{grant}/{chat}/{path}", {"kind": "http"}),
+            ("grant wrong rewrite", "f/{grant}/{chat}/{path}", {"prefix": "strip"}),
+            ("grant missing HEAD", "f/{grant}/{chat}/{path}", {"methods": ["GET"]}),
+            ("grant mutation", "f/{grant}/{chat}/{path}", {"mutating": True}),
+            ("grant catch-all", "f/{grant}/{chat}/{path}", {"path": "f/{chat}/{path}"}),
+            ("issuer other surface", "api/outputs/{chat}", {"auth": "issuer"}),
+            ("grant other surface", "api/outputs/{chat}", {"auth": "grant", "prefix": "file"}),
+            ("grant wrong position", "f/{grant}/{chat}/{path}", {"path": "files/{grant}/{chat}/{path}"}),
+            ("missing exact issuer", "files/{chat}/{path}",
+             {"path": "preview/{chat}/ordinary", "auth": "chat", "kind": "http",
+              "prefix": "strip", "methods": ["GET"]}),
+            ("missing exact grant", "f/{grant}/{chat}/{path}",
+             {"path": "preview/{chat}/ordinary", "auth": "chat", "kind": "http",
+              "prefix": "strip", "methods": ["GET"]}),
+        )
+        for label, path, change in cases:
+            with self.subTest(case=label):
+                candidate = json.loads(json.dumps(fixture))
+                next(row for row in candidate["rows"] if row["path"] == path).update(change)
+                table = Path(self.sandbox.name) / "routes.json"
+                raw = json.dumps(candidate).encode()
+                table.write_bytes(raw)
+                with patch.object(render_module, "REVIEWED_TABLE_SHA256",
+                                  hashlib.sha256(raw).hexdigest()):
+                    with self.assertRaises(render_module.RenderError):
+                        self.render(table=table)
+                self.assertTrue(self.output.read_bytes() == original,
+                                "invalid classification must preserve the private configuration")
+
 
 if __name__ == "__main__":
     unittest.main()

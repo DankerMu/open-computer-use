@@ -16,6 +16,8 @@ import threading
 from urllib.parse import parse_qs, unquote, urlsplit
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# Interface-only grant fixture: no signing or cryptographic verification.
+SYNTHETIC_GRANT = "synthetic-payload.synthetic-signature"
 
 
 class RecordingServer(ThreadingHTTPServer):
@@ -64,6 +66,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _fail_transport(self, malformed=False):
+        if malformed:
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n")
+            self.wfile.flush()
+        self.close_connection = True
+
     def _serve(self):
         kind = self.server.kind
         extra = {}
@@ -101,6 +109,47 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._reply(401)
                 return
+            elif self.path == "/api/v1/ocu/resource-grants/issue":
+                headers = [("Cache-Control", "no-store"),
+                           ("Referrer-Policy", "no-referrer")]
+                if cookie in {"session=drop", "session=malformed"}:
+                    self._fail_transport(cookie == "session=malformed")
+                    return
+                if cookie == "session=owner" and chat == "chat-ABC-123":
+                    path = self.headers.get("X-Ocu-Resource-Path", "")
+                    query = self.headers.get("X-Ocu-Resource-Query", "")
+                    location = f"/ocu/f/{SYNTHETIC_GRANT}/{chat}/{path}"
+                    if query:
+                        location += "?" + query
+                    self._reply(302, b"", [*headers, ("Location", location)])
+                elif cookie in {"session=owner", "session=foreign"}:
+                    self._reply(403, b"", headers)
+                elif cookie == "session=error":
+                    self._reply(503, b"", headers)
+                else:
+                    self._reply(401, b"", headers)
+                return
+            elif self.path == "/api/v1/ocu/resource-grants/auth":
+                grant = self.headers.get("X-Ocu-Grant", "")
+                path = self.headers.get("X-Ocu-Resource-Path", "")
+                method = self.headers.get("X-Ocu-Resource-Method", "")
+                headers = [("Cache-Control", "no-store")]
+                if grant in {"drop-payload.synthetic-signature",
+                             "malformed-payload.synthetic-signature"}:
+                    self._fail_transport(grant.startswith("malformed-"))
+                    return
+                if grant == "error-payload.synthetic-signature":
+                    self._reply(503, b"", headers)
+                elif not grant or grant == "missing-payload.synthetic-signature":
+                    self._reply(401, b"", headers)
+                elif (grant != SYNTHETIC_GRANT or chat != "chat-ABC-123"
+                      or not path or method not in {"GET", "HEAD"}):
+                    self._reply(403, b"", headers)
+                else:
+                    self._reply(200, b"", [*headers,
+                                ("X-User-Id", "grant-user-current"),
+                                ("X-User-Email", "grant%2Bcurrent%40example.test")])
+                return
             elif self.path == "/api/v1/auths/":
                 if cookie.startswith("session=status-"):
                     self._reply(int(cookie.removeprefix("session=status-")))
@@ -111,6 +160,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._reply(503)
                 else:
                     self._reply(401)
+                return
+            elif self.path == "/native-log-control":
+                self._fail_transport()
                 return
             else:
                 if not (self.path == "/ws/socket.io/?EIO=4&transport=websocket"
@@ -149,6 +201,9 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     return
         path = unquote(urlsplit(self.path).path)
+        if kind == "ocu" and path.endswith(("/drop.bin", "/malformed.bin")):
+            self._fail_transport(path.endswith("/malformed.bin"))
+            return
         if path.endswith("/backend-html403.html"):
             self._reply(403, b"upstream error",
                         [("Content-Type", "TEXT/HTML; charset=utf-8"),
@@ -175,7 +230,12 @@ class Handler(BaseHTTPRequestHandler):
             disposition = "attachment; filename=report.html" if download else "inline; filename=report.html"
             headers = [("Content-Type", mime), ("Content-Disposition", disposition),
                        ("Content-Security-Policy", "default-src 'self'"),
-                       ("X-Content-Type-Options", "other")]
+                       ("X-Content-Type-Options", "other"),
+                       ("Set-Cookie", "upstream=private"),
+                       ("Access-Control-Allow-Origin", "*"),
+                       ("Access-Control-Allow-Credentials", "true"),
+                       ("Vary", "Accept-Encoding, Origin" if path.endswith("/vary-origin.bin")
+                        else "Accept-Encoding")]
             self._reply(200, b"file", headers)
             return
         self._reply(200, b"ocu")
