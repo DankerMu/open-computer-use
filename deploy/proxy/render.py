@@ -22,12 +22,13 @@ DEFAULTS = {
     "OCU_PROXY_UPSTREAM": "http://127.0.0.1:8090",
     "OCU_PROXY_LISTEN": "127.0.0.1:8082",
 }
-REVIEWED_TABLE_SHA256 = "a94f730ea2ff0185ff576fd4f1c48681a17c0b216ada49f31953c66a26233b1d"
+REVIEWED_TABLE_SHA256 = "c55498f12f30983cb730540a107bd88774f18bb612948e2086be879584a0d69e"
 FIELDS = {"path", "methods", "auth", "mutating", "prefix", "kind"}
 SEGMENT = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\Z")
-PLACEHOLDER = {"chat", "path", "pid", "page", "file", "session"}
+PLACEHOLDER = {"chat", "path", "pid", "page", "file", "session", "grant"}
 URI_PART = {
     "chat": r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*",
+    "grant": r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
     "path": r"[^/?#]+(?:/[^/?#]+)*",
     "pid": r"[0-9]+",
     "page": r"[A-Za-z0-9._~-]+",
@@ -98,8 +99,8 @@ def _table(table: Path) -> list[dict]:
             or not isinstance(source["rows"], list)):
         raise RenderError("route table schema is invalid")
     rows = source["rows"]
-    if not rows or len(rows) != 27:
-        raise RenderError("route table must contain 27 reviewed rows")
+    if not rows or len(rows) != 28:
+        raise RenderError("route table must contain 28 reviewed rows")
     seen = set()
     for row in rows:
         if not isinstance(row, dict) or set(row) != FIELDS:
@@ -110,8 +111,8 @@ def _table(table: Path) -> list[dict]:
         seen.add(path)
         parts = path.split("/")
         parameters = [part[1:-1] for part in parts if part.startswith("{") and part.endswith("}")]
-        if (parts[0] not in {"api", "files", "preview", "browser", "terminal", "static"}
-                or any(not (SEGMENT.fullmatch(part) or part in {"{chat}", "{path}", "{pid}", "{page}", "{file}", "{session}"}) for part in parts)
+        if (parts[0] not in {"api", "files", "f", "preview", "browser", "terminal", "static"}
+                or any(not (SEGMENT.fullmatch(part) or part in {"{" + name + "}" for name in PLACEHOLDER}) for part in parts)
                 or any(part.startswith("{") and part.endswith("}") and part[1:-1] not in PLACEHOLDER for part in parts)
                 or parameters.count("chat") > 1 or parameters.count("path") > 1
                 or ("path" in parameters and parts[-1] != "{path}")
@@ -126,9 +127,11 @@ def _table(table: Path) -> list[dict]:
                 or ("HEAD" in methods and "GET" not in methods)):
             raise RenderError("route methods are invalid")
         auth = row["auth"]
-        if not isinstance(auth, str) or auth not in {"chat", "session"} or ("{chat}" in parts) != (auth == "chat"):
+        if (not isinstance(auth, str) or auth not in {"chat", "session", "issuer", "grant"}
+                or ("{chat}" in parts) != (auth != "session")):
             raise RenderError("route auth is invalid")
-        if row["prefix"] != ("preserve" if auth == "session" else "strip"):
+        expected_prefix = "preserve" if auth == "session" else "file" if auth == "grant" else "strip"
+        if row["prefix"] != expected_prefix:
             raise RenderError("route prefix is invalid")
         if (type(row["mutating"]) is not bool or not isinstance(row["kind"], str)
                 or row["kind"] not in {"http", "ws", "file", "upload"}):
@@ -139,8 +142,15 @@ def _table(table: Path) -> list[dict]:
             raise RenderError("route upload classification is invalid")
         if ("POST" in methods and not row["mutating"]) or (row["kind"] == "upload" and methods != ["POST"]):
             raise RenderError("route mutation is invalid")
-        if row["kind"] == "file" and (not path.startswith("files/") or "{path}" not in parts):
-            raise RenderError("route file classification is invalid")
+        canonical = path == "files/{chat}/{path}"
+        grant = path == "f/{grant}/{chat}/{path}"
+        if ((auth == "issuer") != canonical or (auth == "grant") != grant
+                or ("grant" in parameters) != grant or (parts[0] == "f") != grant
+                or (row["kind"] == "file") != (canonical or grant)
+                or ((canonical or grant) and (methods != ["GET", "HEAD"] or row["mutating"]))):
+            raise RenderError("route file authority classification is invalid")
+    if not {"files/{chat}/{path}", "f/{grant}/{chat}/{path}"} <= seen:
+        raise RenderError("route file authority classification is incomplete")
     if hashlib.sha256(raw_bytes).hexdigest() != REVIEWED_TABLE_SHA256:
         raise RenderError("route table differs from reviewed inventory")
     return rows
@@ -184,6 +194,8 @@ def _route_regex(path: str, *, raw: bool = False) -> str:
 
 
 def _location(row: dict, ocu: str, bearer: str) -> str:
+    if row["kind"] == "file":
+        return _file_location(row, ocu, bearer)
     pattern = _route_regex(row["path"])
     # nginx selects locations by normalized URI; validate the original request
     # against the same table row and compare the chat before forwarding it raw.
@@ -231,6 +243,10 @@ def _location(row: dict, ocu: str, bearer: str) -> str:
         f'            proxy_set_header Authorization "Bearer {bearer}";',
         "            proxy_set_header X-OCU-Internal-Token \"\";",
         "            proxy_set_header X-Ocu-Grant \"\";",
+        "            proxy_set_header X-Ocu-Auth-Mode \"\";",
+        "            proxy_set_header X-Ocu-Resource-Path \"\";",
+        "            proxy_set_header X-Ocu-Resource-Query \"\";",
+        "            proxy_set_header X-Ocu-Resource-Method \"\";",
         "            proxy_set_header X-Chat-Id $ocu_chat_id;" if row["auth"] == "chat" else "            proxy_set_header X-Chat-Id \"\";",
         "            proxy_set_header X-User-Id $ocu_user_id;",
         "            proxy_set_header X-User-Email $ocu_user_email;",
@@ -252,14 +268,138 @@ def _location(row: dict, ocu: str, bearer: str) -> str:
         ]
     else:
         lines += ["            proxy_set_header Upgrade \"\";", "            proxy_set_header Connection \"\";"]
-    if row["kind"] == "file":
+    lines.append("        }")
+    return "\n".join(lines)
+
+
+def _file_policy(*, grant: bool = False) -> list[str]:
+    lines = [
+        "            proxy_hide_header Content-Security-Policy;",
+        "            proxy_hide_header X-Content-Type-Options;",
+        "            add_header Content-Security-Policy $ocu_csp always;",
+        "            add_header X-Content-Type-Options $ocu_nosniff always;",
+    ]
+    if grant:
         lines += [
-            "            proxy_hide_header Content-Security-Policy;",
-            "            proxy_hide_header X-Content-Type-Options;",
-            "            add_header Content-Security-Policy $ocu_csp always;",
-            "            add_header X-Content-Type-Options $ocu_nosniff always;",
+            "            proxy_hide_header Cache-Control;",
+            "            proxy_hide_header Referrer-Policy;",
+            "            proxy_hide_header Set-Cookie;",
+            "            proxy_hide_header Access-Control-Allow-Origin;",
+            "            proxy_hide_header Access-Control-Allow-Credentials;",
+            "            proxy_hide_header Access-Control-Allow-Headers;",
+            "            proxy_hide_header Access-Control-Allow-Methods;",
+            "            proxy_hide_header Access-Control-Expose-Headers;",
+            "            proxy_hide_header Vary;",
+            "            add_header Cache-Control no-store always;",
+            "            add_header Referrer-Policy no-referrer always;",
+            "            add_header Access-Control-Allow-Origin $ocu_grant_cors always;",
+            "            add_header Vary $ocu_grant_vary always;",
+        ]
+    return lines
+
+
+def _file_forward(ocu: str, bearer: str, *, grant: bool) -> list[str]:
+    lines = [
+        "            proxy_http_version 1.1;",
+        f"            proxy_pass {ocu}$ocu_file_target;",
+        "            proxy_pass_request_body off;",
+        "            proxy_pass_request_headers off;",
+        "            proxy_set_header Content-Length \"\";",
+        "            proxy_set_header Host $proxy_host;",
+        f'            proxy_set_header Authorization "Bearer {bearer}";',
+        "            proxy_set_header X-Chat-Id $ocu_chat_id;",
+        "            proxy_set_header X-User-Id $ocu_user_id;",
+        "            proxy_set_header X-User-Email $ocu_user_email;",
+        "            proxy_set_header Accept $http_accept;",
+        "            proxy_set_header Accept-Encoding $http_accept_encoding;",
+        "            proxy_set_header Range $http_range;",
+        "            proxy_set_header If-Range $http_if_range;",
+        "            proxy_set_header If-None-Match $http_if_none_match;",
+        "            proxy_set_header If-Modified-Since $http_if_modified_since;",
+        "            proxy_set_header X-Forwarded-For $remote_addr;",
+        "            proxy_set_header X-Forwarded-Proto $scheme;",
+        "            proxy_intercept_errors off;",
+    ]
+    if not grant:
+        lines += ["            proxy_set_header Cookie $http_cookie;"]
+    return lines + _file_policy(grant=grant)
+
+
+def _file_location(row: dict, ocu: str, bearer: str) -> str:
+    grant = row["auth"] == "grant"
+    pattern = _route_regex(row["path"])
+    raw = _route_regex(row["path"], raw=True)
+    lines = [f"        location ~ ^{pattern}$ {{"]
+    if grant:
+        lines += [
+            "            error_log /dev/null crit;",
+            "            set $ocu_normalized_grant $ocu_route_grant;",
+        ]
+    lines += [
+        "            set $ocu_normalized_chat $ocu_route_chat;",
+        "            set $ocu_normalized_path $ocu_route_path;",
+        "            set $ocu_resource_query \"\";",
+        f'            if ($request_uri !~ "^{raw}(?:\\?(?<ocu_raw_query>[^#]*))?$") {{ return 404; }}',
+        "            set $ocu_chat_id $ocu_raw_chat;",
+        "            set $ocu_resource_path $ocu_raw_path;",
+        "            set $ocu_resource_query $ocu_raw_query;",
+        "            set $ocu_resource_method $request_method;",
+        "            if ($ocu_normalized_chat != $ocu_chat_id) { return 404; }",
+        '            if ($ocu_resource_path ~* "(?:%0[0-9a-f]|%1[0-9a-f]|%7f)") { return 404; }',
+        "            if ($request_method !~ ^(?:GET|HEAD)$) { return 404; }",
+        "            set $ocu_file_target /files/$ocu_chat_id/$ocu_resource_path;",
+        "            if ($ocu_resource_query != \"\") { set $ocu_file_target $ocu_file_target?$ocu_resource_query; }",
+    ]
+    if grant:
+        lines += [
+            "            set $ocu_grant $ocu_raw_grant;",
+            "            if ($ocu_normalized_grant != $ocu_grant) { return 404; }",
+            "            if ($ocu_normalized_path = archive) { return 404; }",
+            "            if ($ocu_download_exempt) { return 404; }",
+            "            error_page 401 = @ocu_grant_unauthorized;",
+            "            error_page 403 = @ocu_grant_not_found;",
+            "            error_page 500 = @ocu_grant_error;",
+            "            auth_request /_ocu_grant_auth;",
+            "            auth_request_set $ocu_grant_status $upstream_status;",
+            "            auth_request_set $ocu_user_id $upstream_http_x_user_id;",
+            "            auth_request_set $ocu_user_email $upstream_http_x_user_email;",
+        ]
+        lines += _file_forward(ocu, bearer, grant=True)
+    else:
+        lines += [
+            "            error_page 418 = @ocu_file_download;",
+            "            if ($ocu_download_exempt) { return 418; }",
+            "            error_page 403 = @ocu_entry_not_found;",
+            "            proxy_intercept_errors on;",
+            "            set $ocu_issuer_target /api/v1/ocu/resource-grants/issue;",
+            "            proxy_pass http://ocu_proxy_webui$ocu_issuer_target;",
+            "            proxy_pass_request_body off;",
+            "            proxy_pass_request_headers off;",
+            "            proxy_set_header Content-Length \"\";",
+            "            proxy_set_header Host $proxy_host;",
+            "            proxy_set_header Cookie $http_cookie;",
+            "            proxy_set_header X-Chat-Id $ocu_chat_id;",
+            "            proxy_set_header X-Ocu-Resource-Path $ocu_resource_path;",
+            "            proxy_set_header X-Ocu-Resource-Query $ocu_resource_query;",
+            "            proxy_redirect off;",
+            "            proxy_hide_header Cache-Control;",
+            "            proxy_hide_header Referrer-Policy;",
+            "            proxy_hide_header Set-Cookie;",
+            "            add_header Cache-Control no-store always;",
+            "            add_header Referrer-Policy no-referrer always;",
         ]
     lines.append("        }")
+    if not grant:
+        lines += [
+            "        location @ocu_file_download {",
+            "            internal;",
+            "            error_page 403 = @ocu_auth_not_found;",
+            "            auth_request /_ocu_chat_auth;",
+            "            auth_request_set $ocu_user_id $upstream_http_x_user_id;",
+            "            auth_request_set $ocu_user_email $upstream_http_x_user_email;",
+            *_file_forward(ocu, bearer, grant=False),
+            "        }",
+        ]
     return "\n".join(lines)
 
 

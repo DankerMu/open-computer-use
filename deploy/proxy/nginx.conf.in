@@ -52,12 +52,32 @@ http {
         default $upstream_http_x_content_type_options;
         1 nosniff;
     }
+    map $request $ocu_early_cache {
+        default "";
+        "~^[^ ]+ /ocu/(?:f|%66)(?:/|\?| )" no-store;
+    }
+    map $ocu_early_cache $ocu_early_referrer {
+        default "";
+        no-store no-referrer;
+    }
+    map "$ocu_grant_status:$http_origin" $ocu_grant_cors {
+        default "";
+        ~^200:null$ null;
+    }
+    map "$ocu_grant_cors:$upstream_http_vary" $ocu_grant_vary {
+        default $upstream_http_vary;
+        ~^null:$ Origin;
+        "~*^null:(?:[^,]*,\s*)*Origin\s*(?:,|$)" $upstream_http_vary;
+        ~^null:.+ "$upstream_http_vary, Origin";
+    }
     server {
         listen @@LISTEN@@;
         server_name _;
         server_tokens off;
         client_max_body_size 0;
         proxy_intercept_errors off;
+        add_header Cache-Control $ocu_early_cache always;
+        add_header Referrer-Policy $ocu_early_referrer always;
         # Reject ambiguous raw path forms before normalized location selection.
         # Do not reject ordinary %25: it represents a literal percent in a filename.
         if ($request_uri ~* "^/ocu/[^?]*(?:%2f|%5c|%25[0-9a-f]{2}|%(?![0-9a-f]{2})|\\\\|//)") { return 404; }
@@ -81,6 +101,53 @@ http {
             proxy_set_header Content-Length "";
             proxy_set_header Host $proxy_host;
             proxy_set_header Cookie $http_cookie;
+        }
+        location = /_ocu_grant_auth {
+            internal;
+            error_log /dev/null crit;
+            proxy_pass @@WEBUI@@/api/v1/ocu/resource-grants/auth;
+            proxy_method GET;
+            proxy_pass_request_body off;
+            proxy_pass_request_headers off;
+            proxy_set_header Content-Length "";
+            proxy_set_header Host $proxy_host;
+            proxy_set_header X-Ocu-Grant $ocu_grant;
+            proxy_set_header X-Chat-Id $ocu_chat_id;
+            proxy_set_header X-Ocu-Resource-Path $ocu_resource_path;
+            proxy_set_header X-Ocu-Resource-Method $ocu_resource_method;
+        }
+        location @ocu_entry_not_found {
+            internal;
+            add_header Cache-Control no-store always;
+            add_header Referrer-Policy no-referrer always;
+            return 404;
+        }
+        location @ocu_grant_unauthorized {
+            internal;
+            error_log /dev/null crit;
+            add_header Cache-Control no-store always;
+            add_header Referrer-Policy no-referrer always;
+            return 401;
+        }
+        location @ocu_grant_not_found {
+            internal;
+            error_log /dev/null crit;
+            add_header Cache-Control no-store always;
+            add_header Referrer-Policy no-referrer always;
+            return 404;
+        }
+        location @ocu_grant_error {
+            internal;
+            error_log /dev/null crit;
+            add_header Cache-Control no-store always;
+            add_header Referrer-Policy no-referrer always;
+            return 500;
+        }
+        location /ocu/f/ {
+            error_log /dev/null crit;
+            add_header Cache-Control no-store always;
+            add_header Referrer-Policy no-referrer always;
+            return 404;
         }
         location @ocu_auth_not_found { internal; return 404; }
         location @ocu_mutation_denied { internal; return 403; }
