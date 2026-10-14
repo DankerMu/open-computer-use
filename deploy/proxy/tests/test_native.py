@@ -1011,6 +1011,8 @@ class NativeProxyTests(unittest.TestCase):
                              [disposition])
             self.assertEqual([value for key, value in headers if key.lower() == "content-security-policy"],
                              ["sandbox allow-scripts allow-forms"])
+            self.assertEqual([value for key, value in headers if key.lower() == "x-content-type-options"],
+                             ["nosniff"])
         before = self.snapshot()
         status, headers, body = self.follow_file(
             "/ocu/files/" + CHAT + "/backend-html403.html")
