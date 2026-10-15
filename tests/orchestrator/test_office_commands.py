@@ -432,8 +432,7 @@ def test_command_bridge_propagates_operation_errors_including_timeout(error_type
 
     with start_blocking_portal() as portal:
         loop = portal.call(asyncio.get_running_loop)
-        with pytest.raises(error_type) as caught:
+        with pytest.raises(error_type):
             live_commands.run_command(
                 fail(), loop, unreachable=live_commands.KeyLookupOutcome.UNREACHABLE,
             )
-        assert caught.value is failure

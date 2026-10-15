@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Office session recovery on the existing idle poll's synchronous worker."""
+"""Office session recovery on the lifespan-owned transaction workers."""
 from __future__ import annotations
 
 import asyncio
@@ -11,8 +11,11 @@ import time
 
 import docker_manager
 
-from . import commands, config
-from .sessions import _final_receipt, _orphan_session, _persisted_session, _status_projection
+from . import commands, config, epoch
+from .sessions import (
+    _final_receipt, _lookup_authority, _orphan_session, _persisted_session,
+    _session_identity, _status_projection,
+)
 from .publish import recover_publications
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
 
@@ -106,34 +109,76 @@ def _sweep_chat(
             if overdue_save or _expired(
                 record, "last_activity_at", current, config.SESSION_LIVENESS_INTERVAL_SECONDS,
             ):
-                due[session_id] = overdue_save
+                due[session_id] = (
+                    _session_identity(record),
+                    (record.get("pending_save_seq"), record.get("saving_started_at")) if overdue_save else None,
+                )
         recovering_saves = {
             entry.get("session_id") for entry in before["journal"].values()
             if entry.get("requester") == "save"
         }
         recover_publications(chat, now=current)
-        state = store.read(chat)
-        for session_id, overdue_save in due.items():
-            record = _persisted_session(session_id, state["sessions"].get(session_id))
+    for session_id, (identity, overdue_save) in due.items():
+        with docker_manager._combined_lock(chat, create=False) as lock:
+            if lock is None or not _has_state(store, chat):
+                return
+            state = store.read(chat)
+            stored = state["sessions"].get(session_id)
+            if stored is None:
+                continue
+            record = _persisted_session(session_id, stored)
             _status_projection(record)
             recovered_conflict = (
                 session_id in recovering_saves and record["state"] == "conflict"
                 and _final_receipt(state, session_id) is None
             )
+            if _session_identity(record) != identity:
+                continue
             if record["state"] not in _ELIGIBLE and not recovered_conflict:
                 continue
-            outcome = commands.run_command(
-                commands.lookup_key(record["document_key"]), loop,
-                unreachable=commands.KeyLookupOutcome.UNREACHABLE,
-            )
-            if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
-                _orphan_session(store, chat, session_id, "editor_state_lost")
-            elif (
-                outcome is commands.KeyLookupOutcome.KNOWN
-                and overdue_save and record["state"] == "saving"
+            save_due = _same_overdue_save(record, overdue_save, current)
+            if not recovered_conflict and not save_due and not _expired(
+                record, "last_activity_at", current, config.SESSION_LIVENESS_INTERVAL_SECONDS,
             ):
+                continue
+            authority = _lookup_authority(state, record, epoch.current_epoch())
+            document_key = record["document_key"]
+        outcome = commands.run_command(
+            commands.lookup_key(document_key), loop,
+            unreachable=commands.KeyLookupOutcome.UNREACHABLE,
+        )
+        with docker_manager._combined_lock(chat, create=False) as lock:
+            if lock is None or not _has_state(store, chat):
+                return
+            recover_publications(chat, now=current)
+            state = store.read(chat)
+            stored = state["sessions"].get(session_id)
+            if stored is None:
+                continue
+            record = _persisted_session(session_id, stored)
+            _status_projection(record)
+            if _lookup_authority(state, record, epoch.current_epoch()) != authority:
+                continue
+            save_due = _same_overdue_save(record, overdue_save, current)
+            if not recovered_conflict and not save_due and not _expired(
+                record, "last_activity_at", current, config.SESSION_LIVENESS_INTERVAL_SECONDS,
+            ):
+                continue
+            if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
+                _orphan_session(
+                    store, chat, session_id, "editor_state_lost", expected_authority=authority,
+                )
+            elif outcome is commands.KeyLookupOutcome.KNOWN and save_due:
                 def mutate(working):
                     live = _persisted_session(session_id, working["sessions"].get(session_id))
                     live["state"] = "editing"
                     live["reason"] = "save_timeout"
                 store.update(chat, mutate)
+
+
+def _same_overdue_save(record, observed, current):
+    return (
+        observed is not None and record["state"] == "saving"
+        and (record.get("pending_save_seq"), record.get("saving_started_at")) == observed
+        and _expired(record, "saving_started_at", current, config.SAVE_CALLBACK_TIMEOUT_SECONDS)
+    )

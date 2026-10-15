@@ -14,10 +14,10 @@ import docker_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from outputs_broker import FileIdNotFoundError, OutputsBroker, OutputsBrokerError
-from starlette.concurrency import run_in_threadpool
 
 from . import config, publish, sessions, versions, workspace
 from .epoch import RestoreEpochError
+from .transaction_workers import run_transaction_worker
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
 
 
@@ -68,8 +68,9 @@ async def restore_version(request: Request) -> JSONResponse:
     loop = asyncio.get_running_loop()
     try:
         number = _number(await request.body())
-        result = await run_in_threadpool(
-            _restore_version, request.scope["ocu_chat_id"], request.path_params["file_id"], number,
+        result = await run_transaction_worker(
+            request.app, _restore_version,
+            request.scope["ocu_chat_id"], request.path_params["file_id"], number,
             loop=loop,
         )
     except sessions.InvalidRequestError:
@@ -99,15 +100,12 @@ def _restore_version(chat_id, file_id, number, *, loop: asyncio.AbstractEventLoo
     chat = docker_manager.canonical_lock_chat_id(chat_id)
     store, broker = OfficeStore(), OutputsBroker()
     store._assert_chat_root_safe(chat, allow_missing=True)
-    with docker_manager._combined_lock(chat, create=False) as lock:
-        if lock is None:
-            raise FileIdNotFoundError("chat control root is unavailable")
-        broker.resolve_file_id(chat, file_id)
-        state = store.read(chat)
-        _selected(state, file_id, number)
-        state, _active, _epoch, _orphaned = sessions._reopen_session(
-            store, chat, file_id, state, loop=loop,
-        )
+    with sessions._reopen_session(
+        store, chat, file_id, loop=loop, create=False,
+        admit=lambda: broker.resolve_file_id(chat, file_id),
+        validate=lambda state: _selected(state, file_id, number),
+    ) as reopened:
+        state, _active, _epoch, _orphaned = reopened
         # Reopen recovery can move a session to a successor; never follow it.
         broker.resolve_file_id(chat, file_id)
         if sessions._open_session(state, file_id) is not None:

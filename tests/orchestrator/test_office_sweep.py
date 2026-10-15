@@ -565,7 +565,7 @@ def test_sweep_write_failures_keep_complete_state_and_allow_later_chats(
         assert hidden not in output
 
 
-def test_two_process_sweeps_hold_flock_through_lookup_and_retain_real_store_commit(
+def test_two_process_sweeps_release_flock_during_lookup_and_retain_real_store_commit(
     office_world, monkeypatch,
 ):
     from office.store import OfficeStore
@@ -577,9 +577,9 @@ def test_two_process_sweeps_hold_flock_through_lookup_and_retain_real_store_comm
                            last_activity_at=NOW)
     before = OfficeStore().read(CHAT)["sessions"][created["session_id"]]
     entered, release = threading.Event(), threading.Event()
-    contended = data.parent / "sweep-worker-contended"
+    acquired = data.parent / "sweep-worker-acquired"
     source = r'''
-import asyncio, fcntl, json, os
+import asyncio, json, os
 from pathlib import Path
 from anyio.from_thread import start_blocking_portal
 from office.store import OfficeStore
@@ -590,19 +590,11 @@ if os.environ["ROLE"] == "first":
     store.store_version(chat, "unrelated-file", b"unrelated persisted content",
         source="workspace", parent=None, published=True, min_free_bytes=0)
 else:
-    original = fcntl.flock
-    def contend(fd, operation):
-        if operation == fcntl.LOCK_EX:
-            try:
-                original(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                Path(os.environ["CONTENDED"]).write_text("blocked")
-                fcntl.flock = original
-                return original(fd, fcntl.LOCK_EX)
-            original(fd, fcntl.LOCK_UN)
-            raise AssertionError("sweep released canonical flock during info lookup")
-        return original(fd, operation)
-    fcntl.flock = contend
+    import docker_manager
+    with docker_manager._combined_lock(chat):
+        store.store_version(chat, "concurrent-file", b"concurrent persisted content",
+            source="workspace", parent=None, published=True, min_free_bytes=0)
+        Path(os.environ["ACQUIRED"]).write_text("acquired")
 with start_blocking_portal() as portal:
     sweep_office_sessions(float(os.environ["NOW"]), loop=portal.call(asyncio.get_running_loop))
 print(json.dumps(store.read(chat)))
@@ -611,7 +603,7 @@ print(json.dumps(store.read(chat)))
     with _info_origin(monkeypatch, {created["document_key"]}, code=0,
                       entered=entered, release=release) as (origin, seen):
         try:
-            env = _child_env(data, origin.url, NOW=str(NOW), CONTENDED=str(contended))
+            env = _child_env(data, origin.url, NOW=str(NOW), ACQUIRED=str(acquired))
             first = subprocess.Popen([sys.executable, "-c", source], cwd=SERVER_DIR,
                                      env={**env, "ROLE": "first"}, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True)
@@ -619,9 +611,10 @@ print(json.dumps(store.read(chat)))
             second = subprocess.Popen([sys.executable, "-c", source], cwd=SERVER_DIR,
                                       env={**env, "ROLE": "second"}, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, text=True)
-            _wait_marker(contended, second, "second sweep did not observe real LOCK_NB denial")
-            assert first.poll() is None and second.poll() is None
-            assert seen == [{"c": "info", "key": created["document_key"]}]
+            _wait_marker(acquired, second, "second sweep could not commit while first info remained pending")
+            assert first.poll() is None
+            assert not release.is_set()
+            assert seen[0] == {"c": "info", "key": created["document_key"]}
             release.set()
             one_out, one_err = first.communicate(timeout=15)
             two_out, two_err = second.communicate(timeout=15)
@@ -634,7 +627,6 @@ print(json.dumps(store.read(chat)))
             release.set()
             _stop_child(first)
             _stop_child(second)
-    assert len(seen) == 1
     record = one["sessions"][created["session_id"]]
     assert record == {**before, "state": "editing", "reason": "save_timeout"}
     version = one["documents"]["unrelated-file"]["versions"][0]
@@ -643,6 +635,12 @@ print(json.dumps(store.read(chat)))
         "size": 27, "source": "workspace", "published": True,
     }
     assert (_versions(data) / _sha(b"unrelated persisted content")).read_bytes() == b"unrelated persisted content"
+    concurrent = one["documents"]["concurrent-file"]["versions"][0]
+    assert {field: value for field, value in concurrent.items() if field != "created_at"} == {
+        "number": 1, "parent": None, "sha256": _sha(b"concurrent persisted content"),
+        "size": 28, "source": "workspace", "published": True,
+    }
+    assert (_versions(data) / _sha(b"concurrent persisted content")).read_bytes() == b"concurrent persisted content"
     assert json.loads(_state(data).read_bytes()) == one
 
 

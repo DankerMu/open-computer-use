@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Save admission, cancellation and lifespan ownership with real worker resources."""
+"""Office transaction admission, cancellation and lifespan ownership with real workers."""
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +19,7 @@ from starlette.datastructures import State
 
 from tests.orchestrator._office_recorded_callbacks import recorded_status_1_payload
 from tests.orchestrator.test_office_callback_processing import _post
-from tests.orchestrator.test_office_save_close import _command_box, _save
+from tests.orchestrator.test_office_save_close import _command_box, _lookup, _save
 from tests.orchestrator.test_office_session_lifecycle import _created
 from tests.orchestrator.test_office_sessions import (
     _snapshot, _state, office_world as office_world,
@@ -52,7 +52,7 @@ def _resources(monkeypatch, workers, *, fail_start=False, shutdown_failure=None)
 
     class Executor(ThreadPoolExecutor):
         def __init__(self, *args, **kwargs):
-            super().__init__(max_workers=1, thread_name_prefix="test-office-save-owned")
+            super().__init__(max_workers=1, thread_name_prefix="test-office-transaction-owned")
             resources.executors.append(self)
 
         def submit(self, *args, **kwargs):
@@ -73,7 +73,7 @@ def _resources(monkeypatch, workers, *, fail_start=False, shutdown_failure=None)
         resources.started.append(thread)
 
     def collect(thread, *args, **kwargs):
-        if thread.name.startswith("test-office-save-owned"):
+        if thread.name.startswith("test-office-transaction-owned"):
             resources.joining_workers.set()
         return join(thread, *args, **kwargs)
 
@@ -99,7 +99,7 @@ def _other_bytes(before, data):
 def test_forcesave_induced_callback_finishes_before_accepted_command_response(
     office_world, monkeypatch,
 ):
-    # Independently selectable before the new save-worker module exists.
+    # Exercise the public save route and authenticated callback admission.
     http, data, recording, _manager, _broker = office_world
     _file_id, session = _created(office_world, "editing")
     before = json.loads(_state(data).read_bytes())
@@ -177,8 +177,8 @@ def test_forcesave_induced_callback_finishes_before_accepted_command_response(
 
 
 @pytest.mark.parametrize("body_failure", (False, True))
-def test_save_owner_drains_real_workers_on_normal_and_failed_body(monkeypatch, tmp_path, body_failure):
-    import office.save_workers as workers
+def test_transaction_owner_drains_real_workers_on_normal_and_failed_body(monkeypatch, tmp_path, body_failure):
+    import office.transaction_workers as workers
 
     app = SimpleNamespace(state=State())
     failure = ValueError("controlled lifespan body failure")
@@ -194,13 +194,13 @@ def test_save_owner_drains_real_workers_on_normal_and_failed_body(monkeypatch, t
 
     async def scenario():
         with pytest.raises(Exception):
-            await workers.run_save_worker(app, output.write_bytes, b"unowned execution")
+            await workers.run_transaction_worker(app, output.write_bytes, b"unowned execution")
         assert not output.exists()
         requester = queued = coordinator = None
 
         async def release_after_admission_closes():
             async def withdrawn():
-                while getattr(app.state, "office_save_executor", None) is not None:
+                while getattr(app.state, "office_transaction_executor", None) is not None:
                     await asyncio.sleep(0.001)
             try:
                 await asyncio.wait_for(withdrawn(), READY_TIMEOUT)
@@ -212,12 +212,12 @@ def test_save_owner_drains_real_workers_on_normal_and_failed_body(monkeypatch, t
             finally:
                 release.set()
         try:
-            async with workers.save_worker_lifespan(app):
+            async with workers.transaction_worker_lifespan(app):
                 assert len(resources.started) == 1 and resources.started[0].is_alive()
                 try:
-                    requester = asyncio.create_task(workers.run_save_worker(app, work))
+                    requester = asyncio.create_task(workers.run_transaction_worker(app, work))
                     await _event(entered)
-                    queued = asyncio.create_task(workers.run_save_worker(
+                    queued = asyncio.create_task(workers.run_transaction_worker(
                         app, queued_output.write_bytes, b"queued transaction finished",
                     ))
                     await asyncio.sleep(0)
@@ -243,7 +243,7 @@ def test_save_owner_drains_real_workers_on_normal_and_failed_body(monkeypatch, t
         assert output.read_bytes() == b"owned transaction finished"
         assert queued_output.read_bytes() == b"queued transaction finished"
         with pytest.raises(Exception):
-            await workers.run_save_worker(app, output.write_bytes, b"post-close execution")
+            await workers.run_transaction_worker(app, output.write_bytes, b"post-close execution")
         assert output.read_bytes() == b"owned transaction finished"
 
     with _resources(monkeypatch, workers) as resources:
@@ -257,18 +257,18 @@ def test_save_owner_drains_real_workers_on_normal_and_failed_body(monkeypatch, t
             asyncio.run(scenario())
 
 
-def test_save_owner_start_failure_cleans_unused_executor_without_admission(monkeypatch):
-    import office.save_workers as workers
+def test_transaction_owner_start_failure_cleans_unused_executor_without_admission(monkeypatch):
+    import office.transaction_workers as workers
 
     app = SimpleNamespace(state=State())
     admitted = []
 
     async def scenario():
         with pytest.raises(RuntimeError, match="controlled supervisor startup failure"):
-            async with workers.save_worker_lifespan(app):
+            async with workers.transaction_worker_lifespan(app):
                 admitted.append("body entered")
         with pytest.raises(Exception):
-            await workers.run_save_worker(app, admitted.append, "fallback worker")
+            await workers.run_transaction_worker(app, admitted.append, "fallback worker")
 
     with _resources(monkeypatch, workers, fail_start=True) as resources:
         asyncio.run(scenario())
@@ -276,14 +276,14 @@ def test_save_owner_start_failure_cleans_unused_executor_without_admission(monke
     assert resources.started == []
 
 
-def test_save_owner_publication_failure_joins_started_supervisor(monkeypatch):
-    import office.save_workers as workers
+def test_transaction_owner_publication_failure_joins_started_supervisor(monkeypatch):
+    import office.transaction_workers as workers
 
     failure = RuntimeError("controlled owner publication failure")
 
     class PublishingState(State):
         def __setattr__(self, name, value):
-            if name == "office_save_executor" and value is not None:
+            if name == "office_transaction_executor" and value is not None:
                 raise failure
             super().__setattr__(name, value)
 
@@ -292,11 +292,11 @@ def test_save_owner_publication_failure_joins_started_supervisor(monkeypatch):
 
     async def scenario():
         with pytest.raises(RuntimeError) as caught:
-            async with workers.save_worker_lifespan(app):
+            async with workers.transaction_worker_lifespan(app):
                 admitted.append("body entered")
         assert caught.value is failure
         with pytest.raises(Exception):
-            await workers.run_save_worker(app, admitted.append, "fallback worker")
+            await workers.run_transaction_worker(app, admitted.append, "fallback worker")
 
     with _resources(monkeypatch, workers) as resources:
         asyncio.run(scenario())
@@ -304,8 +304,8 @@ def test_save_owner_publication_failure_joins_started_supervisor(monkeypatch):
     assert len(resources.started) == 1
 
 
-def test_save_owner_propagates_shutdown_failure_after_real_workers_join(monkeypatch, tmp_path):
-    import office.save_workers as workers
+def test_transaction_owner_propagates_shutdown_failure_after_real_workers_join(monkeypatch, tmp_path):
+    import office.transaction_workers as workers
 
     app = SimpleNamespace(state=State())
     failure = OSError("controlled shutdown failure")
@@ -313,21 +313,21 @@ def test_save_owner_propagates_shutdown_failure_after_real_workers_join(monkeypa
 
     async def scenario():
         with pytest.raises(OSError) as caught:
-            async with workers.save_worker_lifespan(app):
-                await workers.run_save_worker(app, output.write_bytes, b"save completed")
+            async with workers.transaction_worker_lifespan(app):
+                await workers.run_transaction_worker(app, output.write_bytes, b"save completed")
         assert caught.value is failure
         with pytest.raises(Exception):
-            await workers.run_save_worker(app, output.write_bytes, b"fallback after failed shutdown")
+            await workers.run_transaction_worker(app, output.write_bytes, b"fallback after failed shutdown")
         assert output.read_bytes() == b"save completed"
 
     with _resources(monkeypatch, workers, shutdown_failure=failure):
         asyncio.run(scenario())
 
 
-def test_save_owner_isolates_fresh_request_context_through_loop_submission(monkeypatch):
-    import office.save_workers as workers
+def test_transaction_owner_isolates_fresh_request_context_through_loop_submission(monkeypatch):
+    import office.transaction_workers as workers
 
-    request_value = contextvars.ContextVar("office-save-request", default="outside")
+    request_value = contextvars.ContextVar("office-transaction-request", default="outside")
     app = SimpleNamespace(state=State())
 
     async def scenario():
@@ -345,35 +345,40 @@ def test_save_owner_isolates_fresh_request_context_through_loop_submission(monke
         async def request(value):
             token = request_value.set(value)
             try:
-                initial, submitted, thread = await workers.run_save_worker(app, work)
+                initial, submitted, thread = await workers.run_transaction_worker(app, work)
                 assert (initial, submitted, request_value.get()) == (value, value, value)
                 assert thread is not threading.current_thread()
             finally:
                 request_value.reset(token)
 
-        async with workers.save_worker_lifespan(app):
+        async with workers.transaction_worker_lifespan(app):
             await asyncio.gather(request("first-request"), request("second-request"))
-            initial, submitted, _thread = await workers.run_save_worker(app, work)
+            initial, submitted, _thread = await workers.run_transaction_worker(app, work)
             assert (initial, submitted, request_value.get()) == ("outside", "outside", "outside")
             with pytest.raises(ValueError, match="invalid save operation"):
                 def invalid():
                     raise ValueError("invalid save operation")
-                await workers.run_save_worker(app, invalid)
+                await workers.run_transaction_worker(app, invalid)
 
     with _resources(monkeypatch, workers):
         asyncio.run(scenario())
 
 
-async def _save_request(http, session):
+async def _transaction_request(http, session, operation="save"):
+    if operation in ("save", "close"):
+        path = f"/api/office/{CHAT}/sessions/{session['session_id']}/{operation}"
+        body = {"intent": "persist"} if operation == "save" else {}
+    else:
+        path = f"/api/office/{CHAT}/documents/{session['file_id']}"
+        path += "/sessions" if operation == "join" else "/restore"
+        body = {} if operation == "join" else {"number": 1}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=http.app), base_url="http://testserver") as client:
-        return await client.post(
-            f"/api/office/{CHAT}/sessions/{session['session_id']}/save",
-            headers=_auth(), json={"intent": "persist"},
-        )
+        return await client.post(path, headers=_auth(), json=body)
 
 
-def test_cancelled_queued_save_issues_no_sequence_or_command(office_world, monkeypatch):
-    import office.save_workers as workers
+@pytest.mark.parametrize("operation", ("save", "join", "close", "restore"))
+def test_cancelled_queued_transaction_issues_no_sequence_or_command(office_world, monkeypatch, operation):
+    import office.transaction_workers as workers
 
     http, data, recording, _manager, _broker = office_world
     _file_id, session = _created(office_world, "editing")
@@ -387,13 +392,13 @@ def test_cancelled_queued_save_issues_no_sequence_or_command(office_world, monke
 
     async def scenario(resources):
         blocker = queued = None
-        async with workers.save_worker_lifespan(app):
-            previous = getattr(http.app.state, "office_save_executor", None)
-            http.app.state.office_save_executor = app.state.office_save_executor
+        async with workers.transaction_worker_lifespan(app):
+            previous = getattr(http.app.state, "office_transaction_executor", None)
+            http.app.state.office_transaction_executor = app.state.office_transaction_executor
             try:
-                blocker = asyncio.create_task(workers.run_save_worker(app, occupied))
+                blocker = asyncio.create_task(workers.run_transaction_worker(app, occupied))
                 await _event(entered)
-                queued = asyncio.create_task(_save_request(http, session))
+                queued = asyncio.create_task(_transaction_request(http, session, operation))
 
                 async def submitted():
                     while len(resources.futures) < 2:
@@ -407,7 +412,7 @@ def test_cancelled_queued_save_issues_no_sequence_or_command(office_world, monke
                 await blocker
             finally:
                 release.set()
-                http.app.state.office_save_executor = previous
+                http.app.state.office_transaction_executor = previous
                 for task in (blocker, queued):
                     if task is not None:
                         if not task.done():
@@ -426,7 +431,7 @@ def test_cancelled_queued_save_issues_no_sequence_or_command(office_world, monke
 def test_cancelled_running_save_finishes_outcome_specific_reconciliation(
     office_world, monkeypatch, code, state, reason,
 ):
-    import office.save_workers as workers
+    import office.transaction_workers as workers
 
     http, data, recording, _manager, _broker = office_world
     _file_id, session = _created(office_world, "editing")
@@ -437,11 +442,11 @@ def test_cancelled_running_save_finishes_outcome_specific_reconciliation(
 
     async def scenario(resources):
         requester = None
-        async with workers.save_worker_lifespan(app):
-            previous = getattr(http.app.state, "office_save_executor", None)
-            http.app.state.office_save_executor = app.state.office_save_executor
+        async with workers.transaction_worker_lifespan(app):
+            previous = getattr(http.app.state, "office_transaction_executor", None)
+            http.app.state.office_transaction_executor = app.state.office_transaction_executor
             try:
-                requester = asyncio.create_task(_save_request(http, session))
+                requester = asyncio.create_task(_transaction_request(http, session))
                 await _event(entered)
                 assert len(resources.futures) == 1 and resources.futures[0].running()
                 requester.cancel()
@@ -452,7 +457,7 @@ def test_cancelled_running_save_finishes_outcome_specific_reconciliation(
                 assert record["state"] == "saving" and record["pending_save_seq"] == 1
             finally:
                 release.set()
-                http.app.state.office_save_executor = previous
+                http.app.state.office_transaction_executor = previous
                 if requester is not None:
                     if not requester.done():
                         requester.cancel()
@@ -481,8 +486,8 @@ def test_cancelled_running_save_finishes_outcome_specific_reconciliation(
 
 
 @pytest.mark.parametrize("cancellation", ("asyncio", "anyio"))
-def test_teardown_drains_cancelled_save_with_both_shared_worker_pools_occupied(monkeypatch, cancellation):
-    import office.save_workers as workers
+def test_teardown_drains_cancelled_transaction_with_both_shared_worker_pools_occupied(monkeypatch, cancellation):
+    import office.transaction_workers as workers
 
     app = SimpleNamespace(state=State())
     default_entered, callback_entered, work_entered = (threading.Event() for _ in range(3))
@@ -520,8 +525,8 @@ def test_teardown_drains_cancelled_save_with_both_shared_worker_pools_occupied(m
             with anyio.CancelScope() as scope:
                 scopes.append(scope)
                 try:
-                    async with workers.save_worker_lifespan(app):
-                        requester = asyncio.create_task(workers.run_save_worker(app, work))
+                    async with workers.transaction_worker_lifespan(app):
+                        requester = asyncio.create_task(workers.run_transaction_worker(app, work))
                         await _event(work_entered)
                         requester.cancel()
                         with pytest.raises(asyncio.CancelledError):
@@ -541,16 +546,16 @@ def test_teardown_drains_cancelled_save_with_both_shared_worker_pools_occupied(m
             callback_job = asyncio.create_task(anyio.to_thread.run_sync(block, callback_entered))
             await _event(default_entered)
             await _event(callback_entered)
-            # Record only save-owner threads, not the deliberately occupied shared pools.
+            # Record only transaction-owner threads, not the occupied shared pools.
             resources.started.clear()
             owner = asyncio.create_task(own())
             await _event(work_entered)
             body_exit.set()
             await _event(closing)
             await asyncio.sleep(0)
-            assert getattr(app.state, "office_save_executor", None) is None
+            assert getattr(app.state, "office_transaction_executor", None) is None
             with pytest.raises(Exception):
-                await workers.run_save_worker(app, ordering.append, "late admission")
+                await workers.run_transaction_worker(app, ordering.append, "late admission")
             if cancellation == "asyncio":
                 owner.cancel()
                 await asyncio.sleep(0)
@@ -592,8 +597,8 @@ def test_teardown_drains_cancelled_save_with_both_shared_worker_pools_occupied(m
         asyncio.run(scenario(resources))
 
 
-def test_save_owner_start_failure_after_acquisition_drains_and_joins_before_propagating(monkeypatch):
-    import office.save_workers as workers
+def test_transaction_owner_start_failure_after_acquisition_drains_and_joins_before_propagating(monkeypatch):
+    import office.transaction_workers as workers
 
     app = SimpleNamespace(state=State())
     failure = RuntimeError("controlled post-acquisition startup failure")
@@ -620,7 +625,7 @@ def test_save_owner_start_failure_after_acquisition_drains_and_joins_before_prop
     async def scenario():
         try:
             with pytest.raises(RuntimeError) as caught:
-                async with workers.save_worker_lifespan(app):
+                async with workers.transaction_worker_lifespan(app):
                     admitted.append("body entered")
             assert caught.value is failure
             assert admitted == []
@@ -628,7 +633,7 @@ def test_save_owner_start_failure_after_acquisition_drains_and_joins_before_prop
             assert shutdown_completed.is_set()
             assert not acquired[0].is_alive(), "acquired supervisor survived startup failure before rescue"
             with pytest.raises(Exception):
-                await workers.run_save_worker(app, admitted.append, "fallback after failed start")
+                await workers.run_transaction_worker(app, admitted.append, "fallback after failed start")
             assert admitted == []
         finally:
             # Release captured real Events only for rescue, after all proof observations.
@@ -644,3 +649,69 @@ def test_save_owner_start_failure_after_acquisition_drains_and_joins_before_prop
         patch.setattr(workers.threading, "Event", event)
         patch.setattr(workers, "ThreadPoolExecutor", Executor)
         asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("code,expected_state,reason,sequence", (
+    (0, "closing", None, 1),
+    (1, "orphaned", "editor_state_lost", 0),
+    (5, "closing", None, 1),
+))
+def test_cancelled_running_close_drains_lookup_and_reconciles_current_authority(
+    office_world, monkeypatch, code, expected_state, reason, sequence,
+):
+    import office.transaction_workers as workers
+
+    http, data, recording, _manager, _broker = office_world
+    monkeypatch.setattr("time.time", lambda: 1_700_000_000.25)
+    _file_id, session = _created(office_world, "editing")
+    before = json.loads(_state(data).read_bytes())
+    before_bytes = _snapshot(data)
+    app = SimpleNamespace(state=State())
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario(resources):
+        requester = None
+        async with workers.transaction_worker_lifespan(app):
+            previous = http.app.state.office_transaction_executor
+            http.app.state.office_transaction_executor = app.state.office_transaction_executor
+            try:
+                requester = asyncio.create_task(_transaction_request(http, session, "close"))
+                await _event(entered)
+                assert len(resources.futures) == 1 and resources.futures[0].running()
+                requester.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(requester), READY_TIMEOUT)
+                assert not resources.futures[0].done()
+                assert json.loads(_state(data).read_bytes()) == before
+            finally:
+                release.set()
+                http.app.state.office_transaction_executor = previous
+                if requester is not None:
+                    if not requester.done():
+                        requester.cancel()
+                    await asyncio.gather(requester, return_exceptions=True)
+        assert resources.futures[0].done()
+
+    with _lookup(
+        monkeypatch, session["document_key"], code=code, entered=entered, release=release,
+    ) as origin:
+        with _resources(monkeypatch, workers) as resources:
+            http.portal.call(scenario, resources)
+        assert len(origin.requests) == 1
+    expected = {
+        **before["sessions"][session["session_id"]],
+        "state": expected_state, "reason": reason, "save_seq": sequence,
+    }
+    if sequence:
+        expected.update(pending_close_seq=1)
+        expected["last_activity_at"] = 1_700_000_000.25
+        assert resources.futures[0].result() == {
+            "session_id": session["session_id"], "save_seq": 1, "state": "closing",
+        }
+    else:
+        assert resources.futures[0].exception().reason == "session_not_open"
+    assert json.loads(_state(data).read_bytes()) == {
+        **before, "sessions": {**before["sessions"], session["session_id"]: expected},
+    }
+    _other_bytes(before_bytes, data)
+    assert recording.hits == 0

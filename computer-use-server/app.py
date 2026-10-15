@@ -28,13 +28,12 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
-from starlette.concurrency import run_in_threadpool
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from office.router import OfficeAvailabilityMiddleware, create_office_router
 from office import config as office_config
 from office.control_plane import install_source_access_log_filter
 from office.sweep import sweep_office_publications, sweep_office_sessions
-from office.save_workers import save_worker_lifespan
+from office.transaction_workers import run_transaction_worker, transaction_worker_lifespan
 from ws_recheck import (
     admit,
     forward_cdp_backend,
@@ -428,7 +427,8 @@ async def _idle_reaper(stop_idle: asyncio.Event):
             except Exception as exc:
                 print(f"[IDLE] reap tick failed: {exc}")
             try:
-                await run_in_threadpool(sweep_office_sessions, loop=loop)
+                # ocu-office-lookup-locking (#425): induced callbacks need the shared pools.
+                await run_transaction_worker(app, sweep_office_sessions, loop=loop)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -463,7 +463,7 @@ async def lifespan(app):
     async with _mcp_server.session_manager.run():
         print("[MCP] session_manager.run() entered — /mcp endpoint is live")
         try:
-            async with save_worker_lifespan(app):
+            async with transaction_worker_lifespan(app):
                 stop_idle = asyncio.Event()
                 reaper = asyncio.create_task(_idle_reaper(stop_idle))
                 try:

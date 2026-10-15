@@ -10,6 +10,7 @@ import math
 import os
 import uuid
 import time
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import quote
 
@@ -17,11 +18,10 @@ import docker_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from outputs_broker import CorruptIndexError, FileIdNotFoundError, OutputsBroker, OutputsBrokerError
-from starlette.concurrency import run_in_threadpool
 
 from . import commands, config, epoch, notice, ooxml, tokens, versions
 from .epoch import RestoreEpochError
-from .save_workers import run_save_worker
+from .transaction_workers import run_transaction_worker
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
 from .versions import StorageLowError
 from .workspace import FileTooLargeError, UnsafePathError
@@ -87,8 +87,9 @@ class InvalidRequestError(ValueError):
 async def create_session(request: Request) -> JSONResponse:
     loop = asyncio.get_running_loop()
     try:
-        created = await run_in_threadpool(
-            _create_session, request.scope["ocu_chat_id"], request.path_params["file_id"], loop=loop,
+        created = await run_transaction_worker(
+            request.app, _create_session,
+            request.scope["ocu_chat_id"], request.path_params["file_id"], loop=loop,
         )
     except FileIdNotFoundError:
         return _error(404, "unknown_file")
@@ -122,7 +123,7 @@ async def save_session(request: Request) -> JSONResponse:
     loop = asyncio.get_running_loop()
     try:
         intent = _save_intent(await request.body())
-        saved = await run_save_worker(
+        saved = await run_transaction_worker(
             request.app, _save_session,
             request.scope["ocu_chat_id"],
             request.path_params["session_id"],
@@ -159,8 +160,9 @@ async def save_session(request: Request) -> JSONResponse:
 async def close_session(request: Request) -> JSONResponse:
     loop = asyncio.get_running_loop()
     try:
-        closed = await run_in_threadpool(
-            _close_session, request.scope["ocu_chat_id"], request.path_params["session_id"], loop=loop,
+        closed = await run_transaction_worker(
+            request.app, _close_session,
+            request.scope["ocu_chat_id"], request.path_params["session_id"], loop=loop,
         )
     except UnknownSessionError:
         return _error(404, "unknown_session")
@@ -186,16 +188,15 @@ def _create_session(
     store = OfficeStore()
     broker = OutputsBroker()
     store._assert_chat_root_safe(chat, allow_missing=True)
-    with docker_manager._combined_lock(chat):
-        store._assert_chat_root_safe(chat, allow_missing=False)
+    def admit():
+        relative_path = broker.resolve_file_id(chat, file_id)
+        if _document_type(relative_path) is None:
+            raise UnsupportedTypeError()
+
+    with _reopen_session(store, chat, file_id, admit=admit, loop=loop) as reopened:
+        state, active, restore_epoch, orphaned_here = reopened
         relative_path = broker.resolve_file_id(chat, file_id)
         document_type = _document_type(relative_path)
-        if document_type is None:
-            raise UnsupportedTypeError()
-        state = store.read(chat)
-        state, active, restore_epoch, orphaned_here = _reopen_session(
-            store, chat, file_id, state, loop=loop,
-        )
         if any(entry.get("requester") == "restore" and entry.get("session_id") is None
                and entry.get("file_id") == file_id for entry in state["journal"].values()):
             from .publish import RecoveryRequiredError, SandboxStateError, recover_publications
@@ -236,7 +237,7 @@ def _create_session(
         content, digest = store.read_workspace_file(chat, relative_path, max_bytes=broker.max_file_size)
         ooxml.validate_ooxml(content, document_type)
         store.check_free_space(chat, config.MIN_FREE_BYTES)
-        # Reuse the epoch checked before any bounded command lookup.
+        # The shared reopen decision rechecks the epoch after every remote wait.
         listed = versions._document_versions(state, file_id)
         latest = listed[-1] if listed else None
         parent = latest["number"] if latest else None
@@ -393,32 +394,86 @@ def _final_receipt(state, session_id) -> tuple[int, dict[str, Any]] | None:
     return found
 
 
-def _reopen_session(store, chat, file_id, state, *, loop: asyncio.AbstractEventLoop):
-    """Apply the canonical create/reopen decision while the caller holds the chat lock."""
-    active = _open_session(state, file_id)
-    restore_epoch = epoch.current_epoch()
-    orphaned_here = False
-    if active is not None:
-        _status_projection(active)
-        _active_versions(state, file_id)[-1]
-        ended = active["state"] == "conflict" and _final_receipt(state, active["session_id"]) is not None
-        reason = None
-        if active["restore_epoch"] != restore_epoch:
-            reason = "restore_epoch_changed"
-        elif active["state"] != "opening" and not ended:
-            outcome = commands.run_command(
-                commands.lookup_key(active["document_key"]), loop,
-                unreachable=commands.KeyLookupOutcome.UNREACHABLE,
-            )
-            if outcome is commands.KeyLookupOutcome.UNREACHABLE:
-                raise DocumentServerUnavailableError()
-            if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
-                reason = "editor_state_lost"
-        if reason is not None:
-            state = _orphan_session(store, chat, active["session_id"], reason)
-            active = _require_session(state, active["session_id"])
-            orphaned_here = active["state"] == "orphaned"
-    return state, active, restore_epoch, orphaned_here
+def _session_identity(record):
+    return tuple(record[field] for field in ("session_id", "file_id", "document_key", "restore_epoch"))
+
+
+def _lookup_authority(state, record, restore_epoch):
+    """Exclude activity/participants: an info-induced status 1 is not a new target."""
+    document = state["documents"].get(record["file_id"], {})
+    return (
+        _session_identity(record), restore_epoch,
+        tuple(record.get(field) for field in (
+            "state", "save_seq", "pending_save_seq", "pending_close_seq",
+            "last_committed_seq", "last_published_seq", "baseline_sha256", "save_intents",
+        )),
+        tuple(document.get(field) for field in ("file_id", "path", "type")),
+        _final_receipt(state, record["session_id"]),
+    )
+
+
+@contextmanager
+def _reopen_session(store, chat, file_id, *, admit, loop: asyncio.AbstractEventLoop,
+                    validate=None, create=True):
+    """Yield the shared create/restore decision with its canonical lock still held."""
+    observed = None
+    while True:
+        with docker_manager._combined_lock(chat, create=create) as lock:
+            if not create and lock is None:
+                raise FileIdNotFoundError("chat control root is unavailable")
+            store._assert_chat_root_safe(chat, allow_missing=False)
+            admit()
+            state = store.read(chat)
+            if validate is not None:
+                validate(state)
+            active = _open_session(state, file_id)
+            restore_epoch = epoch.current_epoch()
+            orphaned_here = False
+            reason = None
+            prepared = None
+            if active is not None:
+                _status_projection(active)
+                _active_versions(state, file_id)[-1]
+                ended = active["state"] == "conflict" and _final_receipt(state, active["session_id"]) is not None
+                authority = _lookup_authority(state, active, restore_epoch)
+                if active["restore_epoch"] != restore_epoch:
+                    reason = "restore_epoch_changed"
+                elif active["state"] != "opening" and not ended:
+                    if observed is None or observed[0] != authority:
+                        prepared = authority, active["document_key"]
+                    else:
+                        outcome = observed[1]
+                        if outcome is commands.KeyLookupOutcome.UNREACHABLE:
+                            raise DocumentServerUnavailableError()
+                        if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
+                            reason = "editor_state_lost"
+                        prepared = None
+                if reason is not None:
+                    identity = _session_identity(active)
+                    state = _orphan_session(
+                        store, chat, active["session_id"], reason, expected_authority=authority,
+                    )
+                    settled = _require_session(state, active["session_id"])
+                    if _session_identity(settled) != identity or (
+                        settled["state"] in OPEN_STATES
+                        and not (settled["state"] == "conflict" and _final_receipt(state, settled["session_id"]) is not None)
+                        and _lookup_authority(state, settled, epoch.current_epoch()) != authority
+                    ):
+                        # Accepted recovery can move responsibility to a successor file.
+                        continue
+                    orphaned_here = settled["state"] == "orphaned"
+                    active = settled
+                    prepared = None
+            else:
+                prepared = None
+            if prepared is None:
+                yield state, active, restore_epoch, orphaned_here
+                return
+        outcome = commands.run_command(
+            commands.lookup_key(prepared[1]), loop,
+            unreachable=commands.KeyLookupOutcome.UNREACHABLE,
+        )
+        observed = prepared[0], outcome
 
 
 def _recover_session_publications(store, chat, session_id):
@@ -445,8 +500,9 @@ def _settle_session_resolve(store, chat, session_id):
     return state
 
 
-def _orphan_session(store, chat, session_id, reason):
+def _orphan_session(store, chat, session_id, reason, *, expected_authority=None):
     before = store.read(chat)
+    identity = _session_identity(_require_session(before, session_id))
     recovering_final = any(
         entry.get("session_id") == session_id and entry.get("requester") == "final"
         for entry in before["journal"].values()
@@ -454,6 +510,15 @@ def _orphan_session(store, chat, session_id, reason):
     protect_final_conflict = reason != "restore_epoch_changed" or recovering_final
     state = _recover_session_publications(store, chat, session_id)
     record = _require_session(state, session_id)
+    if reason == "restore_epoch_changed":
+        # Recovery may move the file without restoring the editor's epoch.
+        if record["restore_epoch"] == epoch.current_epoch():
+            return state
+    else:
+        if _session_identity(record) != identity:
+            return state
+        if expected_authority is not None and _lookup_authority(state, record, epoch.current_epoch()) != expected_authority:
+            return state
     ended = record["state"] == "conflict" and _final_receipt(state, session_id) is not None
     if record["state"] not in OPEN_STATES or ended and protect_final_conflict:
         return state
@@ -833,50 +898,67 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
 
 def _close_session(chat_id, session_id, *, loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
     chat, store = _load_session(chat_id, session_id)
-    with docker_manager._combined_lock(chat):
-        state = store.read(chat)
-        record = _require_session(state, session_id)
-        _status_projection(record)
-        orphaned = _maybe_orphan_epoch(store, chat, record, session_id)
-        if orphaned is not None:
-            raise SessionNotOpenError()
-        state = _recover_session_publications(store, chat, session_id)
-        record = _require_session(state, session_id)
-        _status_projection(record)
-        if record["state"] in FINAL_STATES:
-            raise SessionNotOpenError()
-        if record["state"] == "opening":
-            return _commit_opening_close(store, chat, session_id)
-        if record["state"] == "closing":
-            pending = record.get("pending_close_seq")
-            if type(pending) is int:
-                if pending < 1:
-                    raise StateCorruptError("office session pending allocation is invalid")
-                _refresh_activity(store, chat, session_id)
-                return {"session_id": session_id, "save_seq": pending, "state": "closing"}
-            if pending is not None:
-                raise StateCorruptError("office session pending allocation is invalid")
-            found = _final_receipt(state, session_id)
-            if found is None:
-                raise StateCorruptError("office session pending allocation is invalid")
-            sequence, _receipt = found
-            return {"session_id": session_id, "save_seq": sequence, "state": "closing"}
-        ended_conflict = record["state"] == "conflict" and _final_receipt(state, session_id) is not None
-        if ended_conflict:
-            return {
-                "session_id": session_id,
-                "save_seq": record["save_seq"],
-                "state": "conflict",
-            }
-        if record["state"] in ("editing", "saving"):
-            outcome = commands.run_command(
-                commands.lookup_key(record["document_key"]), loop,
-                unreachable=commands.KeyLookupOutcome.UNREACHABLE,
-            )
-            if outcome is commands.KeyLookupOutcome.KEY_UNKNOWN:
-                _orphan_session(store, chat, session_id, "editor_state_lost")
+    observed = None
+    identity = None
+    while True:
+        with docker_manager._combined_lock(chat):
+            state = store.read(chat)
+            record = _require_session(state, session_id)
+            _status_projection(record)
+            if identity is None:
+                identity = _session_identity(record)
+            elif _session_identity(record) != identity:
                 raise SessionNotOpenError()
-        return _commit_close_allocation(store, chat, session_id, record["state"])
+            orphaned = _maybe_orphan_epoch(store, chat, record, session_id)
+            if orphaned is not None:
+                raise SessionNotOpenError()
+            state = _recover_session_publications(store, chat, session_id)
+            record = _require_session(state, session_id)
+            _status_projection(record)
+            if _session_identity(record) != identity:
+                raise SessionNotOpenError()
+            if record["state"] in FINAL_STATES:
+                raise SessionNotOpenError()
+            if record["state"] == "opening":
+                return _commit_opening_close(store, chat, session_id)
+            if record["state"] == "closing":
+                pending = record.get("pending_close_seq")
+                if type(pending) is int:
+                    if pending < 1:
+                        raise StateCorruptError("office session pending allocation is invalid")
+                    _refresh_activity(store, chat, session_id)
+                    return {"session_id": session_id, "save_seq": pending, "state": "closing"}
+                if pending is not None:
+                    raise StateCorruptError("office session pending allocation is invalid")
+                found = _final_receipt(state, session_id)
+                if found is None:
+                    raise StateCorruptError("office session pending allocation is invalid")
+                sequence, _receipt = found
+                return {"session_id": session_id, "save_seq": sequence, "state": "closing"}
+            ended_conflict = record["state"] == "conflict" and _final_receipt(state, session_id) is not None
+            if ended_conflict:
+                return {
+                    "session_id": session_id,
+                    "save_seq": record["save_seq"],
+                    "state": "conflict",
+                }
+            if record["state"] not in ("editing", "saving"):
+                return _commit_close_allocation(store, chat, session_id, record["state"])
+            authority = _lookup_authority(state, record, epoch.current_epoch())
+            if observed is not None and observed[0] == authority:
+                if observed[1] is commands.KeyLookupOutcome.KEY_UNKNOWN:
+                    _orphan_session(
+                        store, chat, session_id, "editor_state_lost", expected_authority=authority,
+                    )
+                    raise SessionNotOpenError()
+                # Unreachable preserves close's existing admitted-close behavior.
+                return _commit_close_allocation(store, chat, session_id, record["state"])
+            document_key = record["document_key"]
+        outcome = commands.run_command(
+            commands.lookup_key(document_key), loop,
+            unreachable=commands.KeyLookupOutcome.UNREACHABLE,
+        )
+        observed = authority, outcome
 
 
 def _commit_opening_close(store, chat, session_id) -> dict[str, Any]:
