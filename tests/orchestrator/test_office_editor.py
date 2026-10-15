@@ -436,12 +436,14 @@ def test_parent_publish_command_does_not_acknowledge_uncommitted_edits(tmp_path)
     assert _states(result)[-1]["state"] == "saving"
 
 
-@pytest.mark.parametrize("later_edit", [False, True])
+@pytest.mark.parametrize("later_edit", ["absent", "pending", "delivered"])
 @pytest.mark.parametrize("commit_before_reply", [False, True])
 def test_committed_save_covers_only_its_dispatch_generation(tmp_path, later_edit, commit_before_reply):
     actions = [{"kind": "command", "command": "save"}]
-    if later_edit:
-        actions.append({"kind": "modify"})
+    if later_edit != "absent":
+        actions.append({"kind": "modify", "value": True})
+        if later_edit == "delivered":
+            actions.append({"kind": "modify", "value": False})
     committed = {"kind": "snapshot", "status": {
         "state": "editing", "save_seq": 9, "last_committed_seq": 9, "last_published_seq": 9,
     }}
@@ -450,15 +452,20 @@ def test_committed_save_covers_only_its_dispatch_generation(tmp_path, later_edit
     result = _run(tmp_path, open=True, modify=[True, False], deferSave=True,
                   nextSaveSequence=9, actions=actions)
     assert result["actionStates"][0]["dirty"] is True
-    assert result["actionStates"][-1]["dirty"] is later_edit
+    assert result["actionStates"][-1]["dirty"] is (later_edit != "absent")
     assert _states(result)[-1]["state"] == "editing"
     assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 1
 
 
-def test_another_tabs_sequence_does_not_acknowledge_local_edits(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], actions=[
-        {"kind": "snapshot", "status": {"save_seq": 9, "last_committed_seq": 9, "last_published_seq": 9}},
-    ])
+@pytest.mark.parametrize("local_edit", ["pending", "delivered"])
+def test_another_tabs_sequence_does_not_acknowledge_local_edits(tmp_path, local_edit):
+    actions = [{"kind": "modify", "value": True}]
+    if local_edit == "delivered":
+        actions.append({"kind": "modify", "value": False})
+    actions.append({
+        "kind": "snapshot", "status": {"save_seq": 9, "last_committed_seq": 9, "last_published_seq": 9},
+    })
+    result = _run(tmp_path, open=True, actions=actions)
     assert _states(result)[-1]["dirty"] is True
     assert all(not row["url"].endswith("/save") for row in result["calls"])
 
@@ -770,22 +777,26 @@ def test_retirement_aborts_creation_and_ignores_abort_insensitive_completion(tmp
     assert result["signals"] == [True]
 
 
-@pytest.mark.parametrize("later_edit", [False, True])
+@pytest.mark.parametrize("later_edit", ["absent", "pending", "delivered"])
 @pytest.mark.parametrize("committed_sequence", [3, 4])
 def test_timeout_does_not_revoke_later_cumulative_coverage(tmp_path, later_edit, committed_sequence):
     actions = [
         {"kind": "command", "command": "save"},
         {"kind": "snapshot", "status": {"state": "editing", "reason": "save_timeout"}},
     ]
-    if later_edit:
-        actions.append({"kind": "modify"})
+    if later_edit != "absent":
+        actions.append({"kind": "modify", "value": True})
+        if later_edit == "delivered":
+            actions.append({"kind": "modify", "value": False})
     actions.append({"kind": "snapshot", "status": {
         "state": "editing", "reason": None, "save_seq": committed_sequence,
         "last_committed_seq": committed_sequence, "last_published_seq": committed_sequence,
     }})
     result = _run(tmp_path, open=True, modify=[True, False], actions=actions)
     assert result["actionStates"][1]["dirty"] is True
-    assert result["actionStates"][-1]["dirty"] is later_edit
+    assert result["actionStates"][-1]["dirty"] is (later_edit != "absent")
+    assert _states(result)[-1]["state"] == "editing"
+    assert len([row for row in result["calls"] if row["url"].endswith("/save")]) == 1
 
 
 @pytest.mark.parametrize(("options", "before", "release", "had_editor"), [
