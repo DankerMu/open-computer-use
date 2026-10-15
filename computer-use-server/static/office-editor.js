@@ -101,6 +101,7 @@ export function createOfficeEditorHost({
   let publishIntent = null;
   let latestCommand = 0;
   let closeRequested = false;
+  let closeWaiting = false;
   let closeAccepted = false;
 
   const final = () => disposed || refusalReason !== null || localError !== null || FINAL_STATES.has(snapshot?.state);
@@ -113,8 +114,9 @@ export function createOfficeEditorHost({
     const next = {
       type: 'ocu:office-state', chat_id: chatId, file_id: opened.fileId, generation: opened.generation,
       session_id: sessionId, state,
-      dirty: state === 'closed' ? false : state === 'conflict' || modification > coveredModification ||
-        Boolean(snapshot && snapshot.last_committed_seq > snapshot.last_published_seq),
+      dirty: deliveredModification < modification || (state === 'closed' ? false :
+        state === 'conflict' || modification > coveredModification ||
+        Boolean(snapshot && snapshot.last_committed_seq > snapshot.last_published_seq)),
       workspace_changed: snapshot?.workspace_changed ?? false, reason,
     };
     statusElement.setAttribute('role', state === 'error' || state === 'refused' ? 'alert' : 'status');
@@ -148,6 +150,9 @@ export function createOfficeEditorHost({
       return false;
     }
     snapshot = { ...status };
+    if (FINAL_STATES.has(snapshot.state) && deliveredModification < modification) {
+      localError = snapshot.reason ?? 'native_delivery_incomplete';
+    }
     coverModifications();
     if (final()) stopTimers();
     else syncAutoSave();
@@ -162,6 +167,7 @@ export function createOfficeEditorHost({
     pollTimer = autoSaveTimer = null;
     retireSaveWaits();
     publishIntent = null;
+    closeWaiting = false;
   }
 
   function syncAutoSave() {
@@ -342,19 +348,43 @@ export function createOfficeEditorHost({
     releaseEditor();
   }
 
-  async function close() {
+  function close() {
     if (!sessionId || closeRequested || final()) return;
     closeRequested = true;
     retireSaveWaits();
     publishIntent = null;
-    const command = ++latestCommand;
-    mutationEpoch++;
+    ++latestCommand;
+    closeWaiting = true;
     syncAutoSave();
+    drainCloseWait();
+  }
+
+  function drainCloseWait() {
+    if (!closeWaiting || !closeRequested || final() || deliveredModification < modification ||
+        (modification > 0 && editor === null)) return;
+    closeWaiting = false;
+    void dispatchClose(latestCommand);
+  }
+
+  function releaseAcceptedClose() {
+    if (!closeAccepted || disposed || localError !== null || deliveredModification < modification) return;
+    try {
+      releaseEditor();
+      report();
+    } catch {
+      fail('editor_release_failed');
+    }
+  }
+
+  async function dispatchClose(command) {
+    mutationEpoch++;
     try {
       const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/close`, { method: 'POST', signal: lifetime.signal });
-      if (disposed) return;
+      if (disposed || localError !== null || refusalReason !== null || command !== latestCommand ||
+          (final() && snapshot?.state !== 'closed')) return;
       const body = await response.json();
-      if (disposed) return;
+      if (disposed || localError !== null || refusalReason !== null || command !== latestCommand ||
+          (final() && snapshot?.state !== 'closed')) return;
       if (!response.ok) {
         commandReason = reasonOf(body, 'close_failed');
       } else if (response.status !== 202 || body?.session_id !== sessionId ||
@@ -371,13 +401,7 @@ export function createOfficeEditorHost({
       mutationEpoch++;
       if (!closeAccepted) closeRequested = false;
     }
-    if (closeAccepted) {
-      try {
-        releaseEditor();
-      } catch {
-        fail('editor_release_failed');
-      }
-    }
+    releaseAcceptedClose();
     await refreshStatus();
   }
 
@@ -430,7 +454,7 @@ export function createOfficeEditorHost({
     const events = {
       ...created.editor_config.events,
       onDocumentStateChange(event) {
-        if (final() || closeAccepted) return;
+        if (final() || (closeAccepted && editor === null)) return;
         if (event?.data === true) {
           modification++;
           report();
@@ -438,10 +462,12 @@ export function createOfficeEditorHost({
           // Delivery to DocumentServer is not a committed or published workspace save.
           deliveredModification = modification;
           drainSaveWaits();
+          drainCloseWait();
+          releaseAcceptedClose();
         }
       },
       onError(event) {
-        if (closeAccepted) return;
+        if (final() || (closeAccepted && editor === null)) return;
         const code = event?.data?.errorCode;
         fail(Number.isInteger(code) ? `editor_error_${code}` : 'editor_error');
       },
@@ -456,6 +482,8 @@ export function createOfficeEditorHost({
       editor = instance;
       report();
       drainSaveWaits();
+      drainCloseWait();
+      releaseAcceptedClose();
     } catch {
       if (disposed) return;
       documentElement.replaceChildren();

@@ -200,7 +200,8 @@ for(const action of options.actions||[]){
   actionStates.push(clone(messages.at(-1).data));
   actionResources.push({destroyed,timerDelays:[...timers.values()].map(timer=>timer.ms),calls:calls.length,messages:messages.length,
     listeners:[...listeners.values()].reduce((sum,group)=>sum+group.size,0),apiElements:hostDocument.head.children.length,
-    saves:calls.filter(row=>row.url.endsWith('/save')).length});
+    saves:calls.filter(row=>row.url.endsWith('/save')).length,
+    closes:calls.filter(row=>row.url.endsWith('/close')).length});
 }
 const dom=node=>({tag:node.tagName,text:node.textContent,hidden:node.hidden,attributes:node.attributes,children:node.children.map(dom)});
 process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(config=>clone(config)),signed,order,attempts,timers:timers.size,actionStates,
@@ -542,8 +543,89 @@ def test_another_tabs_save_refusal_is_not_an_automatic_retry(tmp_path):
     assert _states(result)[-1]["reason"] == "session_not_editing"
 
 
-def test_close_releases_editor_only_after_acceptance_and_polls_to_closed(tmp_path):
+def test_close_waits_for_native_delivery_before_admission(tmp_path):
     result = _run(tmp_path, open=True, modify=[True], deferClose=True, actions=[
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "modify", "value": False},
+        {"kind": "releaseClose"},
+        {"kind": "status", "status": {"state": "closed"}},
+        {"kind": "tick", "ms": 1000},
+        {"kind": "modify", "value": True},
+        {"kind": "modify", "value": False},
+        {"kind": "error"},
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 1000},
+    ])
+    for index in (0, 1):
+        assert result["actionResources"][index]["closes"] == 0
+        assert result["actionResources"][index]["destroyed"] == 0
+        assert result["actionStates"][index]["dirty"] is True
+    assert result["actionResources"][2]["closes"] == 1
+    assert result["actionResources"][2]["destroyed"] == 0
+    assert result["actionStates"][2]["dirty"] is True
+    assert result["actionResources"][3]["destroyed"] == 1
+    assert result["actionStates"][3]["state"] == "closing"
+    assert result["actionStates"][3]["dirty"] is True
+    assert result["actionStates"][3]["reason"] is None
+    assert result["actionStates"][5]["state"] == "closed"
+    assert result["actionStates"][5]["dirty"] is False
+    assert _states(result)[-1] == result["actionStates"][5]
+    retired = result["actionResources"][5]
+    assert result["actionResources"][-1]["calls"] == retired["calls"]
+    assert result["actionResources"][-1]["messages"] == retired["messages"]
+    assert result["actionResources"][-1]["closes"] == 1
+    assert result["destroyed"] == 1
+    assert result["timers"] == 0
+    assert all(not row["url"].endswith("/save") for row in result["calls"])
+
+
+@pytest.mark.parametrize("delivery_outcome", ["acknowledged", "error", "closed"])
+def test_accepted_close_retains_editor_for_later_native_delivery(tmp_path, delivery_outcome):
+    outcomes = {
+        "acknowledged": {"kind": "modify", "value": False},
+        "error": {"kind": "error"},
+        "closed": {"kind": "snapshot", "status": {
+            "state": "closed", "save_seq": 3, "last_committed_seq": 3, "last_published_seq": 3,
+        }},
+    }
+    result = _run(tmp_path, open=True, modify=[True, False], deferClose=True, actions=[
+        {"kind": "command", "command": "close"},
+        {"kind": "modify", "value": True},
+        {"kind": "releaseClose"},
+        outcomes[delivery_outcome],
+        {"kind": "modify", "value": False},
+        {"kind": "tick", "ms": 1000},
+    ])
+    for index in (0, 1, 2):
+        assert result["actionResources"][index]["closes"] == 1
+        assert result["actionResources"][index]["destroyed"] == 0
+        assert result["actionStates"][index]["dirty"] is True
+        assert result["actionStates"][index]["reason"] is None
+    assert result["actionStates"][2]["state"] == "closing"
+    delivered = delivery_outcome == "acknowledged"
+    for index in (3, 4, 5):
+        assert result["actionResources"][index]["closes"] == 1
+        assert result["actionResources"][index]["destroyed"] == int(delivered)
+        assert result["actionStates"][index]["dirty"] is True
+        assert result["actionStates"][index]["state"] == ("closing" if delivered else "error")
+        assert result["actionStates"][index]["reason"] == result["actionStates"][3]["reason"]
+    assert all(not row["url"].endswith("/save") for row in result["calls"])
+    assert result["destroyed"] == int(delivered)
+    if delivered:
+        assert result["actionStates"][3]["reason"] is None
+    else:
+        reason = result["actionStates"][3]["reason"]
+        assert isinstance(reason, str) and reason
+        alert = result["dom"]["children"][0]
+        assert alert["attributes"]["role"] == "alert"
+        assert alert["hidden"] is False
+        assert reason in alert["text"]
+        assert result["actionResources"][-1]["calls"] == result["actionResources"][3]["calls"]
+
+
+def test_close_releases_editor_only_after_acceptance_and_polls_to_closed(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True, False], deferClose=True, actions=[
         {"kind": "command", "command": "close"},
         {"kind": "tick", "ms": 300000},
         {"kind": "releaseClose"},
@@ -567,7 +649,7 @@ def test_close_releases_editor_only_after_acceptance_and_polls_to_closed(tmp_pat
 
 
 def test_rejected_close_retains_editor_and_resumes_editing_timer(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], rejectClose=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], rejectClose=True, actions=[
         {"kind": "command", "command": "close"},
         {"kind": "tick", "ms": 3000},
         {"kind": "allowClose"},
@@ -741,7 +823,7 @@ def test_callback_failure_keeps_save_and_autosave_usable(tmp_path, reason):
 
 @pytest.mark.parametrize("state", ["closed", "error", "orphaned"])
 def test_observed_final_state_stops_live_host_work(tmp_path, state):
-    result = _run(tmp_path, open=True, modify=[True], actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
         {"kind": "status", "status": {"state": state, "reason": "final_failure" if state == "error" else None}},
         {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
         {"kind": "command", "command": "close"}, {"kind": "modify"}, {"kind": "tick", "ms": 300000},
@@ -856,7 +938,7 @@ def test_failed_owned_autosave_keeps_queued_publication_without_covering_edits(t
     ("conflict", "path_missing"), ("error", "state_corrupt"), ("orphaned", "editor_state_lost"),
 ])
 def test_broker_failure_reason_overrides_prior_command_failure(tmp_path, command, state, reason):
-    result = _run(tmp_path, open=True, modify=[True, False] if command == "save" else [True],
+    result = _run(tmp_path, open=True, modify=[True, False],
                   rejectSave=True, rejectClose=True, actions=[
         {"kind": "command", "command": command}, {"kind": "tick", "ms": 1000},
         {"kind": "status", "status": {"state": state, "reason": reason}},
