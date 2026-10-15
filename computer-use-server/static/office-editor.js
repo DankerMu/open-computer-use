@@ -85,6 +85,7 @@ export function createOfficeEditorHost({
   let snapshot = null;
   let editor = null;
   let modification = 0;
+  let deliveredModification = 0;
   let coveredModification = 0;
   const saveCoverage = new Map();
   let refusalReason = null;
@@ -159,6 +160,7 @@ export function createOfficeEditorHost({
     hostWindow.clearTimeout(pollTimer);
     hostWindow.clearTimeout(autoSaveTimer);
     pollTimer = autoSaveTimer = null;
+    retireSaveWaits();
     publishIntent = null;
   }
 
@@ -243,20 +245,46 @@ export function createOfficeEditorHost({
     return statusFlight;
   }
 
-  async function save(intent = 'publish') {
+  function retireSaveWaits() {
+    if (autoSave?.waiting) autoSave = null;
+    if (publishIntent?.waiting) publishIntent = null;
+  }
+
+  function drainSaveWaits() {
+    if (!sessionId || closeRequested || final() || deliveredModification < modification ||
+        (modification > 0 && editor === null)) return;
+    const attempt = autoSave;
+    if (attempt?.waiting && attempt.command === latestCommand) {
+      attempt.waiting = false;
+      void dispatchSave('persist', attempt.command, attempt, null);
+    }
+    const publication = publishIntent;
+    if (publication?.waiting && publication.command === latestCommand) {
+      publication.waiting = false;
+      void dispatchSave('publish', publication.command, null, publication);
+    }
+  }
+
+  function save(intent = 'publish') {
     if (!sessionId || closeRequested || final()) return;
-    const requestedModification = modification;
+    if (intent === 'publish') retireSaveWaits();
     // Background persistence cannot supersede an unresolved explicit publication.
     const command = intent === 'persist' ? latestCommand : ++latestCommand;
-    const attempt = intent === 'persist' ? { pending: true, sequence: null } : null;
+    const attempt = intent === 'persist' ? { command, pending: true, waiting: true, sequence: null } : null;
     const publication = attempt ? null : {
-      command, pending: true, blockingSequence: null, attempts: new Set(autoSave ? [autoSave] : []),
+      command, pending: true, waiting: true, blockingSequence: null, attempts: new Set(autoSave ? [autoSave] : []),
     };
-    mutationEpoch++;
     if (attempt) {
       autoSave = attempt;
       if (publishIntent?.pending) publishIntent.attempts.add(attempt);
     } else publishIntent = publication;
+    drainSaveWaits();
+  }
+
+  async function dispatchSave(intent, command, attempt, publication) {
+    // Delivery qualifies dispatch; only the accepted broker sequence can cover this generation.
+    const requestedModification = modification;
+    mutationEpoch++;
     try {
       const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}/save`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent }), signal: lifetime.signal,
@@ -317,6 +345,7 @@ export function createOfficeEditorHost({
   async function close() {
     if (!sessionId || closeRequested || final()) return;
     closeRequested = true;
+    retireSaveWaits();
     publishIntent = null;
     const command = ++latestCommand;
     mutationEpoch++;
@@ -401,10 +430,15 @@ export function createOfficeEditorHost({
     const events = {
       ...created.editor_config.events,
       onDocumentStateChange(event) {
-        if (final() || closeAccepted || event?.data !== true) return;
-        // false acknowledges delivery to DocumentServer, not a committed workspace save.
-        modification++;
-        report();
+        if (final() || closeAccepted) return;
+        if (event?.data === true) {
+          modification++;
+          report();
+        } else if (event?.data === false) {
+          // Delivery to DocumentServer is not a committed or published workspace save.
+          deliveredModification = modification;
+          drainSaveWaits();
+        }
       },
       onError(event) {
         if (closeAccepted) return;
@@ -421,6 +455,7 @@ export function createOfficeEditorHost({
       }
       editor = instance;
       report();
+      drainSaveWaits();
     } catch {
       if (disposed) return;
       documentElement.replaceChildren();

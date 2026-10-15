@@ -424,7 +424,7 @@ def test_late_api_completion_cannot_resurrect_a_timed_out_open(tmp_path):
 
 
 def test_parent_publish_command_does_not_acknowledge_uncommitted_edits(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], after=[
+    result = _run(tmp_path, open=True, modify=[True, False], after=[
         {"type": "ocu:office-command", "chat_id": CHAT, "generation": 7, "command": "save"},
     ])
     saves = [row for row in result["calls"] if row["url"].endswith("/save")]
@@ -446,7 +446,7 @@ def test_committed_save_covers_only_its_dispatch_generation(tmp_path, later_edit
     }}
     actions += ([committed, {"kind": "releaseSave"}] if commit_before_reply
                 else [{"kind": "releaseSave"}, committed])
-    result = _run(tmp_path, open=True, modify=[True], deferSave=True,
+    result = _run(tmp_path, open=True, modify=[True, False], deferSave=True,
                   nextSaveSequence=9, actions=actions)
     assert result["actionStates"][0]["dirty"] is True
     assert result["actionStates"][-1]["dirty"] is later_edit
@@ -466,7 +466,7 @@ def test_another_tabs_sequence_does_not_acknowledge_local_edits(tmp_path):
     ("commit", 1, True), ("equal", 1, False), ("reject", 2, True),
 ])
 def test_editing_polls_do_not_starve_autosave_or_repeat_covered_edits(tmp_path, mode, save_count, dirty):
-    result = _run(tmp_path, open=True, modify=[True], autoCommit=mode != "reject",
+    result = _run(tmp_path, open=True, modify=[True, False], autoCommit=mode != "reject",
                   equalPublished=mode == "equal", rejectSave=mode == "reject", actions=[
                       {"kind": "tick", "ms": 300000}, {"kind": "tick", "ms": 300000},
                   ])
@@ -481,6 +481,29 @@ def test_editing_polls_do_not_starve_autosave_or_repeat_covered_edits(tmp_path, 
         assert _states(result)[-1]["reason"] == "documentserver_unavailable"
 
 
+@pytest.mark.parametrize("intent", ["publish", "persist"])
+def test_no_change_save_waits_for_native_delivery_acknowledgement(tmp_path, intent):
+    trigger = {"kind": "command", "command": "save"} if intent == "publish" else {"kind": "tick", "ms": 300000}
+    result = _run(tmp_path, open=True, modify=[True], autoCommit=True, equalPublished=True,
+                  deferSave=True, actions=[
+                      trigger,
+                      {"kind": "modify", "value": False},
+                      {"kind": "releaseSave"},
+                  ])
+    assert result["actionResources"][0]["saves"] == 0
+    assert result["actionStates"][0]["dirty"] is True
+    assert result["actionResources"][1]["saves"] == 1
+    assert result["actionStates"][1]["dirty"] is True
+    assert result["actionResources"][2]["saves"] == 1
+    assert result["actionStates"][2]["dirty"] is False
+    saves = [row for row in result["calls"] if row["url"].endswith("/save")]
+    assert len(saves) == 1
+    assert saves[0]["method"] == "POST"
+    assert saves[0]["body"] == {"intent": intent}
+    assert _states(result)[-1]["state"] == "editing"
+    assert _states(result)[-1]["reason"] is None
+
+
 def test_status_poll_does_not_overlap_a_held_request(tmp_path):
     result = _run(tmp_path, open=True, holdStatusAfter=1, actions=[
         {"kind": "tick", "ms": 1000}, {"kind": "tick", "ms": 5000},
@@ -490,7 +513,7 @@ def test_status_poll_does_not_overlap_a_held_request(tmp_path):
 
 
 def test_publish_refused_during_own_autosave_retries_once_after_editing(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
         {"kind": "tick", "ms": 300000},
         {"kind": "command", "command": "save"},
         {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
@@ -587,7 +610,7 @@ def test_timeout_does_not_revoke_later_cumulative_coverage(tmp_path, later_edit,
         "state": "editing", "reason": None, "save_seq": committed_sequence,
         "last_committed_seq": committed_sequence, "last_published_seq": committed_sequence,
     }})
-    result = _run(tmp_path, open=True, modify=[True], actions=actions)
+    result = _run(tmp_path, open=True, modify=[True, False], actions=actions)
     assert result["actionStates"][1]["dirty"] is True
     assert result["actionStates"][-1]["dirty"] is later_edit
 
@@ -631,7 +654,8 @@ def test_twenty_retired_hosts_release_editing_and_saving_resources(tmp_path):
     actions, retirements = [], []
     for index in range(20):
         if index % 2:
-            actions += [{"kind": "modify"}, {"kind": "command", "command": "save"}]
+            actions += [{"kind": "modify"}, {"kind": "modify", "value": False},
+                        {"kind": "command", "command": "save"}]
         retirements.append(len(actions))
         actions.append({"kind": "dispose"})
         actions.append({"kind": "tick", "ms": 1000})
@@ -666,7 +690,7 @@ def test_terminal_status_before_close_reply_still_releases_accepted_editor(tmp_p
 @pytest.mark.parametrize("first_intent", ["publish", "persist"])
 def test_unchanged_publishing_save_finishes_clean_without_inventing_edits(tmp_path, first_intent):
     first = {"kind": "command", "command": "save"} if first_intent == "publish" else {"kind": "tick", "ms": 300000}
-    result = _run(tmp_path, prefix="/ocu", open=True, modify=[True], actions=[
+    result = _run(tmp_path, prefix="/ocu", open=True, modify=[True, False], actions=[
         first, {"kind": "status", "status": {
             "state": "editing", "last_committed_seq": 3, "last_published_seq": 3 if first_intent == "publish" else 2,
         }}, {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
@@ -685,7 +709,7 @@ def test_unchanged_publishing_save_finishes_clean_without_inventing_edits(tmp_pa
 
 @pytest.mark.parametrize("transport", [False, True])
 def test_rejected_publishing_save_stays_dirty_and_retryable(tmp_path, transport):
-    result = _run(tmp_path, open=True, modify=[True], rejectSave=not transport, saveTransportError=transport, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], rejectSave=not transport, saveTransportError=transport, actions=[
         {"kind": "command", "command": "save"}, {"kind": "tick", "ms": 3000},
         {"kind": "allowSave"}, {"kind": "command", "command": "save"},
     ])
@@ -701,7 +725,7 @@ def test_rejected_publishing_save_stays_dirty_and_retryable(tmp_path, transport)
 
 @pytest.mark.parametrize("reason", ["save_timeout", "storage_low"])
 def test_callback_failure_keeps_save_and_autosave_usable(tmp_path, reason):
-    result = _run(tmp_path, open=True, modify=[True], actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
         {"kind": "command", "command": "save"},
         {"kind": "status", "status": {"state": "editing", "reason": reason}},
         {"kind": "tick", "ms": 3000}, {"kind": "command", "command": "save"},
@@ -730,7 +754,7 @@ def test_observed_final_state_stops_live_host_work(tmp_path, state):
 
 
 def test_old_status_cannot_reverse_a_later_save_mutation(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], status={"state": "saving"}, holdStatusAfter=1, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], status={"state": "saving"}, holdStatusAfter=1, actions=[
         {"kind": "status", "status": {"state": "editing"}}, {"kind": "tick", "ms": 1000},
         {"kind": "command", "command": "save"}, {"kind": "allowStatus"}, {"kind": "releaseStatus"},
     ])
@@ -763,7 +787,7 @@ def test_bound_host_rejects_unauthorized_and_malformed_commands(tmp_path, varian
 
 
 def test_close_supersedes_an_already_queued_publishing_retry(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
         {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
         {"kind": "command", "command": "close"},
         {"kind": "status", "status": {"state": "closed"}}, {"kind": "tick", "ms": 300000},
@@ -775,7 +799,7 @@ def test_close_supersedes_an_already_queued_publishing_retry(tmp_path):
 
 
 def test_queued_publish_waits_for_owned_autosave_acceptance_before_retry(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], deferSave=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], deferSave=True, actions=[
         {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
         {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
         {"kind": "tick", "ms": 1000}, {"kind": "releaseSave"}, {"kind": "releaseSave"},
@@ -790,7 +814,7 @@ def test_queued_publish_waits_for_owned_autosave_acceptance_before_retry(tmp_pat
 
 
 def test_accepted_autosave_owns_retry_before_its_status_is_observed(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], holdStatusAfter=300, actions=[
         {"kind": "tick", "ms": 300000},
         {"kind": "command", "command": "save"},
         {"kind": "allowStatus"}, {"kind": "releaseStatus"},
@@ -810,7 +834,7 @@ def test_accepted_autosave_owns_retry_before_its_status_is_observed(tmp_path):
 
 
 def test_failed_owned_autosave_keeps_queued_publication_without_covering_edits(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], deferPersistFailure=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], deferPersistFailure=True, actions=[
         {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
         {"kind": "status", "status": {"last_committed_seq": 3, "last_published_seq": 3}},
         {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
@@ -832,7 +856,8 @@ def test_failed_owned_autosave_keeps_queued_publication_without_covering_edits(t
     ("conflict", "path_missing"), ("error", "state_corrupt"), ("orphaned", "editor_state_lost"),
 ])
 def test_broker_failure_reason_overrides_prior_command_failure(tmp_path, command, state, reason):
-    result = _run(tmp_path, open=True, modify=[True], rejectSave=True, rejectClose=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False] if command == "save" else [True],
+                  rejectSave=True, rejectClose=True, actions=[
         {"kind": "command", "command": command}, {"kind": "tick", "ms": 1000},
         {"kind": "status", "status": {"state": state, "reason": reason}},
         {"kind": "tick", "ms": 1000},
@@ -846,7 +871,7 @@ def test_broker_failure_reason_overrides_prior_command_failure(tmp_path, command
 
 
 def test_pending_but_refused_autosave_cannot_own_another_tabs_retry(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], deferPersistRefusal=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], deferPersistRefusal=True, actions=[
         {"kind": "tick", "ms": 299999},
         {"kind": "status", "status": {"state": "saving", "save_seq": 3}},
         {"kind": "tick", "ms": 1}, {"kind": "command", "command": "save"},
@@ -860,7 +885,7 @@ def test_pending_but_refused_autosave_cannot_own_another_tabs_retry(tmp_path):
 
 @pytest.mark.parametrize("ending", ["close", "dispose"])
 def test_failed_autosave_cannot_revive_a_superseded_publication(tmp_path, ending):
-    result = _run(tmp_path, open=True, modify=[True], deferPersistFailure=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], deferPersistFailure=True, actions=[
         {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
         {"kind": "command", "command": "close"} if ending == "close" else {"kind": "dispose"},
         {"kind": "releaseSave"}, {"kind": "tick", "ms": 5000},
@@ -878,7 +903,7 @@ def test_old_autosave_does_not_own_a_later_foreign_allocation(tmp_path, timed_ou
         {"kind": "status", "status": {"state": "editing", "reason": "save_timeout"}},
         {"kind": "tick", "ms": 1000},
     ] if timed_out else []
-    result = _run(tmp_path, open=True, modify=[True], actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
         {"kind": "tick", "ms": 300000}, *transition,
         {"kind": "status", "status": {"state": "saving", "save_seq": 4, "reason": None}},
         {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
@@ -894,7 +919,7 @@ def test_old_autosave_does_not_own_a_later_foreign_allocation(tmp_path, timed_ou
 def test_correlated_refusal_distinguishes_a_foreign_successor(tmp_path, cause):
     publish = {"kind": "command", "command": "save"}
     successor = {"kind": "status", "status": {"state": "saving", "save_seq": 4}}
-    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], holdStatusAfter=300, actions=[
         {"kind": "tick", "ms": 300000},
         *([publish, successor] if cause == "owned" else [successor, publish]),
         {"kind": "allowStatus"}, {"kind": "releaseStatus"},
@@ -923,7 +948,7 @@ def test_delayed_auto_reply_cannot_change_refusal_ownership(tmp_path, boundary, 
     release = [{"kind": "releaseBody"}] if boundary == "body" else [{"kind": "releaseSave"}]
     if boundary == "failure-body":
         release.append({"kind": "releaseBody"})
-    result = _run(tmp_path, open=True, modify=[True], **options, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], **options, actions=[
         {"kind": "tick", "ms": 300000},
         *([publish] if cause == "owned" else []),
         {"kind": "status", "status": ending}, {"kind": "tick", "ms": 1000},
@@ -945,7 +970,7 @@ def test_unusable_correlation_never_authorizes_a_publishing_retry(tmp_path, valu
     options = {response_kind + "Correlation": {} if value == "missing" else {key: value}}
     if response_kind == "failure":
         options["deferPersistFailure"] = True
-    result = _run(tmp_path, open=True, modify=[True], **options, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], **options, actions=[
         {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
         *([{"kind": "releaseSave"}] if response_kind == "failure" else []),
         {"kind": "status", "status": {"state": "editing"}}, {"kind": "tick", "ms": 5000},
@@ -967,11 +992,12 @@ def test_only_explicit_commands_supersede_pending_publication(tmp_path, supersed
             }},
             {"kind": "tick", "ms": 1000},
         ])
-    result = _run(tmp_path, open=True, modify=[True], holdStatusAfter=300, deferRefusalBody=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], holdStatusAfter=300, deferRefusalBody=True, actions=[
         {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
         {"kind": "allowStatus"}, {"kind": "releaseStatus"},
         {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
         {"kind": "tick", "ms": 1000}, {"kind": "modify"},
+        {"kind": "modify", "value": False},
         {"kind": "tick", "ms": 300000},
         {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
         {"kind": "tick", "ms": 1000}, *supersession,
@@ -990,7 +1016,7 @@ def test_only_explicit_commands_supersede_pending_publication(tmp_path, supersed
 
 @pytest.mark.parametrize("blocking_sequence", [3, 5])
 def test_new_explicit_save_supersedes_an_installed_retry(tmp_path, blocking_sequence):
-    result = _run(tmp_path, open=True, modify=[True], deferPersist=True, holdStatusAfter=300,
+    result = _run(tmp_path, open=True, modify=[True, False], deferPersist=True, holdStatusAfter=300,
                   refusalCorrelation={"blocking_save_seq": blocking_sequence}, actions=[
         {"kind": "tick", "ms": 300000}, {"kind": "command", "command": "save"},
         {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
@@ -1027,7 +1053,7 @@ def test_auto_save_admitted_during_publish_flight_owns_its_refusal(tmp_path, bou
             options["deferBody"] = "save"
             release.append({"kind": "releaseBody"})
     foreign = [{"kind": "status", "status": {"state": "saving", "save_seq": 4}}] if cause == "foreign" else []
-    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, **options, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], holdPublishAdmission=True, **options, actions=[
         {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
         {"kind": "tick", "ms": 1}, *foreign, {"kind": "releasePublishAdmission"}, *release,
         {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4 if foreign else 3}},
@@ -1042,7 +1068,7 @@ def test_auto_save_admitted_during_publish_flight_owns_its_refusal(tmp_path, bou
 
 @pytest.mark.parametrize("ending", ["close", "dispose"])
 def test_retirement_supersedes_publication_owned_by_a_newer_auto_save(tmp_path, ending):
-    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, deferPersist=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], holdPublishAdmission=True, deferPersist=True, actions=[
         {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
         {"kind": "tick", "ms": 1}, {"kind": "releasePublishAdmission"},
         {"kind": "command", "command": "close"} if ending == "close" else {"kind": "dispose"},
@@ -1056,11 +1082,12 @@ def test_retirement_supersedes_publication_owned_by_a_newer_auto_save(tmp_path, 
 
 
 def test_newer_auto_candidate_survives_replacement_before_refusal_delivery(tmp_path):
-    result = _run(tmp_path, open=True, modify=[True], holdPublishAdmission=True, deferRefusalBody=True, actions=[
+    result = _run(tmp_path, open=True, modify=[True, False], holdPublishAdmission=True, deferRefusalBody=True, actions=[
         {"kind": "tick", "ms": 299999}, {"kind": "command", "command": "save"},
         {"kind": "tick", "ms": 1}, {"kind": "releasePublishAdmission"},
         {"kind": "status", "status": {"state": "editing", "last_committed_seq": 3}},
         {"kind": "tick", "ms": 1000}, {"kind": "modify"},
+        {"kind": "modify", "value": False},
         {"kind": "tick", "ms": 300000},
         {"kind": "status", "status": {"state": "editing", "last_committed_seq": 4}},
         {"kind": "tick", "ms": 1000}, {"kind": "releaseRefusalBody"},
