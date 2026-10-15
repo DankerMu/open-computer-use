@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Office native edit delivery.** Publishing and automatic saves wait for native
+  delivery before dispatch and bind coverage to the eligible modification.
+  Close revalidates delivery before releasing the editor; intervening edits,
+  delivery failures and lifetime retirement cannot become false-clean success.
+
 - **Generated HTML resource base.** Relative resources use the final fetched
   document directory; link messages, file selection and downloads retain
   canonical workspace URLs. The opaque-origin `allow-scripts allow-forms`

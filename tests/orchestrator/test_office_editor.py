@@ -505,6 +505,97 @@ def test_no_change_save_waits_for_native_delivery_acknowledgement(tmp_path, inte
     assert _states(result)[-1]["reason"] is None
 
 
+@pytest.mark.parametrize("command", ["save", "close"])
+@pytest.mark.parametrize("ending", ["dispose", "error", "closed"])
+def test_retirement_withdraws_operations_waiting_for_native_delivery(tmp_path, command, ending):
+    retirement = {
+        "dispose": {"kind": "dispose"},
+        "error": {"kind": "error"},
+        "closed": {"kind": "snapshot", "status": {
+            "state": "closed", "save_seq": 9, "last_committed_seq": 9, "last_published_seq": 9,
+        }},
+    }
+    actions = [
+        {"kind": "command", "command": command},
+        retirement[ending],
+        {"kind": "modify", "value": False},
+        {"kind": "command", "command": "save"},
+        {"kind": "command", "command": "close"},
+        {"kind": "tick", "ms": 300000},
+        {"kind": "modify", "value": False},
+    ]
+    if ending == "dispose":
+        actions.append({"kind": "dispose"})
+    result = _run(tmp_path, open=True, modify=[True], actions=actions)
+    pending = result["actionResources"][0]
+    assert pending["saves"] == pending["closes"] == pending["destroyed"] == 0
+    assert result["actionStates"][0]["dirty"] is True
+    retired = result["actionResources"][1]
+    for resources in result["actionResources"][1:]:
+        assert resources["saves"] == resources["closes"] == 0
+        assert resources["destroyed"] == int(ending == "dispose")
+        assert resources["timerDelays"] == []
+        assert resources["calls"] == retired["calls"]
+    assert all(not row["url"].endswith(("/save", "/close")) for row in result["calls"])
+    assert result["attempts"] == 1
+    if ending == "dispose":
+        assert result["destroyed"] == 1
+        assert result["timers"] == result["listeners"] == result["apiElements"] == 0
+        assert all(resources["listeners"] == resources["apiElements"] == 0
+                   for resources in result["actionResources"][1:])
+        assert result["actionResources"][-1]["messages"] == retired["messages"]
+    else:
+        failure = result["actionStates"][1]
+        assert failure["state"] == "error"
+        assert isinstance(failure["reason"], str) and failure["reason"]
+        for state in result["actionStates"][1:]:
+            assert (state["state"], state["dirty"], state["reason"]) == ("error", True, failure["reason"])
+        assert result["destroyed"] == 0
+        alert = result["dom"]["children"][0]
+        assert alert["attributes"]["role"] == "alert"
+        assert alert["hidden"] is False
+        assert failure["reason"] in alert["text"]
+
+
+@pytest.mark.parametrize("superseding_command", ["save", "close"])
+def test_latest_command_supersedes_publication_waiting_for_native_delivery(tmp_path, superseding_command):
+    publishing = superseding_command == "save"
+    result = _run(tmp_path, open=True, modify=[True], deferSave=True, deferClose=True,
+                  autoCommit=True, equalPublished=True, actions=[
+                      {"kind": "command", "command": "save"},
+                      {"kind": "command", "command": superseding_command},
+                      {"kind": "tick", "ms": 1000},
+                      {"kind": "modify", "value": False},
+                      {"kind": "modify", "value": False},
+                      {"kind": "releaseSave" if publishing else "releaseClose"},
+                      {"kind": "snapshot", "status": {
+                          "state": "editing" if publishing else "closed", "save_seq": 3,
+                          "last_committed_seq": 3, "last_published_seq": 3,
+                      }},
+                      {"kind": "tick", "ms": 300000},
+                  ])
+    for index in (0, 1, 2):
+        resources = result["actionResources"][index]
+        assert resources["saves"] == resources["closes"] == resources["destroyed"] == 0
+        assert result["actionStates"][index]["dirty"] is True
+    for index in (3, 4):
+        resources = result["actionResources"][index]
+        assert (resources["saves"], resources["closes"]) == (int(publishing), int(not publishing))
+        assert resources["destroyed"] == 0
+        assert result["actionStates"][index]["dirty"] is True
+    assert [row["body"] for row in result["calls"] if row["url"].endswith("/save")] == (
+        [{"intent": "publish"}] if publishing else []
+    )
+    assert len([row for row in result["calls"] if row["url"].endswith("/close")]) == int(not publishing)
+    assert all(state["reason"] is None for state in result["actionStates"])
+    assert _states(result)[-1]["state"] == ("editing" if publishing else "closed")
+    assert _states(result)[-1]["dirty"] is False
+    assert result["destroyed"] == int(not publishing)
+    if not publishing:
+        assert result["timers"] == 0
+        assert result["actionResources"][-1]["messages"] == result["actionResources"][6]["messages"]
+
+
 def test_status_poll_does_not_overlap_a_held_request(tmp_path):
     result = _run(tmp_path, open=True, holdStatusAfter=1, actions=[
         {"kind": "tick", "ms": 1000}, {"kind": "tick", "ms": 5000},
