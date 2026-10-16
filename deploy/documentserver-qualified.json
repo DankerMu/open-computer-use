@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "recipe_tree": "843d8fcb1eb97616fe9dc0909885f712984d8ae9",
+  "platforms": {
+    "linux/arm64": {
+      "reference": "ocu-documentserver:632634a677f0729cd9e6d163c9eed3c82f667f87237400fc568ade6df34a17e5",
+      "configuration_digest": "sha256:632634a677f0729cd9e6d163c9eed3c82f667f87237400fc568ade6df34a17e5",
+      "platform_manifest_digest": "sha256:6fec47ffea0bd9753382060e49c336e6d0078b33af6e248235a64f5b3ad56bce"
+    },
+    "linux/amd64": {
+      "reference": "ocu-documentserver:5a7a316e2c973161866ea4481e432c057a921ae0080dee5978d8aedc8900622d",
+      "configuration_digest": "sha256:5a7a316e2c973161866ea4481e432c057a921ae0080dee5978d8aedc8900622d",
+      "platform_manifest_digest": "sha256:f3eaaa8c5925b336276ba1f86c6035620f3152492519408f2cafbdaa7d14b963"
+    }
+  }
+}

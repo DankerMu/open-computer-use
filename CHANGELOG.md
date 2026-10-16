@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Office native bootstrap ordering.** The qualified DocumentServer derivative
+  initializes native Window/BaseView before dispatching desktop editor consumers.
+  Exact-source patching preserves the pinned base, runtime settings and fonts;
+  release provenance binds the committed recipe and immutable material.
+  Startup still requires verified local images without building or pulling.
+
 - **Office callback-progressing lookup.** Join/reopen, close, restore and sweep
   release the chat lock for key lookup, then revalidate current authority before
   applying its result. A separate cross-process observation gate preserves one

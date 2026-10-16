@@ -1,0 +1,15 @@
+Open Computer Use modification, 2026-10-16
+
+Base: onlyoffice/documentserver@sha256:e3da62a847b9a5d51a11f73cfea1d9c13c3be3809614490d4edddcf01dcf919b
+
+Modified files: web-apps/apps/{documenteditor,spreadsheeteditor,presentationeditor}/main/app.js
+After existing locale readiness, require the native Window provider (which depends
+on BaseView) before requesting the existing controller/view factories. All
+upstream copyright, licence, attribution and branding notices remain intact.
+
+Modification source and exact hash-bound patch inventory:
+https://github.com/DankerMu/open-computer-use/tree/HEAD/deploy/documentserver
+Upstream corresponding source:
+https://github.com/ONLYOFFICE/web-apps/tree/v9.4.0
+Upstream licensing continues to apply to the modified upstream files; this notice
+does not replace or amend the upstream notices or licence terms.

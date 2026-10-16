@@ -1,0 +1,63 @@
+{
+	"base_image": "onlyoffice/documentserver@sha256:e3da62a847b9a5d51a11f73cfea1d9c13c3be3809614490d4edddcf01dcf919b",
+	"scope": "Desktop editor AMD bootstrap after locale readiness; native module bytes otherwise unchanged",
+	"files": [
+		{
+			"path": "documenteditor/main/app.js",
+			"before_sha256": "22f47179dd92027553022f447db91d5421eb1a4e1ac0c58995fe80b4af04173f",
+			"after_sha256": "c8721f869abda1cb82daaedb731fbfd93b0a85561dd0fe95a4220df909734480",
+			"edits": [
+				{
+					"before": " * SPDX-License-Identifier: AGPL-3.0-only\n */",
+					"after": " * SPDX-License-Identifier: AGPL-3.0-only\n */\n// OCU modification 2026-10-16: initialize shared UI bases before controller factories."
+				},
+				{
+					"before": "        function() {\n            require([",
+					"after": "        function() {\n            require(['common/main/lib/component/Window'], function () {\n            require(["
+				},
+				{
+					"before": "            });\n        }\n    );\n}, function(err) {",
+					"after": "            });\n            });\n        }\n    );\n}, function(err) {"
+				}
+			]
+		},
+		{
+			"path": "spreadsheeteditor/main/app.js",
+			"before_sha256": "bce3fff901c5c67d40024d6f9a28e69580d7778674e58036eacf7e5064bfa641",
+			"after_sha256": "05bb8213d370d9be45ab7b6f6d0e0087e65ee8c33b7f00572facdf80cc379804",
+			"edits": [
+				{
+					"before": " * SPDX-License-Identifier: AGPL-3.0-only\n */",
+					"after": " * SPDX-License-Identifier: AGPL-3.0-only\n */\n// OCU modification 2026-10-16: initialize shared UI bases before controller factories."
+				},
+				{
+					"before": "    Common.Locale.apply(function(){\n        require([",
+					"after": "    Common.Locale.apply(function(){\n        require(['common/main/lib/component/Window'], function () {\n        require(["
+				},
+				{
+					"before": "        });\n    });\n}, function(err) {",
+					"after": "        });\n        });\n    });\n}, function(err) {"
+				}
+			]
+		},
+		{
+			"path": "presentationeditor/main/app.js",
+			"before_sha256": "fb02c408f5148c441fe4c502c7345d7f32a7d2f68083d630d362861db976fbed",
+			"after_sha256": "a121b2dadea93923ddb95a72dee6f1c6f121c15d5a702c7e80dfcf0b581a5ed6",
+			"edits": [
+				{
+					"before": " * SPDX-License-Identifier: AGPL-3.0-only\n */",
+					"after": " * SPDX-License-Identifier: AGPL-3.0-only\n */\n// OCU modification 2026-10-16: initialize shared UI bases before controller factories."
+				},
+				{
+					"before": "    Common.Locale.apply(function(){\n        require([",
+					"after": "    Common.Locale.apply(function(){\n        require(['common/main/lib/component/Window'], function () {\n        require(["
+				},
+				{
+					"before": "        });\n    });\n}, function(err) {",
+					"after": "        });\n        });\n    });\n}, function(err) {"
+				}
+			]
+		}
+	]
+}
