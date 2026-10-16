@@ -126,10 +126,6 @@ BUILD_REQUIRED = (
 SOURCE_BUNDLE_REQUIRED = ("path", "sha256")
 SECRET_BUILD_ARG_MARKERS = ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "API_KEY")
 POSTGRES_DEFAULT = "postgres:17-alpine"
-DOCUMENTSERVER_DEFAULT = (
-    "onlyoffice/documentserver@sha256:"
-    "e3da62a847b9a5d51a11f73cfea1d9c13c3be3809614490d4edddcf01dcf919b"
-)
 WEBUI_BUILD_HASH_ARG = "BUILD_HASH"
 PYODIDE_PREPARE_RELATIVE = "scripts/prepare-pyodide.js"
 PYODIDE_SUPPLEMENT_RELATIVE = "scripts/pyodide-supplement.json"
@@ -183,9 +179,9 @@ ROLE_SPECS = {
     },
     "documentserver": {
         "source": "ocu",
-        "context": ".",
-        "dockerfile": "deploy/release.py",
-        "image_kind": "pull",
+        "context": "deploy/documentserver",
+        "dockerfile": "deploy/documentserver/Dockerfile",
+        "image_kind": "build",
     },
 }
 
@@ -1660,6 +1656,22 @@ def workspace_materials(arguments: dict[str, str]) -> list[dict]:
     ]
 
 
+def documentserver_base(ocu_root: Path) -> str:
+    recipe = require_tracked_regular_file(
+        ocu_root, ROLE_SPECS["documentserver"]["dockerfile"]
+    )
+    instructions = [
+        line.strip() for line in recipe.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    bases = [line for line in instructions if line.split()[0].upper() == "FROM"]
+    if len(bases) != 1 or not re.fullmatch(
+        r"FROM onlyoffice/documentserver@sha256:[0-9a-f]{64}", bases[0]
+    ) or any(line.split()[0].upper() == "ARG" for line in instructions):
+        raise ReleaseError("documentserver recipe requires one immutable base and no base overrides")
+    return bases[0].split()[1]
+
+
 def material_versions(
     role: str,
     arguments: dict[str, str],
@@ -1690,7 +1702,11 @@ def material_versions(
                 }
             )
         return materials
-    if role in ("postgres", "documentserver"):
+    if role == "documentserver":
+        if ocu_root is None:
+            raise ReleaseError("OCU source is required for documentserver base provenance")
+        return [{"name": "base", "requested": documentserver_base(ocu_root), "kind": "base-image"}]
+    if role == "postgres":
         variable = RUNTIME_IMAGE_VARS[role]
         if variable not in arguments:
             raise ReleaseError(f"{role} image declaration is missing")
@@ -1938,22 +1954,24 @@ def validate_inventory_schema(payload: dict) -> None:
                     f"{role}: material input hashes are not installed package versions"
                 )
         if role == "documentserver":
-            variable = RUNTIME_IMAGE_VARS[role]
-            upstream = arguments.get(variable)
             if (
-                not isinstance(upstream, str)
-                or not upstream
-                or arguments != {variable: upstream}
-                or build["argument_defaults"] != arguments
+                arguments != {}
+                or build["argument_defaults"] != {}
                 or build["argument_overrides"] != {}
                 or build["dockerfile"] != ROLE_SPECS[role]["dockerfile"]
-                or build["context"] != "."
-                or materials != [
-                    {"name": role, "requested": upstream, "kind": "upstream-image"}
-                ]
+                or build["context"] != ROLE_SPECS[role]["context"]
+                or len(materials) != 1
+                or set(materials[0]) != {"name", "requested", "kind"}
+                or materials[0]["name"] != "base"
+                or materials[0]["kind"] != "base-image"
+                or not isinstance(materials[0]["requested"], str)
+                or not re.fullmatch(
+                    r"onlyoffice/documentserver@sha256:[0-9a-f]{64}",
+                    materials[0]["requested"],
+                )
             ):
                 raise ReleaseError(
-                    "documentserver must use pulled upstream-image provenance"
+                    "documentserver must use selected-recipe built base-image provenance"
                 )
 
 
@@ -2100,16 +2118,8 @@ def plan_role(
         raise ReleaseError(f"{role}: missing build context {spec['context']}")
     if spec["image_kind"] == "pull":
         variable = RUNTIME_IMAGE_VARS[role]
-        if role == "postgres":
-            declared_image = postgres_declared_default(ocu_root)
-            requested = {} if postgres_image is None else {variable: postgres_image}
-        else:
-            declared_image = extract_pinned_assignments(
-                dockerfile, {"DOCUMENTSERVER_DEFAULT"}
-            ).get("DOCUMENTSERVER_DEFAULT")
-            if not declared_image:
-                raise ReleaseError("documentserver image declaration is missing")
-            requested = {}
+        declared_image = postgres_declared_default(ocu_root)
+        requested = {} if postgres_image is None else {variable: postgres_image}
         arguments, argument_defaults, overrides = split_arguments(
             {variable: declared_image}, requested
         )
@@ -2132,6 +2142,8 @@ def plan_role(
             "image_kind": spec["image_kind"],
             "temp_tag": arguments[variable],
         }
+    if role == "documentserver" and requested_args:
+        raise ReleaseError("documentserver does not accept base overrides or build arguments")
     declared = parse_arg_declarations(dockerfile)
     arguments, argument_defaults, overrides = resolve_role_arguments(
         role=role,

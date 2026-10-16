@@ -560,6 +560,10 @@ class OfflineReleaseTests(unittest.TestCase):
             "docker-compose.webui.yml",
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
+            "deploy/documentserver/Dockerfile",
+            "deploy/documentserver/patch.py",
+            "deploy/documentserver/patch-inventory.json",
+            "deploy/documentserver/OCU-MODIFICATIONS",
         ):
             dest = ocu / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -603,6 +607,7 @@ class OfflineReleaseTests(unittest.TestCase):
             / "retention"
             / "untracked-retention.env",
             "proxy": ocu / "deploy" / "proxy" / "untracked-proxy.env",
+            "documentserver": ocu / "deploy/documentserver/untracked-documentserver.env",
             "webui": webui / "untracked-webui.env",
         }
         for path in canaries.values():
@@ -1036,32 +1041,59 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertFalse((self.state / "images.json").exists())
         self.assertEqual(ops(self.state), [])
 
-    def test_documentserver_default_comes_from_selected_source_and_cache_is_reused(self):
+    def test_documentserver_base_comes_from_committed_recipe(self):
         ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
         selected = "onlyoffice/documentserver@sha256:" + "d" * 64
-        declaration = ocu / "deploy" / "release.py"
-        declaration.write_text(declaration.read_text().replace(
-            DOCUMENTSERVER_UPSTREAM.rsplit(":", 1)[1], "d" * 64
-        ))
-        git_init_commit(ocu, "select upstream image")
-        for name in ("uncached", "cached"):
-            destination = self.root / name
-            result = self.build_cmd(ocu, webui, destination)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            inventory = json.loads((destination / "release.json").read_text())
-            image = inventory["images"]["documentserver"]
-            self.assertEqual(image["build"]["arguments"], {"DOCUMENTSERVER_IMAGE": selected})
-            self.assertEqual(image["build"]["argument_defaults"], {"DOCUMENTSERVER_IMAGE": selected})
-            self.assertEqual(image["build"]["materials"], [
-                {"name": "documentserver", "requested": selected, "kind": "upstream-image"}
-            ])
-            self.assertEqual(
-                image["build"]["dockerfile_sha256"],
-                hashlib.sha256(declaration.read_bytes()).hexdigest(),
-            )
-            pulls = [row for row in self.recorded_builds() if row["tag"] == selected]
-            self.assertEqual([row["kind"] for row in pulls], ["pull"])
-            self.assertEqual(image["configuration_digest"], pulls[0]["id"])
+        declaration = ocu / "deploy/documentserver/Dockerfile"
+        declaration.write_text(declaration.read_text().replace(DOCUMENTSERVER_UPSTREAM, selected))
+        recipe_hash = hashlib.sha256(declaration.read_bytes()).hexdigest()
+        git_init_commit(ocu, "select immutable base recipe")
+        destination = self.root / "selected-recipe"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = json.loads((destination / "release.json").read_text())
+        image = inventory["images"]["documentserver"]
+        self.assertEqual(image["build"]["arguments"], {})
+        self.assertEqual(image["build"]["argument_defaults"], {})
+        self.assertEqual(image["build"]["materials"], [
+            {"name": "base", "requested": selected, "kind": "base-image"}
+        ])
+        self.assertEqual(image["build"]["dockerfile_sha256"], recipe_hash)
+        builds = [row for row in self.recorded_builds()
+                  if row["kind"] == "build" and "documentserver" in row["tag"]]
+        self.assertEqual(len(builds), 1)
+        self.assertFalse(any(row["kind"] == "pull" and row["tag"] == selected
+                             for row in self.recorded_builds()))
+
+    def test_documentserver_base_override_refuses_before_docker_mutation(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        result = self.build_cmd(
+            ocu, webui, self.root / "override",
+            extra=["--build-arg", "documentserver:BASE_IMAGE=mutable:escape"],
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("documentserver", result.stderr)
+        self.assertFalse(self.recorded_builds())
+        self.assertFalse(any(set(row.split()) & {"build", "pull", "tag", "load"}
+                             for row in ops(self.state)))
+
+    def test_documentserver_recipe_refuses_mutable_or_ambiguous_base_before_build(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        recipe = ocu / "deploy/documentserver/Dockerfile"
+        for index, source in enumerate((
+            "FROM onlyoffice/documentserver:latest\n",
+            f"FROM {DOCUMENTSERVER_UPSTREAM}\nFROM {DOCUMENTSERVER_UPSTREAM}\n",
+            f"ARG BASE={DOCUMENTSERVER_UPSTREAM}\nFROM $BASE\n",
+        )):
+            with self.subTest(source=source):
+                recipe.write_text(source)
+                git_init_commit(ocu, f"invalid base {index}")
+                result = self.build_cmd(ocu, webui, self.root / f"bad-base-{index}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("documentserver recipe", result.stderr)
+                self.assertFalse(self.recorded_builds())
+                self.assertFalse(any(set(row.split()) & {"build", "pull", "tag", "load"}
+                                     for row in ops(self.state)))
 
     def test_seven_image_release_starts_with_documentserver_compose_service(self):
         env, script, _source = prepare_up_context(self.state)
@@ -1097,18 +1129,24 @@ class OfflineReleaseTests(unittest.TestCase):
         mutations = {"load", "pull", "build", "create", "up", "iptables-restore", "ip6tables-restore"}
         self.assertFalse(any(set(row.split()) & mutations for row in ops(self.state)[before_ops:]))
 
-    def test_import_rejects_built_documentserver_before_loading_images(self):
+    def test_import_rejects_old_pulled_documentserver_before_loading_images(self):
         delivery, inventory, _sha = self.write_delivery()
-        inventory["images"]["documentserver"]["build"] = dict(
-            inventory["images"]["proxy"]["build"]
+        build = inventory["images"]["documentserver"]["build"]
+        build.update(
+            dockerfile="deploy/release.py", context=".",
+            arguments={"DOCUMENTSERVER_IMAGE": DOCUMENTSERVER_UPSTREAM},
+            argument_defaults={"DOCUMENTSERVER_IMAGE": DOCUMENTSERVER_UPSTREAM},
+            materials=[{"name": "documentserver", "requested": DOCUMENTSERVER_UPSTREAM,
+                        "kind": "upstream-image"}],
         )
         write_inventory(delivery / "release.json", inventory)
-        install = self.root / "built-documentserver-install"
+        install = self.root / "old-documentserver-install"
         result = self.import_cmd(delivery, install)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("documentserver", result.stderr)
         self.assertFalse(install.exists())
         self.assertFalse((self.state / "load-count").exists())
+        self.assertEqual(ops(self.state), [])
 
     def test_build_records_verified_font_bundle(self):
         ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
@@ -1213,7 +1251,7 @@ class OfflineReleaseTests(unittest.TestCase):
                 self.assertEqual(ops(self.state), [])
                 self.assertEqual(outside.read_bytes(), b"unrelated bytes")
 
-    def test_build_exports_documentserver_as_unmodified_pulled_role(self):
+    def test_build_exports_documentserver_as_source_built_role(self):
         ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
         destination = self.root / "seven-role-release"
         result = self.build_cmd(ocu, webui, destination)
@@ -1230,33 +1268,33 @@ class OfflineReleaseTests(unittest.TestCase):
             "e3da62a847b9a5d51a11f73cfea1d9c13c3be3809614490d4edddcf01dcf919b"
         )
         commands = self.recorded_builds()
-        pulled = [row for row in commands if row["tag"] == upstream]
-        self.assertEqual(len(pulled), 1)
-        self.assertEqual(pulled[0]["kind"], "pull")
-        self.assertEqual(pulled[0]["platform"], "linux/amd64")
+        built = [
+            row for row in commands
+            if row["kind"] == "build" and "documentserver" in row["tag"]
+        ]
+        self.assertEqual(len(built), 1)
+        self.assertEqual(built[0]["platform"], "linux/amd64")
         self.assertFalse(any(
-            row["kind"] == "build" and "documentserver" in row["tag"]
-            for row in commands
+            row["kind"] == "pull" and row["tag"] == upstream for row in commands
         ))
         documentserver = inventory["images"]["documentserver"]
-        self.assertEqual(documentserver["configuration_digest"], pulled[0]["id"])
+        self.assertEqual(documentserver["configuration_digest"], built[0]["id"])
         self.assertEqual(
             documentserver["archive"]["sha256"],
             hashlib.sha256(
                 (destination / documentserver["archive"]["path"]).read_bytes()
             ).hexdigest(),
         )
-        self.assertEqual(documentserver["build"]["dockerfile"], "deploy/release.py")
         self.assertEqual(
-            documentserver["build"]["arguments"], {"DOCUMENTSERVER_IMAGE": upstream}
+            documentserver["build"]["dockerfile"], "deploy/documentserver/Dockerfile"
         )
-        self.assertEqual(
-            documentserver["build"]["argument_defaults"], {"DOCUMENTSERVER_IMAGE": upstream}
-        )
+        self.assertEqual(documentserver["build"]["context"], "deploy/documentserver")
+        self.assertEqual(documentserver["build"]["arguments"], {})
+        self.assertEqual(documentserver["build"]["argument_defaults"], {})
         self.assertEqual(documentserver["build"]["argument_overrides"], {})
         self.assertEqual(
             documentserver["build"]["materials"],
-            [{"name": "documentserver", "requested": upstream, "kind": "upstream-image"}],
+            [{"name": "base", "requested": upstream, "kind": "base-image"}],
         )
 
     def test_build_excludes_untracked_context_from_snapshot_inputs(self):
@@ -1293,6 +1331,9 @@ class OfflineReleaseTests(unittest.TestCase):
             elif "ocu-build-proxy-" in tag:
                 roles["proxy"] = record
                 self.assertNotIn("untracked-proxy.env", files)
+            elif "ocu-build-documentserver-" in tag:
+                roles["documentserver"] = record
+                self.assertNotIn("untracked-documentserver.env", files)
             elif "ocu-build-open-webui-" in tag:
                 roles["open-webui"] = record
                 self.assertNotIn("untracked-webui.env", files)
@@ -1304,6 +1345,7 @@ class OfflineReleaseTests(unittest.TestCase):
                 "retention-guard",
                 "proxy",
                 "open-webui",
+                "documentserver",
             },
         )
         payload = json.loads((dest / "release.json").read_text(encoding="utf-8"))

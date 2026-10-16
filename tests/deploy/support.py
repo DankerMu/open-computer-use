@@ -642,19 +642,19 @@ def serve_font_archive(data=None):
 
 
 def empty_build(role: str) -> dict:
-    upstream = DOCUMENTSERVER_UPSTREAM if role == "documentserver" else None
+    documentserver = role == "documentserver"
     return {
-        "dockerfile": "deploy/release.py" if upstream else f"{role}.Dockerfile",
+        "dockerfile": "deploy/documentserver/Dockerfile" if documentserver else f"{role}.Dockerfile",
         "dockerfile_sha256": hashlib.sha256(role.encode("utf-8")).hexdigest(),
-        "context": ".",
-        "arguments": {"DOCUMENTSERVER_IMAGE": upstream} if upstream else {},
-        "argument_defaults": {"DOCUMENTSERVER_IMAGE": upstream} if upstream else {},
+        "context": "deploy/documentserver" if documentserver else ".",
+        "arguments": {},
+        "argument_defaults": {},
         "argument_overrides": {},
         "input_manifest_sha256": hashlib.sha256(f"input-{role}".encode("utf-8")).hexdigest(),
         "materials": [{
-            "name": role,
-            "requested": upstream or "synthetic",
-            "kind": "upstream-image" if upstream else "test",
+            "name": "base" if documentserver else role,
+            "requested": DOCUMENTSERVER_UPSTREAM if documentserver else "synthetic",
+            "kind": "base-image" if documentserver else "test",
         }],
     }
 
