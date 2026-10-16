@@ -755,9 +755,9 @@ os.replace, os.link, os.fsync = replaced, linked, synced
 mode = os.environ.get("RESOLVE_MODE", "request")
 if mode == "http":
     import uvicorn
-    from office.save_workers import save_worker_lifespan
-    # Own save transactions without unrelated MCP, reaper or recovery startup.
-    app.app.router.lifespan_context = save_worker_lifespan
+    from office.transaction_workers import transaction_worker_lifespan
+    # Own Office transactions without unrelated MCP, reaper or recovery startup.
+    app.app.router.lifespan_context = transaction_worker_lifespan
     uvicorn.run(app.app, host="127.0.0.1", port=int(os.environ["OCU_PORT"]),
                 lifespan="on", log_level="warning")
 elif mode == "recover":

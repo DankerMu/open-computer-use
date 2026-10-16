@@ -1006,7 +1006,6 @@ print(json.dumps({"status": response.status_code, "body": response.json()}))
             _wait_marker(dispatched, child, "child close was not dispatched while INFO was held")
             assert parent.is_alive()
             assert child.poll() is None
-            assert len(origin.requests) == 1
             payload = _independent_verify(
                 json.loads(origin.requests[0]["body"].decode("utf-8"))["token"], JWT_SECRET
             )
@@ -1025,7 +1024,6 @@ print(json.dumps({"status": response.status_code, "body": response.json()}))
             assert child_response == {"status": 202, "body": expected}
             assert _record(first["session_id"])["pending_close_seq"] == 1
             assert _record(first["session_id"])["save_seq"] == 1
-            assert len(origin.requests) == 1
             assert _independent_verify(
                 json.loads(origin.requests[0]["body"].decode("utf-8"))["token"], JWT_SECRET
             ) == {"c": "info", "key": first["document_key"]}
@@ -1034,6 +1032,183 @@ print(json.dumps({"status": response.status_code, "body": response.json()}))
             if parent is not None:
                 parent.join(timeout=10)
             _stop_child(child)
+    assert recording.hits == 0
+
+
+@pytest.mark.parametrize("separate_process", (False, True), ids=("same-process", "cross-process"))
+def test_concurrent_info_callbacks_preserve_duplicate_close_reservation(
+    office_world, monkeypatch, separate_process,
+):
+    from office.store import OfficeStore
+    from tests.orchestrator._office_recorded_callbacks import (
+        recorded_status_1_payload, recorded_status_4_payload,
+    )
+    from tests.orchestrator.test_office_callback_processing import _post
+
+    http, data, recording, _docker, _broker = office_world
+    _file_id, session = _created(office_world, "editing")
+    session_id = session["session_id"]
+    store = OfficeStore()
+    activity = recorded_status_1_payload(document_key=session["document_key"])
+    assert activity["users"] == ["user-1"]
+    opened = _post(http, session, activity)
+    assert opened.status_code == 200 and opened.json() == {"error": 0}
+    before = store.read(CHAT)
+    before_files = _snapshot(_outputs(data))
+    first_entered, second_entered, second_dispatched = (
+        threading.Event() for _ in range(3)
+    )
+    release_first, release_second = threading.Event(), threading.Event()
+    ordinal_lock = threading.Lock()
+    observations, responses, failures = [], {}, []
+    ordinal = 0
+
+    def respond(handler, body, _origin):
+        nonlocal ordinal
+        assert handler.path == "/command"
+        command = _independent_verify(json.loads(body)["token"], JWT_SECRET)
+        assert command == {"c": "info", "key": session["document_key"]}
+        with ordinal_lock:
+            ordinal += 1
+            number = ordinal
+        if number == 1:
+            first_entered.set()
+            assert release_first.wait(15), "first info responder emergency escape"
+        else:
+            second_entered.set()
+            assert release_second.wait(15), "duplicate info responder emergency escape"
+        prior = store.read(CHAT)["sessions"][session_id]
+        callback = _post(http, session, activity)
+        assert callback.status_code == 200 and callback.json() == {"error": 0}
+        after = store.read(CHAT)["sessions"][session_id]
+        observations.append((
+            number, prior["state"], prior.get("pending_close_seq"),
+            after["state"], after.get("pending_close_seq"),
+        ))
+        return 200, {"Content-Type": "application/json"}, b'{"error":0}'
+
+    def request(name):
+        try:
+            if name == "second":
+                second_dispatched.set()
+            response = _close(http, session_id)
+            responses[name] = {"status": response.status_code, "body": response.json()}
+        except BaseException as error:
+            failures.append(error)
+
+    child_src = r"""
+import json, os, sys
+from pathlib import Path
+from fastapi.testclient import TestClient
+import app
+from office.transaction_workers import transaction_worker_lifespan
+app.app.router.lifespan_context = transaction_worker_lifespan
+with TestClient(app.app) as client:
+    Path(os.environ["READY"]).write_text("ready")
+    sys.stdin.readline()
+    Path(os.environ["DISPATCHED"]).write_text("dispatched")
+    response = client.post(
+        f'/api/office/{os.environ["OCU_CHAT"]}/sessions/{os.environ["OCU_SESSION"]}/close',
+        headers={"Authorization": "Bearer " + os.environ["OCU_INTERNAL_TOKEN"]},
+    )
+print(json.dumps({"status": response.status_code, "body": response.json()}))
+"""
+    first = threading.Thread(target=request, args=("first",), name="office-first-close")
+    second = None
+    child = None
+    with _command_origin(respond, release=release_first) as origin, monkeypatch.context() as env:
+        origin._lifetime.release_on_close(release_second)
+        env.setenv("OCU_OFFICE_DOCSERVER_URL", origin.url)
+        try:
+            if separate_process:
+                ready = data.parent / "callback-close-worker-ready"
+                dispatched = data.parent / "callback-close-worker-dispatched"
+                child = subprocess.Popen(
+                    [sys.executable, "-c", child_src], cwd=str(SERVER_DIR),
+                    env=_child_env(
+                        data, origin.url, OCU_SESSION=session_id, READY=str(ready),
+                        DISPATCHED=str(dispatched),
+                    ),
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True,
+                )
+                _wait_marker(ready, child, "duplicate close worker did not load the actual app")
+            first.start()
+            assert first_entered.wait(5), "first close did not issue info"
+            if separate_process:
+                child.stdin.write("go\n")
+                child.stdin.flush()
+                _wait_marker(dispatched, child, "child duplicate close was not dispatched")
+            else:
+                second = threading.Thread(
+                    target=request, args=("second",), name="office-duplicate-close",
+                )
+                second.start()
+                assert second_dispatched.wait(5), "duplicate close was not dispatched"
+            # A coordinated duplicate may never enter info; this is not a two-entry barrier.
+            second_entered.wait(2)
+            release_first.set()
+            first.join(5)
+            assert not first.is_alive(), "first close did not admit after its callback ack"
+            assert not failures, failures
+            assert responses["first"] == {"status": 202, "body": {
+                "session_id": session_id, "save_seq": 1, "state": "closing",
+            }}
+            reserved = store.read(CHAT)["sessions"][session_id]
+            assert (reserved["state"], reserved["save_seq"], reserved["pending_close_seq"]) == (
+                "closing", 1, 1,
+            )
+            release_second.set()
+            if separate_process:
+                stdout, stderr = child.communicate(timeout=15)
+                assert child.returncode == 0, stderr
+                responses["second"] = json.loads(stdout.strip().splitlines()[-1])
+            else:
+                second.join(5)
+                assert not second.is_alive(), "duplicate close did not finish"
+            assert not failures, failures
+            final = _post(http, session, recorded_status_4_payload(
+                document_key=session["document_key"],
+            ))
+            assert final.status_code == 200 and final.json() == {"error": 0}
+            after = store.read(CHAT)
+            record = after["sessions"][session_id]
+            assert [responses[name]["status"] for name in ("first", "second")] == [202, 202]
+            assert [responses[name]["body"]["save_seq"] for name in ("first", "second")] == [
+                1, 1,
+            ], {
+                "responses": responses, "info_callback_states": observations,
+                "final": {key: record[key] for key in (
+                    "state", "save_seq", "pending_close_seq",
+                    "last_committed_seq", "last_published_seq",
+                )},
+            }
+            assert responses["second"] == responses["first"]
+            for number, prior_state, prior_seq, after_state, after_seq in observations:
+                if number > 1:
+                    assert (prior_state, prior_seq, after_state, after_seq) == (
+                        "closing", 1, "closing", 1,
+                    ), "original-user info callback voided the reserved close"
+            assert (record["state"], record["save_seq"], record["pending_close_seq"]) == (
+                "closed", 1, None,
+            )
+            assert (record["last_committed_seq"], record["last_published_seq"]) == (1, 1)
+            assert after["receipts"][session_id] == {"1": {
+                "status": 4, "sha256": None, "version": None, "answer": {"error": 0},
+            }}
+            assert after["documents"] == before["documents"]
+            assert after["journal"] == before["journal"]
+            assert _snapshot(_outputs(data)) == before_files
+        finally:
+            release_first.set()
+            release_second.set()
+            if first.ident is not None:
+                first.join(15)
+            if second is not None:
+                second.join(15)
+            _stop_child(child)
+            assert not first.is_alive(), "first close survived dependency release"
+            assert second is None or not second.is_alive(), "duplicate close survived dependency release"
     assert recording.hits == 0
 
 

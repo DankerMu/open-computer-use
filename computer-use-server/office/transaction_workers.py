@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Lifespan-owned save transactions independent of DNS and callback workers."""
+"""Lifespan-owned Office transactions independent of DNS and callback workers."""
 from __future__ import annotations
 
 import asyncio
@@ -17,15 +17,15 @@ _Parameters = ParamSpec("_Parameters")
 _Result = TypeVar("_Result")
 
 
-async def run_save_worker(
+async def run_transaction_worker(
     app: Any,
     operation: Callable[_Parameters, _Result],
     *args: _Parameters.args,
     **kwargs: _Parameters.kwargs,
 ) -> _Result:
-    executor = getattr(app.state, "office_save_executor", None)
+    executor = getattr(app.state, "office_transaction_executor", None)
     if executor is None:
-        raise RuntimeError("Office save worker ownership is unavailable")
+        raise RuntimeError("Office transaction worker ownership is unavailable")
     context = contextvars.copy_context()
     submitted = executor.submit(context.run, operation, *args, **kwargs)
     # Unshielded cancellation can stop queued work, but cannot abandon a running transaction.
@@ -33,7 +33,7 @@ async def run_save_worker(
 
 
 @asynccontextmanager
-async def save_worker_lifespan(app: Any) -> AsyncIterator[None]:
+async def transaction_worker_lifespan(app: Any) -> AsyncIterator[None]:
     loop = asyncio.get_running_loop()
     completed: asyncio.Future[None] = loop.create_future()
     stop = threading.Event()
@@ -58,16 +58,16 @@ async def save_worker_lifespan(app: Any) -> AsyncIterator[None]:
     cancellation = None
     supervisor = None
     try:
-        supervisor = threading.Thread(target=shutdown, name="office-save-shutdown")
+        supervisor = threading.Thread(target=shutdown, name="office-transaction-shutdown")
         supervisor.start()
-        app.state.office_save_executor = executor
+        app.state.office_transaction_executor = executor
         try:
             yield
         except asyncio.CancelledError as extra:
             cancellation = extra
     finally:
         try:
-            app.state.office_save_executor = None
+            app.state.office_transaction_executor = None
         finally:
             if supervisor is None or supervisor.ident is None:
                 # A genuinely unstarted supervisor owns no jobs and must not be joined.

@@ -68,7 +68,7 @@ This scope covers controlled startup faults and the successful contention paths,
 not request cancellation, arbitrary simultaneous cleanup failures, deployment
 behavior, or cross-platform leak freedom. Production locks and callbacks are unchanged.
 
-### Office command deadlines and save-worker ownership
+### Office command deadlines and transaction-worker ownership
 
 Run the focused command protocol and ownership scope with the canonical discovery root:
 
@@ -77,29 +77,35 @@ uv run --no-project --with pytest \
   --with-requirements computer-use-server/requirements.txt -- \
   python -m pytest tests/ -q \
   --import-mode=importlib --ignore=tests/integration \
-  -k 'test_office_commands.py or test_office_command_deadline.py or test_office_save_workers.py'
+  -k 'test_office_commands.py or test_office_command_deadline.py or test_office_transaction_workers.py or test_office_lookup_admission.py or test_office_save_close.py'
 ```
 
 The regressions cover:
 
 - Real held threaded DNS for join/reopen, close, save and the Office poll. Timing
   starts before caller submission with the unchanged 10-second command budget
-  and a 150 ms test scheduling allowance. Caller completion and lookup-lock
-  release must precede resolver release/return; force-save waits outside the lock.
+  and a 150 ms test scheduling allowance. Lookup and force-save wait outside
+  the canonical lock; caller completion must precede resolver release/return.
 - Healthy real DNS with one default-executor worker, including history restore's
   known-key `409 session_open` admission and unchanged persisted bytes.
-- Authenticated command-induced callback completion with one available AnyIO
-  worker before an accepted force-save response is released and save returns `202`.
-- Cancelled queued saves without allocation or commands, and cancelled running
-  requests whose admitted transactions finish outcome-specific reconciliation.
+- Authenticated command-induced callbacks with one available AnyIO worker finish
+  before lookup/force-save responses; lookup reconciliation revalidates session,
+  key, epoch and allocation authority after concurrent state changes.
+- Cancelled queued transactions issue no command or allocation; cancelled running
+  requests retain ownership through outcome-specific reconciliation.
 - Fresh request-context isolation through workers and loop submission; lifespan
   failures before/after supervisor acquisition, publication and shutdown; draining
   real workers through repeated asyncio and AnyIO cancellation while both shared
   worker domains remain occupied.
+- Same-process and cross-process duplicate closes preserve one reservation across
+  induced callbacks; a genuine later participant report can still void it.
+- Observation-gate waiters leave callbacks and other chats independent. Unsafe
+  or replaced roots/lock inodes refuse admission; cleanup and process death release
+  ownership without unlinking the stable coordination file.
 
-Commands execute on the service loop. Whole synchronous save transactions use a
-lifespan-owned executor separate from DNS and callback workers; cleanup drains
-actual admitted work before releasing lifecycle dependencies.
+Commands execute on the service loop. Synchronous save, join/reopen, close,
+restore and sweep transactions share one lifespan-owned executor independent of
+DNS and callback workers; cleanup drains admitted work before releasing dependencies.
 
 This selected scope is not all Office or deployment coverage. Runtime fault
 probes must record the selected event-loop backend and observe actual resolver

@@ -101,13 +101,15 @@ if mode == "recover":
 elif mode == "startup":
     app.sweep_office_publications()
 else:
-    http = TestClient(app.app)
+    from office.transaction_workers import transaction_worker_lifespan
+    app.app.router.lifespan_context = transaction_worker_lifespan
     suffix = "/sessions" if mode == "create" else "/restore"
-    response = http.post(
-        "/api/office/" + os.environ["OCU_CHAT"] + "/documents/" + os.environ["RESTORE_FILE"] + suffix,
-        headers={"Authorization": "Bearer " + os.environ["OCU_INTERNAL_TOKEN"]},
-        json={} if mode == "create" else {"number": int(os.environ.get("RESTORE_NUMBER", "1"))},
-    )
+    with TestClient(app.app) as http:
+        response = http.post(
+            "/api/office/" + os.environ["OCU_CHAT"] + "/documents/" + os.environ["RESTORE_FILE"] + suffix,
+            headers={"Authorization": "Bearer " + os.environ["OCU_INTERNAL_TOKEN"]},
+            json={} if mode == "create" else {"number": int(os.environ.get("RESTORE_NUMBER", "1"))},
+        )
     print("response=" + json.dumps({"status": response.status_code, "body": response.json()}), flush=True)
 print("completed", flush=True)
 '''

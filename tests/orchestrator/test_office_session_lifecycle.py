@@ -577,7 +577,7 @@ async def _asgi(app, method, path):
     return start["status"], json.loads(body)
 
 
-def test_delayed_lookup_serializes_same_chat_without_blocking_health(office_world, monkeypatch):
+def test_delayed_lookup_allows_same_chat_progress_without_blocking_health(office_world, monkeypatch):
     http, data, recording, _docker, _broker = office_world
     file_id, first = _created(office_world, "editing")
     entered, release = threading.Event(), threading.Event()
@@ -592,7 +592,12 @@ def test_delayed_lookup_serializes_same_chat_without_blocking_health(office_worl
                 health = await asyncio.wait_for(_asgi(http.app, "GET", "/health"), 1)
                 assert health == (200, {"status": "healthy"})
                 assert not one.done() and not two.done()
-                assert len(origin.requests) == 1
+                # #425 permits both remote observations; neither owns the chat lock.
+                import docker_manager
+                def contend():
+                    with docker_manager._combined_lock(CHAT):
+                        return True
+                assert await asyncio.wait_for(asyncio.to_thread(contend), 1)
                 release.set()
                 results = await asyncio.wait_for(asyncio.gather(one, two), 5)
                 for status, body in results:
