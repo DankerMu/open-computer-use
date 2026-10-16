@@ -3,6 +3,12 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Office callback-progressing lookup.** Join/reopen, close, restore and sweep
+  release the chat lock for key lookup, then revalidate current authority before
+  applying its result. One lifespan-owned transaction executor keeps callback
+  admission and DNS independent; command budgets and remaining-participant
+  transitions are unchanged.
+
 - **Office native edit delivery.** Publishing and automatic saves wait for native
   delivery before dispatch and bind coverage to the eligible modification.
   Close revalidates delivery before releasing the editor; intervening edits,
