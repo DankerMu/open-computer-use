@@ -12,18 +12,26 @@ OCU_RELEASE_MANIFEST=<DEPLOY_ROOT>/release.json deploy/up.sh
 OCU_RELEASE_MANIFEST=<DEPLOY_ROOT>/release.json deploy/production-like-test/scripts/write-deployed-version.sh
 ```
 
-`build` 从干净的已提交 OCU/WebUI 快照构建五张源镜像并拉取选定的 PostgreSQL 和 DocumentServer（已缓存且 identity 匹配的上游引用可复用，不覆盖不同内容；更新缓存上游标签是显式操作），导出 linux/amd64 命名归档和 OCU Git bundle。内容派生的 workspace 名称必须保留 `open-computer-use`，并使用完整 configuration digest 作为标签。清单记录两个完整源 SHA、所选源的 `source_consumer_contract`、七张镜像的命名引用与 configuration digest（Docker image `.Id`，不是 registry manifest digest）、归档 SHA-256、非密钥 build-arg 以及材料输入版本/哈希。输入哈希不是已安装软件包版本。缺少该契约常量的历史 checkout（例如 `f851621`）不是合格离线运行时。
+`build` uses clean committed OCU/WebUI snapshots to build six source images, including DocumentServer, and pull the selected PostgreSQL image. It exports named linux/amd64 archives and an OCU Git bundle. The content-derived workspace name retains `open-computer-use` and uses the full configuration digest as its tag. The inventory binds both source commits, the selected `source_consumer_contract`, seven named image/configuration identities, archive SHA-256 values, non-secret build arguments and material input versions/hashes. Input hashes are not installed-package versions. Configuration identity comes from configuration bytes, not a registry manifest; engines may expose a manifest as image `.Id`. General containerd release-path compatibility remains tracked in [issue 337](https://github.com/DankerMu/open-webui/issues/337); local DocumentServer qualification does not certify the complete export/import path on that engine.
 
 `import` 在加载任何镜像前校验 schema、七角色集合、受约束的普通文件路径、全部校验和、归档内部 Docker/OCI 引用与配置字节、所选源消费者契约以及已有本地标签冲突。检查和 `docker load` 使用同一份私有暂存字节。合作构建/导入对同一本机 Docker 守护进程的镜像库写入通过 `/run/ocu-image-store/<daemon-id>.lock` 串行化；该 flock 文件在进程生命周期内持有、不在等待者仍引用其 inode 时 unlink。远程 Docker 守护进程协调不受支持。失败不发布安装根或成功记录；一旦尝试过 load，会披露可能残留的镜像缓存，但不会删除无关镜像。已有目标目录和竞争发布锁都会失败。任意外部 Docker 写者与宿主机管理员不在该保证内。
 
 `deploy/up.sh` 在任何网络/防火墙/容器变更前要求 `OCU_RELEASE_MANIFEST`，并核对本仓库 HEAD、被消费的 tracked 部署/initializer 字节、七张本地镜像以及解析后的服务镜像（含 `open-webui-init` 复用 `open-webui`）。无关 untracked 文件单独存在不是拒绝原因。冻结快照以 `up -d --no-build --pull never` 启动；缺少或被替换的本地镜像不会触发 build 或 pull。`bootstrap-test.sh` 仍保持 root-only、0600、不覆盖既有 runtime/凭证；镜像值可从清单安全派生，但不会执行生成的 shell 片段。
 
 Only release inventory `format_version` 2 is accepted; version 1 is refused by
-import, verify, startup and recovery. DocumentServer is pulled from the immutable
-upstream reference declared in the selected source's `deploy/release.py`, not built
-from a derived Dockerfile. Its existing provenance `build.dockerfile` field names
-that declaration file. The upstream index digest is distinct from the inspected
-linux/amd64 configuration digest and the exported archive checksum.
+import, verify, startup and recovery. DocumentServer is built from the selected
+source's `deploy/documentserver/Dockerfile`, immutable B1 base and exact patch
+inventory. The recipe changes only the three native desktop bootstrap scripts
+and adds a modification notice. It rejects source/hash drift and build overrides.
+PostgreSQL remains pulled. The base index, derived platform manifest,
+configuration digest and exported archive checksum are distinct identities.
+
+For local Office qualification, explicitly load the archive matching
+`deploy/documentserver-qualified.json` and the selected recipe tree before running
+the WebUI `make verify-office` target. Its content-derived reference and inspected
+immutable identity must match the qualified platform entry. Missing material is
+an error; the target does not build, pull or select a fallback image. Preserve the
+original B1 image. This local campaign is not release-wide or LAN acceptance.
 
 Format 2 requires `font_bundle: {path, sha256}`. Build reads the selected committed
 source's `deploy/fonts/fonts.json`, verifies upstream ZIP sizes and hashes, and
