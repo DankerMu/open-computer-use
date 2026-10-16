@@ -193,6 +193,11 @@ def office_world(tmp_path, monkeypatch):
         (data / CHAT_B).mkdir()
         with docker_manager._combined_lock(CHAT):
             pass
+        from office.lookup_admission import lookup_admission
+
+        for chat in (CHAT, CHAT_B):
+            with lookup_admission(chat):
+                pass
         yield http, data, origin, docker_manager, outputs_broker
 
 

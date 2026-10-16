@@ -21,6 +21,7 @@ from outputs_broker import CorruptIndexError, FileIdNotFoundError, OutputsBroker
 
 from . import commands, config, epoch, notice, ooxml, tokens, versions
 from .epoch import RestoreEpochError
+from .lookup_admission import lookup_admission
 from .transaction_workers import run_transaction_worker
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
 from .versions import StorageLowError
@@ -415,7 +416,22 @@ def _lookup_authority(state, record, restore_epoch):
 @contextmanager
 def _reopen_session(store, chat, file_id, *, admit, loop: asyncio.AbstractEventLoop,
                     validate=None, create=True):
-    """Yield the shared create/restore decision with its canonical lock still held."""
+    """Hold observation admission through the caller's canonical transaction."""
+    # Refuse unknown/unsupported creates before adding lookup coordination metadata.
+    # This preliminary read is not authority; admission repeats under both locks.
+    if create:
+        admit()
+    with lookup_admission(chat, create=create) as admission:
+        if admission is None:
+            raise FileIdNotFoundError("chat control root is unavailable")
+        with _reopen_admitted(
+            store, chat, file_id, admit=admit, loop=loop, validate=validate, create=create,
+        ) as reopened:
+            yield reopened
+
+
+@contextmanager
+def _reopen_admitted(store, chat, file_id, *, admit, loop, validate, create):
     observed = None
     while True:
         with docker_manager._combined_lock(chat, create=create) as lock:
@@ -898,6 +914,13 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
 
 def _close_session(chat_id, session_id, *, loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
     chat, store = _load_session(chat_id, session_id)
+    with lookup_admission(chat) as admission:
+        if admission is None:
+            raise StateCorruptError("chat control root is unavailable")
+        return _close_admitted(store, chat, session_id, loop=loop)
+
+
+def _close_admitted(store, chat, session_id, *, loop):
     observed = None
     identity = None
     while True:

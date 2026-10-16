@@ -318,7 +318,8 @@ def test_command_callers_keep_normal_admission_with_one_dns_executor_worker(
 
 @contextmanager
 def _pending_info(world, monkeypatch, caller, file_id, session, *, code=0,
-                  one_callback_worker=False, number=1, observe=None, subsequent_code=None, info_calls=None):
+                  one_callback_worker=False, number=1, observe=None, subsequent_code=None,
+                  info_calls=None, subsequent_key=None):
     """Own held dependency I/O and collect even a lock-blocked pre-repair request."""
     import office.commands as commands
 
@@ -335,7 +336,8 @@ def _pending_info(world, monkeypatch, caller, file_id, session, *, code=0,
     def respond(handler, body, _parent):
         assert handler.path == "/command"
         command = _oracle_verify(json.loads(body)["token"], JWT_SECRET)
-        assert command == {"c": "info", "key": session["document_key"]}
+        expected_key = session["document_key"] if not infos or subsequent_key is None else subsequent_key
+        assert command == {"c": "info", "key": expected_key}
         infos.append(command)
         if info_calls is not None:
             info_calls.append(command)
@@ -487,28 +489,116 @@ def test_info_induced_callback_precedes_lookup_admission_with_one_callback_and_d
     assert recording.hits == 0
 
 
+def test_concurrent_join_waits_for_lookup_admission_without_blocking_callbacks(office_world, monkeypatch):
+    import fcntl
+    import os
+
+    http, data, _recording, _manager, _broker = office_world
+    file_id, session = _prepare(office_world, monkeypatch, "join")
+    denied, completed = threading.Event(), threading.Event()
+    responses, failures = [], []
+    real_flock = fcntl.flock
+    worker = None
+
+    def join():
+        try:
+            responses.append(_create(http, file_id))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            completed.set()
+
+    with _pending_info(office_world, monkeypatch, "join", file_id, session) as (finish, overlap):
+        lock_info = (data / CHAT / ".office-lookup.lock").stat()
+
+        def contend(fd, operation):
+            info = os.fstat(fd)
+            if operation == fcntl.LOCK_EX and (info.st_dev, info.st_ino) == (
+                lock_info.st_dev, lock_info.st_ino,
+            ):
+                try:
+                    real_flock(fd, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    denied.set()
+                    return real_flock(fd, operation)
+                raise AssertionError("concurrent join bypassed the first observation")
+            return real_flock(fd, operation)
+
+        with monkeypatch.context() as boundary:
+            boundary.setattr(fcntl, "flock", contend)
+            worker = threading.Thread(target=join, name="office-queued-join")
+            try:
+                worker.start()
+                assert denied.wait(2), failures
+                assert not completed.is_set()
+                callback = overlap(lambda: _post(http, session, recorded_status_1_payload(
+                    document_key=session["document_key"],
+                )))
+                assert callback.status_code == 200 and callback.json() == {"error": 0}
+                frozen = _snapshot(data)
+                first = finish()
+                assert completed.wait(2), failures
+                worker.join(CLEANUP_TIMEOUT)
+                assert failures == []
+                for response in (first, *responses):
+                    assert response.status_code == 200 and response.json()["joined"] is True
+                    assert response.json()["session_id"] == session["session_id"]
+                    assert response.json()["document_key"] == session["document_key"]
+                    assert response.json()["state"] == "editing"
+                assert len(responses) == 1
+                assert _snapshot(data) == frozen
+            finally:
+                # Finish releases the owned dependency even when an assertion fails.
+                finish()
+                worker.join(CLEANUP_TIMEOUT)
+                assert not worker.is_alive()
+
+
+def _replace_canonical_session(session_id, state):
+    """Inject replaced authority, not a create command that can bypass the gate."""
+    import docker_manager
+    from office.store import OfficeStore
+
+    successor_id = "00000000-0000-4000-8000-000000000425"
+
+    def replace(working):
+        original = working["sessions"][session_id]
+        original["state"] = "closed"
+        working["sessions"][successor_id] = {
+            **original, "session_id": successor_id, "document_key": "replacement-editor-key",
+            "state": state, "reason": None, "save_seq": 0, "pending_save_seq": None,
+            "pending_close_seq": None, "last_committed_seq": 0, "last_published_seq": 0,
+            "save_intents": {}, "participants": [],
+        }
+
+    with docker_manager._combined_lock(CHAT):
+        return OfficeStore().update(CHAT, replace)["sessions"][successor_id]
+
+
 def test_join_discards_unknown_lookup_for_replaced_session_and_key(office_world, monkeypatch):
     http, data, _recording, _manager, _broker = office_world
     file_id, session = _prepare(office_world, monkeypatch, "join")
 
-    def replace():
-        _change(session["session_id"], state="closed")
-        response = _create(http, file_id)
-        assert response.status_code == 201
-        return response.json()
-
-    with _pending_info(office_world, monkeypatch, "join", file_id, session, code=1) as (finish, overlap):
-        successor = overlap(replace)
+    infos = []
+    with _pending_info(
+        office_world, monkeypatch, "join", file_id, session, code=1,
+        subsequent_code=0, subsequent_key="replacement-editor-key", info_calls=infos,
+    ) as (finish, overlap):
+        successor = overlap(lambda: _replace_canonical_session(session["session_id"], "editing"))
         frozen = _snapshot(data)
         response = finish()
         assert response.status_code == 200 and response.json()["joined"] is True
         assert response.json()["session_id"] == successor["session_id"] != session["session_id"]
         assert response.json()["document_key"] == successor["document_key"] != session["document_key"]
-        assert response.json()["state"] == "opening"
+        assert response.json()["state"] == "editing"
+        assert infos == [
+            {"c": "info", "key": session["document_key"]},
+            {"c": "info", "key": "replacement-editor-key"},
+        ]
         assert _snapshot(data) == frozen
 
 
-@pytest.mark.parametrize("change", ("epoch", "terminal", "duplicate"))
+@pytest.mark.parametrize("change", ("epoch", "terminal"))
 def test_close_revalidates_authority_after_lookup_overlap(office_world, monkeypatch, change):
     import docker_manager
     from office.store import OfficeStore
@@ -525,21 +615,13 @@ def test_close_revalidates_authority_after_lookup_overlap(office_world, monkeypa
                 document_key=session["document_key"],
             ))
             assert response.status_code == 200 and response.json() == {"error": 0}
-        else:
-            response = _close(http, session["session_id"])
-            assert response.status_code == 202
-            assert response.json() == {"session_id": session["session_id"], "save_seq": 1, "state": "closing"}
 
     with _pending_info(office_world, monkeypatch, "close", file_id, session) as (finish, overlap):
         overlap(mutate)
         frozen = _snapshot(data)
         observed = json.loads(_state(data).read_bytes())
         response = finish()
-        if change == "duplicate":
-            assert response.status_code == 202
-            assert response.json() == {"session_id": session["session_id"], "save_seq": 1, "state": "closing"}
-        else:
-            _assert_refusal(response, 409, "session_not_open")
+        _assert_refusal(response, 409, "session_not_open")
         if change == "epoch":
             after = OfficeStore().read(CHAT)
             record = after["sessions"][session["session_id"]]
@@ -670,9 +752,8 @@ def test_sweep_discards_unknown_observation_after_authority_changes(office_world
             ))
             assert response.status_code == 200 and response.json() == {"error": 0}
             if change == "replacement":
-                created = _create(http, file_id)
-                assert created.status_code == 201
-                assert created.json()["document_key"] != session["document_key"]
+                created = _replace_canonical_session(session["session_id"], "opening")
+                assert created["document_key"] != session["document_key"]
 
     with _pending_info(office_world, monkeypatch, "poll", file_id, session, code=1) as (finish, overlap):
         overlap(mutate)
@@ -710,9 +791,7 @@ def test_restore_refuses_new_opening_session_instead_of_using_old_unknown_key(of
             document_key=session["document_key"],
         ))
         assert response.status_code == 200 and response.json() == {"error": 0}
-        created = _create(http, file_id)
-        assert created.status_code == 201
-        return created.json()
+        return _replace_canonical_session(session["session_id"], "opening")
 
     with _pending_info(office_world, monkeypatch, "restore", file_id, session, code=1) as (finish, overlap):
         successor = overlap(replace)

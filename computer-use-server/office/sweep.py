@@ -12,6 +12,7 @@ import time
 import docker_manager
 
 from . import commands, config, epoch
+from .lookup_admission import lookup_admission
 from .sessions import (
     _final_receipt, _lookup_authority, _orphan_session, _persisted_session,
     _session_identity, _status_projection,
@@ -92,6 +93,13 @@ def _recover_chat(store, chat, current):
 def _sweep_chat(
     store: OfficeStore, chat: str, current: float, *, loop: asyncio.AbstractEventLoop,
 ) -> None:
+    with lookup_admission(chat) as admission:
+        if admission is None:
+            return
+        _sweep_chat_admitted(store, chat, current, loop=loop)
+
+
+def _sweep_chat_admitted(store, chat, current, *, loop):
     store._assert_chat_root_safe(chat, allow_missing=False)
     with docker_manager._combined_lock(chat, create=False) as lock:
         if lock is None or not _has_state(store, chat):

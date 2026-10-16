@@ -64,6 +64,7 @@ _APP_MODULES = (
     "office.epoch",
     "office.tokens",
     "office.commands",
+    "office.lookup_admission",
     "office.transaction_workers",
     "office.sessions",
     "office.notice",
