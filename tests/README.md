@@ -77,7 +77,7 @@ uv run --no-project --with pytest \
   --with-requirements computer-use-server/requirements.txt -- \
   python -m pytest tests/ -q \
   --import-mode=importlib --ignore=tests/integration \
-  -k 'test_office_commands.py or test_office_command_deadline.py or test_office_transaction_workers.py'
+  -k 'test_office_commands.py or test_office_command_deadline.py or test_office_transaction_workers.py or test_office_lookup_admission.py or test_office_save_close.py'
 ```
 
 The regressions cover:
@@ -97,6 +97,11 @@ The regressions cover:
   failures before/after supervisor acquisition, publication and shutdown; draining
   real workers through repeated asyncio and AnyIO cancellation while both shared
   worker domains remain occupied.
+- Same-process and cross-process duplicate closes preserve one reservation across
+  induced callbacks; a genuine later participant report can still void it.
+- Observation-gate waiters leave callbacks and other chats independent. Unsafe
+  or replaced roots/lock inodes refuse admission; cleanup and process death release
+  ownership without unlinking the stable coordination file.
 
 Commands execute on the service loop. Synchronous save, join/reopen, close,
 restore and sweep transactions share one lifespan-owned executor independent of
