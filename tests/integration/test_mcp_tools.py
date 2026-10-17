@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.integration._mcp import call_mcp
+from ._mcp import call_mcp
 
 # Snapshot of tools registered in mcp_tools.py. Update intentionally when the
 # tool surface changes; a drift here means somebody renamed/added/removed a tool
