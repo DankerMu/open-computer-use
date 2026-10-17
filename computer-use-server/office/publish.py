@@ -16,6 +16,7 @@ import uuid
 from dataclasses import dataclass
 
 import docker_manager
+from descriptor_io import CommittedCloseError
 from docker.errors import NotFound
 from outputs_broker import FileIdNotFoundError, OutputsBroker, OutputsBrokerError
 
@@ -656,7 +657,7 @@ class _Stage:
                     state["journal"][self.journal_id]["staging"]["retired"] = True
                 try:
                     self.entry = self.store.update(self.chat, retire)["journal"][self.journal_id]
-                except StateDurabilityError:
+                except (StateDurabilityError, CommittedCloseError):
                     self.entry = self.store.read(self.chat)["journal"][self.journal_id]
                     raise
                 if identity is not None:

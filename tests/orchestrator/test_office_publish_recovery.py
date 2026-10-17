@@ -1912,3 +1912,110 @@ def test_missing_office_is_corrupt_unless_peripheral_admission_noops(world):
     recover_publications(CHAT, allow_missing_office=True)
     assert _snapshot(data) == before
     assert not (data / CHAT / ".ocu" / "office").exists()
+
+
+def test_committed_registration_close_failure_retains_obligation_and_recovery_reuses_index(
+        world, monkeypatch):
+    from descriptor_io import CommittedCloseError
+    from office.publish import publish
+
+    fixture = _prepared(world, "absent")
+    replaced, synced, closed = os.replace, os.fsync, os.close
+    close_error = OSError(errno.EIO, "controlled committed registration close failure")
+    writer_fd = None
+    ready = False
+    injected = False
+    attempts = []
+
+    def watch_replace(src, dst, *args, **kwargs):
+        nonlocal writer_fd
+        result = replaced(src, dst, *args, **kwargs)
+        if dst == "index.json":
+            writer_fd = kwargs["dst_dir_fd"]
+        return result
+
+    def watch_sync(fd):
+        nonlocal ready
+        result = synced(fd)
+        if writer_fd is not None and fd == writer_fd and not injected:
+            ready = True
+        return result
+
+    def close_then_fail(fd):
+        nonlocal injected
+        if not ready or injected or fd != writer_fd:
+            return closed(fd)
+        attempts.append(fd)
+        closed(fd)
+        with pytest.raises(OSError) as retired:
+            os.fstat(fd)
+        assert retired.value.errno == errno.EBADF
+        injected = True
+        raise close_error
+
+    with monkeypatch.context() as patches:
+        patches.setattr(os, "replace", watch_replace)
+        patches.setattr(os, "fsync", watch_sync)
+        patches.setattr(os, "close", close_then_fail)
+        with pytest.raises(CommittedCloseError) as failure:
+            publish(CHAT, OBLIGATION)
+    assert attempts == [writer_fd]
+    assert failure.value.resource == "outputs_index"
+    assert failure.value.close_errors == (close_error,)
+    assert failure.value.__cause__ is close_error
+    pending = fixture.store.read(CHAT)
+    assert OBLIGATION in pending["journal"]
+    assert pending["documents"][fixture.file_id]["published_version"] == 1
+    assert pending["documents"][fixture.file_id]["versions"][1]["published"] is False
+    assert fixture.target.read_bytes() == SAVED
+    inode = fixture.target.stat().st_ino
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    index_bytes = index.read_bytes()
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 1
+    _recover()
+    _published(fixture)
+    assert fixture.target.stat().st_ino == inode
+    assert index.read_bytes() == index_bytes
+    settled = _snapshot(fixture.data)
+    _recover()
+    assert _snapshot(fixture.data) == settled
+
+
+def test_committed_staging_retirement_close_failure_preserves_visible_responsibility_and_recovery(
+        world, monkeypatch):
+    from descriptor_io import CommittedCloseError
+    from office.publish import publish
+    from tests.orchestrator._office_store import _state_write_fault
+
+    fixture = _prepared(world, "absent")
+    close_error = OSError(errno.EIO, "controlled committed retirement close failure")
+
+    def retiring(state):
+        return state["journal"].get(OBLIGATION, {}).get("staging", {}).get("retired") is True
+
+    with _state_write_fault(
+        monkeypatch, fixture.data, {"office": close_error}, select_successor=retiring,
+    ) as trace:
+        with pytest.raises(CommittedCloseError) as failure:
+            publish(CHAT, OBLIGATION)
+    assert failure.value.resource == "office_state"
+    assert failure.value.close_errors == (close_error,)
+    assert failure.value.__cause__ is close_error
+    assert trace["attempts"] == trace["retired"] == ["office", "ocu", "root", "base"]
+    assert trace["still_owned"] == []
+    pending = fixture.store.read(CHAT)
+    assert pending == trace["successor"]
+    assert pending["journal"][OBLIGATION]["staging"]["retired"] is True
+    assert pending["documents"][fixture.file_id]["published_version"] == 1
+    assert fixture.target.read_bytes() == SAVED
+    inode = fixture.target.stat().st_ino
+    index = fixture.data / CHAT / ".ocu" / "index.json"
+    index_bytes = index.read_bytes()
+    assert fixture.broker.current_revision(CHAT) == fixture.indexed["revision"] + 1
+    _recover()
+    _published(fixture)
+    assert fixture.target.stat().st_ino == inode
+    assert index.read_bytes() == index_bytes
+    settled = _snapshot(fixture.data)
+    _recover()
+    assert _snapshot(fixture.data) == settled

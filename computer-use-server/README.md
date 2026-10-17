@@ -111,6 +111,27 @@ Unresolved recovery or uncertain fencing returns 503 `publish_pending`.
 Durability and corrupt-state errors remain explicit 500 `state_durability`
 and `state_corrupt`.
 
+After atomic replacement and containing-directory synchronization succeed, a
+final owned-directory close failure remains HTTP500 with
+`{"reason":"committed_close_failed","committed":true,"resource":"office_state"}`.
+`resource` identifies only the committed atomic file: `office_state`,
+`outputs_index` or `import_receipts`. Office responses keep these fields at the
+top level; upload and outputs-listing responses place them in the existing
+`detail` object. These committed-close responses contain neither host paths nor
+close-error text.
+
+The complete successor remains readable, and immutable blobs referenced by
+committed Office state remain retained. Same-attachment-id upload retries
+acknowledge the existing receipt without publishing another file. A committed
+state or index does not complete the surrounding workspace publication:
+surviving journal obligations retain their existing recovery path.
+
+An earlier write, replacement or synchronization failure remains primary with
+its original cause. Actual secondary directory-close errors remain inspectable
+on `close_errors` and in traceback notes. Each remaining owned final directory
+receives one close attempt; uncertain failed closes are not retried. This
+contract does not change temporary-file cleanup or certify power-loss durability.
+
 Create drains an accepted restore for that file before admitting an editor;
 unresolved recovery refuses admission with 503 `publish_pending`. Disable new
 Office requests and drain accepted restore obligations before downgrading

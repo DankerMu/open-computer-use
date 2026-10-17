@@ -13,6 +13,7 @@ import uuid
 from typing import Any
 
 from fastapi.responses import JSONResponse
+from descriptor_io import CommittedCloseError
 
 from . import config, download, epoch, ooxml, publish, sessions, store as store_module, versions
 from .download import DownloadFailed, DownloadRejected, FileTooLarge
@@ -53,6 +54,8 @@ def process_authenticated_callback(
     except RestoreEpochError:
         _reject(chat, session_id, "state_corrupt")
         return JSONResponse(status_code=500, content={"reason": "state_corrupt"})
+    except CommittedCloseError as extra:
+        return JSONResponse(status_code=500, content=extra.public_detail())
     except StateDurabilityError:
         return JSONResponse(status_code=500, content={"reason": "state_durability"})
     except StateCorruptError:
@@ -206,7 +209,7 @@ def _persist_content(
             journal_id = _store_content(store, chat, session_id, status, save_seq, source, body)
         else:
             journal_id = _store_content(store, chat, session_id, status, None, "close", body)
-    except StateDurabilityError:
+    except (StateDurabilityError, CommittedCloseError):
         raise
     except (
         DownloadRejected,

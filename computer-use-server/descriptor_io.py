@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""No-follow read acquisition without workspace or broker error policy."""
+"""No-follow descriptor acquisition and strict final-directory cleanup."""
 from __future__ import annotations
 
 import errno
@@ -43,6 +43,53 @@ class DescriptorTypeError(Exception):
             if self.cleanup_error is not None:
                 raise self.cleanup_error
             raise
+
+
+class CommittedCloseError(RuntimeError):
+    """An atomic resource was replaced and synced before directory close failed."""
+
+    def __init__(self, resource: str, close_errors: tuple[OSError, ...]):
+        self.committed = True
+        self.resource = resource
+        self.close_errors = close_errors
+        super().__init__(f"{resource} committed but final directory cleanup failed")
+
+    def public_detail(self) -> dict[str, str | bool]:
+        return {
+            "reason": "committed_close_failed",
+            "committed": self.committed,
+            "resource": self.resource,
+        }
+
+
+def close_final_directories(
+    directory_fds: tuple[int | None, ...], *, resource: str,
+    committed_and_synced: bool, primary_error: BaseException | None,
+) -> None:
+    """Attempt each owned directory once without replacing an earlier failure."""
+    errors: list[OSError] = []
+    for fd in directory_fds:
+        if fd is None:
+            continue
+        try:
+            os.close(fd)
+        except OSError as error:
+            errors.append(error)
+    if not errors:
+        return
+    close_errors = tuple(errors)
+    if primary_error is not None:
+        primary_error.close_errors = getattr(primary_error, "close_errors", ()) + close_errors
+        primary_error.add_note(
+            "Final directory cleanup also failed: "
+            + "; ".join(f"{type(error).__name__}: {error}" for error in close_errors)
+        )
+        return
+    if committed_and_synced:
+        raise CommittedCloseError(resource, close_errors) from close_errors[0]
+    error = close_errors[0]
+    error.close_errors = close_errors
+    raise error
 
 
 def is_missing(error: OSError) -> bool:

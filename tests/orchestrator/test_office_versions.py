@@ -574,6 +574,157 @@ def test_post_replace_state_durability_error_retains_blob_and_visible_successor(
     assert _blob(data, WORKSPACE).read_bytes() == WORKSPACE
 
 
+def test_version_final_state_close_failure_retains_committed_blob_and_closes_all_directories(
+        world, monkeypatch):
+    import descriptor_io
+
+    store_mod, _docker_manager, data = world
+    store = store_mod.OfficeStore()
+    _outputs(data).mkdir(parents=True, exist_ok=True)
+    workspace_file = _outputs(data) / "brief.docx"
+    workspace_file.write_bytes(WORKSPACE)
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    predecessor = _state(data).read_bytes()
+    content = b"bb"
+    digest = "3b64db95cb55c763391c707108489ae18b4112d783300de38e033b4c98c3deaf"
+    new_blob = _versions_dir(data) / digest
+    roles = {
+        "office": _inode(_office(data)),
+        "ocu": _inode(_office(data).parent),
+        "root": _inode(data / CHAT),
+        "base": _inode(data),
+    }
+    original_open, original_replace = os.open, os.replace
+    original_fsync, original_close = os.fsync, os.close
+    close_error = OSError(errno.ENOSPC, "controlled committed Office state close failure")
+    writer_started = False
+    replaced_fd = None
+    synchronized = False
+    writer_fds = {}
+    retired_roles = set()
+    observations = {"events": [], "close_attempts": [], "invalid_close_attempts": []}
+
+    def recording_open(path, flags, *args, **kwargs):
+        nonlocal writer_started
+        fd = original_open(path, flags, *args, **kwargs)
+        if str(path).startswith(".state.") and str(path).endswith(".tmp"):
+            assert _inode(_office(data)) == roles["office"]
+            writer_started = True
+        return fd
+
+    def recording_replace(src, dst, *args, **kwargs):
+        nonlocal replaced_fd
+        result = original_replace(src, dst, *args, **kwargs)
+        if dst == "state.json":
+            replaced_fd = kwargs["dst_dir_fd"]
+            assert kwargs["src_dir_fd"] == replaced_fd
+            info = os.fstat(replaced_fd)
+            assert (info.st_dev, info.st_ino) == roles["office"]
+            observations["events"].append("replace")
+        return result
+
+    def recording_fsync(fd):
+        nonlocal synchronized
+        result = original_fsync(fd)
+        if writer_started:
+            info = os.fstat(fd)
+            identity = (info.st_dev, info.st_ino)
+            for role, inode in roles.items():
+                if identity == inode:
+                    writer_fds[role] = fd
+            if replaced_fd is not None and fd == replaced_fd:
+                synchronized = True
+                observations["events"].append("fsync")
+                observations["synchronized_successor"] = json.loads(_state(data).read_bytes())
+                observations["synchronized_blob"] = new_blob.read_bytes()
+        return result
+
+    def close_then_fail(fd):
+        if not synchronized:
+            return original_close(fd)
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            observations["invalid_close_attempts"].append(fd)
+            return original_close(fd)
+        identity = (info.st_dev, info.st_ino)
+        role = next((
+            role for role, owned in writer_fds.items()
+            if owned == fd and roles[role] == identity and role not in retired_roles
+        ), None)
+        if role is None:
+            return original_close(fd)
+        observations["close_attempts"].append(role)
+        original_close(fd)
+        with pytest.raises(OSError) as retired:
+            os.fstat(fd)
+        assert retired.value.errno == errno.EBADF
+        retired_roles.add(role)
+        if role == "office":
+            raise close_error
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "open", recording_open)
+            patches.setattr(os, "replace", recording_replace)
+            patches.setattr(os, "fsync", recording_fsync)
+            patches.setattr(os, "close", close_then_fail)
+            with pytest.raises(Exception) as failure:
+                _store(
+                    store_mod, content, source="save", parent=1, published=True,
+                    receipt=_receipt(SESSION, 6, 6, None, None, {"error": 0}),
+                )
+        observations["still_owned"] = []
+        for role, fd in writer_fds.items():
+            try:
+                info = os.fstat(fd)
+            except OSError as error:
+                assert error.errno == errno.EBADF
+            else:
+                if (info.st_dev, info.st_ino) == roles[role]:
+                    observations["still_owned"].append(role)
+        outcome = failure.value
+        observations["outcome_type"] = type(outcome).__name__
+        observations["retained_blob"] = new_blob.read_bytes() if new_blob.is_file() else None
+        successor = store.read(CHAT)
+        observations["visible_successor"] = successor
+        expected = json.loads(predecessor)
+        expected["documents"][FILE_A]["versions"].append({
+            "number": 2, "parent": 1, "sha256": digest, "size": 2,
+            "source": "save", "published": True,
+            "created_at": observations["synchronized_successor"]["documents"][FILE_A]["versions"][1]["created_at"],
+        })
+        expected["receipts"][SESSION] = {
+            "6": {"status": 6, "sha256": digest, "version": 2, "answer": {"error": 0}},
+        }
+        assert observations["events"] == ["replace", "fsync"]
+        assert set(writer_fds) == {"office", "ocu", "root", "base"}
+        assert observations["synchronized_successor"] == expected
+        assert successor == expected
+        assert observations["synchronized_blob"] == content
+        assert _blob(data, WORKSPACE).read_bytes() == WORKSPACE
+        assert workspace_file.read_bytes() == WORKSPACE
+        assert observations["retained_blob"] == content, observations
+        assert observations["close_attempts"] == ["office", "ocu", "root", "base"], observations
+        assert observations["invalid_close_attempts"] == []
+        assert observations["still_owned"] == []
+        assert retired_roles == {"office", "ocu", "root", "base"}
+        assert isinstance(outcome, descriptor_io.CommittedCloseError)
+        assert not isinstance(outcome, store_mod.StateDurabilityError)
+        assert outcome.committed is True
+        assert outcome.resource == "office_state"
+        assert outcome.close_errors == (close_error,)
+        assert outcome.__cause__ is close_error
+    finally:
+        for role, fd in writer_fds.items():
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) == roles[role]:
+                original_close(fd)
+
+
 def test_null_document_and_receipt_slots_preserve_state_and_blobs(world):
     store_mod, _docker_manager, data = world
     store = store_mod.OfficeStore()

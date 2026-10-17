@@ -822,6 +822,8 @@ class OutputsBroker:
         assert control_fd is not None
         temporary = f".index.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         committed = False
+        synchronized = False
+        primary_error = None
         try:
             try:
                 existing = os.lstat("index.json", dir_fd=control_fd)
@@ -847,7 +849,9 @@ class OutputsBroker:
                 raise CommitDurabilityError(
                     "broker index replacement committed but directory durability sync failed"
                 ) from exc
-        except BaseException:
+            synchronized = True
+        except BaseException as error:
+            primary_error = error
             if not committed:
                 try:
                     os.unlink(temporary, dir_fd=control_fd)
@@ -855,7 +859,11 @@ class OutputsBroker:
                     pass
             raise
         finally:
-            os.close(control_fd)
+            descriptor_io.close_final_directories(
+                (control_fd,), resource="outputs_index",
+                committed_and_synced=committed and synchronized,
+                primary_error=primary_error,
+            )
 
     @staticmethod
     def _write_all(fd: int, encoded: bytes) -> None:

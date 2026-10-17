@@ -9,6 +9,7 @@ import stat
 import uuid
 from typing import Any, Callable
 
+import descriptor_io
 import docker_manager
 
 SCHEMA_VERSION = 1
@@ -248,6 +249,8 @@ class OfficeStore:
         base_fd, root_fd, ocu_fd, office_fd = opened
         temporary = f".state.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         committed = False
+        synchronized = False
+        primary_error = None
         try:
             try:
                 existing = os.lstat("state.json", dir_fd=office_fd)
@@ -274,7 +277,9 @@ class OfficeStore:
                 raise StateDurabilityError(
                     "office state replacement committed but directory durability sync failed"
                 ) from extra
-        except BaseException:
+            synchronized = True
+        except BaseException as error:
+            primary_error = error
             if not committed:
                 try:
                     os.unlink(temporary, dir_fd=office_fd)
@@ -282,10 +287,11 @@ class OfficeStore:
                     pass
             raise
         finally:
-            os.close(office_fd)
-            os.close(ocu_fd)
-            os.close(root_fd)
-            os.close(base_fd)
+            descriptor_io.close_final_directories(
+                (office_fd, ocu_fd, root_fd, base_fd), resource="office_state",
+                committed_and_synced=committed and synchronized,
+                primary_error=primary_error,
+            )
 
     @staticmethod
     def _empty() -> dict[str, Any]:

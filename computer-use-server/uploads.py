@@ -627,10 +627,20 @@ def write_import_receipts(chat_dir: Path, receipts: dict[str, dict[str, Any]]) -
         committed = True
         dir_fd = os.open(control, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                          | getattr(os, "O_CLOEXEC", 0))
+        synchronized = False
+        primary_error = None
         try:
             os.fsync(dir_fd)
+            synchronized = True
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            os.close(dir_fd)
+            descriptor_io.close_final_directories(
+                (dir_fd,), resource="import_receipts",
+                committed_and_synced=committed and synchronized,
+                primary_error=primary_error,
+            )
     except BaseException:
         if not committed:
             temporary.unlink(missing_ok=True)

@@ -924,6 +924,100 @@ def test_failed_receipt_write_leaves_prior_receipts_and_retries_without_overwrit
     assert receipts["F2"]["stored_name"] == "notes (2).txt"
 
 
+def test_receipt_final_close_failure_reports_committed_upload_and_replays_same_id(
+        upload_server, monkeypatch):
+    client, uploads = upload_server
+    destination = uploads.parent / ".ocu" / "imports.json"
+    original_replace, original_fsync, original_close = os.replace, os.fsync, os.close
+    host_marker = "/private/issue365-receipt-close-host-marker"
+    close_error = OSError(errno.EIO, host_marker)
+    control_info = None
+    writer_fd = None
+    observations = {"events": [], "close_attempts": [], "retired": False}
+
+    def recording_replace(src, dst, *args, **kwargs):
+        nonlocal control_info
+        result = original_replace(src, dst, *args, **kwargs)
+        if Path(dst) == destination:
+            control_info = destination.parent.stat()
+            observations["events"].append("replace")
+        return result
+
+    def recording_fsync(fd):
+        nonlocal writer_fd
+        result = original_fsync(fd)
+        if control_info is not None and _same_inode(os.fstat(fd), control_info):
+            writer_fd = fd
+            observations["events"].append("fsync")
+            observations["synchronized_successor"] = _receipts(uploads)
+        return result
+
+    def close_then_fail(fd):
+        if writer_fd is None or fd != writer_fd:
+            return original_close(fd)
+        observations["close_attempts"].append(fd)
+        assert _same_inode(os.fstat(fd), control_info)
+        original_close(fd)
+        with pytest.raises(OSError) as retired:
+            os.fstat(fd)
+        assert retired.value.errno == errno.EBADF
+        observations["retired"] = True
+        observations["events"].append("close")
+        raise close_error
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "replace", recording_replace)
+            patches.setattr(os, "fsync", recording_fsync)
+            patches.setattr(os, "close", close_then_fail)
+            failed = _upload(client, "brief.docx", b"one", attachment_id="F1")
+        assert writer_fd is not None
+        assert observations["events"] == ["replace", "fsync", "close"]
+        assert observations["close_attempts"] == [writer_fd]
+        assert observations["retired"] is True
+        with pytest.raises(OSError) as retired:
+            os.fstat(writer_fd)
+        assert retired.value.errno == errno.EBADF
+        successor_bytes = destination.read_bytes()
+        successor = _receipts(uploads)
+        imported_at = successor["F1"]["imported_at"]
+        expected = {"F1": {
+            "stored_name": "brief.docx", "size": 3,
+            "md5": "f97c5d29941bfb1b2fdab0874906ab82", "imported_at": imported_at,
+        }}
+        assert observations["synchronized_successor"] == expected
+        assert successor == expected
+        assert (uploads / "brief.docx").read_bytes() == b"one"
+        assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx"]
+        assert sorted(path.name for path in destination.parent.iterdir()) == ["imports.json"]
+        retry = _upload(client, "another.txt", b"replacement", attachment_id="F1")
+        assert retry.status_code == 200, retry.text
+        assert retry.json() == {
+            "status": "success", "filename": "brief.docx", "size": 3,
+            "md5": "f97c5d29941bfb1b2fdab0874906ab82",
+        }
+        assert destination.read_bytes() == successor_bytes
+        assert (uploads / "brief.docx").read_bytes() == b"one"
+        assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx"]
+        assert _imports(client).json() == {"ids": ["F1"]}
+        assert failed.status_code == 500
+        assert failed.json() == {"detail": {
+            "reason": "committed_close_failed", "committed": True,
+            "resource": "import_receipts",
+        }}, observations
+        assert host_marker not in failed.text
+        assert str(uploads.parent) not in failed.text
+    finally:
+        if writer_fd is not None:
+            try:
+                current = os.fstat(writer_fd)
+            except OSError:
+                pass
+            else:
+                if _same_inode(current, control_info):
+                    original_close(writer_fd)
+
+
 def test_waiting_for_chat_lock_keeps_health_requests_responsive(upload_server):
     import app
     from docker_manager import _combined_lock
@@ -1609,3 +1703,86 @@ def test_sandbox_visible_staging_replacement_cannot_substitute_uploaded_bytes(
     published.write_bytes(b"post-publication-edit")
     assert published.read_bytes() == b"post-publication-edit"
 
+
+@pytest.mark.parametrize("fail_sync", (False, True), ids=("close-only", "sync-and-close"))
+def test_direct_receipt_final_cleanup_retains_original_errors_and_complete_successor(
+        tmp_path, monkeypatch, fail_sync):
+    import traceback
+    import descriptor_io
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    destination = chat_dir / ".ocu" / "imports.json"
+    expected = {"F1": {
+        "stored_name": "brief.docx", "size": 3, "md5": "f97c5d29941bfb1b2fdab0874906ab82",
+        "imported_at": "2026-10-11T00:00:00Z",
+    }}
+    replaced, synced, closed = os.replace, os.fsync, os.close
+    primary = OSError(errno.ENOSPC, "controlled receipt directory sync failure")
+    cause = ValueError("controlled earlier receipt cause")
+    cleanup = OSError(errno.EIO, "controlled receipt final close failure")
+    committed = False
+    writer_fd = None
+    attempts = []
+
+    def watch_replace(src, dst, *args, **kwargs):
+        nonlocal committed
+        result = replaced(src, dst, *args, **kwargs)
+        if Path(dst) == destination:
+            committed = True
+        return result
+
+    def watch_sync(fd):
+        nonlocal writer_fd
+        if committed and _same_inode(os.fstat(fd), destination.parent.stat()):
+            writer_fd = fd
+            if fail_sync:
+                raise primary from cause
+        return synced(fd)
+
+    def close_then_fail(fd):
+        if writer_fd is None or fd != writer_fd:
+            return closed(fd)
+        attempts.append(fd)
+        closed(fd)
+        with pytest.raises(OSError) as retired:
+            os.fstat(fd)
+        assert retired.value.errno == errno.EBADF
+        raise cleanup
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "replace", watch_replace)
+            patches.setattr(os, "fsync", watch_sync)
+            patches.setattr(os, "close", close_then_fail)
+            with pytest.raises(Exception) as failure:
+                uploads.write_import_receipts(chat_dir, expected)
+        outcome = failure.value
+        assert writer_fd is not None
+        assert attempts == [writer_fd]
+        with pytest.raises(OSError) as retired:
+            os.fstat(writer_fd)
+        assert retired.value.errno == errno.EBADF
+        assert uploads.read_import_receipts(chat_dir) == expected
+        assert sorted(path.name for path in destination.parent.iterdir()) == ["imports.json"]
+        assert outcome.close_errors == (cleanup,)
+        if fail_sync:
+            assert outcome is primary
+            assert outcome.__cause__ is cause
+            assert not isinstance(outcome, descriptor_io.CommittedCloseError)
+            assert str(cleanup) in "".join(traceback.format_exception(outcome))
+        else:
+            assert isinstance(outcome, descriptor_io.CommittedCloseError)
+            assert outcome.resource == "import_receipts"
+            assert outcome.committed is True
+            assert outcome.__cause__ is cleanup
+    finally:
+        if writer_fd is not None:
+            try:
+                current = os.fstat(writer_fd)
+            except OSError:
+                pass
+            else:
+                if _same_inode(current, destination.parent.stat()):
+                    closed(writer_fd)

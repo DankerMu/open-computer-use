@@ -3,12 +3,14 @@
 """Shared child protocol and process helpers for Office store tests."""
 from __future__ import annotations
 
+import errno
 import importlib
 import json
 import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -297,3 +299,116 @@ def _seed(store_mod, token: str = "seed") -> dict:
         state["documents"][token] = {"id": token}
 
     return store_mod.OfficeStore().update(CHAT, mutate)
+
+
+@contextmanager
+def _state_write_fault(
+    monkeypatch, data, close_errors, *, primary_stage=None, primary=None,
+    cause=None, select_successor=None,
+):
+    """Fault real writer IO and snapshot ownership before emergency cleanup."""
+    roles = _role_inodes(data)
+    opened, written, replaced, synced, closed = os.open, os.write, os.replace, os.fsync, os.close
+    latest = {}
+    candidate = {}
+    temporary_fd = None
+    selected = False
+    faulted = False
+    trace = {"owned": {}, "attempts": [], "retired": [], "replaced": False, "synced": False}
+
+    def choose():
+        nonlocal selected
+        selected = True
+        trace["owned"] = dict(candidate)
+
+    def fail():
+        nonlocal faulted
+        faulted = True
+        raise primary from cause
+
+    def watch_open(path, flags, *args, **kwargs):
+        nonlocal candidate, temporary_fd
+        fd = opened(path, flags, *args, **kwargs)
+        if not selected:
+            info = os.fstat(fd)
+            for role, identity in roles.items():
+                if (info.st_dev, info.st_ino) == identity:
+                    latest[role] = fd
+            if str(path).startswith(".state.") and str(path).endswith(".tmp"):
+                candidate = dict(latest)
+                temporary_fd = fd
+                if select_successor is None:
+                    choose()
+        return fd
+
+    def watch_write(fd, content):
+        if selected and primary_stage == "write" and fd == temporary_fd:
+            fail()
+        return written(fd, content)
+
+    def watch_replace(src, dst, *args, **kwargs):
+        if dst != "state.json":
+            return replaced(src, dst, *args, **kwargs)
+        if not selected and select_successor is not None:
+            successor = json.loads((_state(data).parent / src).read_bytes())
+            if select_successor(successor):
+                choose()
+        if selected and primary_stage == "replace":
+            fail()
+        result = replaced(src, dst, *args, **kwargs)
+        if selected:
+            trace["replaced"] = True
+            trace["successor"] = json.loads(_state(data).read_bytes())
+        return result
+
+    def watch_sync(fd):
+        if selected:
+            role = next((role for role, owned in trace["owned"].items() if owned == fd), None)
+            if primary_stage == role and role is not None:
+                fail()
+        result = synced(fd)
+        if selected and trace["replaced"] and fd == trace["owned"]["office"]:
+            trace["synced"] = True
+        return result
+
+    def watch_close(fd):
+        if not selected or not (faulted or trace["synced"]):
+            return closed(fd)
+        role = next((
+            role for role, owned in trace["owned"].items()
+            if owned == fd and role not in trace["retired"]
+        ), None)
+        if role is None:
+            return closed(fd)
+        info = os.fstat(fd)
+        assert (info.st_dev, info.st_ino) == roles[role]
+        trace["attempts"].append(role)
+        closed(fd)
+        with pytest.raises(OSError) as retired:
+            os.fstat(fd)
+        assert retired.value.errno == errno.EBADF
+        trace["retired"].append(role)
+        if role in close_errors:
+            raise close_errors[role]
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "open", watch_open)
+            patches.setattr(os, "write", watch_write)
+            patches.setattr(os, "replace", watch_replace)
+            patches.setattr(os, "fsync", watch_sync)
+            patches.setattr(os, "close", watch_close)
+            yield trace
+    finally:
+        trace["still_owned"] = []
+        for role, fd in trace["owned"].items():
+            if role in trace["retired"]:
+                continue
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) == roles[role]:
+                trace["still_owned"].append(role)
+        for role in trace["still_owned"]:
+            closed(trace["owned"][role])

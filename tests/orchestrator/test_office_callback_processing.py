@@ -1606,3 +1606,70 @@ def test_status1_precommit_state_write_eio_is_structured_then_retry_commits(
     assert origin.hits == 0
 
 
+
+def test_callback_committed_state_close_failure_retains_blob_and_replays_publication_once(
+        office_world, monkeypatch):
+    import errno
+    from tests.orchestrator._office_store import _state_write_fault
+
+    http, data, origin, _docker, broker, content, session = _open_session(office_world)
+    _change(session["session_id"], state="editing", save_seq=0)
+    before_revision = broker.OutputsBroker().current_revision(CHAT)
+    close_error = OSError(errno.ENOSPC, "/private/callback-close-host-marker")
+    with _content_origin({"/cache/ok.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        payload = recorded_status_2_payload(
+            document_key=session["document_key"], url=server.url + "/cache/ok.docx",
+        )
+        with _state_write_fault(monkeypatch, data, {"office": close_error}) as trace:
+            failed = _post(http, session, payload)
+        assert failed.status_code == 500
+        assert failed.json() == {
+            "reason": "committed_close_failed", "committed": True, "resource": "office_state",
+        }
+        assert str(close_error) not in failed.text
+        assert trace["attempts"] == trace["retired"] == ["office", "ocu", "root", "base"]
+        assert trace["still_owned"] == []
+        state = json.loads(_state(data).read_bytes())
+        assert state == trace["successor"]
+        versions = state["documents"][session["file_id"]]["versions"]
+        assert [record["number"] for record in versions] == [1, 2]
+        assert {key: versions[1][key] for key in (
+            "number", "parent", "sha256", "size", "source", "published",
+        )} == {
+            "number": 2, "parent": 1, "sha256": _sha(CHANGED), "size": len(CHANGED),
+            "source": "close", "published": False,
+        }
+        assert _receipt(data, session["session_id"], 1) == {
+            "status": 2, "sha256": _sha(CHANGED), "version": 2, "answer": {"error": 0},
+        }
+        assert list(state["journal"].values()) == [{
+            "file_id": session["file_id"], "version": 2,
+            "session_id": session["session_id"], "save_seq": 1, "requester": "final",
+        }]
+        blob = _versions(data) / _sha(CHANGED)
+        assert blob.read_bytes() == CHANGED
+        assert (_outputs(data) / "report.docx").read_bytes() == content
+        assert broker.OutputsBroker().current_revision(CHAT) == before_revision
+        hits = server.hits
+        retry = _post(http, session, payload)
+        assert retry.status_code == 200
+        assert retry.json() == {"error": 0}
+        completed = json.loads(_state(data).read_bytes())
+        assert completed["journal"] == {}
+        assert completed["documents"][session["file_id"]]["published_version"] == 2
+        assert completed["sessions"][session["session_id"]]["state"] == "closed"
+        assert [record["number"] for record in completed["documents"][session["file_id"]]["versions"]] == [1, 2]
+        assert blob.read_bytes() == CHANGED
+        target = _outputs(data) / "report.docx"
+        assert target.read_bytes() == CHANGED
+        assert broker.OutputsBroker().current_revision(CHAT) == before_revision + 1
+        state_bytes = _state(data).read_bytes()
+        target_inode = target.stat().st_ino
+        replay = _post(http, session, payload)
+        assert replay.status_code == 200
+        assert replay.json() == {"error": 0}
+        assert _state(data).read_bytes() == state_bytes
+        assert target.stat().st_ino == target_inode
+        assert broker.OutputsBroker().current_revision(CHAT) == before_revision + 1
+        assert server.hits == hits
+    assert origin.hits == 0
