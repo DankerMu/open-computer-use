@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Owned Docker-manager test data.** Standalone credential-injection tests keep
+  metadata inside a private temporary root without a caller `BASE_DATA_DIR`.
+  Cleanup restores prior environment and cached-root state and retires only
+  fixture-owned data after success or failure. Production behavior is unchanged.
+
 - **Accurate committed atomic-resource cleanup failures.** Final directory-close
   failures after replacement and directory synchronization report HTTP500
   `committed_close_failed` with `committed: true` and the specific outputs index,

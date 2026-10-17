@@ -45,6 +45,17 @@ Collection success is not a test pass: then execute the same canonical selected
 scope without `--collect-only` and record execution separately. Do not trim an
 evolving corpus to match an old count.
 
+### Docker-manager test data ownership
+
+`orchestrator/test_docker_manager.py` owns a private temporary data root across
+imports, reloads and real metadata writes under standalone and pytest execution.
+No caller-provided `BASE_DATA_DIR` is required. Cleanup restores the prior
+environment and cached data root independently and removes only the fixture-owned
+directory, including after setup or test-body failures.
+
+For pytest, use the canonical discovery command above with
+`-k 'test_docker_manager.py'` to select this module rather than the full unit scope.
+
 ### Office contention startup ownership
 
 The owners in `orchestrator/test_office_control_plane_concurrency.py` release and
