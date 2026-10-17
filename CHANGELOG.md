@@ -3,6 +3,14 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Bounded archive member staging.** Output ZIPs copy fixed-size chunks from each
+  verified workspace descriptor instead of buffering its complete uncompressed
+  payload. Relative names and bytes, empty files, confinement and source error
+  responses are preserved; source and ZIP failures release the descriptor without
+  publishing a successful partial archive. Entries retain current-time DEFLATE
+  metadata and deliberately use ZIP64 headers for unknown or growing sizes. The
+  completed compressed ZIP remains in memory; total archive memory is not bounded.
+
 - **Integration helper import ownership.** Integration MCP helpers use
   package-relative imports for console and full-root importlib discovery,
   without resolving the ambiguous top-level `conftest` module. Fixtures and

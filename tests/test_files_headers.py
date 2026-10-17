@@ -1011,6 +1011,196 @@ def test_archive_missing_source_read_returns_404_and_closes_descriptor(
         observer.cleanup()
 
 
+@pytest.mark.parametrize(
+    "boundary,error_type",
+    [
+        ("source", OSError),
+        ("open", OSError),
+        ("open", FileNotFoundError),
+        ("write", OSError),
+        ("write", FileNotFoundError),
+        ("close", OSError),
+        ("close", FileNotFoundError),
+    ],
+)
+def test_archive_transfer_failure_retires_source_without_success(
+    client, output_dir, monkeypatch, boundary, error_type
+):
+    from tests.test_file_response import BoundaryFailure, _FileIO
+
+    victim = output_dir / "payload.bin"
+    payload = b"real source payload\x00" * (128 * 1024)
+    victim.write_bytes(payload)
+    sentinel = output_dir.parents[1] / "sentinel.txt"
+    sentinel.write_bytes(b"sentinel descriptor remains owned by the test")
+    source_bytes = 0
+
+    class FailingSourceIO(_FileIO):
+        def read(self, fd, size, operation):
+            nonlocal source_bytes
+            chunk = super().read(fd, size, operation)
+            source_bytes += len(chunk)
+            if boundary == "source" and chunk:
+                self.fail_read = True
+            return chunk
+
+    observer = FailingSourceIO(monkeypatch, victim, sentinel)
+    failure = error_type("injected ZIP boundary failure")
+    faults = []
+    real_zip_open = zipfile.ZipFile.open
+
+    def observe_member_open(archive, name, mode="r", *args, **kwargs):
+        member = real_zip_open(archive, name, mode, *args, **kwargs)
+        if mode != "w":
+            return member
+        if boundary == "open":
+            member.close()
+            faults.append(boundary)
+            raise failure
+        if boundary == "write":
+            real_write = member.write
+
+            def fail_write(payload):
+                real_write(payload)
+                faults.append(boundary)
+                raise failure
+
+            monkeypatch.setattr(member, "write", fail_write)
+        elif boundary == "close":
+            real_close = member.close
+
+            def fail_close():
+                real_close()
+                if not faults:
+                    faults.append(boundary)
+                    raise failure
+
+            monkeypatch.setattr(member, "close", fail_close)
+        return member
+
+    try:
+        monkeypatch.setattr(zipfile.ZipFile, "open", observe_member_open)
+        with pytest.raises(error_type) as raised:
+            client.get(_file_url("archive"), headers=_auth_headers())
+        assert observer.acquired, "Source descriptor observation was bypassed"
+        if boundary == "source":
+            assert isinstance(raised.value, BoundaryFailure)
+            assert observer.read_faults == observer.acquired
+            assert 0 < source_bytes < len(payload), "Fault must follow partial source transfer"
+        else:
+            assert raised.value is failure, "ZIP failure was translated or replaced"
+            assert faults == [boundary]
+            if boundary != "open":
+                assert observer.read_sizes, "ZIP fault did not follow a source read"
+        observer.assert_closed()
+    finally:
+        observer.cleanup()
+
+
+def test_archive_leaf_replacement_during_transfer_keeps_acquired_bytes(
+    client, output_dir, monkeypatch
+):
+    from tests.test_file_response import _FileIO
+
+    original = b"original pinned bytes\x00" * (160 * 1024)
+    replacement = b"replacement must not enter the archive"
+    victim = output_dir / "payload.bin"
+    victim.write_bytes(original)
+    saved = output_dir.parents[1] / "pinned-original.bin"
+    sentinel = output_dir.parents[1] / "sentinel.txt"
+    sentinel.write_bytes(b"sentinel descriptor remains owned by the test")
+    read_bytes = 0
+    reads = 0
+    replaced = False
+
+    class ReplacingIO(_FileIO):
+        def read(self, fd, size, operation):
+            nonlocal read_bytes, reads, replaced
+            payload = super().read(fd, size, operation)
+            read_bytes += len(payload)
+            reads += bool(payload)
+            if payload and not replaced:
+                victim.rename(saved)
+                victim.write_bytes(replacement)
+                replaced = True
+            return payload
+
+    observer = ReplacingIO(monkeypatch, victim, sentinel)
+    try:
+        response = client.get(_file_url("archive"), headers=_auth_headers())
+        assert response.status_code == 200
+        with zipfile.ZipFile(BytesIO(response.content)) as archive:
+            assert archive.namelist() == ["payload.bin"]
+            assert archive.read("payload.bin") == original
+        assert replaced
+        assert read_bytes == len(original)
+        assert reads > 1, "Replacement must precede subsequent genuine source reads"
+        assert victim.read_bytes() == replacement
+        assert saved.read_bytes() == original
+        assert observer.acquired, "Source descriptor observation was bypassed"
+        observer.assert_closed()
+    finally:
+        observer.cleanup()
+
+
+def test_archive_growing_member_crosses_zip64_boundary_and_reads_to_eof(
+    client, output_dir, monkeypatch
+):
+    from tests.test_file_response import _FileIO
+
+    limit = 64 * 1024
+    initial = b"a" * (32 * 1024)
+    appended = b"b" * (96 * 1024) + b"\x00grown tail"
+    victim = output_dir / "growing.bin"
+    victim.write_bytes(initial)
+    sentinel = output_dir.parents[1] / "sentinel.txt"
+    sentinel.write_bytes(b"sentinel descriptor remains owned by the test")
+    header_sizes = []
+    read_bytes = 0
+    reads = 0
+    grown = False
+
+    class GrowingIO(_FileIO):
+        def read(self, fd, size, operation):
+            nonlocal read_bytes, reads, grown
+            payload = super().read(fd, size, operation)
+            read_bytes += len(payload)
+            reads += bool(payload)
+            if payload and not grown:
+                with self.real_open(victim, "ab") as writer:
+                    writer.write(appended)
+                grown = True
+            return payload
+
+    observer = GrowingIO(monkeypatch, victim, sentinel)
+    real_zip_open = zipfile.ZipFile.open
+
+    def observe_member_open(archive, name, mode="r", *args, **kwargs):
+        member = real_zip_open(archive, name, mode, *args, **kwargs)
+        if mode == "w":
+            header_sizes.append(observer.real_fstat(observer.acquired[-1]).st_size)
+        return member
+
+    try:
+        monkeypatch.setattr(zipfile, "ZIP64_LIMIT", limit)
+        monkeypatch.setattr(zipfile.ZipFile, "open", observe_member_open)
+        response = client.get(_file_url("archive"), headers=_auth_headers())
+        assert response.status_code == 200
+        assert header_sizes == [len(initial)]
+        assert header_sizes[0] < limit < len(initial) + len(appended)
+        with zipfile.ZipFile(BytesIO(response.content)) as archive:
+            assert archive.namelist() == ["growing.bin"]
+            assert archive.read("growing.bin") == initial + appended
+        assert grown
+        assert reads > 1, "Growth must be consumed by a subsequent genuine source read"
+        assert read_bytes == len(initial) + len(appended)
+        assert victim.read_bytes() == initial + appended
+        assert observer.acquired, "Source descriptor observation was bypassed"
+        observer.assert_closed()
+    finally:
+        observer.cleanup()
+
+
 @pytest.mark.parametrize("filename", ("archive", "%61rchive"), ids=("literal", "encoded"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_reserved_archive_head_does_not_serve_ordinary_file(
