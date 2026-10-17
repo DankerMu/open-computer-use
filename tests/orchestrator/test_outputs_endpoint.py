@@ -745,3 +745,78 @@ def test_listing_corrupt_office_state_is_500_without_index_write(tmp_path):
         assert "Retry-After" not in response.headers
         assert _index(data).read_bytes() == index_before
         assert state_path.read_bytes() == b"{not-json"
+
+
+def test_listing_committed_index_close_failure_reports_resource_and_replays_without_revision(
+        tmp_path, monkeypatch):
+    import errno
+
+    with _isolated_app(tmp_path) as (loaded, _manager, _broker, data), _client(loaded) as http:
+        output = _put(data, "a.txt", b"a")
+        first = http.get(_list_url(), headers=_auth())
+        assert first.status_code == 200
+        predecessor = json.loads(_index(data).read_bytes())
+        output.write_bytes(b"bb")
+        control = _index(data).parent.stat()
+        replaced, synced, closed = os.replace, os.fsync, os.close
+        writer_fd = None
+        ready = False
+        attempts = []
+
+        def watch_replace(src, dst, *args, **kwargs):
+            nonlocal writer_fd
+            result = replaced(src, dst, *args, **kwargs)
+            if dst == "index.json":
+                writer_fd = kwargs["dst_dir_fd"]
+            return result
+
+        def watch_sync(fd):
+            nonlocal ready
+            result = synced(fd)
+            if writer_fd is not None and fd == writer_fd:
+                info = os.fstat(fd)
+                assert (info.st_dev, info.st_ino) == (control.st_dev, control.st_ino)
+                ready = True
+            return result
+
+        def close_then_fail(fd):
+            if not ready or fd != writer_fd:
+                return closed(fd)
+            attempts.append(fd)
+            closed(fd)
+            with pytest.raises(OSError) as retired:
+                os.fstat(fd)
+            assert retired.value.errno == errno.EBADF
+            raise OSError("private outputs index close marker")
+
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "replace", watch_replace)
+            patches.setattr(os, "fsync", watch_sync)
+            patches.setattr(os, "close", close_then_fail)
+            failed = http.get(_list_url(), headers={**_auth(), "If-None-Match": "*"})
+        assert failed.status_code == 500
+        assert failed.json() == {"detail": {
+            "reason": "committed_close_failed", "committed": True, "resource": "outputs_index",
+        }}
+        assert "private outputs index close marker" not in failed.text
+        assert str(data) not in failed.text
+        assert writer_fd is not None
+        assert attempts == [writer_fd]
+        with pytest.raises(OSError) as retired:
+            os.fstat(writer_fd)
+        assert retired.value.errno == errno.EBADF
+        successor_bytes = _index(data).read_bytes()
+        expected = predecessor
+        expected["counter"] = 2
+        digest = "3b64db95cb55c763391c707108489ae18b4112d783300de38e033b4c98c3deaf"
+        expected["active"]["a.txt"].update(
+            size=2, revision=2, hash=digest, mtime_ns=output.stat().st_mtime_ns,
+        )
+        expected["fingerprints"] = {f"2:{digest}": [expected["active"]["a.txt"]["file_id"]]}
+        assert json.loads(successor_bytes) == expected
+        replay = http.get(_list_url(), headers=_auth())
+        assert replay.status_code == 200
+        assert replay.json()["revision"] == 2
+        assert replay.json()["total"] == 1
+        assert _index(data).read_bytes() == successor_bytes
+        assert output.read_bytes() == b"bb"

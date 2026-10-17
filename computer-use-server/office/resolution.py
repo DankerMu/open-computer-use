@@ -12,6 +12,7 @@ import uuid
 import docker_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from descriptor_io import CommittedCloseError
 from outputs_broker import OutputsBroker
 
 from . import config, publish, sessions
@@ -55,6 +56,8 @@ async def resolve_session(request: Request) -> JSONResponse:
         return sessions._error(extra.status, extra.reason)
     except StorageLowError:
         return sessions._error(503, "storage_low")
+    except CommittedCloseError as extra:
+        return JSONResponse(status_code=500, content=extra.public_detail())
     except StateDurabilityError:
         return sessions._error(500, "state_durability")
     except (RestoreEpochError, StateCorruptError):

@@ -17,6 +17,7 @@ from urllib.parse import quote
 import docker_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from descriptor_io import CommittedCloseError
 from outputs_broker import CorruptIndexError, FileIdNotFoundError, OutputsBroker, OutputsBrokerError
 
 from . import commands, config, epoch, notice, ooxml, tokens, versions
@@ -112,6 +113,8 @@ async def create_session(request: Request) -> JSONResponse:
         return _error(503, "publish_pending")
     except (RestoreEpochError, StateCorruptError, CorruptIndexError):
         return _error(500, "state_corrupt")
+    except CommittedCloseError as extra:
+        return JSONResponse(status_code=500, content=extra.public_detail())
     except StateDurabilityError:
         return _error(500, "state_durability")
     except (CreationFailedError, tokens.MissingSigningKeyError, OutputsBrokerError, OSError):
@@ -149,6 +152,8 @@ async def save_session(request: Request) -> JSONResponse:
         return _error(503, "storage_low")
     except (RestoreEpochError, StateCorruptError):
         return _error(500, "state_corrupt")
+    except CommittedCloseError as extra:
+        return JSONResponse(status_code=500, content=extra.public_detail())
     except StateDurabilityError:
         return _error(500, "state_durability")
     except OSError as extra:
@@ -171,6 +176,8 @@ async def close_session(request: Request) -> JSONResponse:
         return _error(409, "session_not_open")
     except (RestoreEpochError, StateCorruptError):
         return _error(500, "state_corrupt")
+    except CommittedCloseError as extra:
+        return JSONResponse(status_code=500, content=extra.public_detail())
     except StateDurabilityError:
         return _error(500, "state_durability")
     except OSError as extra:
@@ -554,6 +561,8 @@ def session_status(request: Request) -> JSONResponse:
         return _error(404, "unknown_session")
     except (RestoreEpochError, StateCorruptError, OutputsBrokerError):
         return _error(500, "state_corrupt")
+    except CommittedCloseError as extra:
+        return JSONResponse(status_code=500, content=extra.public_detail())
     except StateDurabilityError:
         return _error(500, "state_durability")
     except OSError:

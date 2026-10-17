@@ -3,6 +3,15 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Accurate committed atomic-resource cleanup failures.** Final directory-close
+  failures after replacement and directory synchronization report HTTP500
+  `committed_close_failed` with `committed: true` and the specific outputs index,
+  import receipts or Office state resource. Complete successors and referenced
+  Office blobs remain retained; attachment retry and publication recovery reuse
+  committed state. Earlier failures retain their original cause and actual
+  secondary close errors while every owned final directory gets one close
+  attempt without retrying uncertain closes.
+
 - **Bounded archive member staging.** Output ZIPs copy fixed-size chunks from each
   verified workspace descriptor instead of buffering its complete uncompressed
   payload. Relative names and bytes, empty files, confinement and source error

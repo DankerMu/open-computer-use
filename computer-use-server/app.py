@@ -105,8 +105,10 @@ _GENERIC_OUTPUTS_FAILURE = "outputs listing failed"
 
 
 def _outputs_http_error(exc: BaseException) -> HTTPException:
-    """Map broker failures to generic HTTP errors without leaking host paths."""
+    """Map broker outcomes to HTTP errors without leaking host paths."""
     _OUTPUTS_LOG.warning("outputs broker failure: %s: %s", type(exc).__name__, exc)
+    if isinstance(exc, CommittedCloseError):
+        return HTTPException(status_code=500, detail=exc.public_detail())
     if isinstance(exc, StaleCursorError):
         status = 409
     elif isinstance(exc, CursorError):
@@ -931,7 +933,7 @@ async def list_outputs(
         listing = await asyncio.to_thread(_reconcile_outputs, chat_id, cursor, limit)
     except (RecoveryRequiredError, SandboxStateError, docker.errors.DockerException) as exc:
         raise _outputs_http_error(UnstableReadError(str(exc))) from exc
-    except (StateCorruptError, StateDurabilityError) as extra:
+    except (CommittedCloseError, StateCorruptError, StateDurabilityError) as extra:
         raise _outputs_http_error(extra) from extra
     except (OutputsBrokerError, OSError) as extra:
         raise _outputs_http_error(extra) from extra

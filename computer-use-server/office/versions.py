@@ -13,6 +13,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Callable
 
 import docker_manager
+from descriptor_io import CommittedCloseError
 
 from .store import (
     StateCorruptError,
@@ -143,7 +144,7 @@ def store_version(
 
         try:
             store.update(chat, mutate)
-        except StateDurabilityError:
+        except (StateDurabilityError, CommittedCloseError):
             raise
         except OSError as extra:
             if owned_blob:
@@ -243,7 +244,7 @@ def commit_publication_lineage(store, chat, journal_id, content, digest, path, *
 
     try:
         return store.update(chat, mutate)
-    except StateDurabilityError:
+    except (StateDurabilityError, CommittedCloseError):
         raise
     except OSError as extra:
         if owned_blob:

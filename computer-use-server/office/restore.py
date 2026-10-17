@@ -13,6 +13,7 @@ import uuid
 import docker_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from descriptor_io import CommittedCloseError
 from outputs_broker import FileIdNotFoundError, OutputsBroker, OutputsBrokerError
 
 from . import config, publish, sessions, versions, workspace
@@ -85,6 +86,8 @@ async def restore_version(request: Request) -> JSONResponse:
         return sessions._error(503, "publish_pending")
     except versions.StorageLowError:
         return sessions._error(503, "storage_low")
+    except CommittedCloseError as extra:
+        return JSONResponse(status_code=500, content=extra.public_detail())
     except StateDurabilityError:
         return sessions._error(500, "state_durability")
     except (RestoreEpochError, StateCorruptError, OutputsBrokerError):

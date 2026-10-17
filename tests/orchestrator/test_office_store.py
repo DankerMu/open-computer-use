@@ -11,6 +11,7 @@ import errno
 import json
 import os
 import stat
+import traceback
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from tests.orchestrator._office_store import (
     _state,
     _stop_child,
     _wait_marker,
+    _state_write_fault,
 )
 
 
@@ -436,6 +438,65 @@ def test_post_replace_directory_fsync_failure_reports_complete_successor(world, 
     persisted = store_mod.OfficeStore().read(CHAT)
     assert persisted["documents"]["keep"] == {"id": "keep"}
     assert persisted["sessions"]["live"] == {"id": "live"}
+
+
+@pytest.mark.parametrize("primary_stage", (None, "write", "replace", "base", "root", "ocu", "office"),
+                         ids=("close-only", "write", "replace", "base-sync", "root-sync", "ocu-sync", "leaf-sync"))
+def test_state_write_preserves_primary_and_attempts_all_directories_after_multiple_close_failures(
+        world, monkeypatch, primary_stage):
+    import descriptor_io
+
+    store_mod, _manager, data = world
+    _seed(store_mod, "keep")
+    store = store_mod.OfficeStore()
+    predecessor = _state(data).read_bytes()
+    primary = OSError(errno.ENOSPC, f"controlled {primary_stage} primary failure")
+    cause = ValueError("controlled prior cause")
+    office_error = OSError(errno.EIO, "controlled office close failure")
+    root_error = OSError(errno.ENOSPC, "controlled chat close failure")
+    with _state_write_fault(
+        monkeypatch, data, {"office": office_error, "root": root_error},
+        primary_stage=primary_stage, primary=primary, cause=cause,
+    ) as trace:
+        with pytest.raises(Exception) as failure:
+            store.update(CHAT, lambda state: state["sessions"].__setitem__("live", {"id": "live"}))
+    outcome = failure.value
+    assert trace["attempts"] == trace["retired"] == ["office", "ocu", "root", "base"]
+    assert trace["still_owned"] == []
+    assert outcome.close_errors == (office_error, root_error)
+    if primary_stage is None:
+        assert isinstance(outcome, descriptor_io.CommittedCloseError)
+        assert outcome.resource == "office_state"
+        assert outcome.committed is True
+        assert outcome.__cause__ is office_error
+    else:
+        assert not isinstance(outcome, descriptor_io.CommittedCloseError)
+        if primary_stage == "office":
+            assert type(outcome) is store_mod.StateDurabilityError
+            assert outcome.__cause__ is primary
+        else:
+            assert outcome is primary
+            assert outcome.__cause__ is cause
+        assert primary.__cause__ is cause
+        rendered = "".join(traceback.format_exception(outcome))
+        assert str(office_error) in rendered
+        assert str(root_error) in rendered
+    if primary_stage in (None, "office"):
+        expected = {
+            "schema_version": 1, "documents": {"keep": {"id": "keep"}},
+            "sessions": {"live": {"id": "live"}}, "receipts": {}, "journal": {},
+        }
+        assert trace["successor"] == expected
+        assert store.read(CHAT) == expected
+    else:
+        assert trace["replaced"] is False
+        assert _state(data).read_bytes() == predecessor
+        assert store.read(CHAT) == {
+            "schema_version": 1, "documents": {"keep": {"id": "keep"}},
+            "sessions": {}, "receipts": {}, "journal": {},
+        }
+    assert trace["synced"] is (primary_stage is None)
+    assert sorted(path.name for path in _state(data).parent.iterdir()) == ["state.json"]
 
 
 def test_symlinked_state_and_control_paths_leave_external_sentinel_unchanged(world):
