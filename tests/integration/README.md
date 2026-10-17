@@ -13,6 +13,13 @@ End-to-end tests against a real `computer-use-server` container that spawns real
 | Workspace container has the prod labels (managed-by, chat-id, tool) | `test_workspace_lifecycle.py` | Drift in any of these labels breaks the cleanup cron's filter in prod. |
 | `/mnt/user-data/files` bind mount | `test_workspace_lifecycle.py` | Compose `BASE_DATA_DIR` must round-trip into the spawned container. |
 
+Shared MCP request/response helpers live in `tests/integration/_mcp.py`; use
+package-relative imports such as `from ._mcp import call_mcp`. The integration
+package supports console `pytest tests/integration/` and full-root importlib
+discovery without importing helpers from the ambiguous top-level `conftest`
+module. Pytest fixtures remain in `tests/integration/conftest.py`, including
+stack ownership and cleanup.
+
 ## How to run
 
 ### From a clean checkout (test harness owns the stack)

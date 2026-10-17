@@ -3,6 +3,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Integration helper import ownership.** Integration MCP helpers use
+  package-relative imports for console and full-root importlib discovery,
+  without resolving the ambiguous top-level `conftest` module. Fixtures and
+  test assertions are unchanged.
+
 - **Office native bootstrap ordering.** The qualified DocumentServer derivative
   initializes native Window/BaseView before dispatching desktop editor consumers.
   Exact-source patching preserves the pinned base, runtime settings and fonts;

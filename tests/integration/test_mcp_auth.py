@@ -11,7 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from conftest import mcp_request
+from ._mcp import mcp_request
 
 
 def _init_payload() -> dict:
