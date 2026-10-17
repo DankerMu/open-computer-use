@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — `main` branch
+
+### Fixed
+- **Main CI root-module coverage.** The non-image pytest job runs the complete
+  `tests/test_upload_claim.py` and `tests/test_tools.py` modules in one invocation,
+  separate from orchestrator collection. A failure in either module fails the
+  invocation and job; existing verification selections remain unchanged.
+
 ## Unreleased — `next/v1` branch
 
 ### Fixed
