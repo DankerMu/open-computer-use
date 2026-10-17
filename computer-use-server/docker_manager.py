@@ -1030,6 +1030,13 @@ def _lookup_container(chat_id: str):
     return container
 
 
+def _lifecycle_docker_step(context, step, *args, **kwargs):
+    try:
+        return step(*args, **kwargs)
+    except docker.errors.DockerException as exc:
+        raise LaunchFailed(500, f"{context} failed: {exc}") from exc
+
+
 def _get_or_create_container(chat_id: str) -> docker.models.containers.Container:
     """Return a running sandbox, or create one only when nothing exists.
 
@@ -1038,7 +1045,7 @@ def _get_or_create_container(chat_id: str) -> docker.models.containers.Container
     """
     chat_id = canonical_lock_chat_id(chat_id)
     with _combined_lock(chat_id):
-        container = _lookup_container(chat_id)
+        container = _lifecycle_docker_step("engine lookup", _lookup_container, chat_id)
         meta = load_container_meta(chat_id)
         if container is not None:
             if container.status != "running":
@@ -1795,10 +1802,7 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
         meta = load_container_meta(chat_id)
     except MetadataCorrupt:
         raise
-    try:
-        container = _lookup_container(chat_id)
-    except docker.errors.DockerException as exc:
-        raise LaunchFailed(500, f"engine lookup failed: {exc}") from exc
+    container = _lifecycle_docker_step("engine lookup", _lookup_container, chat_id)
     if container is None and meta is None:
         raise NeverCreated()
     if container is None:
@@ -1812,14 +1816,14 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
     if status == "paused" and not _migration_verified(state, container):
         raise MigrationRequired()
     if status == "running":
-        _prepare_existing_container(container, mutate=False)
+        _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
         if not _migration_verified(state, container):
             retire_legacy_sleeper(chat_id, container)
         else:
             note_running_activity(chat_id, container)
         return {"state": "running"}
     if status == "paused":
-        _prepare_existing_container(container, mutate=False)
+        _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
         note_running_activity(chat_id, container)
         try:
             container.unpause()
@@ -1829,7 +1833,7 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
             raise LaunchFailed(500, "unpause did not reach running")
         return {"state": "running"}
     if status in {"exited", "created"}:
-        _prepare_existing_container(container, mutate=True)
+        _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=True)
         try:
             container.start()
         except docker.errors.APIError as exc:
@@ -1838,8 +1842,8 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
         mark_sleeper_retired(chat_id, container)
         return {"state": "running"}
     if status == "restarting":
-        _prepare_existing_container(container, mutate=False)
-        if not _wait_until_running(container):
+        _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
+        if not _lifecycle_docker_step("restart readiness", _wait_until_running, container):
             raise LaunchFailed(504, "restart readiness timed out")
         retire_legacy_sleeper(chat_id, container)
         return {"state": "running"}
@@ -1863,7 +1867,7 @@ def describe_sandbox(chat_id: str) -> dict:
     """Read Docker state and metadata without creating or changing a sandbox."""
     chat_id = canonical_lock_chat_id(chat_id)
     with _combined_lock(chat_id):
-        container = _lookup_container(chat_id)
+        container = _lifecycle_docker_step("engine lookup", _lookup_container, chat_id)
         meta = load_container_meta(chat_id)
         if container is not None and container.status == "running":
             state = "running"
