@@ -45,6 +45,14 @@ Collection success is not a test pass: then execute the same canonical selected
 scope without `--collect-only` and record execution separately. Do not trim an
 evolving corpus to match an old count.
 
+### Main CI root-module coverage
+
+The main build workflow's non-image `pytest-orchestrator` job runs both complete
+`tests/test_upload_claim.py` and `tests/test_tools.py` modules in one pytest
+invocation, separate from orchestrator collection. A failure in either module
+fails the invocation and job. Existing orchestrator, auth-guard, deploy and
+integration selections remain unchanged.
+
 ### Docker-manager test data ownership
 
 `orchestrator/test_docker_manager.py` owns a private temporary data root across
