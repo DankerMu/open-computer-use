@@ -11,9 +11,11 @@ Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_docke
 
 import os
 import sys
+import tempfile
 import unittest
 import importlib
 import contextvars
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'computer-use-server'))
@@ -132,12 +134,29 @@ def _clear_gateway_env():
 
 class _RuntimeEnvironmentCase(unittest.TestCase):
     def setUp(self):
+        data_dir = tempfile.TemporaryDirectory(prefix="ocu-docker-manager-tests-")
+        self.addCleanup(data_dir.cleanup)
+        prior_module = sys.modules.get("docker_manager")
+        prior_base = (
+            prior_module.BASE_DATA_DIR if prior_module is not None
+            else Path(os.environ.get("BASE_DATA_DIR", "/data"))
+        )
+
+        def restore_data_root():
+            module = sys.modules.get("docker_manager")
+            if module is not None:
+                module.BASE_DATA_DIR = prior_base
+
+        self.addCleanup(restore_data_root)
         # Keep ambient runtime selection from changing these fixtures' branches.
         self.enterContext(patch.dict(os.environ, {
             "ENABLE_NETWORK": "true",
             "SANDBOX_HOST_BIND_IP": "172.31.0.1",
             "SUBAGENT_CLI": "claude",
+            "BASE_DATA_DIR": data_dir.name,
         }))
+        if prior_module is not None:
+            prior_module.BASE_DATA_DIR = Path(data_dir.name)
 
 
 class TestDockerManagerEnvInjection(_RuntimeEnvironmentCase):
@@ -153,13 +172,10 @@ class TestDockerManagerEnvInjection(_RuntimeEnvironmentCase):
         os.environ.pop("OCU_SANDBOX_DNS", None)
         for k, v in overrides.items():
             os.environ[k] = v
-        os.environ.setdefault("BASE_DATA_DIR", os.path.join(os.environ.get("TMPDIR", "/tmp"), "ocu-docker-manager-tests"))
         import docker_manager
-        prior_base = docker_manager.BASE_DATA_DIR
         importlib.reload(docker_manager)
         if "outputs_broker" in sys.modules:
             importlib.reload(sys.modules["outputs_broker"])
-        docker_manager.BASE_DATA_DIR = prior_base
         return docker_manager
 
     def _run_isolated(self, body):
@@ -312,11 +328,9 @@ class TestBuildMcpConfigBaseUrlFallback(_RuntimeEnvironmentCase):
 
     def _reload_docker_manager(self):
         import docker_manager
-        prior_base = docker_manager.BASE_DATA_DIR
         importlib.reload(docker_manager)
         if "outputs_broker" in sys.modules:
             importlib.reload(sys.modules["outputs_broker"])
-        docker_manager.BASE_DATA_DIR = prior_base
         return docker_manager
 
     def test_none_base_url_falls_back_to_module_constant(self):
@@ -362,11 +376,9 @@ class TestAnthropicBaseUrlEmptyStringHandling(_RuntimeEnvironmentCase):
         the public Anthropic URL via `os.getenv(...) or "https://..."`."""
         with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": ""}, clear=False):
             import docker_manager
-            prior_base = docker_manager.BASE_DATA_DIR
             importlib.reload(docker_manager)
             if "outputs_broker" in sys.modules:
                 importlib.reload(sys.modules["outputs_broker"])
-            docker_manager.BASE_DATA_DIR = prior_base
             self.assertEqual(docker_manager.ANTHROPIC_BASE_URL, "https://api.anthropic.com")
 
 
