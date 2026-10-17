@@ -307,9 +307,9 @@ class _CombinedLock:
             else:
                 _FLOCK_DEPTH.pop(self.chat_id, None)
                 if self._file is not None:
-                    fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-                    self._file.close()
-                    self._file = None
+                    with self._file as handle:
+                        self._file = None
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             self._thread_lock.release()
         return False
