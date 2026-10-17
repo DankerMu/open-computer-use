@@ -75,9 +75,9 @@ from uploads import (
     close_fd,
     ensure_workspace_directories,
     import_receipt,
+    open_chat_upload,
     open_control_directory,
     open_directory_path,
-    read_chat_upload,
     read_import_receipts,
     stage_upload_bytes,
     unlink_relative,
@@ -790,12 +790,29 @@ async def download_archive(chat_id: str):
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for file_path in files:
             arcname = str(file_path.relative_to(outputs_dir))
-            # Read verified descriptors, never reopen the selected workspace path.
+            # Copy verified descriptors directly, never reopen the selected workspace path.
             try:
-                contents, _ = read_chat_upload(chat_id, arcname)
+                file_fd = open_chat_upload(chat_id, arcname)
             except FileNotFoundError as exc:
                 raise HTTPException(status_code=404, detail=f"File not found: {arcname}") from exc
-            zip_file.writestr(arcname, contents)
+            try:
+                # Bare ZipInfo defaults to a 1980 timestamp and uncompressed data.
+                entry = zipfile.ZipInfo(arcname, date_time=time.localtime()[:6])
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                # Unknown or growing sizes may cross ZIP64 limits after the local header.
+                with zip_file.open(entry, mode="w", force_zip64=True) as member:
+                    while True:
+                        try:
+                            chunk = os.read(file_fd, 1024 * 1024)
+                        except FileNotFoundError as exc:
+                            raise HTTPException(
+                                status_code=404, detail=f"File not found: {arcname}"
+                            ) from exc
+                        if not chunk:
+                            break
+                        member.write(chunk)
+            finally:
+                close_fd(file_fd)
 
     # Seek to beginning of buffer
     zip_buffer.seek(0)

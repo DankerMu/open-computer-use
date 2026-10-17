@@ -887,6 +887,130 @@ def test_archive_keeps_zip_contents_without_cache_or_isolation_headers(client, o
         assert archive.read("nested/active.html") == b"<p>archived output</p>"
 
 
+def test_archive_bounds_outstanding_source_payload(client, output_dir, monkeypatch):
+    from tests.test_file_response import _FileIO
+
+    expected = {
+        "nested/first.bin": b"a" * (3 * 1024 * 1024) + b"\x00first tail",
+        "nested/second.bin": b"b" * (3 * 1024 * 1024) + b"\x00second tail",
+        "nested/empty.bin": b"",
+    }
+    for name, payload in expected.items():
+        target = output_dir / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    sentinel = output_dir.parents[1] / "sentinel.txt"
+    sentinel.write_bytes(b"sentinel descriptor remains owned by the test")
+    allowance = 2 * 1024 * 1024
+    observed = {
+        name: {"read": 0, "written": 0, "reads": 0, "outstanding": 0, "peak": 0}
+        for name in expected
+    }
+
+    class PayloadIO(_FileIO):
+        def __init__(self, patch, name):
+            self.member_name = name
+            super().__init__(patch, output_dir / name, sentinel)
+
+        def read(self, fd, size, operation):
+            payload = super().read(fd, size, operation)
+            state = observed[self.member_name]
+            state["read"] += len(payload)
+            state["reads"] += bool(payload)
+            state["outstanding"] += len(payload)
+            state["peak"] = max(state["peak"], state["outstanding"])
+            return payload
+
+    real_zip_open = zipfile.ZipFile.open
+
+    def observe_member_open(archive, name, mode="r", *args, **kwargs):
+        member = real_zip_open(archive, name, mode, *args, **kwargs)
+        member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if mode == "w" and member_name in observed:
+            real_write = member.write
+
+            def observe_write(payload):
+                accepted = real_write(payload)
+                state = observed[member_name]
+                state["written"] += accepted
+                state["outstanding"] -= accepted
+                assert state["outstanding"] >= 0, "ZIP consumed unobserved source bytes"
+                return accepted
+
+            transfer_patch.setattr(member, "write", observe_write)
+        return member
+
+    observers = []
+    with monkeypatch.context() as transfer_patch:
+        try:
+            for name in expected:
+                observers.append(PayloadIO(transfer_patch, name))
+            transfer_patch.setattr(zipfile.ZipFile, "open", observe_member_open)
+
+            response = client.get(_file_url("archive"), headers=_auth_headers())
+
+            assert response.status_code == 200
+            with zipfile.ZipFile(BytesIO(response.content)) as archive:
+                assert sorted(archive.namelist()) == sorted(expected)
+                for name, payload in expected.items():
+                    assert archive.read(name) == payload
+            for observer in observers:
+                assert observer.acquired, "Source descriptor observation was bypassed"
+                observer.assert_closed()
+            for name, payload in expected.items():
+                state = observed[name]
+                assert state["read"] == len(payload), "Source read observation was bypassed"
+                assert state["written"] == len(payload), "ZIP write observation was bypassed"
+                assert state["outstanding"] == 0
+                if payload:
+                    assert state["reads"] > 1, "Expected genuine multi-chunk source reads"
+                assert state["peak"] <= allowance, (
+                    f"{name}: {state['peak']} source bytes outstanding before ZIP writes; "
+                    f"allowance is {allowance}"
+                )
+        finally:
+            for observer in reversed(observers):
+                observer.cleanup()
+
+
+def test_archive_missing_source_read_returns_404_and_closes_descriptor(
+    client, output_dir, monkeypatch
+):
+    from tests.test_file_response import _FileIO
+
+    victim = output_dir / "lost.bin"
+    victim.write_bytes(b"real source acquired before injected read loss")
+    sentinel = output_dir.parents[1] / "sentinel.txt"
+    sentinel.write_bytes(b"sentinel descriptor remains owned by the test")
+
+    class MissingSourceIO(_FileIO):
+        def read(self, fd, size, operation):
+            with self.lock:
+                self.read_sizes.append(size)
+                self.active_reads.add(fd)
+            self.read_entered.set()
+            self.read_faults.append(fd)
+            try:
+                raise FileNotFoundError("injected source read loss")
+            finally:
+                with self.lock:
+                    self.active_reads.remove(fd)
+                self.read_finished.set()
+
+    observer = MissingSourceIO(monkeypatch, victim, sentinel)
+    try:
+        try:
+            response = client.get(_file_url("archive"), headers=_auth_headers())
+        finally:
+            assert observer.acquired, "Source descriptor observation was bypassed"
+            assert observer.read_faults == observer.acquired
+            observer.assert_closed()
+        assert response.status_code == 404
+        assert response.json() == {"detail": "File not found: lost.bin"}
+    finally:
+        observer.cleanup()
+
+
 @pytest.mark.parametrize("filename", ("archive", "%61rchive"), ids=("literal", "encoded"))
 @pytest.mark.parametrize("download", (False, True), ids=("inline", "download"))
 def test_reserved_archive_head_does_not_serve_ordinary_file(
