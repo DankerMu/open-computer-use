@@ -3,9 +3,9 @@
 """Request lifecycle Docker failures retain their typed error contract."""
 
 import pytest
-from docker.errors import DockerException
+from docker.errors import DockerException, NotFound
 
-from tests.orchestrator.test_lifecycle import CHAT, _put, world
+from tests.orchestrator.test_lifecycle import CHAT, INTERNAL, _put, _run, app_module, world
 from tests.orchestrator.test_network_membership import (
     CHAT as NETWORK_CHAT,
     COMPOSE_ID,
@@ -17,7 +17,7 @@ from tests.orchestrator.test_network_membership import (
     world as network_world,
 )
 
-__all__ = ["world", "network_world"]
+__all__ = ["world", "network_world", "app_module"]
 
 
 @pytest.mark.parametrize(
@@ -141,3 +141,86 @@ def test_restart_readiness_docker_failure_stops_retirement(
     container.exec_run.assert_not_called()
     assert client.created == []
     assert client.ops == []
+
+
+def test_sub_agent_reports_engine_failure_through_lifecycle_consumer(
+    app_module, world, monkeypatch,
+):
+    import mcp_tools
+
+    docker_manager, client, _clock, _tmp = world
+    monkeypatch.setattr(
+        client.containers.get, "side_effect", DockerException("engine unavailable"),
+    )
+    chat_token = docker_manager.current_chat_id.set(CHAT)
+    gitlab_token = docker_manager.current_gitlab_token.set("synthetic-test-gitlab-token")
+    try:
+        result = _run(mcp_tools.sub_agent("task", "desc", None, model="sonnet"))
+    finally:
+        docker_manager.current_gitlab_token.reset(gitlab_token)
+        docker_manager.current_chat_id.reset(chat_token)
+
+    assert result == "Error: engine lookup failed: engine unavailable"
+    client.containers.create.assert_not_called()
+
+
+def test_describe_http_reports_nested_lifecycle_failure(
+    app_module, world, monkeypatch,
+):
+    _docker_manager, client, _clock, _tmp = world
+    container = _put(client, f"owui-chat-{CHAT}", "running")
+    monkeypatch.setattr(
+        client.containers.get, "side_effect", DockerException("engine unavailable"),
+    )
+
+    response = app_module._lifecycle_client.get(
+        f"/internal/describe/{CHAT}",
+        headers={"Authorization": f"Bearer {INTERNAL}"},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": {
+            "detail": "engine lookup failed: engine unavailable",
+            "reason": "launch_failed",
+        },
+    }
+    client.containers.create.assert_not_called()
+    container.start.assert_not_called()
+    container.unpause.assert_not_called()
+    container.remove.assert_not_called()
+    container.exec_run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param("_get_or_create_container", id="get-create"),
+        pytest.param("describe_sandbox", id="describe"),
+    ],
+)
+def test_lookup_reload_not_found_is_failure_not_absence(world, monkeypatch, operation):
+    docker_manager, client, _clock, _tmp = world
+    container = _put(client, f"owui-chat-{CHAT}", "running")
+    failure = NotFound("container disappeared during reload")
+    monkeypatch.setattr(container.reload, "side_effect", failure)
+
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        getattr(docker_manager, operation)(CHAT)
+
+    assert caught.value.status_code == 500
+    assert caught.value.reason == "launch_failed"
+    assert caught.value.__cause__ is failure
+    client.containers.create.assert_not_called()
+
+
+def test_raw_lookup_preserves_untranslated_docker_failure(world, monkeypatch):
+    docker_manager, client, _clock, _tmp = world
+    failure = DockerException("engine unavailable")
+    monkeypatch.setattr(client.containers.get, "side_effect", failure)
+
+    with pytest.raises(DockerException) as caught:
+        docker_manager._lookup_container(CHAT)
+
+    assert caught.value is failure
+    client.containers.create.assert_not_called()
