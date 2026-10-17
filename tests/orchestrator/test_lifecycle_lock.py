@@ -590,6 +590,96 @@ def test_removed_pinned_chat_returns_none_without_recreation(world, monkeypatch)
     _assert_another_thread_acquires(manager)
 
 
+def test_combined_lock_release_retires_owned_handle_when_unlock_fails(world, monkeypatch):
+    _store, manager, data = world
+    (data / CHAT).mkdir(parents=True)
+    owner = manager._combined_lock(CHAT)
+    real_flock = manager.fcntl.flock
+    error = OSError(errno.EIO, "lifecycle unlock failed")
+    handle = None
+
+    def failing_unlock(fd, operation):
+        if operation == manager.fcntl.LOCK_UN:
+            raise error
+        return real_flock(fd, operation)
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(manager.fcntl, "flock", failing_unlock)
+            with pytest.raises(OSError) as failure:
+                with owner:
+                    handle = owner._file
+                    fd = handle.fileno()
+        assert failure.value is error
+        assert handle.closed
+        assert owner._file is None
+        with pytest.raises(OSError) as closed:
+            os.fstat(fd)
+        assert closed.value.errno == errno.EBADF
+        assert CHAT not in manager._FLOCK_DEPTH
+    finally:
+        if handle is not None and not handle.closed:
+            handle.close()
+
+    with manager._combined_lock(CHAT) as held:
+        assert held is not None
+    assert CHAT not in manager._FLOCK_DEPTH
+    _assert_another_thread_acquires(manager)
+
+
+@pytest.mark.parametrize("unlock_fails", (False, True), ids=("close-only", "unlock-and-close"))
+def test_combined_lock_close_error_after_retirement_is_visible(world, monkeypatch, unlock_fails):
+    _store, manager, data = world
+    (data / CHAT).mkdir(parents=True)
+    owner = manager._combined_lock(CHAT)
+    real_flock = manager.fcntl.flock
+    unlock_error = OSError(errno.EIO, "lifecycle unlock failed before close")
+    close_error = OSError(errno.EIO, "lifecycle close failed after descriptor retirement")
+    events = []
+    handle = None
+
+    def failing_unlock(fd, operation):
+        if operation == manager.fcntl.LOCK_UN:
+            events.append(("unlock", fd))
+            if unlock_fails:
+                raise unlock_error
+        return real_flock(fd, operation)
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(manager.fcntl, "flock", failing_unlock)
+            with pytest.raises(OSError) as failure:
+                with owner:
+                    handle = owner._file
+                    fd = handle.fileno()
+                    real_close = handle.close
+
+                    def close_after_retirement():
+                        events.append(("close", fd))
+                        real_close()
+                        raise close_error
+
+                    fault.setattr(handle, "close", close_after_retirement)
+        assert failure.value is close_error
+        if unlock_fails:
+            assert failure.value.__context__ is unlock_error
+        assert events == [("unlock", fd), ("close", fd)]
+        assert handle.closed
+        assert owner._file is None
+        with pytest.raises(OSError) as closed:
+            os.fstat(fd)
+        assert closed.value.errno == errno.EBADF
+        assert CHAT not in manager._FLOCK_DEPTH
+    finally:
+        if handle is not None and not handle.closed:
+            handle.close()
+
+    with manager._combined_lock(CHAT) as held:
+        assert held is not None
+    assert CHAT not in manager._FLOCK_DEPTH
+    _assert_another_thread_acquires(manager)
+
+
 @pytest.mark.parametrize("create", (True, False))
 @pytest.mark.parametrize("replacement", ("regular", "symlink"))
 def test_concurrent_lock_creator_winner_is_verified_before_flock(
