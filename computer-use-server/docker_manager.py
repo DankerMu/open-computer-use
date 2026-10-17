@@ -1816,14 +1816,14 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
     if status == "paused" and not _migration_verified(state, container):
         raise MigrationRequired()
     if status == "running":
-        _prepare_existing_container(container, mutate=False)
+        _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
         if not _migration_verified(state, container):
             retire_legacy_sleeper(chat_id, container)
         else:
             note_running_activity(chat_id, container)
         return {"state": "running"}
     if status == "paused":
-        _prepare_existing_container(container, mutate=False)
+        _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
         note_running_activity(chat_id, container)
         try:
             container.unpause()
@@ -1833,7 +1833,7 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
             raise LaunchFailed(500, "unpause did not reach running")
         return {"state": "running"}
     if status in {"exited", "created"}:
-        _prepare_existing_container(container, mutate=True)
+        _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=True)
         try:
             container.start()
         except docker.errors.APIError as exc:
@@ -1842,8 +1842,8 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
         mark_sleeper_retired(chat_id, container)
         return {"state": "running"}
     if status == "restarting":
-        _prepare_existing_container(container, mutate=False)
-        if not _wait_until_running(container):
+        _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
+        if not _lifecycle_docker_step("restart readiness", _wait_until_running, container):
             raise LaunchFailed(504, "restart readiness timed out")
         retire_legacy_sleeper(chat_id, container)
         return {"state": "running"}
