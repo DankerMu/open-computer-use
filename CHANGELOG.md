@@ -3,6 +3,10 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Integration helper import ownership.** Integration MCP helpers use
+  `tests.integration._mcp` instead of the ambiguous top-level `conftest` module
+  under full-root pytest discovery. Fixtures and test assertions are unchanged.
+
 - **Office native bootstrap ordering.** The qualified DocumentServer derivative
   initializes native Window/BaseView before dispatching desktop editor consumers.
   Exact-source patching preserves the pinned base, runtime settings and fonts;

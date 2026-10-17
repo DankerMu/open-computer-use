@@ -17,7 +17,7 @@ import subprocess
 import httpx
 import pytest
 
-from conftest import call_mcp
+from tests.integration._mcp import call_mcp
 
 
 def _list_containers_for_chat(chat_id: str) -> list[dict]:
