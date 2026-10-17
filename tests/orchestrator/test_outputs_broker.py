@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -1532,6 +1533,254 @@ def test_postcommit_durability_failure_reports_complete_successor(world, monkeyp
     complete = broker.reconcile(CHAT)
     assert complete["total"] == 2
     assert complete["revision"] == 2
+
+
+def test_reconcile_final_close_failure_reports_committed_index_and_preserves_successor(
+        world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    output = _put(data, "a.txt", b"a")
+    initial = broker.reconcile(CHAT)
+    file_id = _entry_by_path(initial, "a.txt")["file_id"]
+    destination = _index(data)
+    predecessor = destination.read_bytes()
+    control_info = destination.parent.stat()
+    output.write_bytes(b"bb")
+    digest = "3b64db95cb55c763391c707108489ae18b4112d783300de38e033b4c98c3deaf"
+    entry = {
+        "file_id": file_id,
+        "path": "a.txt",
+        "name": "a.txt",
+        "size": 2,
+        "mtime_ns": output.stat().st_mtime_ns,
+        "revision": 2,
+        "hash": digest,
+    }
+    expected = {
+        "schema_version": 1,
+        "counter": 2,
+        "active": {"a.txt": entry},
+        "fingerprints": {f"2:{digest}": [file_id]},
+        "tombstones": {},
+    }
+    original_replace, original_fsync, original_close = os.replace, os.fsync, os.close
+    close_error = OSError(errno.EIO, "controlled final broker directory close failure")
+    writer_fd = None
+    synchronized_fd = None
+    observations = {"events": [], "close_attempts": [], "retired": False}
+
+    def recording_replace(src, dst, *args, **kwargs):
+        nonlocal writer_fd
+        result = original_replace(src, dst, *args, **kwargs)
+        if dst == "index.json":
+            fd = kwargs["dst_dir_fd"]
+            assert kwargs["src_dir_fd"] == fd
+            assert _same_inode(os.fstat(fd), control_info)
+            writer_fd = fd
+            observations["events"].append("replace")
+        return result
+
+    def recording_fsync(fd):
+        nonlocal synchronized_fd
+        result = original_fsync(fd)
+        if writer_fd is not None and fd == writer_fd:
+            assert _same_inode(os.fstat(fd), control_info)
+            synchronized_fd = fd
+            observations["events"].append("fsync")
+            observations["synchronized_successor"] = _read_index(data)
+        return result
+
+    def close_then_fail(fd):
+        if synchronized_fd is None or fd != synchronized_fd:
+            return original_close(fd)
+        observations["close_attempts"].append(fd)
+        assert _same_inode(os.fstat(fd), control_info)
+        original_close(fd)
+        observations["events"].append("close")
+        with pytest.raises(OSError) as retired:
+            os.fstat(fd)
+        assert retired.value.errno == errno.EBADF
+        observations["retired"] = True
+        raise close_error
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "replace", recording_replace)
+            patches.setattr(os, "fsync", recording_fsync)
+            patches.setattr(os, "close", close_then_fail)
+            with pytest.raises(Exception) as failure:
+                broker.reconcile(CHAT)
+
+        outcome = failure.value
+        successor_bytes = destination.read_bytes()
+        observations["visible_successor"] = _read_index(data)
+        observations["outcome_type"] = type(outcome).__name__
+        observations["original_close_error"] = repr(close_error)
+        observations["original_error_is_outcome"] = outcome is close_error
+        assert writer_fd is not None
+        assert synchronized_fd == writer_fd
+        assert observations["events"] == ["replace", "fsync", "close"]
+        assert observations["close_attempts"] == [writer_fd]
+        assert observations["retired"] is True
+        assert observations["synchronized_successor"] == expected
+        assert observations["visible_successor"] == expected
+        assert successor_bytes != predecessor
+        assert output.read_bytes() == b"bb"
+        assert sorted(path.name for path in destination.parent.iterdir()) == ["index.json"]
+        with pytest.raises(OSError) as retired:
+            os.fstat(writer_fd)
+        assert retired.value.errno == errno.EBADF
+
+        replay = broker.reconcile(CHAT)
+        assert replay == {
+            "revision": 2,
+            "entries": [entry],
+            "total": 1,
+            "next_cursor": None,
+            "unchanged": True,
+        }
+        assert destination.read_bytes() == successor_bytes
+        assert getattr(outcome, "committed", False) is True, observations
+        assert outcome.resource == "outputs_index"
+        assert isinstance(outcome, broker_module.descriptor_io.CommittedCloseError)
+        assert not isinstance(outcome, broker_module.CommitDurabilityError)
+        assert outcome.close_errors == (close_error,)
+        assert outcome.__cause__ is close_error
+    finally:
+        if writer_fd is not None:
+            try:
+                current = os.fstat(writer_fd)
+            except OSError:
+                pass
+            else:
+                if _same_inode(current, control_info):
+                    original_close(writer_fd)
+
+
+@pytest.mark.parametrize("failure_stage", ("write", "replace", "fsync"))
+def test_reconcile_primary_failure_keeps_provenance_when_final_close_also_fails(
+        world, monkeypatch, failure_stage):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    output = _put(data, "a.txt", b"a")
+    initial = broker.reconcile(CHAT)
+    file_id = _entry_by_path(initial, "a.txt")["file_id"]
+    destination = _index(data)
+    predecessor = destination.read_bytes()
+    control_info = destination.parent.stat()
+    output.write_bytes(b"bb")
+    digest = "3b64db95cb55c763391c707108489ae18b4112d783300de38e033b4c98c3deaf"
+    expected = {
+        "schema_version": 1, "counter": 2,
+        "active": {"a.txt": {
+            "file_id": file_id, "path": "a.txt", "name": "a.txt", "size": 2,
+            "mtime_ns": output.stat().st_mtime_ns, "revision": 2, "hash": digest,
+        }},
+        "fingerprints": {f"2:{digest}": [file_id]}, "tombstones": {},
+    }
+    original_open, original_write = os.open, os.write
+    original_replace, original_fsync, original_close = os.replace, os.fsync, os.close
+    origin = ValueError("controlled original primary cause")
+    primary_error = OSError(errno.ENOSPC, f"controlled broker {failure_stage} failure")
+    close_error = OSError(errno.EIO, "controlled secondary final-directory close failure")
+    writer_fd = None
+    temporary_fd = None
+    close_attempts = []
+    retired_fds = []
+    replacement_succeeded = False
+    failure_started = False
+
+    def recording_open(path, flags, *args, **kwargs):
+        nonlocal writer_fd, temporary_fd
+        fd = original_open(path, flags, *args, **kwargs)
+        if str(path).startswith(".index.") and str(path).endswith(".tmp"):
+            writer_fd = kwargs["dir_fd"]
+            assert _same_inode(os.fstat(writer_fd), control_info)
+            temporary_fd = fd
+        return fd
+
+    def fail_primary():
+        nonlocal failure_started
+        failure_started = True
+        raise primary_error from origin
+
+    def controlled_write(fd, content):
+        if failure_stage == "write" and fd == temporary_fd:
+            fail_primary()
+        return original_write(fd, content)
+
+    def controlled_replace(src, dst, *args, **kwargs):
+        nonlocal replacement_succeeded
+        if dst == "index.json" and kwargs.get("dst_dir_fd") == writer_fd:
+            if failure_stage == "replace":
+                fail_primary()
+            result = original_replace(src, dst, *args, **kwargs)
+            replacement_succeeded = True
+            return result
+        return original_replace(src, dst, *args, **kwargs)
+
+    def controlled_fsync(fd):
+        if failure_stage == "fsync" and writer_fd is not None and fd == writer_fd:
+            assert replacement_succeeded
+            fail_primary()
+        return original_fsync(fd)
+
+    def close_then_fail(fd):
+        if not failure_started or fd != writer_fd:
+            return original_close(fd)
+        close_attempts.append(fd)
+        assert _same_inode(os.fstat(fd), control_info)
+        original_close(fd)
+        with pytest.raises(OSError) as retired:
+            os.fstat(fd)
+        assert retired.value.errno == errno.EBADF
+        retired_fds.append(fd)
+        raise close_error
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(os, "open", recording_open)
+            patches.setattr(os, "write", controlled_write)
+            patches.setattr(os, "replace", controlled_replace)
+            patches.setattr(os, "fsync", controlled_fsync)
+            patches.setattr(os, "close", close_then_fail)
+            with pytest.raises(Exception) as failure:
+                broker.reconcile(CHAT)
+        outcome = failure.value
+        assert writer_fd is not None
+        assert close_attempts == retired_fds == [writer_fd]
+        with pytest.raises(OSError) as retired:
+            os.fstat(writer_fd)
+        assert retired.value.errno == errno.EBADF
+        assert replacement_succeeded is (failure_stage == "fsync")
+        if failure_stage == "fsync":
+            assert type(outcome) is broker_module.CommitDurabilityError
+            assert outcome.__cause__ is primary_error
+            assert _read_index(data) == expected
+            assert broker.current_revision(CHAT) == 2
+        else:
+            assert outcome is primary_error
+            assert outcome.__cause__ is origin
+            assert destination.read_bytes() == predecessor
+            assert broker.current_revision(CHAT) == 1
+        assert primary_error.__cause__ is origin
+        assert not isinstance(outcome, broker_module.descriptor_io.CommittedCloseError)
+        assert getattr(outcome, "committed", False) is False
+        assert outcome.close_errors == (close_error,)
+        rendered = "".join(traceback.format_exception(outcome))
+        assert any(str(close_error) in note for note in outcome.__notes__)
+        assert str(close_error) in rendered
+        assert output.read_bytes() == b"bb"
+        assert sorted(path.name for path in destination.parent.iterdir()) == ["index.json"]
+    finally:
+        if writer_fd is not None:
+            try:
+                current = os.fstat(writer_fd)
+            except OSError:
+                pass
+            else:
+                if _same_inode(current, control_info):
+                    original_close(writer_fd)
 
 
 def test_symlinked_entries_are_excluded_and_unsafe_roots_controls_and_indexes_fail(world):

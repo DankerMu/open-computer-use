@@ -67,6 +67,7 @@ from docker_manager import (
 )
 from security import sanitize_chat_id, safe_path
 from file_response import WorkspaceFileResponse
+from descriptor_io import CommittedCloseError
 from uploads import (
     CorruptReceiptsError,
     DiscoveryError,
@@ -733,6 +734,8 @@ async def upload_file(
         return result
     except HTTPException:
         raise
+    except CommittedCloseError as exc:
+        raise HTTPException(status_code=500, detail=exc.public_detail()) from exc
     except CorruptReceiptsError:
         raise HTTPException(status_code=500, detail="import receipts are corrupt")
     except NameCapacityError as exc:
