@@ -1350,7 +1350,7 @@ async function renderDrawioPreview(container, file) {
     if (!lifetime.current()) return;
     const host = document.createElement('div');
     host.className = 'drawio-host';
-    host.style.cssText = 'max-width:100%;margin:0 auto;background:#fff;padding:20px;border-radius:8px;min-height:120px;';
+    host.style.cssText = 'max-width:100%;margin:0 auto;background:#fff;padding:20px;border-radius:8px;min-height:120px;box-sizing:content-box;';
     container.innerHTML = '';
     container.style.display = 'flex';
     container.style.justifyContent = 'center';

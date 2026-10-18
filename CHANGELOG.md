@@ -29,6 +29,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Complete ordinary Drawio geometry** (issue #314). Small plain, compressed and
+  multipage diagrams retain rounded corners and painted strokes without manual
+  zoom reduction or fullscreen. Selection and revision replacement preserve
+  visibility; page, Zoom In/Out, Fit and fullscreen controls remain usable.
+
 - **Drawio fullscreen theme subscriptions** (issue #313). Icon, Escape, backdrop
   close and preview retirement release the child UI's theme callback without
   disabling the parent preview or unrelated listeners. Live theme updates,
