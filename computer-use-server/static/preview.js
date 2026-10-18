@@ -124,7 +124,8 @@ export function safeOfficeHtml(markup) {
     if (href.startsWith('#')) {
       try {
         ids ??= new Set(Array.from(fragment.querySelectorAll('[id]'), node => node.id));
-        const target = 'user-content-' + decodeURIComponent(href.slice(1));
+        const id = decodeURIComponent(href.slice(1));
+        const target = id.startsWith('user-content-') ? id : 'user-content-' + id;
         if (ids.has(target)) link.setAttribute('href', '#' + encodeURIComponent(target));
         else link.removeAttribute('href');
       } catch {

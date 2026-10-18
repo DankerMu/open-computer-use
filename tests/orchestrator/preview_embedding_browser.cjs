@@ -962,7 +962,9 @@ async function main() {
         zip.file('_rels/.rels', `<Relationships xmlns="${relNS}"><Relationship Id="rId1" Type="${officeNS}/officeDocument" Target="word/document.xml"/></Relationships>`);
         const links = hostile ? `<w:hyperlink r:id="evil"><w:r><w:t>Unsafe link</w:t></w:r></w:hyperlink>
           <w:hyperlink r:id="safe"><w:r><w:t>Safe link</w:t></w:r></w:hyperlink>
-          <w:hyperlink w:anchor="section"><w:r><w:t>Go to section</w:t></w:r></w:hyperlink>` : '';
+          <w:hyperlink w:anchor="section"><w:r><w:t>Go to section</w:t></w:r></w:hyperlink>
+          <w:hyperlink w:anchor="user-content-policy"><w:r><w:t>Go to prefixed policy</w:t></w:r></w:hyperlink>
+          <w:hyperlink w:anchor="chapter"><w:r><w:t>Go to ordinary chapter</w:t></w:r></w:hyperlink>` : '';
         const blocks = hostile ? `<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Table cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
           <w:p><w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/><wp:docPr id="1" name="pixel"/>
             <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
@@ -970,11 +972,19 @@ async function main() {
                 <pic:blipFill><a:blip r:embed="image"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
                 <pic:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
               </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>` : '';
+        const bookmarkTargets = hostile
+          ? Array.from({ length: 48 }, (_, index) =>
+            `<w:p><w:r><w:t>Bookmark separation paragraph ${index + 1}.</w:t></w:r></w:p>`).join('') +
+            '<w:p><w:bookmarkStart w:id="8" w:name="user-content-policy"/>' +
+            '<w:r><w:t>Prefixed policy bookmark target</w:t></w:r><w:bookmarkEnd w:id="8"/></w:p>' +
+            '<w:p><w:bookmarkStart w:id="9" w:name="chapter"/>' +
+            '<w:r><w:t>Ordinary chapter bookmark target</w:t></w:r><w:bookmarkEnd w:id="9"/></w:p>'
+          : '';
         zip.file('word/document.xml', `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="${officeNS}"
           xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
           xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
           xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
-          <w:body><w:p>${hostile ? '<w:bookmarkStart w:id="7" w:name="section"/>' : ''}<w:r><w:rPr><w:b/></w:rPr><w:t>${text}</w:t></w:r>${links}${hostile ? '<w:bookmarkEnd w:id="7"/>' : ''}</w:p>${blocks}</w:body></w:document>`);
+          <w:body><w:p>${hostile ? '<w:bookmarkStart w:id="7" w:name="section"/>' : ''}<w:r><w:rPr><w:b/></w:rPr><w:t>${text}</w:t></w:r>${links}${hostile ? '<w:bookmarkEnd w:id="7"/>' : ''}</w:p>${blocks}${bookmarkTargets}</w:body></w:document>`);
         zip.file('word/_rels/document.xml.rels', hostile
           ? `<Relationships xmlns="${relNS}"><Relationship Id="evil" Type="${officeNS}/hyperlink" Target="javascript:parent.__docxExecuted=1;void(0)" TargetMode="External"/>
             <Relationship Id="safe" Type="${officeNS}/hyperlink" Target="https://example.invalid/safe" TargetMode="External"/>
@@ -1357,8 +1367,151 @@ async function main() {
     assert.equal(await frame().locator('.preview-stage [id="user-content-section"]').count(), 1);
     assert.equal(await frame().locator('.preview-stage .markdown-body').locator('script, style, svg, iframe, [onclick], [onerror], [style]').count(), 0);
     assert.deepEqual(externalRequests, [], 'document content caused an external request');
+    const exerciseOfficeBookmarks = async (targetPage, surface, mode, iframe = null) => {
+      for (const spec of [
+        { kind: 'prefixed', linkText: 'Go to prefixed policy', targetId: 'user-content-policy',
+          targetText: 'Prefixed policy bookmark target', href: '#user-content-policy' },
+        { kind: 'ordinary', linkText: 'Go to ordinary chapter', targetId: 'user-content-chapter',
+          targetText: 'Ordinary chapter bookmark target', href: '#user-content-chapter' },
+      ]) {
+        const label = `office-bookmark-${spec.kind}-${mode}`;
+        const evidence = { case: label, clicked: false, before: null, after: null, errors: [] };
+        const errorsBefore = consoleErrors.length;
+        const frameStyle = iframe ? await iframe.getAttribute('style') : null;
+        const measureBookmark = async () => surface.locator('#docxContainer').evaluate((body, spec) => {
+          const link = Array.from(body.querySelectorAll('a')).find(node => node.textContent === spec.linkText);
+          const target = body.querySelector(`[id="${spec.targetId}"]`);
+          const paragraph = target?.closest('p');
+          const measure = node => {
+            if (!node) return null;
+            const range = document.createRange();
+            range.selectNodeContents(node);
+            const bounds = range.getBoundingClientRect();
+            const rect = { top: bounds.top, bottom: bounds.bottom, left: bounds.left,
+              right: bounds.right, width: bounds.width, height: bounds.height };
+            const clip = { top: 0, bottom: innerHeight, left: 0, right: innerWidth };
+            const scroll = [];
+            for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+              const style = getComputedStyle(ancestor);
+              const box = ancestor.getBoundingClientRect();
+              if (/(auto|scroll|hidden|clip)/.test(style.overflowY)) {
+                clip.top = Math.max(clip.top, box.top + ancestor.clientTop);
+                clip.bottom = Math.min(clip.bottom, box.top + ancestor.clientTop + ancestor.clientHeight);
+              }
+              if (/(auto|scroll|hidden|clip)/.test(style.overflowX)) {
+                clip.left = Math.max(clip.left, box.left + ancestor.clientLeft);
+                clip.right = Math.min(clip.right, box.left + ancestor.clientLeft + ancestor.clientWidth);
+              }
+              if (ancestor.scrollHeight > ancestor.clientHeight)
+                scroll.push({ id: ancestor.id, className: ancestor.className,
+                  top: ancestor.scrollTop, height: ancestor.clientHeight, contentHeight: ancestor.scrollHeight });
+            }
+            return { rect, clip, scroll,
+              visible: rect.width > 0 && rect.height > 0 && rect.top >= clip.top &&
+                rect.bottom <= clip.bottom && rect.left >= clip.left && rect.right <= clip.right,
+              intersects: rect.width > 0 && rect.height > 0 && rect.bottom > clip.top &&
+                rect.top < clip.bottom && rect.right > clip.left && rect.left < clip.right };
+          };
+          return { href: link?.getAttribute('href') ?? null, targetId: target?.id ?? null,
+            targetText: paragraph?.textContent ?? null, link: measure(link), target: measure(paragraph) };
+        }, spec);
+        let failure;
+        try {
+          if (iframe) await iframe.evaluate(node => {
+            node.style.width = '1000px';
+            node.style.height = '700px';
+          });
+          const link = surface.locator('#docxContainer a').filter({ hasText: spec.linkText });
+          await link.scrollIntoViewIfNeeded();
+          evidence.before = await measureBookmark();
+          assert.equal(evidence.before.targetId, spec.targetId, `${label}: DOCX bookmark target lost`);
+          assert.equal(evidence.before.targetText, spec.targetText);
+          assert.equal(evidence.before.link?.visible, true, `${label}: link is not in the visible scroll area`);
+          assert.equal(evidence.before.target?.intersects, false, `${label}: target must start outside the visible scroll area`);
+          await targetPage.screenshot({ path: path.join(artifacts, `${label}-before.png`) });
+          await link.click();
+          evidence.clicked = true;
+          evidence.after = await measureBookmark();
+          assert.equal(evidence.before.href, spec.href, `${label}: DOCX bookmark lost its usable href after Office sanitization`);
+          const scrollDeadline = Date.now() + 2000;
+          while (!evidence.after.target?.visible && Date.now() < scrollDeadline) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+            evidence.after = await measureBookmark();
+          }
+          assert.equal(evidence.after.target?.visible, true,
+            `${label}: clicking DOCX bookmark did not reveal its target text: ${JSON.stringify(evidence)}`);
+          assert.deepEqual(consoleErrors.slice(errorsBefore), [], `${label}: DOCX bookmark produced browser errors`);
+        } catch (error) {
+          failure = error;
+          evidence.failure = String(error);
+          throw error;
+        } finally {
+          evidence.errors = consoleErrors.slice(errorsBefore);
+          console.log(JSON.stringify(evidence));
+          const captured = await Promise.allSettled([
+            targetPage.screenshot({ path: path.join(artifacts, `${label}.png`) }),
+            fs.writeFile(path.join(artifacts, `${label}.json`), JSON.stringify(evidence, null, 2) + '\n'),
+          ]);
+          const evidenceFailures = captured.filter(result => result.status === 'rejected').map(result => result.reason);
+          try {
+            if (iframe) await iframe.evaluate((node, style) => {
+              if (style === null) node.removeAttribute('style');
+              else node.setAttribute('style', style);
+            }, frameStyle);
+          } catch (error) {
+            evidenceFailures.push(error);
+          }
+          for (const error of evidenceFailures)
+            console.error(JSON.stringify({ case: label, artifactFailure: String(error) }));
+          if (!failure && evidenceFailures.length) throw evidenceFailures[0];
+        }
+      }
+    };
+    await exerciseOfficeBookmarks(page, frame(), 'embedded', page.locator('#preview'));
     // Synthetic converted-markup boundary proof of the real sanitizer seam,
     // not an end-to-end DOCX fixture or a substituted Office renderer.
+    const fragmentPolicy = await frame().locator('#app').evaluate(async root => {
+      const { safeOfficeHtml } = await import(new URL('../static/preview.js', document.baseURI).href);
+      const outside = document.createElement('p');
+      outside.id = 'user-content-boundary-outside';
+      outside.textContent = 'Document-global target outside the sanitized fragment';
+      document.body.appendChild(outside);
+      const probe = document.createElement('div');
+      try {
+        probe.appendChild(safeOfficeHtml(`
+          <p id="boundary-chapter">Ordinary boundary target</p>
+          <p id="user-content-boundary-policy">Prefixed boundary target</p>
+          <a href="#boundary%2Dchapter">Encoded ordinary</a>
+          <a href="#user%2Dcontent%2Dboundary%2Dpolicy">Encoded prefixed</a>
+          <a href="#%E0%A4%A">Malformed encoding</a>
+          <a href="#boundary-missing">Missing target</a>
+          <a href="#boundary-outside">Document-global-only target</a>`));
+        root.appendChild(probe);
+        return {
+          ids: Array.from(probe.querySelectorAll('[id]'), node => node.id),
+          links: Array.from(probe.querySelectorAll('a'), node =>
+            ({ text: node.textContent, href: node.getAttribute('href') })),
+          documentGlobalTargetPresent: document.getElementById('user-content-boundary-outside') === outside,
+          documentGlobalTargetInFragment: !!probe.querySelector('[id="user-content-boundary-outside"]'),
+        };
+      } finally {
+        probe.remove();
+        outside.remove();
+      }
+    });
+    console.log(JSON.stringify({ case: 'office-bookmark-sanitizer-boundary', ...fragmentPolicy }));
+    assert.deepEqual(fragmentPolicy, {
+      ids: ['user-content-boundary-chapter', 'user-content-boundary-policy'],
+      links: [
+        { text: 'Encoded ordinary', href: '#user-content-boundary-chapter' },
+        { text: 'Encoded prefixed', href: '#user-content-boundary-policy' },
+        { text: 'Malformed encoding', href: null },
+        { text: 'Missing target', href: null },
+        { text: 'Document-global-only target', href: null },
+      ],
+      documentGlobalTargetPresent: true,
+      documentGlobalTargetInFragment: false,
+    }, 'Office fragments must use idempotent sanitized IDs and reject non-local or malformed targets');
     const remotePolicy = await frame().locator('#app').evaluate(async (root, markup) => {
       const { safeOfficeHtml } = await import(new URL('../static/preview.js', document.baseURI).href);
       const fragment = safeOfficeHtml(markup);
@@ -3137,6 +3290,7 @@ async function main() {
       assert.equal(await officeSession.page.evaluate(() => window.__docxExecuted), undefined);
       await officeSession.page.locator('.preview-stage').getByText('Table cell').waitFor();
       await officeSession.page.screenshot({ path: path.join(artifacts, 'standalone-sanitized-office.png') });
+      await exerciseOfficeBookmarks(officeSession.page, officeSession.page, 'standalone');
       await selectStandaloneFile(officeSession.page, 'diagram.drawio');
       await officeSession.page.locator('.drawio-host svg').waitFor();
       await officeSession.page.getByText('Local shape').waitFor();
