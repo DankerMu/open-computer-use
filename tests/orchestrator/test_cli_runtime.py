@@ -34,12 +34,13 @@ _SERVER_DIR = os.path.join(
 )
 sys.path.insert(0, _SERVER_DIR)
 
+_OWNED_MODULES = ("cli_runtime", "docker_manager", "outputs_broker")
+
 
 def _drop_modules():
-    """Drop docker_manager + cli_runtime from sys.modules so the next import
-    re-runs module-load validation and re-binds SUBAGENT_CLI from the current
-    os.environ (Pitfall B in 04-RESEARCH.md)."""
-    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
+    """Drop the owned modules so the next import re-runs module-load validation
+    and re-binds SUBAGENT_CLI from the current os.environ."""
+    for mod in _OWNED_MODULES:
         sys.modules.pop(mod, None)
 
 
@@ -51,12 +52,16 @@ def _reload_docker_manager():
 
 @pytest.fixture(autouse=True)
 def _clean_subagent_env(monkeypatch):
-    """Remove SUBAGENT_CLI before each test; tests opt in via monkeypatch.setenv.
-    Also clear the modules cache after each test so cross-test load order is
-    deterministic."""
+    """Clear SUBAGENT_CLI for fresh imports, then restore callers' module cache."""
+    snapshot = {name: sys.modules[name] for name in _OWNED_MODULES
+                if name in sys.modules}
     monkeypatch.delenv("SUBAGENT_CLI", raising=False)
-    yield
     _drop_modules()
+    try:
+        yield
+    finally:
+        _drop_modules()
+        sys.modules.update(snapshot)
 
 
 # === a, b: unset/empty/whitespace -> "claude" ===
@@ -134,27 +139,12 @@ def test_invalid_subagent_cli_exits(monkeypatch, capfd, invalid_value):
 
 # === e: extra_env injection ===
 
-def test_extra_env_injection_line_present_in_source():
-    """ROADMAP success criterion #1: every spawned container has SUBAGENT_CLI
-    in Env. Phase 4 plan 04-01 implemented this as a single-line assignment in
-    _create_container (D5 shape a). Verify the source contains the injection
-    line — the runtime correctness is also covered by Phase 6's TEST-06
-    image-level docker-inspect test."""
-    with open(os.path.join(_SERVER_DIR, "docker_manager.py")) as f:
-        src = f.read()
-    assert 'extra_env["SUBAGENT_CLI"] = SUBAGENT_CLI' in src, (
-        "extra_env injection of SUBAGENT_CLI is missing from docker_manager.py "
-        "(expected `extra_env[\"SUBAGENT_CLI\"] = SUBAGENT_CLI` in _create_container)"
-    )
-
-
 def test_extra_env_carries_subagent_cli_via_create_container(monkeypatch):
     """Functional check: invoke _create_container with mocked Docker client
     and assert the captured environment dict carries SUBAGENT_CLI=<chosen cli>.
 
-    Patches the Docker client + filesystem prep + skill_manager so the call
-    reaches the create() step where we capture `environment`. This is best-effort:
-    if downstream wiring fails, the source-grep test above is the safety net.
+    Docker and filesystem dependencies are patched so the call reaches create(),
+    where the environment is captured.
     """
     monkeypatch.setenv("SUBAGENT_CLI", "opencode")
     dm = _reload_docker_manager()
@@ -231,31 +221,15 @@ def test_extra_env_carries_subagent_cli_via_create_container(monkeypatch):
     current_anthropic_auth_token.set(None)
     current_anthropic_base_url.set(None)
 
-    create_exception = None
+    create_error_kind = None
     try:
         dm._create_container("test-chat", "test-container")
-    except Exception as e:  # noqa: BLE001 — best-effort capture, see skip below
-        # Some downstream code may still fail without real Docker — that is
-        # fine. The extra_env was already constructed and captured BEFORE
-        # any failure path that requires real network/skill state.
-        create_exception = e
+    except Exception as exc:  # noqa: BLE001 — assert capture even after a downstream error
+        create_error_kind = type(exc).__name__
 
-    if not captured_env:
-        # _FakeContainers.create() was never reached. The previous fallback
-        # (assert dm.SUBAGENT_CLI == "opencode") would silently green-light
-        # this test even if _create_container stopped emitting SUBAGENT_CLI
-        # entirely (covered already by test_valid_subagent_cli_resolves_to_lowercase
-        # and test_extra_env_injection_line_present_in_source). Skip explicitly
-        # so a real regression in extra_env injection cannot hide here.
-        # Per CodeRabbit PR#75 review.
-        import pytest
-        pytest.skip(
-            "_FakeContainers.create() not reached "
-            f"(upstream raised: {type(create_exception).__name__ if create_exception else 'no error'}). "
-            "Coverage falls back to test_extra_env_injection_line_present_in_source."
-        )
     assert captured_env.get("SUBAGENT_CLI") == "opencode", (
-        f"SUBAGENT_CLI not in captured environment: {captured_env}"
+        "SUBAGENT_CLI missing or incorrect in captured container environment "
+        f"(create error: {create_error_kind or 'none'})"
     )
 
 
