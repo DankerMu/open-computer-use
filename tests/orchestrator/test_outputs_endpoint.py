@@ -104,6 +104,8 @@ def _isolated_app(tmp_path, prefix=PREFIX):
     prior_base = getattr(docker_manager, "BASE_DATA_DIR", None)
     try:
         os.environ.update(_subprocess_env(data, prefix=prefix))
+        if prefix is None:
+            os.environ.pop("OCU_PUBLIC_PREFIX", None)
         for name in list(sys.modules):
             if name in _APP_MODULES or name.startswith("mcp_resources"):
                 sys.modules.pop(name, None)

@@ -45,6 +45,34 @@ Collection success is not a test pass: then execute the same canonical selected
 scope without `--collect-only` and record execution separately. Do not trim an
 evolving corpus to match an old count.
 
+### Output fixture prefix isolation
+
+`orchestrator/test_outputs_endpoint.py::_isolated_app` removes inherited
+`OCU_PUBLIC_PREFIX` before app import when `prefix=None`, including invalid
+inherited values. Explicit `""` selects root routes while keeping the variable
+present; explicit `/ocu` and the omitted/default `/ocu` select prefixed public URLs.
+
+`orchestrator/test_outputs_prefix.py` exercises real static content, preview
+configuration, broker output listings and exact file bytes. Nested real app
+contexts verify full environment contents and selected module keys/object
+identities after normal and intentional-assertion exits; the original assertion
+remains visible. Close clients before fixture restoration. App-import fixtures
+mutate process-global state and must not overlap within one process.
+
+Run the fixture and affected consumer scope from the repository root:
+
+```bash
+uv run --no-project --with pytest \
+  --with-requirements computer-use-server/requirements.txt -- \
+  python -m pytest tests/ -q \
+  --import-mode=importlib --ignore=tests/integration \
+  -k 'test_outputs_endpoint.py or test_outputs_prefix.py or test_preview_prefix.py or test_office_router.py or test_office_publish_recovery.py or test_path_traversal_app.py'
+```
+
+This local selected scope does not establish deep restoration of module internals,
+real Docker or LAN behavior, or full repository coverage. The path-traversal
+consumer retains its explicit empty-prefix configuration and security assertions.
+
 ### Main CI root-module coverage
 
 The main build workflow's non-image `pytest-orchestrator` job runs both complete
