@@ -31,6 +31,42 @@ EMPTY = {
     "journal": {},
 }
 
+# Embedded before each crash worker installs production filesystem fault hooks.
+_MARKER_WRITER = r'''
+import errno as _marker_errno
+import os as _marker_os
+from uuid import uuid4 as _marker_uuid4
+
+_marker_open = _marker_os.open
+_marker_write = _marker_os.write
+_marker_sync = _marker_os.fsync
+_marker_close = _marker_os.close
+_marker_replace = _marker_os.replace
+_marker_unlink = _marker_os.unlink
+
+def _publish_marker(path, text):
+    stage = path.with_name("." + path.name + "." + _marker_uuid4().hex + ".stage")
+    fd = _marker_open(stage, _marker_os.O_WRONLY | _marker_os.O_CREAT | _marker_os.O_EXCL, 0o600)
+    published = False
+    try:
+        try:
+            body = memoryview(text.encode("utf-8"))
+            while body:
+                size = _marker_write(fd, body)
+                if size <= 0:
+                    raise OSError(_marker_errno.EIO, "marker write made no progress")
+                body = body[size:]
+            _marker_sync(fd)
+        finally:
+            _marker_close(fd)
+        _marker_replace(stage, path)
+        published = True
+    finally:
+        if not published:
+            _marker_unlink(stage)
+'''
+
+
 _PROCESS = r'''
 import fcntl
 import json

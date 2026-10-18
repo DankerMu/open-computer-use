@@ -23,7 +23,7 @@ from tests.orchestrator.test_lifecycle import _bind_outputs_broker, _container, 
 from tests.orchestrator.test_office_publish import (
     BASELINE, OBLIGATION, SAVED, SESSION, _prepared, _reload_publish, _sha,
 )
-from tests.orchestrator._office_store import _child_env, _stop_child, _wait_marker
+from tests.orchestrator._office_store import _MARKER_WRITER, _child_env, _stop_child, _wait_marker
 from tests.orchestrator.test_office_sessions import _snapshot
 
 
@@ -375,7 +375,7 @@ def test_unsupported_shared_hardlink_retains_obligation_without_copy_fallback(wo
     _published(fixture)
 
 
-_CRASH_WORKER = r'''
+_CRASH_WORKER = _MARKER_WRITER + r'''
 import json
 import os
 import sys
@@ -394,7 +394,7 @@ mode = os.environ.get("CRASH_MODE", "publish")
 journal_id = os.environ.get("CRASH_JOURNAL", "publish-save-3")
 def stop(point):
     if point == cut:
-        marker.write_text(point)
+        _publish_marker(marker, point)
         while True:
             time.sleep(0.05)
 engine_path = Path(os.environ["ENGINE_STATE"]) if os.environ.get("ENGINE_STATE") else None

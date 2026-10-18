@@ -17,7 +17,7 @@ import pytest
 import httpx
 
 from tests.orchestrator._office_recorded_callbacks import recorded_status_1_payload, recorded_status_4_payload
-from tests.orchestrator._office_store import SERVER_DIR, _child_env, _stop_child, _wait_marker
+from tests.orchestrator._office_store import SERVER_DIR, _MARKER_WRITER, _child_env, _stop_child, _wait_marker
 from tests.orchestrator.test_office_callback_publish import (
     CHANGED, _allocate, _autosaved, _bind_internal, _content_origin, _opened,
     _payload, _post, _read, _running, _sha,
@@ -592,7 +592,7 @@ def test_final_copy_follows_pause_settled_workspace(office_world, monkeypatch, m
 
 
 
-_COPY_WORKER = r'''
+_COPY_WORKER = _MARKER_WRITER + r'''
 import json, os, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -607,7 +607,7 @@ cut = os.environ.get("COPY_CUT", "")
 marker = Path(os.environ["COPY_MARKER"])
 def stop(point):
     if point == cut:
-        marker.write_text(point)
+        _publish_marker(marker, point)
         while True:
             time.sleep(0.02)
 real_open, real_link, real_replace, real_unlink, real_sync = os.open, os.link, os.replace, os.unlink, os.fsync
@@ -1791,7 +1791,7 @@ def test_equal_content_capacity_failures_reclaim_each_private_allocation(
         _assert_private_reclaimed(data)
 
 
-_RETIREMENT_WORKER = r'''
+_RETIREMENT_WORKER = _MARKER_WRITER + r'''
 import json, os, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1823,7 +1823,7 @@ cut = os.environ.get("COPY_CUT", "")
 marker = Path(os.environ["COPY_MARKER"])
 def stop(point):
     if point == cut:
-        marker.write_text(point)
+        _publish_marker(marker, point)
         while True:
             time.sleep(0.02)
 real_replace, real_sync, real_unlink = os.replace, os.fsync, os.unlink
