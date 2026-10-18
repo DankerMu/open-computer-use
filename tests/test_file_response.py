@@ -15,6 +15,8 @@ from pathlib import Path
 import anyio
 import pytest
 
+from tests.file_route_module_ownership import isolated_file_route_modules
+
 SERVER_DIR = Path(__file__).resolve().parents[1] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
@@ -26,33 +28,74 @@ WAIT_SECONDS = 5
 
 @pytest.fixture
 def workspace(monkeypatch, tmp_path):
-    monkeypatch.setenv("OCU_INTERNAL_TOKEN", "ocu-response-lifecycle-test-token")
-    monkeypatch.setenv("MCP_API_KEY", "ocu-response-lifecycle-mcp-key")
-    monkeypatch.setenv("OCU_WEBUI_ORIGIN", "https://webui.example")
-    monkeypatch.setenv("OCU_SANDBOX_SUBNET", "10.90.0.0/24")
-    monkeypatch.setenv("SINGLE_USER_MODE", "true")
-    monkeypatch.setenv("PUBLIC_BASE_URL", "http://ocu.example")
-    monkeypatch.setenv("BASE_DATA_DIR", str(tmp_path))
-    for name in list(sys.modules):
-        if name in {
-            "app", "auth_guard", "mcp_tools", "docker_manager", "outputs_broker",
-            "context_vars", "security", "system_prompt", "skill_manager", "file_response",
-            "descriptor_io",
-        } or name.startswith("mcp_resources"):
-            sys.modules.pop(name, None)
-    import app
-    import docker_manager
+    with isolated_file_route_modules():
+        monkeypatch.setenv("OCU_INTERNAL_TOKEN", "ocu-response-lifecycle-test-token")
+        monkeypatch.setenv("MCP_API_KEY", "ocu-response-lifecycle-mcp-key")
+        monkeypatch.setenv("OCU_WEBUI_ORIGIN", "https://webui.example")
+        monkeypatch.setenv("OCU_SANDBOX_SUBNET", "10.90.0.0/24")
+        monkeypatch.setenv("SINGLE_USER_MODE", "true")
+        monkeypatch.setenv("PUBLIC_BASE_URL", "http://ocu.example")
+        monkeypatch.setenv("BASE_DATA_DIR", str(tmp_path))
+        import app
+        import docker_manager
+        import uploads
+
+        for module in (app, docker_manager, uploads):
+            monkeypatch.setattr(module, "BASE_DATA_DIR", tmp_path)
+        output_dir = tmp_path / CHAT / "outputs"
+        output_dir.mkdir(parents=True)
+        victim = output_dir / "victim.txt"
+        victim.write_bytes(b"original lifecycle response bytes")
+        sentinel = tmp_path / "sentinel.txt"
+        sentinel.write_bytes(b"sentinel descriptor remains owned by the test")
+        yield app, victim, sentinel
+
+
+def test_workspace_keeps_receipt_producer_and_app_exception_identity_coherent(
+    request, monkeypatch, tmp_path,
+):
+    module_names = {
+        "app", "auth_guard", "ws_recheck", "mcp_tools", "docker_manager",
+        "outputs_broker", "context_vars", "security", "system_prompt",
+        "skill_manager", "cli_runtime", "sandbox_dns", "uploads", "docs_html",
+        "file_response", "descriptor_io", "office", "cli_adapters",
+    }
+    snapshot = {
+        name: module for name, module in sys.modules.copy().items()
+        if name in module_names or name.startswith(
+            ("mcp_resources", "office.", "cli_adapters.")
+        )
+    }
+
+    def restore_ambient_state():
+        try:
+            monkeypatch.undo()
+        finally:
+            for name in list(sys.modules):
+                if name in module_names or name.startswith(
+                    ("mcp_resources", "office.", "cli_adapters.")
+                ):
+                    sys.modules.pop(name, None)
+            sys.modules.update(snapshot)
+
+    # Register before requesting workspace so its teardown runs before this guard.
+    request.addfinalizer(restore_ambient_state)
+    for name in snapshot:
+        sys.modules.pop(name, None)
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    monkeypatch.setenv("BASE_DATA_DIR", str(tmp_path / "caller"))
+    import descriptor_io
     import uploads
 
-    for module in (app, docker_manager, uploads):
-        monkeypatch.setattr(module, "BASE_DATA_DIR", tmp_path)
-    output_dir = tmp_path / CHAT / "outputs"
-    output_dir.mkdir(parents=True)
-    victim = output_dir / "victim.txt"
-    victim.write_bytes(b"original lifecycle response bytes")
-    sentinel = tmp_path / "sentinel.txt"
-    sentinel.write_bytes(b"sentinel descriptor remains owned by the test")
-    return app, victim, sentinel
+    caller_uploads = uploads
+    caller_descriptor = descriptor_io
+    assert caller_uploads.descriptor_io is caller_descriptor
+
+    loaded, _victim, _sentinel = request.getfixturevalue("workspace")
+    active_uploads = sys.modules["uploads"]
+    assert active_uploads.descriptor_io.CommittedCloseError is loaded.CommittedCloseError, (
+        "workspace split the receipt producer's exception class from the app's"
+    )
 
 
 class BoundaryFailure(OSError):
