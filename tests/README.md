@@ -102,6 +102,15 @@ Later subprocesses inherit the caller's Docker environment, not the deploy fake.
 The same module tests all three outcomes through the unittest runner. Full-root
 real-Docker verification remains distinct from this isolated lifecycle coverage.
 
+### CLI-runtime module ownership
+
+`orchestrator/test_cli_runtime.py` owns temporary cache entries for `cli_runtime`,
+`docker_manager` and `outputs_broker`. Each fixture lifecycle permits fresh imports
+and restores entry module objects or entry absence, including after a test-body
+failure. Downstream consumers retain their caller-owned manager references.
+The isolation regression and CLI-predecessor-to-sweep sequence exercise this
+boundary without replacing production admission or weakening the canary oracle.
+
 ### Office contention startup ownership
 
 The owners in `orchestrator/test_office_control_plane_concurrency.py` release and
