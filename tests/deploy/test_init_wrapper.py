@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -19,6 +18,8 @@ import unittest
 from urllib.parse import urlparse
 
 from support import ROOT
+
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
 
 
 WRAPPER = ROOT / "deploy" / "production-like-test" / "init" / "run-init.sh"
@@ -130,13 +131,13 @@ class FakeWebUI:
         self.filter_valves = None
         self.tool_access = None
         self.workspace_access = None
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._lifetime = None
+        self.server = None
 
     def _handler(self):
         owner = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(OriginRequestHandler):
             def log_message(self, format, *args):
                 return
 
@@ -166,8 +167,8 @@ class FakeWebUI:
                         return
                 marker = Path(owner.hold_path)
                 owner.entered.set()
-                while marker.exists():
-                    time.sleep(0.05)
+                while marker.exists() and not owner._lifetime.stopping:
+                    owner._lifetime.pause(0.05)
 
             def do_GET(self):
                 self._hold_if_needed("GET")
@@ -343,30 +344,27 @@ class FakeWebUI:
         return f"http://{host}:{port}"
 
     def start(self):
-        self.thread.start()
+        self._lifetime = HttpOriginLifetime(self._handler())
+        self.server = self._lifetime.server
 
     def stop(self):
-        self.hold_path = ""
-        self.hold_request = ""
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
+        if self._lifetime is not None:
+            self._lifetime.stop()
 
 
 class InitWrapperTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ocu-init-test-")
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.source = self.root / "source"
         shutil.copytree(SOURCE, self.source)
         self.data = self.root / "data"
         self.data.mkdir()
         self.webui = FakeWebUI()
+        self.addCleanup(self.webui.stop)
         self.webui.start()
 
-    def tearDown(self):
-        self.webui.stop()
-        self.temp.cleanup()
 
     def run_wrapper(self, extra_env=None, timeout=20):
         env = os.environ.copy()

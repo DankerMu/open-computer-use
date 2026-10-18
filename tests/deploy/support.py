@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import hashlib
 import io
@@ -15,8 +14,8 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import sys
 import tempfile
-import threading
 import zipfile
 
 
@@ -24,6 +23,11 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
+
 CHECK_PORTS = ROOT / "deploy" / "check-ports.sh"
 PROVISION = ROOT / "deploy" / "provision-networks.sh"
 UP = ROOT / "deploy" / "up.sh"
@@ -618,7 +622,7 @@ def write_installed_fonts(root: Path) -> None:
 def serve_font_archive(data=None):
     content = font_archive_bytes() if data is None else data
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(OriginRequestHandler):
         def do_GET(self):
             if self.path != "/fonts.zip":
                 self.send_error(404)
@@ -628,17 +632,8 @@ def serve_font_archive(data=None):
             self.end_headers()
             self.wfile.write(content)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_port}/fonts.zip"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-        if thread.is_alive():
-            raise RuntimeError("font fixture server did not stop")
+    with HttpOriginLifetime(Handler) as lifetime:
+        yield f"{lifetime.url}/fonts.zip"
 
 
 def empty_build(role: str) -> dict:

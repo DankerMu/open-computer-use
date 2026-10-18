@@ -25,6 +25,17 @@ class _ExpectedDisconnect(Exception):
     """A peer or teardown closed actual request/response transport I/O."""
 
 
+def _transport_call(owner, operation, *args, **kwargs):
+    try:
+        return operation(*args, **kwargs)
+    except OSError as error:
+        if isinstance(error, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)) or (
+            owner.stopping and error.errno == errno.EBADF
+        ):
+            raise _ExpectedDisconnect() from error
+        raise
+
+
 class _TransportStream:
     def __init__(self, stream, owner):
         self._stream = stream
@@ -34,14 +45,9 @@ class _TransportStream:
         return getattr(self._stream, name)
 
     def _call(self, method, *args, **kwargs):
-        try:
-            result = getattr(self._stream, method)(*args, **kwargs)
-        except OSError as error:
-            if isinstance(error, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)) or (
-                self._owner.stopping and error.errno == errno.EBADF
-            ):
-                raise _ExpectedDisconnect() from error
-            raise
+        result = _transport_call(
+            self._owner, getattr(self._stream, method), *args, **kwargs,
+        )
         if method in ("read", "readline") and self._owner.stopping:
             # shutdown() can unblock a partial request with EOF instead of an OSError.
             raise _ExpectedDisconnect()
@@ -64,6 +70,9 @@ class _TransportStream:
 
 
 class OriginRequestHandler(BaseHTTPRequestHandler):
+    def set_connection_timeout(self, seconds):
+        _transport_call(self.server.owner, self.connection.settimeout, seconds)
+
     def setup(self):
         # Setup and teardown must not race makefile() on an already closed socket.
         with self.server.owner._lock:
@@ -95,9 +104,9 @@ class _OwnedHTTPServer(ThreadingHTTPServer):
     # The owner joins every worker against one deadline, not server_close's unbounded join.
     block_on_close = False
 
-    def __init__(self, owner, handler):
+    def __init__(self, owner, handler, bind_address):
         self.owner = owner
-        super().__init__(("127.0.0.1", 0), handler, bind_and_activate=False)
+        super().__init__(bind_address, handler, bind_and_activate=False)
 
     def get_request(self):
         with self.owner._lock:
@@ -146,7 +155,7 @@ class HttpOriginLifetime:
     # Released holds and closed I/O should drain promptly; stuck responders must fail finitely.
     TEARDOWN_TIMEOUT_SECONDS = 2.0
 
-    def __init__(self, handler):
+    def __init__(self, handler, *, bind_address=("127.0.0.1", 0)):
         self._lock = threading.RLock()
         self._stopping = False
         self._cancel = threading.Event()
@@ -157,7 +166,7 @@ class HttpOriginLifetime:
         self.server = None
         self._thread = None
         try:
-            self.server = _OwnedHTTPServer(self, handler)
+            self.server = _OwnedHTTPServer(self, handler, bind_address)
             self.server.server_bind()
             self.server.server_activate()
             self.server.socket.setblocking(False)
@@ -171,7 +180,8 @@ class HttpOriginLifetime:
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self.server.server_address[1]}"
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
 
     @property
     def stopping(self):

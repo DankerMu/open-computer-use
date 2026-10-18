@@ -17,12 +17,17 @@ import sys
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
 if str(DEPLOY) not in sys.path:
     sys.path.insert(0, str(DEPLOY))
+
+ROOT = DEPLOY.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
 
 from smoke_deployment import (
     SmokeError,
@@ -40,7 +45,7 @@ from smoke_deployment import (
 from smoke_tty import TtydProtocolError, connect_ttyd, expected_accept
 
 
-class OkHandler(BaseHTTPRequestHandler):
+class OkHandler(OriginRequestHandler):
     def log_message(self, format, *args):  # noqa: A003
         del format, args
 
@@ -49,7 +54,7 @@ class OkHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-class RedirectHandler(BaseHTTPRequestHandler):
+class RedirectHandler(OriginRequestHandler):
     def log_message(self, format, *args):  # noqa: A003
         del format, args
 
@@ -59,7 +64,7 @@ class RedirectHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-class TtyHandler(BaseHTTPRequestHandler):
+class TtyHandler(OriginRequestHandler):
     def log_message(self, format, *args):  # noqa: A003
         del format, args
 
@@ -75,7 +80,7 @@ class TtyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.server.upgraded.set()
         self.server.init_release.wait(timeout=3)
-        self.connection.settimeout(3)
+        self.set_connection_timeout(3)
         try:
             payload = self.rfile.read(2)
             if payload:
@@ -89,7 +94,7 @@ class TtyHandler(BaseHTTPRequestHandler):
                 self.server.closed.set()
                 return
             self.server.hold.wait(timeout=5)
-        except OSError:
+        except TimeoutError:
             return
 
 
@@ -378,16 +383,10 @@ class NativeSmokeTests(unittest.TestCase):
             listener.close()
 
     def test_host_http_success_and_dead_listener(self):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), OkHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
+        with HttpOriginLifetime(OkHandler) as lifetime:
+            server = lifetime.server
             port = server.server_address[1]
             self.assertEqual(require_http_status(f"http://127.0.0.1:{port}/", allow_any=True), 204)
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
         dead = sock.getsockname()[1]
@@ -396,17 +395,11 @@ class NativeSmokeTests(unittest.TestCase):
             require_http_status(f"http://127.0.0.1:{dead}/", allow_any=True)
 
     def test_redirect_is_not_followed(self):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
+        with HttpOriginLifetime(RedirectHandler) as lifetime:
+            server = lifetime.server
             port = server.server_address[1]
             status = require_http_status(f"http://127.0.0.1:{port}/", allow_any=True)
             self.assertEqual(status, 302)
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
 
     def test_curl_classifier_separates_false_isolation_signals(self):
         blocked = parse_curl_writeout(
@@ -450,17 +443,18 @@ class NativeSmokeTests(unittest.TestCase):
 
     def test_tty_handshake_requires_subprotocol_and_init(self):
         for selected in (True, False):
-            server = ThreadingHTTPServer(("127.0.0.1", 0), TtyHandler)
+            lifetime = self.enterContext(HttpOriginLifetime(TtyHandler))
+            server = lifetime.server
             server.select_tty = selected
             server.upgraded = threading.Event()
             server.init_release = threading.Event()
+            lifetime.release_on_close(server.init_release)
             server.init_seen = threading.Event()
             server.drop_after_init = False
             server.closed = threading.Event()
             server.hold = threading.Event()
+            lifetime.release_on_close(server.hold)
             server.init = b""
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
             session = None
             try:
                 origin = f"http://127.0.0.1:{server.server_address[1]}"
@@ -483,23 +477,21 @@ class NativeSmokeTests(unittest.TestCase):
                     session.close()
                 server.init_release.set()
                 server.hold.set()
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=2)
 
     def test_ttyd_eof_after_init_is_not_a_held_connection(self):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), TtyHandler)
+        lifetime = self.enterContext(HttpOriginLifetime(TtyHandler))
+        server = lifetime.server
         server.select_tty = True
         server.upgraded = threading.Event()
         server.init_release = threading.Event()
+        lifetime.release_on_close(server.init_release)
         server.init_release.set()
         server.init_seen = threading.Event()
         server.closed = threading.Event()
         server.drop_after_init = True
         server.hold = threading.Event()
+        lifetime.release_on_close(server.hold)
         server.init = b""
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
         session = None
         try:
             origin = f"http://127.0.0.1:{server.server_address[1]}"
@@ -519,9 +511,6 @@ class NativeSmokeTests(unittest.TestCase):
             if session is not None:
                 session.close()
             server.hold.set()
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
 
     def test_stale_owned_group_requires_observed_absence(self):
         process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
