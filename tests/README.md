@@ -96,6 +96,11 @@ invocation, separate from orchestrator collection. A failure in either module
 fails the invocation and job. Existing orchestrator, auth-guard, deploy and
 integration selections remain unchanged.
 
+The orchestrator selection runs from the checkout root via
+`python -m pytest tests/orchestrator/ -v`, making the repository namespace
+available to package-qualified fixture imports without `PYTHONPATH` or an
+import-mode override.
+
 ### Docker-manager test data ownership
 
 `orchestrator/test_docker_manager.py` owns a private temporary data root across
