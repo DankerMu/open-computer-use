@@ -29,6 +29,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Drawio fullscreen theme subscriptions** (issue #313). Icon, Escape, backdrop
+  close and preview retirement release the child UI's theme callback without
+  disabling the parent preview or unrelated listeners. Live theme updates,
+  repeated fullscreen use and deferred-close ownership remain intact.
+
 - **Office bookmark navigation.** Ordinary and already-prefixed DOCX bookmarks
   navigate to their sanitized local targets in embedded and standalone previews.
   Malformed fragments and missing or document-global-only targets have no active

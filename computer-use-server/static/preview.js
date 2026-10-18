@@ -1232,45 +1232,81 @@ function attachLocalLightboxGuard(viewer, Viewer, host, file, parentLifetime) {
     if (!parentLifetime?.current()) return null;
     const overflow = document.body.style.overflow;
     const resizeSensor = Viewer.resizeSensorEnabled;
-    const ui = previous.apply(this, arguments);
-    if (ui) {
-      const uiTracker = installStencilLoadTracker();
-      const uiLifetime = createDrawioLifetime(host, parentLifetime);
-      attachRenderedPageGuard(ui, host, file, uiTracker, uiLifetime);
-      const destroy = ui.destroy;
-      let requested = false;
-      let mounted = false;
-      let completed = false;
-      const finish = () => {
-        if (completed || !requested || !mounted) return;
-        completed = true;
-        drawioFullscreenClosures.delete(close);
-        try { destroy.call(ui); }
-        finally {
-          document.body.style.overflow = drawioFullscreenClosures.size ? 'hidden' : drawioFullscreenOverflow;
-          Viewer.resizeSensorEnabled = drawioFullscreenClosures.size ? false : drawioFullscreenResizeSensor;
-        }
-      };
-      const close = () => {
-        if (requested) return;
-        requested = true;
-        uiLifetime.dispose();
-        finish();
-      };
-      if (!drawioFullscreenClosures.size) {
-        drawioFullscreenOverflow = overflow;
-        drawioFullscreenResizeSensor = resizeSensor;
+    const parent = this;
+    const addListener = parent.addListener;
+    const addListenerDescriptor = Object.getOwnPropertyDescriptor(parent, 'addListener');
+    const themeCallbacks = [];
+    const releaseThemeCallbacks = () => {
+      while (themeCallbacks.length) {
+        parent.removeListener(themeCallbacks[themeCallbacks.length - 1]);
+        themeCallbacks.pop();
       }
-      drawioFullscreenClosures.add(close);
-      ui.destroy = close;
-      uiLifetime.addCleanup(close);
-      // The pinned viewer queues body attachment before returning; destroy requires that mount to settle.
-      window.setTimeout(() => {
-        mounted = true;
-        finish();
-      }, 0);
+    };
+    let uiLifetime;
+    try {
+      let ui;
+      try {
+        Object.defineProperty(parent, 'addListener', {
+          configurable: true,
+          writable: true,
+          value: function(name, callback) {
+            if (this === parent && name === 'darkModeChanged') themeCallbacks.push(callback);
+            return addListener.apply(this, arguments);
+          },
+        });
+        ui = previous.apply(this, arguments);
+      } finally {
+        if (addListenerDescriptor) Object.defineProperty(parent, 'addListener', addListenerDescriptor);
+        else delete parent.addListener;
+      }
+      if (ui) {
+        uiLifetime = createDrawioLifetime(host, parentLifetime);
+        uiLifetime.addCleanup(releaseThemeCallbacks);
+        const uiTracker = installStencilLoadTracker();
+        attachRenderedPageGuard(ui, host, file, uiTracker, uiLifetime);
+        const destroy = ui.destroy;
+        let requested = false;
+        let mounted = false;
+        let completed = false;
+        const finish = () => {
+          if (completed || !requested || !mounted) return;
+          completed = true;
+          drawioFullscreenClosures.delete(close);
+          try { destroy.call(ui); }
+          finally {
+            document.body.style.overflow = drawioFullscreenClosures.size ? 'hidden' : drawioFullscreenOverflow;
+            Viewer.resizeSensorEnabled = drawioFullscreenClosures.size ? false : drawioFullscreenResizeSensor;
+          }
+        };
+        const close = () => {
+          if (requested) return;
+          requested = true;
+          uiLifetime.dispose();
+          finish();
+        };
+        if (!drawioFullscreenClosures.size) {
+          drawioFullscreenOverflow = overflow;
+          drawioFullscreenResizeSensor = resizeSensor;
+        }
+        drawioFullscreenClosures.add(close);
+        ui.destroy = close;
+        uiLifetime.addCleanup(close);
+        // The pinned viewer queues body attachment before returning; destroy requires that mount to settle.
+        window.setTimeout(() => {
+          mounted = true;
+          finish();
+        }, 0);
+      } else {
+        releaseThemeCallbacks();
+      }
+      return ui;
+    } catch (error) {
+      uiLifetime?.dispose();
+      try { releaseThemeCallbacks(); } catch {
+        // Preserve the original factory/setup error if secondary listener removal fails.
+      }
+      throw error;
     }
-    return ui;
   };
 }
 
