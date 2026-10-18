@@ -215,6 +215,10 @@ Controlled holds observe cancellation; initializer cancellation preserves
 caller-owned marker files. Handler and body failures remain visible together.
 Expected disconnects are classified only at actual transport operations, including
 socket timeout configuration, not by swallowing responder exceptions.
+The runtime TTY timeout regression joins the admitted worker within the running
+owner's lifetime so error classification and recording finish before owner exit.
+It verifies real EBADF propagation; the shutdown-time contrast treats EBADF as an
+expected disconnect.
 
 Run the shared lifetime and affected consumer scope from the repository root:
 

@@ -361,9 +361,13 @@ class ConsumerOriginLifetimeTests(unittest.TestCase):
         original_settimeout = socket.socket.settimeout
         handlers = []
         errors = []
+        timeout_calls = 0
+        error_stopping = []
         with _observe_requests(handlers=handlers) as (observed, entered), ExitStack() as clients:
             def settimeout(connection, seconds):
+                nonlocal timeout_calls
                 if observed and connection is observed[0][1]:
+                    timeout_calls += 1
                     handlers[0].rfile.close()
                     handlers[0].wfile.close()
                     connection.close()
@@ -371,6 +375,7 @@ class ConsumerOriginLifetimeTests(unittest.TestCase):
                         return original_settimeout(connection, seconds)
                     except OSError as error:
                         errors.append(error)
+                        error_stopping.append(lifetime.stopping)
                         raise
                 return original_settimeout(connection, seconds)
 
@@ -402,6 +407,26 @@ class ConsumerOriginLifetimeTests(unittest.TestCase):
                         self.assertTrue(entered.wait(2))
                         while client.recv(4096):
                             pass
+                        # EOF can precede transport-error classification and recording.
+                        worker = observed[0][0]
+                        worker.join(timeout=5)
+                        self.assertFalse(
+                            worker.is_alive(),
+                            "runtime timeout request worker did not complete before owner exit",
+                        )
+                        self.assertEqual(
+                            timeout_calls, 1,
+                            "accepted-socket timeout operation was not called exactly once",
+                        )
+                        self.assertEqual(
+                            len(errors), 1,
+                            "accepted-socket timeout operation did not raise exactly one OSError",
+                        )
+                        self.assertEqual(errors[0].errno, errno.EBADF)
+                        self.assertEqual(
+                            error_stopping, [False],
+                            "accepted-socket timeout error occurred after owner shutdown began",
+                        )
                 self.assertEqual(raised.exception.errno, errno.EBADF)
                 self.assertEqual(len(errors), 1)
                 self.assertIs(raised.exception, errors[0])
