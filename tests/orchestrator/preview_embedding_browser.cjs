@@ -2308,14 +2308,192 @@ async function main() {
       await session.page.close();
       await session.isolated.close();
     };
-    const assertLocalShapeGeometry = async (session) => {
-      const boxes = await session.page.locator('.drawio-host svg').evaluate(svg =>
-        [...svg.querySelectorAll('path,rect')].map(node => {
-          const box = node.getBBox();
-          return { width: Math.round(box.width), height: Math.round(box.height) };
-        }));
-      assert(boxes.some(box => box.width === 120 && box.height === 60),
-        'Drawio lost the fixture’s 120×60 shape geometry after renderer switching');
+    let localShapeGeometryCapture = 0;
+    const assertLocalShapeGeometry = async (session, {
+      scaled = false, surface = '.drawio-host', phase = 'native', transition,
+    } = {}) => {
+      const label = `drawio-geometry-${session.prefix.replaceAll('/', '-') || 'root'}-${++localShapeGeometryCapture}-${phase}`;
+      // A quarter CSS pixel tolerates subpixel rounding only, not a clipped stroke.
+      const tolerance = 0.25;
+      const evidence = { case: label, tolerance, url: session.page.url(), scaled, surface, transition };
+      let failure;
+      try {
+        let transitionFailure;
+        if (transition) {
+          try {
+            await session.page.waitForFunction(({ surface, transition, tolerance }) => {
+              const shapes = [...document.querySelectorAll(`${surface} svg rect`)]
+                .filter(node => node.rx.baseVal.value > 0 && node.ry.baseVal.value > 0);
+              if (shapes.length !== 1) return false;
+              const box = shapes[0].getBoundingClientRect();
+              if (transition.target)
+                return ['width', 'height'].every(axis =>
+                  Math.abs(box[axis] - transition.target[axis]) <= tolerance);
+              return ['width', 'height'].every(axis => transition.direction === 'larger' ?
+                box[axis] > transition.before[axis] + tolerance :
+                box[axis] < transition.before[axis] - tolerance);
+            }, { surface, transition, tolerance }, { timeout: 10000 });
+          } catch (error) {
+            // Still measure and capture the unchanged surface when a control fails.
+            transitionFailure = error;
+          }
+        }
+        evidence.geometry = await session.page.locator(`${surface} svg`).evaluate((svg, scaled) => {
+          const nodes = [...svg.querySelectorAll('path,rect')];
+          const boxes = nodes.map(node => {
+            const box = node.getBBox();
+            return { width: Math.round(box.width), height: Math.round(box.height) };
+          });
+          const describe = box => ({ left: box.left, top: box.top, right: box.right,
+            bottom: box.bottom, width: box.width, height: box.height });
+          const viewport = { left: 0, top: 0, right: innerWidth, bottom: innerHeight };
+          const shapes = nodes.flatMap((node, index) => {
+            if (node.localName !== 'rect') return [];
+            const box = node.getBBox();
+            if (!scaled) {
+              if (box.x !== 40 || box.y !== 40 || box.width !== 120 || box.height !== 60) return [];
+            } else if (!(node.rx.baseVal.value > 0 && node.ry.baseVal.value > 0)) return [];
+            const style = getComputedStyle(node);
+            const matrix = node.getScreenCTM();
+            const strokeWidth = parseFloat(style.strokeWidth);
+            const halfStroke = strokeWidth / 2;
+            const points = matrix ? [
+              [box.x - halfStroke, box.y - halfStroke],
+              [box.x + box.width + halfStroke, box.y - halfStroke],
+              [box.x - halfStroke, box.y + box.height + halfStroke],
+              [box.x + box.width + halfStroke, box.y + box.height + halfStroke],
+            ].map(([x, y]) => new DOMPoint(x, y).matrixTransform(matrix)) : [];
+            const painted = {
+              left: Math.min(...points.map(point => point.x)),
+              right: Math.max(...points.map(point => point.x)),
+              top: Math.min(...points.map(point => point.y)),
+              bottom: Math.max(...points.map(point => point.y)),
+            };
+            const clip = { ...viewport };
+            const boundaries = [];
+            let effectiveOpacity = 1;
+            let displayed = true;
+            for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+              const computed = getComputedStyle(ancestor);
+              effectiveOpacity *= Number(computed.opacity);
+              displayed &&= computed.display !== 'none' && computed.contentVisibility !== 'hidden';
+              if (ancestor === node) continue;
+              const clipsX = /^(hidden|clip|auto|scroll)$/.test(computed.overflowX);
+              const clipsY = /^(hidden|clip|auto|scroll)$/.test(computed.overflowY);
+              if (!clipsX && !clipsY) continue;
+              const bounds = ancestor.getBoundingClientRect();
+              // SVG's bounding client rect is its viewport, not its graphics getBBox().
+              const isSvgViewport = ancestor instanceof SVGSVGElement;
+              const scaleX = ancestor.offsetWidth ? bounds.width / ancestor.offsetWidth : 1;
+              const scaleY = ancestor.offsetHeight ? bounds.height / ancestor.offsetHeight : 1;
+              const left = isSvgViewport ? bounds.left : bounds.left + ancestor.clientLeft * scaleX;
+              const top = isSvgViewport ? bounds.top : bounds.top + ancestor.clientTop * scaleY;
+              const right = isSvgViewport ? bounds.right : left + ancestor.clientWidth * scaleX;
+              const bottom = isSvgViewport ? bounds.bottom : top + ancestor.clientHeight * scaleY;
+              if (clipsX) {
+                clip.left = Math.max(clip.left, left);
+                clip.right = Math.min(clip.right, right);
+              }
+              if (clipsY) {
+                clip.top = Math.max(clip.top, top);
+                clip.bottom = Math.min(clip.bottom, bottom);
+              }
+              boundaries.push({ tag: ancestor.tagName, className: ancestor.getAttribute('class'),
+                overflowX: computed.overflowX, overflowY: computed.overflowY,
+                clipsX, clipsY, left, top, right, bottom });
+            }
+            const alpha = style.stroke.match(/^rgba\([^)]*,\s*([\d.]+)\s*\)$/) ||
+              style.stroke.match(/\/\s*([\d.]+)\s*\)$/);
+            return [{
+              index, element: node.outerHTML,
+              intrinsic: { x: box.x, y: box.y, width: box.width, height: box.height,
+                rx: node.rx.baseVal.value, ry: node.ry.baseVal.value, strokeWidth },
+              paint: { stroke: style.stroke, strokeAlpha: alpha ? Number(alpha[1]) : 1,
+                strokeOpacity: Number(style.strokeOpacity), effectiveOpacity, displayed,
+                visibility: style.visibility, vectorEffect: style.vectorEffect },
+              matrix: matrix && { a: matrix.a, b: matrix.b, c: matrix.c, d: matrix.d, e: matrix.e, f: matrix.f },
+              clientBox: describe(node.getBoundingClientRect()), painted, clip, boundaries,
+              overruns: { left: clip.left - painted.left, right: painted.right - clip.right,
+                top: clip.top - painted.top, bottom: painted.bottom - clip.bottom },
+            }];
+          });
+          return { boxes, shapes, viewport };
+        }, scaled);
+        const { boxes, shapes } = evidence.geometry;
+        if (!scaled) {
+          assert(boxes.some(box => box.width === 120 && box.height === 60),
+            'Drawio lost the fixture’s 120×60 shape geometry after renderer switching');
+          assert.equal(shapes.length, 1, 'Drawio must render exactly one actual 120×60 fixture rectangle');
+        } else {
+          assert.equal(shapes.length, 1, 'Scaled Drawio must render exactly one rounded fixture rectangle');
+        }
+        const shape = shapes[0];
+        if (!scaled) {
+          assert.deepEqual(boxes[shape.index], { width: 120, height: 60 });
+        }
+        const { x, y, width, height, rx, ry, strokeWidth } = shape.intrinsic;
+        if (!scaled) {
+          assert.deepEqual({ x, y, width, height }, { x: 40, y: 40, width: 120, height: 60 },
+            'Drawio changed the fixture rectangle geometry');
+        } else {
+          assert([x, y, width, height].every(Number.isFinite) && width > 0 && height > 0,
+            'Scaled Drawio fixture rectangle must have finite positive dimensions');
+          // The pinned viewer may round scaled SVG attributes rather than use a CTM scale.
+          assert(Math.abs(width / height - 2) <= 0.002 &&
+            Math.abs(shape.clientBox.width / shape.clientBox.height - 2) <= 0.002,
+          'Scaled Drawio fixture rectangle must preserve its 2:1 aspect ratio');
+        }
+        assert(rx > 0 && rx <= width / 2 && ry > 0 && ry <= height / 2,
+          'Drawio fixture rectangle must retain rounded corners within its dimensions');
+        assert(Number.isFinite(strokeWidth) && strokeWidth > 0, 'Drawio fixture stroke must have positive width');
+        const { paint, matrix, painted, clip } = shape;
+        assert(paint.displayed && paint.visibility === 'visible' && paint.effectiveOpacity > 0 &&
+          paint.stroke && paint.stroke !== 'none' && paint.stroke !== 'transparent' &&
+          paint.strokeAlpha > 0 && paint.strokeOpacity > 0, 'Drawio fixture stroke must visibly paint');
+        // Local half-stroke expansion is exact for this fixture's axis-aligned scale/translation.
+        assert(matrix && Object.values(matrix).every(Number.isFinite) &&
+          Math.abs(matrix.b) < 1e-9 && Math.abs(matrix.c) < 1e-9 &&
+          matrix.a > 0 && matrix.d > 0 && paint.vectorEffect === 'none',
+          'Drawio fixture requires a nonsingular axis-aligned transform and scaling stroke');
+        assert([...Object.values(painted), ...Object.values(clip)].every(Number.isFinite) &&
+          painted.right > painted.left && painted.bottom > painted.top &&
+          clip.right > clip.left && clip.bottom > clip.top, 'Drawio paint and clip bounds must be finite and nonempty');
+        for (const edge of ['left', 'right', 'top', 'bottom'])
+          assert(shape.overruns[edge] <= tolerance,
+            `Drawio fixture ${edge} painted stroke exceeds its visible clipping boundary: ${JSON.stringify(shape)}`);
+        if (transitionFailure) throw transitionFailure;
+        if (transition) {
+          evidence.transition.after = shape.clientBox;
+          for (const axis of ['width', 'height']) {
+            if (transition.target) {
+              assert(Math.abs(transition.before[axis] - transition.target[axis]) > tolerance,
+                `${transition.control} must start away from the initial screen ${axis}`);
+              assert(Math.abs(shape.clientBox[axis] - transition.target[axis]) <= tolerance,
+                `${transition.control} did not restore the initial screen ${axis}`);
+            } else {
+              assert(transition.direction === 'larger' ?
+                shape.clientBox[axis] > transition.before[axis] + tolerance :
+                shape.clientBox[axis] < transition.before[axis] - tolerance,
+              `${transition.control} did not make the fixture screen ${axis} ${transition.direction}`);
+            }
+          }
+        }
+        return evidence.geometry;
+      } catch (error) {
+        failure = error;
+        evidence.failure = String(error);
+        throw error;
+      } finally {
+        console.log(JSON.stringify(evidence));
+        const captured = await Promise.allSettled([
+          session.page.screenshot({ path: path.join(artifacts, `${label}.png`) }),
+          fs.writeFile(path.join(artifacts, `${label}.json`), JSON.stringify(evidence, null, 2) + '\n'),
+        ]);
+        const evidenceFailures = captured.filter(result => result.status === 'rejected').map(result => result.reason);
+        for (const error of evidenceFailures)
+          console.error(JSON.stringify({ case: label, artifactFailure: String(error) }));
+        if (!failure && evidenceFailures.length) throw evidenceFailures[0];
+      }
     };
     const andGeometryOf = async (session) => session.page.locator('.drawio-host svg').evaluate((svg) => {
       const paths = [...svg.querySelectorAll('path')].map((path) => path.getAttribute('d') || '');
@@ -3294,6 +3472,7 @@ async function main() {
       await selectStandaloneFile(officeSession.page, 'diagram.drawio');
       await officeSession.page.locator('.drawio-host svg').waitFor();
       await officeSession.page.getByText('Local shape').waitFor();
+      await assertLocalShapeGeometry(officeSession, { phase: 'plain' });
       await officeSession.page.screenshot({ path: path.join(artifacts, 'standalone-drawio.png') });
       const afterGeometry = caseRequests(officeSession);
       assert(afterGeometry.some(row => row.path.includes('/static/drawio/js/viewer-static.min.js')),
@@ -3328,6 +3507,7 @@ async function main() {
       await selectStandaloneFile(compressedSession.page, 'compressed.drawio');
       await compressedSession.page.locator('.drawio-host svg').waitFor();
       await compressedSession.page.getByText('Compressed shape').waitFor();
+      await assertLocalShapeGeometry(compressedSession, { phase: 'compressed' });
       assert.deepEqual(caseErrors(compressedSession), [], 'compressed Drawio produced unexpected console errors');
     } finally {
       await closeStandalone(compressedSession);
@@ -3814,6 +3994,7 @@ async function main() {
       await selectStandaloneFile(pagesSession.page, 'pages.drawio');
       await pagesSession.page.locator('.drawio-host svg').waitFor();
       await pagesSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      const pageOneGeometry = await assertLocalShapeGeometry(pagesSession, { phase: 'page-one' });
       assert.equal(await pagesSession.page.locator('.dl-error').count(), 0);
       const beforePageTwo = requests.length;
       assert.equal(caseRequests(pagesSession).filter(row =>
@@ -3823,10 +4004,34 @@ async function main() {
       await clickViewerToolbar(pagesSession, 'Zoom In');
       const afterZoom = await pagesSession.page.locator('.drawio-host svg').evaluate((svg) => svg.getBoundingClientRect().width);
       assert(afterZoom > beforeZoom, 'Zoom In did not enlarge the diagram');
+      const zoomedIn = await assertLocalShapeGeometry(pagesSession, {
+        scaled: true, phase: 'zoom-in',
+        transition: { control: 'Zoom In', before: pageOneGeometry.shapes[0].clientBox, direction: 'larger' },
+      });
+      await clickViewerToolbar(pagesSession, 'Zoom Out');
+      const zoomedOut = await assertLocalShapeGeometry(pagesSession, {
+        scaled: true, phase: 'zoom-out',
+        transition: { control: 'Zoom Out', before: zoomedIn.shapes[0].clientBox, direction: 'smaller' },
+      });
+      // Move below the initial scale so Fit cannot pass as a no-op after reciprocal zoom.
+      await clickViewerToolbar(pagesSession, 'Zoom Out');
+      const reduced = await assertLocalShapeGeometry(pagesSession, {
+        scaled: true, phase: 'zoom-out-below-initial',
+        transition: { control: 'Zoom Out', before: zoomedOut.shapes[0].clientBox, direction: 'smaller' },
+      });
+      await clickViewerToolbar(pagesSession, 'Fit');
+      const fitted = await assertLocalShapeGeometry(pagesSession, {
+        scaled: true, phase: 'fit',
+        transition: { control: 'Fit', before: reduced.shapes[0].clientBox,
+          target: pageOneGeometry.shapes[0].clientBox },
+      });
       await clickViewerToolbar(pagesSession, 'Fullscreen');
       const lightbox = pagesSession.page.locator('body > .geDiagramContainer');
       await lightbox.locator('svg').waitFor();
       await lightbox.getByText('Page one', { exact: true }).waitFor();
+      await assertLocalShapeGeometry(pagesSession, {
+        scaled: true, surface: 'body > .geDiagramContainer', phase: 'fullscreen-page-one',
+      });
       const beforeFullscreenPageTwo = requests.length;
       await clickFullscreenNextAnd(pagesSession);
       await lightbox.getByText('AND', { exact: true }).waitFor();
@@ -3846,6 +4051,13 @@ async function main() {
         'fullscreen page two did not render AND wire geometry');
       await pagesSession.page.locator('body > img.geAdaptiveAsset[style*="position: fixed"]').click();
       await lightbox.waitFor({ state: 'detached' });
+      await pagesSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      const returned = await assertLocalShapeGeometry(pagesSession, {
+        scaled: true, phase: 'fullscreen-return',
+      });
+      for (const axis of ['width', 'height'])
+        assert(Math.abs(returned.shapes[0].clientBox[axis] - fitted.shapes[0].clientBox[axis]) <= 0.25,
+          `Fullscreen close changed the ordinary fixture screen ${axis}`);
       await clickViewerToolbar(pagesSession, 'Fullscreen');
       const reopened = pagesSession.page.locator('body > .geDiagramContainer');
       await reopened.locator('svg').waitFor();
@@ -4374,6 +4586,7 @@ async function main() {
 
       await activateStandaloneFile(fullscreenSelectionSession, 'pages.drawio');
       await fullscreenSelectionSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      await assertLocalShapeGeometry(fullscreenSelectionSession, { phase: 'selected-b' });
       const transition = await fullscreenSelectionSession.page.evaluate((nodes) => ({
         selected: document.querySelector('.file-selector-btn .selector-name').textContent,
         replacementRendered: document.querySelector('.drawio-host').textContent.includes('Page one'),
@@ -4436,6 +4649,8 @@ async function main() {
           await session.page.waitForFunction(expected =>
             document.querySelector('.file-selector-btn .selector-name')?.textContent === expected, scenario.selected);
           await session.page.locator('.drawio-host').getByText(scenario.content, { exact: true }).waitFor();
+          if (scenario.label === 'revision')
+            await assertLocalShapeGeometry(session, { phase: 'revision-replacement' });
         } else {
           await session.page.locator('.preview .empty-state').waitFor();
           assert.equal(await session.page.locator('.drawio-host, .file-selector').count(), 0,
