@@ -154,6 +154,29 @@ This scope covers controlled startup faults and the successful contention paths,
 not request cancellation, arbitrary simultaneous cleanup failures, deployment
 behavior, or cross-platform leak freedom. Production locks and callbacks are unchanged.
 
+### Office crash-cut marker readiness
+
+Publication, copy, retirement and resolution crash workers share the embedded
+marker writer in `orchestrator/_office_store.py`. Each writes the complete cut
+name to an exclusively owned, private (`0600`) sibling stage, syncs and closes
+it, then atomically publishes the final marker with saved filesystem primitives.
+Final-path existence therefore signals complete exact text, not a write still
+in progress; successful publication leaves no stage. Marker bookkeeping bypasses
+the production replacement/write/sync hooks without advancing the selected cut.
+Existing child holds, exact-text checks, SIGKILL checks and recovery assertions
+remain unchanged. Contention-only markers and the separate pause/read oracle
+are outside this protocol.
+
+`orchestrator/test_office_crash_markers.py` holds real filesystem writes before
+text is complete, exercises short writes and publication failures, and checks
+saved-hook isolation plus private-mode/sync/close ordering. Its behavioral
+mutation seam is `_publish_marker` in the shared embedded source: restoring
+direct final-path writes must expose premature readiness, not an import failure.
+Run this module together with the complete `test_office_publish_recovery.py`,
+`test_office_save_as.py`, `test_office_resolution.py` and `test_office_store.py`
+modules; do not exclude the independent pause/read case if it fails.
+
+
 ### Office command deadlines and transaction-worker ownership
 
 Run the focused command protocol and ownership scope with the canonical discovery root:

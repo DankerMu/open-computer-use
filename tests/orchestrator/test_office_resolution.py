@@ -20,7 +20,7 @@ import httpx
 import pytest
 
 from tests.orchestrator._office_recorded_callbacks import recorded_status_4_payload
-from tests.orchestrator._office_store import SERVER_DIR, _child_env, _stop_child, _wait_marker
+from tests.orchestrator._office_store import SERVER_DIR, _MARKER_WRITER, _child_env, _stop_child, _wait_marker
 from tests.orchestrator.test_office_callback_publish import _read, _running
 from tests.orchestrator.test_office_save_as import (
     _nested, _fresh_files, _final, _copy_outcome, _assert_private_reclaimed,
@@ -657,7 +657,7 @@ def test_failed_replacement_keeps_user_restore_latest_and_retry_does_not_duplica
     assert (_outputs(data) / "report.docx").read_bytes() == CHANGED
 
 
-_RESOLVE_WORKER = r'''
+_RESOLVE_WORKER = _MARKER_WRITER + r'''
 import json, os, stat, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -691,12 +691,7 @@ fcntl.flock = flock
 def stop(point):
     if not cut or not point or cut != point:
         return
-    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, point.encode())
-        real_sync(fd)
-    finally:
-        os.close(fd)
+    _publish_marker(marker, point)
     while True:
         time.sleep(0.02)
 def replaced(source, destination, *args, **kwargs):
