@@ -92,6 +92,16 @@ directory, including after setup or test-body failures.
 For pytest, use the canonical discovery command above with
 `-k 'test_docker_manager.py'` to select this module rather than the full unit scope.
 
+### Recovery database environment ownership
+
+`deploy/test_recovery_db.py` scopes its fake Docker environment to each unittest
+lifecycle. Registered cleanups restore the complete entry environment and remove
+the owned temporary directory after success, body errors and setup errors.
+Later subprocesses inherit the caller's Docker environment, not the deploy fake.
+
+The same module tests all three outcomes through the unittest runner. Full-root
+real-Docker verification remains distinct from this isolated lifecycle coverage.
+
 ### Office contention startup ownership
 
 The owners in `orchestrator/test_office_control_plane_concurrency.py` release and

@@ -7,10 +7,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import unittest
+from unittest.mock import patch
 
-from support import DEFAULT_RELEASE_IMAGES, ROOT, fake_env, seed_images, tmp_dir
+from support import DEFAULT_RELEASE_IMAGES, FAKE_DOCKER, ROOT, fake_env, seed_images, tmp_dir
 
 sys.path.insert(0, str(ROOT / "deploy"))
 import recovery
@@ -20,6 +22,7 @@ import recovery_db
 class RecoveryDatabaseTests(unittest.TestCase):
     def setUp(self):
         self.context = tmp_dir()
+        self.addCleanup(self.context.cleanup)
         self.root = Path(self.context.name)
         self.state = self.root / "fake-state"
         self.state.mkdir()
@@ -27,7 +30,7 @@ class RecoveryDatabaseTests(unittest.TestCase):
         self.lock_dir.mkdir()
         self.env = fake_env(self.state)
         self.env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
-        os.environ.update(self.env)
+        self.enterContext(patch.dict(os.environ, self.env))
         seed_images(self.state)
         recovery.pin_runtime_docker_host("unix:///var/run/docker.sock")
         self.container = "ocu-test-postgres-1"
@@ -79,9 +82,6 @@ class RecoveryDatabaseTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-
-    def tearDown(self):
-        self.context.cleanup()
 
     def test_prune_removes_only_orphan_chat_state(self):
         removed = recovery_db.prune_orphans(self.container)
@@ -150,6 +150,112 @@ class RecoveryDatabaseTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError) as tools:
             recovery_db.require_compatible_tools(old, DEFAULT_RELEASE_IMAGES["postgres"])
         self.assertIn("cannot restore dump", str(tools.exception))
+
+
+class RecoveryDatabaseEnvironmentTests(unittest.TestCase):
+    def test_successful_recovery_restores_complete_environment(self):
+        observed_docker = []
+
+        class SuccessfulCase(RecoveryDatabaseTests):
+            def runTest(self):
+                observed_docker.append(shutil.which("docker"))
+                self.test_prune_removes_only_orphan_chat_state()
+
+        with patch.dict(os.environ, {
+            "DOCKER_HOST": "unix:///ambient-recovery-test.sock",
+            "COMPOSE_PROJECT_NAME": "ambient-recovery-project",
+            "DOCKER_CONTEXT": "ambient-recovery-context",
+        }):
+            os.environ.pop("FAKE_DOCKER_STATE", None)
+            before = dict(os.environ)
+            result = unittest.TestResult()
+            SuccessfulCase().run(result)
+
+            self.assertTrue(
+                result.wasSuccessful(),
+                f"Recovery lifecycle recorded {len(result.errors)} errors "
+                f"and {len(result.failures)} failures",
+            )
+            self.assertEqual(observed_docker, [str(FAKE_DOCKER)])
+            self.assert_environment_restored(before)
+
+    def test_recovery_body_error_restores_complete_environment(self):
+        observed_docker = []
+
+        class FailingCase(RecoveryDatabaseTests):
+            def runTest(self):
+                observed_docker.append(shutil.which("docker"))
+                raise RuntimeError("recovery-body-error-canary")
+
+        with patch.dict(os.environ, {
+            "DOCKER_HOST": "unix:///ambient-recovery-test.sock",
+            "COMPOSE_PROJECT_NAME": "ambient-recovery-project",
+            "DOCKER_CONTEXT": "ambient-recovery-context",
+        }):
+            os.environ.pop("FAKE_DOCKER_STATE", None)
+            before = dict(os.environ)
+            case = FailingCase()
+            result = unittest.TestResult()
+            case.run(result)
+
+            self.assertEqual(len(result.errors), 1)
+            self.assertEqual(len(result.failures), 0)
+            self.assertTrue(
+                "RuntimeError: recovery-body-error-canary" in result.errors[0][1],
+                "Expected recovery body error was not reported",
+            )
+            self.assertEqual(observed_docker, [str(FAKE_DOCKER)])
+            self.assert_environment_restored(before)
+            self.assertFalse(case.root.exists(), "Failed body retained its temporary root")
+
+    def test_recovery_setup_error_restores_complete_environment(self):
+        observed_docker = []
+        body_ran = []
+
+        class FailingCase(RecoveryDatabaseTests):
+            def runTest(self):
+                body_ran.append(True)
+
+        def failing_seed_images(_state):
+            observed_docker.append(shutil.which("docker"))
+            raise RuntimeError("recovery-setup-error-canary")
+
+        with patch.dict(os.environ, {
+            "DOCKER_HOST": "unix:///ambient-recovery-test.sock",
+            "COMPOSE_PROJECT_NAME": "ambient-recovery-project",
+            "DOCKER_CONTEXT": "ambient-recovery-context",
+        }):
+            os.environ.pop("FAKE_DOCKER_STATE", None)
+            before = dict(os.environ)
+            case = FailingCase()
+            result = unittest.TestResult()
+            with patch.object(sys.modules[__name__], "seed_images", failing_seed_images):
+                case.run(result)
+
+            self.assertEqual(len(result.errors), 1)
+            self.assertEqual(len(result.failures), 0)
+            self.assertTrue(
+                "RuntimeError: recovery-setup-error-canary" in result.errors[0][1],
+                "Expected recovery setup error was not reported",
+            )
+            self.assertEqual(observed_docker, [str(FAKE_DOCKER)])
+            self.assertEqual(body_ran, [])
+            self.assert_environment_restored(before)
+            self.assertFalse(case.root.exists(), "Failed setup retained its temporary root")
+
+    def assert_environment_restored(self, before):
+        after = dict(os.environ)
+        added = sorted(after.keys() - before.keys())
+        removed = sorted(before.keys() - after.keys())
+        changed = sorted(
+            key for key in before.keys() & after.keys()
+            if before[key] != after[key]
+        )
+        self.assertTrue(
+            after == before,
+            f"Environment was not restored: added keys={added}; "
+            f"removed keys={removed}; changed keys={changed}",
+        )
 
 
 if __name__ == "__main__":
