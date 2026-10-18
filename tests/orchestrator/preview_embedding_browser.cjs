@@ -3866,6 +3866,503 @@ async function main() {
       await closeStandalone(pagesSession);
     }
 
+    const fullscreenThemeSession = await openStandalone('/ocu');
+    const themeLabel = 'fullscreen-theme-close-icon';
+    const themeEvidence = {
+      case: themeLabel,
+      browser: browser.version(),
+      themeInput: 'actual parent instance darkMode=auto; real prefers-color-scheme media changes',
+      closed: false,
+    };
+    let themeNodes;
+    const themeCycleNodes = [];
+    let themeFailure;
+    try {
+      await fullscreenThemeSession.page.emulateMedia({ colorScheme: 'light' });
+      await selectStandaloneFile(fullscreenThemeSession.page, 'diagram.drawio');
+      await fullscreenThemeSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      await fullscreenThemeSession.page.evaluate(() => {
+        const originalFactory = GraphViewer.prototype.showLocalLightbox;
+        const ids = new Map();
+        const listeners = parent => {
+          const pairs = [];
+          for (let index = 0; index < (parent.eventListeners || []).length; index += 2) {
+            const callback = parent.eventListeners[index + 1];
+            if (!ids.has(callback)) ids.set(callback, ids.size + 1);
+            pairs.push({ event: parent.eventListeners[index], callback, id: ids.get(callback) });
+          }
+          return pairs;
+        };
+        const describe = pairs => pairs.map(({ event, id }) => ({ event, id }));
+        const state = container => ({
+          connected: container.isConnected,
+          darkClass: container.classList.contains('geDarkMode'),
+          colorScheme: container.style.colorScheme,
+        });
+        const trace = { phase: 'open', calls: [], sentinelEvents: [], children: [], sameParent: true };
+        const observeFactory = function() {
+          if (!trace.parent) {
+            trace.parent = this;
+            trace.parentContainer = this.graph.container;
+            trace.originalMode = this.darkMode;
+          }
+          trace.sameParent = trace.sameParent && trace.parent === this;
+          trace.phase = 'open';
+          // Auto is test input on this instance; production defaults stay untouched.
+          this.darkMode = 'auto';
+          this.darkModeChanged();
+          trace.preexisting = listeners(this);
+          const ui = originalFactory.apply(this, arguments);
+          trace.ui = ui;
+          trace.childContainer = ui.editor.graph.container;
+          trace.afterFactory = listeners(this);
+          trace.owned = trace.afterFactory.filter(pair => pair.event === 'darkModeChanged' &&
+            !trace.preexisting.some(before => before.callback === pair.callback));
+          const child = {
+            ui, container: trace.childContainer, owned: trace.owned,
+            originalSetDarkMode: ui.setDarkMode, calls: [], phase: 'open', retired: false,
+          };
+          trace.children.push(child);
+          trace.calls = child.calls;
+          ui.setDarkMode = function() {
+            child.calls.push({
+              phase: child.phase, dark: arguments[0], receiverIsUi: this === ui,
+            });
+            return child.originalSetDarkMode.apply(this, arguments);
+          };
+          return ui;
+        };
+        trace.markClosed = () => {
+          const child = trace.children.at(-1);
+          child.phase = 'closed';
+          child.retired = true;
+          child.closedCalls = child.calls.length;
+          trace.phase = 'closed';
+        };
+        trace.snapshot = () => {
+          const current = listeners(trace.parent);
+          return {
+            phase: trace.phase,
+            mediaDark: matchMedia('(prefers-color-scheme: dark)').matches,
+            originalMode: trace.originalMode,
+            parent: state(trace.parentContainer),
+            child: state(trace.childContainer),
+            calls: trace.calls.slice(),
+            sentinelEvents: trace.sentinelEvents.slice(),
+            preexisting: describe(trace.preexisting),
+            afterFactory: describe(trace.afterFactory),
+            owned: describe(trace.owned),
+            retainedOwned: describe(current.filter(pair =>
+              trace.owned.some(owned => owned.callback === pair.callback))),
+            unrelated: describe(current.filter(pair =>
+              !trace.owned.some(owned => owned.callback === pair.callback))),
+            current: describe(current),
+            sameParent: trace.sameParent,
+            children: trace.children.map((child, index) => ({
+              index, retired: child.retired, calls: child.calls.slice(),
+              closedCalls: child.closedCalls, container: state(child.container),
+              owned: describe(child.owned),
+              retainedOwned: describe(current.filter(pair =>
+                child.owned.some(owned => owned.callback === pair.callback))),
+            })),
+          };
+        };
+        trace.restore = () => {
+          if (GraphViewer.prototype.showLocalLightbox === observeFactory)
+            GraphViewer.prototype.showLocalLightbox = originalFactory;
+          for (const child of trace.children) child.ui.setDarkMode = child.originalSetDarkMode;
+          if (trace.sentinel) trace.parent.removeListener(trace.sentinel);
+          if (trace.parent) trace.parent.darkMode = trace.originalMode;
+        };
+        trace.restorePrototype = () => {
+          GraphViewer.prototype.showLocalLightbox = originalFactory;
+        };
+        GraphViewer.prototype.showLocalLightbox = observeFactory;
+        window.__drawioThemeTrace = trace;
+      });
+      // The mounted guard captures the factory during construction, so construct a fresh viewer.
+      await selectStandaloneFile(fullscreenThemeSession.page, 'pages.drawio');
+      await fullscreenThemeSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      await selectStandaloneFile(fullscreenThemeSession.page, 'diagram.drawio');
+      await fullscreenThemeSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      const themeOverflow = await fullscreenThemeSession.page.evaluate(() => document.body.style.overflow);
+      await clickViewerToolbar(fullscreenThemeSession, 'Fullscreen');
+      themeNodes = await captureFullscreenNodes(fullscreenThemeSession, 'Local shape');
+      themeEvidence.before = await fullscreenThemeSession.page.evaluate(() => {
+        const trace = window.__drawioThemeTrace;
+        trace.restorePrototype();
+        // Outside the factory window, this listener also witnesses real event delivery.
+        trace.sentinel = () => trace.sentinelEvents.push({
+          phase: trace.phase, dark: trace.parent.isDarkMode(),
+        });
+        trace.parent.addListener('darkModeChanged', trace.sentinel);
+        return trace.snapshot();
+      });
+      assert.equal(themeEvidence.before.owned.length, 1,
+        `${themeLabel}: real factory did not register its single child theme callback`);
+      await fullscreenThemeSession.page.emulateMedia({ colorScheme: 'dark' });
+      await fullscreenThemeSession.page.waitForFunction(() => {
+        const trace = window.__drawioThemeTrace;
+        return trace.calls.some(call => call.dark === true) &&
+          trace.sentinelEvents.some(event => event.dark === true) &&
+          trace.parent.graph.container.classList.contains('geDarkMode') &&
+          trace.childContainer.classList.contains('geDarkMode');
+      });
+      themeEvidence.open = await fullscreenThemeSession.page.evaluate(() => window.__drawioThemeTrace.snapshot());
+      assert.equal(themeEvidence.open.parent.colorScheme, 'dark');
+      assert.equal(themeEvidence.open.child.colorScheme, 'dark');
+      assert(themeEvidence.open.calls.every(call => call.receiverIsUi),
+        `${themeLabel}: actual UI theme calls lost their receiver`);
+      assert.deepEqual(themeEvidence.open.current, themeEvidence.before.current,
+        `${themeLabel}: live media change altered parent callback identities`);
+      await fullscreenThemeSession.page.screenshot({ path: path.join(artifacts, `${themeLabel}-open.png`) });
+      await fullscreenThemeSession.page.locator('body > img.geAdaptiveAsset[style*="position: fixed"]').click();
+      await assertFullscreenRetired(fullscreenThemeSession, themeNodes, themeOverflow, themeLabel);
+      themeEvidence.closed = true;
+      themeEvidence.afterClose = await fullscreenThemeSession.page.evaluate(() => {
+        const trace = window.__drawioThemeTrace;
+        trace.markClosed();
+        return trace.snapshot();
+      });
+      await fullscreenThemeSession.page.emulateMedia({ colorScheme: 'light' });
+      await fullscreenThemeSession.page.waitForFunction(({ calls, events }) => {
+        const trace = window.__drawioThemeTrace;
+        return !matchMedia('(prefers-color-scheme: dark)').matches &&
+          trace.parent.graph.container.style.colorScheme === 'light' &&
+          (trace.sentinelEvents.length > events || trace.calls.length > calls);
+      }, { calls: themeEvidence.afterClose.calls.length, events: themeEvidence.afterClose.sentinelEvents.length });
+      themeEvidence.afterMedia = await fullscreenThemeSession.page.evaluate(() => window.__drawioThemeTrace.snapshot());
+      await fullscreenThemeSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      const themeWidthBefore = await fullscreenThemeSession.page.locator('.drawio-host svg').evaluate(svg =>
+        svg.getBoundingClientRect().width);
+      await clickViewerToolbar(fullscreenThemeSession, 'Zoom In');
+      themeEvidence.parentZoom = {
+        before: themeWidthBefore,
+        after: await fullscreenThemeSession.page.locator('.drawio-host svg').evaluate(svg =>
+          svg.getBoundingClientRect().width),
+      };
+      assert.equal(themeEvidence.afterMedia.calls.length, themeEvidence.afterClose.calls.length,
+        `${themeLabel}: real media event called retired UI.setDarkMode; ` +
+        `calls=${JSON.stringify(themeEvidence.afterMedia.calls)}, ` +
+        `retainedCallbacks=${JSON.stringify(themeEvidence.afterMedia.retainedOwned)}`);
+      assert.deepEqual(themeEvidence.afterMedia.retainedOwned, [],
+        `${themeLabel}: closed UI theme callback remains registered on its parent`);
+      assert.deepEqual(themeEvidence.afterClose.retainedOwned, [],
+        `${themeLabel}: close icon did not release its exact child callback`);
+      assert.deepEqual(themeEvidence.afterMedia.current, themeEvidence.before.unrelated,
+        `${themeLabel}: closing child changed unrelated parent callback identities`);
+      assert.deepEqual(themeEvidence.afterClose.unrelated, themeEvidence.before.unrelated,
+        `${themeLabel}: close icon removed unrelated parent listeners`);
+      assert.equal(themeEvidence.afterMedia.parent.connected, true);
+      assert.equal(themeEvidence.afterMedia.parent.darkClass, false);
+      assert.equal(themeEvidence.afterMedia.parent.colorScheme, 'light');
+      assert.equal(themeEvidence.afterMedia.sentinelEvents.at(-1)?.dark, false,
+        `${themeLabel}: surviving parent listener did not receive the later real media event`);
+      assert(themeEvidence.parentZoom.after > themeEvidence.parentZoom.before,
+        `${themeLabel}: surviving parent toolbar stopped responding`);
+      assert.deepEqual(caseErrors(fullscreenThemeSession), [], `${themeLabel}: unexpected browser errors`);
+      const assertRetiredThemeChildren = (snapshot, label) => {
+        assert.equal(snapshot.sameParent, true, `${label}: fullscreen did not reuse the same parent`);
+        for (const child of snapshot.children.filter(child => child.retired)) {
+          assert.equal(child.calls.length, child.closedCalls,
+            `${label}: later theme event called retired UI ${child.index}: ${JSON.stringify(child)}`);
+          assert.deepEqual(child.retainedOwned, [],
+            `${label}: parent retained retired UI ${child.index}'s exact theme callback`);
+        }
+      };
+      assertRetiredThemeChildren(themeEvidence.afterMedia, themeLabel);
+      themeEvidence.paths = [];
+      for (const [cycle, closePath] of ['Escape', 'backdrop', 'icon', 'Escape', 'backdrop', 'retirement'].entries()) {
+        const label = `fullscreen-theme-${closePath}-${cycle}`;
+        const record = { case: label, closePath };
+        themeEvidence.paths.push(record);
+        await clickViewerToolbar(fullscreenThemeSession, 'Fullscreen');
+        const nodes = await captureFullscreenNodes(fullscreenThemeSession, 'Local shape');
+        themeCycleNodes.push(nodes);
+        record.before = await fullscreenThemeSession.page.evaluate(() => window.__drawioThemeTrace.snapshot());
+        assert.equal(record.before.children.length, cycle + 2, `${label}: unexpected real UI creation count`);
+        assert.equal(record.before.owned.length, 1, `${label}: missing actual child theme subscription`);
+        assertRetiredThemeChildren(record.before, label);
+        assert.deepEqual(record.before.unrelated, themeEvidence.before.unrelated,
+          `${label}: reopening changed unrelated callback identities`);
+        await fullscreenThemeSession.page.emulateMedia({ colorScheme: 'dark' });
+        await fullscreenThemeSession.page.waitForFunction(events => {
+          const trace = window.__drawioThemeTrace;
+          return trace.calls.some(call => call.dark === true) &&
+            trace.sentinelEvents.length > events &&
+            trace.parentContainer.classList.contains('geDarkMode') &&
+            trace.childContainer.classList.contains('geDarkMode');
+        }, record.before.sentinelEvents.length);
+        record.open = await fullscreenThemeSession.page.evaluate(() => window.__drawioThemeTrace.snapshot());
+        assertRetiredThemeChildren(record.open, label);
+        assert.equal(record.open.child.connected, true);
+        assert.equal(record.open.child.colorScheme, 'dark');
+        assert.equal(record.open.parent.colorScheme, 'dark');
+        assert(record.open.calls.every(call => call.receiverIsUi), `${label}: UI theme receiver changed`);
+        assert.deepEqual(record.open.current, record.before.current, `${label}: theme dispatch changed callback identities`);
+        await fullscreenThemeSession.page.screenshot({ path: path.join(artifacts, `${label}-open.png`) });
+        if (closePath === 'Escape') {
+          await fullscreenThemeSession.page.keyboard.press('Escape');
+        } else if (closePath === 'backdrop') {
+          record.hitTarget = await nodes.evaluate(nodes => {
+            const hit = document.elementFromPoint(8, 8);
+            return {
+              x: 8, y: 8,
+              isBackdrop: hit === nodes.find(({ role }) => role === 'backdrop').node,
+              tag: hit?.tagName, className: hit?.className,
+            };
+          });
+          assert.equal(record.hitTarget.isBackdrop, true,
+            `${label}: real pointer target at the visible margin is not the captured backdrop`);
+          await fullscreenThemeSession.page.mouse.click(8, 8);
+        } else if (closePath === 'retirement') {
+          await activateStandaloneFile(fullscreenThemeSession, 'pages.drawio');
+          await fullscreenThemeSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+        } else {
+          await fullscreenThemeSession.page.locator('body > img.geAdaptiveAsset[style*="position: fixed"]').click();
+        }
+        await assertFullscreenRetired(fullscreenThemeSession, nodes, themeOverflow, label);
+        record.afterClose = await fullscreenThemeSession.page.evaluate(() => {
+          const trace = window.__drawioThemeTrace;
+          trace.markClosed();
+          trace.ui.destroy();
+          trace.ui.destroy();
+          return trace.snapshot();
+        });
+        assertRetiredThemeChildren(record.afterClose, label);
+        const totalCalls = record.afterClose.children.reduce((sum, child) => sum + child.calls.length, 0);
+        await fullscreenThemeSession.page.emulateMedia({ colorScheme: 'light' });
+        await fullscreenThemeSession.page.waitForFunction(({ events, calls }) => {
+          const trace = window.__drawioThemeTrace;
+          return !matchMedia('(prefers-color-scheme: dark)').matches &&
+            trace.parentContainer.style.colorScheme === 'light' &&
+            (trace.sentinelEvents.length > events ||
+              trace.children.reduce((sum, child) => sum + child.calls.length, 0) > calls);
+        }, { events: record.afterClose.sentinelEvents.length, calls: totalCalls });
+        record.afterMedia = await fullscreenThemeSession.page.evaluate(() => window.__drawioThemeTrace.snapshot());
+        assertRetiredThemeChildren(record.afterMedia, label);
+        assert.equal(record.afterMedia.parent.darkClass, false);
+        assert.equal(record.afterMedia.parent.colorScheme, 'light');
+        assert.equal(record.afterMedia.sentinelEvents.at(-1)?.dark, false,
+          `${label}: unrelated sentinel did not receive the later media event`);
+        if (closePath === 'retirement') {
+          assert.equal(record.afterMedia.parent.connected, false, `${label}: old preview was not retired`);
+          record.afterParentEvent = await fullscreenThemeSession.page.evaluate(() => {
+            const trace = window.__drawioThemeTrace;
+            trace.parent.fireEvent(new mxEventObject('darkModeChanged'));
+            return trace.snapshot();
+          });
+          assertRetiredThemeChildren(record.afterParentEvent, label);
+          assert.deepEqual(record.afterParentEvent.current, record.afterMedia.current,
+            `${label}: real post-retirement dispatch changed the remaining parent listeners`);
+          assert.deepEqual(record.afterParentEvent.current.filter(pair => pair.event === 'darkModeChanged'),
+            themeEvidence.before.unrelated.filter(pair => pair.event === 'darkModeChanged'),
+            `${label}: retirement removed unrelated theme listeners`);
+          assert.equal(record.afterParentEvent.sentinelEvents.length, record.afterMedia.sentinelEvents.length + 1,
+            `${label}: real old-parent dispatch did not reach the unrelated sentinel`);
+          await clickNextPage(fullscreenThemeSession);
+          await fullscreenThemeSession.page.locator('.drawio-host').getByText('AND', { exact: true }).waitFor();
+          await assertAndGeometry(fullscreenThemeSession, label);
+        } else {
+          assert.equal(record.afterMedia.parent.connected, true);
+          assert.deepEqual(record.afterMedia.current, themeEvidence.before.unrelated,
+            `${label}: closing changed unrelated parent callback identities`);
+          const before = await fullscreenThemeSession.page.locator('.drawio-host svg').evaluate(svg =>
+            svg.getBoundingClientRect().width);
+          await clickViewerToolbar(fullscreenThemeSession, 'Zoom In');
+          record.parentZoom = { before, after: await fullscreenThemeSession.page.locator('.drawio-host svg')
+            .evaluate(svg => svg.getBoundingClientRect().width) };
+          assert(record.parentZoom.after > before, `${label}: parent toolbar stopped responding`);
+        }
+        assert.deepEqual(caseErrors(fullscreenThemeSession), [], `${label}: unexpected browser errors`);
+        await fullscreenThemeSession.page.screenshot({ path: path.join(artifacts, `${label}.png`) });
+      }
+    } catch (error) {
+      themeFailure = error;
+      themeEvidence.failure = String(error);
+      throw error;
+    } finally {
+      themeEvidence.errors = caseErrors(fullscreenThemeSession);
+      const themeCaptureFailures = [];
+      try {
+        themeEvidence.final = await fullscreenThemeSession.page.evaluate(() => {
+          const trace = window.__drawioThemeTrace;
+          return trace?.ui ? trace.snapshot() : null;
+        });
+      } catch (error) { themeCaptureFailures.push(error); }
+      console.log(JSON.stringify(themeEvidence));
+      const captures = await Promise.allSettled([
+        fullscreenThemeSession.page.screenshot({ path: path.join(artifacts, `${themeLabel}.png`) }),
+        fs.writeFile(path.join(artifacts, `${themeLabel}.json`), JSON.stringify(themeEvidence, null, 2) + '\n'),
+      ]);
+      themeCaptureFailures.push(...captures.filter(result => result.status === 'rejected').map(result => result.reason));
+      try {
+        await fullscreenThemeSession.page.evaluate(() => {
+          window.__drawioThemeTrace?.restore();
+          delete window.__drawioThemeTrace;
+        });
+      } catch (error) { themeCaptureFailures.push(error); }
+      try { await themeNodes?.dispose(); }
+      catch (error) { themeCaptureFailures.push(error); }
+      for (const nodes of themeCycleNodes) {
+        try { await nodes.dispose(); }
+        catch (error) { themeCaptureFailures.push(error); }
+      }
+      try { await closeStandalone(fullscreenThemeSession); }
+      catch (error) { themeCaptureFailures.push(error); }
+      for (const error of themeCaptureFailures)
+        console.error(JSON.stringify({ case: themeLabel, artifactOrCleanupFailure: String(error) }));
+      if (!themeFailure && themeCaptureFailures.length) throw themeCaptureFailures[0];
+    }
+
+    const factoryProbeSession = await openStandalone('/ocu');
+    const factoryProbeLabel = 'fullscreen-theme-synthetic-factory-outcomes';
+    const factoryProbeEvidence = { case: factoryProbeLabel, synthetic: true, outcomes: [] };
+    let factoryProbeFailure;
+    try {
+      await selectStandaloneFile(factoryProbeSession.page, 'diagram.drawio');
+      await factoryProbeSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      await factoryProbeSession.page.evaluate(() => {
+        const originalFactory = GraphViewer.prototype.showLocalLightbox;
+        const probe = {
+          mode: 'capture', callbackCalls: 0, sentinelCalls: 0,
+          error: new Error('synthetic vendor factory failure'),
+        };
+        probe.callback = () => { probe.callbackCalls += 1; };
+        const injectedFactory = function() {
+          probe.parent = this;
+          if (probe.mode === 'capture') return null;
+          this.addListener('darkModeChanged', probe.callback);
+          if (probe.mode === 'throw') throw probe.error;
+          return null;
+        };
+        probe.restore = () => {
+          GraphViewer.prototype.showLocalLightbox = originalFactory;
+          if (probe.parent) {
+            if (probe.originalDescriptor)
+              Object.defineProperty(probe.parent, 'addListener', probe.originalDescriptor);
+            else delete probe.parent.addListener;
+            if (probe.sentinel) probe.parent.removeListener(probe.sentinel);
+          }
+        };
+        probe.finishCapture = () => {
+          GraphViewer.prototype.showLocalLightbox = originalFactory;
+          probe.originalDescriptor = Object.getOwnPropertyDescriptor(probe.parent, 'addListener');
+          probe.originalAddListener = probe.parent.addListener;
+          probe.sentinel = () => { probe.sentinelCalls += 1; };
+          probe.parent.addListener('darkModeChanged', probe.sentinel);
+          return {
+            canonicalWrapper: probe.parent.showLocalLightbox !== injectedFactory &&
+              probe.parent.showLocalLightbox !== originalFactory,
+            inheritedMethod: !probe.originalDescriptor,
+          };
+        };
+        GraphViewer.prototype.showLocalLightbox = injectedFactory;
+        window.__drawioFactoryProbe = probe;
+      });
+      await selectStandaloneFile(factoryProbeSession.page, 'pages.drawio');
+      await factoryProbeSession.page.locator('.drawio-host').getByText('Page one', { exact: true }).waitFor();
+      await selectStandaloneFile(factoryProbeSession.page, 'diagram.drawio');
+      await factoryProbeSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      await clickViewerToolbar(factoryProbeSession, 'Fullscreen');
+      factoryProbeEvidence.capture = await factoryProbeSession.page.evaluate(() =>
+        window.__drawioFactoryProbe.finishCapture());
+      assert.equal(factoryProbeEvidence.capture.canonicalWrapper, true,
+        `${factoryProbeLabel}: injected dependency bypassed the actual OCU wrapper`);
+      assert.equal(factoryProbeEvidence.capture.inheritedMethod, true,
+        `${factoryProbeLabel}: bootstrap left the parent's temporary method shadow installed`);
+      for (const propertyState of ['inherited', 'own']) {
+        for (const outcome of ['throw', 'null']) {
+          const result = await factoryProbeSession.page.evaluate(({ propertyState, outcome }) => {
+            const probe = window.__drawioFactoryProbe;
+            const parent = probe.parent;
+            if (propertyState === 'own') {
+              Object.defineProperty(parent, 'addListener', {
+                configurable: true, enumerable: true, writable: false, value: probe.originalAddListener,
+              });
+            } else {
+              delete parent.addListener;
+            }
+            const descriptor = Object.getOwnPropertyDescriptor(parent, 'addListener');
+            const before = (parent.eventListeners || []).slice();
+            const sentinelCalls = probe.sentinelCalls;
+            probe.mode = outcome;
+            let returned;
+            let caught;
+            let threw = false;
+            try { returned = parent.showLocalLightbox(); }
+            catch (error) { threw = true; caught = error; }
+            const restored = Object.getOwnPropertyDescriptor(parent, 'addListener');
+            const methodRestored = parent.addListener === probe.originalAddListener &&
+              (descriptor ? restored?.value === descriptor.value &&
+                restored?.configurable === descriptor.configurable &&
+                restored?.enumerable === descriptor.enumerable &&
+                restored?.writable === descriptor.writable : restored === undefined);
+            parent.fireEvent(new mxEventObject('darkModeChanged'));
+            const after = parent.eventListeners || [];
+            return {
+              propertyState, outcome, threw,
+              exactOriginalError: caught === probe.error,
+              unexpectedError: threw && caught !== probe.error ? String(caught) : null,
+              returned: returned === null ? 'null' : typeof returned,
+              methodRestored,
+              unrelatedListenersUnchanged: before.length === after.length &&
+                before.every((value, index) => value === after[index]),
+              capturedCallbackRetained: after.includes(probe.callback),
+              capturedCallbackCalls: probe.callbackCalls,
+              sentinelDeliveries: probe.sentinelCalls - sentinelCalls,
+            };
+          }, { propertyState, outcome });
+          factoryProbeEvidence.outcomes.push(result);
+          assert.equal(result.unexpectedError, null, `${factoryProbeLabel}: unexpected setup error`);
+          assert.equal(result.threw, outcome === 'throw',
+            `${factoryProbeLabel}: factory throw/return outcome was not preserved`);
+          assert.equal(result.exactOriginalError, outcome === 'throw',
+            `${factoryProbeLabel}: factory exception identity was not preserved`);
+          if (outcome !== 'throw') assert.equal(result.returned, outcome,
+            `${factoryProbeLabel}: no-UI factory return was not preserved`);
+          assert.equal(result.methodRestored, true,
+            `${factoryProbeLabel}: ${propertyState} addListener property state was not restored`);
+          assert.equal(result.unrelatedListenersUnchanged, true,
+            `${factoryProbeLabel}: ${outcome} changed unrelated parent callback identities`);
+          assert.equal(result.capturedCallbackRetained, false,
+            `${factoryProbeLabel}: ${outcome} retained its captured theme callback`);
+          assert.equal(result.capturedCallbackCalls, 0,
+            `${factoryProbeLabel}: post-${outcome} parent event reached the abandoned callback`);
+          assert.equal(result.sentinelDeliveries, 1,
+            `${factoryProbeLabel}: ${outcome} disabled unrelated theme delivery`);
+          assert.equal(await factoryProbeSession.page.locator('body > .geDiagramContainer').count(), 0,
+            `${factoryProbeLabel}: synthetic no-UI outcome mounted a popup`);
+        }
+      }
+      await factoryProbeSession.page.locator('.drawio-host').getByText('Local shape', { exact: true }).waitFor();
+      assert.deepEqual(caseErrors(factoryProbeSession), [], `${factoryProbeLabel}: unexpected browser errors`);
+    } catch (error) {
+      factoryProbeFailure = error;
+      factoryProbeEvidence.failure = String(error);
+      throw error;
+    } finally {
+      factoryProbeEvidence.errors = caseErrors(factoryProbeSession);
+      console.log(JSON.stringify(factoryProbeEvidence));
+      const captures = await Promise.allSettled([
+        factoryProbeSession.page.screenshot({ path: path.join(artifacts, `${factoryProbeLabel}.png`) }),
+        fs.writeFile(path.join(artifacts, `${factoryProbeLabel}.json`),
+          JSON.stringify(factoryProbeEvidence, null, 2) + '\n'),
+      ]);
+      const failures = captures.filter(result => result.status === 'rejected').map(result => result.reason);
+      try {
+        await factoryProbeSession.page.evaluate(() => {
+          window.__drawioFactoryProbe?.restore();
+          delete window.__drawioFactoryProbe;
+        });
+      } catch (error) { failures.push(error); }
+      try { await closeStandalone(factoryProbeSession); }
+      catch (error) { failures.push(error); }
+      for (const error of failures)
+        console.error(JSON.stringify({ case: factoryProbeLabel, artifactOrCleanupFailure: String(error) }));
+      if (!factoryProbeFailure && failures.length) throw failures[0];
+    }
+
     const fullscreenSelectionSession = await openStandalone('/ocu');
     let oldFullscreenNodes;
     try {
