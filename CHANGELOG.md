@@ -3,6 +3,12 @@
 ## Unreleased — `main` branch
 
 ### Fixed
+- **Output test-fixture prefix isolation.** An unset prefix selection removes
+  inherited configuration before app import, including invalid inherited values.
+  Explicit empty, explicit `/ocu` and default modes retain their route and URL
+  behavior. Full environment contents and selected module keys/object identities
+  are restored after normal and failing contexts. Production behavior is unchanged.
+
 - **Bounded non-Office HTTP test origins.** Tool redirect, font archive, deployment
   smoke fixture/control, initializer fake WebUI and native HTTP/TTY fixtures share
   the canonical socket/worker lifetime. Partial input and controlled holds retire
