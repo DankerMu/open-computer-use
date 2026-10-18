@@ -29,6 +29,11 @@
 ## Unreleased — `next/v1` branch
 
 ### Fixed
+- **Office bookmark navigation.** Ordinary and already-prefixed DOCX bookmarks
+  navigate to their sanitized local targets in embedded and standalone previews.
+  Malformed fragments and missing or document-global-only targets have no active
+  link destination.
+
 - **Owned Docker-manager test data.** Standalone credential-injection tests keep
   metadata inside a private temporary root without a caller `BASE_DATA_DIR`.
   Cleanup restores prior environment and cached-root state and retires only
