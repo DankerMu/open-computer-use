@@ -132,6 +132,41 @@ entry; a healthy auto-selected backend run does not prove held-threaded-DNS
 behavior. The scheduling allowance is not a production timeout or SLA, and
 worker draining supplies neither forced thread termination nor a shutdown deadline.
 
+### HTTP test-origin ownership
+
+`orchestrator/_http_origin.py` owns the Office origins, tool redirect origin
+(`test_tools.py`), font archive origin (`deploy/support.py`), deployment smoke
+fixture and control listeners (`deploy/test_deployment_smoke.py`), initializer
+fake WebUI (`deploy/test_init_wrapper.py`) and native HTTP/TTY fixtures
+(`deploy/test_smoke_native.py`).
+
+Owner exit retires admitted workers and accepted/listening sockets within a finite
+per-origin bound, or reports teardown failure. Register each acquired owner's
+cleanup immediately, including reservation sockets before bind and temporary
+directories before subsequent setup. Cleanup failure must not bypass other owners.
+Controlled holds observe cancellation; initializer cancellation preserves
+caller-owned marker files. Handler and body failures remain visible together.
+Expected disconnects are classified only at actual transport operations, including
+socket timeout configuration, not by swallowing responder exceptions.
+
+Run the shared lifetime and affected consumer scope from the repository root:
+
+```bash
+uv run --python 3.12 --no-project --with pytest \
+  --with-requirements computer-use-server/requirements.txt -- \
+  python -m pytest tests/ -q \
+  --import-mode=importlib --ignore=tests/integration \
+  -k 'test_office_commands.py or test_office_router.py or test_office_callback_processing.py or test_office_download.py or test_http_origin.py or test_office_http_holders.py or test_tools.py or test_http_origin_consumers.py or test_deployment_smoke.py or test_init_wrapper.py or test_smoke_native.py or test_prepare_fonts.py or test_offline_release.py'
+```
+
+Use the same Python dependencies for deploy unittest discovery and direct-script
+entrypoints. The deployment control cases require free loopback ports 8081/8080/8082;
+do not stop unrelated services to obtain them. Retirement assertions observe real
+resources before emergency client closure, marker removal or worker joins.
+Local verification uses Python 3.12 on Darwin/arm64 with loopback fixtures, not real
+Docker or LAN deployments. This selected scope does not establish Linux/amd64
+behavior, full repository coverage or forced termination of uncooperative threads.
+
 ## Test Scripts
 
 | Script | What it validates | Docker required |

@@ -16,7 +16,6 @@ import socket
 import threading
 import time
 import types
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import asynccontextmanager, contextmanager
 
 import pytest
@@ -28,10 +27,15 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from pathlib import Path
 
+
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "openwebui" / "tools"))
 SERVER_DIR = ROOT / "computer-use-server"
 sys.path.insert(0, str(SERVER_DIR))
+
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler  # noqa: E402
 
 
 import computer_use_tools  # noqa: E402
@@ -537,7 +541,7 @@ class _LocalOrigin:
         self._responder = responder
         owner = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(OriginRequestHandler):
             def do_GET(self):
                 self._respond()
 
@@ -571,32 +575,18 @@ class _LocalOrigin:
             def log_message(self, format, *args):
                 return
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(
-            target=self._server.serve_forever, daemon=True
-        )
-
-    def start(self):
-        self._thread.start()
-
-    def stop(self):
-        self._server.shutdown()
-        self._server.server_close()
-        self._thread.join(timeout=5)
+        self._lifetime = HttpOriginLifetime(Handler)
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        return self._lifetime.url
 
 
 @contextmanager
 def _local_origin(responder):
     origin = _LocalOrigin(responder)
-    origin.start()
-    try:
+    with origin._lifetime:
         yield origin
-    finally:
-        origin.stop()
 
 
 def _redirect_to(target):

@@ -15,7 +15,6 @@ import sys
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from support import (
     CONTROL_NETWORK,
@@ -33,6 +32,8 @@ from support import (
     write_ps,
     write_sandbox_terminal,
 )
+
+from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
 
 DESTRUCTIVE = ("network rm", "network disconnect", "compose down", " rm -f", " container rm", "compose up")
 CHAT = "smoke-chat"
@@ -124,7 +125,7 @@ def control_container(cid, name, service, address):
 
 
 
-class OkHandler(BaseHTTPRequestHandler):
+class OkHandler(OriginRequestHandler):
     def log_message(self, format, *args):  # noqa: A003
         del format, args
 
@@ -132,7 +133,7 @@ class OkHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
-class FixtureHandler(BaseHTTPRequestHandler):
+class FixtureHandler(OriginRequestHandler):
     def log_message(self, format, *args):  # noqa: A003
         del format, args
 
@@ -162,7 +163,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.send_header("Sec-WebSocket-Protocol", "tty")
             self.end_headers()
             self.server.ws_started.set()
-            self.connection.settimeout(4)
+            self.set_connection_timeout(4)
             try:
                 frame = self.rfile.read(2)
                 if len(frame) != 2 or frame[0] != 0x81 or not frame[1] & 0x80:
@@ -185,7 +186,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 if self.server.ws_mode == "drop":
                     return
                 self.server.ws_hold.wait(timeout=15)
-            except (OSError, ValueError):
+            except (TimeoutError, ValueError):
                 return
             return
         self.server.record.append(("GET", self.path, dict(self.headers)))
@@ -212,10 +213,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.server.start_entered.set()
             if self.server.start_mode == "delayed":
                 self.server.start_release.wait(timeout=7)
-            try:
-                self._json({"started": True})
-            except OSError:
-                pass
+            self._json({"started": True})
             return
         if self.path.endswith("/stop-ttyd"):
             self.server.stopped.set()
@@ -240,72 +238,55 @@ class FixtureHandler(BaseHTTPRequestHandler):
 class OverlaySmokeCliTests(unittest.TestCase):
     def setUp(self):
         self.context = tmp_dir()
+        self.addCleanup(self.context.cleanup)
         self.state = Path(self.context.name)
         write_network(self.state, CONTROL_NETWORK, subnet="172.30.0.0/24", gateway="172.30.0.1")
         write_network(self.state, SANDBOX_NETWORK, subnet="172.31.0.0/24", gateway="172.31.0.1")
         self.env = smoke_env(self.state)
         self.former_reservation = socket.socket()
+        self.addCleanup(self.former_reservation.close)
         self.former_reservation.bind(("127.0.0.1", 0))
         self.env["OCU_SMOKE_FORMER_URL"] = f"127.0.0.1:{self.former_reservation.getsockname()[1]}"
         self.documentserver_reservation = socket.socket()
+        self.addCleanup(self.documentserver_reservation.close)
         self.documentserver_reservation.bind(("127.0.0.1", 0))
         self.env["OCU_SMOKE_DOCUMENTSERVER_URL"] = (
             f"127.0.0.1:{self.documentserver_reservation.getsockname()[1]}")
         self.env["OCU_SMOKE_HOST_LAN_IPV4"] = "127.0.0.1"
         self.http = None
-        self.thread = None
-        self.control = []
 
-    def tearDown(self):
-        if self.http is not None:
-            self.http.ws_hold.set()
-            self.http.start_release.set()
-            self.http.stop_release.set()
-            self.http.shutdown()
-            self.http.server_close()
-        if self.thread is not None:
-            self.thread.join(timeout=2)
-        for server, thread in self.control:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-        if self.former_reservation is not None:
-            self.former_reservation.close()
-        if self.documentserver_reservation is not None:
-            self.documentserver_reservation.close()
-        self.context.cleanup()
 
     def start_control_listeners(self):
         for port in (8081, 8080, 8082):
             address = "127.0.0.1"
             try:
-                server = ThreadingHTTPServer((address, port), OkHandler)
+                lifetime = HttpOriginLifetime(OkHandler, bind_address=(address, port))
             except OSError as exc:
                 reason = "is occupied" if exc.errno == errno.EADDRINUSE else "cannot be bound"
                 self.fail(f"{address}:{port} {reason}; CLI smoke requires this listener ({exc})")
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            self.control.append((server, thread))
+            self.addCleanup(lifetime.stop)
 
     def start_http(self, *, start_mode="ok", stop_mode="ok", ws_mode="ok"):
         self.start_control_listeners()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+        lifetime = HttpOriginLifetime(FixtureHandler)
+        self.addCleanup(lifetime.stop)
+        server = lifetime.server
         server.record = []
         server.start_mode = start_mode
         server.stop_mode = stop_mode
         server.ws_mode = ws_mode
         server.ws_hold = threading.Event()
+        lifetime.release_on_close(server.ws_hold)
         server.ws_started = threading.Event()
         server.ws_init = threading.Event()
         server.start_entered = threading.Event()
         server.start_release = threading.Event()
+        lifetime.release_on_close(server.start_release)
         server.stop_release = threading.Event()
+        lifetime.release_on_close(server.stop_release)
         server.stopped = threading.Event()
         server.terminal_path = self.state / "sandbox-terminal.json"
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
         self.http = server
-        self.thread = thread
         port = server.server_address[1]
         self.former_reservation.close()
         self.former_reservation = None

@@ -3,6 +3,15 @@
 ## Unreleased — `main` branch
 
 ### Fixed
+- **Bounded non-Office HTTP test origins.** Tool redirect, font archive, deployment
+  smoke fixture/control, initializer fake WebUI and native HTTP/TTY fixtures share
+  the canonical socket/worker lifetime. Partial input and controlled holds retire
+  before successful owner exit; setup or cleanup failure cannot strand earlier
+  owners, reservations or temporary roots. Handler/body failures remain visible,
+  initializer cancellation preserves caller markers, and redirect/security, font
+  bytes, fixed control ports and TTY assertions remain intact. Production behavior
+  is unchanged.
+
 - **Main CI root-module coverage.** The non-image pytest job runs the complete
   `tests/test_upload_claim.py` and `tests/test_tools.py` modules in one invocation,
   separate from orchestrator collection. A failure in either module fails the
