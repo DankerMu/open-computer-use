@@ -48,3 +48,35 @@ def test_cli_fixture_restores_caller_module_identities_after_normal_exit(monkeyp
             for name in owned_modules:
                 sys.modules.pop(name, None)
             sys.modules.update(snapshot)
+
+
+def test_cli_fixture_leaves_owned_modules_absent_when_absent_at_entry(monkeypatch):
+    owned_modules = ("cli_runtime", "docker_manager", "outputs_broker")
+    snapshot = {name: sys.modules[name] for name in owned_modules
+                if name in sys.modules}
+    lifecycle = None
+    try:
+        for name in owned_modules:
+            sys.modules.pop(name, None)
+        assert all(name not in sys.modules for name in owned_modules)
+
+        lifecycle = cli_tests._clean_subagent_env.__wrapped__(monkeypatch)
+        next(lifecycle)
+        for name in owned_modules:
+            importlib.import_module(name)
+        assert all(name in sys.modules for name in owned_modules)
+        with pytest.raises(StopIteration):
+            next(lifecycle)
+
+        for name in owned_modules:
+            assert name not in sys.modules, (
+                f"CLI fixture left newly imported module {name} behind"
+            )
+    finally:
+        try:
+            if lifecycle is not None:
+                lifecycle.close()
+        finally:
+            for name in owned_modules:
+                sys.modules.pop(name, None)
+            sys.modules.update(snapshot)
