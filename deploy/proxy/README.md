@@ -179,11 +179,13 @@ private nginx error log is expected at `runtime/error.log` beside the JSONL
 record's parent directory. Transport-drop and malformed-response hooks exist
 only in the loopback fixture.
 
-The existing WebUI stub reflects Authorization in `X-Echo-Authorization` on
-responses. It cannot prove token-response containment and must not be hidden
-with a stub-specific proxy workaround. A separate real WebUI harness plus that
-stub launch through `scripts/proxy-dev.sh` is parent-owned; issue 23 fixes the
-stub and adds permanent make smoke-proxy/CI against the frozen OCU commit.
+The WebUI stub intentionally reflects Authorization in `X-Echo-Authorization`
+only on `/internal/*` observation routes; public fixture responses do not echo
+Authorization. The stub alone is not end-to-end token-containment proof, and
+a stub-specific proxy workaround must not conceal a leak. The integrated
+real-WebUI/proxy/stub path is delivered as WebUI's permanent `make smoke-proxy`
+target and is wired into its CI against the pinned OCU checkout. It checks
+response token containment and rejects public `X-Echo-Authorization` headers.
 The issuer/verifier fixture uses explicitly synthetic two-component grants,
 not signing, expiry, revocation storage or actual WebUI user sessions. It proves
 the gateway's interface and authority separation, not real issuance, confined
