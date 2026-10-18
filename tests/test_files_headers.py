@@ -14,6 +14,8 @@ from urllib.parse import unquote
 
 import pytest
 
+from tests.file_route_module_ownership import isolated_file_route_modules
+
 SERVER_DIR = Path(__file__).resolve().parents[1] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
@@ -28,33 +30,18 @@ XML_MIME_TYPES = ("text/xml", "application/xml")
 @pytest.fixture
 def app_module(monkeypatch):
     """Import the guarded app after setting the service credentials."""
-    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
-    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
-    monkeypatch.setenv("OCU_WEBUI_ORIGIN", "https://webui.example")
-    monkeypatch.setenv("OCU_SANDBOX_SUBNET", "10.90.0.0/24")
-    monkeypatch.setenv("SINGLE_USER_MODE", "true")
-    monkeypatch.setenv("PUBLIC_BASE_URL", "http://ocu.example")
-    monkeypatch.setenv("BASE_DATA_DIR", "/tmp/ocu-files-headers-unused")
+    with isolated_file_route_modules():
+        monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+        monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
+        monkeypatch.setenv("OCU_WEBUI_ORIGIN", "https://webui.example")
+        monkeypatch.setenv("OCU_SANDBOX_SUBNET", "10.90.0.0/24")
+        monkeypatch.setenv("SINGLE_USER_MODE", "true")
+        monkeypatch.setenv("PUBLIC_BASE_URL", "http://ocu.example")
+        monkeypatch.setenv("BASE_DATA_DIR", "/tmp/ocu-files-headers-unused")
 
-    for name in list(sys.modules):
-        if name in {
-            "app",
-            "auth_guard",
-            "mcp_tools",
-            "docker_manager",
-            "outputs_broker",
-            "context_vars",
-            "security",
-            "system_prompt",
-            "skill_manager",
-            "file_response",
-            "descriptor_io",
-        } or name.startswith("mcp_resources"):
-            sys.modules.pop(name, None)
+        import app as loaded
 
-    import app as loaded
-
-    return loaded
+        yield loaded
 
 
 @pytest.fixture

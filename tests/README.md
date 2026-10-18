@@ -73,6 +73,21 @@ This local selected scope does not establish deep restoration of module internal
 real Docker or LAN behavior, or full repository coverage. The path-traversal
 consumer retains its explicit empty-prefix configuration and security assertions.
 
+### File-route fixture module ownership
+
+`test_file_response.py::workspace` and `test_files_headers.py::app_module` share
+`file_route_module_ownership.py::isolated_file_route_modules` for their temporary
+app-import cache family, including the coupled `uploads` module. Receipt producers
+and the app share the active descriptor exception class. Cleanup retires replacement
+modules and restores exact entry objects or entry absence after normal completion,
+test-body failure, or setup failure after eviction.
+
+`test_file_route_module_ownership.py` covers both owners with present and absent
+entry modules. Restoration assertions run after actual pytest fixture teardown and
+before emergency cleanup. The workspace coherence regression checks producer/app
+exception identity inside the live fixture; `test_upload_claim.py` retains its
+nominal receipt exception and committed-write assertions.
+
 ### Main CI root-module coverage
 
 The main build workflow's non-image `pytest-orchestrator` job runs both complete
