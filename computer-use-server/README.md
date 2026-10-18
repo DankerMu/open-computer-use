@@ -256,23 +256,26 @@ successful response or a fabricated rollback.
 - `POST /mcp` — MCP Streamable HTTP endpoint (main interface)
 
 ### Files
-- `GET /files/{chat_id}/{filename}` — Serves output files. Non-download HTML,
+- `GET/HEAD /files/{chat_id}/{filename}` — Serves output files. Non-download HTML,
   SVG, XHTML, and XML responses are isolated with
   `Content-Security-Policy: sandbox allow-scripts allow-forms`,
   `X-Content-Type-Options: nosniff`, and Starlette
   framework-encoded inline disposition (RFC 5987 `filename*` for encoded names).
   `?download=1` still forces
-  `attachment`. Every successful file GET, inline or forced download, carries
+  `attachment`. Every successful file GET or HEAD, inline or forced download, carries
   exactly one `Cache-Control: no-store` header. The SPA HTML renderer uses the
   same sandbox tokens on `srcdoc` and `src` iframes and does not add
   `allow-same-origin`.
-  Payload bytes and Content-Length/ETag/Last-Modified come from the same securely
+  GET payload bytes and Content-Length/ETag/Last-Modified come from the same securely
   opened workspace descriptor. Reads use bounded chunks; path replacements cannot
   redirect the stream. Safely resolved in-root aliases retain target naming/MIME.
   The response owns acquisition through completion, failure or disconnect and
   waits for active reads before closing. Same-inode writes are not snapshots.
-  The pinned stack rejects HEAD with405 and ignores Range, returning the full file.
-- `GET /files/{chat_id}/archive` — Download visible regular workspace files as ZIP.
+  Successful ordinary-file HEAD returns 200 with GET-equivalent relevant headers,
+  no response body and no payload reads. Range is ignored for GET, which returns
+  the full file representation.
+- `GET /files/{chat_id}/archive` — GET-only ZIP download of visible regular workspace
+  files; HEAD returns 405.
   Hidden path components are excluded. Payload reads reject symlinks at the chat
   root, outputs root, ancestors and leaves, including in-tree aliases. Each member
   transfers from one verified descriptor to its ZIP entry in fixed 1 MiB chunks
