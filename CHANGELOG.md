@@ -3,6 +3,9 @@
 ## Unreleased — `main` branch
 
 ### Fixed
+- **Lifecycle test runner cleanup.** Removed unused machine-specific lifecycle test
+  runner declarations; subprocess behavior is unchanged.
+
 - **Output test-fixture prefix isolation.** An unset prefix selection removes
   inherited configuration before app import, including invalid inherited values.
   Explicit empty, explicit `/ocu` and default modes retain their route and URL

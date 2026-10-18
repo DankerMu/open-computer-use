@@ -35,22 +35,6 @@ CHAT_B = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
 STOPPED_MESSAGE = "workspace is stopped and needs an explicit launch"
 NEVER_CREATED = "never_created"
 MIGRATION_REQUIRED = "migration_required"
-UV = "/Users/danker/.local/bin/uv"
-PYTEST_PREFIX = [
-    UV,
-    "run",
-    "--no-project",
-    "--python",
-    "3.12",
-    "--with",
-    "pytest",
-    "--with-requirements",
-    str(SERVER_DIR / "requirements.txt"),
-    "--",
-    "python",
-    "-m",
-    "pytest",
-]
 
 
 import docker as docker_sdk
