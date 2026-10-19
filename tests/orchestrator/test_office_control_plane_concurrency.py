@@ -12,9 +12,29 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from tests.orchestrator._office_store import _MARKER_WRITER
 from tests.orchestrator.test_office_control_plane import _callback_path, _header_jwt, _open_session
 from tests.orchestrator.test_office_sessions import SERVER_DIR, office_world as office_world
 from tests.orchestrator.test_outputs_endpoint import CHAT
+
+
+_PROCESS_HOLDER = _MARKER_WRITER + r'''
+import os
+import time
+from pathlib import Path
+import docker_manager
+
+chat = os.environ["OCU_CHAT"]
+release = Path(os.environ["RELEASE"])
+deadline = time.monotonic() + 8
+with docker_manager._combined_lock(chat):
+    _publish_marker(Path(os.environ["ENTERED"]), "held")
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+print("released")
+'''
 
 
 def _hold_chat_lock(docker, chat, held, release, expired, timeout=10):
@@ -118,23 +138,6 @@ def test_callback_waits_for_ordinary_process_holder_while_health_progresses(offi
             "RELEASE": str(release_path),
         }
     )
-    holder_source = r'''
-import os
-import time
-from pathlib import Path
-import docker_manager
-
-chat = os.environ["OCU_CHAT"]
-release = Path(os.environ["RELEASE"])
-deadline = time.monotonic() + 8
-with docker_manager._combined_lock(chat):
-    Path(os.environ["ENTERED"]).write_text("held", encoding="utf-8")
-    while not release.exists():
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(0.01)
-print("released")
-'''
     original_lock = docker._combined_lock
     original_flock = None
     health_progress = threading.Event()
@@ -197,7 +200,7 @@ print("released")
     watching = threading.Thread(target=watchdog, daemon=True)
     try:
         holder = subprocess.Popen(
-            [sys.executable, "-c", holder_source],
+            [sys.executable, "-c", _PROCESS_HOLDER],
             cwd=str(SERVER_DIR),
             env=env,
             text=True,

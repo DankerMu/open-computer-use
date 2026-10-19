@@ -12,7 +12,8 @@ import sys
 
 import pytest
 
-from tests.orchestrator._office_store import _MARKER_WRITER, _stop_child
+from tests.orchestrator._office_store import CHAT, SERVER_DIR, _MARKER_WRITER, _stop_child
+from tests.orchestrator.test_office_control_plane_concurrency import _PROCESS_HOLDER
 
 
 _HELD_IO = r'''
@@ -25,14 +26,29 @@ def held():
     print("opened", flush=True)
     assert sys.stdin.readline() == "release\n"
 
+marker_parent, marker_name = os.path.split(sys.argv[1])
+
+def marker_open(path):
+    # Integer fds (os.fdopen) and unrelated paths, such as lock files, pass through.
+    if not isinstance(path, (str, os.PathLike)):
+        return False
+    path = os.fspath(path)
+    if not isinstance(path, str):
+        return False
+    parent, name = os.path.split(path)
+    return parent == marker_parent and (
+        name == marker_name or name.startswith("." + marker_name + "."))
+
 def opened(*args, **kwargs):
     fd = test_open(*args, **kwargs)
-    held()
+    if marker_open(args[0]):
+        held()
     return fd
 
 def text_opened(*args, **kwargs):
     stream = test_text_open(*args, **kwargs)
-    held()
+    if marker_open(args[0]):
+        held()
     return stream
 
 def short_write(fd, body):
@@ -66,6 +82,48 @@ def test_incomplete_marker_is_not_ready_then_publishes_exact_text(tmp_path, writ
         assert child.returncode == 0, (out, err)
         assert marker.read_text() == "retirement-durability-after"
         assert set(tmp_path.iterdir()) == {marker}
+    finally:
+        _stop_child(child)
+
+
+def test_process_holder_entered_marker_is_absent_until_complete(tmp_path):
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    entered = markers / "callback-process-entered"
+    release_path = tmp_path / "callback-process-release"
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH", "")
+    env.update(
+        {
+            "PYTHONPATH": str(SERVER_DIR) + (os.pathsep + pythonpath if pythonpath else ""),
+            "BASE_DATA_DIR": str(tmp_path / "data"),
+            "OCU_CHAT": CHAT,
+            "ENTERED": str(entered),
+            "RELEASE": str(release_path),
+        }
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", _HELD_IO + _PROCESS_HOLDER, str(entered), "held", "1"],
+        cwd=str(SERVER_DIR), env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        readable, _, _ = select.select([child.stdout], [], [], 5)
+        assert readable, "process holder did not reach the held-open boundary"
+        assert os.read(child.stdout.fileno(), 7) == b"opened\n"
+        assert not entered.exists(), "an incomplete holder marker must not satisfy readiness"
+        stages = list(markers.iterdir())
+        assert len(stages) == 1
+        stage = stages[0]
+        assert stage.name.startswith(".callback-process-entered.") and stage.suffix == ".stage"
+        assert stage.read_bytes() == b""
+        assert stat.S_IMODE(stage.stat().st_mode) == 0o600
+        release_path.write_text("release", encoding="utf-8")
+        out, err = child.communicate("release\n", timeout=10)
+        assert child.returncode == 0, (out, err)
+        assert out == "released\n"
+        assert entered.read_text(encoding="utf-8") == "held"
+        assert set(markers.iterdir()) == {entered}
     finally:
         _stop_child(child)
 
