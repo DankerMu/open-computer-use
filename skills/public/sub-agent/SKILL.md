@@ -99,7 +99,7 @@ sub_agent(
 You are a Python debugging specialist fixing a broken test suite after a refactor.
 
 ## DIRECTIVE
-Run `pytest tests/orchestrator/` and fix every failing test until the suite is green.
+Run `python -m pytest tests/orchestrator/` and fix every failing test until the suite is green.
 The refactor renamed `SkillStore` → `SkillManager`; most failures are stale imports
 and fixture mocks that still reference the old name.
 
