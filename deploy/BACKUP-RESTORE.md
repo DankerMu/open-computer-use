@@ -95,9 +95,16 @@ The post-activation smoke derives its Compose font input from the selected
 `OCU_RELEASE_MANIFEST` itself, overriding stale inherited values. No additional
 stored setting or manual font export is required for `deploy/smoke.sh`.
 
-Backup compares Docker's actual `Image` configuration digest with the inventory, independently of the launch reference in `Config.Image`. Sandbox attribution requires the producer's canonical name, required labels, and exact volume/bind mount types, paths, destinations, and access modes. Every discovered sandbox is checked before stopping any writer, then checked again after admission shutdown.
+Backup checks Docker's actual container `Image` against the selected release's configuration digest and archive-verified descriptor identities, independently of the launch reference in `Config.Image`. A container and its local reference may use different accepted engine representations. A foreign actual image refuses before any writer is stopped. Source, font, service, project, data environment and mount checks remain mandatory. Sandbox attribution requires the producer's canonical name, required labels, and exact volume/bind mount types, paths, destinations, and access modes. Every discovered sandbox is checked before stopping any writer, then checked again after admission shutdown.
 
 An interrupted activation can resume only its recorded selected-source publication. A private receipt binds the target directory identity, complete retained inventory, selected-source location, and random ownership token; the imported tree carries the matching marker from before publication. Pre-existing unowned directories, symlinks, and altered inventories are refused without overwriting the restored target. Keep these ownership records with the restored target when retrying the same delivery.
+
+Retained format2 contract1 releases remain selectable only with config-only image
+records and matching bundled source1. Contract2 supports verified descriptor
+identities as well as config-only records. Contract1 descriptor fields, unknown
+contracts and mismatched bundled readers refuse before load or activation.
+See the [local engine/store qualification matrix](production-like-test/NETWORK-HARDENING.md#qualified-local-image-identity-paths)
+for release-transport limits; these do not certify a real recovery drill.
 
 An existing checkout without this publication's ownership receipt is not adopted, even if its commit and image references match. Retry requires the original complete delivery inventory, not merely matching tags.
 

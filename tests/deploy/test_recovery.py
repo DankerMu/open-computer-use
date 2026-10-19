@@ -42,6 +42,7 @@ from support import (
     write_font_pin,
     write_installed_fonts,
     write_image_archive,
+    write_hybrid_image_archive,
     write_inventory,
     write_network,
 )
@@ -553,6 +554,45 @@ recovery_resources.time = SimpleNamespace(
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(path.read_bytes(), before)
         self.assertFalse((self.state / "stopped.log").exists())
+    def test_verified_container_manifest_and_live_index_identities_allow_backup(self):
+        inventory_path = Path(self.env["OCU_RELEASE_MANIFEST"])
+        inventory = json.loads(inventory_path.read_text())
+        images_path = self.state / "images.json"
+        images = json.loads(images_path.read_text())
+        manifests = {}
+        for role, record in inventory["images"].items():
+            archive = write_hybrid_image_archive(
+                self.root / f"{role}.tar", reference=record["reference"],
+                config=images[record["reference"]]["ConfigBytes"].encode(),
+                nested_index=True,
+            )
+            with tarfile.open(archive) as bundle:
+                index_descriptor = json.load(bundle.extractfile("index.json"))["manifests"][0]
+                child_path = "blobs/sha256/" + index_descriptor["digest"][7:]
+                manifest_descriptor = json.load(bundle.extractfile(child_path))["manifests"][0]
+            record["descriptor_digests"] = sorted([
+                index_descriptor["digest"], manifest_descriptor["digest"],
+            ])
+            images[record["reference"]]["Id"] = index_descriptor["digest"]
+            manifests[record["reference"]] = manifest_descriptor["digest"]
+        inventory_path.write_text(json.dumps(inventory))
+        images_path.write_text(json.dumps(images))
+        containers_path = self.state / "containers.json"
+        containers = json.loads(containers_path.read_text())
+        for container in containers:
+            reference = container.get("Config", {}).get("Image")
+            if reference in manifests:
+                container["Image"] = manifests[reference]
+        containers_path.write_text(json.dumps(containers))
+        destination = self.root / "descriptor-backup"
+        result = self.run_cli([
+            "backup", "--deploy-root", str(self.deploy_root),
+            "--destination", str(destination), "--runtime-file", str(self.runtime),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(destination.is_dir())
+        self.assertTrue((self.state / "stopped.log").exists())
+
 
     def test_foreign_producer_identity_refuses_before_any_stop(self):
         original = (self.state / "containers.json").read_bytes()

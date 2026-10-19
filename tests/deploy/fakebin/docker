@@ -17,11 +17,13 @@ import stat
 
 import tarfile
 import time
+import tempfile
 
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from interpolation import UnsupportedInterpolation, interpolate_value
+from support import write_hybrid_image_archive
 
 
 
@@ -361,6 +363,8 @@ def docker_info(state: Path, argv: list[str] | None = None) -> int:
         "Rootless": False,
         "DockerRootDir": str(state / "docker-root"),
     }
+    if (state / "image-store-mode").exists():
+        payload["DriverStatus"] = [["driver-type", "io.containerd.snapshotter.v1"]]
     override = state / "docker-info.json"
     if override.exists():
         payload.update(json.loads(override.read_text(encoding="utf-8")))
@@ -735,10 +739,27 @@ def save_images(state: Path, payload: dict) -> None:
     write_json(images_path(state), payload)
 
 
+def image_reference_key(payload: dict, target: str) -> str | None:
+    if target in payload:
+        return target
+    normalized = normalized_image_reference(target)
+    return next(
+        (name for name in payload if normalized_image_reference(name) == normalized),
+        None,
+    )
+
+
+def normalized_image_reference(reference: str) -> str:
+    familiar = _familiar_name(reference)
+    if "@" not in familiar and ":" not in familiar.rsplit("/", 1)[-1]:
+        familiar += ":latest"
+    return familiar
+
+
 def lookup_image(payload: dict, target: str):
-    record = payload.get(target)
-    if record:
-        return record
+    name = image_reference_key(payload, target)
+    if name is not None:
+        return payload[name]
     for item in payload.values():
         if item.get("Id") == target:
             return item
@@ -748,11 +769,17 @@ def lookup_image(payload: dict, target: str):
 def docker_image_inspect(state: Path, argv: list[str]) -> int:
     fmt = ""
     args = argv[:]
+    platform = ""
     target = None
     while args:
         token = args.pop(0)
         if token in {"--format", "-f"} and args:
             fmt = args.pop(0)
+        elif token == "--platform" and args:
+            platform = args.pop(0)
+            if (state / "reject-platform-options").exists():
+                sys.stderr.write("platform option is unavailable\n")
+                return 1
         elif not token.startswith("-") and target is None:
             target = token
         else:
@@ -772,6 +799,8 @@ def docker_image_inspect(state: Path, argv: list[str]) -> int:
     if not record:
         sys.stderr.write(f"Error: No such image: {target}\n")
         return 1
+    if platform and record.get("PlatformImage"):
+        record = record["PlatformImage"]
     if fmt == "{{.Id}}":
         sys.stdout.write(record["Id"] + "\n")
         return 0
@@ -850,6 +879,26 @@ def config_bytes_for(record: dict) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def apply_store_identity(state: Path, record: dict) -> dict:
+    mode_path = state / "image-store-mode"
+    if not mode_path.exists():
+        return record
+    mode = mode_path.read_text().strip()
+    if mode not in {"manifest", "index", "foreign"}:
+        raise ValueError("unknown fake image store mode")
+    with tempfile.TemporaryDirectory() as temporary:
+        path = write_hybrid_image_archive(
+            Path(temporary) / "image.tar", reference="store:identity",
+            config=config_bytes_for(record), nested_index=mode == "index",
+        )
+        with tarfile.open(path) as archive:
+            descriptor = json.load(archive.extractfile("index.json"))["manifests"][0]
+    record["Id"] = descriptor["digest"] if mode != "foreign" else "sha256:" + "0" * 64
+    record["HybridArchive"] = True
+    record["NestedIndex"] = mode == "index"
+    return record
+
+
 def docker_build(state: Path, argv: list[str]) -> int:
     hold_named(state, "FAKE_DOCKER_HOLD_BUILD", "entered-build")
     fail = state / "build-fail"
@@ -915,6 +964,8 @@ def docker_build(state: Path, argv: list[str]) -> int:
         architecture=architecture,
         extra={"ConfigBytes": config},
     )
+    record = apply_store_identity(state, record)
+    image_id = record["Id"]
     images = load_images(state)
     images[tag] = record
     save_images(state, images)
@@ -948,6 +999,9 @@ def docker_tag(state: Path, argv: list[str]) -> int:
         return 1
     images[target] = dict(record)
     save_images(state, images)
+    if (state / "tag-fail-after").exists():
+        sys.stderr.write("tag response lost after updating the mapping\n")
+        return 1
     return 0
 
 
@@ -1000,6 +1054,8 @@ def docker_pull(state: Path, argv: list[str]) -> int:
             "ConfigBytes": config,
         },
     )
+    images[reference] = apply_store_identity(state, images[reference])
+    image_id = images[reference]["Id"]
 
     save_images(state, images)
     append_json_list(
@@ -1017,12 +1073,18 @@ def docker_pull(state: Path, argv: list[str]) -> int:
 
 def docker_save(state: Path, argv: list[str]) -> int:
     output = None
+    platform = ""
     args = argv[:]
     tags: list[str] = []
     while args:
         token = args.pop(0)
         if token in {"-o", "--output"} and args:
             output = args.pop(0)
+        elif token == "--platform" and args:
+            platform = args.pop(0)
+            if (state / "reject-platform-options").exists():
+                sys.stderr.write("platform option is unavailable\n")
+                return 1
         elif not token.startswith("-"):
             tags.append(token)
         else:
@@ -1032,8 +1094,37 @@ def docker_save(state: Path, argv: list[str]) -> int:
         sys.stderr.write("docker save requires an output and at least one image\n")
         return 1
     images = load_images(state)
+    for tag in tags:
+        record = lookup_image(images, tag)
+        if record and record.get("PlatformImage"):
+            if platform != "linux/amd64":
+                sys.stderr.write("missing content for unselected platforms\n")
+                return 1
+            images[tag] = record["PlatformImage"]
+    rebind = state / "save-rebind-reference.json"
+    if rebind.exists():
+        changed = load_images(state)
+        for tag in tags:
+            changed[tag] = json.loads(rebind.read_text())
+        save_images(state, changed)
+    scripted = state / "save-script.json"
+    if scripted.exists():
+        actions = json.loads(scripted.read_text())
+        action = actions.pop(0) if actions else {}
+        scripted.write_text(json.dumps(actions))
+        if action:
+            images = dict(images)
+            for tag in tags:
+                images[tag] = {**lookup_image(images, tag), **action}
+    if len(tags) == 1:
+        record = lookup_image(images, tags[0])
+        if record and record.get("HybridArchive"):
+            write_hybrid_image_archive(
+                Path(output), reference=tags[0], config=config_bytes_for(record),
+                nested_index=record.get("NestedIndex", False),
+            )
+            return 0
     entries = []
-    repositories: dict[str, dict[str, str]] = {}
     buffer = io.BytesIO()
 
     with tarfile.open(fileobj=buffer, mode="w") as archive:
@@ -1049,16 +1140,10 @@ def docker_save(state: Path, argv: list[str]) -> int:
             info.size = len(config)
             archive.addfile(info, io.BytesIO(config))
             entries.append({"Config": config_name, "RepoTags": [tag], "Layers": []})
-            name, _, label = tag.partition(":")
-            repositories.setdefault(name, {})[label or "latest"] = digest
         manifest = json.dumps(entries).encode("utf-8")
         info = tarfile.TarInfo(name="manifest.json")
         info.size = len(manifest)
         archive.addfile(info, io.BytesIO(manifest))
-        repos = json.dumps(repositories).encode("utf-8")
-        info = tarfile.TarInfo(name="repositories")
-        info.size = len(repos)
-        archive.addfile(info, io.BytesIO(repos))
     Path(output).write_bytes(buffer.getvalue())
     return 0
 
@@ -1119,7 +1204,7 @@ def iter_archive_tags(archive_path: Path):
                 annotations = desc.get("annotations") or {}
                 if not isinstance(annotations, dict):
                     continue
-                if annotations.get("containerd.io/manifest.subject") or annotations.get(
+                if annotations.get("io.containerd.manifest.subject") or annotations.get(
                     "vnd.docker.reference.type"
                 ) == "attestation-manifest":
                     continue
@@ -1180,12 +1265,13 @@ def docker_load(state: Path, argv: list[str]) -> int:
         for tag, config in iter_archive_tags(Path(input_path)):
             digest = hashlib.sha256(config).hexdigest()
             payload = json.loads(config.decode("utf-8"))
-            images[tag] = image_record(
+            record = image_record(
                 image_id="sha256:" + digest,
                 os_name=str(payload.get("os") or "linux"),
                 architecture=str(payload.get("architecture") or "amd64"),
                 extra={"ConfigBytes": config.decode("utf-8")},
             )
+            images[tag] = apply_store_identity(state, record)
     except Exception as exc:
         sys.stderr.write(f"docker load failed: {exc}\n")
         return 1
@@ -1211,7 +1297,10 @@ def docker_version(state: Path, argv: list[str]) -> int:
         else:
             sys.stderr.write("unsupported docker command\n")
             return 1
-    payload = {"Server": {"Version": "29.1.3-fake"}}
+    payload = {
+        "Client": {"ApiVersion": "1.52"},
+        "Server": {"Version": "29.1.3-fake", "ApiVersion": "1.52"},
+    }
     override = state / "docker-version.json"
     if override.exists():
         payload.update(json.loads(override.read_text(encoding="utf-8")))
@@ -1902,6 +1991,18 @@ def main(argv: list[str]) -> int:
         return docker_version(state, argv[1:])
     if len(argv) >= 2 and argv[0] == "image" and argv[1] == "inspect":
         return docker_image_inspect(state, argv[2:])
+    if len(argv) == 4 and argv[:3] == ["image", "rm", "--no-prune"]:
+        if (state / "image-rm-fail").exists():
+            sys.stderr.write("image reference removal failed\n")
+            return 1
+        images = load_images(state)
+        name = image_reference_key(images, argv[3])
+        if name is None:
+            sys.stderr.write(f"Error: No such image: {argv[3]}\n")
+            return 1
+        del images[name]
+        save_images(state, images)
+        return 0
     if argv and argv[0] == "build":
         return docker_build(state, argv[1:])
     if argv and argv[0] == "tag":

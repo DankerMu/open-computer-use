@@ -195,7 +195,7 @@ class OfflineReleaseTests(unittest.TestCase):
     def tearDown(self):
         self.context.cleanup()
 
-    def write_delivery(self, *, extra_tag=None, mutate=None, skip_role=None, name="delivery"):
+    def write_delivery(self, *, extra_tag=None, mutate=None, skip_role=None, name="delivery", contract=SOURCE_CONSUMER_CONTRACT):
         ocu = self.root / f"{name}-ocu-src"
         ocu.mkdir()
         for relative in (
@@ -216,6 +216,11 @@ class OfflineReleaseTests(unittest.TestCase):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(source.read_bytes())
         write_font_pin(ocu)
+        consumer = ocu / "deploy/release.py"
+        consumer.write_text(consumer.read_text().replace(
+            f"SOURCE_CONSUMER_CONTRACT = {SOURCE_CONSUMER_CONTRACT}",
+            f"SOURCE_CONSUMER_CONTRACT = {contract}", 1,
+        ))
         (ocu / "README").write_text("delivery source\n", encoding="utf-8")
         ocu_sha = git_init_commit(ocu, "delivery source")
         delivery = self.root / name
@@ -255,6 +260,7 @@ class OfflineReleaseTests(unittest.TestCase):
             images=image_records,
             bundle_sha=hashlib.sha256(bundle.read_bytes()).hexdigest(),
         )
+        payload["source_consumer_contract"] = contract
         if mutate:
             mutate(payload, delivery)
         write_inventory(delivery / "release.json", payload)
@@ -394,7 +400,7 @@ class OfflineReleaseTests(unittest.TestCase):
                 config=config,
                 extra_oci_names=extras,
                 extra_index_descriptors=extra_index_descriptors if role == "workspace" else (),
-                nested_index=nested_index and role == "workspace",
+                nested_index=nested_index,
                 attestation=attestation if role == "workspace" else None,
             )
             image_records[role] = {
@@ -628,6 +634,706 @@ class OfflineReleaseTests(unittest.TestCase):
         if not path.exists():
             return []
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_export_uses_archive_configuration_not_engine_manifest_identity(self):
+        config = config_payload(digest_for("producer-configuration"))
+        upstream = "postgres:identity-fixture"
+        fixture = write_hybrid_image_archive(
+            self.root / "producer.tar", reference=upstream, config=config,
+        )
+        with tarfile.open(fixture) as archive:
+            index = json.load(archive.extractfile("index.json"))
+        manifest_digest = index["manifests"][0]["digest"]
+        seed_images(self.state, {upstream: {
+            "Id": manifest_digest, "Os": "linux", "Architecture": "amd64",
+            "ConfigBytes": config.decode(), "HybridArchive": True,
+        }})
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        expected_config = image_id_for_config(config)
+        self.assertEqual(record["configuration_digest"], expected_config)
+        self.assertEqual(record["reference"], "ocu-postgres:" + expected_config[7:])
+        self.assertIn(manifest_digest, record["descriptor_digests"])
+        final = release.inspect_archive_bytes(self.root / "exports/postgres.tar")
+        self.assertEqual(final[record["reference"]]["digest"], expected_config)
+
+    def pull_plan(self, reference):
+        dockerfile = self.root / "Dockerfile"
+        dockerfile.write_text("FROM scratch\n")
+        return {
+            "temp_tag": reference, "image_kind": "pull",
+            "dockerfile": str(dockerfile), "source_root": str(self.root),
+            "context": str(self.root), "arguments": {}, "argument_defaults": {},
+            "argument_overrides": {}, "input_manifest_sha256": "a" * 64,
+            "materials": [],
+        }
+
+    def export_plan(self, plan, *, occupied_alias=None):
+        program = "\n".join([
+            "import json,os,sys,traceback",
+            "from pathlib import Path",
+            "import release",
+            "p=json.loads(sys.argv[1])",
+            "for k in ('dockerfile','source_root','context'): p[k]=Path(p[k])",
+            "occupied=json.loads(sys.argv[3])",
+            "if occupied is not None:",
+            "    state=Path(os.environ['FAKE_DOCKER_STATE'])/'images.json'",
+            "    images=json.loads(state.read_text())",
+            "    images[f'ocu-build-postgres-{os.getpid()}']=occupied",
+            "    state.write_text(json.dumps(images))",
+            "try:",
+            "    record=release.export_built_image(role='postgres',plan=p,archive_dir=Path(sys.argv[2]))",
+            "except Exception as exc:",
+            "    print(json.dumps({'error_cause':type(exc.__cause__).__name__}))",
+            "    traceback.print_exc()",
+            "    sys.exit(1)",
+            "print(json.dumps(record))",
+        ])
+        env = dict(self.env, PYTHONPATH=str(ROOT / "deploy"))
+        return subprocess.run(
+            ["python3", "-c", program, json.dumps(plan), str(self.root / "exports"), json.dumps(occupied_alias)],
+            env=env, capture_output=True, text=True, timeout=20,
+        )
+
+    def test_multiplatform_upstream_selects_inspect_and_export_platform(self):
+        upstream = "postgres:multi-platform"
+        config = config_payload(digest_for("platform-configuration"))
+        fixture = write_hybrid_image_archive(
+            self.root / "platform.tar", reference=upstream, config=config,
+        )
+        with tarfile.open(fixture) as archive:
+            selected_id = json.load(archive.extractfile("index.json"))["manifests"][0]["digest"]
+        root_id = "sha256:" + "e" * 64
+        selected = {
+            "Id": selected_id, "Os": "linux", "Architecture": "amd64",
+            "ConfigBytes": config.decode(), "HybridArchive": True,
+        }
+        seed_images(self.state, {upstream: {
+            "Id": root_id, "Os": "", "Architecture": "", "PlatformImage": selected,
+        }})
+        (self.state / "image-store-mode").write_text("manifest")
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["configuration_digest"], image_id_for_config(config))
+        self.assertEqual(record["descriptor_digests"], [selected_id])
+        self.assertNotIn(root_id, record["descriptor_digests"])
+        images = json.loads((self.state / "images.json").read_text())
+        self.assertEqual(images[record["reference"]]["PlatformImage"]["Id"], selected_id)
+        install_inventory = synthetic_inventory(
+            ocu_sha="a" * 40, webui_sha="b" * 40,
+            images={"postgres": record},
+        )
+        seed_images(self.state, {
+            **{key: value for key, value in images.items()},
+            **{
+                item["reference"]: {
+                    "Id": item["configuration_digest"], "Os": "linux", "Architecture": "amd64",
+                }
+                for role, item in install_inventory["images"].items() if role != "postgres"
+            },
+        })
+        write_inventory(self.root / "platform-inventory.json", install_inventory)
+        verified = self.verify_cmd(self.root / "platform-inventory.json", mode="images")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_unsupported_modern_profile_refuses_and_classic_needs_no_platform_flags(self):
+        config = config_payload(digest_for("profile"))
+        upstream = "postgres:profile"
+        seed_images(self.state, {upstream: {
+            "Id": image_id_for_config(config), "Os": "linux", "Architecture": "amd64",
+            "ConfigBytes": config.decode(),
+        }})
+        (self.state / "image-store-mode").write_text("manifest")
+        (self.state / "docker-version.json").write_text(json.dumps({
+            "Client": {"ApiVersion": "1.48"},
+            "Server": {"Version": "classic-compatible", "ApiVersion": "1.48"},
+        }))
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(line.startswith("docker tag ") for line in ops(self.state)))
+        self.assertFalse((self.root / "exports/postgres.tar").exists())
+        (self.state / "image-store-mode").unlink()
+        (self.state / "reject-platform-options").touch()
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["configuration_digest"], image_id_for_config(config))
+        self.assertNotIn("descriptor_digests", record)
+
+    def test_digest_upstream_export_retires_only_its_owned_alias_on_success_and_failure(self):
+        upstream = "postgres@sha256:" + "d" * 64
+        config = config_payload(digest_for("digest-upstream"))
+        source = {
+            "Id": image_id_for_config(config), "Os": "linux", "Architecture": "amd64",
+            "ConfigBytes": config.decode(),
+        }
+        unrelated = "unrelated:keep"
+        seed_images(self.state, {upstream: source, unrelated: dict(source)})
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        images = json.loads((self.state / "images.json").read_text())
+        self.assertEqual(images[upstream], source)
+        self.assertEqual(images[unrelated], source)
+        self.assertEqual(images[record["reference"]]["Id"], source["Id"])
+        self.assertFalse(any(name.startswith("ocu-build-postgres-") for name in images))
+        (self.state / "save-script.json").write_text(json.dumps([{
+            "ConfigBytes": config_payload(digest_for("wrong-initial-export")).decode(),
+        }]))
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads((self.state / "images.json").read_text()), images)
+
+
+    def test_digest_export_alias_failures_preserve_foreign_mappings_and_primary_error(self):
+        upstream = "postgres@sha256:" + "d" * 64
+        config = config_payload(digest_for("owned-alias"))
+        source = {
+            "Id": image_id_for_config(config), "Os": "linux", "Architecture": "amd64",
+            "ConfigBytes": config.decode(),
+        }
+        foreign = {**source, "Id": "sha256:" + "f" * 64}
+        seed_images(self.state, {upstream: source})
+        result = self.export_plan(self.pull_plan(upstream), occupied_alias=foreign)
+        self.assertNotEqual(result.returncode, 0)
+        images = json.loads((self.state / "images.json").read_text())
+        aliases = {name: record for name, record in images.items() if name != upstream}
+        self.assertEqual(list(aliases.values()), [foreign])
+        self.assertFalse(any(line.startswith("docker tag ") for line in ops(self.state)))
+        seed_images(self.state, {upstream: source})
+        (self.state / "tag-fail-after").touch()
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads((self.state / "images.json").read_text()), {upstream: source})
+        (self.state / "tag-fail-after").unlink()
+        (self.state / "save-rebind-reference.json").write_text(json.dumps(foreign))
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertNotEqual(result.returncode, 0)
+        images = json.loads((self.state / "images.json").read_text())
+        self.assertEqual(images[upstream], source)
+        self.assertEqual([value for key, value in images.items() if key != upstream], [foreign])
+        (self.state / "save-rebind-reference.json").unlink()
+        seed_images(self.state, {upstream: source})
+        (self.state / "save-script.json").write_text(json.dumps([{"ConfigBytes": "not JSON"}]))
+        (self.state / "image-rm-fail").touch()
+        result = self.export_plan(self.pull_plan(upstream))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["error_cause"], "JSONDecodeError")
+        images = json.loads((self.state / "images.json").read_text())
+        self.assertEqual(images[upstream], source)
+        self.assertEqual([value for key, value in images.items() if key != upstream], [source])
+        retained_alias = next(name for name in images if name != upstream)
+        self.assertIn(retained_alias, result.stderr)
+
+    def descriptor_chain(self, path):
+        with tarfile.open(path) as archive:
+            descriptor = json.load(archive.extractfile("index.json"))["manifests"][0]
+            digests = [descriptor["digest"]]
+            if descriptor["mediaType"] == release.OCI_INDEX_MEDIA:
+                blob = "blobs/sha256/" + descriptor["digest"][7:]
+                child = json.load(archive.extractfile(blob))["manifests"][0]
+                digests.append(child["digest"])
+        return sorted(digests)
+
+    def claim_hybrid_descriptors(self, delivery, inventory):
+        for record in inventory["images"].values():
+            record["descriptor_digests"] = self.descriptor_chain(
+                delivery / record["archive"]["path"]
+            )
+        write_inventory(delivery / "release.json", inventory)
+
+    def test_manifest_and_index_engine_ids_import_reimport_and_verify(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery(nested_index=True, attestation={})
+        self.claim_hybrid_descriptors(delivery, inventory)
+        workspace = inventory["images"]["workspace"]
+        seed_images(self.state, {
+            workspace["reference"]: {
+                "Id": workspace["descriptor_digests"][0], "Os": "linux", "Architecture": "amd64",
+            },
+            "docker.io/library/" + workspace["reference"]: {
+                "Id": workspace["configuration_digest"], "Os": "linux", "Architecture": "amd64",
+            },
+        })
+        mode = self.state / "image-store-mode"
+        for store in ("manifest", "index"):
+            with self.subTest(store=store):
+                mode.write_text(store)
+                result = self.import_cmd(delivery, self.root / f"install-{store}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                images = json.loads((self.state / "images.json").read_text())
+                for record in inventory["images"].values():
+                    self.assertIn(images[record["reference"]]["Id"], record["descriptor_digests"])
+                    self.assertNotEqual(images[record["reference"]]["Id"], record["configuration_digest"])
+                verified = self.verify_cmd(delivery / "release.json", mode="images")
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+                repeated = self.import_cmd(delivery, self.root / f"repeat-{store}")
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+
+    def test_foreign_descriptor_claims_refuse_before_load(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery(nested_index=True, attestation={})
+        workspace = inventory["images"]["workspace"]
+        archive = delivery / workspace["archive"]["path"]
+        with tarfile.open(archive) as bundle:
+            root = json.load(bundle.extractfile("index.json"))
+        attestation = root["manifests"][1]["digest"]
+        foreign = self.descriptor_chain(delivery / inventory["images"]["proxy"]["archive"]["path"])[0]
+        claims = (
+            ["sha256:" + "f" * 64], [foreign], [attestation],
+            [workspace["configuration_digest"]],
+            [self.descriptor_chain(archive)[0]] * 2,
+        )
+        before = seed_images(self.state)
+        for index, descriptors in enumerate(claims):
+            with self.subTest(descriptors=descriptors):
+                workspace["descriptor_digests"] = descriptors
+                write_inventory(delivery / "release.json", inventory)
+                result = self.import_cmd(delivery, self.root / f"forged-{index}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.state / "load-count").exists())
+                self.assertEqual(json.loads((self.state / "images.json").read_text()), before)
+                self.assertFalse((self.root / f"forged-{index}").exists())
+
+    def duplicate_reference_delivery(self, *, name, alias=False):
+        delivery, inventory, _sha = self.write_delivery(name=name)
+        earlier = inventory["images"]["computer-use-server"]
+        later = inventory["images"]["retention-guard"]
+        earlier["reference"] = (
+            "docker.io/library/" + later["reference"] if alias else later["reference"]
+        )
+        earlier["configuration_digest"] = later["configuration_digest"]
+        config = config_payload(DEFAULT_RELEASE_DIGESTS["retention-guard"])
+        for record in (earlier, later):
+            archive = write_hybrid_image_archive(
+                delivery / record["archive"]["path"],
+                reference=record["reference"], config=config, nested_index=True,
+            )
+            record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        return delivery, inventory, earlier, later
+
+    def test_duplicate_reference_cannot_hide_earlier_forged_descriptor_before_load(self):
+        for alias in (False, True):
+            with self.subTest(alias=alias):
+                delivery, inventory, earlier, _later = self.duplicate_reference_delivery(
+                    name=f"forged-duplicate-{alias}", alias=alias,
+                )
+                earlier["descriptor_digests"] = ["sha256:" + "f" * 64]
+                write_inventory(delivery / "release.json", inventory)
+                seed_images(self.state)
+                before = (self.state / "images.json").read_bytes()
+                install = self.root / f"forged-duplicate-install-{alias}"
+                result = self.import_cmd(delivery, install)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(install.exists())
+                self.assertFalse((self.state / "load-count").exists())
+                self.assertEqual((self.state / "images.json").read_bytes(), before)
+
+    def test_duplicate_config_only_roles_and_valid_descriptor_subsets_import(self):
+        for descriptors in (False, True):
+            with self.subTest(descriptors=descriptors):
+                delivery, inventory, earlier, later = self.duplicate_reference_delivery(
+                    name=f"valid-duplicate-{descriptors}", alias=True,
+                )
+                if descriptors:
+                    archive = delivery / earlier["archive"]["path"]
+                    with tarfile.open(archive) as bundle:
+                        index_digest = json.load(bundle.extractfile("index.json"))["manifests"][0]["digest"]
+                        child = json.load(bundle.extractfile("blobs/sha256/" + index_digest[7:]))
+                    manifest_digest = child["manifests"][0]["digest"]
+                    earlier["descriptor_digests"] = sorted([index_digest, manifest_digest])
+                    later["descriptor_digests"] = [manifest_digest]
+                    seed_images(self.state, {later["reference"]: {
+                        "Id": manifest_digest, "Os": "linux", "Architecture": "amd64",
+                    }})
+                write_inventory(delivery / "release.json", inventory)
+                install = self.root / f"valid-duplicate-install-{descriptors}"
+                result = self.import_cmd(delivery, install)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                installed = json.loads((install / "release.json").read_text())
+                self.assertEqual(installed["images"]["computer-use-server"], earlier)
+                self.assertEqual(installed["images"]["retention-guard"], later)
+                verified = self.verify_cmd(install / "release.json", mode="images")
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_shared_reference_requires_occupied_identity_accepted_by_every_role(self):
+        delivery, inventory, earlier, later = self.duplicate_reference_delivery(
+            name="incompatible-duplicate",
+        )
+        archive = delivery / earlier["archive"]["path"]
+        with tarfile.open(archive) as bundle:
+            index_digest = json.load(bundle.extractfile("index.json"))["manifests"][0]["digest"]
+            child = json.load(bundle.extractfile("blobs/sha256/" + index_digest[7:]))
+        manifest_digest = child["manifests"][0]["digest"]
+        earlier["descriptor_digests"] = [manifest_digest]
+        later["descriptor_digests"] = sorted([index_digest, manifest_digest])
+        write_inventory(delivery / "release.json", inventory)
+        seed_images(self.state, {later["reference"]: {
+            "Id": index_digest, "Os": "linux", "Architecture": "amd64",
+        }})
+        before = (self.state / "images.json").read_bytes()
+        install = self.root / "incompatible-duplicate-install"
+        result = self.import_cmd(delivery, install)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(install.exists())
+        self.assertFalse((self.state / "load-count").exists())
+        self.assertEqual((self.state / "images.json").read_bytes(), before)
+
+    def test_foreign_occupied_descriptor_tag_refuses_before_load(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery()
+        self.claim_hybrid_descriptors(delivery, inventory)
+        seed_images(self.state, {inventory["images"]["workspace"]["reference"]: {
+            "Id": inventory["images"]["proxy"]["descriptor_digests"][0],
+            "Os": "linux", "Architecture": "amd64",
+        }})
+        before = (self.state / "images.json").read_bytes()
+        result = self.import_cmd(delivery, self.root / "foreign-tag")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / "load-count").exists())
+        self.assertEqual((self.state / "images.json").read_bytes(), before)
+
+    def test_classic_contract1_rollback_imports_with_matching_bundled_reader(self):
+        delivery, inventory, _sha = self.write_delivery(contract=1)
+        install = self.root / "rollback"
+        result = self.import_cmd(delivery, install)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.verify_cmd(install / "release.json", mode="startup", source=install / "source")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads((install / "release.json").read_text())["source_consumer_contract"], 1)
+
+    def test_contract1_descriptor_claim_and_mismatched_reader_refuse_before_load(self):
+        delivery, inventory, _sha = self.write_delivery(contract=1)
+        for descriptors in ([], ["sha256:" + "d" * 64]):
+            inventory["images"]["workspace"]["descriptor_digests"] = descriptors
+            write_inventory(delivery / "release.json", inventory)
+            result = self.import_cmd(delivery, self.root / "invalid-contract")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.state / "load-count").exists())
+        del inventory["images"]["workspace"]["descriptor_digests"]
+        for contract in (2, 3, True):
+            inventory["source_consumer_contract"] = contract
+            write_inventory(delivery / "release.json", inventory)
+            result = self.import_cmd(delivery, self.root / "wrong-reader")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.state / "load-count").exists())
+
+    def test_new_producer_refuses_source1_before_docker_mutation(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        consumer = ocu / "deploy/release.py"
+        consumer.write_text(consumer.read_text().replace(
+            f"SOURCE_CONSUMER_CONTRACT = {SOURCE_CONSUMER_CONTRACT}",
+            "SOURCE_CONSUMER_CONTRACT = 1", 1,
+        ))
+        git_init_commit(ocu, "config-only reader")
+        destination = self.root / "old-reader-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(destination.exists())
+        self.assertEqual(ops(self.state), [])
+        self.assertFalse((self.state / "images.json").exists())
+
+    def test_unknown_engine_and_changed_final_export_never_publish(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        (self.state / "image-store-mode").write_text("foreign")
+        destination = self.root / "foreign-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(destination.exists())
+        self.assertFalse(any(line.startswith("docker tag ") for line in ops(self.state)))
+        (self.state / "image-store-mode").unlink()
+        (self.state / "images.json").unlink()
+        (self.state / "save-script.json").write_text(json.dumps([
+            {}, {"ConfigBytes": config_payload(digest_for("changed-final")).decode()},
+        ]))
+        destination = self.root / "changed-final-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(destination.exists())
+        self.assertFalse((self.state / "load-count").exists())
+
+    def test_descriptor_store_build_uses_config_names_and_verified_final_archives(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        (self.state / "image-store-mode").write_text("index")
+        destination = self.root / "index-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = json.loads((destination / "release.json").read_text())
+        for role, record in inventory["images"].items():
+            archive = destination / record["archive"]["path"]
+            with tarfile.open(archive) as bundle:
+                manifest = json.load(bundle.extractfile("manifest.json"))[0]
+                config = bundle.extractfile(manifest["Config"]).read()
+            self.assertEqual(record["configuration_digest"], image_id_for_config(config))
+            name = "open-computer-use" if role == "workspace" else f"ocu-{role}"
+            self.assertEqual(record["reference"], name + ":" + image_id_for_config(config)[7:])
+            self.assertEqual(record["descriptor_digests"], self.descriptor_chain(archive))
+        self.assertEqual(sorted(path.name for path in (destination / "images").iterdir()),
+                         sorted(f"{role}.tar" for role in ROLE_ORDER))
+
+    def rewrite_archive(self, path, transform):
+        with tarfile.open(path) as archive:
+            members = {
+                member.name: archive.extractfile(member).read()
+                for member in archive.getmembers() if member.isfile()
+            }
+        transform(members)
+        with tarfile.open(path, "w") as archive:
+            for name, data in members.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+
+    def test_descriptor_ancestry_excludes_attestation_config_layer_and_export_index(self):
+        reference = "open-computer-use:ancestry"
+        config = config_payload(digest_for("ancestry"))
+        archive = write_hybrid_image_archive(
+            self.root / "ancestry.tar", reference=reference, config=config,
+            nested_index=True, attestation={},
+        )
+        with tarfile.open(archive) as bundle:
+            outer_bytes = bundle.extractfile("index.json").read()
+            outer = json.loads(outer_bytes)
+            index_digest = outer["manifests"][0]["digest"]
+            index = json.load(bundle.extractfile("blobs/sha256/" + index_digest[7:]))
+            manifest_digest = index["manifests"][0]["digest"]
+            manifest = json.load(bundle.extractfile("blobs/sha256/" + manifest_digest[7:]))
+        result = release.inspect_archive_bytes(archive)[reference]
+        self.assertEqual(result["descriptor_digests"], sorted([index_digest, manifest_digest]))
+        for forbidden in (
+            image_id_for_config(config), manifest["layers"][0]["digest"],
+            outer["manifests"][1]["digest"], image_id_for_config(outer_bytes),
+        ):
+            self.assertNotIn(forbidden, result["descriptor_digests"])
+
+    def test_containerd_subject_marker_alone_excludes_attachment_from_runtime_authority(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery(attestation={})
+        record = inventory["images"]["workspace"]
+        archive = delivery / record["archive"]["path"]
+        identities = {}
+        def vendor_marker_only(members):
+            root = json.loads(members["index.json"])
+            runtime, attachment = root["manifests"]
+            identities["runtime"] = runtime["digest"]
+            identities["attachment"] = attachment["digest"]
+            attachment["annotations"] = {
+                "io.containerd.manifest.subject": runtime["digest"],
+            }
+            members["index.json"] = json.dumps(root).encode()
+        self.rewrite_archive(archive, vendor_marker_only)
+        selected = release.inspect_archive_bytes(archive)[record["reference"]]
+        self.assertEqual(selected["digest"], record["configuration_digest"])
+        self.assertEqual(selected["descriptor_digests"], [identities["runtime"]])
+        self.assertNotIn(identities["attachment"], selected["descriptor_digests"])
+        record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        record["descriptor_digests"] = [identities["attachment"]]
+        write_inventory(delivery / "release.json", inventory)
+        seed_images(self.state)
+        before = (self.state / "images.json").read_bytes()
+        install = self.root / "attachment-authority"
+        result = self.import_cmd(delivery, install)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(install.exists())
+        self.assertFalse((self.state / "load-count").exists())
+        self.assertEqual((self.state / "images.json").read_bytes(), before)
+        def name_attachment(members):
+            root = json.loads(members["index.json"])
+            root["manifests"][1]["annotations"]["io.containerd.image.name"] = record["reference"]
+            members["index.json"] = json.dumps(root).encode()
+        self.rewrite_archive(archive, name_attachment)
+        with self.assertRaises(release.ReleaseError):
+            release.inspect_archive_bytes(archive)
+
+    def test_foreign_unnamed_sibling_does_not_authorize_ancestor_index(self):
+        reference = "open-computer-use:bound"
+        archive = write_hybrid_image_archive(
+            self.root / "bound.tar", reference=reference,
+            config=config_payload(digest_for("bound")), nested_index=True,
+        )
+        foreign = write_hybrid_image_archive(
+            self.root / "foreign.tar", reference="foreign:sibling",
+            config=config_payload(digest_for("foreign")),
+        )
+        with tarfile.open(foreign) as bundle:
+            foreign_members = {
+                member.name: bundle.extractfile(member).read()
+                for member in bundle.getmembers() if member.isfile()
+            }
+        foreign_descriptor = json.loads(foreign_members["index.json"])["manifests"][0]
+        del foreign_descriptor["annotations"]
+        identities = {}
+        def add_sibling(members):
+            root = json.loads(members["index.json"])
+            descriptor = root["manifests"][0]
+            annotations = descriptor.pop("annotations")
+            child_name = "blobs/sha256/" + descriptor["digest"][7:]
+            child = json.loads(members[child_name])
+            identities["manifest"] = child["manifests"][0]["digest"]
+            child["manifests"][0]["annotations"] = annotations
+            child["manifests"].append(foreign_descriptor)
+            child_bytes = json.dumps(child).encode()
+            descriptor["digest"] = image_id_for_config(child_bytes)
+            descriptor["size"] = len(child_bytes)
+            identities["index"] = descriptor["digest"]
+            members["blobs/sha256/" + descriptor["digest"][7:]] = child_bytes
+            members.update({name: data for name, data in foreign_members.items()
+                            if name.startswith("blobs/sha256/")})
+            members["index.json"] = json.dumps(root).encode()
+        self.rewrite_archive(archive, add_sibling)
+        selected = release.inspect_archive_bytes(archive)[reference]
+        self.assertEqual(selected["descriptor_digests"], [identities["manifest"]])
+        self.assertNotIn(identities["index"], selected["descriptor_digests"])
+        self.assertNotIn(foreign_descriptor["digest"], selected["descriptor_digests"])
+
+    def test_nested_attestation_preserves_only_runtime_ancestor_identities(self):
+        reference = "open-computer-use:nested-attestation"
+        archive = write_hybrid_image_archive(
+            self.root / "nested-attestation.tar", reference=reference,
+            config=config_payload(digest_for("nested-attestation")),
+            nested_index=True, attestation={},
+        )
+        identities = {}
+        def nest_attestation(members):
+            root = json.loads(members["index.json"])
+            descriptor = root["manifests"][0]
+            attestation = root["manifests"].pop()
+            identities["attestation"] = attestation["digest"]
+            child = json.loads(members["blobs/sha256/" + descriptor["digest"][7:]])
+            identities["manifest"] = child["manifests"][0]["digest"]
+            child["manifests"].append(attestation)
+            child_bytes = json.dumps(child).encode()
+            descriptor["digest"] = image_id_for_config(child_bytes)
+            descriptor["size"] = len(child_bytes)
+            identities["index"] = descriptor["digest"]
+            members["blobs/sha256/" + descriptor["digest"][7:]] = child_bytes
+            members["index.json"] = json.dumps(root).encode()
+        self.rewrite_archive(archive, nest_attestation)
+        selected = release.inspect_archive_bytes(archive)[reference]
+        self.assertEqual(selected["descriptor_digests"], sorted([
+            identities["index"], identities["manifest"],
+        ]))
+        self.assertNotIn(identities["attestation"], selected["descriptor_digests"])
+
+    def test_wrong_descriptor_and_ancestor_platform_refuse_before_load(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery(nested_index=True)
+        record = inventory["images"]["workspace"]
+        archive = delivery / record["archive"]["path"]
+        original = archive.read_bytes()
+        for nested in (False, True):
+            archive.write_bytes(original)
+            def corrupt(members):
+                root = json.loads(members["index.json"])
+                descriptor = root["manifests"][0]
+                if nested:
+                    descriptor["platform"] = {"os": "linux", "architecture": "arm64"}
+                else:
+                    child_name = "blobs/sha256/" + descriptor["digest"][7:]
+                    child = json.loads(members[child_name])
+                    child["manifests"][0]["platform"]["architecture"] = "arm64"
+                    child_bytes = json.dumps(child).encode()
+                    child_digest = hashlib.sha256(child_bytes).hexdigest()
+                    members["blobs/sha256/" + child_digest] = child_bytes
+                    descriptor["digest"] = "sha256:" + child_digest
+                    descriptor["size"] = len(child_bytes)
+                members["index.json"] = json.dumps(root).encode()
+            self.rewrite_archive(archive, corrupt)
+            record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            write_inventory(delivery / "release.json", inventory)
+            result = self.import_cmd(delivery, self.root / f"wrong-platform-{nested}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.state / "load-count").exists())
+
+    def test_classic_hybrid_repositories_bind_verified_top_layer_not_configuration(self):
+        delivery, inventory, _sha = self.write_delivery()
+        record = inventory["images"]["workspace"]
+        layer = b"classic exporter layer bytes\n"
+        top_layer = "sha256:" + hashlib.sha256(layer).hexdigest()
+        config = config_payload(top_layer)
+        archive = write_hybrid_image_archive(
+            delivery / record["archive"]["path"], reference=record["reference"],
+            config=config, layer=layer, repositories=True,
+        )
+        record["configuration_digest"] = image_id_for_config(config)
+        record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        proxy = inventory["images"]["proxy"]
+        proxy_payload = json.loads(config)
+        proxy_payload["config"]["Env"].append("ROLE=proxy")
+        proxy_config = json.dumps(proxy_payload).encode()
+        proxy_archive = write_hybrid_image_archive(
+            delivery / proxy["archive"]["path"], reference=proxy["reference"],
+            config=proxy_config, layer=layer, repositories=True,
+        )
+        proxy["configuration_digest"] = image_id_for_config(proxy_config)
+        proxy["archive"]["sha256"] = hashlib.sha256(proxy_archive.read_bytes()).hexdigest()
+        write_inventory(delivery / "release.json", inventory)
+        result = self.import_cmd(delivery, self.root / "classic-hybrid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        images = json.loads((self.state / "images.json").read_text())
+        self.assertEqual(images[record["reference"]]["Id"], image_id_for_config(config))
+        self.assertNotEqual(images[record["reference"]]["Id"], top_layer)
+        self.assertEqual(images[proxy["reference"]]["Id"], image_id_for_config(proxy_config))
+        self.assertNotEqual(images[proxy["reference"]]["Id"], images[record["reference"]]["Id"])
+
+    def test_wrong_repository_association_and_layer_bytes_refuse_before_load(self):
+        delivery, inventory, _sha = self.write_delivery()
+        record = inventory["images"]["workspace"]
+        layer = b"repository-associated top layer\n"
+        layer_id = hashlib.sha256(layer).hexdigest()
+        config = config_payload("sha256:" + layer_id)
+        archive = write_hybrid_image_archive(
+            delivery / record["archive"]["path"], reference=record["reference"],
+            config=config, layer=layer, repositories=True,
+        )
+        record["configuration_digest"] = image_id_for_config(config)
+        original = archive.read_bytes()
+        before = seed_images(self.state)
+        for defect in ("configuration-id", "wrong-layer", "undeclared-reference", "changed-layer"):
+            with self.subTest(defect=defect):
+                archive.write_bytes(original)
+                def corrupt(members):
+                    repositories = json.loads(members["repositories"])
+                    name, _, tag = record["reference"].rpartition(":")
+                    if defect == "configuration-id":
+                        repositories[name][tag] = record["configuration_digest"][7:]
+                    elif defect == "wrong-layer":
+                        repositories[name][tag] = "f" * 64
+                    elif defect == "undeclared-reference":
+                        repositories["foreign/image"] = {"tag": layer_id}
+                    else:
+                        members["blobs/sha256/" + layer_id] = b"changed layer\n"
+                    members["repositories"] = json.dumps(repositories).encode()
+                self.rewrite_archive(archive, corrupt)
+                record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+                write_inventory(delivery / "release.json", inventory)
+                destination = self.root / defect
+                result = self.import_cmd(delivery, destination)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(destination.exists())
+                self.assertFalse((self.state / "load-count").exists())
+                self.assertEqual(json.loads((self.state / "images.json").read_text()), before)
+
+    def test_repository_layer_never_authorizes_an_existing_engine_identity(self):
+        delivery, inventory, _sha = self.write_delivery()
+        record = inventory["images"]["workspace"]
+        layer = b"not an engine identity\n"
+        layer_id = hashlib.sha256(layer).hexdigest()
+        config = config_payload("sha256:" + layer_id)
+        archive = write_hybrid_image_archive(
+            delivery / record["archive"]["path"], reference=record["reference"],
+            config=config, layer=layer, repositories=True,
+        )
+        record["configuration_digest"] = image_id_for_config(config)
+        record["descriptor_digests"] = self.descriptor_chain(archive)
+        record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        write_inventory(delivery / "release.json", inventory)
+        seed_images(self.state, {record["reference"]: {
+            "Id": "sha256:" + layer_id, "Os": "linux", "Architecture": "amd64",
+        }})
+        before = (self.state / "images.json").read_bytes()
+        result = self.import_cmd(delivery, self.root / "layer-engine")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / "load-count").exists())
+        self.assertEqual((self.state / "images.json").read_bytes(), before)
+
 
     def test_import_publishes_source_and_inventory_after_verified_load(self):
         delivery, inventory, ocu_sha = self.write_delivery()
@@ -1863,37 +2569,6 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertFalse((self.state / "load-count").exists())
         self.assertEqual((self.state / "images.json").read_text(encoding="utf-8"), before)
 
-    def test_declared_conflict_bypass_mutant_overwrites_existing_mapping(self):
-        delivery, inventory, _sha = self.write_delivery()
-        tag = inventory["images"]["workspace"]["reference"]
-        original = digest_for("present-workspace")
-        seed_images(
-            self.state,
-            {
-                tag: {
-                    "Id": original,
-                    "Os": "linux",
-                    "Architecture": "amd64",
-                    "ConfigBytes": config_payload(original).decode("utf-8"),
-                }
-            },
-        )
-        before = (self.state / "images.json").read_text(encoding="utf-8")
-        script = self.patched_release(
-            (
-                "        if image_id != info[\"digest\"]:\n"
-                "            raise ReleaseError(f\"existing image {reference} conflicts with the release\")\n",
-                "        if False and image_id != info[\"digest\"]:\n"
-                "            raise ReleaseError(f\"existing image {reference} conflicts with the release\")\n",
-            )
-        )
-        result = self.import_with(script, delivery, self.root / "install-bypass-conflict")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        after = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
-        self.assertNotEqual((self.state / "images.json").read_text(encoding="utf-8"), before)
-        self.assertEqual(
-            after[tag]["Id"], inventory["images"]["workspace"]["configuration_digest"]
-        )
 
     def test_cross_destination_conflicting_imports_serialize(self):
         first_delivery, first_inventory, _sha = self.write_delivery(name="delivery-a")
@@ -2060,33 +2735,6 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertFalse((self.state / "load-count").exists())
         self.assertEqual((self.state / "images.json").read_text(encoding="utf-8"), before)
 
-    def test_hybrid_agreement_bypass_mutant_loads_hidden_alias(self):
-        extra = "unrelated.example/app:keep"
-        original = digest_for("keep-original")
-        seed_images(
-            self.state,
-            {
-                extra: {
-                    "Id": original,
-                    "Os": "linux",
-                    "Architecture": "amd64",
-                    "ConfigBytes": config_payload(original).decode("utf-8"),
-                }
-            },
-        )
-        delivery, _inventory, _sha = self.write_hybrid_delivery(extra_oci_names=(extra,))
-        script = self.patched_release(
-            (
-                "            oci_map = parse_oci_layout(archive, bundle, names)\n"
-                "            return agree_reference_maps(docker_map, oci_map, archive)\n",
-                "            oci_map = parse_oci_layout(archive, bundle, names)\n"
-                "            return docker_map\n",
-            )
-        )
-        result = self.import_with(script, delivery, self.root / "install-hybrid-bypass")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
-        self.assertNotEqual(images[extra]["Id"], original)
 
     def test_allocation_faults_release_reservation(self):
         delivery, _inventory, _sha = self.write_delivery()
@@ -2404,28 +3052,6 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertFalse((self.state / "builds.json").exists())
         self.assertFalse((self.state / "ops.log").exists())
 
-    def test_clean_head_bypass_mutant_publishes_from_dirty_tree(self):
-        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
-        (ocu / "deploy" / "up.sh").write_text(
-            (ocu / "deploy" / "up.sh").read_text(encoding="utf-8") + "# dirty\n",
-            encoding="utf-8",
-        )
-        script = self.patched_release(
-            (
-                "    if dirty:\n"
-                "        raise ReleaseError(\n"
-                "            f\"{cwd}: tracked source is dirty; build from a committed snapshot\"\n"
-                "        )\n",
-                "    if False and dirty:\n"
-                "        raise ReleaseError(\n"
-                "            f\"{cwd}: tracked source is dirty; build from a committed snapshot\"\n"
-                "        )\n",
-            )
-        )
-        dest = self.root / "dirty-bypass"
-        result = self.build_with(script, ocu, webui, dest)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((dest / "release.json").is_file())
 
     def test_replaced_image_fails_startup_before_mutation(self):
         env, script, _source = prepare_up_context(self.state)
@@ -2442,72 +3068,12 @@ class OfflineReleaseTests(unittest.TestCase):
                 (self.state / "images.json").write_text(json.dumps(images))
                 result = run_script(script, env)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("configuration digest", result.stderr)
                 self.assertFalse((self.state / "starts.log").exists())
                 recorded = "\n".join(ops(self.state))
                 self.assertNotIn("network create", recorded)
                 self.assertNotIn("compose up", recorded)
                 self.assertFalse((self.state / "builds.json").exists())
 
-    def test_image_equality_bypass_mutant_starts_replaced_image(self):
-        env, _script, source = prepare_up_context(self.state)
-        write_fake_configs(self.state)
-        seed_healthy_host(self.state)
-        write_network(
-            self.state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1"
-        )
-        write_network(
-            self.state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1"
-        )
-        images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
-        tag = DEFAULT_RELEASE_IMAGES["proxy"]
-        images[tag]["Id"] = digest_for("replaced-proxy")
-        (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
-        script = self.patched_release(
-            (
-                "        if image_id != record[\"configuration_digest\"]:\n"
-                "            raise ReleaseError(\n"
-                "                f\"{role} image {record['reference']} has configuration digest {image_id}, expected {record['configuration_digest']}\"\n"
-                "            )\n",
-                "        if False and image_id != record[\"configuration_digest\"]:\n"
-                "            raise ReleaseError(\n"
-                "                f\"{role} image {record['reference']} has configuration digest {image_id}, expected {record['configuration_digest']}\"\n"
-                "            )\n",
-            )
-        )
-        mutant_source = source / "deploy" / "release.py"
-        mutant_source.write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
-        subprocess.run(
-            ["git", "add", "deploy/release.py"],
-            cwd=str(source),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            [
-                "git",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-q",
-                "-m",
-                "bypass image equality",
-            ],
-            cwd=str(source),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=str(source), text=True
-        ).strip()
-        inventory = write_release_for_sha(self.state / "release.json", sha, WEBUI_SYNTHETIC_SHA)
-        env["OCU_RELEASE_MANIFEST"] = str(inventory)
-        env["SOURCE_SHA"] = sha
-        result = run_script(source / "deploy" / "up.sh", env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.state / "starts.log").exists())
 
 
 if __name__ == "__main__":

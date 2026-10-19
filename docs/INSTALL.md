@@ -8,6 +8,15 @@ This guide is for **self-hosting**. For the managed version (GitHub/Google sign-
 - **8 GB RAM** minimum (16 GB recommended)
 - **20 GB disk** (sandbox image is ~5 GB)
 
+The fork's verified offline-release overlay has a narrower transport contract than
+the upstream quick start below: local Docker only, linux/amd64 images, format2
+inventory and a matching bundled source reader. Engine configuration digests and
+manifest/index engine IDs are distinct; only archive-verified identities are
+accepted. See the [qualified local Engine/Desktop store and export matrix](../deploy/production-like-test/NETWORK-HARDENING.md#qualified-local-image-identity-paths)
+before selecting an engine. Remote daemons and Podman release transport are not
+supported; identity-probe evidence is not production-image or LAN acceptance.
+
+
 ## Quick Start
 
 ```bash

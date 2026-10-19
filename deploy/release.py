@@ -31,7 +31,7 @@ FORMAT_VERSION = 2
 PLATFORM = "linux/amd64"
 HEX_LEN = 64
 SHA_LEN = 40
-SOURCE_CONSUMER_CONTRACT = 1
+SOURCE_CONSUMER_CONTRACT = 2
 SOURCE_CONSUMER_CONTRACT_NAME = "SOURCE_CONSUMER_CONTRACT"
 IMAGE_STORE_LOCK_DIR = Path("/run/ocu-image-store")
 METADATA_JSON_LIMIT = 20 * 1024 * 1024
@@ -44,7 +44,7 @@ OCI_INDEX_FILE = "index.json"
 OCI_BLOBS_DIR = "blobs"
 ANNOTATION_IMAGE_NAME = "io.containerd.image.name"
 ANNOTATION_REF_NAME = "org.opencontainers.image.ref.name"
-ANNOTATION_MANIFEST_SUBJECT = "containerd.io/manifest.subject"
+ANNOTATION_MANIFEST_SUBJECT = "io.containerd.manifest.subject"
 ATTESTATION_TYPE_KEY = "vnd.docker.reference.type"
 ATTESTATION_MANIFEST = "attestation-manifest"
 OCI_INDEX_MEDIA = "application/vnd.oci.image.index.v1+json"
@@ -110,7 +110,7 @@ IMAGE_REQUIRED = (
     "archive",
     "build",
 )
-IMAGE_OPTIONAL = ("registry_digests",)
+IMAGE_OPTIONAL = ("registry_digests", "descriptor_digests")
 
 ARCHIVE_REQUIRED = ("path", "sha256")
 BUILD_REQUIRED = (
@@ -678,14 +678,54 @@ def record_mapping(
     digest: str,
     platform: str,
     archive: Path,
+    descriptor_digests=(),
 ) -> None:
+    descriptors = sorted(set(descriptor_digests))
+    if digest in descriptors or len(descriptors) > METADATA_TRAVERSAL_LIMIT:
+        raise ReleaseError(f"{archive}: invalid descriptor identities")
     for alias in alias_set(reference):
         current = mappings.get(alias)
         if current is None:
-            mappings[alias] = {"digest": digest, "platform": platform}
+            mappings[alias] = {
+                "digest": digest, "platform": platform,
+                "descriptor_digests": descriptors,
+            }
             continue
         if current["digest"] != digest or current["platform"] != platform:
             raise ReleaseError(f"{archive}: conflicting imported reference {alias}")
+        merged = sorted(set(current["descriptor_digests"]) | set(descriptors))
+        if len(merged) > METADATA_TRAVERSAL_LIMIT:
+            raise ReleaseError(f"{archive}: too many descriptor identities")
+        current["descriptor_digests"] = merged
+
+
+def repository_layer_identity(
+    archive: Path, bundle: tarfile.TarFile, names: dict, layers: list, config: dict
+) -> str:
+    rootfs = config.get("rootfs") or {}
+    diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
+    if not layers or not isinstance(diff_ids, list) or len(diff_ids) != len(layers):
+        raise ReleaseError(f"{archive}: repositories requires a configuration-bound final layer")
+    expected = require_digest(diff_ids[-1], f"{archive}: final layer diff ID")
+    top = canonical_member_name(layers[-1], archive)
+    member = names[top]
+    hasher = hashlib.sha256()
+    stream = bundle.extractfile(member)
+    if stream is None:
+        raise ReleaseError(f"{archive}: missing final layer {top}")
+    with stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    if "sha256:" + hasher.hexdigest() != expected:
+        raise ReleaseError(f"{archive}: final layer does not match configuration diff ID")
+    parts = Path(top).parts
+    if len(parts) == 3 and parts[:2] == ("blobs", "sha256"):
+        if "sha256:" + parts[2] != expected:
+            raise ReleaseError(f"{archive}: final layer blob name does not match its bytes")
+        return parts[2]
+    if len(parts) == 2 and parts[1] == "layer.tar" and is_hex(parts[0], HEX_LEN):
+        return parts[0]
+    raise ReleaseError(f"{archive}: unsupported repositories final-layer association")
 
 
 def parse_docker_manifest(
@@ -698,6 +738,7 @@ def parse_docker_manifest(
     if not isinstance(manifest, list):
         raise ReleaseError(f"{archive}: manifest.json must be a list")
     mappings: dict[str, dict] = {}
+    repository_layers: dict[str, str] = {}
     for entry in manifest:
         if not isinstance(entry, dict):
             raise ReleaseError(f"{archive}: manifest entry is not an object")
@@ -740,6 +781,13 @@ def parse_docker_manifest(
             member = names.get(canonical_member_name(layer, archive))
             if member is None or not _tar_regular(member):
                 raise ReleaseError(f"{archive}: missing layer {layer}")
+        if "repositories" in names:
+            top_layer = repository_layer_identity(archive, bundle, names, layers, config_payload)
+            for tag in tags:
+                for alias in alias_set(tag):
+                    if alias in repository_layers and repository_layers[alias] != top_layer:
+                        raise ReleaseError(f"{archive}: conflicting final layer for {alias}")
+                    repository_layers[alias] = top_layer
     if "repositories" in names:
         repositories = decode_json_bytes(
             read_archive_member(bundle, names, "repositories", archive),
@@ -752,20 +800,17 @@ def parse_docker_manifest(
                 raise ReleaseError(f"{archive}: repositories[{name}] must be an object")
             for label, value in tags.items():
                 tag = f"{name}:{label}"
-                digest_value = str(value)
-                if not digest_value.startswith("sha256:"):
-                    digest_value = (
-                        "sha256:" + digest_value
-                        if is_hex(digest_value, HEX_LEN)
-                        else digest_value
-                    )
+                layer_id = require_digest(
+                    str(value) if str(value).startswith("sha256:") else "sha256:" + str(value),
+                    f"{archive}: repositories final layer",
+                )[7:]
                 aliases = alias_set(tag)
                 matched = next((mappings[alias] for alias in aliases if alias in mappings), None)
                 if matched is None:
                     raise ReleaseError(
                         f"{archive}: repositories names undeclared reference {tag}"
                     )
-                if matched["digest"] != digest_value and matched["digest"][7:] != str(value):
+                if any(repository_layers.get(alias) != layer_id for alias in aliases):
                     raise ReleaseError(f"{archive}: repositories conflict for {tag}")
     return mappings
 
@@ -782,6 +827,8 @@ def parse_oci_image_manifest(
         raise ReleaseError(f"{archive}: image manifest is not an object")
     if payload.get("subject") not in (None, {}):
         raise ReleaseError(f"{archive}: unsupported nested image subject")
+    if payload.get("artifactType"):
+        raise ReleaseError(f"{archive}: artifact manifest is not a runtime image")
     config = payload.get("config")
     if not isinstance(config, dict):
         raise ReleaseError(f"{archive}: image manifest is missing config")
@@ -828,16 +875,21 @@ def parse_oci_index(
     depth: int = 0,
     remaining: list[int],
     inherited_name: str | None = None,
+    leaves: list[tuple[str, str]] | None = None,
 ) -> dict[str, dict]:
     if depth > METADATA_INDEX_DEPTH:
         raise ReleaseError(f"{archive}: nested index depth is unsupported")
     payload = decode_json_bytes(data, f"{archive}: OCI index")
     if not isinstance(payload, dict):
         raise ReleaseError(f"{archive}: OCI index is not an object")
+    if payload.get("subject") not in (None, {}) or payload.get("artifactType"):
+        raise ReleaseError(f"{archive}: artifact index is not a runtime image")
     manifests = payload.get("manifests")
     if not isinstance(manifests, list):
         raise ReleaseError(f"{archive}: OCI index manifests must be a list")
     mappings: dict[str, dict] = {}
+    if leaves is None:
+        leaves = []
     for desc in manifests:
         remaining[0] -= 1
         if remaining[0] < 0:
@@ -853,13 +905,16 @@ def parse_oci_index(
             annotations = {}
         if not isinstance(annotations, dict):
             raise ReleaseError(f"{archive}: descriptor annotations must be an object")
-        image_name = annotations.get(ANNOTATION_IMAGE_NAME) or inherited_name
+        own_name = annotations.get(ANNOTATION_IMAGE_NAME)
+        if own_name is not None and (not isinstance(own_name, str) or not own_name):
+            raise ReleaseError(f"{archive}: invalid OCI image name")
+        image_name = own_name or inherited_name
         if (
             annotations.get(ATTESTATION_TYPE_KEY) == ATTESTATION_MANIFEST
             or ANNOTATION_MANIFEST_SUBJECT in annotations
             or desc.get("artifactType")
         ):
-            if image_name:
+            if own_name:
                 raise ReleaseError(
                     f"{archive}: attestation metadata names a runtime reference"
                 )
@@ -867,6 +922,7 @@ def parse_oci_index(
         if media in {OCI_INDEX_MEDIA, DOCKER_INDEX_MEDIA} or media.endswith(
             "manifest.list.v2+json"
         ):
+            nested_leaves: list[tuple[str, str]] = []
             nested = parse_oci_index(
                 archive,
                 bundle,
@@ -875,25 +931,42 @@ def parse_oci_index(
                 depth=depth + 1,
                 remaining=remaining,
                 inherited_name=image_name if isinstance(image_name, str) else None,
+                leaves=nested_leaves,
             )
+            leaves.extend(nested_leaves)
             for tag, info in nested.items():
-                record_mapping(mappings, tag, info["digest"], info["platform"], archive)
+                index_platform = descriptor_platform(desc)
+                if index_platform and index_platform != info["platform"]:
+                    raise ReleaseError(f"{archive}: ancestor index platform disagrees with image")
+                descriptors = list(info["descriptor_digests"])
+                if image_name and normalize_docker_ref(image_name) != normalize_docker_ref(tag):
+                    raise ReleaseError(f"{archive}: ancestor index reference disagrees with image")
+                configurations = {
+                    config for config, platform in nested_leaves
+                    if platform == info["platform"]
+                }
+                if configurations == {info["digest"]}:
+                    descriptors.append(digest)
+                record_mapping(
+                    mappings, tag, info["digest"], info["platform"], archive, descriptors
+                )
             continue
         if media not in {OCI_MANIFEST_MEDIA, DOCKER_MANIFEST_MEDIA} and media:
             raise ReleaseError(f"{archive}: unsupported OCI media type {media}")
         image_digest, platform = parse_oci_image_manifest(
             archive, bundle, names, desc, child
         )
+        leaves.append((image_digest, platform))
         if image_name:
             if not isinstance(image_name, str) or not image_name:
                 raise ReleaseError(f"{archive}: empty OCI image name")
-            record_mapping(mappings, image_name, image_digest, platform, archive)
+            record_mapping(mappings, image_name, image_digest, platform, archive, [digest])
         elif annotations.get(ANNOTATION_REF_NAME):
             raise ReleaseError(
                 f"{archive}: org.opencontainers.image.ref.name is not a complete image reference"
             )
         elif inherited_name:
-            record_mapping(mappings, inherited_name, image_digest, platform, archive)
+            record_mapping(mappings, inherited_name, image_digest, platform, archive, [digest])
         elif depth == 0:
             raise ReleaseError(f"{archive}: unnamed OCI manifest is unsupported")
     return mappings
@@ -930,7 +1003,10 @@ def agree_reference_maps(
     combined: dict[str, dict] = {}
     for source in (docker_map, oci_map):
         for tag, info in source.items():
-            record_mapping(combined, tag, info["digest"], info["platform"], archive)
+            record_mapping(
+                combined, tag, info["digest"], info["platform"], archive,
+                info["descriptor_digests"],
+            )
     docker_normalized = {
         normalize_docker_ref(tag): info for tag, info in docker_map.items()
     }
@@ -987,7 +1063,9 @@ def inspect_archive_bytes(archive: Path) -> dict[str, dict]:
         return docker_map
 
 
-def existing_reference(reference: str, *, upstream: bool = False) -> dict | None:
+def existing_reference(
+    reference: str, *, upstream: bool = False, identities: set[str] | None = None
+) -> dict | None:
     seen: dict[str, dict] = {}
     aliases = (
         {reference}
@@ -995,7 +1073,7 @@ def existing_reference(reference: str, *, upstream: bool = False) -> dict | None
         else alias_set(reference)
     )
     for alias in sorted(aliases):
-        result = docker("image", "inspect", alias)
+        result = docker("image", "inspect", *image_platform_options(), alias)
         if result.returncode != 0:
             detail = (result.stderr or "").strip().lower()
             if "no such image" in detail or "not found" in detail:
@@ -1016,33 +1094,32 @@ def existing_reference(reference: str, *, upstream: bool = False) -> dict | None
         seen[alias] = payload
     if not seen:
         return None
-    identities = {image_identity(payload)[0] for payload in seen.values()}
-    if len(identities) != 1:
+    observed = {image_identity(payload)[0] for payload in seen.values()}
+    if identities is not None:
+        if not observed <= identities:
+            raise ReleaseError(f"existing image {reference} conflicts with the release")
+    elif len(observed) != 1:
         raise ReleaseError(f"existing image {reference} has conflicting aliases")
     return next(iter(seen.values()))
 
 
 def reject_existing_conflicts(imported: dict[str, dict]) -> None:
     for reference, info in imported.items():
-        existing = existing_reference(reference)
-        if existing is None:
-            continue
-        image_id, _platform = image_identity(existing)
-        if image_id != info["digest"]:
-            raise ReleaseError(f"existing image {reference} conflicts with the release")
+        existing_reference(
+            reference,
+            identities=accepted_image_identities(info["digest"], info["descriptor_digests"]),
+        )
 
 def reject_occupied_reference(reference: str) -> None:
     if existing_reference(reference) is not None:
         raise ReleaseError(f"existing image {reference} conflicts with the release")
 
 
-def reject_output_conflict(reference: str, image_id: str) -> None:
-    existing = existing_reference(reference)
-    if existing is None:
-        return
-    found, _platform = image_identity(existing)
-    if found != image_id:
-        raise ReleaseError(f"existing image {reference} conflicts with the release")
+def reject_output_conflict(reference: str, info: dict) -> None:
+    existing_reference(
+        reference,
+        identities=accepted_image_identities(info["digest"], info["descriptor_digests"]),
+    )
 
 
 def source_consumer_contract_from_tree(root: Path) -> int:
@@ -1057,7 +1134,7 @@ def source_consumer_contract_from_tree(root: Path) -> int:
         target = node.targets[0]
         if not isinstance(target, ast.Name) or target.id != SOURCE_CONSUMER_CONTRACT_NAME:
             continue
-        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, int):
+        if isinstance(node.value, ast.Constant) and type(node.value.value) is int:
             return node.value.value
         raise ReleaseError("selected source consumer contract is not an integer literal")
     raise ReleaseError("selected source is missing a supported consumer contract")
@@ -1067,7 +1144,7 @@ def require_supported_source_contract(root: Path, expected: str | None = None) -
     for relative in SOURCE_CONSUMER_PATHS:
         require_tracked_regular_file(root, relative)
     contract = source_consumer_contract_from_tree(root)
-    if contract != SOURCE_CONSUMER_CONTRACT:
+    if contract not in (1, SOURCE_CONSUMER_CONTRACT):
         raise ReleaseError(
             f"selected source consumer contract {contract} is unsupported"
         )
@@ -1720,8 +1797,40 @@ def material_versions(
     return []
 
 
+def image_platform_options() -> tuple[str, ...]:
+    result = docker("info", "--format", "{{json .}}")
+    require_command(result, "inspect image-store capabilities")
+    info = decode_json_bytes(result.stdout.encode(), "Docker image-store capabilities")
+    if not isinstance(info, dict):
+        raise ReleaseError("Docker image-store capabilities must be an object")
+    statuses = info.get("DriverStatus") or []
+    if not isinstance(statuses, list):
+        raise ReleaseError("Docker image-store driver status must be a list")
+    containerd = ["driver-type", "io.containerd.snapshotter.v1"] in statuses
+    if containerd:
+        result = docker("version", "--format", "{{json .}}")
+        require_command(result, "inspect Docker API capabilities")
+        version = decode_json_bytes(result.stdout.encode(), "Docker API capabilities")
+        if not isinstance(version, dict):
+            raise ReleaseError("Docker API capabilities must be an object")
+        versions = []
+        for side in ("Client", "Server"):
+            details = version.get(side)
+            if not isinstance(details, dict):
+                raise ReleaseError(f"Docker API capabilities missing {side}")
+            versions.append(details.get("ApiVersion"))
+        if os.environ.get("DOCKER_API_VERSION"):
+            versions.append(os.environ["DOCKER_API_VERSION"])
+        for api in versions:
+            match = re.fullmatch(r"1\.(\d+)", str(api or ""))
+            if match is None or int(match.group(1)) < 49:
+                raise ReleaseError("containerd image selection requires Docker client and server API 1.49+")
+        return ("--platform", PLATFORM)
+    return ()
+
+
 def inspect_image(reference: str) -> dict:
-    result = docker("image", "inspect", reference)
+    result = docker("image", "inspect", *image_platform_options(), reference)
     if result.returncode != 0:
         detail = (result.stderr or "").strip()
         lowered = detail.lower()
@@ -1746,7 +1855,7 @@ def inspect_image(reference: str) -> dict:
 def image_identity(payload: dict) -> tuple[str, str]:
     image_id = str(payload.get("Id") or "")
     if not image_id.startswith("sha256:") or not is_hex(image_id[7:], HEX_LEN):
-        raise ReleaseError("image configuration digest is missing")
+        raise ReleaseError("engine image identity is missing")
     os_name = str(payload.get("Os") or payload.get("os") or "")
     architecture = str(payload.get("Architecture") or payload.get("architecture") or "")
     config = payload.get("Config") or {}
@@ -1762,10 +1871,14 @@ def image_identity(payload: dict) -> tuple[str, str]:
     return image_id, platform
 
 
-def content_reference(role: str, image_id: str) -> str:
-    digest = image_id[7:]
+def accepted_image_identities(configuration_digest: str, descriptor_digests=()) -> set[str]:
+    return {configuration_digest, *descriptor_digests}
+
+
+def content_reference(role: str, configuration_digest: str) -> str:
+    digest = configuration_digest[7:]
     if not is_hex(digest, HEX_LEN):
-        raise ReleaseError(f"{role}: configuration digest is not an image ID")
+        raise ReleaseError(f"{role}: configuration digest is not a sha256 digest")
     if role == "workspace":
         return f"open-computer-use:{digest}"
     return f"ocu-{role}:{digest}"
@@ -1805,7 +1918,10 @@ def tag_image(source: str, target: str) -> None:
 
 def save_image(reference: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    require_command(docker("save", "-o", str(dest), reference), f"save {reference}")
+    require_command(
+        docker("save", *image_platform_options(), "-o", str(dest), reference),
+        f"save {reference}",
+    )
 
 
 def load_image(archive: Path) -> None:
@@ -1845,7 +1961,7 @@ def validate_inventory_schema(payload: dict) -> None:
     contract = payload.get("source_consumer_contract")
     if not isinstance(contract, int) or isinstance(contract, bool):
         raise ReleaseError("source_consumer_contract must be an integer")
-    if contract != SOURCE_CONSUMER_CONTRACT:
+    if contract not in (1, SOURCE_CONSUMER_CONTRACT):
         raise ReleaseError("source_consumer_contract is unsupported")
     if not is_hex(webui_sha, SHA_LEN):
         raise ReleaseError("webui_source_sha must be a full commit")
@@ -1903,7 +2019,19 @@ def validate_inventory_schema(payload: dict) -> None:
             )
         digest = str(record.get("configuration_digest") or "")
         if not digest.startswith("sha256:") or not is_hex(digest[7:], HEX_LEN):
-            raise ReleaseError(f"{role}: configuration_digest is not an image ID")
+            raise ReleaseError(f"{role}: configuration_digest is not a sha256 digest")
+        if "descriptor_digests" in record:
+            if contract == 1:
+                raise ReleaseError(f"{role}: contract1 forbids descriptor_digests")
+            descriptors = record["descriptor_digests"]
+            if not isinstance(descriptors, list) or len(descriptors) > METADATA_TRAVERSAL_LIMIT:
+                raise ReleaseError(f"{role}: descriptor_digests exceeds its bounded list contract")
+            for item in descriptors:
+                if not isinstance(item, str):
+                    raise ReleaseError(f"{role}: descriptor identity must be a string")
+                require_digest(item, f"{role}: descriptor identity")
+            if len(set(descriptors)) != len(descriptors) or digest in descriptors:
+                raise ReleaseError(f"{role}: duplicate or configuration descriptor identity")
         if reference in seen_refs and seen_refs[reference] != digest:
             raise ReleaseError(f"conflicting reference {reference}")
         seen_refs[reference] = digest
@@ -2191,13 +2319,62 @@ def export_built_image(*, role: str, plan: dict, archive_dir: Path) -> dict:
         )
         payload = inspect_image(temp_tag)
     image_id, _platform = image_identity(payload)
-    reference = content_reference(role, image_id)
-    if reference != temp_tag:
-        reject_output_conflict(reference, image_id)
-        if existing_reference(reference) is None:
-            tag_image(temp_tag, reference)
+    export_reference = temp_tag
+    if "@sha256:" in temp_tag:
+        export_reference = f"ocu-build-{role}-{os.getpid()}"
+        reject_occupied_reference(export_reference)
     archive_path = archive_dir / f"{role}.tar"
+    export_failure: BaseException | None = None
+    try:
+        if export_reference != temp_tag:
+            tag_image(temp_tag, export_reference)
+        save_image(export_reference, archive_path)
+        initial = inspect_archive_bytes(archive_path)
+    except BaseException as exc:
+        export_failure = exc
+        raise
+    finally:
+        if export_reference != temp_tag:
+            try:
+                with _blocked_signals():
+                    owned = existing_reference(export_reference, identities={image_id})
+                    if owned is not None:
+                        require_command(
+                            docker("image", "rm", "--no-prune", export_reference),
+                            f"retire temporary export reference {export_reference}",
+                        )
+            except BaseException as cleanup_error:
+                if export_failure is None:
+                    raise
+                print(
+                    f"release: temporary export reference {export_reference} may remain; cleanup failed: {cleanup_error}",
+                    file=sys.stderr,
+                )
+    aliases = alias_set(export_reference)
+    selected = next((initial[alias] for alias in aliases if alias in initial), None)
+    if selected is None or set(initial) != aliases:
+        raise ReleaseError(f"{role}: initial archive references do not match {temp_tag}")
+    if selected["platform"] != PLATFORM:
+        raise ReleaseError(f"{role}: initial archive platform is not {PLATFORM}")
+    if image_id not in accepted_image_identities(selected["digest"], selected["descriptor_digests"]):
+        raise ReleaseError(f"{role}: engine image identity is not verified by the archive")
+    reference = content_reference(role, selected["digest"])
+    reject_output_conflict(reference, selected)
+    archive_path.unlink()
+    if reference != temp_tag:
+        tag_image(temp_tag, reference)
     save_image(reference, archive_path)
+    final = inspect_archive_bytes(archive_path)
+    if set(final) != alias_set(reference):
+        raise ReleaseError(f"{role}: final archive references do not match {reference}")
+    selected_final = final[reference]
+    if selected_final["digest"] != selected["digest"] or selected_final["platform"] != PLATFORM:
+        raise ReleaseError(f"{role}: final archive configuration or platform changed")
+    if image_id not in accepted_image_identities(selected_final["digest"], selected_final["descriptor_digests"]):
+        raise ReleaseError(f"{role}: final archive does not verify the engine image identity")
+    final_image_id, _platform = image_identity(inspect_image(reference))
+    if final_image_id not in accepted_image_identities(selected_final["digest"], selected_final["descriptor_digests"]):
+        raise ReleaseError(f"{role}: final reference has an unverified engine image identity")
     repo_digests = payload.get("RepoDigests") or []
     if not isinstance(repo_digests, list):
         repo_digests = []
@@ -2206,7 +2383,7 @@ def export_built_image(*, role: str, plan: dict, archive_dir: Path) -> dict:
     context = plan["context"]
     record = {
         "reference": reference,
-        "configuration_digest": image_id,
+        "configuration_digest": selected_final["digest"],
         "archive": {
             "path": f"images/{role}.tar",
             "sha256": sha256_file(archive_path),
@@ -2224,6 +2401,8 @@ def export_built_image(*, role: str, plan: dict, archive_dir: Path) -> dict:
             "materials": plan["materials"],
         },
     }
+    if selected_final["descriptor_digests"]:
+        record["descriptor_digests"] = selected_final["descriptor_digests"]
     if repo_digests:
         record["registry_digests"] = [str(item) for item in repo_digests]
     return record
@@ -2257,6 +2436,8 @@ def build_release(
         checkout_tracked_tree(ocu_snap, ocu_tree, ocu_sha)
         checkout_tracked_tree(webui_snap, webui_tree, webui_sha)
         contract = require_supported_source_contract(ocu_tree)
+        if contract != SOURCE_CONSUMER_CONTRACT:
+            raise ReleaseError("new builds require selected source consumer contract2")
         plans = {}
         for role in ROLE_ORDER:
             source_sha = webui_sha if ROLE_SPECS[role]["source"] == "webui" else ocu_sha
@@ -2295,6 +2476,7 @@ def build_release(
                 "images": images,
             }
             validate_inventory_schema(payload)
+            verify_archive_set(stage, payload)
             write_inventory(stage / "release.json", payload)
             publish_exclusive(stage, destination, session.lock_path)
         session.committed = True
@@ -2374,6 +2556,10 @@ def expected_imported_refs(payload: dict) -> dict[str, str]:
 def verify_archive_set(root: Path, payload: dict) -> dict[str, dict]:
     imported: dict[str, dict] = {}
     expected = expected_imported_refs(payload)
+    records: dict[str, list[tuple[str, dict]]] = {}
+    for role, record in payload["images"].items():
+        reference = normalize_docker_ref(record["reference"])
+        records.setdefault(reference, []).append((role, record))
     declared = {
         normalize_docker_ref(record["reference"]) for record in payload["images"].values()
     }
@@ -2403,9 +2589,23 @@ def verify_archive_set(root: Path, payload: dict) -> dict[str, dict]:
                 raise ReleaseError(
                     f"{role}: archive platform for {tag} is {info['platform']}, expected {PLATFORM}"
                 )
+            # A shared reference must substantiate and satisfy every declaring role.
+            shared_descriptors: set[str] | None = None
+            for declared_role, declared_record in records[normalized]:
+                claimed = set(declared_record.get("descriptor_digests", []))
+                if not claimed <= set(info["descriptor_digests"]):
+                    raise ReleaseError(
+                        f"{declared_role}: archive descriptor identities for {tag} do not match the inventory"
+                    )
+                shared_descriptors = (
+                    claimed if shared_descriptors is None
+                    else shared_descriptors & claimed
+                )
             if tag in imported and imported[tag]["digest"] != info["digest"]:
                 raise ReleaseError(f"conflicting imported reference {tag}")
-            imported[tag] = info
+            imported[tag] = {
+                **info, "descriptor_digests": sorted(shared_descriptors or []),
+            }
     present = {normalize_docker_ref(tag) for tag in imported}
     if present != declared:
         missing = sorted(declared - present)
@@ -2427,9 +2627,11 @@ def verify_loaded_images(payload: dict) -> None:
     for role, record in payload["images"].items():
         inspected = inspect_image(record["reference"])
         image_id, platform = image_identity(inspected)
-        if image_id != record["configuration_digest"]:
+        if image_id not in accepted_image_identities(
+            record["configuration_digest"], record.get("descriptor_digests", [])
+        ):
             raise ReleaseError(
-                f"{role}: loaded {record['reference']} has {image_id}, expected {record['configuration_digest']}"
+                f"{role}: loaded {record['reference']} has unverified engine image identity {image_id}"
             )
         if platform != PLATFORM:
             raise ReleaseError(f"{role}: loaded platform is {platform}")
@@ -2558,16 +2760,21 @@ def derive_runtime_images(
     return values
 
 
-def verify_local_images(payload: dict) -> None:
+def verify_local_images(payload: dict) -> dict[str, str]:
+    selected = {}
     for role, record in payload["images"].items():
         inspected = inspect_image(record["reference"])
         image_id, platform = image_identity(inspected)
-        if image_id != record["configuration_digest"]:
+        if image_id not in accepted_image_identities(
+            record["configuration_digest"], record.get("descriptor_digests", [])
+        ):
             raise ReleaseError(
-                f"{role} image {record['reference']} has configuration digest {image_id}, expected {record['configuration_digest']}"
+                f"{role} image {record['reference']} has unverified engine image identity {image_id}"
             )
         if platform != PLATFORM:
             raise ReleaseError(f"{role} image platform is {platform}")
+        selected[role] = image_id
+    return selected
 
 
 def resolved_service_images(docs: dict) -> dict[str, str]:
@@ -2667,7 +2874,7 @@ def provenance_lines(payload: dict) -> list[str]:
         f"- Target platform: `{payload['platform']}`",
         f"- Open Computer Use source commit: `{payload['ocu_source_sha']}`",
         f"- Open WebUI source commit: `{payload['webui_source_sha']}`",
-        "- Image configuration digests are Docker image IDs, not registry manifest digests.",
+        "- Configuration digests hash archive configuration bytes; engine image IDs must match a configuration or verified descriptor identity.",
         "- Dockerfile hashes and material input versions record requested build inputs, not installed package versions.",
         "- Input hashes cover declared tracked context files, not Dockerignore-filtered engine inputs.",
     ]
@@ -2675,8 +2882,12 @@ def provenance_lines(payload: dict) -> list[str]:
         record = payload["images"][role]
         build = record["build"]
         lines.append(
-            f"- {role} image: `{record['reference']}` (`{record['configuration_digest']}`)"
+            f"- {role} image: `{record['reference']}` (configuration: `{record['configuration_digest']}`)"
         )
+        if record.get("descriptor_digests"):
+            lines.append("  - verified descriptor identities: " + ", ".join(
+                f"`{digest}`" for digest in record["descriptor_digests"]
+            ))
         materials = ", ".join(
             f"{item['name']}={item['requested']}"
             for item in build.get("materials") or []
