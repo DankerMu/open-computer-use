@@ -151,6 +151,7 @@ try:
     runtime = dict(os.environ)
     release.verify_runtime_binding(payload, runtime)
     release.verify_tracked_source(root, payload["ocu_source_sha"])
+    release.require_supported_source_contract(root, payload["source_consumer_contract"])
     fonts = release.verify_release_fonts(Path(sys.argv[2]), root)
     release.verify_local_images(payload)
     print(fonts, end="\0")

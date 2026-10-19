@@ -9,6 +9,13 @@ The orchestrator runs an inner container engine to spawn the sandboxes. As of ch
 stock Kubernetes node: no privileged container, no RuntimeClass, no Block-mode PVC.
 `podman system service` speaks the Docker API, so the orchestrator is unchanged.
 
+This inner Podman engine does not qualify Podman as a transport for the fork's
+`deploy/release.py` offline release workflow. That workflow supports only qualified
+local Docker Engine/Desktop store/export paths; see its
+[identity matrix](../deploy/production-like-test/NETWORK-HARDENING.md#qualified-local-image-identity-paths).
+Remote Docker daemons and Podman release import/export remain outside that contract.
+
+
 Isolation is user namespaces plus an AppArmor profile, which is weaker than the VM
 boundary the Kata-based chart gave you. Say so out loud when deciding: it is a
 reduction, not an equivalent. The profile must already exist on the node — a chart

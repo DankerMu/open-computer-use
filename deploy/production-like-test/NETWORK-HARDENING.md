@@ -26,6 +26,80 @@ and adds a modification notice. It rejects source/hash drift and build overrides
 PostgreSQL remains pulled. The base index, derived platform manifest,
 configuration digest and exported archive checksum are distinct identities.
 
+`configuration_digest` hashes the saved configuration bytes, never an inspected
+engine ID. Optional `descriptor_digests` contain only independently hash-verified
+image manifests and ancestor indexes bound to that reference, configuration and
+platform. Attestations, foreign siblings and other platforms cannot authorize an
+engine identity. Registry observations and archive checksums have separate roles.
+Attachment markers do not prove non-selectability. A marked manifest whose
+verified configuration selects linux/amd64 refuses before load even if its
+configuration equals the runtime image's and the inventory omits the index digest.
+Verified unknown/unknown attachments remain excluded from runtime identities.
+Named indexes containing foreign selectable configurations and attachment indexes
+whose selection cannot be qualified are refused.
+Build derives the content tag from the first export, retires that private archive,
+saves the final reference and verifies the complete archive set before publication.
+Startup, bootstrap and recovery accept an actual engine/container `Image` only
+when it belongs to the selected configuration/descriptor set; they do not export
+images to establish identity.
+
+For containerd stores, observed daemon `DriverStatus` must identify the containerd
+snapshotter and both client and server must expose API 1.49 or newer. Inspection
+and export explicitly select `--platform linux/amd64`; an unfiltered multi-platform
+index may lack platform fields or refer to unfetched content. Classic stores use
+ordinary inspect/save and still require concrete linux/amd64 metadata plus archive
+agreement. Unsupported containerd capability combinations refuse without retrying
+an unfiltered export or assuming a platform. The selected engine ID in the version
+record comes from the same verified inspection, not a raw root-index observation.
+
+An optional Docker `repositories` entry associates its reference with the selected
+manifest's final layer, not the configuration. The parser verifies that association
+and the final layer's configuration diff ID using streamed hashing. Undeclared
+references, inconsistent layer associations and altered layer bytes refuse before
+load; shared layers are valid. Layer identities never authorize engine IDs.
+
+New builds require selected committed source-consumer contract2 before Docker
+mutation. Format2 readers accept contract1 only with config-only image records
+and matching bundled source1, preserving valid classic-store rollback. Contract2
+also accepts config-only records. Unknown contracts, contract1 descriptor fields
+and mismatched bundled readers are refused. Historical artifacts that mislabeled
+an engine ID as configuration must be rebuilt, not edited into apparent validity.
+Direct `deploy/up.sh` invocation checks the inventory/source contract pairing
+before deployment resource mutation, independently of prior bootstrap or verify.
+
+### Qualified local image identity paths
+
+| Local daemon/store | Build/export path | Observed engine identity | Evidence boundary |
+| --- | --- | --- | --- |
+| Docker Engine 29.1.3, classic `vfs` | `docker build --platform linux/amd64`, ordinary inspect/save | Configuration digest | Seven-role CLI protocol qualification and separate initially empty image/cache targets |
+| Docker Engine 29.1.3, containerd snapshotter | linux/amd64 build; inspect/save explicitly select `--platform linux/amd64` | Selected runtime manifest IDs verified against exported descriptors | Seven-role CLI protocol qualification and separate initially empty image/cache targets |
+| Docker Desktop Engine 29.1.3, containerd store | Build/save and load of an isolated image | Verified image-manifest digest | Producer/load/container identity observations; not full release CLI or product acceptance |
+
+Both Engine profiles passed seven-role CLI build/export, delivery verification,
+import, local/startup verification and identical re-import, including separate
+cold targets with initially empty image stores and caches. The daemon binaries
+were arm64 on LinuxKit; all release images were linux/amd64. Inputs used five
+small protocol-image recipes plus the actual qualified DocumentServer and
+PostgreSQL images. This qualifies the exercised release protocol, not production
+application behavior or native-Linux portability.
+
+Containerd's unqualified raw index ID can differ from the selected runtime
+manifest ID. Platform-selected exports and verification bind the latter to the
+actual configuration. A raw index ID is not accepted merely because the daemon
+reports it; it must independently occur in the archive's verified identity set.
+
+The release transport is limited to local Docker daemons and one linux/amd64
+image per role. Pure classic Docker archives contribute no alternate descriptors;
+canonical Moby/containerd hybrid archives can provide verified alternates on
+either store. Qualification of one store/export combination does not qualify all
+Docker versions, snapshotters or export tools. Remote daemons, Podman release
+transport, Windows and multi-platform publication are not supported by this
+change. The Kubernetes chart's inner Podman sandbox engine is a different path.
+Production application-image behavior, WAN-free product restart and LAN
+deployment require separate execution evidence. Neither the Engine protocol
+qualification nor the standalone Desktop identity probes establish those results.
+
+
 For local Office qualification, explicitly load the archive matching
 `deploy/documentserver-qualified.json` and the selected recipe tree before running
 the WebUI `make verify-office` target. Its content-derived reference and inspected

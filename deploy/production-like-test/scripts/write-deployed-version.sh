@@ -29,20 +29,9 @@ if [ -z "$manifest" ]; then
     printf '%s\n' 'OCU_RELEASE_MANIFEST is required' >&2
     exit 1
 fi
-openwebui_image=$(env_value OPENWEBUI_IMAGE)
-postgres_image=$(env_value POSTGRES_IMAGE)
-documentserver_image=$(env_value DOCUMENTSERVER_IMAGE)
-workspace_image=$(env_value DOCKER_IMAGE)
-server_image=$(env_value COMPUTER_USE_SERVER_IMAGE)
-retention_image=$(env_value RETENTION_GUARD_IMAGE)
-proxy_image=$(env_value OCU_PROXY_IMAGE)
 generated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 tmp_file=$(mktemp "$deploy_root/.DEPLOYED_VERSION.md.XXXXXX")
 trap 'rm -f "$tmp_file"' EXIT
-
-image_id() {
-    docker image inspect --format '{{.Id}}' "$1"
-}
 
 {
     printf '%s\n' '# Open WebUI + Open Computer Use deployment version record'
@@ -64,16 +53,12 @@ for line in Path(sys.argv[3]).read_text(encoding="utf-8").splitlines():
     runtime[name] = value
 release.verify_runtime_binding(payload, runtime)
 release.verify_tracked_source(source, payload["ocu_source_sha"])
-release.verify_local_images(payload)
+release.require_supported_source_contract(source, payload["source_consumer_contract"])
+selected_ids = release.verify_local_images(payload)
 sys.stdout.write("\n".join(release.provenance_lines(payload)) + "\n")
+for role, record in payload["images"].items():
+    print(f"- {role} image selected engine ID: `{record['reference']}` (`{selected_ids[role]}`)")
 PY
-    printf -- '- Workspace image runtime ID: `%s` (`%s`)\n' "$workspace_image" "$(image_id "$workspace_image")"
-    printf -- '- Computer Use server image runtime ID: `%s` (`%s`)\n' "$server_image" "$(image_id "$server_image")"
-    printf -- '- Retention guard image runtime ID: `%s` (`%s`)\n' "$retention_image" "$(image_id "$retention_image")"
-    printf -- '- Proxy image runtime ID: `%s` (`%s`)\n' "$proxy_image" "$(image_id "$proxy_image")"
-    printf -- '- Open WebUI image runtime ID: `%s` (`%s`)\n' "$openwebui_image" "$(image_id "$openwebui_image")"
-    printf -- '- PostgreSQL image runtime ID: `%s` (`%s`)\n' "$postgres_image" "$(image_id "$postgres_image")"
-    printf -- '- DocumentServer image runtime ID: `%s` (`%s`)\n' "$documentserver_image" "$(image_id "$documentserver_image")"
 
     printf -- '- Docker engine: `%s`\n' "$(docker version --format '{{.Server.Version}}')"
     printf -- '- Docker Compose: `%s`\n' "$(docker compose version --short)"
@@ -92,7 +77,7 @@ PY
     printf -- '- `%s`\n' 'Ollama disabled; only the configured OpenAI-compatible provider is enabled'
     printf '\n## Upgrade and offline-production notes\n\n'
     printf -- '- Import a verified `release.json` before bootstrap or startup. Do not rebuild or pull images during `deploy/up.sh`.\n'
-    printf -- '- Image configuration digests are Docker image IDs, not registry manifest digests.\n'
+    printf -- '- Configuration digests hash archive configuration bytes; engine IDs may instead identify verified image manifests or ancestor indexes.\n'
     printf -- '- Dockerfile hashes and material input versions record requested build inputs, not installed package versions.\n'
     printf -- '- Re-run the compatibility, UI, RAG, sandbox-isolation and backup tests before changing the source commit, Open WebUI image, model endpoint or Docker engine.\n'
     printf -- '- The runtime configuration and provider credential files are intentionally excluded from this document.\n'

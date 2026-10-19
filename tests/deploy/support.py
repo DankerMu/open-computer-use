@@ -91,7 +91,7 @@ DEFAULT_RELEASE_DIGESTS = {
 FORMAT_VERSION = 2
 PLATFORM = "linux/amd64"
 WEBUI_SYNTHETIC_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-SOURCE_CONSUMER_CONTRACT = 1
+SOURCE_CONSUMER_CONTRACT = 2
 HISTORICAL_INCOMPATIBLE_SOURCE = "f851621f7d425487c99b0f548dcb4dab06a9648e"
 OCI_LAYOUT_VERSION = "1.0.0"
 ANNOTATION_IMAGE_NAME = "io.containerd.image.name"
@@ -347,6 +347,7 @@ def run_checker(paths, *, env=None, extra_env=None):
 
 def fake_env(state_dir: Path, extra=None):
     env = os.environ.copy()
+    env.pop("DOCKER_API_VERSION", None)
     env["PATH"] = str(FAKE_DOCKER.parent) + os.pathsep + env.get("PATH", "")
     env["FAKE_DOCKER_STATE"] = str(state_dir)
     env["TMPDIR"] = str(state_dir)
@@ -672,6 +673,8 @@ def synthetic_inventory(*, ocu_sha: str, webui_sha: str, images=None, bundle_sha
         }
         if "registry_digests" in source:
             records[role]["registry_digests"] = source["registry_digests"]
+        if "descriptor_digests" in source:
+            records[role]["descriptor_digests"] = source["descriptor_digests"]
     return {
         "format_version": FORMAT_VERSION,
         "platform": PLATFORM,
@@ -721,7 +724,6 @@ def default_config_id(role: str) -> str:
 def write_image_archive(path: Path, tags: dict[str, bytes]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     entries = []
-    repositories = {}
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w") as archive:
         for tag, config in tags.items():
@@ -731,16 +733,10 @@ def write_image_archive(path: Path, tags: dict[str, bytes]) -> Path:
             info.size = len(config)
             archive.addfile(info, io.BytesIO(config))
             entries.append({"Config": name, "RepoTags": [tag], "Layers": []})
-            repo, _, label = tag.partition(":")
-            repositories.setdefault(repo, {})[label or "latest"] = digest
         manifest = json.dumps(entries).encode("utf-8")
         info = tarfile.TarInfo(name="manifest.json")
         info.size = len(manifest)
         archive.addfile(info, io.BytesIO(manifest))
-        repos = json.dumps(repositories).encode("utf-8")
-        info = tarfile.TarInfo(name="repositories")
-        info.size = len(repos)
-        archive.addfile(info, io.BytesIO(repos))
     path.write_bytes(payload.getvalue())
     return path
 
@@ -789,6 +785,7 @@ def write_hybrid_image_archive(
     nested_index=False,
     attestation=None,
     layer: bytes | None = None,
+    repositories=False,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     layer_bytes = b"ocu-hybrid-layer\n" if layer is None else layer
@@ -847,7 +844,7 @@ def write_hybrid_image_archive(
         child = {
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.index.v1+json",
-            "manifests": named,
+            "manifests": [{key: value for key, value in named[0].items() if key != "annotations"}],
         }
         child_bytes = json.dumps(child, separators=(",", ":"), sort_keys=True).encode("utf-8")
         child_digest = _sha256_hex(child_bytes)
@@ -857,17 +854,25 @@ def write_hybrid_image_archive(
                 "mediaType": "application/vnd.oci.image.index.v1+json",
                 "digest": f"sha256:{child_digest}",
                 "size": len(child_bytes),
+                "annotations": descriptor["annotations"],
             }
+            for descriptor in named
         ]
     if attestation is not None:
         subject = f"sha256:{manifest_digest}"
+        attachment_config = json.dumps({
+            "os": "unknown", "architecture": "unknown",
+            "rootfs": {"type": "layers", "diff_ids": []}, "config": {},
+        }, separators=(",", ":"), sort_keys=True).encode()
+        attachment_config_digest = _sha256_hex(attachment_config)
+        blobs[attachment_config_digest] = attachment_config
         attestation_manifest = {
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {
                 "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": f"sha256:{config_digest}",
-                "size": len(config),
+                "digest": f"sha256:{attachment_config_digest}",
+                "size": len(attachment_config),
             },
             "layers": [],
             "subject": {
@@ -888,7 +893,7 @@ def write_hybrid_image_archive(
                 "size": len(attestation_bytes),
                 "annotations": {
                     "vnd.docker.reference.type": "attestation-manifest",
-                    "containerd.io/manifest.subject": subject,
+                    "io.containerd.manifest.subject": subject,
                 },
             }
         )
@@ -921,6 +926,9 @@ def write_hybrid_image_archive(
         add("oci-layout", layout_bytes)
         add("index.json", index_bytes)
         add("manifest.json", docker_manifest)
+        if repositories:
+            name, _, tag = familiar_docker_ref(reference).rpartition(":")
+            add("repositories", json.dumps({name: {tag: layer_digest}}).encode())
         for digest, data in blobs.items():
             add(f"blobs/sha256/{digest}", data)
     path.write_bytes(payload.getvalue())

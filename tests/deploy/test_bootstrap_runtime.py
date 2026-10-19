@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+import tarfile
 from unittest.mock import patch
 
 from support import (
@@ -31,6 +32,7 @@ from support import (
     write_fake_configs,
     write_network,
     write_release_for_sha,
+    write_hybrid_image_archive,
 )
 
 
@@ -507,6 +509,46 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
                 token,
             )
 
+    def test_direct_startup_refuses_mismatched_reader_contract_before_resource_changes(self):
+        created = self.run_bootstrap()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        write_fake_configs(self.state, token_docs())
+        seed_healthy_host(self.state)
+        write_network(
+            self.state, runtime["OCU_PRIVATE_NETWORK"],
+            subnet=runtime["OCU_PRIVATE_SUBNET"], gateway=runtime["OCU_PRIVATE_GATEWAY"],
+        )
+        write_network(
+            self.state, SANDBOX_NETWORK,
+            subnet=runtime["OCU_SANDBOX_SUBNET"], gateway=runtime["OCU_SANDBOX_GATEWAY"],
+        )
+        inventory = json.loads(self.inventory.read_text())
+        self.assertEqual(inventory["source_consumer_contract"], 2)
+        inventory["source_consumer_contract"] = 1
+        self.inventory.write_text(json.dumps(inventory))
+        before = {
+            str(path.relative_to(self.state)): path.read_bytes()
+            for path in self.state.rglob("*") if path.is_file() and path.name != "ops.log"
+        }
+        runtime_before = self.runtime_path().read_bytes()
+        credentials_before = self.credentials.read_bytes()
+        env, script, source = self.consumer_up_env(runtime)
+        result = subprocess.run(
+            ["bash", str(script)], cwd=str(source), env=env,
+            capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / "starts.log").exists())
+        self.assertFalse((self.state / "executed.json").exists())
+        after = {
+            str(path.relative_to(self.state)): path.read_bytes()
+            for path in self.state.rglob("*") if path.is_file() and path.name != "ops.log"
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(self.runtime_path().read_bytes(), runtime_before)
+        self.assertEqual(self.credentials.read_bytes(), credentials_before)
+
     def test_generated_credentials_are_fresh_across_deployments(self):
         first = self.run_bootstrap()
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -688,12 +730,41 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         self.assertTrue(any(
             runtime["DOCUMENTSERVER_IMAGE"] in line
             and default_config_id("documentserver") in line
-            for line in record.splitlines() if "image runtime ID:" in line
+            for line in record.splitlines()
         ))
         self.assertIn(self.sha, record)
         self.assertIn(self.webui_sha, record)
         self.assertNotIn(runtime["WEBUI_SECRET_KEY"], record)
         self.assertEqual(stat.S_IMODE((self.deploy_root / "DEPLOYED_VERSION.md").stat().st_mode), 0o644)
+
+    def test_descriptor_engine_identity_bootstraps_and_records_distinct_configuration(self):
+        images_path = self.state / "images.json"
+        images = json.loads(images_path.read_text())
+        inventory = json.loads(self.inventory.read_text())
+        record = inventory["images"]["workspace"]
+        image = images[record["reference"]]
+        archive = write_hybrid_image_archive(
+            self.root / "workspace.tar", reference=record["reference"],
+            config=image["ConfigBytes"].encode(),
+        )
+        with tarfile.open(archive) as bundle:
+            engine_id = json.load(bundle.extractfile("index.json"))["manifests"][0]["digest"]
+        record["descriptor_digests"] = [engine_id]
+        image["Id"] = engine_id
+        self.inventory.write_text(json.dumps(inventory))
+        images_path.write_text(json.dumps(images))
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run(
+            ["bash", str(WRITE_VERSION)], cwd=str(ROOT), env=self.env,
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = (self.deploy_root / "DEPLOYED_VERSION.md").read_text()
+        self.assertIn(record["configuration_digest"], rendered)
+        self.assertIn(engine_id, rendered)
+        self.assertNotEqual(record["configuration_digest"], engine_id)
+        self.assertFalse((self.state / "builds.json").exists())
 
     def test_replaced_image_rejects_bootstrap_before_publication(self):
         images = json.loads((self.state / "images.json").read_text(encoding="utf-8"))
@@ -702,7 +773,6 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         (self.state / "images.json").write_text(json.dumps(images), encoding="utf-8")
         result = self.run_bootstrap()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("configuration digest", result.stderr)
         self.assert_unpublished()
 
     def test_replaced_image_preserves_existing_version_record(self):

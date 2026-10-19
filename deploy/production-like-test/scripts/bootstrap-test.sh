@@ -136,6 +136,7 @@ sys.path.insert(0, os.path.join(sys.argv[1], "deploy"))
 import release
 
 payload = release.load_inventory(Path(os.environ["OCU_RELEASE_MANIFEST"]))
+release.require_supported_source_contract(Path(sys.argv[1]), payload["source_consumer_contract"])
 assignments = release.bootstrap_dotenv_assignments(payload, dict(os.environ))
 allowed = {
     "SOURCE_SHA",

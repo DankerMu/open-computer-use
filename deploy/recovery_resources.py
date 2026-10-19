@@ -405,13 +405,13 @@ def _stop_writer(name: str) -> None:
 
 def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inventory: dict) -> None:
     expected_images = {
-        identity["server_container"]: inventory["images"]["computer-use-server"]["configuration_digest"],
-        identity["retention_container"]: inventory["images"]["retention-guard"]["configuration_digest"],
-        identity["init_container"]: inventory["images"]["open-webui"]["configuration_digest"],
-        identity["webui_container"]: inventory["images"]["open-webui"]["configuration_digest"],
-        identity["proxy_container"]: inventory["images"]["proxy"]["configuration_digest"],
-        identity["documentserver_container"]: inventory["images"]["documentserver"]["configuration_digest"],
-        identity["postgres_container"]: inventory["images"]["postgres"]["configuration_digest"],
+        identity["server_container"]: inventory["images"]["computer-use-server"],
+        identity["retention_container"]: inventory["images"]["retention-guard"],
+        identity["init_container"]: inventory["images"]["open-webui"],
+        identity["webui_container"]: inventory["images"]["open-webui"],
+        identity["proxy_container"]: inventory["images"]["proxy"],
+        identity["documentserver_container"]: inventory["images"]["documentserver"],
+        identity["postgres_container"]: inventory["images"]["postgres"],
     }
     expected_services = {
         identity["server_container"]: "computer-use-server",
@@ -430,9 +430,11 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
         payload = inspect_container(name)
         inspected.add(name)
         image = _container_image(payload)
-        if image != expected:
+        if image not in release.accepted_image_identities(
+            expected["configuration_digest"], expected.get("descriptor_digests", [])
+        ):
             raise RecoveryError(
-                f"{name} image {image} does not match selected release {expected}"
+                f"{name} image {image} does not match selected release {expected['reference']}"
             )
         project, service = _compose_labels(payload)
         if project != identity["project"]:
@@ -1158,7 +1160,7 @@ def _require_matching_selected_root(source_root: Path, requested: dict, owner: d
     payload = release.load_inventory(manifest)
     require_selected_release(payload, requested)
     release.verify_tracked_source(source_root / "source", requested["ocu_source_sha"])
-    release.require_supported_source_contract(source_root / "source")
+    release.require_supported_source_contract(source_root / "source", payload["source_consumer_contract"])
     release.verify_release_fonts(manifest, source_root / "source")
     release.verify_local_images(payload)
     return payload
@@ -1534,7 +1536,9 @@ def activate_release(*, destination_root: Path, retained_delivery: Path, docker_
         require_selected_release(inventory, requested)
         release.verify_tracked_source(destination_root / "source", inventory["ocu_source_sha"])
         release.verify_local_images(inventory)
-        release.require_supported_source_contract(destination_root / "source")
+        release.require_supported_source_contract(
+            destination_root / "source", inventory["source_consumer_contract"]
+        )
         recovery_db.require_compatible_revision(schema, inventory["images"]["open-webui"]["reference"])
         recovery_db.require_compatible_tools(schema, inventory["images"]["postgres"]["reference"])
         script = destination_root / "source" / "deploy" / "up.sh"
