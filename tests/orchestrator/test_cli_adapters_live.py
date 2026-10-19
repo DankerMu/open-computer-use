@@ -30,7 +30,7 @@ Other env knobs:
                    (default: 18080)
 
 Run locally:
-  RUN_LIVE_CLI=1 pytest tests/orchestrator/test_cli_adapters_live.py -v -s
+  RUN_LIVE_CLI=1 python -m pytest tests/orchestrator/test_cli_adapters_live.py -v -s
 """
 
 import json
