@@ -164,16 +164,23 @@ Final-path existence therefore signals complete exact text, not a write still
 in progress; successful publication leaves no stage. Marker bookkeeping bypasses
 the production replacement/write/sync hooks without advancing the selected cut.
 Existing child holds, exact-text checks, SIGKILL checks and recovery assertions
-remain unchanged. Contention-only markers and the separate pause/read oracle
-are outside this protocol.
+remain unchanged. The ordinary process holder in
+`orchestrator/test_office_control_plane_concurrency.py` publishes its
+`callback-process-entered` readiness marker through the same writer, so the
+startup-failure owner's exact `held` read never sees incomplete text. The other
+contention markers (`callback-process-contended` and the thread holder) and the
+separate pause/read oracle are outside this protocol.
 
 `orchestrator/test_office_crash_markers.py` holds real filesystem writes before
 text is complete, exercises short writes and publication failures, and checks
-saved-hook isolation plus private-mode/sync/close ordering. Its behavioral
-mutation seam is `_publish_marker` in the shared embedded source: restoring
-direct final-path writes must expose premature readiness, not an import failure.
-Run this module together with the complete `test_office_publish_recovery.py`,
-`test_office_save_as.py`, `test_office_resolution.py` and `test_office_store.py`
+saved-hook isolation plus private-mode/sync/close ordering. It also holds the
+real process holder at its marker open; lock-file and descriptor opens pass
+through the hold filter. Its behavioral mutation seam is `_publish_marker` in the
+shared embedded source: restoring direct final-path writes must expose premature
+readiness, not an import failure. Run this module together with the complete
+`test_office_publish_recovery.py`, `test_office_save_as.py`,
+`test_office_resolution.py`, `test_office_store.py`,
+`test_office_contention_startup.py` and `test_office_control_plane_concurrency.py`
 modules; do not exclude the independent pause/read case if it fails.
 
 ### Office workspace read observers
