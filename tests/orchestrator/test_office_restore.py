@@ -345,7 +345,6 @@ def test_one_fence_captures_only_after_pause_and_preserves_external_pause(office
     container = _running(manager) if state == "running" else _container(manager._container_name(CHAT), status=state)
     if state != "running":
         manager._docker_client = _docker([container])
-    inode = (path.stat().st_dev, path.stat().st_ino)
     reads, real_read = [], os.read
     def observed(fd, size):
         info = os.fstat(fd)
@@ -353,7 +352,9 @@ def test_one_fence_captures_only_after_pause_and_preserves_external_pause(office
             assert state == "exited" or container.attrs["State"]["Paused"] is True
             reads.append(True)
         return real_read(fd, size)
-    with monkeypatch.context() as boundary:
+    with path.open("rb") as held, monkeypatch.context() as boundary:
+        target = os.fstat(held.fileno())
+        inode = (target.st_dev, target.st_ino)
         boundary.setattr(os, "read", observed)
         response = _restore(http, session["file_id"])
     assert response.status_code == 200 and reads
@@ -373,13 +374,14 @@ def test_pause_failure_only_retains_new_unpublished_restore_without_workspace_re
     revision = broker.OutputsBroker().current_revision(CHAT)
     container = _running(manager)
     container.pause.side_effect = RuntimeError("pause refused")
-    inode = (path.stat().st_dev, path.stat().st_ino)
     real_read = os.read
     def forbidden(fd, size):
         info = os.fstat(fd)
         assert (info.st_dev, info.st_ino) != inode, "workspace read before writer exclusion"
         return real_read(fd, size)
-    with monkeypatch.context() as boundary:
+    with path.open("rb") as held, monkeypatch.context() as boundary:
+        target = os.fstat(held.fileno())
+        inode = (target.st_dev, target.st_ino)
         boundary.setattr(os, "read", forbidden)
         _assert_refusal(_restore(http, session["file_id"], 2), 503, "pause_failed")
     after = _read(data)

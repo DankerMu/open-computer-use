@@ -176,6 +176,16 @@ Run this module together with the complete `test_office_publish_recovery.py`,
 `test_office_save_as.py`, `test_office_resolution.py` and `test_office_store.py`
 modules; do not exclude the independent pause/read case if it fails.
 
+### Office workspace read observers
+
+The resolution, restore, publish-fence and notice tests bind each read observer
+to the identity from `fstat` of an owned read-only file descriptor. The descriptor
+stays open throughout the observed operation, including workspace replacement or
+unlink, and the read hook is removed before the descriptor closes on success or
+failure. Notice counters own this scope explicitly through
+`_count_workspace_reads`; repeated status windows and counter resets share the
+same held resource.
+
 
 ### Office command deadlines and transaction-worker ownership
 
