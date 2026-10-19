@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -75,19 +76,22 @@ def _restore_sample(path: Path, size: int, mtime_ns: int, body: bytes) -> None:
     assert restored[1] == mtime_ns
 
 
+@contextmanager
 def _count_workspace_reads(module, monkeypatch, path: Path):
-    identity = (path.stat().st_dev, path.stat().st_ino)
-    original = module.os.read
-    seen = {"count": 0}
+    with path.open("rb") as held, monkeypatch.context() as boundary:
+        target = os.fstat(held.fileno())
+        identity = (target.st_dev, target.st_ino)
+        original = module.os.read
+        seen = {"count": 0}
 
-    def counted(fd, amount):
-        info = os.fstat(fd)
-        if (info.st_dev, info.st_ino) == identity:
-            seen["count"] += 1
-        return original(fd, amount)
+        def counted(fd, amount):
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) == identity:
+                seen["count"] += 1
+            return original(fd, amount)
 
-    monkeypatch.setattr(module.os, "read", counted)
-    return seen
+        boundary.setattr(module.os, "read", counted)
+        yield seen
 
 
 def _forbid_inode_stat(module, monkeypatch, *paths: Path):
@@ -129,18 +133,18 @@ def test_first_status_hashes_then_equal_pair_repeats_false_without_reading(offic
     _file_id, first = _created(office_world, "opening")
     path = _workspace(data)
     original = path.read_bytes()
-    reads = _count_workspace_reads(notice, monkeypatch, path)
-    first_status = _status_fields(http, first["session_id"])
-    assert first_status["workspace_changed"] is False
-    assert first_status["state"] == "opening"
-    record = _record(first["session_id"])
-    assert (record["last_checked_size"], record["last_checked_mtime_ns"]) == _sample(path)
-    assert reads["count"] > 0
-    reads["count"] = 0
-    second = _status_fields(http, first["session_id"])
-    assert second["workspace_changed"] is False
-    assert second["state"] == "opening"
-    assert reads["count"] == 0
+    with _count_workspace_reads(notice, monkeypatch, path) as reads:
+        first_status = _status_fields(http, first["session_id"])
+        assert first_status["workspace_changed"] is False
+        assert first_status["state"] == "opening"
+        record = _record(first["session_id"])
+        assert (record["last_checked_size"], record["last_checked_mtime_ns"]) == _sample(path)
+        assert reads["count"] > 0
+        reads["count"] = 0
+        second = _status_fields(http, first["session_id"])
+        assert second["workspace_changed"] is False
+        assert second["state"] == "opening"
+        assert reads["count"] == 0
     assert path.read_bytes() == original
     assert origin.hits == 0
 
@@ -156,22 +160,22 @@ def test_first_status_detects_edit_since_creation(office_world, monkeypatch):
     assert not any(key in record for key in ("last_checked_size", "last_checked_mtime_ns"))
     path = _workspace(data)
     path.write_bytes(_same_size_bytes(path.read_bytes()))
-    reads = _count_workspace_reads(notice, monkeypatch, path)
-    changed = _status_fields(http, session_id)
-    assert changed["workspace_changed"] is True
-    assert changed["state"] == "opening"
-    assert reads["count"] > 0
-    after = OfficeStore().read(CHAT)
-    assert _unrelated(after["sessions"][session_id], record)
-    for key in ("documents", "receipts", "journal"):
-        assert after[key] == before[key]
-    assert (
-        after["sessions"][session_id]["last_checked_size"],
-        after["sessions"][session_id]["last_checked_mtime_ns"],
-    ) == _sample(path)
-    reads["count"] = 0
-    assert _status_fields(http, session_id) == changed
-    assert reads["count"] == 0
+    with _count_workspace_reads(notice, monkeypatch, path) as reads:
+        changed = _status_fields(http, session_id)
+        assert changed["workspace_changed"] is True
+        assert changed["state"] == "opening"
+        assert reads["count"] > 0
+        after = OfficeStore().read(CHAT)
+        assert _unrelated(after["sessions"][session_id], record)
+        for key in ("documents", "receipts", "journal"):
+            assert after[key] == before[key]
+        assert (
+            after["sessions"][session_id]["last_checked_size"],
+            after["sessions"][session_id]["last_checked_mtime_ns"],
+        ) == _sample(path)
+        reads["count"] = 0
+        assert _status_fields(http, session_id) == changed
+        assert reads["count"] == 0
     assert origin.hits == 0
 
 
@@ -186,11 +190,11 @@ def test_equal_pair_repeats_true_without_reading(office_world, monkeypatch):
     changed = _status_fields(http, first["session_id"])
     assert changed["workspace_changed"] is True
     assert changed["state"] == "editing"
-    reads = _count_workspace_reads(notice, monkeypatch, path)
-    repeated = _status_fields(http, first["session_id"])
-    assert repeated["workspace_changed"] is True
-    assert repeated["state"] == "editing"
-    assert reads["count"] == 0
+    with _count_workspace_reads(notice, monkeypatch, path) as reads:
+        repeated = _status_fields(http, first["session_id"])
+        assert repeated["workspace_changed"] is True
+        assert repeated["state"] == "editing"
+        assert reads["count"] == 0
     assert origin.hits == 0
 
 
@@ -338,10 +342,10 @@ def test_recovery_after_invalid_sample_hashes_even_when_old_stat_matches(office_
     path.write_bytes(original)
     os.utime(path, ns=(cached[1], cached[1]))
     assert _sample(path) == cached
-    reads = _count_workspace_reads(notice, monkeypatch, path)
-    recovered = _status_fields(http, first["session_id"])
-    assert recovered["workspace_changed"] is False
-    assert reads["count"] > 0
+    with _count_workspace_reads(notice, monkeypatch, path) as reads:
+        recovered = _status_fields(http, first["session_id"])
+        assert recovered["workspace_changed"] is False
+        assert reads["count"] > 0
     assert origin.hits == 0
 
 
@@ -355,11 +359,11 @@ def test_other_workspace_files_are_not_stated_or_read(office_world, monkeypatch)
     assert _status_fields(http, first["session_id"])["workspace_changed"] is False
     other.write_bytes(other.read_bytes() + b"sibling")
     os.utime(other, ns=(other.stat().st_atime_ns, other.stat().st_mtime_ns + 3_000_000))
-    with monkeypatch.context() as trap:
-        reads = _count_workspace_reads(notice, trap, other)
-        _forbid_inode_open(notice, trap, other)
-        _forbid_inode_stat(notice, trap, other)
-        status = _status_fields(http, first["session_id"])
+    with _count_workspace_reads(notice, monkeypatch, other) as reads:
+        with monkeypatch.context() as trap:
+            _forbid_inode_open(notice, trap, other)
+            _forbid_inode_stat(notice, trap, other)
+            status = _status_fields(http, first["session_id"])
     assert status["workspace_changed"] is False
     assert status["state"] == "editing"
     assert reads["count"] == 0
@@ -626,10 +630,10 @@ def test_oversized_file_reports_true_without_content_read(office_world, monkeypa
     with path.open("wb") as stream:
         stream.truncate(SPARSE_SIZE)
     os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
-    reads = _count_workspace_reads(workspace, monkeypatch, path)
-    changed = _status_fields(http, first["session_id"])
-    assert changed["workspace_changed"] is True
-    assert reads["count"] == 0
+    with _count_workspace_reads(workspace, monkeypatch, path) as reads:
+        changed = _status_fields(http, first["session_id"])
+        assert changed["workspace_changed"] is True
+        assert reads["count"] == 0
     record = _record(first["session_id"])
     assert record["last_checked_size"] is None
     assert origin.hits == 0
@@ -859,9 +863,9 @@ def test_ended_conflict_status_refreshes_notice_without_activity_or_other_mutati
         100 if activity_present else None
     )
     unchanged = _snapshot(data), _state(data).stat().st_ino
-    reads = _count_workspace_reads(notice, monkeypatch, path)
-    monkeypatch.setattr("time.time", lambda: 201)
-    assert _status_fields(http, session_id) == response
-    assert reads["count"] == 0
+    with _count_workspace_reads(notice, monkeypatch, path) as reads:
+        monkeypatch.setattr("time.time", lambda: 201)
+        assert _status_fields(http, session_id) == response
+        assert reads["count"] == 0
     assert (_snapshot(data), _state(data).stat().st_ino) == unchanged
     assert origin.hits == 0

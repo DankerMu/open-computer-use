@@ -1274,8 +1274,7 @@ def test_interrupted_visible_publication_retains_session_ownership_until_recover
         assert broker.OutputsBroker().current_revision(CHAT) == revision + 1
 
         import office.notice as notice
-        with monkeypatch.context() as boundary:
-            reads = _count_workspace_reads(notice, boundary, workspace)
+        with _count_workspace_reads(notice, monkeypatch, workspace) as reads:
             reconciled = _status(http, session["session_id"])
             assert reconciled.status_code == 200
             assert reconciled.json()["workspace_changed"] is False

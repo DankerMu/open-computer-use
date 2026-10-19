@@ -1210,8 +1210,6 @@ def test_fresh_files_refuses_foreign_equal_content_copy_substitution(office_worl
 def test_running_overwrite_reads_agent_content_only_after_observed_pause(office_world, monkeypatch):
     http, data, _origin, manager, _broker, _original, session = _conflict(office_world, monkeypatch)
     container = _running(manager)
-    target = (_outputs(data) / "report.docx").stat()
-    identity = target.st_dev, target.st_ino
     reads = []
     real_read = os.read
     def read(fd, size):
@@ -1220,7 +1218,9 @@ def test_running_overwrite_reads_agent_content_only_after_observed_pause(office_
             reads.append(container.attrs["State"]["Paused"])
             assert container.attrs["State"]["Paused"] is True
         return real_read(fd, size)
-    with monkeypatch.context() as boundary:
+    with (_outputs(data) / "report.docx").open("rb") as held, monkeypatch.context() as boundary:
+        target = os.fstat(held.fileno())
+        identity = target.st_dev, target.st_ino
         boundary.setattr(os, "read", read)
         response = _resolve(http, session, "overwrite")
     assert response.status_code == 200

@@ -636,7 +636,6 @@ def test_unverified_pause_cannot_hash_workspace_or_release_unowned_identity(worl
     fixture = _running(world)
     observe = fixture.container.reload.side_effect
     real_read = os.read
-    target_identity = fixture.target.stat()
     target_reads = []
 
     def inspect():
@@ -654,7 +653,8 @@ def test_unverified_pause_cannot_hash_workspace_or_release_unowned_identity(worl
         return real_read(fd, count)
 
     fixture.container.reload.side_effect = inspect
-    with monkeypatch.context() as boundary:
+    with fixture.target.open("rb") as held, monkeypatch.context() as boundary:
+        target_identity = os.fstat(held.fileno())
         boundary.setattr(os, "read", read)
         result = _publish()
     assert (result.outcome, result.reason) == ("failed", "pause_failed")
