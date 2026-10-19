@@ -11,6 +11,8 @@
   Platform-aware containerd inspect/save avoids unselected multi-platform content;
   Docker `repositories` entries are checked against their configuration-bound final
   layer rather than misread as configuration IDs.
+  Attachment markers cannot hide selectable runtime manifests, even with the same
+  configuration; direct startup checks the inventory/source reader-contract pairing.
   Source-consumer contract2 is required for new builds; valid config-only format2
   contract1 deliveries retain matching-reader rollback support. Local Engine/Desktop
   identity qualification does not certify production images, WAN-free restart or LAN.

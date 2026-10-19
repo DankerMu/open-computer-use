@@ -31,6 +31,12 @@ engine ID. Optional `descriptor_digests` contain only independently hash-verifie
 image manifests and ancestor indexes bound to that reference, configuration and
 platform. Attestations, foreign siblings and other platforms cannot authorize an
 engine identity. Registry observations and archive checksums have separate roles.
+Attachment markers do not prove non-selectability. A marked manifest whose
+verified configuration selects linux/amd64 refuses before load even if its
+configuration equals the runtime image's and the inventory omits the index digest.
+Verified unknown/unknown attachments remain excluded from runtime identities.
+Named indexes containing foreign selectable configurations and attachment indexes
+whose selection cannot be qualified are refused.
 Build derives the content tag from the first export, retires that private archive,
 saves the final reference and verifies the complete archive set before publication.
 Startup, bootstrap and recovery accept an actual engine/container `Image` only
@@ -58,6 +64,8 @@ and matching bundled source1, preserving valid classic-store rollback. Contract2
 also accepts config-only records. Unknown contracts, contract1 descriptor fields
 and mismatched bundled readers are refused. Historical artifacts that mislabeled
 an engine ID as configuration must be rebuilt, not edited into apparent validity.
+Direct `deploy/up.sh` invocation checks the inventory/source contract pairing
+before deployment resource mutation, independently of prior bootstrap or verify.
 
 ### Qualified local image identity paths
 

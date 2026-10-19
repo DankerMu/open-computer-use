@@ -1184,6 +1184,179 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertNotIn(identities["index"], selected["descriptor_digests"])
         self.assertNotIn(foreign_descriptor["digest"], selected["descriptor_digests"])
 
+    def add_marked_descendant(self, archive, *, marker, config, platform=None, index=False):
+        descendant = write_hybrid_image_archive(
+            self.root / "marked-descendant.tar", reference="foreign:descendant",
+            config=config,
+        )
+        with tarfile.open(descendant) as bundle:
+            added = {
+                member.name: bundle.extractfile(member).read()
+                for member in bundle.getmembers() if member.isfile()
+            }
+        descriptor = json.loads(added["index.json"])["manifests"][0]
+        descriptor.pop("annotations")
+        descriptor.pop("platform")
+        if platform is not None:
+            os_name, architecture = platform.split("/")
+            descriptor["platform"] = {"os": os_name, "architecture": architecture}
+        manifest_name = "blobs/sha256/" + descriptor["digest"][7:]
+        marked_manifest = json.loads(added[manifest_name])
+        marked_manifest["annotations"] = {"org.opencontainers.image.title": "marked attachment"}
+        marked_bytes = json.dumps(marked_manifest).encode()
+        descriptor["digest"] = image_id_for_config(marked_bytes)
+        descriptor["size"] = len(marked_bytes)
+        added["blobs/sha256/" + descriptor["digest"][7:]] = marked_bytes
+        if index:
+            index_bytes = json.dumps({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [descriptor],
+            }).encode()
+            index_digest = image_id_for_config(index_bytes)
+            added["blobs/sha256/" + index_digest[7:]] = index_bytes
+            descriptor = {
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "digest": index_digest, "size": len(index_bytes),
+            }
+        identities = {"attachment": descriptor["digest"]}
+        def add_descendant(members):
+            root = json.loads(members["index.json"])
+            ancestor = root["manifests"][0]
+            child = json.loads(members["blobs/sha256/" + ancestor["digest"][7:]])
+            identities["runtime"] = child["manifests"][0]["digest"]
+            if marker == "subject":
+                descriptor["annotations"] = {"io.containerd.manifest.subject": identities["runtime"]}
+            elif marker == "attestation-type":
+                descriptor["annotations"] = {"vnd.docker.reference.type": "attestation-manifest"}
+            else:
+                descriptor["artifactType"] = "application/vnd.example.attachment"
+            child["manifests"].append(descriptor)
+            child_bytes = json.dumps(child).encode()
+            ancestor["digest"] = image_id_for_config(child_bytes)
+            ancestor["size"] = len(child_bytes)
+            identities["index"] = ancestor["digest"]
+            members.update({name: data for name, data in added.items()
+                            if name.startswith("blobs/sha256/")})
+            members["blobs/sha256/" + ancestor["digest"][7:]] = child_bytes
+            members["index.json"] = json.dumps(root).encode()
+        self.rewrite_archive(archive, add_descendant)
+        return identities
+
+    def test_marked_foreign_descendants_cannot_authorize_ancestor_before_load(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery(nested_index=True)
+        record = inventory["images"]["workspace"]
+        archive = delivery / record["archive"]["path"]
+        original = archive.read_bytes()
+        seed_images(self.state)
+        before = (self.state / "images.json").read_bytes()
+        for marker in ("subject", "attestation-type", "artifact"):
+            for platform in ("linux/amd64", None, "unknown/unknown"):
+                with self.subTest(marker=marker, platform=platform):
+                    archive.write_bytes(original)
+                    identities = self.add_marked_descendant(
+                        archive, marker=marker, platform=platform,
+                        config=config_payload(digest_for("foreign-selectable")),
+                    )
+                    record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+                    for claim in ("index", "runtime", "configuration"):
+                        with self.subTest(claim=claim):
+                            if claim == "configuration":
+                                record.pop("descriptor_digests", None)
+                            else:
+                                record["descriptor_digests"] = [identities[claim]]
+                            write_inventory(delivery / "release.json", inventory)
+                            platform_label = platform.replace("/", "-") if platform else "missing"
+                            install = self.root / f"marked-foreign-{marker}-{platform_label}-{claim}"
+                            result = self.import_cmd(delivery, install)
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertFalse(install.exists())
+                            self.assertFalse((self.state / "load-count").exists())
+                            self.assertEqual((self.state / "images.json").read_bytes(), before)
+
+    def test_same_configuration_marked_manifest_cannot_be_selected_before_load(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery(nested_index=True)
+        record = inventory["images"]["workspace"]
+        archive = delivery / record["archive"]["path"]
+        with tarfile.open(archive) as bundle:
+            runtime_entry = json.load(bundle.extractfile("manifest.json"))[0]
+            config = bundle.extractfile(runtime_entry["Config"]).read()
+        original = archive.read_bytes()
+        seed_images(self.state)
+        before = (self.state / "images.json").read_bytes()
+        for marker in ("subject", "attestation-type", "artifact"):
+            for platform in ("linux/amd64", None):
+                with self.subTest(marker=marker, platform=platform):
+                    archive.write_bytes(original)
+                    identities = self.add_marked_descendant(
+                        archive, marker=marker, platform=platform, config=config,
+                    )
+                    self.assertNotEqual(identities["attachment"], identities["runtime"])
+                    with tarfile.open(archive) as bundle:
+                        runtime_manifest = json.load(bundle.extractfile(
+                            "blobs/sha256/" + identities["runtime"][7:],
+                        ))
+                        marked_manifest = json.load(bundle.extractfile(
+                            "blobs/sha256/" + identities["attachment"][7:],
+                        ))
+                    self.assertEqual(marked_manifest["config"], runtime_manifest["config"])
+                    self.assertEqual(marked_manifest["layers"], runtime_manifest["layers"])
+                    self.assertEqual(marked_manifest["config"]["digest"], record["configuration_digest"])
+                    record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+                    for claim in ("index", "runtime", "configuration"):
+                        with self.subTest(claim=claim):
+                            if claim == "configuration":
+                                record.pop("descriptor_digests", None)
+                            else:
+                                record["descriptor_digests"] = [identities[claim]]
+                            write_inventory(delivery / "release.json", inventory)
+                            install = self.root / f"same-config-marked-{marker}-{platform is None}-{claim}"
+                            result = self.import_cmd(delivery, install)
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertFalse(install.exists())
+                            self.assertFalse((self.state / "load-count").exists())
+                            self.assertEqual((self.state / "images.json").read_bytes(), before)
+
+    def test_marked_indexes_refuse_unqualified_selection_before_load(self):
+        delivery, inventory, _sha = self.write_hybrid_delivery(nested_index=True)
+        record = inventory["images"]["workspace"]
+        archive = delivery / record["archive"]["path"]
+        original = archive.read_bytes()
+        seed_images(self.state)
+        before = (self.state / "images.json").read_bytes()
+        for marker in ("subject", "attestation-type", "artifact"):
+            with self.subTest(marker=marker):
+                archive.write_bytes(original)
+                identities = self.add_marked_descendant(
+                    archive, marker=marker, index=True,
+                    config=config_payload(digest_for("foreign-index")),
+                )
+                record["archive"]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+                record["descriptor_digests"] = [identities["runtime"]]
+                write_inventory(delivery / "release.json", inventory)
+                install = self.root / f"marked-index-{marker}"
+                result = self.import_cmd(delivery, install)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(install.exists())
+                self.assertFalse((self.state / "load-count").exists())
+                self.assertEqual((self.state / "images.json").read_bytes(), before)
+
+    def test_verified_unknown_platform_attachment_preserves_runtime_ancestor(self):
+        reference = "open-computer-use:unknown-attachment"
+        archive = write_hybrid_image_archive(
+            self.root / "unknown-attachment.tar", reference=reference,
+            config=config_payload(digest_for("runtime")), nested_index=True,
+        )
+        identities = self.add_marked_descendant(
+            archive, marker="subject",
+            config=config_payload(digest_for("attestation"), os_name="unknown", architecture="unknown"),
+        )
+        selected = release.inspect_archive_bytes(archive)[reference]
+        self.assertEqual(selected["descriptor_digests"], sorted([
+            identities["runtime"], identities["index"],
+        ]))
+        self.assertNotIn(identities["attachment"], selected["descriptor_digests"])
+
     def test_nested_attestation_preserves_only_runtime_ancestor_identities(self):
         reference = "open-computer-use:nested-attestation"
         archive = write_hybrid_image_archive(

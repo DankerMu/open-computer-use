@@ -509,6 +509,46 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
                 token,
             )
 
+    def test_direct_startup_refuses_mismatched_reader_contract_before_resource_changes(self):
+        created = self.run_bootstrap()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        write_fake_configs(self.state, token_docs())
+        seed_healthy_host(self.state)
+        write_network(
+            self.state, runtime["OCU_PRIVATE_NETWORK"],
+            subnet=runtime["OCU_PRIVATE_SUBNET"], gateway=runtime["OCU_PRIVATE_GATEWAY"],
+        )
+        write_network(
+            self.state, SANDBOX_NETWORK,
+            subnet=runtime["OCU_SANDBOX_SUBNET"], gateway=runtime["OCU_SANDBOX_GATEWAY"],
+        )
+        inventory = json.loads(self.inventory.read_text())
+        self.assertEqual(inventory["source_consumer_contract"], 2)
+        inventory["source_consumer_contract"] = 1
+        self.inventory.write_text(json.dumps(inventory))
+        before = {
+            str(path.relative_to(self.state)): path.read_bytes()
+            for path in self.state.rglob("*") if path.is_file() and path.name != "ops.log"
+        }
+        runtime_before = self.runtime_path().read_bytes()
+        credentials_before = self.credentials.read_bytes()
+        env, script, source = self.consumer_up_env(runtime)
+        result = subprocess.run(
+            ["bash", str(script)], cwd=str(source), env=env,
+            capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / "starts.log").exists())
+        self.assertFalse((self.state / "executed.json").exists())
+        after = {
+            str(path.relative_to(self.state)): path.read_bytes()
+            for path in self.state.rglob("*") if path.is_file() and path.name != "ops.log"
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(self.runtime_path().read_bytes(), runtime_before)
+        self.assertEqual(self.credentials.read_bytes(), credentials_before)
+
     def test_generated_credentials_are_fresh_across_deployments(self):
         first = self.run_bootstrap()
         self.assertEqual(first.returncode, 0, first.stderr)

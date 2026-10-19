@@ -821,13 +821,15 @@ def parse_oci_image_manifest(
     names: dict[str, tarfile.TarInfo],
     desc: dict,
     data: bytes,
+    *,
+    attachment: bool = False,
 ) -> tuple[str, str]:
     payload = decode_json_bytes(data, f"{archive}: image manifest")
     if not isinstance(payload, dict):
         raise ReleaseError(f"{archive}: image manifest is not an object")
-    if payload.get("subject") not in (None, {}):
+    if not attachment and payload.get("subject") not in (None, {}):
         raise ReleaseError(f"{archive}: unsupported nested image subject")
-    if payload.get("artifactType"):
+    if not attachment and payload.get("artifactType"):
         raise ReleaseError(f"{archive}: artifact manifest is not a runtime image")
     config = payload.get("config")
     if not isinstance(config, dict):
@@ -909,19 +911,20 @@ def parse_oci_index(
         if own_name is not None and (not isinstance(own_name, str) or not own_name):
             raise ReleaseError(f"{archive}: invalid OCI image name")
         image_name = own_name or inherited_name
-        if (
+        attachment = bool(
             annotations.get(ATTESTATION_TYPE_KEY) == ATTESTATION_MANIFEST
             or ANNOTATION_MANIFEST_SUBJECT in annotations
             or desc.get("artifactType")
-        ):
-            if own_name:
-                raise ReleaseError(
-                    f"{archive}: attestation metadata names a runtime reference"
-                )
-            continue
+        )
+        if attachment and own_name:
+            raise ReleaseError(
+                f"{archive}: attestation metadata names a runtime reference"
+            )
         if media in {OCI_INDEX_MEDIA, DOCKER_INDEX_MEDIA} or media.endswith(
             "manifest.list.v2+json"
         ):
+            if attachment:
+                raise ReleaseError(f"{archive}: attachment index selection cannot be qualified")
             nested_leaves: list[tuple[str, str]] = []
             nested = parse_oci_index(
                 archive,
@@ -945,6 +948,8 @@ def parse_oci_index(
                     config for config, platform in nested_leaves
                     if platform == info["platform"]
                 }
+                if image_name and configurations != {info["digest"]}:
+                    raise ReleaseError(f"{archive}: named index has ambiguous platform configurations")
                 if configurations == {info["digest"]}:
                     descriptors.append(digest)
                 record_mapping(
@@ -954,9 +959,13 @@ def parse_oci_index(
         if media not in {OCI_MANIFEST_MEDIA, DOCKER_MANIFEST_MEDIA} and media:
             raise ReleaseError(f"{archive}: unsupported OCI media type {media}")
         image_digest, platform = parse_oci_image_manifest(
-            archive, bundle, names, desc, child
+            archive, bundle, names, desc, child, attachment=attachment
         )
         leaves.append((image_digest, platform))
+        if attachment:
+            if platform == PLATFORM:
+                raise ReleaseError(f"{archive}: attachment manifest can select the runtime platform")
+            continue
         if image_name:
             if not isinstance(image_name, str) or not image_name:
                 raise ReleaseError(f"{archive}: empty OCI image name")

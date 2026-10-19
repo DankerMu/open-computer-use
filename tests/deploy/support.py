@@ -860,13 +860,19 @@ def write_hybrid_image_archive(
         ]
     if attestation is not None:
         subject = f"sha256:{manifest_digest}"
+        attachment_config = json.dumps({
+            "os": "unknown", "architecture": "unknown",
+            "rootfs": {"type": "layers", "diff_ids": []}, "config": {},
+        }, separators=(",", ":"), sort_keys=True).encode()
+        attachment_config_digest = _sha256_hex(attachment_config)
+        blobs[attachment_config_digest] = attachment_config
         attestation_manifest = {
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {
                 "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": f"sha256:{config_digest}",
-                "size": len(config),
+                "digest": f"sha256:{attachment_config_digest}",
+                "size": len(attachment_config),
             },
             "layers": [],
             "subject": {
