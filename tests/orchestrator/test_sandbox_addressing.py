@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'computer
 import docker_manager
 from docker_manager import (
     _published_address,
+    _unassigned_publication,
     get_container_service_address,
     CDP_PORT,
     TTYD_PORT,
@@ -92,6 +93,13 @@ class PublishedAddressTests(unittest.TestCase):
     def test_survives_a_missing_networksettings(self):
         self.assertIsNone(_published_address(_container({}), 9222))
 
+    def test_host_port_zero_is_unassigned(self):
+        """HostPort "0" is a request for a dynamic port, never an assigned one."""
+        c = _container({"NetworkSettings": {"Ports": {
+            "9222/tcp": [{"HostIp": "172.31.0.1", "HostPort": "0"}],
+        }}})
+        self.assertIsNone(_published_address(c, 9222))
+
 
 class ServiceAddressTests(unittest.TestCase):
     """get_container_service_address uses assigned published ports only."""
@@ -142,6 +150,47 @@ class ServiceAddressTests(unittest.TestCase):
             "IPAddress": "",
         }})
         self.assertEqual(get_container_service_address("chat-1", TTYD_PORT), "127.0.0.1:45000")
+
+    # Neighbour suites importlib.reload(docker_manager); the fault class is read
+    # from the module at raise time, so assertions must not bind it at import.
+    def _unassigned_gateway_attrs(self, published):
+        return {
+            "HostConfig": {"PortBindings": {
+                "9222/tcp": [{"HostIp": "172.31.0.1", "HostPort": ""}],
+            }},
+            "NetworkSettings": {"Ports": {"9222/tcp": published}, "Networks": {}},
+        }
+
+    def test_unassigned_gateway_binding_raises_capability_fault(self):
+        """Requested on the gateway, accepted, never assigned: a capability fault, not absence."""
+        container = _container(self._unassigned_gateway_attrs([]))
+        self.assertEqual(_unassigned_publication(container, CDP_PORT), "172.31.0.1")
+        self.client.containers.get.return_value = container
+        with self.assertRaises(docker_manager.GatewayPublicationUnassigned) as raised:
+            get_container_service_address("chat-1", CDP_PORT)
+        exc = raised.exception
+        self.assertEqual(exc.status_code, 503)
+        self.assertEqual(exc.reason, "gateway_publication_unassigned")
+        self.assertIn("9222/tcp", str(exc))
+        self.assertIn("172.31.0.1", str(exc))
+        self.client.networks.get.assert_not_called()
+        wildcard = _container({"HostConfig": {"PortBindings": {
+            "9222/tcp": [{"HostIp": "", "HostPort": ""}],
+        }}})
+        self.assertEqual(_unassigned_publication(wildcard, CDP_PORT), "0.0.0.0")
+
+    def test_host_port_zero_binding_raises(self):
+        self.client.containers.get.return_value = _container(self._unassigned_gateway_attrs(
+            [{"HostIp": "172.31.0.1", "HostPort": "0"}]
+        ))
+        with self.assertRaises(docker_manager.GatewayPublicationUnassigned):
+            get_container_service_address("chat-1", CDP_PORT)
+
+    def test_unassigned_binding_on_a_stopped_container_is_unavailable(self):
+        container = _container(self._unassigned_gateway_attrs([]), status="exited")
+        self.assertEqual(_unassigned_publication(container, CDP_PORT), "172.31.0.1")
+        self.client.containers.get.return_value = container
+        self.assertIsNone(get_container_service_address("chat-1", CDP_PORT))
 
 
 class UserDataDirectoryTests(unittest.TestCase):

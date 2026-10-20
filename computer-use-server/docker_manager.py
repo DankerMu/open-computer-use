@@ -126,6 +126,21 @@ class LaunchFailed(LifecycleError):
         super().__init__(message, status_code=status_code, reason="launch_failed")
 
 
+class GatewayPublicationUnassigned(LifecycleError):
+    """A running sandbox's requested publication never received a host port."""
+
+    def __init__(self, container_port, host_ip):
+        self.container_port = container_port
+        self.host_ip = host_ip
+        super().__init__(
+            f"{container_port}/tcp publication on {host_ip} was accepted by the engine "
+            "but never assigned a host port; gateway publication is unsupported on this "
+            "engine profile (computer-use-server/README.md, Sandbox network host support)",
+            status_code=503,
+            reason="gateway_publication_unassigned",
+        )
+
+
 class MigrationRequired(LifecycleError):
     def __init__(self, message="migration_required"):
         super().__init__(message, status_code=409, reason="migration_required")
@@ -973,7 +988,8 @@ def _published_address(container, container_port: int) -> Optional[str]:
 
     Host networking and empty/wildcard HostIp still resolve to loopback for the
     existing shared-namespace address contract. Concrete gateway bindings are
-    returned as reported. Missing or unassigned publications return None.
+    returned as reported. Missing or unassigned publications (including a host
+    port of "0") return None.
     """
     if ((container.attrs.get("HostConfig") or {}).get("NetworkMode")) == "host":
         return f"127.0.0.1:{container_port}"
@@ -981,7 +997,7 @@ def _published_address(container, container_port: int) -> Optional[str]:
     ports = (container.attrs.get("NetworkSettings") or {}).get("Ports") or {}
     for binding in ports.get(f"{container_port}/tcp") or []:
         host_port = binding.get("HostPort")
-        if not host_port:
+        if host_port in ("", "0", None):
             continue
         host_ip = binding.get("HostIp") or "127.0.0.1"
         if host_ip in ("0.0.0.0", "::", ""):
@@ -990,12 +1006,30 @@ def _published_address(container, container_port: int) -> Optional[str]:
     return None
 
 
+def _unassigned_publication(container, container_port: int) -> Optional[str]:
+    """Requested HostIp of a publication the engine never assigned a host port, if any.
+
+    No immutable binding for the port means nothing was requested (None). Any
+    published entry with a real HostPort means it was assigned (None). A host
+    port of "0" counts as unassigned. Reads container.attrs only.
+    """
+    entries = _binding_entries(_immutable_bindings(container), container_port)
+    if not entries:
+        return None
+    ports = (container.attrs.get("NetworkSettings") or {}).get("Ports") or {}
+    for binding in ports.get(f"{container_port}/tcp") or []:
+        if (binding or {}).get("HostPort") not in ("", "0", None):
+            return None
+    return (entries[0] or {}).get("HostIp") or "0.0.0.0"
+
+
 def get_container_service_address(chat_id: str, container_port: int) -> Optional[str]:
     """Address to reach one of a chat container's services, as "host:port".
 
     Uses the engine-assigned published host address and port only. Missing
     publication is unavailable; there is no compose-network or container-IP
-    fallback, and this function does not mutate membership.
+    fallback, and this function does not mutate membership. A requested
+    publication the engine never assigned raises `GatewayPublicationUnassigned`.
     """
     chat_id = chat_id.lower()
     client = get_docker_client()
@@ -1006,7 +1040,15 @@ def get_container_service_address(chat_id: str, container_port: int) -> Optional
         c.reload()
         if c.status != "running":
             return None
-        return _published_address(c, container_port)
+        address = _published_address(c, container_port)
+        if address is not None:
+            return address
+        host_ip = _unassigned_publication(c, container_port)
+        if host_ip is not None:
+            raise GatewayPublicationUnassigned(container_port, host_ip)
+        return None
+    except GatewayPublicationUnassigned:
+        raise
     except Exception:
         return None
 

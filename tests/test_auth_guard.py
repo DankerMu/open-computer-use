@@ -1247,6 +1247,45 @@ class TestWebSockets:
         assert exc.value.code == 1011
 
 
+class TestUnassignedPublication:
+    """Spec scenario "Routes surface the fault": status routes report it, JSON routes 503."""
+
+    @pytest.fixture(autouse=True)
+    def unassigned(self, app_module, monkeypatch):
+        def boom(*_a, **_k):
+            raise app_module.GatewayPublicationUnassigned(9222, "172.31.0.1")
+
+        monkeypatch.setattr(app_module, "get_container_service_address", boom)
+
+    def test_browser_status_reports_the_fault(self, client):
+        response = client.get(f"/browser/{CHAT}/status", headers=_bearer())
+        assert response.status_code == 200
+        body = response.json()
+        assert body["active"] is False
+        assert body["pages"] == []
+        assert body["reason"] == "gateway_publication_unassigned"
+        assert "9222/tcp" in body["detail"]
+        assert "no-store" in response.headers["Cache-Control"]
+
+    def test_terminal_status_reports_the_fault_not_stopped_or_meta(self, client):
+        response = client.get(f"/terminal/{CHAT}/status", headers=_bearer())
+        assert response.status_code == 200
+        body = response.json()
+        assert body["active"] is False
+        assert body["reason"] == "gateway_publication_unassigned"
+        assert "9222/tcp" in body["detail"]
+        assert "container_stopped" not in body
+        assert "meta_exists" not in body
+
+    @pytest.mark.parametrize("path", ("json", "json/version"))
+    def test_cdp_json_routes_answer_503(self, client, path):
+        response = client.get(f"/browser/{CHAT}/{path}", headers=_bearer())
+        assert response.status_code == 503
+        body = response.json()
+        assert body["detail"]["reason"] == "gateway_publication_unassigned"
+        assert "9222/tcp" in body["detail"]["detail"]
+
+
 class TestMountedMcp:
     def test_mcp_without_internal_token_is_401_even_with_api_key(self, client):
         empty = client.post(

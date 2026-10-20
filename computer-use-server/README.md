@@ -496,6 +496,18 @@ All via environment variables:
 | `MCP_TOKENS_URL` | _(empty)_ | Settings wrapper URL (optional) |
 | `MCP_TOKENS_API_KEY` | _(empty)_ | Settings wrapper auth key |
 
+### Sandbox network host support
+
+Gateway publication of the CDP (`9222`) and ttyd (`7681`) ports needs an engine host that owns the sandbox-bridge gateway address, which a native Linux engine does. Docker Desktop (observed: Engine 29.1.3, linux/arm64, containerd image store, macOS host) accepts the publication but assigns no host port. Sandboxes still run for tool calls, but `/browser/{chat}/status` and `/terminal/{chat}/status` answer `active: false` with `reason: gateway_publication_unassigned`, and the CDP JSON routes answer 503 with the same reason. There is no loopback, wildcard, compose-network or container-IP fallback. `ENABLE_NETWORK=false` disables publication; it does not work around this.
+
+To qualify an engine host, run the opt-in test against it:
+
+```bash
+OCU_ENGINE_PROBE=1 python -m pytest tests/orchestrator/test_engine_gateway_publication.py -v -s
+```
+
+It creates a temporary bridge (`OCU_ENGINE_PROBE_SUBNET`, default `10.242.0.0/24`) and a container from `OCU_ENGINE_PROBE_IMAGE` (default `alpine:3.20`) that publishes both ports on the gateway, resolves them through the production lookup, writes a JSON record to `OCU_ENGINE_PROBE_OUT`, and removes the container and network. A record whose `verdict` reads `assigned` for both ports qualifies the host.
+
 ## Running Standalone
 
 ```bash
