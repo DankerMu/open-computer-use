@@ -136,12 +136,15 @@ Callback receipt replay synchronizes the Office state directory before
 answering. When that synchronization succeeds but a final owned-directory
 close fails, the callback returns HTTP500 `{"reason":"state_close_failed"}`
 instead of `state_corrupt`; a synchronization failure remains
-`state_durability`. The reason covers only this replay barrier. A close-only
-failure while publishing a version blob records no version and leaves the
-content-addressed blob for a later publication to verify and reuse, but the
-callback still reports it as `state_corrupt`. Version-blob publication and
-removal keep an earlier failure primary with every close failure retained, and
-attempt each owned directory close once.
+`state_durability`. On the callback route the reason also covers a close-only
+failure while publishing a version blob: the callback returns HTTP500
+`{"reason":"state_close_failed"}` and logs the refusal. When that failure comes
+from storing the callback's content, no version is recorded, a status-6
+forcesave keeps its pending save, and a later delivery of the same content
+verifies and reuses the content-addressed blob. An out-of-space close failure
+remains `storage_low`. Version-blob publication and removal keep an earlier
+failure primary with every close failure retained, and attempt each owned
+directory close once.
 
 Create drains an accepted restore for that file before admitting an editor;
 unresolved recovery refuses admission with 503 `publish_pending`. Disable new

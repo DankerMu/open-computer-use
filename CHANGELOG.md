@@ -3,6 +3,14 @@
 ## Unreleased — `main` branch
 
 ### Fixed
+- **Office callback version-blob close reason.** A close-only failure while
+  publishing a version blob now reaches the callback as HTTP500
+  `state_close_failed` instead of `state_corrupt`, and the refusal is logged.
+  For callback content no version is recorded, a status-6 forcesave keeps its
+  pending save, and a later delivery of the same content reuses the blob. An
+  out-of-space close failure remains `storage_low`. Other routes keep their
+  existing handling.
+
 - **Office blob and replay-barrier directory cleanup.** Version-blob publication,
   version-blob removal and the callback replay barrier attempt each owned
   directory close once without retrying. An earlier operation or synchronization
