@@ -19,6 +19,11 @@ from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'computer-use-server'))
 
+from tests.file_route_module_ownership import isolated_modules  # noqa: E402
+
+_DOCKER_MANAGER_MODULES = {"docker_manager"}
+_DOCKER_MANAGER_PREFIXES = ("docker_manager.",)
+
 
 def _reload_docker_manager():
     """Re-import docker_manager after env changes so module-level PUBLIC_BASE_URL
@@ -34,6 +39,7 @@ class PublicBaseUrlDefaultWarning(unittest.TestCase):
     """#59: warn_if_public_base_url_is_default() fires iff PUBLIC_BASE_URL is unset."""
 
     def setUp(self):
+        self.enterContext(isolated_modules(_DOCKER_MANAGER_MODULES, _DOCKER_MANAGER_PREFIXES))
         self._saved = os.environ.get("PUBLIC_BASE_URL")
 
     def tearDown(self):
@@ -84,6 +90,7 @@ class McpApiKeyMissingWarning(unittest.TestCase):
     """
 
     def setUp(self):
+        self.enterContext(isolated_modules(_DOCKER_MANAGER_MODULES, _DOCKER_MANAGER_PREFIXES))
         self._saved = os.environ.get("MCP_API_KEY")
 
     def tearDown(self):

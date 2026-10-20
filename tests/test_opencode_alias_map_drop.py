@@ -19,13 +19,21 @@ so local-dev shells with model-override env vars do not break assertions.
 import importlib
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 _SERVER_DIR = os.path.join(
     os.path.dirname(__file__), "..", "computer-use-server"
 )
 sys.path.insert(0, _SERVER_DIR)
+
+from tests.file_route_module_ownership import isolated_modules  # noqa: E402
+
+_ALIAS_RUNTIME_MODULES = ("cli_runtime", "docker_manager", "outputs_broker")
 
 # Env vars that could affect opencode alias resolution — scrub before each test.
 _OPENCODE_ENV_VARS = (
@@ -37,7 +45,7 @@ _OPENCODE_ENV_VARS = (
 
 def _drop_modules():
     """Drop cli_runtime + docker_manager so the next import re-reads env."""
-    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
+    for mod in _ALIAS_RUNTIME_MODULES:
         sys.modules.pop(mod, None)
 
 
@@ -46,13 +54,24 @@ def _import_cli_runtime():
     return importlib.import_module("cli_runtime")
 
 
+@pytest.fixture
+def alias_runtime_modules():
+    """Own the runtime module cache entries that alias tests re-import."""
+    with isolated_modules(_ALIAS_RUNTIME_MODULES):
+        yield
+
+
 @pytest.fixture(autouse=True)
-def _scrub_opencode_env(monkeypatch):
+def _scrub_opencode_env(alias_runtime_modules, monkeypatch):
     """Scrub opencode-related env vars before each test."""
     for var in _OPENCODE_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     yield
-    _drop_modules()
+
+
+def test_scrub_fixture_owns_runtime_modules(request):
+    """The autouse env scrub keeps runtime module ownership in every alias test."""
+    assert "alias_runtime_modules" in request.fixturenames
 
 
 # ---------------------------------------------------------------------------
