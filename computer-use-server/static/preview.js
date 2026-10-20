@@ -2570,7 +2570,7 @@ function App() {
     try {
       const resp = await ocuFetch(`/browser/${CHAT_ID}/status?_t=${Date.now()}`, { cache: 'no-store' });
       const data = await resp.json();
-      setBrowserFault(runtimeFault(data));
+      setBrowserFault(resp.ok ? runtimeFault(data) : null);
       setBrowserActive(prev => {
         if (data.active && !prev) {
           setCurrentView('browser');

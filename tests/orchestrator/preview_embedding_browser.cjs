@@ -381,6 +381,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === `${prefix}/terminal/${CHAT}/processes`) return respond(res, 200, JSON.stringify({ processes: [] }));
     if (url.pathname === `${prefix}/terminal/${CHAT}/status`) {
+      if (terminalFixture === 'status-error') {
+        record.status = 503;
+        return respond(res, 503, '{}');
+      }
       if (terminalFixture === 'fault') return respond(res, 200, JSON.stringify({
         active: false, reason: 'gateway_publication_unassigned', detail: FAULT_DETAIL
       }));
@@ -833,7 +837,9 @@ async function main() {
             address.pathname.endsWith(`/browser/${CHAT}/json`) ||
             // The 503 start and the recovery restart bodies stay unread; frame retirement aborts them.
             address.pathname.endsWith(`/terminal/${CHAT}/start-ttyd`) ||
-            address.pathname.endsWith(`/terminal/${CHAT}/restart-container`))) return;
+            address.pathname.endsWith(`/terminal/${CHAT}/restart-container`) ||
+            // The failed status read before a start leaves its 503 body unread.
+            (terminalFixture === 'status-error' && address.pathname.endsWith(`/terminal/${CHAT}/status`)))) return;
       pendingRuntimeRequests.add(request);
       try {
         if (retiringFrame && request.frame() === retiringFrame)
@@ -901,6 +907,11 @@ async function main() {
       }
       if (text.includes('503') &&
           (url.includes(`/terminal/${CHAT}/start-ttyd`) || text.includes(`/terminal/${CHAT}/start-ttyd`))) {
+        expectedRuntimeFailures.push(text);
+        return;
+      }
+      if (text.includes('503') &&
+          (url.includes(`/terminal/${CHAT}/status`) || text.includes(`/terminal/${CHAT}/status`))) {
         expectedRuntimeFailures.push(text);
         return;
       }
@@ -2134,6 +2145,13 @@ async function main() {
     await page.screenshot({ path: path.join(artifacts, 'embedded-browser-fault.png'), animations: 'disabled' });
     await retireFrame();
     browserFixture = 'inactive';
+    await page.evaluate(() => window.mount('?embed=browser'));
+    await frame().getByText('Shared AI Browser').waitFor();
+    assert.equal(await frame().locator('.runtime-fault').count(), 0,
+      'inactive Browser without a reason rendered the fault panel');
+    assert.equal(await frame().getByRole('alert').count(), 0,
+      'inactive Browser without a reason rendered an alert');
+    await retireFrame();
 
     browserFixture = 'held';
     await page.evaluate(() => window.mount('?embed=browser'));
@@ -2225,6 +2243,27 @@ async function main() {
       row.path === `/ocu/terminal/${CHAT}/restart-container`).length, 1,
     'terminal recovery did not restart the container once');
     await retireFrame();
+    terminalFixture = 'inactive';
+
+    terminalFixture = 'status-error';
+    const beforeTerminalStatusError = requests.length;
+    const messagesBeforeTerminalStatusError = socketMessages.length;
+    await page.evaluate(() => window.mount('?embed=terminal'));
+    await frame().locator('.dash-btn-primary').click();
+    await waitUntil(() => socketMessages.slice(messagesBeforeTerminalStatusError).some(row =>
+      row.path === `/ocu/terminal/${CHAT}/ws` && row.method === 'ttyd-init') &&
+      activeSockets.size === 1, 'terminal start after a failed status read');
+    assert(requests.slice(beforeTerminalStatusError).some(row => row.method === 'GET' &&
+      row.path === `/ocu/terminal/${CHAT}/status` && row.status === 503),
+    'terminal status read did not fail');
+    assert(requests.slice(beforeTerminalStatusError).some(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd`),
+    'failed terminal status read blocked the ttyd start');
+    assert.equal(await frame().getByRole('alert').count(), 0, 'failed terminal status read rendered an alert');
+    assert.equal(await frame().locator('.runtime-fault, .runtime-fault-detail').count(), 0,
+      'failed terminal status read rendered the fault panel');
+    await retireFrame();
+    await waitUntil(() => activeSockets.size === 0, 'terminal status-error socket cleanup');
     terminalFixture = 'inactive';
 
     upgradesHeld = true;
@@ -3170,6 +3209,8 @@ async function main() {
     }
 
     browserFixture = 'fault';
+    const beforeShellFault = requests.length;
+    const socketsBeforeShellFault = activeSockets.size;
     const faultSession = await openStandalone('/ocu');
     try {
       await faultSession.page.locator('.view-tab').filter({ hasText: 'Browser' }).click();
@@ -3187,9 +3228,63 @@ async function main() {
         'standalone Browser fault rendered the empty state');
       assert.equal(await faultSession.page.locator('.browser-connecting, canvas').count(), 0,
         'standalone Browser fault mounted the viewer');
+      assert.equal(requests.slice(beforeShellFault).filter(row =>
+        row.path === `/ocu/browser/${CHAT}/json`).length, 0, 'standalone Browser fault requested pages');
+      assert.equal(activeSockets.size, socketsBeforeShellFault, 'standalone Browser fault started a connection');
       await faultSession.page.screenshot({ path: path.join(artifacts, 'standalone-browser-fault.png'), animations: 'disabled' });
     } finally {
       await closeStandalone(faultSession);
+      browserFixture = 'inactive';
+    }
+
+    assert.equal(activeSockets.size, 0, 'sticky viewer case started with a connection');
+    const messagesBeforeSticky = socketMessages.length;
+    const stickySession = await openStandalone('/ocu');
+    try {
+      // An active mount poll switches the shell away from Files, which openStandalone waits on.
+      browserFixture = 'active';
+      await stickySession.page.evaluate(() => window.__runAppPoll());
+      await stickySession.page.locator('.view-tab').filter({ hasText: 'Browser' }).click();
+      await waitUntil(() => socketMessages.slice(messagesBeforeSticky).some(row =>
+        row.path === `/ocu/browser/${CHAT}/devtools/page/fixture-page` && row.method === 'Page.enable') &&
+        activeSockets.size === 1, 'standalone viewer connected');
+      assert.equal(await stickySession.page.locator('canvas').count(), 1, 'standalone viewer has no canvas');
+      browserFixture = 'fault';
+      const beforeStickyPoll = requests.length;
+      await stickySession.page.evaluate(() => window.__runAppPoll());
+      await waitUntil(() => requests.slice(beforeStickyPoll).some(row =>
+        row.path === `/ocu/browser/${CHAT}/status`), 'sticky viewer fault poll');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      assert.equal(await stickySession.page.locator('canvas').count(), 1,
+        'fault payload unmounted the connected viewer');
+      assert.equal(await stickySession.page.getByRole('alert').count(), 0,
+        'fault payload rendered an alert over the connected viewer');
+      assert.equal(await stickySession.page.locator('.runtime-fault').count(), 0,
+        'fault payload rendered the fault panel over the connected viewer');
+      assert.equal(activeSockets.size, 1, 'fault payload dropped the connected viewer');
+    } finally {
+      await closeStandalone(stickySession);
+      browserFixture = 'inactive';
+    }
+    await waitUntil(() => activeSockets.size === 0, 'sticky viewer socket cleanup');
+
+    browserFixture = 'failure';
+    const failureSession = await openStandalone('/ocu');
+    try {
+      await failureSession.page.locator('.view-tab').filter({ hasText: 'Browser' }).click();
+      await failureSession.page.getByText('Shared AI Browser').waitFor();
+      assert.equal(await failureSession.page.getByRole('alert').count(), 0,
+        'failed shell Browser status rendered an alert');
+      assert.equal(await failureSession.page.locator('.runtime-fault').count(), 0,
+        'failed shell Browser status rendered the fault panel');
+      const failureErrors = caseErrors(failureSession);
+      const statusFailures = failureErrors.filter(error => error.text.includes('503') &&
+        (error.url.includes(`/browser/${CHAT}/status`) || error.text.includes(`/browser/${CHAT}/status`)));
+      expectedOwnedErrors.push(...statusFailures);
+      assert.deepEqual(failureErrors.filter(error => !statusFailures.includes(error)), [],
+        'failed shell Browser status produced unexpected console errors');
+    } finally {
+      await closeStandalone(failureSession);
       browserFixture = 'inactive';
     }
     console.log(JSON.stringify({ runtimeFault: 'ok', embeddedBrowser: true, shellBrowser: true,
