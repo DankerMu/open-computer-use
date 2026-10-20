@@ -24,9 +24,14 @@ from urllib.parse import quote
 
 import pytest
 
-SERVER_DIR = Path(__file__).resolve().parents[1] / "computer-use-server"
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+SERVER_DIR = ROOT / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
+
+from tests.file_route_module_ownership import isolated_modules  # noqa: E402
 
 INTERNAL = "ocu-test-internal-token"
 MCP_KEY = "ocu-test-mcp-api-key"
@@ -42,6 +47,42 @@ OFFICE_ENV = {
     "OCU_OFFICE_DOCSERVER_ORIGIN": "https://docs.example",
     "OCU_OFFICE_SELF_URL": "http://ocu:8081",
     "OCU_OFFICE_JWT_SECRET": "office-startup-secret-canary",
+}
+
+_AUTH_GUARD_MODULES = {
+    "app",
+    "auth_guard",
+    "ws_recheck",
+    "mcp_tools",
+    "docker_manager",
+    "outputs_broker",
+    "context_vars",
+    "security",
+    "system_prompt",
+    "skill_manager",
+    "uploads",
+    "file_response",
+    "office",
+    "office.config",
+    "office.router",
+    "office.store",
+    "office.versions",
+    "office.workspace",
+    "office.publish",
+    "office.save_as",
+    "office.resolution",
+    "office.history",
+    "office.restore",
+    "office.epoch",
+    "office.tokens",
+    "office.commands",
+    "office.sessions",
+    "office.notice",
+    "office.ooxml",
+    "office.sweep",
+    "office.control_plane",
+    "office.download",
+    "office.callback",
 }
 
 
@@ -130,47 +171,11 @@ def _apply_env(monkeypatch):
 @pytest.fixture
 def app_module(monkeypatch):
     """Import the server after the guard env is set, once per test."""
-    _apply_env(monkeypatch)
-    for name in list(sys.modules):
-        if name in {
-            "app",
-            "auth_guard",
-            "ws_recheck",
-            "mcp_tools",
-            "docker_manager",
-            "outputs_broker",
-            "context_vars",
-            "security",
-            "system_prompt",
-            "skill_manager",
-            "uploads",
-            "file_response",
-            "office",
-            "office.config",
-            "office.router",
-            "office.store",
-            "office.versions",
-            "office.workspace",
-            "office.publish",
-            "office.save_as",
-            "office.resolution",
-            "office.history",
-            "office.restore",
-            "office.epoch",
-            "office.tokens",
-            "office.commands",
-            "office.sessions",
-            "office.notice",
-            "office.ooxml",
-            "office.sweep",
-            "office.control_plane",
-            "office.download",
-            "office.callback",
-        } or name.startswith("mcp_resources"):
-            sys.modules.pop(name, None)
-    import app as loaded
+    with isolated_modules(_AUTH_GUARD_MODULES, ("mcp_resources",)):
+        _apply_env(monkeypatch)
+        import app as loaded
 
-    return loaded
+        yield loaded
 
 
 @pytest.fixture

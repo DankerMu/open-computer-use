@@ -23,6 +23,8 @@ from urllib.parse import urlparse
 
 import pytest
 
+from tests.file_route_module_ownership import isolated_modules
+
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
@@ -45,6 +47,19 @@ BACKEND_FAIL_CODE = 1011
 PREACCEPT_CODE = 1008
 FUTURE_MARKER = "post-revoke-marker"
 
+_WS_SERVER_MODULES = {
+    "app",
+    "auth_guard",
+    "ws_recheck",
+    "mcp_tools",
+    "docker_manager",
+    "outputs_broker",
+    "security",
+    "system_prompt",
+    "skill_manager",
+    "file_response",
+}
+
 
 def _apply_env(monkeypatch, tmp_path, auth_url=None):
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL)
@@ -61,25 +76,17 @@ def _apply_env(monkeypatch, tmp_path, auth_url=None):
 
 
 def _reload_server():
-    for name in list(sys.modules):
-        if name in {
-            "app",
-            "auth_guard",
-            "ws_recheck",
-            "mcp_tools",
-            "docker_manager",
-            "outputs_broker",
-            "security",
-            "system_prompt",
-            "skill_manager",
-            "file_response",
-        } or name.startswith(("mcp_resources", "cli_adapters")):
-            sys.modules.pop(name, None)
     return importlib.import_module("app")
 
 
 @pytest.fixture
-def app_module(monkeypatch, tmp_path):
+def ws_server_modules():
+    with isolated_modules(_WS_SERVER_MODULES, ("mcp_resources", "cli_adapters")):
+        yield
+
+
+@pytest.fixture
+def app_module(ws_server_modules, monkeypatch, tmp_path):
     _apply_env(monkeypatch, tmp_path, auth_url="http://127.0.0.1:9" + AUTH_PATH)
     loaded = _reload_server()
     data = tmp_path / "data"
@@ -647,7 +654,7 @@ def _expect_close_code(socket, code, timeout=2.0):
 class TestAdmissionDeniesBeforeBackend:
     @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
     def test_missing_auth_url_closes_1008_without_backend_lookup(
-        self, monkeypatch, tmp_path, kind
+        self, ws_server_modules, monkeypatch, tmp_path, kind
     ):
         _apply_env(monkeypatch, tmp_path, auth_url=None)
         app_module = _reload_server()
