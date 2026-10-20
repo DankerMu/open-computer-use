@@ -1314,6 +1314,11 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+# setup-python's toolcache interpreter needs LD_LIBRARY_PATH to find libpython;
+# pass only loader variables through so the child env stays otherwise literal.
+_INTERPRETER_ENV = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "PATH", "SYSTEMROOT")
+
+
 def test_startup_sweep_looks_up_seeded_managed_chat_through_real_lifespan(tmp_path):
     """The real lifespan's background reaper runs the production startup sweep.
 
@@ -1385,6 +1390,7 @@ def test_startup_sweep_looks_up_seeded_managed_chat_through_real_lifespan(tmp_pa
         [sys.executable, "-c", script],
         cwd=str(SERVER_DIR),
         env={
+            **{name: os.environ[name] for name in _INTERPRETER_ENV if name in os.environ},
             "OCU_SERVER_DIR": str(SERVER_DIR),
             "OCU_INTERNAL_TOKEN": INTERNAL,
             "MCP_API_KEY": MCP_KEY,
