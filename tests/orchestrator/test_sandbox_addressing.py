@@ -7,7 +7,7 @@ host address and port. Missing publication is unavailable. Host-network and
 wildcard HostIp still parse to loopback for the shared-namespace address
 contract; that parser is not a managed-launch isolation exception.
 
-Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_sandbox_addressing.py -v
+Run: python -m pytest tests/orchestrator/test_sandbox_addressing.py -v
 """
 
 import os
