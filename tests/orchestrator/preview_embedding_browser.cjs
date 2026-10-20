@@ -147,6 +147,8 @@ const activeSockets = new Set();
 const socketMessages = [];
 const upgradeAttempts = [];
 let browserFixture = 'inactive';
+let terminalFixture = 'inactive';
+const FAULT_DETAIL = '9222/tcp publication on 172.31.0.1 was accepted by the engine but never assigned a host port; gateway publication is unsupported on this engine profile (computer-use-server/README.md, Sandbox network host support)';
 let browserPagesHeld = false;
 let upgradesHeld = false;
 let ttydSendsData = true;
@@ -352,6 +354,9 @@ const server = http.createServer(async (req, res) => {
       if (browserFixture === 'held') { heldBrowserStatuses.push(res); return; }
       if (browserFixture === 'failure') return respond(res, 503, '{}');
       if (browserFixture === 'malformed') return respond(res, 200, '{"active":"yes"}');
+      if (browserFixture === 'fault') return respond(res, 200, JSON.stringify({
+        active: false, pages: [], reason: 'gateway_publication_unassigned', detail: FAULT_DETAIL
+      }));
       return respond(res, 200, JSON.stringify({
         active: browserFixture === 'active', pages: browserFixture === 'active'
           ? [{ id: 'fixture-page', type: 'page', url: 'about:blank' }] : []
@@ -363,10 +368,26 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === `${prefix}/terminal/${CHAT}/heartbeat`)
       return respond(res, 200, '{"ok":true}');
-    if (url.pathname === `${prefix}/terminal/${CHAT}/start-ttyd` && req.method === 'POST')
+    if (url.pathname === `${prefix}/terminal/${CHAT}/start-ttyd` && req.method === 'POST') {
+      if (terminalFixture === 'stopped') {
+        record.status = 503;
+        return respond(res, 503, '{}');
+      }
       return respond(res, 200, '{"already_running":true}');
+    }
+    if (url.pathname === `${prefix}/terminal/${CHAT}/restart-container` && req.method === 'POST') {
+      record.status = 200;
+      return respond(res, 200, '{}');
+    }
     if (url.pathname === `${prefix}/terminal/${CHAT}/processes`) return respond(res, 200, JSON.stringify({ processes: [] }));
-    if (url.pathname === `${prefix}/terminal/${CHAT}/status`) return respond(res, 200, JSON.stringify({ active: false }));
+    if (url.pathname === `${prefix}/terminal/${CHAT}/status`) {
+      if (terminalFixture === 'fault') return respond(res, 200, JSON.stringify({
+        active: false, reason: 'gateway_publication_unassigned', detail: FAULT_DETAIL
+      }));
+      if (terminalFixture === 'stopped')
+        return respond(res, 200, JSON.stringify({ active: false, container_stopped: true }));
+      return respond(res, 200, JSON.stringify({ active: false }));
+    }
     if (url.pathname === `${prefix}/terminal/${CHAT}/sessions`) return respond(res, 200, JSON.stringify({ sessions: [] }));
     if (url.pathname.startsWith(`${prefix}/api/uploads/${CHAT}/`) && req.method === 'POST' &&
         uploadFixtures.has(url.pathname)) {
@@ -809,7 +830,10 @@ async function main() {
       const address = new URL(request.url());
       if (address.origin !== origin ||
           !(address.pathname.endsWith(`/browser/${CHAT}/status`) ||
-            address.pathname.endsWith(`/browser/${CHAT}/json`))) return;
+            address.pathname.endsWith(`/browser/${CHAT}/json`) ||
+            // The 503 start and the recovery restart bodies stay unread; frame retirement aborts them.
+            address.pathname.endsWith(`/terminal/${CHAT}/start-ttyd`) ||
+            address.pathname.endsWith(`/terminal/${CHAT}/restart-container`))) return;
       pendingRuntimeRequests.add(request);
       try {
         if (retiringFrame && request.frame() === retiringFrame)
@@ -872,6 +896,11 @@ async function main() {
       }
       if (browserFixture === 'failure' && text.includes('503') &&
           (url.includes(`/browser/${CHAT}/status`) || text.includes(`/browser/${CHAT}/status`))) {
+        expectedRuntimeFailures.push(text);
+        return;
+      }
+      if (text.includes('503') &&
+          (url.includes(`/terminal/${CHAT}/start-ttyd`) || text.includes(`/terminal/${CHAT}/start-ttyd`))) {
         expectedRuntimeFailures.push(text);
         return;
       }
@@ -2081,6 +2110,31 @@ async function main() {
       assert.equal(activeSockets.size, beforeConnections, 'unavailable Browser started a connection');
       await retireFrame();
     }
+    browserFixture = 'fault';
+    const beforeBrowserFault = requests.length;
+    const socketsBeforeBrowserFault = activeSockets.size;
+    await page.evaluate(() => window.mount('?embed=browser'));
+    const browserFaultAlert = frame().getByRole('alert');
+    await browserFaultAlert.getByText('gateway_publication_unassigned').waitFor();
+    const browserFaultText = await browserFaultAlert.innerText();
+    assert(browserFaultText.includes('9222/tcp'), 'embedded Browser fault omitted the detail');
+    assert(browserFaultText.includes('Browser port not published by the host engine'),
+      'embedded Browser fault omitted the title');
+    assert.equal(await frame().locator('.runtime-fault-detail').count(), 1,
+      'embedded Browser fault did not render one detail line');
+    assert.equal(await frame().getByText('Browser unavailable').count(), 0,
+      'embedded Browser fault rendered the unavailable alert');
+    assert.equal(await frame().getByText('Shared AI Browser').count(), 0,
+      'embedded Browser fault rendered the empty state');
+    assert.equal(await frame().locator('.browser-connecting, canvas').count(), 0,
+      'embedded Browser fault mounted the viewer');
+    assert.equal(requests.slice(beforeBrowserFault).filter(row =>
+      row.path === `/ocu/browser/${CHAT}/json`).length, 0, 'embedded Browser fault requested pages');
+    assert.equal(activeSockets.size, socketsBeforeBrowserFault, 'embedded Browser fault started a connection');
+    await page.screenshot({ path: path.join(artifacts, 'embedded-browser-fault.png'), animations: 'disabled' });
+    await retireFrame();
+    browserFixture = 'inactive';
+
     browserFixture = 'held';
     await page.evaluate(() => window.mount('?embed=browser'));
     await waitUntil(() => heldBrowserStatuses.length === 1, 'held browser status');
@@ -2124,6 +2178,54 @@ async function main() {
     for (const upgrade of heldUpgrades.splice(0)) acceptUpgrade(upgrade);
     await waitUntil(() => heldBrowserSocket.destroyed, 'held browser transport close');
     assert.equal(activeSockets.size, 0, 'retired Browser retained an accepted WebSocket');
+
+    terminalFixture = 'fault';
+    const beforeTerminalFault = requests.length;
+    const upgradesBeforeTerminalFault = upgradeAttempts.length;
+    await page.evaluate(() => window.mount('?embed=terminal'));
+    await frame().locator('.dash-btn-primary').click();
+    await frame().getByRole('alert').getByText('gateway_publication_unassigned').waitFor();
+    const terminalFaultText = await frame().getByRole('alert').innerText();
+    assert(terminalFaultText.includes('9222/tcp'), 'terminal fault omitted the detail');
+    assert(terminalFaultText.includes('Terminal port not published by the host engine'),
+      'terminal fault omitted the title');
+    assert.equal(requests.slice(beforeTerminalFault).filter(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd`).length, 0, 'terminal fault requested a ttyd start');
+    assert.equal(upgradeAttempts.length, upgradesBeforeTerminalFault, 'terminal fault opened a WebSocket');
+    assert.equal(activeSockets.size, 0, 'terminal fault retained a WebSocket');
+    assert.equal(await frame().getByRole('alert').locator('.dash-btn-primary').count(), 0,
+      'terminal fault offered a recover action');
+    assert.equal(await frame().getByRole('alert').locator('button.btn').count(), 1,
+      'terminal fault dropped the Back button');
+    assert.equal(await frame().getByText('[Session ended]').count(), 0, 'terminal fault ended a session');
+    await page.screenshot({ path: path.join(artifacts, 'embedded-terminal-fault.png'), animations: 'disabled' });
+    await retireFrame();
+    terminalFixture = 'inactive';
+
+    terminalFixture = 'stopped';
+    const beforeTerminalStopped = requests.length;
+    await page.evaluate(() => window.mount('?embed=terminal'));
+    await frame().locator('.dash-btn-primary').click();
+    await frame().getByText('Container stopped').waitFor();
+    assert.equal(await frame().getByRole('alert').count(), 0, 'stopped container rendered a fault alert');
+    assert.equal(await frame().locator('.dash-btn-primary').count(), 1,
+      'stopped container dropped the Restart button');
+    assert(requests.slice(beforeTerminalStopped).some(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd` && row.status === 503),
+    'stopped container did not fail its ttyd start');
+    terminalFixture = 'fault';
+    const beforeTerminalRecovery = requests.length;
+    const upgradesBeforeTerminalRecovery = upgradeAttempts.length;
+    await frame().locator('.dash-btn-primary').click();
+    await frame().getByRole('alert').getByText('gateway_publication_unassigned').waitFor();
+    assert.equal(upgradeAttempts.length, upgradesBeforeTerminalRecovery,
+      'recovered terminal fault opened a WebSocket');
+    assert.equal(activeSockets.size, 0, 'recovered terminal fault retained a WebSocket');
+    assert.equal(requests.slice(beforeTerminalRecovery).filter(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/restart-container`).length, 1,
+    'terminal recovery did not restart the container once');
+    await retireFrame();
+    terminalFixture = 'inactive';
 
     upgradesHeld = true;
     await page.evaluate(() => window.mount('?embed=terminal'));
@@ -3066,6 +3168,32 @@ async function main() {
       standaloneUploadedNote = false;
       await closeStandalone(panelSession);
     }
+
+    browserFixture = 'fault';
+    const faultSession = await openStandalone('/ocu');
+    try {
+      await faultSession.page.locator('.view-tab').filter({ hasText: 'Browser' }).click();
+      const shellFaultAlert = faultSession.page.getByRole('alert');
+      await shellFaultAlert.getByText('gateway_publication_unassigned').waitFor();
+      const shellFaultText = await shellFaultAlert.innerText();
+      assert(shellFaultText.includes('9222/tcp'), 'standalone Browser fault omitted the detail');
+      assert(shellFaultText.includes('Browser port not published by the host engine'),
+        'standalone Browser fault omitted the title');
+      assert.equal(await faultSession.page.locator('.runtime-fault-detail').count(), 1,
+        'standalone Browser fault did not render one detail line');
+      assert.equal(await faultSession.page.getByText('Browser unavailable').count(), 0,
+        'standalone Browser fault rendered the unavailable alert');
+      assert.equal(await faultSession.page.getByText('Shared AI Browser').count(), 0,
+        'standalone Browser fault rendered the empty state');
+      assert.equal(await faultSession.page.locator('.browser-connecting, canvas').count(), 0,
+        'standalone Browser fault mounted the viewer');
+      await faultSession.page.screenshot({ path: path.join(artifacts, 'standalone-browser-fault.png'), animations: 'disabled' });
+    } finally {
+      await closeStandalone(faultSession);
+      browserFixture = 'inactive';
+    }
+    console.log(JSON.stringify({ runtimeFault: 'ok', embeddedBrowser: true, shellBrowser: true,
+      terminal: true, terminalRecovery: true }));
 
     const compatibilityResults = [];
     const compatibilityExpected = [];

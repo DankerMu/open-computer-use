@@ -1607,7 +1607,13 @@ function FilesView({ files, selectedFile, onSelectFile, selectionKey, onRenderSt
   return html`<div class="preview" ref=${containerRef}></div>`;
 }
 
-function BrowserView({ chatId, browserActive, onBrowserViewerRef }) {
+// A string `reason` on a browser/terminal status payload is the server's typed capability fault.
+const runtimeFault = (status) =>
+  status && typeof status.reason === 'string' && status.reason
+    ? { reason: status.reason, detail: typeof status.detail === 'string' ? status.detail : '' }
+    : null;
+
+function BrowserView({ chatId, browserActive, fault, onBrowserViewerRef }) {
   const canvasRef = useRef(null);
   const urlBarRef = useRef(null);
   const viewerRef = useRef(null);
@@ -1653,6 +1659,19 @@ function BrowserView({ chatId, browserActive, onBrowserViewerRef }) {
       if (viewerRef.current === viewer) viewerRef.current = null;
     };
   }, [browserActive]);
+
+  if (fault) {
+    return html`
+      <div class="browser-panel">
+        <div class="empty-state runtime-fault" role="alert">
+          <div class="empty-icon" dangerouslySetInnerHTML=${{ __html: icon('globe', 48) }}></div>
+          <div class="empty-title">${t('browser_fault_title')}</div>
+          <div class="empty-desc">${t('runtime_fault_desc', { reason: fault.reason })}</div>
+          <div class="empty-example runtime-fault-detail">${fault.detail}</div>
+        </div>
+      </div>
+    `;
+  }
 
   if (!browserActive) {
     return html`
@@ -1876,6 +1895,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
   const [startError, setStartError] = useState(null);
   const [selectMode, setSelectMode] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const faultRef = useRef(null);
   const mountedRef = useRef(true);
   const timersRef = useRef(new Map());
   const reconnectTimerRef = useRef(null);
@@ -1905,6 +1925,15 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     mountedRef.current = false;
     for (const timer of timersRef.current.keys()) cancelTimer(timer);
   }, [cancelTimer]);
+  const readTerminalFault = useCallback(async (signal) => {
+    try {
+      const resp = await ocuFetch(`/terminal/${chatId}/status?_t=${Date.now()}`,
+        { cache: 'no-store', signal });
+      return resp.ok ? runtimeFault(await resp.json()) : null;
+    } catch {
+      return null; // a failed or non-JSON status read never blocks a start
+    }
+  }, [chatId]);
 
   const connectWs = useCallback((rId) => {
     if (!mountedRef.current || !xtermRef.current) return;
@@ -1994,6 +2023,9 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     let cancelled = false;
     const controller = new AbortController();
     (async () => {
+      const fault = await readTerminalFault(controller.signal);
+      if (cancelled || !mountedRef.current) return;
+      if (fault) { faultRef.current = fault; setStartError('__fault__'); return; }
       try {
         const resp = await ocuFetch(`/terminal/${chatId}/start-ttyd`, {
           method: 'POST',
@@ -2029,7 +2061,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
       if (!cancelled && mountedRef.current) setReady(true);
     })();
     return () => { cancelled = true; controller.abort(); };
-  }, [chatId, pause]);
+  }, [chatId, pause, readTerminalFault]);
 
   // Phase 2: init xterm + connect WS (only after ttyd is ready)
   useEffect(() => {
@@ -2169,6 +2201,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
   if (startError) {
     const isStopped = startError === '__stopped__';
     const isMetaExists = startError === '__meta_exists__';
+    const isFault = startError === '__fault__';
     const canRecover = isStopped || isMetaExists;
 
     const handleRestart = async () => {
@@ -2178,6 +2211,9 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
         const recovered = await recoverStoppedContainer(chatId, dangerousModeRef.current);
         if (!mountedRef.current) return;
         if (recovered.ok) {
+          const fault = await readTerminalFault();
+          if (!mountedRef.current) return;
+          if (fault) { faultRef.current = fault; setStartError('__fault__'); setRestarting(false); return; }
           setStartError(null);
           setReady(false);
           if (!(await pause(isMetaExists ? 2500 : (recovered.already_running ? 500 : 1500)))) return;
@@ -2190,18 +2226,21 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     };
 
     return html`
-      <div class="empty-state">
+      <div class="empty-state" role=${isFault ? 'alert' : null}>
         <div class="empty-icon" dangerouslySetInnerHTML=${{ __html: icon('terminal', 48) }}></div>
         <div class="empty-title">${
-          isStopped ? t('container_stopped')
+          isFault ? t('terminal_fault_title')
+          : isStopped ? t('container_stopped')
           : isMetaExists ? t('container_removed')
           : startError
         }</div>
         <div class="empty-desc">${
-          isStopped ? t('container_stopped_desc')
+          isFault ? t('runtime_fault_desc', { reason: faultRef.current.reason })
+          : isStopped ? t('container_stopped_desc')
           : isMetaExists ? t('container_removed_desc')
           : t('container_generic_desc')
         }</div>
+        ${isFault && html`<div class="empty-example runtime-fault-detail">${faultRef.current.detail}</div>`}
         ${canRecover && html`
           <button class="dash-btn-primary" onClick=${handleRestart} disabled=${restarting}>
             <span class="icon-inline" dangerouslySetInnerHTML=${{ __html: icon('play') }}></span>
@@ -2416,6 +2455,7 @@ function EmbeddedFilesApp() {
 
 function EmbeddedRuntimeApp({ mode }) {
   const [browserStatus, setBrowserStatus] = useState('loading');
+  const [browserFault, setBrowserFault] = useState(null);
 
   useEffect(() => {
     const stopHeartbeat = startWorkspaceHeartbeat(CHAT_ID);
@@ -2433,9 +2473,13 @@ function EmbeddedRuntimeApp({ mode }) {
         const status = await response.json();
         if (!status || typeof status.active !== 'boolean' || !Array.isArray(status.pages))
           throw new Error('invalid browser status');
-        if (!retired) setBrowserStatus(status.active ? 'active' : 'inactive');
+        const fault = runtimeFault(status);
+        if (!retired) {
+          setBrowserFault(fault);
+          setBrowserStatus(fault ? 'fault' : status.active ? 'active' : 'inactive');
+        }
       } catch {
-        if (!retired) setBrowserStatus('unavailable');
+        if (!retired) { setBrowserFault(null); setBrowserStatus('unavailable'); }
       } finally {
         if (!retired) timer = setTimeout(checkStatus, 3000);
       }
@@ -2454,7 +2498,8 @@ function EmbeddedRuntimeApp({ mode }) {
       ? html`
         ${browserStatus === 'loading' && html`<div role="status">Checking browser status</div>`}
         ${browserStatus === 'unavailable' && html`<div role="alert">Browser unavailable</div>`}
-        <${BrowserView} chatId=${CHAT_ID} browserActive=${browserStatus === 'active'} />
+        <${BrowserView} chatId=${CHAT_ID} browserActive=${browserStatus === 'active'}
+          fault=${browserStatus === 'fault' ? browserFault : null} />
       `
       : html`<div class="terminal-panel"><${TerminalView} chatId=${CHAT_ID} /></div>`}
   </div>`;
@@ -2465,6 +2510,7 @@ function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [currentView, setCurrentView] = useState('files');
   const [browserActive, setBrowserActive] = useState(false);
+  const [browserFault, setBrowserFault] = useState(null);
   const [terminalActive, setTerminalActive] = useState(false);
   const [seenFiles, setSeenFiles] = useState(new Set());
   const [listingError, setListingError] = useState(null);
@@ -2524,6 +2570,7 @@ function App() {
     try {
       const resp = await ocuFetch(`/browser/${CHAT_ID}/status?_t=${Date.now()}`, { cache: 'no-store' });
       const data = await resp.json();
+      setBrowserFault(runtimeFault(data));
       setBrowserActive(prev => {
         if (data.active && !prev) {
           setCurrentView('browser');
@@ -2648,6 +2695,7 @@ function App() {
       <${BrowserView}
         chatId=${CHAT_ID}
         browserActive=${browserActive}
+        fault=${browserActive ? null : browserFault}
         onBrowserViewerRef=${(v) => { browserViewerRef.current = v; }}
       />
     </div>
