@@ -9,11 +9,19 @@ import select
 import stat
 import subprocess
 import sys
+import threading
+from pathlib import Path
 
 import pytest
 
 from tests.orchestrator._office_store import CHAT, SERVER_DIR, _MARKER_WRITER, _stop_child
-from tests.orchestrator.test_office_control_plane_concurrency import _PROCESS_HOLDER
+from tests.orchestrator import test_office_control_plane_concurrency as contention
+from tests.orchestrator.test_office_control_plane_concurrency import (
+    _MARKER_NAMESPACE,
+    _PROCESS_HOLDER,
+    _record_contention,
+)
+from tests.orchestrator.test_office_sessions import office_world as office_world
 
 
 _HELD_IO = r'''
@@ -126,6 +134,65 @@ def test_process_holder_entered_marker_is_absent_until_complete(tmp_path):
         assert set(markers.iterdir()) == {entered}
     finally:
         _stop_child(child)
+
+
+def test_callback_contention_marker_is_absent_until_complete(tmp_path, monkeypatch):
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    contended = markers / "callback-process-contended"
+    reached = threading.Event()
+    release = threading.Event()
+    errors = []
+    original_write = _MARKER_NAMESPACE["_marker_write"]
+
+    def held_write(fd, body):
+        reached.set()
+        if not release.wait(10):
+            raise AssertionError("contention marker hold was never released")
+        return original_write(fd, body)
+
+    def publish():
+        try:
+            _record_contention(contended, "denied")
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            reached.set()
+
+    monkeypatch.setitem(_MARKER_NAMESPACE, "_marker_write", held_write)
+    writer = threading.Thread(target=publish, daemon=True)
+    writer.start()
+    try:
+        assert reached.wait(5), "contention marker writer did not reach the held write"
+        assert not contended.exists(), "an incomplete contention marker must not satisfy readiness"
+        stages = list(markers.iterdir())
+        assert len(stages) == 1
+        stage = stages[0]
+        assert stage.name.startswith(".callback-process-contended.") and stage.suffix == ".stage"
+        assert stage.read_bytes() == b""
+        assert stat.S_IMODE(stage.stat().st_mode) == 0o600
+        release.set()
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+        assert errors == []
+        assert contended.read_text(encoding="utf-8") == "denied"
+        assert set(markers.iterdir()) == {contended}
+    finally:
+        release.set()
+        writer.join(timeout=5)
+
+
+def test_callback_contention_owner_publishes_denial_through_marker_writer(office_world, monkeypatch):
+    original_record = contention._record_contention
+    recorded = []
+
+    def recording(path, outcome):
+        recorded.append((Path(path).name, outcome))
+        return original_record(path, outcome)
+
+    monkeypatch.setattr(contention, "_record_contention", recording)
+    contention.test_callback_waits_for_ordinary_process_holder_while_health_progresses(office_world)
+    assert recorded == [("callback-process-contended", "denied")]
 
 
 _SAVED_IO = r'''

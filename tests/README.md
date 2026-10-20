@@ -167,17 +167,25 @@ Existing child holds, exact-text checks, SIGKILL checks and recovery assertions
 remain unchanged. The ordinary process holder in
 `orchestrator/test_office_control_plane_concurrency.py` publishes its
 `callback-process-entered` readiness marker through the same writer, so the
-startup-failure owner's exact `held` read never sees incomplete text. The other
-contention markers (`callback-process-contended` and the thread holder) and the
-separate pause/read oracle are outside this protocol.
+startup-failure owner's exact `held` read never sees incomplete text. Its
+in-process `contend` hook publishes `callback-process-contended` through
+`_record_contention`, which calls `_publish_marker` from the writer loaded once
+into `_MARKER_NAMESPACE`, so the owner's exact `denied` read never sees incomplete
+text either. The thread holder signals through `threading.Event`, not a file
+marker; it and the separate pause/read oracle are outside this protocol.
 
 `orchestrator/test_office_crash_markers.py` holds real filesystem writes before
 text is complete, exercises short writes and publication failures, and checks
 saved-hook isolation plus private-mode/sync/close ordering. It also holds the
 real process holder at its marker open; lock-file and descriptor opens pass
-through the hold filter. Its behavioral mutation seam is `_publish_marker` in the
-shared embedded source: restoring direct final-path writes must expose premature
-readiness, not an import failure. Run this module together with the complete
+through the hold filter. In process, it holds `_record_contention` at the
+namespace's saved `_marker_write`, after the stage opens and before any byte is
+written, and a call-site guard runs the real owner test to require exactly one
+`denied` publication through `_record_contention`. Its behavioral mutation seams
+are `_publish_marker` in the shared embedded source and its in-process
+`_record_contention` use: restoring direct final-path writes in either must
+expose premature readiness or a missing publication, not an import failure.
+Run this module together with the complete
 `test_office_publish_recovery.py`, `test_office_save_as.py`,
 `test_office_resolution.py`, `test_office_store.py`,
 `test_office_contention_startup.py` and `test_office_control_plane_concurrency.py`
