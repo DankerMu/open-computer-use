@@ -1070,10 +1070,10 @@ _BLOB_CLOSES = ["staging", "versions", "office", "ocu", "root", "base"]
 _REMOVAL_CLOSES = ["versions", "office", "ocu", "root", "base"]
 
 
-def _blob_owner_fault(store_mod, monkeypatch, owner, fail_role):
+def _blob_owner_fault(store_mod, monkeypatch, owner, fail_role, close_errno=errno.EIO):
     import office.versions as versions_mod
 
-    close_error = OSError(errno.EIO, "close refused")
+    close_error = OSError(close_errno, "close refused")
     fault = _owner_close_fault(
         monkeypatch, store_mod.OfficeStore, versions_mod, owner,
         fail_role=fail_role, close_error=close_error,
@@ -1092,7 +1092,11 @@ def test_blob_publication_close_failure_attempts_every_owned_close_once(world, m
     assert trace["calls"] == 1
     assert trace["attempts"] == _BLOB_CLOSES
     assert trace["still_owned"] == []
-    assert failure.value is close_error
+    assert type(failure.value) is versions_mod.BlobCloseError
+    assert (failure.value.errno, failure.value.strerror) == (errno.EIO, "close refused")
+    assert failure.value.close_errors == (close_error,)
+    assert failure.value.__cause__ is close_error
+    assert failure.value.__context__ is close_error
     assert close_error.close_errors == (close_error,)
     assert _blob(data, SAVE).read_bytes() == SAVE
     assert list(_staging(data).iterdir()) == []
@@ -1183,14 +1187,17 @@ def test_store_version_close_failure_records_no_version_and_retry_reuses_blob(wo
     _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
     before = _doc_versions(store_mod)
     before_state = _state(data).read_bytes()
-    _versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", "versions")
+    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", "versions")
     with fault as trace:
         with pytest.raises(Exception) as failure:
             _store(store_mod, SAVE, source="save", parent=1, published=True)
     assert trace["calls"] == 1
     assert trace["attempts"] == _BLOB_CLOSES
     assert trace["still_owned"] == []
-    assert failure.value is close_error
+    assert type(failure.value) is versions_mod.BlobCloseError
+    assert failure.value.errno == errno.EIO
+    assert failure.value.close_errors == (close_error,)
+    assert failure.value.__context__ is close_error
     assert _state(data).read_bytes() == before_state
     assert _doc_versions(store_mod) == before
     blob = _blob(data, SAVE)
@@ -1201,6 +1208,55 @@ def test_store_version_close_failure_records_no_version_and_retry_reuses_blob(wo
     assert _doc_versions(store_mod) == before + [record]
     assert _inode(blob) == identity
     assert blob.read_bytes() == SAVE
+
+
+def test_store_version_existing_blob_close_failure_records_no_version_and_retry_reuses_blob(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    _store(store_mod, SAVE, source="save", parent=1, published=True)
+    before = _doc_versions(store_mod)
+    before_state = _state(data).read_bytes()
+    blob = _blob(data, WORKSPACE)
+    identity = _inode(blob)
+    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", "versions")
+    with fault as trace:
+        with pytest.raises(Exception) as failure:
+            _store(store_mod, WORKSPACE, source="save", parent=2, published=True)
+    assert trace["calls"] == 1
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert type(failure.value) is versions_mod.BlobCloseError
+    assert failure.value.errno == errno.EIO
+    assert failure.value.close_errors == (close_error,)
+    assert failure.value.__context__ is close_error
+    assert _state(data).read_bytes() == before_state
+    assert _inode(blob) == identity
+    record = _store(store_mod, WORKSPACE, source="save", parent=2, published=True)
+    assert (record["number"], record["sha256"]) == (3, _sha(WORKSPACE))
+    assert _doc_versions(store_mod) == before + [record]
+    assert _inode(blob) == identity
+    assert blob.read_bytes() == WORKSPACE
+
+
+def test_store_version_enospc_close_failure_is_storage_low(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    before_state = _state(data).read_bytes()
+    versions_mod, close_error, fault = _blob_owner_fault(
+        store_mod, monkeypatch, "_publish_blob", "office", close_errno=errno.ENOSPC,
+    )
+    with fault as trace:
+        with pytest.raises(Exception) as failure:
+            _store(store_mod, SAVE, source="save", parent=1, published=True)
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert type(failure.value) is versions_mod.StorageLowError
+    assert type(failure.value.__cause__) is versions_mod.BlobCloseError
+    assert failure.value.__cause__.errno == errno.ENOSPC
+    assert failure.value.__cause__.close_errors == (close_error,)
+    assert failure.value.__cause__.__cause__ is close_error
+    assert _state(data).read_bytes() == before_state
+    assert _blob(data, SAVE).read_bytes() == SAVE
 
 
 @pytest.mark.parametrize("fail_role", ["office", "root"])

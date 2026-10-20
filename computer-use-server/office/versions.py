@@ -42,6 +42,14 @@ class StorageLowError(RuntimeError):
         self.reason = "storage_low"
 
 
+class BlobCloseError(OSError):
+    """Version-blob publication failed only at a final owned-directory close.
+
+    Carries the first close failure's errno and message, every close failure on
+    ``close_errors``, and the first close failure as ``__cause__``.
+    """
+
+
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -464,11 +472,16 @@ def _publish_blob(store: OfficeStore, chat: str, digest: str, content: bytes) ->
                     unlink_error = cleanup_error
                 else:
                     record_cleanup_error(primary_error, cleanup_error, what="Temporary version blob")
-        close_final_directories(
-            (staging_fd, versions_fd, office_fd, ocu_fd, root_fd, base_fd),
-            resource="office_version_blob", committed_and_synced=False,
-            primary_error=primary_error if primary_error is not None else unlink_error,
-        )
+        try:
+            close_final_directories(
+                (staging_fd, versions_fd, office_fd, ocu_fd, root_fd, base_fd),
+                resource="office_version_blob", committed_and_synced=False,
+                primary_error=primary_error if primary_error is not None else unlink_error,
+            )
+        except OSError as close_error:
+            blob_error = BlobCloseError(close_error.errno, close_error.strerror)
+            blob_error.close_errors = close_error.close_errors
+            raise blob_error from close_error
         if unlink_error is not None:
             raise unlink_error
 

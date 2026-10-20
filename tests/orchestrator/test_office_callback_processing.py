@@ -32,6 +32,7 @@ from tests.orchestrator.test_office_ooxml import intact_docx, intact_xlsx
 from tests.orchestrator.test_office_router import OFFICE_SETTINGS
 from tests.orchestrator.test_office_save_close import _forcesave, _save
 from tests.orchestrator.test_office_session_lifecycle import _change, _status
+from tests.orchestrator.test_office_versions import _BLOB_CLOSES, _blob_owner_fault
 from tests.orchestrator.test_office_sessions import (
     JWT_SECRET,
     _assert_refusal,
@@ -1788,4 +1789,84 @@ def test_forcesave_receipt_replay_close_failure_is_state_close_failed(office_wor
         duplicate = _post(http, session, four)
         assert duplicate.status_code == 200
         assert duplicate.json() == {"error": 0}
+    assert origin.hits == 0
+
+
+def _blob_fault(monkeypatch, fail_role):
+    import office.store as store_mod
+
+    return _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", fail_role)[2]
+
+
+def test_final_content_blob_close_failure_is_state_close_failed_and_retry_reuses_blob(
+        office_world, monkeypatch, caplog):
+    http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
+    _change(session["session_id"], state="editing", save_seq=0)
+    before = _state(data).read_bytes()
+    before_versions = json.loads(before)["documents"][session["file_id"]]["versions"]
+    with _content_origin({"/cache/close.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        payload = recorded_status_2_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/close.docx",
+        )
+        with _blob_fault(monkeypatch, "root") as trace, caplog.at_level("ERROR", logger="ocu.office"):
+            failed = _post(http, session, payload)
+        _assert_refusal(failed, 500, "state_close_failed")
+        recorded = "\n".join(record.getMessage() for record in caplog.records)
+        assert f"session={session['session_id']} reason=state_close_failed" in recorded
+        assert trace["calls"] == 1
+        assert trace["attempts"] == _BLOB_CLOSES
+        assert trace["still_owned"] == []
+        assert _state(data).read_bytes() == before
+        blob = _versions(data) / _sha(CHANGED)
+        assert blob.read_bytes() == CHANGED
+        identity = (blob.stat().st_dev, blob.stat().st_ino)
+        retry = _post(http, session, payload)
+        assert retry.status_code == 200
+        assert retry.json() == {"error": 0}
+        listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
+        assert listed[:-1] == before_versions
+        assert (listed[-1]["sha256"], listed[-1]["source"]) == (_sha(CHANGED), "close")
+        assert (blob.stat().st_dev, blob.stat().st_ino) == identity
+    assert origin.hits == 0
+
+
+def test_forcesave_content_blob_close_failure_keeps_pending_save_and_retry_reuses_blob(
+        office_world, monkeypatch):
+    http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
+    _change(
+        session["session_id"],
+        state="saving",
+        save_seq=4,
+        pending_save_seq=4,
+        save_intents={"4": "persist"},
+        last_committed_seq=0,
+    )
+    before = _state(data).read_bytes()
+    before_versions = json.loads(before)["documents"][session["file_id"]]["versions"]
+    with _content_origin({"/cache/4.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        four = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/4.docx",
+            save_seq=4,
+            intent="persist",
+        )
+        with _blob_fault(monkeypatch, "versions") as trace:
+            failed = _post(http, session, four)
+        _assert_refusal(failed, 500, "state_close_failed")
+        assert trace["calls"] == 1
+        assert trace["attempts"] == _BLOB_CLOSES
+        assert trace["still_owned"] == []
+        record = json.loads(_state(data).read_bytes())["sessions"][session["session_id"]]
+        assert (record["state"], record["pending_save_seq"]) == ("saving", 4)
+        assert _state(data).read_bytes() == before
+        blob = _versions(data) / _sha(CHANGED)
+        identity = (blob.stat().st_dev, blob.stat().st_ino)
+        retry = _post(http, session, four)
+        assert retry.status_code == 200
+        assert retry.json() == {"error": 0}
+        listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
+        assert listed[:-1] == before_versions
+        assert (listed[-1]["sha256"], listed[-1]["source"]) == (_sha(CHANGED), "autosave")
+        assert (blob.stat().st_dev, blob.stat().st_ino) == identity
     assert origin.hits == 0

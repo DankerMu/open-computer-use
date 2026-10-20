@@ -18,7 +18,7 @@ from . import config, download, epoch, ooxml, publish, sessions, store as store_
 from .download import DownloadFailed, DownloadRejected, FileTooLarge
 from .epoch import RestoreEpochError
 from .store import OfficeStore, StateCorruptError, StateDurabilityError
-from .versions import StorageLowError
+from .versions import BlobCloseError, StorageLowError
 
 _LOG = logging.getLogger("ocu.office")
 _SUCCESS = {"error": 0}
@@ -70,6 +70,9 @@ def process_authenticated_callback(
         return JSONResponse(status_code=502, content={"reason": "download_failed"})
     except ooxml.CorruptDocumentError:
         return JSONResponse(status_code=422, content={"reason": "invalid_content"})
+    except BlobCloseError:
+        _reject(chat, session_id, "state_close_failed")
+        return JSONResponse(status_code=500, content={"reason": "state_close_failed"})
     except OSError as extra:
         if extra.errno == errno.ENOSPC:
             return JSONResponse(status_code=503, content={"reason": "storage_low"})
