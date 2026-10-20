@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Module-cache ownership shared by the response and header fixtures."""
+"""Module-cache ownership shared by file-route, auth-guard and WebSocket fixtures."""
 
 import sys
 from contextlib import contextmanager
@@ -13,10 +13,11 @@ _FILE_ROUTE_MODULES = {
 
 
 @contextmanager
-def isolated_file_route_modules():
+def isolated_modules(names, prefixes=()):
+    prefixes = tuple(prefixes)
     snapshot = {
         name: module for name, module in sys.modules.copy().items()
-        if name in _FILE_ROUTE_MODULES or name.startswith("mcp_resources")
+        if name in names or name.startswith(prefixes)
     }
     try:
         for name in snapshot:
@@ -24,6 +25,10 @@ def isolated_file_route_modules():
         yield
     finally:
         for name in list(sys.modules):
-            if name in _FILE_ROUTE_MODULES or name.startswith("mcp_resources"):
+            if name in names or name.startswith(prefixes):
                 sys.modules.pop(name, None)
         sys.modules.update(snapshot)
+
+
+def isolated_file_route_modules():
+    return isolated_modules(_FILE_ROUTE_MODULES, ("mcp_resources",))

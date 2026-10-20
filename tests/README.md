@@ -82,18 +82,30 @@ consumer retains its explicit empty-prefix configuration and security assertions
 
 ### File-route fixture module ownership
 
-`test_file_response.py::workspace` and `test_files_headers.py::app_module` share
-`file_route_module_ownership.py::isolated_file_route_modules` for their temporary
-app-import cache family, including the coupled `uploads` module. Receipt producers
-and the app share the active descriptor exception class. Cleanup retires replacement
-modules and restores exact entry objects or entry absence after normal completion,
-test-body failure, or setup failure after eviction.
+`file_route_module_ownership.py::isolated_modules(names, prefixes)` owns a temporary
+app-import cache family: a key is owned when it is in `names` or starts with a
+prefix. Cleanup retires replacement modules and restores exact entry objects or
+entry absence after normal completion, test-body failure, or setup failure after
+eviction. Four fixtures share it, each with its unchanged owned set:
 
-`test_file_route_module_ownership.py` covers both owners with present and absent
+- `test_file_response.py::workspace` and `test_files_headers.py::app_module` use
+  `isolated_file_route_modules`, including the coupled `uploads` module. Receipt
+  producers and the app share the active descriptor exception class.
+- `test_auth_guard.py::app_module` owns `_AUTH_GUARD_MODULES` plus `mcp_resources*`.
+- `orchestrator/test_ws_recheck.py::ws_server_modules` owns `_WS_SERVER_MODULES`
+  plus `mcp_resources*` and `cli_adapters*`. Its `app_module` and the direct
+  `_reload_server()` caller both request it, so every fresh server import sits
+  inside the owned scope.
+
+`test_file_route_module_ownership.py` covers all four owners with present and absent
 entry modules. Restoration assertions run after actual pytest fixture teardown and
-before emergency cleanup. The workspace coherence regression checks producer/app
-exception identity inside the live fixture; `test_upload_claim.py` retains its
-nominal receipt exception and committed-write assertions.
+before emergency cleanup. For the auth and WebSocket owners, a child pytest run
+records the entry modules, fails a test body that uses the owner, and checks in a
+following test that the owned keys were restored; the parent reads the outcome from
+JUnit XML. The workspace coherence regression checks producer/app exception identity
+inside the live fixture; `test_upload_claim.py` retains its nominal receipt exception
+and committed-write assertions. No CI selection runs this module; it runs in the
+full local unit command.
 
 ### Main CI root-module coverage
 
