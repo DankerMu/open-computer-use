@@ -4,7 +4,7 @@
 
 Uses mock Docker to test tool logic without real containers.
 
-Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_mcp_tools.py -v
+Run: python -m pytest tests/orchestrator/test_mcp_tools.py -v
 """
 
 import os

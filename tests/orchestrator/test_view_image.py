@@ -2,7 +2,7 @@
 # Copyright (c) 2025 Open Computer Use Contributors
 """Tests for view() image processing path — Pillow 12 API and return structure.
 
-Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_view_image.py -v
+Run: python -m pytest tests/orchestrator/test_view_image.py -v
 """
 
 import os

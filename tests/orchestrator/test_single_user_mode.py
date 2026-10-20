@@ -6,7 +6,7 @@ The service guard rejects missing/default IDs at the MCP transport boundary.
 These unit tests retain the tool-internal behavior only: a supplied valid ID
 must never be remapped to the shared default sandbox.
 
-Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_single_user_mode.py -v
+Run: python -m pytest tests/orchestrator/test_single_user_mode.py -v
 """
 
 import os

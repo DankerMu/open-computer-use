@@ -6,7 +6,7 @@ Covers the three operator paths from Phase 3 (GATEWAY-05) plus the
 ANTHROPIC_CUSTOM_HEADERS regression guard (GATEWAY-07) and the
 current_anthropic_base_url ContextVar default (GATEWAY-01).
 
-Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_docker_manager.py -v
+Run: python -m pytest tests/orchestrator/test_docker_manager.py -v
 """
 
 import os

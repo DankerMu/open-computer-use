@@ -7,7 +7,7 @@ hardcoded internal-DNS default, to catch the #43-class "preview panel
 never appears" misconfiguration at boot instead of in silent production
 failure.
 
-Run: cd computer-use-server && python -m pytest ../tests/orchestrator/test_startup_warnings.py -v
+Run: python -m pytest tests/orchestrator/test_startup_warnings.py -v
 """
 
 import io
@@ -16,8 +16,13 @@ import sys
 import unittest
 import importlib
 from contextlib import redirect_stdout
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'computer-use-server'))
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from tests.file_route_module_ownership import isolated_modules  # noqa: E402
 
