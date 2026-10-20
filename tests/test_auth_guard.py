@@ -1399,6 +1399,18 @@ def _server_local_modules():
     return local
 
 
+def _server_local_files():
+    names = set()
+    for path in SERVER_DIR.rglob("*.py"):
+        if path.is_relative_to(DRAWIO_DIR) or "__pycache__" in path.parts:
+            continue
+        parts = path.relative_to(SERVER_DIR).with_suffix("").parts
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        names.add(".".join(parts))
+    return names
+
+
 def _import_owned_app(monkeypatch):
     _apply_env(monkeypatch)
     import app
@@ -1408,8 +1420,9 @@ def _import_owned_app(monkeypatch):
 
 class TestModuleOwnership:
     def test_app_module_owns_server_local_modules(self, app_module):
+        # Files cover lazy imports no earlier test loaded; modules cover cached aliases.
         unowned = sorted(
-            name for name in _server_local_modules()
+            name for name in _server_local_files() | set(_server_local_modules())
             if name not in _AUTH_GUARD_MODULES
             and not name.startswith(_AUTH_GUARD_PREFIXES)
         )
