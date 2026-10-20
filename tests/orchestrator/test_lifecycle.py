@@ -1314,17 +1314,98 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_lifespan_does_not_open_docker(app_module, monkeypatch, tmp_path):
-    _apply_env(monkeypatch, tmp_path)
-    import docker as docker_mod
+def test_startup_sweep_looks_up_seeded_managed_chat_through_real_lifespan(tmp_path):
+    """The real lifespan's background reaper runs the production startup sweep.
 
-    def fail(*_args, **_kwargs):
-        raise AssertionError("real docker client constructed")
+    A fresh child interpreter seeds one managed chat directory and one
+    unmanaged sibling before importing app, starts with no cached Docker
+    client, and records what the sweep asks of a Docker double. The claim is
+    limited to this seeded state: the sweep builds the client for the
+    configured socket, pings it once, and looks up only the managed chat's
+    container. A healthy response or a swallowed exception is not evidence.
+    """
+    data_root = tmp_path / "data"
+    managed = data_root / CHAT
+    managed.mkdir(parents=True)
+    (managed / ".meta.json").write_text(json.dumps({"user_email": "owner@example"}), encoding="utf-8")
+    (data_root / CHAT_B).mkdir()
+    result_path = tmp_path / "startup-sweep-record.json"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import sys
+        import threading
+        import docker as docker_mod
+        from fastapi.testclient import TestClient
 
-    monkeypatch.setattr(docker_mod, "DockerClient", fail)
-    response = app_module._lifecycle_client.get("/health")
-    assert response.status_code == 200
-    assert response.json()["status"] == "healthy"
+        record = []
+
+        class RecordingContainers:
+            def get(self, name):
+                record.append(["containers.get", name])
+                raise docker_mod.errors.NotFound(name)
+
+        class RecordingDockerClient:
+            def __init__(self, base_url=None, **_kwargs):
+                record.append(["construct", base_url])
+                self.containers = RecordingContainers()
+
+            def ping(self):
+                record.append(["ping"])
+                return True
+
+        docker_mod.DockerClient = RecordingDockerClient
+        sys.path.insert(0, os.environ["OCU_SERVER_DIR"])
+        import docker_manager
+        import app
+
+        if docker_manager._docker_client is not None:
+            raise SystemExit("cached docker client present before startup")
+        app.startup_preflight = lambda: 0
+        app.reap_known_sandboxes = lambda now=None: None
+        swept = threading.Event()
+        original_publication_sweep = app.sweep_office_publications
+
+        def publication_sweep_barrier(*args, **kwargs):
+            try:
+                return original_publication_sweep(*args, **kwargs)
+            finally:
+                swept.set()
+
+        app.sweep_office_publications = publication_sweep_barrier
+        with TestClient(app.app):
+            if not swept.wait(timeout=10):
+                raise SystemExit("startup sweep barrier not reached within 10s")
+            with open(os.environ["OCU_TEST_SWEEP_RECORD"], "w", encoding="utf-8") as fh:
+                json.dump(list(record), fh)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(SERVER_DIR),
+        env={
+            "OCU_SERVER_DIR": str(SERVER_DIR),
+            "OCU_INTERNAL_TOKEN": INTERNAL,
+            "MCP_API_KEY": MCP_KEY,
+            "OCU_WEBUI_ORIGIN": "https://webui.example",
+            "PUBLIC_BASE_URL": "/ocu",
+            "BASE_DATA_DIR": str(data_root),
+            "CONTAINER_IDLE_TIMEOUT": "600",
+            "OCU_IDLE_POLL_SECONDS": "30",
+            "DOCKER_SOCKET": "tcp://ocu-startup-sweep.invalid:2375",
+            "OCU_TEST_SWEEP_RECORD": str(result_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr[-800:]
+    assert json.loads(result_path.read_text(encoding="utf-8")) == [
+        ["construct", "tcp://ocu-startup-sweep.invalid:2375"],
+        ["ping"],
+        ["containers.get", "owui-chat-a1b2c3d4-e5f6-7890-abcd-ef1234567890"],
+    ]
 
 
 def test_lifespan_refuses_invalid_sandbox_dns_without_docker(tmp_path):
