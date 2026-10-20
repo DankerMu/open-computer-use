@@ -34,6 +34,13 @@ all Office coverage. Remove `-k` and its expression for the full unit scope unde
 `--import-mode=importlib` avoids shared test-file basename conflicts.
 `--ignore=tests/integration` excludes integration tests requiring Docker.
 
+The repository-root `.python-version` pins these `uv run` commands to Python
+3.13, matching the orchestrator CI job in `.github/workflows/build.yml`. It
+keeps the CPython 3.14.0–3.14.8 `asyncio.shield` logging regression
+(gh-134331, fixed by gh-156321) out of the local baseline. An explicit
+`--python` or `UV_PYTHON` overrides the pin. Before running offline on a
+machine without Python 3.13, run `uv python install 3.13`.
+
 Mixed explicit-path selections can create distinct collector objects for the
 same logical directory with pytest 9.1.1. Correct the invocation; do not patch
 the `world` fixture or `conftest.py`, change dependencies, or alter source
