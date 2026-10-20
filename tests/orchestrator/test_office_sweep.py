@@ -7,7 +7,6 @@ import asyncio
 import errno
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -16,7 +15,7 @@ from contextlib import contextmanager
 import pytest
 
 from tests.orchestrator._office_store import _stop_child, _wait_marker
-from tests.orchestrator.test_office_commands import _command_origin
+from tests.orchestrator.test_office_commands import _command_origin, _refused_docserver_url
 from tests.orchestrator.test_office_save_close import _child_env, _close, _command_box, _save
 from tests.orchestrator.test_office_session_lifecycle import _asgi, _change, _created, _status
 from tests.orchestrator.test_office_sessions import (
@@ -762,11 +761,9 @@ def test_refused_connection_leaves_overdue_saving_session_and_pending_allocation
     _file, _created_session = _aged(office_world, "saving", save_seq=1,
                                     pending_save_seq=1, save_intents={"1": "persist"})
     before = OfficeStore().read(CHAT), _snapshot(data), _state(data).stat().st_ino
-    with socket.socket() as refusing:
-        refusing.bind(("127.0.0.1", 0))
-        with monkeypatch.context() as patch:
-            patch.setenv("OCU_OFFICE_DOCSERVER_URL", f"http://127.0.0.1:{refusing.getsockname()[1]}")
-            _poll(patch)
+    with monkeypatch.context() as patch:
+        patch.setenv("OCU_OFFICE_DOCSERVER_URL", _refused_docserver_url())
+        _poll(patch)
     assert (OfficeStore().read(CHAT), _snapshot(data), _state(data).stat().st_ino) == before
 
 

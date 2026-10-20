@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -15,7 +14,7 @@ from urllib.parse import quote
 
 import pytest
 
-from tests.orchestrator.test_office_commands import _command_origin
+from tests.orchestrator.test_office_commands import _command_origin, _refused_docserver_url
 from tests.orchestrator.test_office_ooxml import (
     WORD_NS, WORD_TYPE, _content_types, _main, _package, _rels, intact_docx,
 )
@@ -245,11 +244,9 @@ def test_unavailable_lookup_preserves_every_persisted_byte(office_world, monkeyp
     _unpublished(file_id)
     before = _snapshot(data)
     if failure == "connection":
-        with socket.socket() as holder:
-            holder.bind(("127.0.0.1", 0))
-            with monkeypatch.context() as env:
-                env.setenv("OCU_OFFICE_DOCSERVER_URL", f"http://127.0.0.1:{holder.getsockname()[1]}")
-                response = _create(http, file_id)
+        with monkeypatch.context() as env:
+            env.setenv("OCU_OFFICE_DOCSERVER_URL", _refused_docserver_url())
+            response = _create(http, file_id)
     else:
         with _info(monkeypatch, first["document_key"], code=1 if failure == "http" else True, status=503 if failure == "http" else 200) as origin:
             response = _create(http, file_id)
