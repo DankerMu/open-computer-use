@@ -167,8 +167,8 @@ Existing child holds, exact-text checks, SIGKILL checks and recovery assertions
 remain unchanged. The ordinary process holder in
 `orchestrator/test_office_control_plane_concurrency.py` publishes its
 `callback-process-entered` readiness marker through the same writer, so the
-startup-failure owner's exact `held` read never sees incomplete text. Its
-in-process `contend` hook publishes `callback-process-contended` through
+startup-failure owner's exact `held` read never sees incomplete text. The owner
+test's in-process `contend` hook publishes `callback-process-contended` through
 `_record_contention`, which calls `_publish_marker` from the writer loaded once
 into `_MARKER_NAMESPACE`, so the owner's exact `denied` read never sees incomplete
 text either. The thread holder signals through `threading.Event`, not a file
