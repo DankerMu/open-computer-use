@@ -13,7 +13,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Callable
 
 import docker_manager
-from descriptor_io import CommittedCloseError
+from descriptor_io import CommittedCloseError, close_final_directories
 
 from .store import (
     StateCorruptError,
@@ -397,6 +397,7 @@ def _publish_blob(store: OfficeStore, chat: str, digest: str, content: bytes) ->
     staging_fd = versions_fd = None
     temporary = f".blob.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     claimed = False
+    primary_error = None
     try:
         staging_fd = store._open_dir(
             "staging", dir_fd=office_fd, create=True, label="office staging directory"
@@ -441,26 +442,40 @@ def _publish_blob(store: OfficeStore, chat: str, digest: str, content: bytes) ->
         os.fsync(root_fd)
         os.fsync(base_fd)
         return True
-    except BaseException:
+    except BaseException as error:
+        primary_error = error
         if claimed and versions_fd is not None:
             try:
                 os.unlink(digest, dir_fd=versions_fd)
             except FileNotFoundError:
                 pass
+            except OSError as cleanup_error:
+                _record_cleanup_error(error, cleanup_error, "Claimed version blob")
         raise
     finally:
+        unlink_error = None
         if staging_fd is not None:
             try:
                 os.unlink(temporary, dir_fd=staging_fd)
             except FileNotFoundError:
                 pass
-            os.close(staging_fd)
-        if versions_fd is not None:
-            os.close(versions_fd)
-        os.close(office_fd)
-        os.close(ocu_fd)
-        os.close(root_fd)
-        os.close(base_fd)
+            except OSError as cleanup_error:
+                if primary_error is None:
+                    unlink_error = cleanup_error
+                else:
+                    _record_cleanup_error(primary_error, cleanup_error, "Temporary version blob")
+        close_final_directories(
+            (staging_fd, versions_fd, office_fd, ocu_fd, root_fd, base_fd),
+            resource="office_version_blob", committed_and_synced=False,
+            primary_error=primary_error if primary_error is not None else unlink_error,
+        )
+        if unlink_error is not None:
+            raise unlink_error
+
+
+def _record_cleanup_error(error: BaseException, cleanup_error: OSError, label: str) -> None:
+    error.cleanup_errors = getattr(error, "cleanup_errors", ()) + (cleanup_error,)
+    error.add_note(f"{label} cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
 
 
 def _unlink_blob(store: OfficeStore, chat: str, digest: str) -> None:
@@ -468,6 +483,8 @@ def _unlink_blob(store: OfficeStore, chat: str, digest: str) -> None:
     if opened is None:
         return
     base_fd, root_fd, ocu_fd, office_fd = opened
+    versions_fd = None
+    primary_error = None
     try:
         versions_fd = store._open_dir(
             "versions", dir_fd=office_fd, create=False, label="office versions directory"
@@ -478,13 +495,15 @@ def _unlink_blob(store: OfficeStore, chat: str, digest: str) -> None:
             os.unlink(digest, dir_fd=versions_fd)
         except FileNotFoundError:
             pass
-        finally:
-            os.close(versions_fd)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(office_fd)
-        os.close(ocu_fd)
-        os.close(root_fd)
-        os.close(base_fd)
+        close_final_directories(
+            (versions_fd, office_fd, ocu_fd, root_fd, base_fd),
+            resource="office_version_blob", committed_and_synced=False,
+            primary_error=primary_error,
+        )
 
 
 def _blob_stat(versions_fd: int, digest: str) -> os.stat_result | None:

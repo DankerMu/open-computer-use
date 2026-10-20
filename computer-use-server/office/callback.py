@@ -8,12 +8,11 @@ import errno
 import hashlib
 import json
 import logging
-import os
 import uuid
 from typing import Any
 
 from fastapi.responses import JSONResponse
-from descriptor_io import CommittedCloseError
+from descriptor_io import CommittedCloseError, close_final_directories
 
 from . import config, download, epoch, ooxml, publish, sessions, store as store_module, versions
 from .download import DownloadFailed, DownloadRejected, FileTooLarge
@@ -447,15 +446,23 @@ def _replay_barrier(store: OfficeStore, chat: str) -> None:
     if opened is None:
         raise CallbackRefusal(500, "state_durability")
     base_fd, root_fd, ocu_fd, office_fd = opened
+    primary_error = None
     try:
-        store_module.os.fsync(office_fd)
-    except OSError as extra:
-        raise CallbackRefusal(500, "state_durability") from extra
+        try:
+            store_module.os.fsync(office_fd)
+        except OSError as extra:
+            raise CallbackRefusal(500, "state_durability") from extra
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(office_fd)
-        os.close(ocu_fd)
-        os.close(root_fd)
-        os.close(base_fd)
+        try:
+            close_final_directories(
+                (office_fd, ocu_fd, root_fd, base_fd), resource="office_tree",
+                committed_and_synced=False, primary_error=primary_error,
+            )
+        except OSError as close_error:
+            raise CallbackRefusal(500, "state_close_failed") from close_error
 
 
 def _receipt_at(state: dict[str, Any], session_id: str, save_seq: int) -> dict[str, Any] | None:

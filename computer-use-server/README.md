@@ -132,6 +132,17 @@ on `close_errors` and in traceback notes. Each remaining owned final directory
 receives one close attempt; uncertain failed closes are not retried. This
 contract does not change temporary-file cleanup or certify power-loss durability.
 
+Callback receipt replay synchronizes the Office state directory before
+answering. When that synchronization succeeds but a final owned-directory
+close fails, the callback returns HTTP500 `{"reason":"state_close_failed"}`
+instead of `state_corrupt`; a synchronization failure remains
+`state_durability`. The reason covers only this replay barrier. A close-only
+failure while publishing a version blob records no version and leaves the
+content-addressed blob for a later publication to verify and reuse, but the
+callback still reports it as `state_corrupt`. Version-blob publication and
+removal keep an earlier failure primary with every close failure retained, and
+attempt each owned directory close once.
+
 Create drains an accepted restore for that file before admitting an editor;
 unresolved recovery refuses admission with 503 `publish_pending`. Disable new
 Office requests and drain accepted restore obligations before downgrading

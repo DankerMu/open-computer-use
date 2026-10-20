@@ -3,6 +3,15 @@
 ## Unreleased — `main` branch
 
 ### Fixed
+- **Office blob and replay-barrier directory cleanup.** Version-blob publication,
+  version-blob removal and the callback replay barrier attempt each owned
+  directory close once without retrying. An earlier operation or synchronization
+  failure stays primary with close and blob-cleanup failures retained on it.
+  A close-only failure after a blob is linked records no version, and a later
+  publication of the same content reuses the blob. A close-only replay-barrier
+  failure returns HTTP500 `state_close_failed` instead of `state_corrupt`;
+  synchronization failure remains `state_durability`.
+
 - **Release image identity domains.** Configuration digests and content-derived
   names come from exported configuration bytes. Bounded, hash-verified manifest
   and ancestor-index identities authorize local engine IDs without conflating

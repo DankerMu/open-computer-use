@@ -448,3 +448,94 @@ def _state_write_fault(
                 trace["still_owned"].append(role)
         for role in trace["still_owned"]:
             closed(trace["owned"][role])
+
+
+_TREE_ROLES = ("base", "root", "ocu", "office")
+_DIRECTORY_ROLES = {"office staging directory": "staging", "office versions directory": "versions"}
+
+
+@contextmanager
+def _owner_close_fault(monkeypatch, store_cls, module, owner, *, fail_role=None, close_error=None):
+    """Record one owner call's directory closes and fail one owned close once.
+
+    A close of an already-closed descriptor inside the window is a retry; it is
+    recorded and fails the block on normal exit.
+    """
+    original_owner = getattr(module, owner)
+    original_tree, original_dir = store_cls._open_tree, store_cls._open_dir
+    closed = os.close
+    identities = {}
+    trace = {
+        "active": False, "calls": 0, "owned": {}, "attempts": [], "invalid_close_attempts": [],
+        "armed": fail_role is not None,
+    }
+
+    def learn(role, fd):
+        info = os.fstat(fd)
+        identities[role] = (info.st_dev, info.st_ino)
+        trace["owned"][role] = fd
+
+    def watch_tree(self, chat, *, create):
+        opened = original_tree(self, chat, create=create)
+        if trace["active"] and opened is not None:
+            for role, fd in zip(_TREE_ROLES, opened):
+                learn(role, fd)
+        return opened
+
+    def watch_dir(self, name, *, dir_fd, create, label):
+        fd = original_dir(self, name, dir_fd=dir_fd, create=create, label=label)
+        if trace["active"] and fd is not None and label in _DIRECTORY_ROLES:
+            learn(_DIRECTORY_ROLES[label], fd)
+        return fd
+
+    def window(*args, **kwargs):
+        trace["calls"] += 1
+        trace["active"] = True
+        try:
+            return original_owner(*args, **kwargs)
+        finally:
+            trace["active"] = False
+
+    def watch_close(fd):
+        role = None
+        if trace["active"]:
+            try:
+                os.fstat(fd)
+            except OSError:
+                trace["invalid_close_attempts"].append(fd)
+                return closed(fd)
+            role = next((
+                role for role, owned in trace["owned"].items()
+                if owned == fd and role not in trace["attempts"]
+            ), None)
+        if role is None:
+            return closed(fd)
+        info = os.fstat(fd)
+        assert (info.st_dev, info.st_ino) == identities[role]
+        trace["attempts"].append(role)
+        closed(fd)
+        if trace["armed"] and role == fail_role:
+            trace["armed"] = False
+            raise close_error
+
+    try:
+        with monkeypatch.context() as patches:
+            patches.setattr(store_cls, "_open_tree", watch_tree)
+            patches.setattr(store_cls, "_open_dir", watch_dir)
+            patches.setattr(module, owner, window)
+            patches.setattr(os, "close", watch_close)
+            yield trace
+        assert trace["invalid_close_attempts"] == [], f"retried closes: {trace['invalid_close_attempts']}"
+    finally:
+        trace["still_owned"] = []
+        for role, fd in trace["owned"].items():
+            if role in trace["attempts"]:
+                continue
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) == identities[role]:
+                trace["still_owned"].append(role)
+        for role in trace["still_owned"]:
+            closed(trace["owned"][role])
