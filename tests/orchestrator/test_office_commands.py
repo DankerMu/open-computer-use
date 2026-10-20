@@ -143,6 +143,20 @@ def _command_origin(responder, trap=None, *, release=None):
         yield origin
 
 
+def _refused_docserver_url() -> str:
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+    try:
+        probe = socket.create_connection(("127.0.0.1", port), timeout=1)
+    except ConnectionRefusedError:
+        return f"http://127.0.0.1:{port}"
+    except OSError as exc:
+        pytest.fail(f"127.0.0.1:{port} must refuse a direct connect; probe raised {type(exc).__name__}: {exc}")
+    probe.close()
+    pytest.fail(f"127.0.0.1:{port} must refuse a direct connect; probe connected")
+
+
 def _json_error(code):
     def responder(_handler, _body, _parent):
         return 200, {"Content-Type": "application/json"}, json.dumps({"error": code}).encode("utf-8")
@@ -248,11 +262,7 @@ def test_lookup_known_unknown_and_never_orphans_on_unavailability(monkeypatch):
 
 
 def test_refused_connection_is_unreachable_for_forcesave_and_lookup(monkeypatch):
-    holder = socket.socket()
-    holder.bind(("127.0.0.1", 0))
-    port = holder.getsockname()[1]
-    holder.close()
-    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", _refused_docserver_url())
     assert _run(commands.forcesave(DOCUMENT_KEY, SAVE_SEQ, INTENT)) is commands.ForceSaveOutcome.UNREACHABLE
     assert _run(commands.lookup_key(DOCUMENT_KEY)) is commands.KeyLookupOutcome.UNREACHABLE
 
