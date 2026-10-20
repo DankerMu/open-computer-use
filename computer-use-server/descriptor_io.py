@@ -92,6 +92,12 @@ def close_final_directories(
     raise error
 
 
+def record_cleanup_error(primary: BaseException, error: OSError, *, what: str) -> None:
+    """Append a cleanup failure to primary; DescriptorTypeError.cleanup_error replaces instead."""
+    primary.cleanup_errors = getattr(primary, "cleanup_errors", ()) + (error,)
+    primary.add_note(f"{what} cleanup also failed: {type(error).__name__}: {error}")
+
+
 def is_missing(error: OSError) -> bool:
     return error.errno in (errno.ENOENT, errno.ENOTDIR)
 

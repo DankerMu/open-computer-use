@@ -13,7 +13,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Callable
 
 import docker_manager
-from descriptor_io import CommittedCloseError, close_final_directories
+from descriptor_io import CommittedCloseError, close_final_directories, record_cleanup_error
 
 from .store import (
     StateCorruptError,
@@ -450,7 +450,7 @@ def _publish_blob(store: OfficeStore, chat: str, digest: str, content: bytes) ->
             except FileNotFoundError:
                 pass
             except OSError as cleanup_error:
-                _record_cleanup_error(error, cleanup_error, "Claimed version blob")
+                record_cleanup_error(error, cleanup_error, what="Claimed version blob")
         raise
     finally:
         unlink_error = None
@@ -463,7 +463,7 @@ def _publish_blob(store: OfficeStore, chat: str, digest: str, content: bytes) ->
                 if primary_error is None:
                     unlink_error = cleanup_error
                 else:
-                    _record_cleanup_error(primary_error, cleanup_error, "Temporary version blob")
+                    record_cleanup_error(primary_error, cleanup_error, what="Temporary version blob")
         close_final_directories(
             (staging_fd, versions_fd, office_fd, ocu_fd, root_fd, base_fd),
             resource="office_version_blob", committed_and_synced=False,
@@ -471,11 +471,6 @@ def _publish_blob(store: OfficeStore, chat: str, digest: str, content: bytes) ->
         )
         if unlink_error is not None:
             raise unlink_error
-
-
-def _record_cleanup_error(error: BaseException, cleanup_error: OSError, label: str) -> None:
-    error.cleanup_errors = getattr(error, "cleanup_errors", ()) + (cleanup_error,)
-    error.add_note(f"{label} cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
 
 
 def _unlink_blob(store: OfficeStore, chat: str, digest: str) -> None:
