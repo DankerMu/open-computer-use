@@ -274,6 +274,7 @@ def test_owner_restores_modules_after_test_body_failure(owner, entry_state, tmp_
 
 
 CHILD_MARKER = "ocu-module-ownership-child-marker"
+CHILD_STDOUT_MARKER = "ocu-module-ownership-child-stdout-marker"
 FAILING_CHILDREN = {
     "timeout": "import time\n\ntime.sleep(120)\n",
     "crash": "import os\n\nos._exit(3)\n",
@@ -285,7 +286,8 @@ FAILING_CHILDREN = {
 def test_child_run_failure_reports_captured_output(shape, tmp_path):
     child = tmp_path / "test_failing_child.py"
     child.write_text(
-        f"import sys\n\nprint({CHILD_MARKER!r}, file=sys.stderr, flush=True)\n"
+        f"import sys\n\nprint({CHILD_STDOUT_MARKER!r}, flush=True)\n"
+        f"print({CHILD_MARKER!r}, file=sys.stderr, flush=True)\n"
         + FAILING_CHILDREN[shape]
     )
     junit = tmp_path / "child.xml"
@@ -297,6 +299,7 @@ def test_child_run_failure_reports_captured_output(shape, tmp_path):
         _run_child_pytest(child, junit, _child_env(tmp_path), timeout=timeout)
 
     message = str(failure.value)
+    assert CHILD_STDOUT_MARKER in message
     assert CHILD_MARKER in message
     if shape != "timeout":
         assert "exited 3" in message
