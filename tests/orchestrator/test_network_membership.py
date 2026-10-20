@@ -154,6 +154,7 @@ class FakeClient:
         self.defer_endpoints = False
         self.placeholder_fields = {}
         self.start_network_id = None
+        self.assign_published_ports = True
 
     def add_network(self, name=NETWORK_NAME, network_id=NETWORK_ID, driver="bridge", internal=False, gateway=GATEWAY):
         net = FakeNetwork(self, name, network_id, driver=driver, internal=internal, gateway=gateway)
@@ -231,7 +232,8 @@ class FakeClient:
 
         def start():
             started["n"] += 1
-            _assign_published_ports(self, container)
+            if self.assign_published_ports:
+                _assign_published_ports(self, container)
             container.status = "running"
             if self.start_network_id is not None:
                 for data in self.engine_membership.get(container.id, {}).values():
@@ -1206,11 +1208,13 @@ def test_address_uses_assigned_gateway_publication_only(world):
 
 
 def test_missing_publication_is_unavailable_even_with_container_ip(world):
+    """Spec scenario "Missing publication": no immutable binding, no mapping -> unavailable."""
     docker_manager, client, _tmp = world
     container = client.put(
         _name(docker_manager),
         status="running",
         container_id="no-ports",
+        bindings={},
         published={},
     )
     container.attrs["NetworkSettings"]["Networks"] = {
@@ -1222,6 +1226,27 @@ def test_missing_publication_is_unavailable_even_with_container_ip(world):
     assert docker_manager.get_container_service_address(CHAT, 9222) is None
     assert docker_manager.get_container_service_address(CHAT, 7681) is None
     assert client.ops == ops_before
+
+
+def test_unassigned_gateway_publication_raises_without_mutation(world):
+    """Spec scenario "Requested publication never assigned": a typed fault, sandbox untouched."""
+    docker_manager, client, _tmp = world
+    client.assign_published_ports = False
+    container = docker_manager._get_or_create_container(CHAT)
+    assert container.status == "running"
+    assert container.attrs["NetworkSettings"]["Ports"] == {}
+    ops_before = list(client.ops)
+    for port in (9222, 7681):
+        assert container.attrs["HostConfig"]["PortBindings"][f"{port}/tcp"][0]["HostIp"] == GATEWAY
+        with pytest.raises(docker_manager.GatewayPublicationUnassigned) as raised:
+            docker_manager.get_container_service_address(CHAT, port)
+        assert raised.value.status_code == 503
+        assert raised.value.reason == "gateway_publication_unassigned"
+        assert GATEWAY in str(raised.value)
+        assert f"{port}/tcp" in str(raised.value)
+    assert client.ops == ops_before
+    assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    assert container.status == "running"
 
 
 

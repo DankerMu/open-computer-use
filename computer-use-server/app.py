@@ -63,6 +63,7 @@ from docker_manager import (
     validate_idle_configuration,
     validate_sandbox_dns_configuration,
     LifecycleError,
+    GatewayPublicationUnassigned,
     _combined_lock,
 )
 from security import sanitize_chat_id, safe_path
@@ -955,7 +956,10 @@ async def browser_status(chat_id: str, response: Response):
     """Check if browser (Chromium CDP) is running in the chat's container."""
     chat_id = sanitize_chat_id(chat_id)
     response.headers["Cache-Control"] = "no-cache, no-store"
-    container_addr = get_container_service_address(chat_id, CDP_PORT)
+    try:
+        container_addr = get_container_service_address(chat_id, CDP_PORT)
+    except GatewayPublicationUnassigned as exc:
+        return {"active": False, "pages": [], "reason": exc.reason, "detail": str(exc)}
     if not container_addr:
         return {"active": False, "pages": []}
 
@@ -982,7 +986,10 @@ async def browser_status(chat_id: str, response: Response):
 async def browser_cdp_json(chat_id: str):
     """Proxy CDP /json endpoint from container."""
     chat_id = sanitize_chat_id(chat_id)
-    container_addr = get_container_service_address(chat_id, CDP_PORT)
+    try:
+        container_addr = get_container_service_address(chat_id, CDP_PORT)
+    except GatewayPublicationUnassigned as exc:
+        raise _lifecycle_http_error(exc) from exc
     if not container_addr:
         raise HTTPException(404, "Container not found or not running")
 
@@ -1001,7 +1008,10 @@ async def browser_cdp_json(chat_id: str):
 async def browser_cdp_json_version(chat_id: str):
     """Proxy CDP /json/version endpoint from container."""
     chat_id = sanitize_chat_id(chat_id)
-    container_addr = get_container_service_address(chat_id, CDP_PORT)
+    try:
+        container_addr = get_container_service_address(chat_id, CDP_PORT)
+    except GatewayPublicationUnassigned as exc:
+        raise _lifecycle_http_error(exc) from exc
     if not container_addr:
         raise HTTPException(404, "Container not found or not running")
 
@@ -1075,7 +1085,10 @@ async def terminal_status(chat_id: str, response: Response):
     """Check if ttyd terminal is available in the chat's container."""
     chat_id = sanitize_chat_id(chat_id)
     response.headers["Cache-Control"] = "no-cache, no-store"
-    container_addr = get_container_service_address(chat_id, TTYD_PORT)
+    try:
+        container_addr = get_container_service_address(chat_id, TTYD_PORT)
+    except GatewayPublicationUnassigned as exc:
+        return {"active": False, "reason": exc.reason, "detail": str(exc)}
     if not container_addr:
         # Check if container exists but is stopped
         container = _get_container_stopped(chat_id)

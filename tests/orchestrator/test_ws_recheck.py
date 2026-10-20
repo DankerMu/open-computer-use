@@ -1735,14 +1735,19 @@ class TestLookupTimeoutAndException:
         finally:
             backend.lookup_release.set()
 
+    @pytest.mark.parametrize("fault", ("runtime", "unassigned"))
     @pytest.mark.parametrize("kind", ("cdp", "ttyd"))
-    def test_lookup_exception_closes_1011(self, app_module, monkeypatch, kind):
+    def test_lookup_exception_closes_1011(self, app_module, monkeypatch, kind, fault):
         backend = FakeBackend()
         auth = ScriptedAuth([200])
         _install_fakes(app_module, monkeypatch, auth, backend)
+        if fault == "runtime":
+            error = RuntimeError("docker ping failed")
+        else:
+            error = app_module.GatewayPublicationUnassigned(9222, "172.31.0.1")
 
         def boom(*_a, **_k):
-            raise RuntimeError("docker ping failed")
+            raise error
 
         monkeypatch.setattr(app_module, "get_container_service_address", boom)
         with _client(app_module) as client:
