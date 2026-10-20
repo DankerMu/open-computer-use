@@ -50,40 +50,12 @@ OFFICE_ENV = {
 }
 
 _AUTH_GUARD_MODULES = {
-    "app",
-    "auth_guard",
-    "ws_recheck",
-    "mcp_tools",
-    "docker_manager",
-    "outputs_broker",
-    "context_vars",
-    "security",
-    "system_prompt",
-    "skill_manager",
-    "uploads",
-    "file_response",
-    "office",
-    "office.config",
-    "office.router",
-    "office.store",
-    "office.versions",
-    "office.workspace",
-    "office.publish",
-    "office.save_as",
-    "office.resolution",
-    "office.history",
-    "office.restore",
-    "office.epoch",
-    "office.tokens",
-    "office.commands",
-    "office.sessions",
-    "office.notice",
-    "office.ooxml",
-    "office.sweep",
-    "office.control_plane",
-    "office.download",
-    "office.callback",
+    "app", "auth_guard", "ws_recheck", "mcp_tools", "docker_manager", "outputs_broker",
+    "context_vars", "security", "system_prompt", "skill_manager", "uploads", "file_response",
+    "descriptor_io", "docs_html", "sandbox_dns", "cli_runtime", "cli_adapters", "office",
 }
+_AUTH_GUARD_PREFIXES = ("mcp_resources", "office.", "cli_adapters.")
+DRAWIO_DIR = SERVER_DIR / "drawio"
 
 
 @pytest.fixture(autouse=True)
@@ -171,7 +143,7 @@ def _apply_env(monkeypatch):
 @pytest.fixture
 def app_module(monkeypatch):
     """Import the server after the guard env is set, once per test."""
-    with isolated_modules(_AUTH_GUARD_MODULES, ("mcp_resources",)):
+    with isolated_modules(_AUTH_GUARD_MODULES, _AUTH_GUARD_PREFIXES):
         _apply_env(monkeypatch)
         import app as loaded
 
@@ -1413,3 +1385,46 @@ class TestNoDisclosure:
         assert INTERNAL not in response.headers.get("www-authenticate", "")
         assert INTERNAL not in captured.out
         assert INTERNAL not in captured.err
+
+
+def _server_local_modules():
+    local = {}
+    for name, module in sys.modules.copy().items():
+        file = getattr(module, "__file__", None)
+        if not isinstance(file, str):
+            continue  # builtins and namespace packages such as `tests` have no file
+        path = Path(file).resolve()
+        if path.is_relative_to(SERVER_DIR) and not path.is_relative_to(DRAWIO_DIR):
+            local[name] = module
+    return local
+
+
+def _import_owned_app(monkeypatch):
+    _apply_env(monkeypatch)
+    import app
+
+    return app
+
+
+class TestModuleOwnership:
+    def test_app_module_owns_server_local_modules(self, app_module):
+        unowned = sorted(
+            name for name in _server_local_modules()
+            if name not in _AUTH_GUARD_MODULES
+            and not name.startswith(_AUTH_GUARD_PREFIXES)
+        )
+        assert unowned == [], f"unowned server-local modules: {unowned}"
+
+    def test_second_generation_binds_current_modules(self, monkeypatch):
+        with isolated_modules(_AUTH_GUARD_MODULES, _AUTH_GUARD_PREFIXES):
+            _import_owned_app(monkeypatch)
+            first_manager = sys.modules["docker_manager"]
+        with isolated_modules(_AUTH_GUARD_MODULES, _AUTH_GUARD_PREFIXES):
+            _import_owned_app(monkeypatch)
+            manager = sys.modules["docker_manager"]
+            assert manager is not first_manager
+            admission = sys.modules["office.lookup_admission"]
+            runtime = sys.modules["cli_runtime"]
+            assert admission.docker_manager is manager
+            assert admission.StateCorruptError is sys.modules["office.store"].StateCorruptError
+            assert runtime._execute_bash_capture is manager._execute_bash_capture
