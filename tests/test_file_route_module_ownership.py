@@ -92,6 +92,7 @@ def test_file_route_fixture_restores_caller_modules(
 
     import app as caller_app
     import descriptor_io as caller_descriptor
+    import mcp_resources as caller_resources  # noqa: F401
     import uploads as caller_uploads
 
     assert caller_uploads.descriptor_io is caller_descriptor
@@ -119,6 +120,8 @@ def test_file_route_fixture_restores_caller_modules(
     # LIFO: real owner teardown, restoration assertions, then emergency cleanup.
     request.addfinalizer(assert_caller_modules_restored)
     result = request.getfixturevalue(owner)
+    if owned_prefixes:
+        importlib.import_module("mcp_resources")
     if owner == "alias_runtime_modules":
         importlib.import_module("cli_runtime")
     if owner not in FILE_ROUTE_OWNERS:
@@ -139,13 +142,13 @@ CHILD_OWNERS = {
         "from tests.test_auth_guard import _AUTH_GUARD_MODULES as OWNED_NAMES\n"
         "from tests.test_auth_guard import app_module\n",
         "app_module",
-        "",
+        "    import mcp_resources  # noqa: F401\n",
     ),
     "ws_app_module": (
         "from tests.orchestrator.test_ws_recheck import _WS_SERVER_MODULES as OWNED_NAMES\n"
         "from tests.orchestrator.test_ws_recheck import app_module, ws_server_modules\n",
         "app_module",
-        "",
+        "    import mcp_resources  # noqa: F401\n",
     ),
     "alias_runtime_modules": (
         "import importlib\n"
@@ -172,6 +175,7 @@ def _owned():
 
 def test_1_entry():
     import app  # noqa: F401
+    import mcp_resources  # noqa: F401
 
     if {absent!r}:
         for name in _owned():
@@ -193,6 +197,50 @@ def test_3_restored():
 """
 
 
+def _child_env(tmp_path):
+    env = {
+        key: value for key, value in os.environ.items()
+        if key.lower() not in {"all_proxy", "https_proxy", "http_proxy"}
+        and not key.startswith("OCU_OFFICE_")
+    }
+    env.update(SERVICE_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+    env["BASE_DATA_DIR"] = str(tmp_path / "child-data")
+    return env
+
+
+def _run_child_pytest(child, junit, env, timeout=180):
+    # -s: pytest re-enables fd capture while importing test modules, so without it
+    # import-time output is lost when the child is killed or exits via os._exit.
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable, "-m", "pytest", str(child), "--import-mode=importlib", "-s",
+                "-p", "no:cacheprovider", "-p", "no:randomly", "--junitxml", str(junit),
+            ],
+            cwd=ROOT, env=env, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # On POSIX the partial output is bytes or None even under text=True.
+        stdout = (exc.stdout or b"").decode(errors="replace")
+        stderr = (exc.stderr or b"").decode(errors="replace")
+        pytest.fail(
+            f"child pytest timed out after {timeout}s\n{(stdout + stderr)[-4000:]}",
+            pytrace=False,
+        )
+    output = (completed.stdout + completed.stderr)[-4000:]
+    try:
+        tree = ET.parse(junit)
+    except (FileNotFoundError, ET.ParseError) as exc:
+        pytest.fail(
+            f"child pytest exited {completed.returncode} without a parsable JUnit file"
+            f" ({exc})\n{output}",
+            pytrace=False,
+        )
+    cases = {case.get("name"): case for case in tree.getroot().iter("testcase")}
+    return completed, cases, output
+
+
 @pytest.mark.parametrize("owner", tuple(CHILD_OWNERS))
 @pytest.mark.parametrize("entry_state", ("present", "absent"))
 def test_owner_restores_modules_after_test_body_failure(owner, entry_state, tmp_path):
@@ -208,25 +256,7 @@ def test_owner_restores_modules_after_test_body_failure(owner, entry_state, tmp_
         sentinel=BODY_FAILURE,
     ))
     junit = tmp_path / "child.xml"
-    child_env = {
-        key: value for key, value in os.environ.items()
-        if key.lower() not in {"all_proxy", "https_proxy", "http_proxy"}
-        and not key.startswith("OCU_OFFICE_")
-    }
-    child_env.update(SERVICE_ENV)
-    child_env["PYTHONPATH"] = str(ROOT)
-    child_env["BASE_DATA_DIR"] = str(tmp_path / "child-data")
-
-    completed = subprocess.run(
-        [
-            sys.executable, "-m", "pytest", str(child), "--import-mode=importlib",
-            "-p", "no:cacheprovider", "-p", "no:randomly", "--junitxml", str(junit),
-        ],
-        cwd=ROOT, env=child_env, capture_output=True, text=True, timeout=180,
-    )
-
-    output = (completed.stdout + completed.stderr)[-4000:]
-    cases = {case.get("name"): case for case in ET.parse(junit).getroot().iter("testcase")}
+    completed, cases, output = _run_child_pytest(child, junit, _child_env(tmp_path))
     outcomes = {
         name: [
             (result.tag, result.get("message")) for result in case
@@ -241,6 +271,38 @@ def test_owner_restores_modules_after_test_body_failure(owner, entry_state, tmp_
     assert [tag for tag, _ in body] == ["failure"], outcomes
     assert BODY_FAILURE in body[0][1], outcomes
     assert completed.returncode == 1, output
+
+
+CHILD_MARKER = "ocu-module-ownership-child-marker"
+CHILD_STDOUT_MARKER = "ocu-module-ownership-child-stdout-marker"
+FAILING_CHILDREN = {
+    "timeout": "import time\n\ntime.sleep(120)\n",
+    "crash": "import os\n\nos._exit(3)\n",
+    "unparsable": "import os\n\nos._exit(3)\n",
+}
+
+
+@pytest.mark.parametrize("shape", tuple(FAILING_CHILDREN))
+def test_child_run_failure_reports_captured_output(shape, tmp_path):
+    child = tmp_path / "test_failing_child.py"
+    child.write_text(
+        f"import sys\n\nprint({CHILD_STDOUT_MARKER!r}, flush=True)\n"
+        f"print({CHILD_MARKER!r}, file=sys.stderr, flush=True)\n"
+        + FAILING_CHILDREN[shape]
+    )
+    junit = tmp_path / "child.xml"
+    if shape == "unparsable":
+        junit.write_text("not junit xml <")
+    timeout = 10 if shape == "timeout" else 180
+
+    with pytest.raises(pytest.fail.Exception) as failure:
+        _run_child_pytest(child, junit, _child_env(tmp_path), timeout=timeout)
+
+    message = str(failure.value)
+    assert CHILD_STDOUT_MARKER in message
+    assert CHILD_MARKER in message
+    if shape != "timeout":
+        assert "exited 3" in message
 
 
 WARNING_CASES = {

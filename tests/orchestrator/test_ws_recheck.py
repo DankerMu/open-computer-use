@@ -75,20 +75,25 @@ def _apply_env(monkeypatch, tmp_path, auth_url=None):
         monkeypatch.setenv("OCU_WEBUI_AUTH_URL", auth_url)
 
 
-def _reload_server():
+_WS_SCOPE = object()
+
+
+def _reload_server(ws_server_modules):
+    if ws_server_modules is not _WS_SCOPE:
+        raise RuntimeError("fresh server import requires the ws_server_modules scope")
     return importlib.import_module("app")
 
 
 @pytest.fixture
 def ws_server_modules():
     with isolated_modules(_WS_SERVER_MODULES, ("mcp_resources", "cli_adapters")):
-        yield
+        yield _WS_SCOPE
 
 
 @pytest.fixture
 def app_module(ws_server_modules, monkeypatch, tmp_path):
     _apply_env(monkeypatch, tmp_path, auth_url="http://127.0.0.1:9" + AUTH_PATH)
-    loaded = _reload_server()
+    loaded = _reload_server(ws_server_modules)
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setattr(loaded, "BASE_DATA_DIR", data)
@@ -657,7 +662,7 @@ class TestAdmissionDeniesBeforeBackend:
         self, ws_server_modules, monkeypatch, tmp_path, kind
     ):
         _apply_env(monkeypatch, tmp_path, auth_url=None)
-        app_module = _reload_server()
+        app_module = _reload_server(ws_server_modules)
         backend = FakeBackend()
         monkeypatch.setattr(app_module, "get_container_service_address", backend.address)
         with _client(app_module) as client:

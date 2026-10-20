@@ -93,9 +93,10 @@ eviction. Six owners share it, each with its unchanged owned set:
   producers and the app share the active descriptor exception class.
 - `test_auth_guard.py::app_module` owns `_AUTH_GUARD_MODULES` plus `mcp_resources*`.
 - `orchestrator/test_ws_recheck.py::ws_server_modules` owns `_WS_SERVER_MODULES`
-  plus `mcp_resources*` and `cli_adapters*`. Its `app_module` and the direct
-  `_reload_server()` caller both request it, so every fresh server import sits
-  inside the owned scope.
+  plus `mcp_resources*` and `cli_adapters*`. `_reload_server(ws_server_modules)`
+  requires the scope value the fixture yields and raises when given anything
+  else, so neither its `app_module` nor the direct caller can import the server
+  outside the owned scope.
 - `orchestrator/test_startup_warnings.py`: both `unittest` classes enter
   `isolated_modules` for `docker_manager` plus `docker_manager.*` in `setUp` through
   `self.enterContext(...)`, so `_reload_docker_manager()` reimports inside the owned
