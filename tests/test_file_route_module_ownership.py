@@ -2,9 +2,11 @@
 # Copyright (c) 2025 Open Computer Use Contributors
 """App-module fixtures preserve caller-owned module identities."""
 
+import importlib
 import os
 import subprocess
 import sys
+import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -13,7 +15,9 @@ import pytest
 from tests import test_auth_guard as auth_tests
 from tests import test_file_response as response_tests
 from tests import test_files_headers as header_tests
+from tests import test_opencode_alias_map_drop as alias_tests
 from tests.file_route_module_ownership import _FILE_ROUTE_MODULES
+from tests.orchestrator import test_startup_warnings as warning_tests
 from tests.orchestrator import test_ws_recheck as ws_tests
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,12 +28,14 @@ app_module = header_tests.app_module
 auth_app_module = auth_tests.app_module
 ws_app_module = ws_tests.app_module
 ws_server_modules = ws_tests.ws_server_modules
+alias_runtime_modules = alias_tests.alias_runtime_modules
 
 OWNERSHIP = {
     "workspace": (_FILE_ROUTE_MODULES, ("mcp_resources",)),
     "app_module": (_FILE_ROUTE_MODULES, ("mcp_resources",)),
     "auth_app_module": (auth_tests._AUTH_GUARD_MODULES, ("mcp_resources",)),
     "ws_app_module": (ws_tests._WS_SERVER_MODULES, ("mcp_resources", "cli_adapters")),
+    "alias_runtime_modules": (alias_tests._ALIAS_RUNTIME_MODULES, ()),
 }
 FILE_ROUTE_OWNERS = ("workspace", "app_module")
 AMBIENT_NAMES = set().union(*(names for names, _ in OWNERSHIP.values())) | {
@@ -37,7 +43,7 @@ AMBIENT_NAMES = set().union(*(names for names, _ in OWNERSHIP.values())) | {
 }
 AMBIENT_PREFIXES = tuple(
     sorted({prefix for _, prefixes in OWNERSHIP.values() for prefix in prefixes}
-           | {"office.", "cli_adapters."})
+           | {"office.", "cli_adapters."} | set(warning_tests._DOCKER_MANAGER_PREFIXES))
 )
 SERVICE_ENV = {
     "PYTHON_DOTENV_DISABLED": "1",
@@ -57,12 +63,7 @@ def _owned(names, prefixes):
     }
 
 
-@pytest.mark.parametrize("owner", tuple(OWNERSHIP))
-@pytest.mark.parametrize("entry_state", ("present", "absent"))
-def test_file_route_fixture_restores_caller_modules(
-    owner, entry_state, request, monkeypatch, tmp_path,
-):
-    owned_names, owned_prefixes = OWNERSHIP[owner]
+def _isolate_ambient_modules(request, monkeypatch):
     ambient = _owned(AMBIENT_NAMES, AMBIENT_PREFIXES)
 
     def restore_ambient_state():
@@ -77,6 +78,15 @@ def test_file_route_fixture_restores_caller_modules(
     request.addfinalizer(restore_ambient_state)
     for name in ambient:
         sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize("owner", tuple(OWNERSHIP))
+@pytest.mark.parametrize("entry_state", ("present", "absent"))
+def test_file_route_fixture_restores_caller_modules(
+    owner, entry_state, request, monkeypatch, tmp_path,
+):
+    owned_names, owned_prefixes = OWNERSHIP[owner]
+    _isolate_ambient_modules(request, monkeypatch)
     for key, value in {**SERVICE_ENV, "BASE_DATA_DIR": str(tmp_path / "caller")}.items():
         monkeypatch.setenv(key, value)
 
@@ -109,6 +119,8 @@ def test_file_route_fixture_restores_caller_modules(
     # LIFO: real owner teardown, restoration assertions, then emergency cleanup.
     request.addfinalizer(assert_caller_modules_restored)
     result = request.getfixturevalue(owner)
+    if owner == "alias_runtime_modules":
+        importlib.import_module("cli_runtime")
     if owner not in FILE_ROUTE_OWNERS:
         return
     loaded = result[0] if owner == "workspace" else result
@@ -125,11 +137,22 @@ def test_file_route_fixture_restores_caller_modules(
 CHILD_OWNERS = {
     "auth_app_module": (
         "from tests.test_auth_guard import _AUTH_GUARD_MODULES as OWNED_NAMES\n"
-        "from tests.test_auth_guard import app_module\n"
+        "from tests.test_auth_guard import app_module\n",
+        "app_module",
+        "",
     ),
     "ws_app_module": (
         "from tests.orchestrator.test_ws_recheck import _WS_SERVER_MODULES as OWNED_NAMES\n"
-        "from tests.orchestrator.test_ws_recheck import app_module, ws_server_modules\n"
+        "from tests.orchestrator.test_ws_recheck import app_module, ws_server_modules\n",
+        "app_module",
+        "",
+    ),
+    "alias_runtime_modules": (
+        "import importlib\n"
+        "from tests.test_opencode_alias_map_drop import _ALIAS_RUNTIME_MODULES as OWNED_NAMES\n"
+        "from tests.test_opencode_alias_map_drop import alias_runtime_modules\n",
+        "alias_runtime_modules",
+        "    importlib.import_module(\"cli_runtime\")\n",
     ),
 }
 CHILD_TEMPLATE = """\
@@ -156,8 +179,8 @@ def test_1_entry():
     ENTRY.update(_owned())
 
 
-def test_2_body(app_module):
-    assert False, {sentinel!r}
+def test_2_body({fixture}):
+{prelude}    assert False, {sentinel!r}
 
 
 def test_3_restored():
@@ -174,9 +197,12 @@ def test_3_restored():
 @pytest.mark.parametrize("entry_state", ("present", "absent"))
 def test_owner_restores_modules_after_test_body_failure(owner, entry_state, tmp_path):
     _, owned_prefixes = OWNERSHIP[owner]
+    imports, fixture, prelude = CHILD_OWNERS[owner]
     child = tmp_path / "test_ownership_child.py"
     child.write_text(CHILD_TEMPLATE.format(
-        imports=CHILD_OWNERS[owner],
+        imports=imports,
+        fixture=fixture,
+        prelude=prelude,
         prefixes=owned_prefixes,
         absent=entry_state == "absent",
         sentinel=BODY_FAILURE,
@@ -215,3 +241,57 @@ def test_owner_restores_modules_after_test_body_failure(owner, entry_state, tmp_
     assert [tag for tag, _ in body] == ["failure"], outcomes
     assert BODY_FAILURE in body[0][1], outcomes
     assert completed.returncode == 1, output
+
+
+WARNING_CASES = {
+    "PublicBaseUrlDefaultWarning": "test_silent_when_user_overrides_to_custom_url",
+    "McpApiKeyMissingWarning": "test_silent_when_key_set",
+}
+
+
+@pytest.mark.parametrize("warning_case", tuple(WARNING_CASES))
+@pytest.mark.parametrize("entry_state", ("present", "absent"))
+@pytest.mark.parametrize("body", ("normal", "failure"))
+def test_startup_warning_case_restores_docker_manager(
+    warning_case, entry_state, body, request, monkeypatch,
+):
+    owned_names = warning_tests._DOCKER_MANAGER_MODULES
+    owned_prefixes = warning_tests._DOCKER_MANAGER_PREFIXES
+    _isolate_ambient_modules(request, monkeypatch)
+    for key in ("PUBLIC_BASE_URL", "MCP_API_KEY"):
+        monkeypatch.setenv(key, SERVICE_ENV[key])
+    importlib.import_module("docker_manager")
+    if entry_state == "absent":
+        for name in list(sys.modules):
+            if name in owned_names or name.startswith(owned_prefixes):
+                sys.modules.pop(name, None)
+    entry = _owned(owned_names, owned_prefixes)
+
+    case_class = getattr(warning_tests, warning_case)
+    if body == "normal":
+        case = case_class(WARNING_CASES[warning_case])
+    else:
+        def test_body(self):
+            warning_tests._reload_docker_manager()
+            self.fail(BODY_FAILURE)
+
+        case = type(f"{warning_case}BodyFailure", (case_class,), {"test_body": test_body})(
+            "test_body"
+        )
+    result = unittest.TestResult()
+    case.run(result)
+
+    if body == "normal":
+        assert result.wasSuccessful(), result.failures + result.errors
+    else:
+        assert result.errors == [], result.errors
+        assert len(result.failures) == 1, result.failures
+        assert BODY_FAILURE in result.failures[0][1], result.failures
+    restored = _owned(owned_names, owned_prefixes)
+    assert restored.keys() == entry.keys(), (
+        f"{warning_case} did not restore the caller's module presence"
+    )
+    for name, module in entry.items():
+        assert restored[name] is module, (
+            f"{warning_case} did not restore the caller's {name} module object"
+        )
