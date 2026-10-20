@@ -1,6 +1,18 @@
 ## Summary
 Brief description of changes.
 
+## Intended issue closures
+
+<!-- intended-closing-issues: [] -->
+
+<!-- Keep exactly one marker. Its JSON array lists full owner/repo#number identities;
+     [] explicitly means no issue closures. Reference issues as (#N); no closing keywords. -->
+
+Merge only through the central closing-reference guard, run from the open-webui checkout:
+`make -C <central-checkout> pr-merge-check PR_REPO=DankerMu/open-computer-use PR_NUMBER=<n> PR_HEAD=<full-reviewed-sha>`,
+then `make -C <central-checkout> pr-merge` with the same inputs (it repeats the check).
+Rules: the central `AGENTS.md` § Pull requests.
+
 ## Changes
 - ...
 
