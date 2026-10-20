@@ -1070,13 +1070,13 @@ _BLOB_CLOSES = ["staging", "versions", "office", "ocu", "root", "base"]
 _REMOVAL_CLOSES = ["versions", "office", "ocu", "root", "base"]
 
 
-def _blob_owner_fault(store_mod, monkeypatch, owner, fail_role, close_errno=errno.EIO):
+def _blob_owner_fault(store_mod, monkeypatch, owner, fail_role, close_errno=errno.EIO, sync_errors=None):
     import office.versions as versions_mod
 
     close_error = OSError(close_errno, "close refused")
     fault = _owner_close_fault(
         monkeypatch, store_mod.OfficeStore, versions_mod, owner,
-        fail_role=fail_role, close_error=close_error,
+        close_errors={fail_role: close_error}, sync_errors=sync_errors,
     )
     return versions_mod, close_error, fault
 
@@ -1102,19 +1102,39 @@ def test_blob_publication_close_failure_attempts_every_owned_close_once(world, m
     assert list(_staging(data).iterdir()) == []
 
 
+def test_blob_publication_several_close_failures_are_all_kept_in_close_order(world, monkeypatch):
+    import office.versions as versions_mod
+
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    first = OSError(errno.EIO, "versions close refused")
+    second = OSError(errno.EBADF, "root close refused")
+    fault = _owner_close_fault(
+        monkeypatch, store_mod.OfficeStore, versions_mod, "_publish_blob",
+        close_errors={"versions": first, "root": second},
+    )
+    with fault as trace:
+        with pytest.raises(versions_mod.BlobCloseError) as failure:
+            versions_mod._publish_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE), SAVE)
+    assert trace["calls"] == 1
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert failure.value.close_errors == (first, second)
+    assert failure.value.errno == first.errno
+    assert failure.value.strerror == first.strerror
+    assert failure.value.__cause__ is first
+    assert _blob(data, SAVE).read_bytes() == SAVE
+    assert list(_staging(data).iterdir()) == []
+
+
 def test_blob_publication_fsync_failure_stays_primary_over_close_failure(world, monkeypatch):
     store_mod, _docker_manager, data = world
     _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
-    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", "ocu")
     sync_error = OSError(errno.EIO, "versions fsync refused")
-    original_fsync = os.fsync
+    versions_mod, close_error, fault = _blob_owner_fault(
+        store_mod, monkeypatch, "_publish_blob", "ocu", sync_errors={"versions": sync_error},
+    )
     with fault as trace:
-        def refuse_versions_sync(fd):
-            if trace["active"] and fd == trace["owned"].get("versions"):
-                raise sync_error
-            return original_fsync(fd)
-
-        monkeypatch.setattr(os, "fsync", refuse_versions_sync)
         with pytest.raises(Exception) as failure:
             versions_mod._publish_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE), SAVE)
     assert failure.value is sync_error
@@ -1257,6 +1277,28 @@ def test_store_version_enospc_close_failure_is_storage_low(world, monkeypatch):
     assert failure.value.__cause__.__cause__ is close_error
     assert _state(data).read_bytes() == before_state
     assert _blob(data, SAVE).read_bytes() == SAVE
+
+
+def test_store_version_fsync_failure_stays_primary_over_close_failure(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    before_state = _state(data).read_bytes()
+    sync_error = OSError(errno.EIO, "versions fsync refused")
+    versions_mod, close_error, fault = _blob_owner_fault(
+        store_mod, monkeypatch, "_publish_blob", "ocu", sync_errors={"versions": sync_error},
+    )
+    with fault as trace:
+        with pytest.raises(Exception) as failure:
+            _store(store_mod, SAVE, source="save", parent=1, published=True)
+    assert failure.value is sync_error
+    assert type(failure.value) is not versions_mod.BlobCloseError
+    assert failure.value.close_errors == (close_error,)
+    assert trace["calls"] == 1
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert _state(data).read_bytes() == before_state
+    assert not _blob(data, SAVE).exists()
+    assert list(_staging(data).iterdir()) == []
 
 
 @pytest.mark.parametrize("fail_role", ["office", "root"])

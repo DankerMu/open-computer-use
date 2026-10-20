@@ -455,20 +455,22 @@ _DIRECTORY_ROLES = {"office staging directory": "staging", "office versions dire
 
 
 @contextmanager
-def _owner_close_fault(monkeypatch, store_cls, module, owner, *, fail_role=None, close_error=None):
-    """Record one owner call's directory closes and fail one owned close once.
+def _owner_close_fault(monkeypatch, store_cls, module, owner, *, close_errors=None, sync_errors=None):
+    """Record one owner call's directory closes and fail listed roles once each.
 
+    ``close_errors`` maps a role to the error its close raises once, after the
+    real close. ``sync_errors`` maps a role to the error its ``os.fsync`` raises
+    once inside the window; ``os.fsync`` is patched only when it is non-empty.
     A close of an already-closed descriptor inside the window is a retry; it is
     recorded and fails the block on normal exit.
     """
     original_owner = getattr(module, owner)
     original_tree, original_dir = store_cls._open_tree, store_cls._open_dir
-    closed = os.close
+    closed, synced = os.close, os.fsync
     identities = {}
-    trace = {
-        "active": False, "calls": 0, "owned": {}, "attempts": [], "invalid_close_attempts": [],
-        "armed": fail_role is not None,
-    }
+    close_armed = dict(close_errors or {})
+    sync_armed = dict(sync_errors or {})
+    trace = {"active": False, "calls": 0, "owned": {}, "attempts": [], "invalid_close_attempts": []}
 
     def learn(role, fd):
         info = os.fstat(fd)
@@ -514,9 +516,15 @@ def _owner_close_fault(monkeypatch, store_cls, module, owner, *, fail_role=None,
         assert (info.st_dev, info.st_ino) == identities[role]
         trace["attempts"].append(role)
         closed(fd)
-        if trace["armed"] and role == fail_role:
-            trace["armed"] = False
-            raise close_error
+        if role in close_armed:
+            raise close_armed.pop(role)
+
+    def watch_sync(fd):
+        if trace["active"]:
+            role = next((role for role in sync_armed if trace["owned"].get(role) == fd), None)
+            if role is not None:
+                raise sync_armed.pop(role)
+        return synced(fd)
 
     try:
         with monkeypatch.context() as patches:
@@ -524,6 +532,8 @@ def _owner_close_fault(monkeypatch, store_cls, module, owner, *, fail_role=None,
             patches.setattr(store_cls, "_open_dir", watch_dir)
             patches.setattr(module, owner, window)
             patches.setattr(os, "close", watch_close)
+            if sync_armed:
+                patches.setattr(os, "fsync", watch_sync)
             yield trace
         assert trace["invalid_close_attempts"] == [], f"retried closes: {trace['invalid_close_attempts']}"
     finally:

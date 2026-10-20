@@ -1689,7 +1689,7 @@ def _barrier_fault(monkeypatch, fail_role):
     close_error = OSError(errno.EIO, "close refused")
     fault = _owner_close_fault(
         monkeypatch, store_mod.OfficeStore, callback_mod, "_replay_barrier",
-        fail_role=fail_role, close_error=close_error,
+        close_errors={fail_role: close_error},
     )
     return callback_mod, store_mod, close_error, fault
 
@@ -1792,10 +1792,35 @@ def test_forcesave_receipt_replay_close_failure_is_state_close_failed(office_wor
     assert origin.hits == 0
 
 
-def _blob_fault(monkeypatch, fail_role):
+def _blob_fault(monkeypatch, fail_role, sync_errors=None):
     import office.store as store_mod
 
-    return _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", fail_role)[2]
+    return _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", fail_role, sync_errors=sync_errors)[2]
+
+
+def test_final_content_blob_fsync_failure_stays_state_corrupt_over_close_failure(office_world, monkeypatch):
+    http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
+    _change(session["session_id"], state="editing", save_seq=0)
+    before = _state(data).read_bytes()
+    before_versions = json.loads(before)["documents"][session["file_id"]]["versions"]
+    sync_error = OSError(errno.EIO, "versions fsync refused")
+    with _content_origin({"/cache/primary.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        payload = recorded_status_2_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/primary.docx",
+        )
+        with _blob_fault(monkeypatch, "root", sync_errors={"versions": sync_error}) as trace:
+            failed = _post(http, session, payload)
+        _assert_refusal(failed, 500, "state_corrupt")
+        assert [error.strerror for error in sync_error.close_errors] == ["close refused"]
+        assert trace["calls"] == 1
+        assert trace["attempts"] == _BLOB_CLOSES
+        assert trace["still_owned"] == []
+        assert _state(data).read_bytes() == before
+        listed = json.loads(_state(data).read_bytes())["documents"][session["file_id"]]["versions"]
+        assert listed == before_versions
+        assert not (_versions(data) / _sha(CHANGED)).exists()
+    assert origin.hits == 0
 
 
 def test_final_content_blob_close_failure_is_state_close_failed_and_retry_reuses_blob(
