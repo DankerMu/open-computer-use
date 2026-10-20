@@ -456,12 +456,19 @@ _DIRECTORY_ROLES = {"office staging directory": "staging", "office versions dire
 
 @contextmanager
 def _owner_close_fault(monkeypatch, store_cls, module, owner, *, fail_role=None, close_error=None):
-    """Record one owner call's directory closes and fail one owned close once."""
+    """Record one owner call's directory closes and fail one owned close once.
+
+    A close of an already-closed descriptor inside the window is a retry; it is
+    recorded and fails the block on normal exit.
+    """
     original_owner = getattr(module, owner)
     original_tree, original_dir = store_cls._open_tree, store_cls._open_dir
     closed = os.close
     identities = {}
-    trace = {"active": False, "calls": 0, "owned": {}, "attempts": [], "armed": fail_role is not None}
+    trace = {
+        "active": False, "calls": 0, "owned": {}, "attempts": [], "invalid_close_attempts": [],
+        "armed": fail_role is not None,
+    }
 
     def learn(role, fd):
         info = os.fstat(fd)
@@ -492,6 +499,11 @@ def _owner_close_fault(monkeypatch, store_cls, module, owner, *, fail_role=None,
     def watch_close(fd):
         role = None
         if trace["active"]:
+            try:
+                os.fstat(fd)
+            except OSError:
+                trace["invalid_close_attempts"].append(fd)
+                return closed(fd)
             role = next((
                 role for role, owned in trace["owned"].items()
                 if owned == fd and role not in trace["attempts"]
@@ -513,6 +525,7 @@ def _owner_close_fault(monkeypatch, store_cls, module, owner, *, fail_role=None,
             patches.setattr(module, owner, window)
             patches.setattr(os, "close", watch_close)
             yield trace
+        assert trace["invalid_close_attempts"] == [], f"retried closes: {trace['invalid_close_attempts']}"
     finally:
         trace["still_owned"] = []
         for role, fd in trace["owned"].items():
