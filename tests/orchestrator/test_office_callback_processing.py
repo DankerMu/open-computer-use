@@ -3,8 +3,10 @@
 """Public HTTP seam for authenticated DocumentServer callback processing."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
 import threading
 from contextlib import contextmanager
 from urllib.parse import urlsplit
@@ -12,6 +14,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHandler
+from tests.orchestrator._office_store import _owner_close_fault
 from tests.orchestrator._office_recorded_callbacks import (
     recorded_status_1_payload,
     recorded_status_2_payload,
@@ -1672,4 +1675,117 @@ def test_callback_committed_state_close_failure_retains_blob_and_replays_publica
         assert target.stat().st_ino == target_inode
         assert broker.OutputsBroker().current_revision(CHAT) == before_revision + 1
         assert server.hits == hits
+    assert origin.hits == 0
+
+
+_BARRIER_CLOSES = ["office", "ocu", "root", "base"]
+
+
+def _barrier_fault(monkeypatch, fail_role):
+    import office.callback as callback_mod
+    import office.store as store_mod
+
+    close_error = OSError(errno.EIO, "close refused")
+    fault = _owner_close_fault(
+        monkeypatch, store_mod.OfficeStore, callback_mod, "_replay_barrier",
+        fail_role=fail_role, close_error=close_error,
+    )
+    return callback_mod, store_mod, close_error, fault
+
+
+@pytest.mark.parametrize("fail_role", ["office", "root"])
+def test_replay_barrier_close_failure_attempts_every_owned_close_once(office_world, monkeypatch, fail_role):
+    _open_session(office_world)
+    callback_mod, store_mod, close_error, fault = _barrier_fault(monkeypatch, fail_role)
+    with fault as trace:
+        with pytest.raises(Exception) as failure:
+            callback_mod._replay_barrier(store_mod.OfficeStore(), CHAT)
+    assert trace["calls"] == 1
+    assert trace["attempts"] == _BARRIER_CLOSES
+    assert trace["still_owned"] == []
+    assert isinstance(failure.value, callback_mod.CallbackRefusal)
+    assert (failure.value.status, failure.value.reason) == (500, "state_close_failed")
+    assert failure.value.__cause__ is close_error
+    assert close_error.close_errors == (close_error,)
+
+
+def test_replay_barrier_fsync_failure_stays_durability_over_close_failure(office_world, monkeypatch):
+    _open_session(office_world)
+    callback_mod, store_mod, close_error, fault = _barrier_fault(monkeypatch, "office")
+    sync_error = OSError(errno.EIO, "barrier fsync refused")
+    original_fsync = os.fsync
+    with fault as trace:
+        def refuse_barrier_sync(fd):
+            if trace["active"]:
+                raise sync_error
+            return original_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", refuse_barrier_sync)
+        with pytest.raises(Exception) as failure:
+            callback_mod._replay_barrier(store_mod.OfficeStore(), CHAT)
+    assert isinstance(failure.value, callback_mod.CallbackRefusal)
+    assert (failure.value.status, failure.value.reason) == (500, "state_durability")
+    assert trace["attempts"] == _BARRIER_CLOSES
+    assert trace["still_owned"] == []
+    assert failure.value.__cause__ is sync_error
+    assert failure.value.close_errors == (close_error,)
+
+
+def test_final_receipt_replay_close_failure_is_state_close_failed(office_world, monkeypatch):
+    http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
+    with _content_origin({"/cache/close.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        payload = recorded_status_2_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/close.docx",
+        )
+        assert _post(http, session, payload).status_code == 200
+        committed = _state(data).read_bytes()
+        hits = server.hits
+        _callback_mod, _store_mod, _close_error, fault = _barrier_fault(monkeypatch, "root")
+        with fault as trace:
+            failed = _post(http, session, payload)
+        _assert_refusal(failed, 500, "state_close_failed")
+        assert trace["calls"] == 1
+        assert trace["attempts"] == _BARRIER_CLOSES
+        assert trace["still_owned"] == []
+        assert _state(data).read_bytes() == committed
+        retry = _post(http, session, payload)
+        assert retry.status_code == 200
+        assert retry.json() == {"error": 0}
+        assert server.hits == hits
+    assert origin.hits == 0
+
+
+def test_forcesave_receipt_replay_close_failure_is_state_close_failed(office_world, monkeypatch):
+    http, data, origin, _docker, _broker, _content, session = _open_session(office_world)
+    _change(
+        session["session_id"],
+        state="saving",
+        save_seq=4,
+        pending_save_seq=4,
+        save_intents={"4": "persist"},
+        last_committed_seq=0,
+    )
+    with _content_origin({"/cache/4.docx": CHANGED}) as server, _bind_internal(monkeypatch, server.url):
+        four = recorded_status_6_payload(
+            document_key=session["document_key"],
+            url=server.url + "/cache/4.docx",
+            save_seq=4,
+            intent="persist",
+        )
+        assert _post(http, session, four).status_code == 200
+        committed = _state(data).read_bytes()
+        hits = server.hits
+        _callback_mod, _store_mod, _close_error, fault = _barrier_fault(monkeypatch, "office")
+        with fault as trace:
+            failed = _post(http, session, four)
+        _assert_refusal(failed, 500, "state_close_failed")
+        assert trace["calls"] == 1
+        assert trace["attempts"] == _BARRIER_CLOSES
+        assert trace["still_owned"] == []
+        assert _state(data).read_bytes() == committed
+        assert server.hits == hits
+        duplicate = _post(http, session, four)
+        assert duplicate.status_code == 200
+        assert duplicate.json() == {"error": 0}
     assert origin.hits == 0

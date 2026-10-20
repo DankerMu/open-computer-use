@@ -294,7 +294,7 @@ def test_postreplace_durability_failure_replays_and_publishes_in_fresh_worker(of
             out_fail, err_fail = failing.communicate(timeout=15)
             assert failing.returncode == 0, (out_fail, err_fail)
             failed = json.loads(out_fail.strip().splitlines()[-1])
-            assert failed["status"] == 500
+            assert failed == {"status": 500, "body": {"reason": "state_durability"}}
             env["OCU_FAIL_BARRIER"] = "0"
             env["OCU_TRAP_REPLACE"] = "0"
             recovered = subprocess.Popen(

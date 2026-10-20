@@ -15,6 +15,7 @@ from tests.orchestrator._office_store import (
     CHAT,
     _inode,
     _outputs,
+    _owner_close_fault,
     _run_child,
     _start_child,
     _state,
@@ -1063,3 +1064,181 @@ def test_postreplace_durability_failure_keeps_mutator_successor_and_blob(world, 
     assert _blob(data, SAVE).read_bytes() == SAVE
     assert _blob(data, WORKSPACE).read_bytes() == WORKSPACE
 
+
+
+_BLOB_CLOSES = ["staging", "versions", "office", "ocu", "root", "base"]
+_REMOVAL_CLOSES = ["versions", "office", "ocu", "root", "base"]
+
+
+def _blob_owner_fault(store_mod, monkeypatch, owner, fail_role):
+    import office.versions as versions_mod
+
+    close_error = OSError(errno.EIO, "close refused")
+    fault = _owner_close_fault(
+        monkeypatch, store_mod.OfficeStore, versions_mod, owner,
+        fail_role=fail_role, close_error=close_error,
+    )
+    return versions_mod, close_error, fault
+
+
+@pytest.mark.parametrize("fail_role", ["staging", "ocu"])
+def test_blob_publication_close_failure_attempts_every_owned_close_once(world, monkeypatch, fail_role):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", fail_role)
+    with fault as trace:
+        with pytest.raises(Exception) as failure:
+            versions_mod._publish_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE), SAVE)
+    assert trace["calls"] == 1
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert failure.value is close_error
+    assert close_error.close_errors == (close_error,)
+    assert _blob(data, SAVE).read_bytes() == SAVE
+    assert list(_staging(data).iterdir()) == []
+
+
+def test_blob_publication_fsync_failure_stays_primary_over_close_failure(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", "ocu")
+    sync_error = OSError(errno.EIO, "versions fsync refused")
+    original_fsync = os.fsync
+    with fault as trace:
+        def refuse_versions_sync(fd):
+            if trace["active"] and fd == trace["owned"].get("versions"):
+                raise sync_error
+            return original_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", refuse_versions_sync)
+        with pytest.raises(Exception) as failure:
+            versions_mod._publish_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE), SAVE)
+    assert failure.value is sync_error
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert sync_error.close_errors == (close_error,)
+    assert not _blob(data, SAVE).exists()
+    assert list(_staging(data).iterdir()) == []
+
+
+def test_blob_publication_unlink_failures_never_replace_the_outcome(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", "office")
+    sync_error = OSError(errno.ENOSPC, "versions fsync refused")
+    unlink_errors = {
+        "versions": OSError(errno.EIO, "claimed blob unlink refused"),
+        "staging": OSError(errno.EIO, "temporary blob unlink refused"),
+    }
+    original_fsync, original_unlink = os.fsync, os.unlink
+    with fault as trace:
+        def refuse_versions_sync(fd):
+            if trace["active"] and fd == trace["owned"].get("versions"):
+                raise sync_error
+            return original_fsync(fd)
+
+        def refuse_unlink(path, *, dir_fd=None):
+            for role, error in unlink_errors.items():
+                if trace["active"] and dir_fd is not None and dir_fd == trace["owned"].get(role):
+                    raise error
+            return original_unlink(path, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "fsync", refuse_versions_sync)
+        monkeypatch.setattr(os, "unlink", refuse_unlink)
+        with pytest.raises(Exception) as failure:
+            _store(store_mod, SAVE, source="save", parent=1, published=True)
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert isinstance(failure.value, versions_mod.StorageLowError)
+    assert failure.value.__cause__ is sync_error
+    assert sync_error.cleanup_errors == (unlink_errors["versions"], unlink_errors["staging"])
+    assert sync_error.close_errors == (close_error,)
+    assert _doc_versions(store_mod)[-1]["sha256"] == _sha(WORKSPACE)
+
+
+def test_blob_publication_temporary_unlink_failure_without_primary_is_raised_after_closes(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", "office")
+    unlink_error = OSError(errno.EIO, "temporary blob unlink refused")
+    original_unlink = os.unlink
+    with fault as trace:
+        def refuse_temporary_unlink(path, *, dir_fd=None):
+            if trace["active"] and dir_fd is not None and dir_fd == trace["owned"].get("staging"):
+                raise unlink_error
+            return original_unlink(path, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "unlink", refuse_temporary_unlink)
+        with pytest.raises(Exception) as failure:
+            versions_mod._publish_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE), SAVE)
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert failure.value is unlink_error
+    assert unlink_error.close_errors == (close_error,)
+    assert _blob(data, SAVE).read_bytes() == SAVE
+
+
+def test_store_version_close_failure_records_no_version_and_retry_reuses_blob(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    before = _doc_versions(store_mod)
+    before_state = _state(data).read_bytes()
+    _versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_publish_blob", "versions")
+    with fault as trace:
+        with pytest.raises(Exception) as failure:
+            _store(store_mod, SAVE, source="save", parent=1, published=True)
+    assert trace["calls"] == 1
+    assert trace["attempts"] == _BLOB_CLOSES
+    assert trace["still_owned"] == []
+    assert failure.value is close_error
+    assert _state(data).read_bytes() == before_state
+    assert _doc_versions(store_mod) == before
+    blob = _blob(data, SAVE)
+    assert blob.read_bytes() == SAVE
+    identity = _inode(blob)
+    record = _store(store_mod, SAVE, source="save", parent=1, published=True)
+    assert (record["number"], record["sha256"]) == (2, _sha(SAVE))
+    assert _doc_versions(store_mod) == before + [record]
+    assert _inode(blob) == identity
+    assert blob.read_bytes() == SAVE
+
+
+@pytest.mark.parametrize("fail_role", ["office", "root"])
+def test_blob_removal_close_failure_attempts_every_owned_close_once(world, monkeypatch, fail_role):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_unlink_blob", fail_role)
+    assert versions_mod._publish_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE), SAVE) is True
+    with fault as trace:
+        with pytest.raises(Exception) as failure:
+            versions_mod._unlink_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE))
+    assert trace["calls"] == 1
+    assert trace["attempts"] == _REMOVAL_CLOSES
+    assert trace["still_owned"] == []
+    assert failure.value is close_error
+    assert close_error.close_errors == (close_error,)
+    assert not _blob(data, SAVE).exists()
+    assert _blob(data, WORKSPACE).read_bytes() == WORKSPACE
+
+
+def test_blob_removal_unlink_failure_stays_primary_over_close_failure(world, monkeypatch):
+    store_mod, _docker_manager, data = world
+    _store(store_mod, WORKSPACE, source="workspace", parent=None, published=True)
+    versions_mod, close_error, fault = _blob_owner_fault(store_mod, monkeypatch, "_unlink_blob", "office")
+    assert versions_mod._publish_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE), SAVE) is True
+    unlink_error = OSError(errno.EIO, "blob unlink refused")
+    original_unlink = os.unlink
+    with fault as trace:
+        def refuse_blob_unlink(path, *, dir_fd=None):
+            if trace["active"] and path == _sha(SAVE):
+                raise unlink_error
+            return original_unlink(path, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "unlink", refuse_blob_unlink)
+        with pytest.raises(Exception) as failure:
+            versions_mod._unlink_blob(store_mod.OfficeStore(), CHAT, _sha(SAVE))
+    assert failure.value is unlink_error
+    assert trace["attempts"] == _REMOVAL_CLOSES
+    assert trace["still_owned"] == []
+    assert unlink_error.close_errors == (close_error,)
+    assert _blob(data, SAVE).read_bytes() == SAVE
