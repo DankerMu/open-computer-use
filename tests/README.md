@@ -86,12 +86,15 @@ consumer retains its explicit empty-prefix configuration and security assertions
 app-import cache family: a key is owned when it is in `names` or starts with a
 prefix. Cleanup retires replacement modules and restores exact entry objects or
 entry absence after normal completion, test-body failure, or setup failure after
-eviction. Six owners share it, each with its unchanged owned set:
+eviction. Six owners share it:
 
 - `test_file_response.py::workspace` and `test_files_headers.py::app_module` use
   `isolated_file_route_modules`, including the coupled `uploads` module. Receipt
   producers and the app share the active descriptor exception class.
-- `test_auth_guard.py::app_module` owns `_AUTH_GUARD_MODULES` plus `mcp_resources*`.
+- `test_auth_guard.py::app_module` owns `_AUTH_GUARD_MODULES` plus
+  `_AUTH_GUARD_PREFIXES` (`mcp_resources*`, `office.*`, `cli_adapters*`): the whole
+  server directory except the standalone `drawio/` script. A regression in the
+  same file fails when a server-local module is loaded but not owned.
 - `orchestrator/test_ws_recheck.py::ws_server_modules` owns `_WS_SERVER_MODULES`
   plus `mcp_resources*` and `cli_adapters*`. `_reload_server(ws_server_modules)`
   requires the scope value the fixture yields and raises when given anything

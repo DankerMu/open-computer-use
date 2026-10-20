@@ -33,7 +33,7 @@ alias_runtime_modules = alias_tests.alias_runtime_modules
 OWNERSHIP = {
     "workspace": (_FILE_ROUTE_MODULES, ("mcp_resources",)),
     "app_module": (_FILE_ROUTE_MODULES, ("mcp_resources",)),
-    "auth_app_module": (auth_tests._AUTH_GUARD_MODULES, ("mcp_resources",)),
+    "auth_app_module": (auth_tests._AUTH_GUARD_MODULES, auth_tests._AUTH_GUARD_PREFIXES),
     "ws_app_module": (ws_tests._WS_SERVER_MODULES, ("mcp_resources", "cli_adapters")),
     "alias_runtime_modules": (alias_tests._ALIAS_RUNTIME_MODULES, ()),
 }
