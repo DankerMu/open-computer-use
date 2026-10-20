@@ -187,3 +187,45 @@ def test_cleanup_failure_policy_preserves_original_metadata_error_when_requested
                                        ignore_close_errors=ignore_close_errors)
     assert failure.value is (metadata_error if ignore_close_errors else close_error)
     assert os.fstat(root_fd).st_ino == root.stat().st_ino
+
+
+def test_record_cleanup_error_first_record_sets_tuple_and_exact_note():
+    primary = OSError(errno.ENOSPC, "replace refused")
+    cleanup = PermissionError(errno.EACCES, "cleanup refused")
+    descriptor_io.record_cleanup_error(primary, cleanup, what="Temporary receipt")
+    assert getattr(primary, "cleanup_errors", None) == (cleanup,)
+    assert getattr(primary, "__notes__", []) == [
+        "Temporary receipt cleanup also failed: PermissionError: [Errno 13] cleanup refused"]
+
+
+def test_record_cleanup_error_accumulates_errors_and_notes_in_order():
+    primary = OSError(errno.ENOSPC, "versions fsync refused")
+    claimed = OSError(errno.EIO, "claimed blob unlink refused")
+    temporary = OSError(errno.EIO, "temporary blob unlink refused")
+    descriptor_io.record_cleanup_error(primary, claimed, what="Claimed version blob")
+    descriptor_io.record_cleanup_error(primary, temporary, what="Temporary version blob")
+    assert getattr(primary, "cleanup_errors", None) == (claimed, temporary)
+    assert getattr(primary, "__notes__", []) == [
+        "Claimed version blob cleanup also failed: OSError: [Errno 5] claimed blob unlink refused",
+        "Temporary version blob cleanup also failed: OSError: [Errno 5] temporary blob unlink refused",
+    ]
+
+
+def test_record_cleanup_error_is_independent_of_close_errors():
+    close_error = OSError(errno.EBADF, "close failed")
+    carrying = OSError(errno.ENOSPC, "fsync refused")
+    carrying.close_errors = (close_error,)
+    cleanup = OSError(errno.EIO, "unlink refused")
+    descriptor_io.record_cleanup_error(carrying, cleanup, what="Temporary version blob")
+    assert getattr(carrying, "cleanup_errors", None) == (cleanup,)
+    assert getattr(carrying, "__notes__", []) == [
+        "Temporary version blob cleanup also failed: OSError: [Errno 5] unlink refused"]
+    assert carrying.close_errors == (close_error,)
+
+    bare = OSError(errno.ENOSPC, "fsync refused")
+    other = OSError(errno.EIO, "unlink refused again")
+    descriptor_io.record_cleanup_error(bare, other, what="Claimed version blob")
+    assert getattr(bare, "cleanup_errors", None) == (other,)
+    assert getattr(bare, "__notes__", []) == [
+        "Claimed version blob cleanup also failed: OSError: [Errno 5] unlink refused again"]
+    assert not hasattr(bare, "close_errors")
