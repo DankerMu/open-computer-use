@@ -36,6 +36,13 @@ with docker_manager._combined_lock(chat):
 print("released")
 '''
 
+_MARKER_NAMESPACE: dict = {}
+exec(_MARKER_WRITER, _MARKER_NAMESPACE)
+
+
+def _record_contention(path, outcome):
+    _MARKER_NAMESPACE["_publish_marker"](Path(path), outcome)
+
 
 def _hold_chat_lock(docker, chat, held, release, expired, timeout=10):
     with docker._combined_lock(chat):
@@ -177,10 +184,10 @@ def test_callback_waits_for_ordinary_process_holder_while_health_progresses(offi
                     try:
                         original_flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
-                        Path(contended).write_text("denied", encoding="utf-8")
+                        _record_contention(contended, "denied")
                         return original_flock(fd, fcntl.LOCK_EX)
                     original_flock(fd, fcntl.LOCK_UN)
-                    Path(contended).write_text("acquired", encoding="utf-8")
+                    _record_contention(contended, "acquired")
                     raise AssertionError("callback lock was granted without process contention")
                 return original_flock(fd, operation)
 
