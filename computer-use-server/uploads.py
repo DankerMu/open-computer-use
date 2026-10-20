@@ -641,9 +641,15 @@ def write_import_receipts(chat_dir: Path, receipts: dict[str, dict[str, Any]]) -
                 committed_and_synced=committed and synchronized,
                 primary_error=primary_error,
             )
-    except BaseException:
+    except BaseException as error:
         if not committed:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                error.cleanup_errors = getattr(error, "cleanup_errors", ()) + (cleanup_error,)
+                error.add_note(
+                    f"Temporary receipt cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                )
         raise
 
 

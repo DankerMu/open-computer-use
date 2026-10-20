@@ -924,6 +924,51 @@ def test_failed_receipt_write_leaves_prior_receipts_and_retries_without_overwrit
     assert receipts["F2"]["stored_name"] == "notes (2).txt"
 
 
+def _is_receipt_temporary(path, control):
+    path = Path(path)
+    return (path.parent == control and path.name.startswith(".imports.")
+            and path.name.endswith(".tmp"))
+
+
+def test_receipt_replace_and_temporary_cleanup_failure_reports_replace_failure(
+        upload_server, monkeypatch):
+    client, uploads = upload_server
+    first = _upload(client, "brief.docx", b"one", attachment_id="F1")
+    assert first.status_code == 200
+    control = uploads.parent / ".ocu"
+    destination = control / "imports.json"
+    prior = _receipts(uploads)
+    prior_bytes = destination.read_bytes()
+    replaced, unlink = os.replace, Path.unlink
+    replace_error = OSError(errno.EIO, "receipt replace refused")
+    refused = []
+
+    def failing_replace(src, dst, *args, **kwargs):
+        if Path(dst) == destination:
+            raise replace_error
+        return replaced(src, dst, *args, **kwargs)
+
+    def refusing_unlink(self, *args, **kwargs):
+        if _is_receipt_temporary(self, control):
+            refused.append(self)
+            raise PermissionError(errno.EACCES, "cleanup refused")
+        return unlink(self, *args, **kwargs)
+
+    with monkeypatch.context() as patches:
+        patches.setattr(os, "replace", failing_replace)
+        patches.setattr(Path, "unlink", refusing_unlink)
+        failed = _upload(client, "notes.txt", b"two", attachment_id="F2")
+    assert failed.status_code == 500
+    detail = failed.json()["detail"]
+    assert detail.startswith("Failed to save file:")
+    assert "receipt replace refused" in detail
+    assert "cleanup refused" not in detail
+    assert len(refused) == 1
+    assert destination.read_bytes() == prior_bytes
+    assert _receipts(uploads) == prior
+    assert _imports(client).json() == {"ids": ["F1"]}
+
+
 def test_receipt_final_close_failure_reports_committed_upload_and_replays_same_id(
         upload_server, monkeypatch):
     client, uploads = upload_server
@@ -1429,6 +1474,124 @@ def test_direct_receipt_retry_requires_parent_sync_after_interrupted_creation(
     assert uploads.read_import_receipts(chat_dir) == receipts
     assert marker.read_bytes() == b"surviving interrupted receipt creation"
     assert sorted(path.name for path in control.iterdir()) == ["imports.json", "marker"]
+
+
+PRIOR_RECEIPTS = {"F0": {
+    "stored_name": "prior.txt", "size": 5, "md5": "prior-md5",
+    "imported_at": "2026-10-10T00:00:00Z",
+}}
+SUCCESSOR_RECEIPTS = {**PRIOR_RECEIPTS, "F1": {
+    "stored_name": "brief.docx", "size": 3, "md5": "f97c5d29941bfb1b2fdab0874906ab82",
+    "imported_at": "2026-10-11T00:00:00Z",
+}}
+
+
+@pytest.mark.parametrize("stage", ("write", "fsync", "replace"))
+def test_direct_receipt_pre_commit_failure_retains_primary_over_cleanup_failure(
+        tmp_path, monkeypatch, stage):
+    import descriptor_io
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    control = chat_dir / ".ocu"
+    destination = control / "imports.json"
+    uploads.write_import_receipts(chat_dir, PRIOR_RECEIPTS)
+    prior_bytes = destination.read_bytes()
+    opened, written, synced, replaced = os.open, os.write, os.fsync, os.replace
+    unlink = Path.unlink
+    primary = OSError(errno.EIO, f"{stage} refused")
+    cleanup_error = PermissionError(errno.EACCES, "cleanup refused")
+    temporaries = {}
+    refused = []
+
+    def recording_open(path, *args, **kwargs):
+        fd = opened(path, *args, **kwargs)
+        if _is_receipt_temporary(path, control):
+            temporaries[fd] = Path(path)
+        return fd
+
+    def failing_write(fd, data):
+        if fd in temporaries:
+            raise primary
+        return written(fd, data)
+
+    def failing_fsync(fd):
+        if fd in temporaries:
+            raise primary
+        return synced(fd)
+
+    def failing_replace(src, dst, *args, **kwargs):
+        if Path(src) in temporaries.values() and Path(dst) == destination:
+            raise primary
+        return replaced(src, dst, *args, **kwargs)
+
+    def refusing_unlink(self, *args, **kwargs):
+        if _is_receipt_temporary(self, control):
+            refused.append(self)
+            raise cleanup_error
+        return unlink(self, *args, **kwargs)
+
+    failing = {"write": failing_write, "fsync": failing_fsync, "replace": failing_replace}
+    with monkeypatch.context() as patches:
+        patches.setattr(os, "open", recording_open)
+        patches.setattr(os, stage, failing[stage])
+        patches.setattr(Path, "unlink", refusing_unlink)
+        with pytest.raises(OSError) as failure:
+            uploads.write_import_receipts(chat_dir, SUCCESSOR_RECEIPTS)
+    outcome = failure.value
+    assert outcome is primary
+    assert outcome.cleanup_errors == (cleanup_error,)
+    assert outcome.__notes__ == [
+        "Temporary receipt cleanup also failed: PermissionError: [Errno 13] cleanup refused"]
+    assert not isinstance(outcome, descriptor_io.CommittedCloseError)
+    assert len(temporaries) == 1
+    temporary = next(iter(temporaries.values()))
+    assert refused == [temporary]
+    assert destination.read_bytes() == prior_bytes
+    assert uploads.read_import_receipts(chat_dir) == PRIOR_RECEIPTS
+    assert sorted(path.name for path in control.iterdir()) == sorted(
+        ["imports.json", temporary.name])
+
+
+def test_direct_receipt_pre_commit_failure_tolerates_missing_temporary(
+        tmp_path, monkeypatch):
+    import uploads
+
+    chat_dir = tmp_path / CHAT
+    chat_dir.mkdir()
+    control = chat_dir / ".ocu"
+    destination = control / "imports.json"
+    uploads.write_import_receipts(chat_dir, PRIOR_RECEIPTS)
+    prior_bytes = destination.read_bytes()
+    replaced, unlink = os.replace, Path.unlink
+    primary = OSError(errno.EIO, "replace refused")
+    removed = []
+
+    def failing_replace(src, dst, *args, **kwargs):
+        if _is_receipt_temporary(src, control) and Path(dst) == destination:
+            raise primary
+        return replaced(src, dst, *args, **kwargs)
+
+    def removing_unlink(self, *args, **kwargs):
+        if _is_receipt_temporary(self, control):
+            removed.append(self)
+            unlink(self)
+        return unlink(self, *args, **kwargs)
+
+    with monkeypatch.context() as patches:
+        patches.setattr(os, "replace", failing_replace)
+        patches.setattr(Path, "unlink", removing_unlink)
+        with pytest.raises(OSError) as failure:
+            uploads.write_import_receipts(chat_dir, SUCCESSOR_RECEIPTS)
+    outcome = failure.value
+    assert outcome is primary
+    assert not hasattr(outcome, "cleanup_errors")
+    assert getattr(outcome, "__notes__", None) is None
+    assert len(removed) == 1
+    assert destination.read_bytes() == prior_bytes
+    assert uploads.read_import_receipts(chat_dir) == PRIOR_RECEIPTS
+    assert sorted(path.name for path in control.iterdir()) == ["imports.json"]
 
 
 def _matches_path(target, args, kwargs, *, directory_keys=("dir_fd",)):
