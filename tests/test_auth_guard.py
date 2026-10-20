@@ -31,7 +31,13 @@ SERVER_DIR = ROOT / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from tests.file_route_module_ownership import isolated_modules  # noqa: E402
+from tests.file_route_module_ownership import (  # noqa: E402
+    _SERVER_MODULES,
+    _SERVER_PREFIXES,
+    _server_local_files,
+    _server_local_modules,
+    isolated_modules,
+)
 
 INTERNAL = "ocu-test-internal-token"
 MCP_KEY = "ocu-test-mcp-api-key"
@@ -48,14 +54,6 @@ OFFICE_ENV = {
     "OCU_OFFICE_SELF_URL": "http://ocu:8081",
     "OCU_OFFICE_JWT_SECRET": "office-startup-secret-canary",
 }
-
-_AUTH_GUARD_MODULES = {
-    "app", "auth_guard", "ws_recheck", "mcp_tools", "docker_manager", "outputs_broker",
-    "context_vars", "security", "system_prompt", "skill_manager", "uploads", "file_response",
-    "descriptor_io", "docs_html", "sandbox_dns", "cli_runtime", "cli_adapters", "office",
-}
-_AUTH_GUARD_PREFIXES = ("mcp_resources", "office.", "cli_adapters.")
-DRAWIO_DIR = SERVER_DIR / "drawio"
 
 
 @pytest.fixture(autouse=True)
@@ -143,7 +141,7 @@ def _apply_env(monkeypatch):
 @pytest.fixture
 def app_module(monkeypatch):
     """Import the server after the guard env is set, once per test."""
-    with isolated_modules(_AUTH_GUARD_MODULES, _AUTH_GUARD_PREFIXES):
+    with isolated_modules(_SERVER_MODULES, _SERVER_PREFIXES):
         _apply_env(monkeypatch)
         import app as loaded
 
@@ -1387,30 +1385,6 @@ class TestNoDisclosure:
         assert INTERNAL not in captured.err
 
 
-def _server_local_modules():
-    local = {}
-    for name, module in sys.modules.copy().items():
-        file = getattr(module, "__file__", None)
-        if not isinstance(file, str):
-            continue  # builtins and namespace packages such as `tests` have no file
-        path = Path(file).resolve()
-        if path.is_relative_to(SERVER_DIR) and not path.is_relative_to(DRAWIO_DIR):
-            local[name] = module
-    return local
-
-
-def _server_local_files():
-    names = set()
-    for path in SERVER_DIR.rglob("*.py"):
-        if path.is_relative_to(DRAWIO_DIR) or "__pycache__" in path.parts:
-            continue
-        parts = path.relative_to(SERVER_DIR).with_suffix("").parts
-        if parts[-1] == "__init__":
-            parts = parts[:-1]
-        names.add(".".join(parts))
-    return names
-
-
 def _import_owned_app(monkeypatch):
     _apply_env(monkeypatch)
     import app
@@ -1423,16 +1397,16 @@ class TestModuleOwnership:
         # Files cover lazy imports no earlier test loaded; modules cover cached aliases.
         unowned = sorted(
             name for name in _server_local_files() | set(_server_local_modules())
-            if name not in _AUTH_GUARD_MODULES
-            and not name.startswith(_AUTH_GUARD_PREFIXES)
+            if name not in _SERVER_MODULES
+            and not name.startswith(_SERVER_PREFIXES)
         )
         assert unowned == [], f"unowned server-local modules: {unowned}"
 
     def test_second_generation_binds_current_modules(self, monkeypatch):
-        with isolated_modules(_AUTH_GUARD_MODULES, _AUTH_GUARD_PREFIXES):
+        with isolated_modules(_SERVER_MODULES, _SERVER_PREFIXES):
             _import_owned_app(monkeypatch)
             first_manager = sys.modules["docker_manager"]
-        with isolated_modules(_AUTH_GUARD_MODULES, _AUTH_GUARD_PREFIXES):
+        with isolated_modules(_SERVER_MODULES, _SERVER_PREFIXES):
             _import_owned_app(monkeypatch)
             manager = sys.modules["docker_manager"]
             assert manager is not first_manager

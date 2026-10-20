@@ -15,7 +15,11 @@ from pathlib import Path
 import anyio
 import pytest
 
-from tests.file_route_module_ownership import isolated_file_route_modules
+from tests.file_route_module_ownership import (
+    _SERVER_MODULES,
+    _SERVER_PREFIXES,
+    isolated_file_route_modules,
+)
 
 SERVER_DIR = Path(__file__).resolve().parents[1] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
@@ -54,17 +58,9 @@ def workspace(monkeypatch, tmp_path):
 def test_workspace_keeps_receipt_producer_and_app_exception_identity_coherent(
     request, monkeypatch, tmp_path,
 ):
-    module_names = {
-        "app", "auth_guard", "ws_recheck", "mcp_tools", "docker_manager",
-        "outputs_broker", "context_vars", "security", "system_prompt",
-        "skill_manager", "cli_runtime", "sandbox_dns", "uploads", "docs_html",
-        "file_response", "descriptor_io", "office", "cli_adapters",
-    }
     snapshot = {
         name: module for name, module in sys.modules.copy().items()
-        if name in module_names or name.startswith(
-            ("mcp_resources", "office.", "cli_adapters.")
-        )
+        if name in _SERVER_MODULES or name.startswith(_SERVER_PREFIXES)
     }
 
     def restore_ambient_state():
@@ -72,9 +68,7 @@ def test_workspace_keeps_receipt_producer_and_app_exception_identity_coherent(
             monkeypatch.undo()
         finally:
             for name in list(sys.modules):
-                if name in module_names or name.startswith(
-                    ("mcp_resources", "office.", "cli_adapters.")
-                ):
+                if name in _SERVER_MODULES or name.startswith(_SERVER_PREFIXES):
                     sys.modules.pop(name, None)
             sys.modules.update(snapshot)
 

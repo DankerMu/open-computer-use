@@ -16,7 +16,12 @@ from tests import test_auth_guard as auth_tests
 from tests import test_file_response as response_tests
 from tests import test_files_headers as header_tests
 from tests import test_opencode_alias_map_drop as alias_tests
-from tests.file_route_module_ownership import _FILE_ROUTE_MODULES
+from tests.file_route_module_ownership import (
+    _SERVER_MODULES,
+    _SERVER_PREFIXES,
+    _server_local_files,
+    _server_local_modules,
+)
 from tests.orchestrator import test_startup_warnings as warning_tests
 from tests.orchestrator import test_ws_recheck as ws_tests
 
@@ -31,13 +36,14 @@ ws_server_modules = ws_tests.ws_server_modules
 alias_runtime_modules = alias_tests.alias_runtime_modules
 
 OWNERSHIP = {
-    "workspace": (_FILE_ROUTE_MODULES, ("mcp_resources",)),
-    "app_module": (_FILE_ROUTE_MODULES, ("mcp_resources",)),
-    "auth_app_module": (auth_tests._AUTH_GUARD_MODULES, auth_tests._AUTH_GUARD_PREFIXES),
-    "ws_app_module": (ws_tests._WS_SERVER_MODULES, ("mcp_resources", "cli_adapters")),
+    "workspace": (_SERVER_MODULES, _SERVER_PREFIXES),
+    "app_module": (_SERVER_MODULES, _SERVER_PREFIXES),
+    "auth_app_module": (_SERVER_MODULES, _SERVER_PREFIXES),
+    "ws_app_module": (_SERVER_MODULES, _SERVER_PREFIXES),
     "alias_runtime_modules": (alias_tests._ALIAS_RUNTIME_MODULES, ()),
 }
 FILE_ROUTE_OWNERS = ("workspace", "app_module")
+APP_OWNERS = ("workspace", "app_module", "auth_app_module", "ws_app_module")
 AMBIENT_NAMES = set().union(*(names for names, _ in OWNERSHIP.values())) | {
     "ws_recheck", "cli_runtime", "sandbox_dns", "docs_html", "office", "cli_adapters",
 }
@@ -137,15 +143,50 @@ def test_file_route_fixture_restores_caller_modules(
     assert loaded.write_import_receipts is active_uploads.write_import_receipts
 
 
+@pytest.mark.parametrize("owner", APP_OWNERS)
+def test_app_owner_owns_server_local_modules(owner, request, monkeypatch, tmp_path):
+    owned_names, owned_prefixes = OWNERSHIP[owner]
+    _isolate_ambient_modules(request, monkeypatch)
+    for key, value in {**SERVICE_ENV, "BASE_DATA_DIR": str(tmp_path / "caller")}.items():
+        monkeypatch.setenv(key, value)
+
+    request.getfixturevalue(owner)
+    # Files cover lazy imports no earlier test loaded; modules cover cached aliases.
+    unowned = sorted(
+        name for name in _server_local_files() | set(_server_local_modules())
+        if name not in owned_names and not name.startswith(owned_prefixes)
+    )
+    assert unowned == [], f"{owner} leaves server-local modules unowned: {unowned}"
+
+
+@pytest.mark.parametrize("owner", APP_OWNERS)
+def test_app_owner_binds_current_generation(owner, request, monkeypatch, tmp_path):
+    _isolate_ambient_modules(request, monkeypatch)
+    for key, value in {**SERVICE_ENV, "BASE_DATA_DIR": str(tmp_path / "caller")}.items():
+        monkeypatch.setenv(key, value)
+    # The caller generation plays generation one: its Office and CLI runtime
+    # modules bind the caller's docker_manager.
+    import app  # noqa: F401
+
+    caller_manager = sys.modules["docker_manager"]
+    request.getfixturevalue(owner)
+    manager = sys.modules["docker_manager"]
+    assert manager is not caller_manager
+    admission = sys.modules["office.lookup_admission"]
+    assert admission.docker_manager is manager
+    assert admission.StateCorruptError is sys.modules["office.store"].StateCorruptError
+    assert sys.modules["cli_runtime"]._execute_bash_capture is manager._execute_bash_capture
+
+
 CHILD_OWNERS = {
     "auth_app_module": (
-        "from tests.test_auth_guard import _AUTH_GUARD_MODULES as OWNED_NAMES\n"
+        "from tests.file_route_module_ownership import _SERVER_MODULES as OWNED_NAMES\n"
         "from tests.test_auth_guard import app_module\n",
         "app_module",
         "    import mcp_resources  # noqa: F401\n",
     ),
     "ws_app_module": (
-        "from tests.orchestrator.test_ws_recheck import _WS_SERVER_MODULES as OWNED_NAMES\n"
+        "from tests.file_route_module_ownership import _SERVER_MODULES as OWNED_NAMES\n"
         "from tests.orchestrator.test_ws_recheck import app_module, ws_server_modules\n",
         "app_module",
         "    import mcp_resources  # noqa: F401\n",
