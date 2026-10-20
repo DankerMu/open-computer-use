@@ -86,20 +86,21 @@ consumer retains its explicit empty-prefix configuration and security assertions
 app-import cache family: a key is owned when it is in `names` or starts with a
 prefix. Cleanup retires replacement modules and restores exact entry objects or
 entry absence after normal completion, test-body failure, or setup failure after
-eviction. Six owners share it:
+eviction. Six owners share it. The app-importing owners in the first three
+bullets share `_SERVER_MODULES` plus `_SERVER_PREFIXES` (`mcp_resources*`,
+`office.*`, `cli_adapters.*`) from the same module: the whole server directory
+except the standalone `drawio/` script.
 
 - `test_file_response.py::workspace` and `test_files_headers.py::app_module` use
   `isolated_file_route_modules`, including the coupled `uploads` module. Receipt
   producers and the app share the active descriptor exception class.
-- `test_auth_guard.py::app_module` owns `_AUTH_GUARD_MODULES` plus
-  `_AUTH_GUARD_PREFIXES` (`mcp_resources*`, `office.*`, `cli_adapters*`): the whole
-  server directory except the standalone `drawio/` script. A regression in the
-  same file fails when a server-local module is loaded but not owned.
-- `orchestrator/test_ws_recheck.py::ws_server_modules` owns `_WS_SERVER_MODULES`
-  plus `mcp_resources*` and `cli_adapters*`. `_reload_server(ws_server_modules)`
-  requires the scope value the fixture yields and raises when given anything
-  else, so neither its `app_module` nor the direct caller can import the server
-  outside the owned scope.
+- `test_auth_guard.py::app_module` owns the shared set. A regression in the same
+  file, which CI runs, fails when a server-local module is loaded or present on
+  disk but not owned.
+- `orchestrator/test_ws_recheck.py::ws_server_modules` owns the shared set.
+  `_reload_server(ws_server_modules)` requires the scope value the fixture yields
+  and raises when given anything else, so neither its `app_module` nor the direct
+  caller can import the server outside the owned scope.
 - `orchestrator/test_startup_warnings.py`: both `unittest` classes enter
   `isolated_modules` for `docker_manager` plus `docker_manager.*` in `setUp` through
   `self.enterContext(...)`, so `_reload_docker_manager()` reimports inside the owned
@@ -116,9 +117,14 @@ alias-map owners, a child pytest run records the entry modules, fails a test bod
 that uses the owner, and checks in a following test that the owned keys were
 restored; the parent reads the outcome from JUnit XML. For each startup-warning
 class, the module runs one real test and a sentinel-failing test body through
-`unittest`'s own `TestCase.run`, then checks the owned keys. The workspace
-coherence regression checks producer/app exception identity inside the live
-fixture; `test_upload_claim.py` retains its nominal receipt exception and
+`unittest`'s own `TestCase.run`, then checks the owned keys. Two regressions run
+once per app-importing owner (`workspace`, `app_module`, `auth_app_module`,
+`ws_app_module`): one fails when a server-local module or module file is not
+owned, and one imports the server first and then checks, inside the owner's
+scope, that the Office lookup-admission module and the CLI runtime bind that
+scope's `docker_manager`, not the caller's. The workspace coherence regression
+checks producer/app exception identity inside the live fixture;
+`test_upload_claim.py` retains its nominal receipt exception and
 committed-write assertions. No CI selection runs this module; it runs in the full
 local unit command.
 

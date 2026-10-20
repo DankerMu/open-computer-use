@@ -23,7 +23,11 @@ from urllib.parse import urlparse
 
 import pytest
 
-from tests.file_route_module_ownership import isolated_modules
+from tests.file_route_module_ownership import (
+    _SERVER_MODULES,
+    _SERVER_PREFIXES,
+    isolated_modules,
+)
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
@@ -46,19 +50,6 @@ REVOKE_CODE = 4401
 BACKEND_FAIL_CODE = 1011
 PREACCEPT_CODE = 1008
 FUTURE_MARKER = "post-revoke-marker"
-
-_WS_SERVER_MODULES = {
-    "app",
-    "auth_guard",
-    "ws_recheck",
-    "mcp_tools",
-    "docker_manager",
-    "outputs_broker",
-    "security",
-    "system_prompt",
-    "skill_manager",
-    "file_response",
-}
 
 
 def _apply_env(monkeypatch, tmp_path, auth_url=None):
@@ -86,7 +77,7 @@ def _reload_server(ws_server_modules):
 
 @pytest.fixture
 def ws_server_modules():
-    with isolated_modules(_WS_SERVER_MODULES, ("mcp_resources", "cli_adapters")):
+    with isolated_modules(_SERVER_MODULES, _SERVER_PREFIXES):
         yield _WS_SCOPE
 
 
