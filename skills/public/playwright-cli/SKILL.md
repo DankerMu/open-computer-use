@@ -179,6 +179,8 @@ playwright-cli close
 playwright-cli delete-data
 ```
 
+A `--config` file replaces the whole production configuration, including `outputDir` and the chromium browser and channel pins; start from a copy of `/home/assistant/playwright-cli.json`, change what you need, and keep `outputDir` at `/mnt/user-data/files` if the files should appear in the workspace.
+
 ## Snapshots
 
 After each command, playwright-cli provides a snapshot of the current browser state.
@@ -189,8 +191,10 @@ After each command, playwright-cli provides a snapshot of the current browser st
 - Page URL: https://example.com/
 - Page Title: Example Domain
 ### Snapshot
-[Snapshot](.playwright-cli/page-2026-02-14T19-22-42-679Z.yml)
+[Snapshot](../../mnt/user-data/files/page-2026-02-14T19-22-42-679Z.yml)
 ```
+
+Snapshots are written to `/mnt/user-data/files` and appear in the workspace Files tab.
 
 You can also take a snapshot on demand using `playwright-cli snapshot` command.
 
