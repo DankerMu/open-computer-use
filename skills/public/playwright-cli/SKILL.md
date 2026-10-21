@@ -189,8 +189,10 @@ After each command, playwright-cli provides a snapshot of the current browser st
 - Page URL: https://example.com/
 - Page Title: Example Domain
 ### Snapshot
-[Snapshot](.playwright-cli/page-2026-02-14T19-22-42-679Z.yml)
+[Snapshot](../../mnt/user-data/files/page-2026-02-14T19-22-42-679Z.yml)
 ```
+
+Snapshots are written to `/mnt/user-data/files` and appear in the workspace Files tab.
 
 You can also take a snapshot on demand using `playwright-cli snapshot` command.
 

@@ -48,15 +48,9 @@ run_in_container_verbose() {
         --kill-after=10s 240s bash -euo pipefail -c "$1" 2>&1
 }
 
-# Own a fresh container; cleanup also runs when setup or a bounded probe fails.
-run_browser_relay_regression() (
-    set -euo pipefail
-    work=$(mktemp -d) || exit
-    owner="ocu-browser-relay-${work##*/}"
-    launching=0
-    # Host Python bounds Docker calls, including startup and cleanup.
-    bounded_docker() {
-        python3 -c '
+# Host Python bounds Docker calls, including startup and cleanup.
+bounded_docker() {
+    python3 -c '
 import subprocess
 import sys
 
@@ -67,22 +61,33 @@ except subprocess.TimeoutExpired:
     sys.exit(124)
 sys.exit(result.returncode)
 ' "$@"
-    }
+}
+
+# Remove every container labelled <label-key>=<owner>. The label, not the
+# cidfile, is the record: a timed-out Docker client may not have written it.
+reap_owned_containers() {
+    local owned container rc=0
+    owned=$(bounded_docker 30 ps -aq --filter "label=$1=$2") || return 1
+    for container in $owned; do
+        if ! bounded_docker 30 rm -f "$container" >/dev/null; then
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+# Own a fresh container; cleanup also runs when setup or a bounded probe fails.
+run_browser_relay_regression() (
+    set -euo pipefail
+    work=$(mktemp -d) || exit
+    owner="ocu-browser-relay-${work##*/}"
+    launching=0
     cleanup() {
         rc=$?
         trap - EXIT
-        owned=""
-        if [ -s "$work/cid" ]; then
-            owned=$(cat "$work/cid") || rc=1
-        elif [ "$launching" -eq 1 ]; then
-            # A timed-out Docker client may not have written its cidfile.
-            owned=$(bounded_docker 30 ps -aq --filter "label=ocu.browser-relay-test-owner=$owner") || rc=1
+        if [ "$launching" -eq 1 ]; then
+            reap_owned_containers ocu.browser-relay-test-owner "$owner" || rc=1
         fi
-        for container in $owned; do
-            if ! bounded_docker 30 rm -f "$container" >/dev/null; then
-                rc=1
-            fi
-        done
         rm -rf "$work"
         exit "$rc"
     }
@@ -99,7 +104,7 @@ sys.exit(result.returncode)
     bounded_docker 30 run -d --rm --platform linux/amd64 --user=assistant \
         --cidfile "$work/cid" --entrypoint=bash \
         --label "ocu.browser-relay-test-owner=$owner" \
-        -e PLAYWRIGHT_CLI_CONFIG=/tmp/relay-playwright.json \
+        -e PLAYWRIGHT_MCP_CONFIG=/tmp/relay-playwright.json \
         "$IMAGE" -c 'exec sleep 180' >/dev/null || exit
     cid=$(cat "$work/cid") || exit
 
@@ -250,6 +255,81 @@ test_browser_relay() {
         fail "browser relay regression exited $RELAY_EXIT"
     fi
     printf '%s\n' "$RELAY_OUT"
+}
+
+# Own a container started through the real ENTRYPOINT, which writes the
+# production CLI config (run_in_container bypasses it); probe from the home
+# directory and from an unrelated one, each in its own subshell.
+run_browser_cli_config_regression() (
+    set -euo pipefail
+    work=$(mktemp -d) || exit
+    owner="ocu-browser-cli-config-${work##*/}"
+    launching=0
+    cleanup() {
+        rc=$?
+        trap - EXIT
+        if [ "$launching" -eq 1 ]; then
+            reap_owned_containers ocu.browser-cli-config-test-owner "$owner" || rc=1
+        fi
+        rm -rf "$work"
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    existing=$(bounded_docker 30 ps -aq --filter "label=ocu.browser-cli-config-test-owner=$owner") || exit
+    if [ -n "$existing" ]; then
+        echo "Refusing to reuse browser CLI config test ownership label: $owner" >&2
+        exit 1
+    fi
+    launching=1
+
+    # The entrypoint ends with exec "$@", so sleep keeps the container alive.
+    bounded_docker 30 run -d --rm --platform linux/amd64 --network=none --user=assistant \
+        --cidfile "$work/cid" \
+        --label "ocu.browser-cli-config-test-owner=$owner" \
+        "$IMAGE" sleep 420 >/dev/null || exit
+    cid=$(cat "$work/cid") || exit
+
+    # Two iterations of at most 60 + 60 + 30 s each fit inside the bound.
+    bounded_docker 400 exec -i "$cid" timeout 360s bash -s <<'CLI_CONFIG_PROBE'
+set -uo pipefail
+for i in $(seq 50); do [ -s /home/assistant/playwright-cli.json ] && break; sleep 0.2; done
+[ -s /home/assistant/playwright-cli.json ] || { echo "entrypoint did not write /home/assistant/playwright-cli.json" >&2; exit 1; }
+rc=0
+for dir in /home/assistant /tmp; do
+  (
+    set -euo pipefail
+    trap 'timeout 30s playwright-cli close >/dev/null 2>&1 || echo "close failed from '"$dir"'" >&2' EXIT
+    cd "$dir" || exit 1
+    rm -f /mnt/user-data/files/page-*.yml
+    if out=$(timeout 60s bash -o pipefail -c "playwright-cli open about:blank 2>&1 | head -40"); then status=0; else status=$?; fi
+    printf 'open from %s: exit %s\n%s\n' "$dir" "$status" "$out"
+    case "$out" in *"Chromium distribution"*) echo "chrome channel fallback from $dir" >&2; exit 1;; esac
+    [ "$status" -eq 0 ] && [[ "$out" == *opened* ]] && [[ "$out" == *about:blank* ]] || { echo "open did not report an opened about:blank page from $dir" >&2; exit 1; }
+    if snap=$(timeout 60s playwright-cli snapshot 2>&1 | head -20); then :; else echo "snapshot failed from $dir: $snap" >&2; exit 1; fi
+    printf 'snapshot from %s:\n%s\n' "$dir" "$snap"
+    [[ "$snap" == *"mnt/user-data/files/page-"*".yml)"* ]] || { echo "snapshot link does not point into /mnt/user-data/files from $dir" >&2; exit 1; }
+    ls /mnt/user-data/files/page-*.yml >/dev/null 2>&1 || { echo "no snapshot under /mnt/user-data/files from $dir" >&2; ls -la /mnt/user-data/files >&2 2>&1 || true; exit 1; }
+    for stray in /home/assistant/.playwright-cli /tmp/.playwright-cli; do
+      [ ! -e "$stray" ] || { echo "unexpected $stray from $dir" >&2; ls -la "$stray" >&2 2>&1 || true; exit 1; }
+    done
+  ); st=$?; [ "$st" -eq 0 ] || { rc=1; echo "FAILED from $dir" >&2; }
+done
+exit "$rc"
+CLI_CONFIG_PROBE
+)
+
+test_browser_cli_config() {
+    echo ""
+    echo "[browser-cli-config] Production CLI config loads from /home/assistant and /tmp"
+    if CLI_CONFIG_OUT=$(run_browser_cli_config_regression 2>&1); then
+        pass "browser CLI loads the production config; snapshots land in /mnt/user-data/files"
+    else
+        CLI_CONFIG_EXIT=$?
+        fail "browser CLI config regression exited $CLI_CONFIG_EXIT"
+    fi
+    printf '%s\n' "$CLI_CONFIG_OUT"
 }
 
 if [ "$MODE" = "--browser-relay-only" ]; then
@@ -744,6 +824,7 @@ else
     fail "entrypoint missing escape-hint line (NO_AUTOSTART=1 bash / touch /tmp/.no_autostart): $ENTRYPOINT_OUT"
 fi
 
+test_browser_cli_config
 test_browser_relay
 
 # Summary
