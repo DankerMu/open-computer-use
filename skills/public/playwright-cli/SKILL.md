@@ -179,6 +179,8 @@ playwright-cli close
 playwright-cli delete-data
 ```
 
+A `--config` file replaces the whole production configuration, including `outputDir`; set `outputDir` to `/mnt/user-data/files` in it if the files should appear in the workspace.
+
 ## Snapshots
 
 After each command, playwright-cli provides a snapshot of the current browser state.
