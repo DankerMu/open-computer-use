@@ -30,7 +30,9 @@ const clone = value => JSON.parse(JSON.stringify(value));
 const signed = {documentType:'word', document:{key:'stable-key',url:'http://private.test/office/source/ticket',fileType:'docx',permissions:{edit:true}},editorConfig:{callbackUrl:'http://private.test/office/callback/chat/session',mode:'edit',customization:{forcesave:false}},token:'signed-configuration-token'};
 const initial = {session_id:'session-id',file_id:file,document_key:'stable-key',state:'editing',reason:null,save_seq:2,last_committed_seq:2,last_published_seq:2,workspace_changed:false,saved_as:null,...options.status};
 let currentStatus = clone(initial);
-const response = (status, body) => ({ok:status>=200&&status<300,status,json:async()=>{
+const statusReplies = [...(options.statusReplies||[])];
+const response = (status, body, raw=false) => ({ok:status>=200&&status<300,status,json:async()=>{
+  if(raw)throw new SyntaxError('Unexpected token < in JSON');
   if(status===409&&options.deferRefusalBody)return new Promise(resolve=>{resolveRefusalBody=()=>resolve(clone(body));});
   const kind=body?.editor_config!==undefined?'create':body?.workspace_changed!==undefined?'status':
     body?.intent||body?.reason==='documentserver_unavailable'&&body?.save_seq!==undefined?'save':body?.session_id&&body?.state?'close':null;
@@ -131,12 +133,13 @@ const fetch=async(url,init={})=>{
   }
   if(options.statusError)return response(500,{reason:'state_corrupt'});
   statusReads++; activeStatuses++; maxActiveStatuses=Math.max(maxActiveStatuses,activeStatuses);
-  const reply=response(200,currentStatus);
-  if(options.holdStatusAfter!==undefined&&statusReads>options.holdStatusAfter){
-    return new Promise(resolve=>heldStatuses.push(()=>{activeStatuses--;resolve(reply);}));
+  const scripted=statusReplies.shift();
+  const reply=scripted?.throw?null:scripted?response(scripted.status,scripted.body??null,scripted.raw):response(200,currentStatus);
+  const settle=()=>{activeStatuses--;if(!reply)throw new Error('status transport failed');return reply;};
+  if(scripted?.hold||options.holdStatusAfter!==undefined&&statusReads>options.holdStatusAfter){
+    return new Promise((resolve,reject)=>heldStatuses.push(()=>{try{resolve(settle());}catch(error){reject(error);}}));
   }
-  activeStatuses--;
-  return reply;
+  return settle();
 };
 const context=vm.createContext({window:hostWindow,document:hostDocument,URL,Headers,AbortController,fetch,console,
   setTimeout:hostWindow.setTimeout,clearTimeout:hostWindow.clearTimeout,queueMicrotask});
@@ -180,7 +183,7 @@ for(const action of options.actions||[]){
   else if(action.kind==='releaseSave')resolveSave();
   else if(action.kind==='status')currentStatus={...currentStatus,...action.status};
   else if(action.kind==='tick')await advance(action.ms);
-  else if(action.kind==='releaseStatus')heldStatuses.shift()();
+  else if(action.kind==='releaseStatus'){if(!heldStatuses.length)throw new Error('no status request is held');heldStatuses.shift()();}
   else if(action.kind==='releaseClose')resolveClose?.();
   else if(action.kind==='allowClose')options.rejectClose=false;
   else if(action.kind==='pagehide')emit('pagehide');
@@ -193,6 +196,7 @@ for(const action of options.actions||[]){
   else if(action.kind==='dispose')host.dispose();
   else if(action.kind==='error')configs.at(-1).events.onError({data:{errorCode:-18}});
   else if(action.kind==='allowStatus')options.holdStatusAfter=undefined;
+  else if(action.kind==='statusReplies')statusReplies.push(...action.replies);
   else if(action.kind==='allowSave'){options.rejectSave=false;options.saveTransportError=false;}
   else if(action.kind==='message')sendTestMessage(action);
   else throw new Error('Unknown test action: '+action.kind);
@@ -609,6 +613,156 @@ def test_status_poll_does_not_overlap_a_held_request(tmp_path):
     ])
     assert len([row for row in result["calls"] if row["method"] == "GET"]) == 2
     assert result["activeStatuses"] == result["maxActiveStatuses"] == 1
+
+
+_TRANSIENT = [
+    {"throw": True}, {"status": 502, "raw": True}, {"status": 503, "body": {"reason": "publish_pending"}},
+    {"status": 504, "raw": True}, {"status": 200, "raw": True},
+]
+_TRANSIENT_IDS = ["fetch-throws", "502-html", "503-json", "504-html", "200-unparseable"]
+_FOREIGN_STATUS = {"session_id": "other-session", "file_id": "document-id", "document_key": "stable-key",
+                   "state": "editing", "reason": None, "save_seq": 2, "last_committed_seq": 2,
+                   "last_published_seq": 2, "workspace_changed": False, "saved_as": None}
+
+
+def _polls(result):
+    return [row for row in result["calls"] if row["method"] == "GET"]
+
+
+def _poll_delays(resources):
+    return [delay for delay in resources["timerDelays"] if delay != 300000]
+
+
+@pytest.mark.parametrize("reply", _TRANSIENT, ids=_TRANSIENT_IDS)
+def test_transient_status_failure_keeps_loaded_editor_usable_and_polling(tmp_path, reply):
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
+        {"kind": "statusReplies", "replies": [reply]}, {"kind": "tick", "ms": 1000},
+        {"kind": "tick", "ms": 1000}, {"kind": "command", "command": "save"},
+    ])
+    outage = result["actionStates"][1]
+    assert (outage["state"], outage["dirty"], outage["reason"]) == ("editing", True, None)
+    assert _poll_delays(result["actionResources"][1]) == [1000]
+    assert _poll_delays(result["actionResources"][2]) == [1000]
+    assert result["actionResources"][1]["timerDelays"].count(300000) == 1
+    assert result["actionResources"][2]["timerDelays"].count(300000) == 1
+    assert result["actionResources"][2]["calls"] == result["actionResources"][1]["calls"] + 1
+    assert result["actionResources"][3]["saves"] == 1
+    assert all(state["state"] != "error" for state in _states(result))
+    assert _states(result)[-1]["state"] == "saving"
+    assert (result["attempts"], result["destroyed"], len(result["configs"])) == (1, 0, 1)
+    assert result["dom"]["children"][1]["hidden"] is False
+
+
+def test_consecutive_status_failures_back_off_to_ten_seconds_then_reset(tmp_path):
+    ticks = [1000, 1000, 2000, 4000, 8000, 10000, 10000]
+    result = _run(tmp_path, open=True, actions=[
+        {"kind": "statusReplies", "replies": [*_TRANSIENT, {"throw": True}]},
+        *({"kind": "tick", "ms": ms} for ms in ticks),
+    ])
+    assert [_poll_delays(row) for row in result["actionResources"][1:]] == [
+        [1000], [2000], [4000], [8000], [10000], [10000], [1000],
+    ]
+    assert len(_polls(result)) == 8
+    assert all(state["state"] != "error" for state in _states(result))
+
+
+@pytest.mark.parametrize(("reply", "reason"), [
+    ({"status": 401, "body": {"reason": "unauthorized"}}, "unauthorized"),
+    ({"status": 401, "raw": True}, "session_status_failed"),
+    ({"status": 403, "raw": True}, "session_status_failed"),
+    ({"status": 404, "raw": True}, "session_status_failed"),
+    ({"status": 500, "body": {"reason": "state_corrupt"}}, "state_corrupt"),
+    ({"status": 500, "raw": True}, "session_status_failed"),
+    ({"status": 400, "raw": True}, "session_status_failed"),
+    ({"status": 400, "body": {"reason": "invalid_request"}}, "invalid_request"),
+    ({"status": 429, "raw": True}, "session_status_failed"),
+    ({"status": 429, "body": {"reason": "rate_limited"}}, "rate_limited"),
+    ({"status": 200, "body": _FOREIGN_STATUS}, "invalid_session_status"),
+], ids=["401-json", "401-html", "403-html", "404-html", "500-json", "500-html", "400-html", "400-json",
+        "429-html", "429-json", "foreign-session"])
+def test_terminal_status_answer_still_ends_editor(tmp_path, reply, reason):
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
+        {"kind": "statusReplies", "replies": [reply]}, {"kind": "tick", "ms": 1000},
+        {"kind": "command", "command": "save"}, {"kind": "tick", "ms": 30000},
+    ])
+    assert (result["actionStates"][1]["state"], result["actionStates"][1]["reason"]) == ("error", reason)
+    assert result["actionResources"][1]["timerDelays"] == []
+    assert (_states(result)[-1]["state"], _states(result)[-1]["reason"]) == ("error", reason)
+    assert result["timers"] == 0
+    assert len(_polls(result)) == 2
+    assert result["actionResources"][-1]["saves"] == 0
+
+
+@pytest.mark.parametrize(("transients", "backoff"), [
+    ([{"status": 502, "raw": True}], [1000]),
+    ([{"status": 502, "raw": True}, {"throw": True}], [1000, 2000]),
+], ids=["after-one-502", "after-502-and-throw"])
+def test_terminal_answer_after_transient_failures_ends_editor(tmp_path, transients, backoff):
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
+        {"kind": "statusReplies", "replies": [*transients, {"status": 401, "raw": True}]},
+        *({"kind": "tick", "ms": ms} for ms in [1000, *backoff]), {"kind": "tick", "ms": 30000},
+    ])
+    outage, ended, after = len(transients), len(transients) + 1, len(transients) + 2
+    assert (result["actionStates"][outage]["state"], result["actionStates"][outage]["reason"]) == ("editing", None)
+    assert _poll_delays(result["actionResources"][outage]) == backoff[-1:]
+    assert (result["actionStates"][ended]["state"], result["actionStates"][ended]["reason"]) == (
+        "error", "session_status_failed")
+    assert result["actionResources"][ended]["timerDelays"] == []
+    assert result["actionResources"][after]["calls"] == result["actionResources"][ended]["calls"]
+    assert len(_polls(result)) == len(transients) + 2
+    assert result["timers"] == 0
+
+
+@pytest.mark.parametrize(("reply", "reason"), [
+    ({"status": 502, "raw": True}, "session_status_failed"),
+    ({"status": 503, "body": {"reason": "publish_pending"}}, "publish_pending"),
+    ({"throw": True}, "session_status_failed"),
+], ids=["502-html", "503-json", "fetch-throws"])
+def test_first_status_outage_still_ends_editor_before_loading(tmp_path, reply, reason):
+    result = _run(tmp_path, open=True, statusReplies=[reply])
+    assert (_states(result)[-1]["state"], _states(result)[-1]["reason"]) == ("error", reason)
+    assert result["configs"] == result["scripts"] == []
+    assert result["timers"] == 0
+    assert len(_polls(result)) == 1
+
+
+@pytest.mark.parametrize("moment", ["backoff", "in-flight"])
+def test_dispose_during_status_outage_leaves_no_poll(tmp_path, moment):
+    reply = {"throw": True, "hold": moment == "in-flight"}
+    release = [{"kind": "releaseStatus"}] if moment == "in-flight" else []
+    result = _run(tmp_path, open=True, actions=[
+        {"kind": "statusReplies", "replies": [reply]}, {"kind": "tick", "ms": 1000},
+        {"kind": "dispose"}, *release, {"kind": "tick", "ms": 60000},
+    ])
+    before = result["actionResources"][1]
+    assert _poll_delays(before) == ([1000] if moment == "backoff" else [])
+    assert result["actionStates"][1]["state"] == "editing"
+    assert result["actionResources"][2]["timerDelays"] == []
+    assert result["timers"] == 0
+    assert result["actionResources"][-1]["calls"] == before["calls"]
+    assert all(result["signals"])
+
+
+def test_save_during_status_outage_joins_the_flight_and_keeps_backoff(tmp_path):
+    result = _run(tmp_path, open=True, modify=[True, False], saveTransportError=True, actions=[
+        {"kind": "statusReplies", "replies": [
+            {"status": 503, "body": {"reason": "publish_pending"}}, {"status": 502, "raw": True, "hold": True},
+            {"throw": True},
+        ]},
+        {"kind": "tick", "ms": 1000}, {"kind": "tick", "ms": 1000},
+        {"kind": "command", "command": "save"}, {"kind": "releaseStatus"},
+        {"kind": "tick", "ms": 2000}, {"kind": "allowSave"}, {"kind": "command", "command": "save"},
+    ])
+    resources, states = result["actionResources"], result["actionStates"]
+    assert result["maxActiveStatuses"] == 1
+    assert resources[3]["saves"] == 1 and states[3]["state"] == "editing"
+    assert _poll_delays(resources[3]) == []
+    assert _poll_delays(resources[4]) == [2000]
+    assert (states[5]["state"], states[5]["reason"]) == ("editing", "save_failed")
+    assert _poll_delays(resources[5]) == [1000]
+    assert resources[7]["saves"] == 2
+    assert (states[7]["state"], states[7]["reason"]) == ("saving", None)
+    assert all(state["state"] != "error" for state in _states(result))
 
 
 def test_publish_refused_during_own_autosave_retries_once_after_editing(tmp_path):

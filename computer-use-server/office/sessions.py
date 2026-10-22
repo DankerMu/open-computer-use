@@ -870,6 +870,9 @@ def _reconcile_save(store, chat, session_id, save_seq, intent, document_key, out
                 current["pending_save_seq"] = None
                 if current["state"] == "saving":
                     current["state"] = "editing"
+                # Nothing new over a published latest is a successful save; an earlier failure is stale.
+                if selected["published"] and current["state"] == "editing":
+                    current["reason"] = None
             return
         if current["state"] == "saving":
             current["state"] = "editing"

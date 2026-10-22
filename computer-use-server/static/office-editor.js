@@ -14,6 +14,10 @@ const REFUSALS = new Map([
 // A stalled API script must become a visible failure instead of leaving opening forever.
 const API_LOAD_TIMEOUT_MS = 10000;
 const POLL_DELAY_MS = 1000;
+// An OCU restart or proxy blip must not end the editor; retries stay bounded only by its lifetime.
+const POLL_BACKOFF_MAX_MS = 10000;
+// The gateway's static upstream answers these while OCU is down; the broker never sends them as a verdict.
+const TRANSIENT_STATUS_CODES = new Set([502, 503, 504]);
 const AUTO_SAVE_DELAY_MS = 5 * 60 * 1000;
 
 function loadEditorApi(origin, hostWindow, hostDocument, signal) {
@@ -96,6 +100,7 @@ export function createOfficeEditorHost({
   let autoSaveTimer = null;
   let statusFlight = null;
   let refreshAgain = false;
+  let statusFailures = 0;
   let mutationEpoch = 0;
   let autoSave = null;
   let publishIntent = null;
@@ -222,19 +227,50 @@ export function createOfficeEditorHost({
         refreshAgain = false;
         const epoch = mutationEpoch;
         try {
-          const response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store', signal: lifetime.signal });
+          let response;
+          try {
+            response = await ocuFetch(`/api/office/${encodeURIComponent(chatId)}/sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store', signal: lifetime.signal });
+          } catch {
+            if (final()) return false;
+            if (epoch !== mutationEpoch) {
+              refreshAgain = true;
+              continue;
+            }
+            // Until a first status is applied, openSession needs a verdict to load or end the editor.
+            if (snapshot === null) {
+              fail('session_status_failed');
+              return false;
+            }
+            statusFailures++;
+            break;
+          }
           if (final()) return false;
-          const status = await response.json();
+          const transient = TRANSIENT_STATUS_CODES.has(response.status);
+          let status = null;
+          let parsed = false;
+          if (!transient || snapshot === null) {
+            try {
+              status = await response.json();
+              parsed = true;
+            } catch {
+              // An unparseable body is classified by its status code below.
+            }
+          }
           if (final()) return false;
           if (epoch !== mutationEpoch) {
             refreshAgain = true;
             continue;
           }
-          if (!response.ok) {
-            fail(reasonOf(status, 'session_status_failed'));
+          if (snapshot !== null && (transient || (response.ok && !parsed))) {
+            statusFailures++;
+            break;
+          }
+          if (!response.ok || !parsed) {
+            fail(parsed ? reasonOf(status, 'session_status_failed') : 'session_status_failed');
             return false;
           }
           applied = applyStatus(status);
+          if (applied) statusFailures = 0;
         } catch {
           if (epoch !== mutationEpoch) refreshAgain = true;
           else fail('session_status_failed');
@@ -246,7 +282,7 @@ export function createOfficeEditorHost({
       if (!final()) pollTimer = hostWindow.setTimeout(() => {
         pollTimer = null;
         void refreshStatus();
-      }, POLL_DELAY_MS);
+      }, statusFailures === 0 ? POLL_DELAY_MS : Math.min(POLL_DELAY_MS * 2 ** (statusFailures - 1), POLL_BACKOFF_MAX_MS));
     });
     return statusFlight;
   }
