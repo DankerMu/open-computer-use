@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import unittest
+from unittest.mock import patch
 from test_deployment_smoke import wait_for
 
 from support import (
@@ -48,6 +49,7 @@ from support import (
 )
 
 sys.path.insert(0, str(ROOT / "deploy"))
+import recovery
 
 RECOVERY = ROOT / "deploy" / "recovery.py"
 CHAT_ID = "chat-live"
@@ -2690,7 +2692,58 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self.assertTrue((dest / ".restored").exists())
 
 
+class VolumeHelperFailureTests(unittest.TestCase):
+    VOLUME = "ocu-test_open-webui-data"
 
+    def setUp(self):
+        import recovery_resources
+
+        self.resources = recovery_resources
+        self.context = tmp_dir()
+        self.root = Path(self.context.name)
+        self.archive = self.root / "set" / "webui-data.tar.gz"
+
+    def tearDown(self):
+        self.context.cleanup()
+
+    def _fail(self, operation, *, stdout="", stderr=""):
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout=stdout, stderr=stderr)
+        with patch.object(self.resources, "inspect_volume", return_value={}), patch.object(
+            self.resources, "run_volume_helper", return_value=failed
+        ):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                operation(self.VOLUME, self.archive, "helper:image")
+        return str(raised.exception)
+
+    def _valid_archive(self):
+        source = self.root / "empty"
+        source.mkdir()
+        self.resources.recovery_fs.capture_tree(source, self.archive)
+
+    def _assert_reports_helper_reason(self, operation):
+        reason = "RecoveryError: /output/x.tar.gz: unsafe symlink a/b"
+        message = self._fail(operation, stdout="ignored stdout\n", stderr=reason + "\n")
+        self.assertIn(f"volume helper failed for {self.VOLUME}", message)
+        self.assertIn(reason, message)
+        self.assertNotIn("ignored stdout", message)
+
+        tail = "t" * 1990 + "TAIL-MARK"
+        message = self._fail(operation, stderr="HEAD-MARK" + "q" * 500 + tail + "\n")
+        self.assertIn(f"volume helper failed for {self.VOLUME}", message)
+        self.assertTrue(message.endswith("q" + tail), message[-80:])
+        self.assertEqual(message.count("q"), 1)
+        self.assertNotIn("HEAD-MARK", message)
+
+        message = self._fail(operation, stdout="  stdout reason\n", stderr="")
+        self.assertIn(f"volume helper failed for {self.VOLUME}", message)
+        self.assertIn("stdout reason", message)
+
+    def test_capture_volume_failure_carries_helper_reason(self):
+        self._assert_reports_helper_reason(self.resources.capture_volume)
+
+    def test_restore_volume_failure_carries_helper_reason(self):
+        self._valid_archive()
+        self._assert_reports_helper_reason(self.resources.restore_volume)
 
 
 if __name__ == "__main__":

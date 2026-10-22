@@ -9,6 +9,7 @@ from pathlib import Path
 import stat
 import tarfile
 import unittest
+from unittest.mock import patch
 
 
 
@@ -201,6 +202,125 @@ class RecoveryFilesystemTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery_fs._reject_destination_conflicts(names)
         self.assertIn("non-directory", str(raised.exception))
+
+    def _require_gnu_tar(self):
+        if not recovery_fs._gnu_tar():
+            self.skipTest("GNU tar unavailable (bsdtar on macOS)")
+
+    def _round_trip_links(self, links: dict[str, str], files: dict[str, bytes]) -> Path:
+        source = self.root / "source"
+        for name, data in files.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        for name, target in links.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(target, path)
+        archive = self.root / "links.tar.gz"
+        recovery_fs.capture_tree(source, archive)
+        dest = self.root / "links-out"
+        recovery_fs.extract_tree(archive, dest)
+        for name, target in links.items():
+            self.assertTrue((dest / name).is_symlink(), name)
+            self.assertEqual(os.readlink(dest / name), target, name)
+        return dest
+
+    def _assert_hf_cache_round_trip(self):
+        dest = self._round_trip_links(
+            {
+                "models--x/snapshots/r1/model.safetensors": "../../blobs/abc",
+                "models--x/snapshots/r1/1_Pooling/config.json": "../../../blobs/def",
+            },
+            {"models--x/blobs/abc": b"weights\n", "models--x/blobs/def": b"pooling\n"},
+        )
+        snapshot = dest / "models--x" / "snapshots" / "r1"
+        self.assertEqual((snapshot / "model.safetensors").read_bytes(), b"weights\n")
+        self.assertEqual((snapshot / "1_Pooling" / "config.json").read_bytes(), b"pooling\n")
+
+    def _assert_confined_links_round_trip(self):
+        dest = self._round_trip_links(
+            {
+                "a/dot-slash": "./y",
+                "a/double-slash": "b//y",
+                "a/dot": ".",
+                "a/dot-dir": "./",
+                "a/parent": "..",
+                "chatA/outputs/y": "../../chatB/x",
+            },
+            {"a/y": b"local\n", "a/b/y": b"nested\n", "chatB/x": b"other chat\n"},
+        )
+        self.assertEqual((dest / "a" / "dot-slash").read_bytes(), b"local\n")
+        self.assertEqual((dest / "a" / "double-slash").read_bytes(), b"nested\n")
+        self.assertEqual((dest / "chatA" / "outputs" / "y").read_bytes(), b"other chat\n")
+
+    def _assert_escaping_capture_refused(self):
+        source = self.root / "escape"
+        (source / "a").mkdir(parents=True)
+        os.symlink("../../outside", source / "a" / "x")
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery_fs.capture_tree(source, self.root / "escape.tar.gz")
+        self.assertIn("unsafe symlink", str(raised.exception))
+
+    def test_hf_cache_links_round_trip_with_gnu_tar(self):
+        self._require_gnu_tar()
+        self._assert_hf_cache_round_trip()
+
+    def test_hf_cache_links_round_trip_with_python_fallback(self):
+        with patch.object(recovery_fs, "_gnu_tar", return_value=False):
+            self._assert_hf_cache_round_trip()
+
+    def test_confined_links_round_trip_with_gnu_tar(self):
+        self._require_gnu_tar()
+        self._assert_confined_links_round_trip()
+
+    def test_confined_links_round_trip_with_python_fallback(self):
+        with patch.object(recovery_fs, "_gnu_tar", return_value=False):
+            self._assert_confined_links_round_trip()
+
+    def test_escaping_link_capture_refused_with_gnu_tar(self):
+        self._require_gnu_tar()
+        self._assert_escaping_capture_refused()
+
+    def test_escaping_link_capture_refused_with_python_fallback(self):
+        with patch.object(recovery_fs, "_gnu_tar", return_value=False):
+            self._assert_escaping_capture_refused()
+
+    def test_escaping_link_archives_refuse_before_mutation(self):
+        cases = [
+            ("x", "../y"),
+            ("a/x", "../../y"),
+            ("a/b/x", "a/../../../y"),
+            ("a/x", "b/../y"),
+            ("a/x", "/etc/passwd"),
+            ("a/b/x", "../../.."),
+            ("a/x", ""),
+        ]
+        for index, (name, target) in enumerate(cases):
+            with self.subTest(name=name, target=target):
+                archive = self.root / f"unsafe-{index}.tar.gz"
+                with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as bundle:
+                    root = tarfile.TarInfo(name=".")
+                    root.type = tarfile.DIRTYPE
+                    bundle.addfile(root)
+                    parts = name.split("/")
+                    for depth in range(1, len(parts)):
+                        directory = tarfile.TarInfo(name="/".join(parts[:depth]))
+                        directory.type = tarfile.DIRTYPE
+                        bundle.addfile(directory)
+                    link = tarfile.TarInfo(name=name)
+                    link.type = tarfile.SYMTYPE
+                    link.linkname = target
+                    bundle.addfile(link)
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    recovery_fs.validate_archive(archive)
+                self.assertIn("unsafe symlink", str(raised.exception))
+                dest = self.root / f"unsafe-out-{index}"
+                dest.mkdir()
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    recovery_fs.extract_tree(archive, dest)
+                self.assertIn("unsafe symlink", str(raised.exception))
+                self.assertEqual(os.listdir(dest), [])
 
 
 

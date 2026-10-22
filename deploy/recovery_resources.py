@@ -638,6 +638,10 @@ def _run_helper(
     return docker(*command)
 
 
+def _helper_detail(result) -> str:
+    return str(result.stderr or result.stdout or "").strip()[-2000:]
+
+
 def capture_volume(volume: str, archive: Path, image: str) -> dict:
     archive.parent.mkdir(parents=True, exist_ok=True)
     inspect_volume(volume)
@@ -650,7 +654,7 @@ def capture_volume(volume: str, archive: Path, image: str) -> dict:
         ["capture", "/source", f"/output/{archive.name}"],
     )
     if result.returncode != 0:
-        raise RecoveryError(f"volume helper failed for {volume}")
+        raise RecoveryError(f"volume helper failed for {volume}: {_helper_detail(result)}")
     if not archive.exists() or archive.stat().st_size == 0:
         raise RecoveryError(f"volume helper did not publish {archive.name}")
     recovery_fs.validate_archive(archive)
@@ -669,7 +673,7 @@ def restore_volume(volume: str, archive: Path, image: str) -> None:
         ["extract", f"/input/{archive.name}", "/target"],
     )
     if result.returncode != 0:
-        raise RecoveryError(f"volume helper failed for {volume}")
+        raise RecoveryError(f"volume helper failed for {volume}: {_helper_detail(result)}")
 
 
 def _copy_tree_archive(source: Path, archive: Path) -> dict:
@@ -1429,8 +1433,7 @@ def _broker_listing(chat_dir: Path, chat_id: str, image: str) -> dict:
         ["listing", "/chat", chat_id],
     )
     if result.returncode != 0:
-        detail = str(result.stderr or result.stdout or "").strip()
-        raise RecoveryError(f"selected-release broker listing failed: {detail}")
+        raise RecoveryError(f"selected-release broker listing failed: {_helper_detail(result)}")
     raw = result.stdout or ""
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
