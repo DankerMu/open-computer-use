@@ -228,11 +228,29 @@ def _apply_metadata(path: Path, member: tarfile.TarInfo) -> None:
         os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
 
 
+def _require_safe_target(archive: Path, dest: Path, name: str, member: tarfile.TarInfo) -> None:
+    current = dest
+    parts = Path(name).parts
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        if index < len(parts) - 1:
+            if not stat.S_ISDIR(info.st_mode):
+                fail(f"{archive}: unsafe parent {name}")
+        elif not (member.isdir() and stat.S_ISDIR(info.st_mode)):
+            fail(f"{archive}: existing target {name}")
+
+
 def _python_extract(archive: Path, dest: Path, members: list[tarfile.TarInfo]) -> None:
     with tarfile.open(archive, "r:*") as bundle:
         for member in members:
             name = canonical_member_name(member.name)
             target = dest if name == "." else dest / name
+            if name != ".":
+                _require_safe_target(archive, dest, name, member)
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
             elif member.issym():

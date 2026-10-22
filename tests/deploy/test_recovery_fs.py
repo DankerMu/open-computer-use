@@ -322,6 +322,100 @@ class RecoveryFilesystemTests(unittest.TestCase):
                 self.assertIn("unsafe symlink", str(raised.exception))
                 self.assertEqual(os.listdir(dest), [])
 
+    def _require_case_insensitive(self):
+        probe = self.root / "CaseProbe"
+        probe.write_bytes(b"")
+        insensitive = (self.root / "caseprobe").exists()
+        probe.unlink()
+        if not insensitive:
+            self.skipTest("temporary filesystem is case-sensitive")
+
+    def _owned_archive(self, archive: Path, members: list[tuple[str, str, str | bytes]]) -> list:
+        with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as bundle:
+            for name, kind, value in members:
+                member = tarfile.TarInfo(name=name)
+                member.uid = os.getuid()
+                member.gid = os.getgid()
+                member.mode = 0o755
+                if kind == "dir":
+                    member.type = tarfile.DIRTYPE
+                    bundle.addfile(member)
+                elif kind == "link":
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = value
+                    bundle.addfile(member)
+                else:
+                    member.size = len(value)
+                    member.mode = 0o644
+                    bundle.addfile(member, io.BytesIO(value))
+        return recovery_fs.inspect_archive(archive)
+
+    def _assert_case_alias_refused(self, members, expected: str):
+        self._require_case_insensitive()
+        archive = self.root / "alias.tar.gz"
+        self._owned_archive(archive, members)
+        outer = self.root / "x"
+        dest = outer / "y" / "dest"
+        (outer / "y").mkdir(parents=True)
+        with patch.object(recovery_fs, "_gnu_tar", return_value=False):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery_fs.extract_tree(archive, dest)
+        self.assertFalse((outer / "evil").exists(), "file written outside the destination")
+        self.assertEqual(os.listdir(outer), ["y"])
+        self.assertEqual(os.listdir(outer / "y"), ["dest"])
+        self.assertIn(expected, str(raised.exception))
+
+    def test_case_alias_parent_link_is_refused_before_writing(self):
+        self._assert_case_alias_refused(
+            [
+                (".", "dir", ""),
+                ("d", "dir", ""),
+                ("d/L", "link", ".."),
+                ("d/l/M", "link", "../.."),
+                ("d/l/m/evil", "file", b"pwned\n"),
+            ],
+            "unsafe parent d/l/M",
+        )
+
+    def test_case_alias_link_over_existing_directory_is_refused(self):
+        self._assert_case_alias_refused(
+            [
+                (".", "dir", ""),
+                ("d", "dir", ""),
+                ("d/l/m/evil", "file", b"pwned\n"),
+                ("d/L", "link", ".."),
+                ("d/l/M", "link", "../.."),
+            ],
+            "existing target d/L",
+        )
+
+    def test_python_extract_refuses_on_disk_symlink_parent(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        dest = self.root / "dest"
+        (dest / "d").mkdir(parents=True)
+        os.symlink(outside, dest / "d" / "l")
+        archive = self.root / "parent.tar.gz"
+        members = self._owned_archive(
+            archive,
+            [(".", "dir", ""), ("d", "dir", ""), ("d/l/m/evil", "file", b"pwned\n")],
+        )
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery_fs._python_extract(archive, dest, members)
+        self.assertEqual(os.listdir(outside), [])
+        self.assertIn("unsafe parent d/l/m/evil", str(raised.exception))
+
+    def test_python_extract_refuses_existing_target(self):
+        dest = self.root / "dest"
+        (dest / "d").mkdir(parents=True)
+        (dest / "d" / "x").write_bytes(b"kept\n")
+        archive = self.root / "existing.tar.gz"
+        members = self._owned_archive(archive, [(".", "dir", ""), ("d/x", "link", "y")])
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery_fs._python_extract(archive, dest, members)
+        self.assertEqual((dest / "d" / "x").read_bytes(), b"kept\n")
+        self.assertIn("existing target d/x", str(raised.exception))
+
 
 
 
