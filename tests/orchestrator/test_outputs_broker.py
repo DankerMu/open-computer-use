@@ -428,7 +428,7 @@ def test_page_and_constructor_limits_are_strict_and_positive(world):
         broker.reconcile(CHAT, limit=3)
 
 
-def test_active_file_and_file_size_limits_preserve_prior_index_bytes(world):
+def test_active_file_limit_counts_oversized_files_and_preserves_prior_index_bytes(world):
     broker_module, _docker_manager, data = world
     active_limited = broker_module.OutputsBroker(max_active_files=1)
     _put(data, "a.txt", b"a")
@@ -439,13 +439,303 @@ def test_active_file_and_file_size_limits_preserve_prior_index_bytes(world):
         active_limited.reconcile(CHAT)
     assert _index(data).read_bytes() == before_active
 
-    sized_limited = broker_module.OutputsBroker(max_file_size=3)
-    sized_limited.reconcile(OTHER_CHAT)
+    # An oversized file is listed rather than refused, so it occupies an
+    # active-file slot like any other regular file.
+    both_limited = broker_module.OutputsBroker(max_active_files=1, max_file_size=3)
+    _put(data, "small.txt", b"abc", OTHER_CHAT)
+    both_limited.reconcile(OTHER_CHAT)
     before_size = _index(data, OTHER_CHAT).read_bytes()
     _put(data, "large.txt", b"four", OTHER_CHAT)
     with pytest.raises(broker_module.LimitExceededError):
-        sized_limited.reconcile(OTHER_CHAT)
+        both_limited.reconcile(OTHER_CHAT)
     assert _index(data, OTHER_CHAT).read_bytes() == before_size
+
+    (_outputs(data, OTHER_CHAT) / "small.txt").unlink()
+    listing = both_limited.reconcile(OTHER_CHAT)
+    assert [(entry["path"], entry["hash"]) for entry in listing["entries"]] == [("large.txt", None)]
+
+
+def _sparse(data: Path, relative_path: str, size: int, chat: str = CHAT) -> Path:
+    path = _outputs(data, chat) / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as stream:
+        stream.truncate(size)
+    return path
+
+
+def _spy_hashes(broker_module, monkeypatch) -> list[str]:
+    hashed: list[str] = []
+    original = broker_module.OutputsBroker._hash_observation
+
+    def spy(self, chat, observation):
+        hashed.append(observation.path)
+        return original(self, chat, observation)
+
+    monkeypatch.setattr(broker_module.OutputsBroker, "_hash_observation", spy)
+    return hashed
+
+
+def _assert_no_null_fingerprints(index: dict) -> None:
+    assert all(not key.endswith(":None") for key in index["fingerprints"]), index["fingerprints"]
+    hashed_ids = sorted(entry["file_id"] for entry in index["active"].values() if entry["hash"] is not None)
+    assert sorted(file_id for ids in index["fingerprints"].values() for file_id in ids) == hashed_ids
+
+
+def test_oversized_file_is_indexed_without_hash_and_never_read(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    _put(data, "a.txt", b"alpha")
+    _put(data, "nested/b.txt", b"beta")
+    big = _sparse(data, "big.bin", broker_module.MAX_FILE_SIZE + 1)
+    hashed = _spy_hashes(broker_module, monkeypatch)
+    _forbid_inode_open(broker_module, monkeypatch, big)
+    broker = broker_module.OutputsBroker()
+
+    listing = broker.reconcile(CHAT)
+
+    assert listing["total"] == 3
+    assert listing["revision"] == 3
+    assert [entry["path"] for entry in listing["entries"]] == ["a.txt", "big.bin", "nested/b.txt"]
+    oversized = _entry_by_path(listing, "big.bin")
+    _assert_uuid(oversized["file_id"])
+    assert oversized["size"] == broker_module.MAX_FILE_SIZE + 1
+    assert oversized["hash"] is None
+    assert 1 <= oversized["revision"] <= listing["revision"]
+    assert _entry_by_path(listing, "a.txt")["hash"] == hashlib.sha256(b"alpha").hexdigest()
+    assert _entry_by_path(listing, "nested/b.txt")["hash"] == hashlib.sha256(b"beta").hexdigest()
+    assert hashed == ["a.txt", "nested/b.txt"]
+    persisted = _read_index(data)
+    assert persisted["active"]["big.bin"]["hash"] is None
+    assert persisted["active"]["big.bin"]["file_id"] == oversized["file_id"]
+    _assert_no_null_fingerprints(persisted)
+
+    before = _index(data).read_bytes()
+    again = broker.reconcile(CHAT)
+    assert again["unchanged"] is True
+    assert again["revision"] == listing["revision"]
+    assert _entry_by_path(again, "big.bin") == oversized
+    assert hashed == ["a.txt", "nested/b.txt"]
+    assert _index(data).read_bytes() == before
+
+
+def test_crossing_the_file_size_limit_keeps_identity_and_toggles_hash(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    growing = _put(data, "grow.bin", b"tiny")
+    _put(data, "stay.txt", b"stay")
+    broker = broker_module.OutputsBroker(max_file_size=8)
+    before = broker.reconcile(CHAT)
+    seeded = _entry_by_path(before, "grow.bin")
+    stay = _entry_by_path(before, "stay.txt")
+    hashed = _spy_hashes(broker_module, monkeypatch)
+
+    growing.write_bytes(b"0123456789")
+    grown = broker.reconcile(CHAT)
+    grown_entry = _entry_by_path(grown, "grow.bin")
+    assert grown["revision"] == before["revision"] + 1
+    assert grown_entry["file_id"] == seeded["file_id"]
+    assert grown_entry["revision"] == grown["revision"]
+    assert grown_entry["size"] == 10
+    assert grown_entry["hash"] is None
+    assert _entry_by_path(grown, "stay.txt") == stay
+    assert hashed == []
+    _assert_no_null_fingerprints(_read_index(data))
+
+    growing.write_bytes(b"small")
+    shrunk = broker.reconcile(CHAT)
+    shrunk_entry = _entry_by_path(shrunk, "grow.bin")
+    assert shrunk["revision"] == grown["revision"] + 1
+    assert shrunk_entry["file_id"] == seeded["file_id"]
+    assert shrunk_entry["revision"] == shrunk["revision"]
+    assert shrunk_entry["hash"] == hashlib.sha256(b"small").hexdigest()
+    assert _entry_by_path(shrunk, "stay.txt") == stay
+    assert hashed == ["grow.bin"]
+    _assert_no_null_fingerprints(_read_index(data))
+
+
+def test_equal_size_oversized_moves_are_never_paired_as_renames(world):
+    broker_module, _docker_manager, data = world
+    first = _put(data, "one.bin", b"same-oversized-bytes")
+    second = _put(data, "two.bin", b"same-oversized-bytes")
+    small = _put(data, "note.txt", b"note")
+    broker = broker_module.OutputsBroker(max_file_size=8)
+    before = broker.reconcile(CHAT)
+    old_ids = _ids(before)
+    _assert_no_null_fingerprints(_read_index(data))
+
+    first.rename(first.with_name("moved-one.bin"))
+    second.rename(second.with_name("moved-two.bin"))
+    small.rename(small.with_name("renamed.txt"))
+    after = broker.reconcile(CHAT)
+    new_ids = _ids(after)
+    persisted = _read_index(data)
+
+    # Two tombstones, two fresh additions, one hashed rename.
+    assert after["revision"] == before["revision"] + 5
+    assert set(new_ids) == {"moved-one.bin", "moved-two.bin", "renamed.txt"}
+    assert new_ids["renamed.txt"] == old_ids["note.txt"]
+    for old_path, new_path in (("one.bin", "moved-one.bin"), ("two.bin", "moved-two.bin")):
+        assert new_ids[new_path] not in old_ids.values()
+        tombstone = persisted["tombstones"][old_ids[old_path]]
+        assert tombstone["path"] == old_path
+        assert tombstone["hash"] is None
+        assert persisted["active"][new_path]["hash"] is None
+    assert new_ids["moved-one.bin"] != new_ids["moved-two.bin"]
+    _assert_no_null_fingerprints(persisted)
+
+
+def test_validator_accepts_null_hash_only_above_the_file_size_limit(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker(max_file_size=8)
+    _put(data, "small.txt", b"small")
+    _put(data, "large.bin", b"0123456789")
+    broker.reconcile(CHAT)
+    valid = _read_index(data)
+
+    small_null = json.loads(json.dumps(valid))
+    small_entry = small_null["active"]["small.txt"]
+    small_null["fingerprints"] = {
+        key: ids for key, ids in small_null["fingerprints"].items() if small_entry["file_id"] not in ids
+    }
+    small_entry["hash"] = None
+    large_hashed = json.loads(json.dumps(valid))
+    large_entry = large_hashed["active"]["large.bin"]
+    large_entry["hash"] = hashlib.sha256(b"0123456789").hexdigest()
+    large_hashed["fingerprints"][f"10:{large_entry['hash']}"] = [large_entry["file_id"]]
+    tombstone_small_null = json.loads(json.dumps(valid))
+    removed = tombstone_small_null["active"].pop("small.txt")
+    tombstone_small_null["fingerprints"] = {
+        key: ids for key, ids in tombstone_small_null["fingerprints"].items() if removed["file_id"] not in ids
+    }
+    tombstone_small_null["tombstones"][removed["file_id"]] = {**removed, "hash": None}
+
+    for corrupt in (small_null, large_hashed, tombstone_small_null):
+        encoded = json.dumps(corrupt).encode("utf-8")
+        _index(data).write_bytes(encoded)
+        with pytest.raises(broker_module.CorruptIndexError):
+            broker.reconcile(CHAT)
+        with pytest.raises(broker_module.CorruptIndexError):
+            broker.current_revision(CHAT)
+        assert _index(data).read_bytes() == encoded
+
+    # A default-limit reader rejects the null-hash entry as well: raising the
+    # limit later needs a rehash, as the README documents.
+    _index(data).write_bytes(json.dumps(valid).encode("utf-8"))
+    with pytest.raises(broker_module.CorruptIndexError):
+        broker_module.OutputsBroker().current_revision(CHAT)
+
+
+def test_index_written_before_oversized_entries_loads_unchanged(world):
+    broker_module, _docker_manager, data = world
+    body = b"pre-change content"
+    path = _put(data, "kept.txt", body)
+    file_id = "3f1c2a9e-7b4d-4e8a-9c6f-0d2b5a7e1c34"
+    digest = hashlib.sha256(body).hexdigest()
+    entry = {
+        "file_id": file_id,
+        "path": "kept.txt",
+        "name": "kept.txt",
+        "size": len(body),
+        "mtime_ns": path.stat().st_mtime_ns,
+        "revision": 1,
+        "hash": digest,
+    }
+    legacy = {
+        "schema_version": 1,
+        "counter": 2,
+        "active": {"kept.txt": entry},
+        "fingerprints": {f"{len(body)}:{digest}": [file_id]},
+        "tombstones": {
+            "8a6d0c3e-2f4b-4b1a-8e7d-5c9f1a2b3d4e": {
+                **entry,
+                "file_id": "8a6d0c3e-2f4b-4b1a-8e7d-5c9f1a2b3d4e",
+                "path": "gone.txt",
+                "name": "gone.txt",
+                "revision": 2,
+            }
+        },
+    }
+    _index(data).parent.mkdir(parents=True)
+    encoded = json.dumps(legacy, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    _index(data).write_bytes(encoded)
+
+    listing = broker_module.OutputsBroker().reconcile(CHAT)
+
+    assert listing["unchanged"] is True
+    assert listing["revision"] == 2
+    assert listing["entries"] == [{**entry, "mtime_ns": path.stat().st_mtime_ns}]
+    assert _index(data).read_bytes() == encoded
+
+
+def test_null_hash_active_and_tombstone_entries_read_back_and_match_documented_grep(world):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker(max_file_size=8)
+    first = _put(data, "first.bin", b"0123456789")
+    broker.reconcile(CHAT)
+    first_id = _read_index(data)["active"]["first.bin"]["file_id"]
+    first.unlink()
+    _put(data, "second.bin", b"0123456789abcdef")
+    broker.reconcile(CHAT)
+    _put(data, "plain.txt", b"plain", OTHER_CHAT)
+    broker.reconcile(OTHER_CHAT)
+
+    fresh = broker_module.OutputsBroker(max_file_size=8)
+    loaded = fresh._read_index(CHAT)
+    assert loaded == _read_index(data)
+    assert loaded["active"]["second.bin"]["hash"] is None
+    assert loaded["active"]["second.bin"]["size"] == 16
+    assert loaded["tombstones"][first_id]["hash"] is None
+    assert loaded["tombstones"][first_id]["path"] == "first.bin"
+    assert fresh.reconcile(CHAT)["unchanged"] is True
+
+    # The README's operator check, verbatim, with BASE_DATA_DIR as <chat_dir>.
+    completed = subprocess.run(
+        ["sh", "-c", "grep -l '\"hash\":null' \"$1\"/*/.ocu/index.json", "sh", str(data)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [str(_index(data))]
+
+
+def test_oversized_addition_still_respects_the_index_size_limit(world):
+    broker_module, _docker_manager, data = world
+    broker_module.OutputsBroker(max_file_size=8).reconcile(CHAT)
+    before = _index(data).read_bytes()
+    constrained = broker_module.OutputsBroker(max_file_size=8, max_index_size=len(before) + 1)
+    _put(data, "large.bin", b"0123456789")
+
+    with pytest.raises(broker_module.LimitExceededError):
+        constrained.reconcile(CHAT)
+
+    assert _index(data).read_bytes() == before
+
+
+def test_register_beside_oversized_entry_succeeds_and_oversized_register_is_refused(world):
+    broker_module, docker_manager, data = world
+    broker = broker_module.OutputsBroker(max_file_size=8)
+    large = _put(data, "large.bin", b"0123456789")
+    _put(data, "keep.docx", b"k")
+    broker.reconcile(CHAT)
+    before = _read_index(data)
+
+    with docker_manager._combined_lock(CHAT):
+        (_outputs(data) / "keep.docx").write_bytes(b"KEEP")
+        registered = broker.register_host_write(CHAT, "keep.docx")
+
+    persisted = _read_index(data)
+    broker._validate_index(persisted)
+    assert registered["file_id"] == before["active"]["keep.docx"]["file_id"]
+    assert registered["hash"] == hashlib.sha256(b"KEEP").hexdigest()
+    assert persisted["counter"] == before["counter"] + 1
+    assert persisted["active"]["large.bin"] == before["active"]["large.bin"]
+    _assert_no_null_fingerprints(persisted)
+
+    after_register = _index(data).read_bytes()
+    with docker_manager._combined_lock(CHAT):
+        large.write_bytes(b"0123456789abcdef")
+        with pytest.raises(broker_module.LimitExceededError):
+            broker.register_host_write(CHAT, "large.bin")
+    assert _index(data).read_bytes() == after_register
 
 
 def test_wide_tree_beyond_default_scan_descriptor_budget_preserves_predecessor(world):

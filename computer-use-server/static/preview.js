@@ -1391,7 +1391,9 @@ function renderDownloadFallback(container, file, iconType, errorMsg) {
   </div>`;
 }
 
-function renderPreviewContent(container, file, files, onSelectFile, embedded = false) {
+export function renderPreviewContent(container, file, files, onSelectFile, embedded = false) {
+  // Over the listing's per-file limit: offer the download, never fetch the bytes.
+  if (file.too_large === true) return renderDownloadFallback(container, file);
   switch (file.type) {
     case 'html': return renderHtmlPreview(container, file);
     case 'image':

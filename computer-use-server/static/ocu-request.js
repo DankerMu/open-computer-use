@@ -248,9 +248,14 @@ export function renderKey(file) {
   return String(file.path) + '\0' + String(file.revision);
 }
 
+// Too-large files are listed but never fetched; only an explicit choice selects one.
+function autoSelectable(file) {
+  return file.too_large !== true;
+}
+
 export function pickAutoSelect(files, previousRevisions) {
   for (const file of files) {
-    if (file.path.includes('/')) continue;
+    if (file.path.includes('/') || !autoSelectable(file)) continue;
     const prev = previousRevisions.get(file.path);
     if (prev === undefined || prev !== file.revision) return file;
   }
@@ -265,14 +270,15 @@ function sameIdentity(previous, next) {
 
 export function applyListingSelection(files, previous, autoTarget, explicitSelection) {
   if (!files.length) return null;
-  if (autoTarget && !explicitSelection) return autoTarget;
+  const target = autoTarget && autoSelectable(autoTarget) ? autoTarget : null;
+  if (target && !explicitSelection) return target;
   if (previous && previous.file_id) {
     const kept = files.find((file) => file.file_id === previous.file_id);
     if (kept) return sameIdentity(previous, kept) ? previous : kept;
   }
-  if (autoTarget) return autoTarget;
-  if (!previous) return files.find((file) => !file.path.includes('/')) || files[0];
-  return files.find((file) => !file.path.includes('/')) || files[0] || null;
+  if (target) return target;
+  const candidates = files.filter(autoSelectable);
+  return candidates.find((file) => !file.path.includes('/')) || candidates[0] || null;
 }
 
 export function formulaHasCachedValue(cell) {
