@@ -39,6 +39,35 @@ the broker. `GET /internal/describe/{chat_id}` reports the persisted counter
 without a scan or index create. Broker defaults remain 100 items per page
 (maximum 1,000), 10,000 active files, 100 MiB per file, and a 64 MiB index.
 
+A regular file over the per-file limit does not fail the listing. It becomes
+an index entry with `hash: null`: it gets a `file_id` and revision events like
+any other entry, still counts toward the active-file limit, and its bytes are
+never read. The listing reports it with `too_large: true`; every other entry
+has `too_large: false`. Oversized entries have no content fingerprint, so a
+moved oversized file gets a new `file_id` and the old one is tombstoned.
+Crossing the limit in either direction is a size change that keeps the
+`file_id`. Registering a host write over the limit (Office publish) and every
+other bound still fail with 413. The preview page never auto-selects a
+too-large file and shows only its download link.
+
+Once a chat has indexed an oversized file, rolling OCU back is one-way for
+that chat. Tombstones are never pruned, so the `hash: null` record stays even
+after the file is deleted, and an older image rejects the index as corrupt
+(500) on every listing of that chat. A recovery set holding such an index is
+therefore not a valid previous-release rollback candidate. Stay on the new
+image, or restore a pre-change `index.json` for each affected chat from a
+backup, losing the revisions and file_ids created after it. Roll back the
+WebUI fork first, then OCU. To find affected chats, with `<chat_dir>` set to
+`BASE_DATA_DIR` (the index is compact JSON):
+
+```bash
+grep -l '"hash":null' <chat_dir>/*/.ocu/index.json
+```
+
+Raising the per-file limit later needs a one-time rehash of null-hash entries
+below the new limit, because the validator rejects a null hash on a file
+within the limit.
+
 Polling cannot detect a same-size in-place edit or a delete/recreate completed
 between reconciliations. A stale cached hash after the former can also prevent
 continuity from being recognised on a later rename. A missing outputs root is

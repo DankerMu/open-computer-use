@@ -187,6 +187,7 @@ def _listing_files(chat_id: str, entries: list[dict]) -> list[dict]:
             "mtime_ns": entry["mtime_ns"],
             "revision": entry["revision"],
             "hash": entry["hash"],
+            "too_large": entry["hash"] is None,
             "type": file_type,
             "mime": mime,
             "url": _output_file_url(chat_id, entry["path"]),

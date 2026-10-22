@@ -637,6 +637,91 @@ def test_listing_rename_retains_id_and_etag_auth_controls(tmp_path):
         assert GENERIC_FAILURE in str(second.json()["detail"])
 
 
+def _truncate(path: Path, size: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as stream:
+        stream.truncate(size)
+    return path
+
+
+def _by_path(body: dict) -> dict:
+    return {entry["path"]: entry for entry in body["files"]}
+
+
+def test_listing_marks_oversized_files_too_large_and_etag_follows_crossing(tmp_path):
+    with _isolated_app(tmp_path) as (loaded, _docker_manager, broker_module, data):
+        oversized = broker_module.MAX_FILE_SIZE + 1
+        _put(data, "a.txt", b"alpha")
+        _truncate(_outputs(data) / "big.html", oversized)
+        growing = _put(data, "grow.bin", b"small")
+        http = _client(loaded)
+
+        first = http.get(_list_url(), headers=_auth())
+        assert first.status_code == 200
+        first_body = first.json()
+        assert first_body["total"] == 3
+        files = _by_path(first_body)
+        assert list(files) == ["a.txt", "big.html", "grow.bin"]
+        assert files["big.html"]["too_large"] is True
+        assert files["big.html"]["hash"] is None
+        assert files["big.html"]["size"] == oversized
+        assert files["big.html"]["url"] == _expected_url("big.html")
+        assert files["a.txt"]["too_large"] is False
+        assert files["a.txt"]["hash"] == hashlib.sha256(b"alpha").hexdigest()
+        assert files["grow.bin"]["too_large"] is False
+        _assert_cache_headers(first, _expected_etag(first_body, 100))
+
+        _truncate(growing, oversized)
+        grown = http.get(_list_url(), headers={**_auth(), "If-None-Match": first.headers["ETag"]})
+        assert grown.status_code == 200
+        grown_body = grown.json()
+        grown_files = _by_path(grown_body)
+        assert grown_body["revision"] == first_body["revision"] + 1
+        assert grown_files["grow.bin"]["file_id"] == files["grow.bin"]["file_id"]
+        assert grown_files["grow.bin"]["too_large"] is True
+        assert grown_files["grow.bin"]["hash"] is None
+        assert grown_files["big.html"] == files["big.html"]
+        assert grown_files["a.txt"] == files["a.txt"]
+        assert grown.headers["ETag"] == _expected_etag(grown_body, 100)
+        assert grown.headers["ETag"] != first.headers["ETag"]
+
+        growing.write_bytes(b"shrunk")
+        shrunk = http.get(_list_url(), headers={**_auth(), "If-None-Match": grown.headers["ETag"]})
+        assert shrunk.status_code == 200
+        shrunk_body = shrunk.json()
+        shrunk_entry = _by_path(shrunk_body)["grow.bin"]
+        assert shrunk_body["revision"] == grown_body["revision"] + 1
+        assert shrunk_entry["file_id"] == files["grow.bin"]["file_id"]
+        assert shrunk_entry["too_large"] is False
+        assert shrunk_entry["hash"] == hashlib.sha256(b"shrunk").hexdigest()
+        assert shrunk.headers["ETag"] == _expected_etag(shrunk_body, 100)
+        assert shrunk.headers["ETag"] not in {first.headers["ETag"], grown.headers["ETag"]}
+
+
+def test_listing_index_limit_with_oversized_file_is_413_without_index_write(tmp_path, monkeypatch):
+    with _isolated_app(tmp_path) as (loaded, _docker_manager, broker_module, data):
+        _put(data, "keep.txt", b"keep")
+        http = _client(loaded)
+        assert http.get(_list_url(), headers=_auth()).status_code == 200
+        before = _index(data).read_bytes()
+        monkeypatch.setattr(
+            loaded, "_OUTPUTS_BROKER", broker_module.OutputsBroker(max_index_size=len(before) + 1)
+        )
+        _truncate(_outputs(data) / "big.bin", broker_module.MAX_FILE_SIZE + 1)
+
+        refused = http.get(_list_url(), headers={**_auth(), "If-None-Match": "*"})
+
+        assert refused.status_code == 413
+        assert GENERIC_FAILURE in str(refused.json()["detail"])
+        assert _index(data).read_bytes() == before
+
+        # The refusal came from the index bound: the default broker lists the file.
+        monkeypatch.undo()
+        listed = http.get(_list_url(), headers=_auth())
+        assert listed.status_code == 200
+        assert _by_path(listed.json())["big.bin"]["too_large"] is True
+
+
 def test_listing_young_fence_is_503_without_index_write(tmp_path, monkeypatch):
     with _isolated_app(tmp_path) as (loaded, _docker_manager, _broker, data):
         from office.store import OfficeStore

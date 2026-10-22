@@ -893,6 +893,24 @@ async function run() {
     );
     return { loaded, late, selected, deleted, same, auto, explicitOffice, key: api.renderKey({ path: 'a.txt', revision: 7 }) };
   }
+  if (scenario === 'too-large-selection') {
+    const big = { file_id: 'big', path: 'big.html', revision: 5, type: 'html', too_large: true };
+    const bigDocx = { file_id: 'bigdocx', path: 'big.docx', revision: 6, type: 'docx', too_large: true };
+    const small = { file_id: 'small', path: 'small.txt', revision: 4, type: 'text', too_large: false };
+    const nested = { file_id: 'nested', path: 'dir/nested.txt', revision: 3, type: 'text' };
+    const fresh = new Map();
+    return {
+      autoSkips: api.pickAutoSelect([big, small], fresh),
+      autoOnlyLarge: api.pickAutoSelect([big, bigDocx], fresh),
+      fallbackSkips: api.applyListingSelection([big, bigDocx, small], null, null, false),
+      fallbackNested: api.applyListingSelection([big, nested], null, null, false),
+      fallbackOnlyLarge: api.applyListingSelection([big, bigDocx], null, null, false),
+      replacedSkips: api.applyListingSelection([big, small], { file_id: 'gone', path: 'gone.txt', revision: 1 }, null, false),
+      directTarget: api.applyListingSelection([big, small], null, big, false),
+      keptExplicit: api.applyListingSelection([big, small], big, small, true),
+      keptRefresh: api.applyListingSelection([{ ...big, revision: 8 }, small], big, null, true),
+    };
+  }
   if (scenario === 'stale-cursor') {
     let hits = 0;
     context.__respond = async (url) => {
@@ -1102,6 +1120,145 @@ def test_listing_keeps_later_pages_and_rejects_stale_generation(tmp_path):
     assert recorded["auto"]["path"] == "b.txt"
     assert recorded["explicitOffice"]["path"] == "report.docx"
     assert recorded["key"] == "a.txt\x007"
+
+
+def test_auto_selection_skips_too_large_files_but_keeps_an_explicit_choice(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "too-large-selection")
+    assert recorded["autoSkips"]["path"] == "small.txt"
+    assert recorded["autoOnlyLarge"] is None
+    assert recorded["fallbackSkips"]["path"] == "small.txt"
+    assert recorded["fallbackNested"]["path"] == "dir/nested.txt"
+    assert recorded["fallbackOnlyLarge"] is None
+    assert recorded["replacedSkips"]["path"] == "small.txt"
+    assert recorded["directTarget"]["path"] == "small.txt"
+    assert recorded["keptExplicit"]["path"] == "big.html"
+    assert recorded["keptRefresh"]["path"] == "big.html"
+    assert recorded["keptRefresh"]["revision"] == 8
+
+
+_PREVIEW_RENDER_HARNESS = r"""
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const [sourceDir, moduleUrl, filesJson] = process.argv.slice(2);
+const calls = [];
+const scripts = [];
+const escape = (text) => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function element(tag) {
+  let text = '';
+  return {
+    tagName: tag.toUpperCase(), style: {}, attributes: {}, children: [], innerHTML: '',
+    set textContent(value) { text = String(value); this.innerHTML = escape(text); },
+    get textContent() { return text; },
+    setAttribute(key, value) { this.attributes[key] = String(value); },
+    appendChild(child) {
+      this.children.push(child);
+      // A loaded library lets a render continue to its fetch instead of hanging.
+      if (child.tagName === 'SCRIPT') { scripts.push(child.src); setTimeout(() => child.onload && child.onload(), 0); }
+      return child;
+    },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    replaceChildren() {},
+  };
+}
+const document = {
+  head: element('head'),
+  body: element('body'),
+  createElement: element,
+  getElementById: () => element('div'),
+  addEventListener() {},
+};
+const location = { search: '', origin: 'https://webui.example', protocol: 'https:', host: 'webui.example' };
+const window = {
+  __CONFIG__: { apiUrl: '/ocu/api/outputs/chat', filesBase: '/ocu/files/chat', chatId: 'chat', describeUrl: null },
+  location, addEventListener() {}, removeEventListener() {}, postMessage() {},
+};
+window.parent = window;
+const context = vm.createContext({
+  window, document, location, console, Headers, URL, URLSearchParams, AbortController, Promise, JSON, Map, Set,
+  setTimeout, clearTimeout, setInterval() { return 0; }, clearInterval() {},
+  fetch: async (url) => {
+    calls.push(String(url));
+    throw new Error('network disabled in render harness');
+  },
+});
+const preactStub = 'export const html = () => null; export function render() {}'
+  + ' export function useState(v) { return [v, () => {}]; } export function useEffect() {}'
+  + ' export function useRef(v) { return { current: v }; } export function useCallback(f) { return f; }';
+const linker = async (specifier, referencingModule) => {
+  const resolved = new URL(specifier, referencingModule.identifier);
+  const filename = resolved.pathname.split('/').pop();
+  const source = filename === 'preact-htm.min.js' ? preactStub : fs.readFileSync(sourceDir + filename, 'utf8');
+  const child = new vm.SourceTextModule(source, {
+    context,
+    identifier: resolved.href,
+    initializeImportMeta(meta) { meta.url = resolved.href; },
+  });
+  await child.link(linker);
+  return child;
+};
+const module = new vm.SourceTextModule(
+  "export { renderPreviewContent } from './preview.js';",
+  { context, identifier: moduleUrl, initializeImportMeta(meta) { meta.url = moduleUrl; } },
+);
+await module.link(linker);
+await module.evaluate();
+const results = [];
+for (const file of JSON.parse(filesJson)) {
+  const before = calls.length;
+  const container = element('div');
+  let failed = null;
+  try {
+    await module.namespace.renderPreviewContent(container, file, [file], () => {}, false);
+  } catch (error) {
+    failed = String(error && error.message);
+  }
+  results.push({ name: file.name, fetches: calls.slice(before), html: container.innerHTML, failed });
+}
+process.stdout.write(JSON.stringify({ results, scripts }));
+"""
+
+
+def test_too_large_selection_renders_download_fallback_without_fetching(tmp_path):
+    if not NODE:
+        pytest.fail("node is required for preview render tests; install Node 22 or set OCU_TEST_NODE")
+    harness = tmp_path / "preview_render_harness.mjs"
+    harness.write_text(_PREVIEW_RENDER_HARNESS)
+    oversized = 100 * 1024 * 1024 + 1
+    files = [
+        {"name": "big.html", "type": "html", "too_large": True, "size": oversized,
+         "url": "/ocu/files/chat/big.html", "path": "big.html", "revision": 1},
+        {"name": "big.docx", "type": "docx", "too_large": True, "size": oversized,
+         "url": "/ocu/files/chat/big.docx", "path": "big.docx", "revision": 1},
+        {"name": "small.html", "type": "html", "too_large": False, "size": 5,
+         "url": "/ocu/files/chat/small.html", "path": "small.html", "revision": 1},
+    ]
+    completed = subprocess.run(
+        [
+            NODE,
+            "--experimental-vm-modules",
+            str(harness),
+            str(SERVER_DIR / "static") + "/",
+            "https://webui.example/ocu/static/preview.js",
+            json.dumps(files),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    recorded = json.loads(completed.stdout)
+    big_html, big_docx, small = recorded["results"]
+    for result, url in ((big_html, "/ocu/files/chat/big.html"), (big_docx, "/ocu/files/chat/big.docx")):
+        assert result["fetches"] == [], result
+        assert result["failed"] is None, result
+        assert 'class="download-prompt"' in result["html"]
+        assert f'href="{url}" download' in result["html"]
+        assert "100.0 MB" in result["html"]
+    assert recorded["scripts"] == []
+    # Control: the same harness observes the fetch a normal HTML preview makes.
+    assert small["fetches"] == ["/ocu/files/chat/small.html"]
 
 
 def test_listing_body_parse_failure_does_not_commit_partial_page(tmp_path):

@@ -713,6 +713,33 @@ def test_oversized_join_refuses_before_reading_workspace_content(office_world, m
     assert origin.hits == 0
 
 
+def test_listed_oversized_docx_refuses_open_before_reading_workspace_content(office_world, monkeypatch):
+    http, data, origin, _docker, _broker = office_world
+    import office.workspace as workspace
+    path = data / CHAT / "outputs" / "big.docx"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as stream:
+        stream.truncate(100 * 1024 * 1024 + 1)
+    # The identity is born in the listing reconcile, never from a smaller file.
+    listing = http.get(f"/api/outputs/{CHAT}", headers=_auth())
+    assert listing.status_code == 200
+    (entry,) = listing.json()["files"]
+    assert (entry["path"], entry["hash"], entry["too_large"]) == ("big.docx", None, True)
+    before = _snapshot(_office(data))
+    identity = (path.stat().st_dev, path.stat().st_ino)
+    original = os.read
+    def guarded_read(fd, amount):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == identity:
+            raise AssertionError("oversized open read document content")
+        return original(fd, amount)
+    with monkeypatch.context() as trap:
+        trap.setattr(workspace.os, "read", guarded_read)
+        _assert_refusal(_create(http, entry["file_id"]), 413, "file_too_large")
+    assert _snapshot(_office(data)) == before
+    assert origin.hits == 0
+
+
 def test_key_lookup_timeout_is_bounded_and_preserves_existing_session(office_world, monkeypatch):
     from office import commands
     http, data, recording, _docker, _broker = office_world

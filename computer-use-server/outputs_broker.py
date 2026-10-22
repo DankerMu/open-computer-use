@@ -388,8 +388,8 @@ class OutputsBroker:
             if file_id in live_ids:
                 raise CorruptIndexError("broker active entries reuse a file_id")
             live_ids.add(file_id)
-            fingerprint = self._fingerprint(entry)
-            expected_fingerprints.setdefault(fingerprint, []).append(file_id)
+            if entry["hash"] is not None:
+                expected_fingerprints.setdefault(self._fingerprint(entry), []).append(file_id)
         for file_ids in expected_fingerprints.values():
             file_ids.sort()
         if fingerprints != expected_fingerprints:
@@ -412,14 +412,21 @@ class OutputsBroker:
             raise CorruptIndexError(f"broker {collection} path is invalid")
         if entry["name"] != path.rsplit("/", 1)[-1]:
             raise CorruptIndexError(f"broker {collection} name does not match path")
-        if type(entry["size"]) is not int or entry["size"] < 0 or entry["size"] > self.max_file_size:
+        if type(entry["size"]) is not int or entry["size"] < 0:
             raise CorruptIndexError(f"broker {collection} size is invalid")
         if type(entry["mtime_ns"]) is not int:
             raise CorruptIndexError(f"broker {collection} mtime_ns is invalid")
         revision = entry["revision"]
         if type(revision) is not int or revision <= 0 or revision > counter:
             raise CorruptIndexError(f"broker {collection} revision is invalid")
-        if type(entry["hash"]) is not str or not _HASH.fullmatch(entry["hash"]):
+        # A file over the per-file limit is indexed but never read: hash is
+        # null exactly when size exceeds the limit.
+        if entry["hash"] is None:
+            if entry["size"] <= self.max_file_size:
+                raise CorruptIndexError(f"broker {collection} hash is invalid")
+        elif entry["size"] > self.max_file_size:
+            raise CorruptIndexError(f"broker {collection} size is invalid")
+        elif type(entry["hash"]) is not str or not _HASH.fullmatch(entry["hash"]):
             raise CorruptIndexError(f"broker {collection} hash is invalid")
         if type(entry["file_id"]) is not str:
             raise CorruptIndexError(f"broker {collection} file_id is invalid")
@@ -555,8 +562,6 @@ class OutputsBroker:
                                 continue
                             if not stat.S_ISREG(mode):
                                 continue
-                            if item_stat.st_size > self.max_file_size:
-                                raise LimitExceededError(f"output file exceeds configured size limit: {relative_path}")
                             observations[relative_path] = _Observation(
                                 path=relative_path,
                                 name=name,
@@ -705,7 +710,8 @@ class OutputsBroker:
         additions = sorted(current_paths - active_paths)
 
         refreshed_hashes = {
-            path: self._hash_observation(chat, observations[path])
+            path: None if observations[path].size > self.max_file_size
+            else self._hash_observation(chat, observations[path])
             for path in [*size_changes, *additions]
         }
         counter = index["counter"]
@@ -733,11 +739,12 @@ class OutputsBroker:
         removed_by_fingerprint: dict[str, list[str]] = {}
         added_by_fingerprint: dict[str, list[str]] = {}
         for path in removals:
-            removed_by_fingerprint.setdefault(self._fingerprint(active[path]), []).append(path)
+            if active[path]["hash"] is not None:
+                removed_by_fingerprint.setdefault(self._fingerprint(active[path]), []).append(path)
         for path in additions:
-            observation = observations[path]
-            fingerprint = f"{observation.size}:{refreshed_hashes[path]}"
-            added_by_fingerprint.setdefault(fingerprint, []).append(path)
+            if refreshed_hashes[path] is not None:
+                fingerprint = f"{observations[path].size}:{refreshed_hashes[path]}"
+                added_by_fingerprint.setdefault(fingerprint, []).append(path)
 
         matched_removals: set[str] = set()
         matched_additions: set[str] = set()
@@ -796,6 +803,8 @@ class OutputsBroker:
     def _fingerprints(active: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
         fingerprints: dict[str, list[str]] = {}
         for entry in active.values():
+            if entry["hash"] is None:
+                continue
             fingerprint = f"{entry['size']}:{entry['hash']}"
             fingerprints.setdefault(fingerprint, []).append(entry["file_id"])
         for file_ids in fingerprints.values():
