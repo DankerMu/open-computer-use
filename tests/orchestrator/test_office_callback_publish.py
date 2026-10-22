@@ -178,6 +178,46 @@ def test_nothing_new_persist_keeps_autosave_unpublished_without_deferred_work(of
     assert broker.OutputsBroker().current_revision(CHAT) == revision
 
 
+@pytest.mark.parametrize("first_intent", ("publish", "persist"))
+@pytest.mark.parametrize(("intent", "code", "published"), (
+    ("publish", 4, 2), ("persist", 4, 2), ("publish", 0, 2), ("persist", 0, 0),
+), ids=("publish-nothing-new", "persist-nothing-new", "publish-published", "persist-committed"))
+def test_later_successful_save_clears_earlier_storage_low(office_world, monkeypatch, first_intent, intent, code, published):
+    import office.versions as versions_mod
+
+    http, _data, _origin, _manager, _broker, _content, session = _opened(office_world)
+    with _forcesave(monkeypatch, session["document_key"]):
+        assert _save(http, session["session_id"], first_intent).status_code == 202
+    original = versions_mod.check_free_space
+    low = {"active": True}
+
+    def floor(store, chat_id, min_free_bytes):
+        if low["active"]:
+            raise versions_mod.StorageLowError("office storage is below the configured floor")
+        return original(store, chat_id, min_free_bytes)
+
+    def status():
+        answer = _status(http, session["session_id"]).json()
+        return answer["state"], answer["reason"], answer["last_committed_seq"], answer["last_published_seq"]
+
+    monkeypatch.setattr(versions_mod, "check_free_space", floor)
+    with _content_origin({"/first.docx": CHANGED, "/second.docx": CHANGED + b"second"}) as server, \
+            _bind_internal(monkeypatch, server.url):
+        _assert_refusal(_post(http, session, recorded_status_6_payload(
+            document_key=session["document_key"], url=server.url + "/first.docx", save_seq=1, intent=first_intent,
+        )), 503, "storage_low")
+        assert status() == ("editing", "storage_low", 0, 0)
+        low["active"] = False
+        with _forcesave(monkeypatch, session["document_key"], code=code):
+            assert _save(http, session["session_id"], intent).status_code == 202
+        if code == 0:
+            assert status() == ("saving", "storage_low", 0, 0)
+            assert _post(http, session, recorded_status_6_payload(
+                document_key=session["document_key"], url=server.url + "/second.docx", save_seq=2, intent=intent,
+            )).json() == {"error": 0}
+    assert status() == ("editing", None, 2, published)
+
+
 @pytest.mark.parametrize("conflict", (False, True), ids=("published", "conflict"))
 def test_status4_after_autosave_reaches_final_outcome_and_complete_replay_is_inert(office_world, monkeypatch, conflict):
     http, data, _origin, _manager, broker, content, session = _autosaved(office_world, monkeypatch)

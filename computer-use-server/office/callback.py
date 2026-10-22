@@ -406,6 +406,9 @@ def _apply_status_6(_working, record: dict[str, Any], save_seq: int, _selected) 
         record["pending_save_seq"] = None
         if record["state"] == "saving":
             record["state"] = "editing"
+        # The owned background persist committed, so an earlier save failure is stale.
+        if record["state"] == "editing":
+            record["reason"] = None
 
 
 def _apply_status_4(working: dict[str, Any], record: dict[str, Any], save_seq: int) -> None:
