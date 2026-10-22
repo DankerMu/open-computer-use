@@ -5,6 +5,7 @@
 Run: python -m pytest tests/test_filter.py -v
 """
 
+import copy
 import os
 import socket
 import sys
@@ -29,6 +30,9 @@ sys.path.insert(0, str(ROOT / "computer-use-server"))
 
 import auth_guard  # noqa: E402
 import computer_link_filter  # noqa: E402
+
+# Saved Open WebUI chats carry UUID ids; the filter only serves saved chats.
+CHAT_ID = "6f1c2a9e-3b4d-4e8f-a1b2-c3d4e5f60718"
 
 
 def _urlopen_mock(
@@ -85,7 +89,7 @@ def _system_content(body: dict) -> str:
     return ""
 
 
-def _assistant_body_with_file(chat_id: str = "abc") -> dict:
+def _assistant_body_with_file(chat_id: str = CHAT_ID) -> dict:
     link = f"http://localhost:8081/files/{chat_id}/report.pdf"
     return {"messages": [{"role": "assistant", "content": f"see {link}"}]}
 
@@ -206,7 +210,7 @@ def test_inlet_authenticates_real_guard_and_preserves_insertion(monkeypatch):
         result = filter_.inlet(
             body,
             __user__={"email": "person@example.test"},
-            __metadata__={"chat_id": "abc"},
+            __metadata__={"chat_id": CHAT_ID},
         )
 
     assert result["messages"] == [
@@ -219,7 +223,7 @@ def test_inlet_authenticates_real_guard_and_preserves_insertion(monkeypatch):
     assert len(records) == 1
     assert records[0]["headers"]["authorization"] == "Bearer filter-test-token"
     assert records[0]["query"] == {
-        "chat_id": ["abc"],
+        "chat_id": [CHAT_ID],
         "user_email": ["person@example.test"],
     }
 
@@ -238,12 +242,12 @@ def test_guard_rejection_does_not_reuse_a_stale_prompt(monkeypatch, capsys):
         )
     ) as origin:
         filter_ = _make_filter(origin)
-        filter_._prompt_cache[("abc", "")] = (
+        filter_._prompt_cache[(CHAT_ID, "")] = (
             time.time() - 9999,
             ("https://webui.example/ocu", "stale prompt"),
         )
         filter_._cache_authority = (origin, "wrong-filter-token")
-        result = filter_.inlet(_active_body(), __metadata__={"chat_id": "abc"})
+        result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
 
     assert _system_content(result) == ""
     assert records[0]["headers"]["authorization"] == "Bearer wrong-filter-token"
@@ -264,12 +268,12 @@ def test_forbidden_response_does_not_reuse_a_stale_prompt(monkeypatch):
         )
     ) as origin:
         filter_ = _make_filter(origin)
-        filter_._prompt_cache[("abc", "")] = (
+        filter_._prompt_cache[(CHAT_ID, "")] = (
             time.time() - 9999,
             ("https://webui.example/ocu", "stale prompt"),
         )
         filter_._cache_authority = (origin, "filter-test-token")
-        result = filter_.inlet(_active_body(), __metadata__={"chat_id": "abc"})
+        result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
 
     assert _system_content(result) == ""
     assert records[0]["headers"]["authorization"] == "Bearer filter-test-token"
@@ -278,11 +282,11 @@ def test_forbidden_response_does_not_reuse_a_stale_prompt(monkeypatch):
 def test_missing_filter_credential_does_not_use_a_warm_prompt(monkeypatch):
     monkeypatch.delenv("OCU_INTERNAL_TOKEN", raising=False)
     filter_ = _make_filter()
-    filter_._prompt_cache[("abc", "")] = (
+    filter_._prompt_cache[(CHAT_ID, "")] = (
         time.time(),
         ("https://webui.example/ocu", "warm prompt"),
     )
-    result = filter_.inlet(_active_body(), __metadata__={"chat_id": "abc"})
+    result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
     assert _system_content(result) == ""
 
 
@@ -292,7 +296,7 @@ def test_missing_public_base_header_does_not_use_internal_url(monkeypatch):
     records = []
     with _live_asgi(_prompt_app(records, "headerless prompt", None)) as origin:
         filter_ = _make_filter(origin)
-        result = filter_.inlet(_active_body(), __metadata__={"chat_id": "abc"})
+        result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
 
     assert _system_content(result) == ""
     assert len(records) == 1
@@ -303,19 +307,19 @@ def test_missing_public_base_header_does_not_reuse_stale_prompt_or_link_metadata
     _configure_filter_token(monkeypatch)
     records = []
     public_base = "https://webui.example/ocu"
-    file_url = f"{public_base}/files/abc/report.html"
+    file_url = f"{public_base}/files/{CHAT_ID}/report.html"
     original = f"see {file_url}"
     with _live_asgi(_prompt_app(records, "headerless prompt", None)) as origin:
         filter_ = _make_filter(origin)
-        filter_._prompt_cache[("abc", "")] = (
+        filter_._prompt_cache[(CHAT_ID, "")] = (
             time.time() - computer_link_filter._PROMPT_TTL_SECONDS - 1,
             (public_base, "stale prompt"),
         )
         filter_._cache_authority = (origin, "filter-test-token")
-        inlet_result = filter_.inlet(_active_body(), __metadata__={"chat_id": "abc"})
+        inlet_result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
         outlet_result = filter_.outlet(
             {"messages": [{"role": "assistant", "content": original}]},
-            __metadata__={"chat_id": "abc"},
+            __metadata__={"chat_id": CHAT_ID},
         )
 
     assert _system_content(inlet_result) == ""
@@ -334,17 +338,17 @@ def test_cache_refreshes_when_token_or_internal_origin_changes(monkeypatch):
         _prompt_app(second_records, "second prompt", "https://webui.example/ocu")
     ) as second_origin:
         filter_ = _make_filter(first_origin)
-        assert filter_._fetch_system_prompt("abc", "person@example.test") == (
+        assert filter_._fetch_system_prompt(CHAT_ID, "person@example.test") == (
             "https://webui.example/ocu",
             "first prompt",
         )
         filter_.valves.ORCHESTRATOR_URL = second_origin
-        assert filter_._fetch_system_prompt("abc", "person@example.test") == (
+        assert filter_._fetch_system_prompt(CHAT_ID, "person@example.test") == (
             "https://webui.example/ocu",
             "second prompt",
         )
         monkeypatch.setenv("OCU_INTERNAL_TOKEN", "second-filter-token")
-        assert filter_._fetch_system_prompt("abc", "person@example.test") == (
+        assert filter_._fetch_system_prompt(CHAT_ID, "person@example.test") == (
             "https://webui.example/ocu",
             "second prompt",
         )
@@ -359,20 +363,20 @@ def test_cache_refreshes_when_token_or_internal_origin_changes(monkeypatch):
 def test_outlet_does_not_reuse_cached_links_after_credential_rotation(monkeypatch):
     _configure_filter_token(monkeypatch, "first-filter-token")
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url="https://webui.example/ocu")
+    _prime_cache(filter_, CHAT_ID, public_url="https://webui.example/ocu")
     filter_._cache_authority = (
         filter_.valves.ORCHESTRATOR_URL.rstrip("/"),
         "first-filter-token",
     )
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", "second-filter-token")
-    file_url = "https://webui.example/ocu/files/abc/report.html"
+    file_url = f"https://webui.example/ocu/files/{CHAT_ID}/report.html"
     body = {"messages": [{"role": "assistant", "content": file_url}]}
 
     with patch(
         "urllib.request.OpenerDirector.open",
         side_effect=urllib.error.URLError("connection refused"),
     ):
-        result = filter_.outlet(body, __metadata__={"chat_id": "abc"})
+        result = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
 
     assert result["messages"][0]["content"] == file_url
 
@@ -392,7 +396,7 @@ def test_redirect_does_not_contact_the_other_origin(monkeypatch):
 
         origin = Starlette(routes=[Route("/system-prompt", redirect)])
         with _live_asgi(origin) as source:
-            result = _make_filter(source)._fetch_system_prompt("abc", "")
+            result = _make_filter(source)._fetch_system_prompt(CHAT_ID, "")
 
     assert result is None
     assert target_records == []
@@ -401,10 +405,10 @@ def test_redirect_does_not_contact_the_other_origin(monkeypatch):
 def test_outlet_links_the_first_current_chat_file_without_a_preview_shell(monkeypatch):
     _configure_filter_token(monkeypatch)
     public_base = "https://webui.example/ocu"
-    first_file = f"{public_base}/files/abc/first%20report.html?download=1#section"
-    second_file = f"{public_base}/files/abc/second.pdf"
+    first_file = f"{public_base}/files/{CHAT_ID}/first%20report.html?download=1#section"
+    second_file = f"{public_base}/files/{CHAT_ID}/second.pdf"
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url=public_base)
+    _prime_cache(filter_, CHAT_ID, public_url=public_base)
     body = {
         "messages": [
             {
@@ -414,24 +418,24 @@ def test_outlet_links_the_first_current_chat_file_without_a_preview_shell(monkey
         ]
     }
 
-    result = filter_.outlet(body, __metadata__={"chat_id": "abc"})
+    result = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
     content = result["messages"][0]["content"]
     assert f"[🖥️ Open preview]({first_file})" in content
     assert f"[🖥️ Open preview]({second_file})" not in content
     assert "/preview/" not in content
-    assert f"[📦 Download all files as archive]({public_base}/files/abc/archive)" in content
+    assert f"[📦 Download all files as archive]({public_base}/files/{CHAT_ID}/archive)" in content
 
 
 def test_outlet_adds_one_preview_label_when_the_file_url_is_already_present(monkeypatch):
     _configure_filter_token(monkeypatch)
     public_base = "https://webui.example/ocu"
-    file_url = f"{public_base}/files/abc/report%20with%20spaces.html?view=1"
+    file_url = f"{public_base}/files/{CHAT_ID}/report%20with%20spaces.html?view=1"
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url=public_base)
+    _prime_cache(filter_, CHAT_ID, public_url=public_base)
     body = {"messages": [{"role": "assistant", "content": f"Open {file_url}"}]}
 
-    first = filter_.outlet(body, __metadata__={"chat_id": "abc"})
-    second = filter_.outlet(first, __metadata__={"chat_id": "abc"})
+    first = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
+    second = filter_.outlet(first, __metadata__={"chat_id": CHAT_ID})
     preview_link = f"[🖥️ Open preview]({file_url})"
     assert second["messages"][0]["content"].count(preview_link) == 1
 
@@ -440,9 +444,9 @@ def test_outlet_leaves_browser_only_and_archive_urls_unchanged(monkeypatch):
     _configure_filter_token(monkeypatch)
     public_base = "https://webui.example/ocu"
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url=public_base)
+    _prime_cache(filter_, CHAT_ID, public_url=public_base)
     browser_only = '<details type="tool_calls" name="playwright"></details>'
-    archive_only = f"{public_base}/files/abc/archive"
+    archive_only = f"{public_base}/files/{CHAT_ID}/archive"
     body = {
         "messages": [
             {"role": "assistant", "content": browser_only},
@@ -450,7 +454,7 @@ def test_outlet_leaves_browser_only_and_archive_urls_unchanged(monkeypatch):
         ]
     }
 
-    result = filter_.outlet(body, __metadata__={"chat_id": "abc"})
+    result = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
     assert [message["content"] for message in result["messages"]] == [
         browser_only,
         archive_only,
@@ -461,23 +465,23 @@ def test_outlet_does_not_match_foreign_public_bases_or_chats(monkeypatch):
     _configure_filter_token(monkeypatch)
     public_base = "https://webui.example/ocu"
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url=public_base)
-    foreign_base = "https://webui.example/ocu-else/files/abc/report.html"
-    foreign_chat = f"{public_base}/files/abc-other/report.html"
+    _prime_cache(filter_, CHAT_ID, public_url=public_base)
+    foreign_base = f"https://webui.example/ocu-else/files/{CHAT_ID}/report.html"
+    foreign_chat = f"{public_base}/files/{CHAT_ID}-other/report.html"
     original = f"{foreign_base} {foreign_chat}"
     result = filter_.outlet(
         {"messages": [{"role": "assistant", "content": original}]},
-        __metadata__={"chat_id": "abc"},
+        __metadata__={"chat_id": CHAT_ID},
     )
     assert result["messages"][0]["content"] == original
 
 def test_outlet_supports_root_relative_public_base_without_matching_foreign_absolute_urls(monkeypatch):
     _configure_filter_token(monkeypatch)
     public_base = "/ocu"
-    local_file = f"{public_base}/files/abc/report.html"
-    foreign_file = "https://foreign.example/ocu/files/abc/foreign.html"
+    local_file = f"{public_base}/files/{CHAT_ID}/report.html"
+    foreign_file = f"https://foreign.example/ocu/files/{CHAT_ID}/foreign.html"
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url=public_base)
+    _prime_cache(filter_, CHAT_ID, public_url=public_base)
     body = {
         "messages": [
             {
@@ -487,18 +491,18 @@ def test_outlet_supports_root_relative_public_base_without_matching_foreign_abso
         ]
     }
 
-    result = filter_.outlet(body, __metadata__={"chat_id": "abc"})
+    result = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
     content = result["messages"][0]["content"]
     assert f"[🖥️ Open preview]({local_file})" in content
     assert f"[🖥️ Open preview]({foreign_file})" not in content
-    assert f"[📦 Download all files as archive]({public_base}/files/abc/archive)" in content
+    assert f"[📦 Download all files as archive]({public_base}/files/{CHAT_ID}/archive)" in content
 
 
 @pytest.mark.parametrize(
     "foreign_file",
     (
-        "http://[::1]/ocu/files/abc/report.html",
-        "https://foreign.example/X_(name)/ocu/files/abc/report.html",
+        f"http://[::1]/ocu/files/{CHAT_ID}/report.html",
+        f"https://foreign.example/X_(name)/ocu/files/{CHAT_ID}/report.html",
     ),
 )
 def test_outlet_does_not_restart_root_relative_match_inside_foreign_absolute_url(
@@ -506,34 +510,34 @@ def test_outlet_does_not_restart_root_relative_match_inside_foreign_absolute_url
 ):
     _configure_filter_token(monkeypatch)
     public_base = "/ocu"
-    local_file = f"{public_base}/files/abc/report.html"
+    local_file = f"{public_base}/files/{CHAT_ID}/report.html"
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url=public_base)
+    _prime_cache(filter_, CHAT_ID, public_url=public_base)
 
     foreign_result = filter_.outlet(
         {"messages": [{"role": "assistant", "content": foreign_file}]},
-        __metadata__={"chat_id": "abc"},
+        __metadata__={"chat_id": CHAT_ID},
     )
 
     assert foreign_result["messages"][0]["content"] == foreign_file
 
     local_result = filter_.outlet(
         {"messages": [{"role": "assistant", "content": local_file}]},
-        __metadata__={"chat_id": "abc"},
+        __metadata__={"chat_id": CHAT_ID},
     )
     assert f"[🖥️ Open preview]({local_file})" in local_result["messages"][0]["content"]
 
 def test_outlet_trims_sentence_punctuation_from_bare_file_urls(monkeypatch):
     _configure_filter_token(monkeypatch)
     public_base = "https://webui.example/ocu"
-    punctuated_file = f"{public_base}/files/abc/report%20final.html?download=1#section."
+    punctuated_file = f"{public_base}/files/{CHAT_ID}/report%20final.html?download=1#section."
     expected_file = punctuated_file[:-1]
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url=public_base)
+    _prime_cache(filter_, CHAT_ID, public_url=public_base)
 
     result = filter_.outlet(
         {"messages": [{"role": "assistant", "content": f"Finished: {punctuated_file}"}]},
-        __metadata__={"chat_id": "abc"},
+        __metadata__={"chat_id": CHAT_ID},
     )
 
     content = result["messages"][0]["content"]
@@ -547,13 +551,13 @@ def test_outlet_trims_terminal_exclamation_and_question_marks_from_bare_file_url
 ):
     _configure_filter_token(monkeypatch)
     public_base = "https://webui.example/ocu"
-    file_url = f"{public_base}/files/abc/report.html"
+    file_url = f"{public_base}/files/{CHAT_ID}/report.html"
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url=public_base)
+    _prime_cache(filter_, CHAT_ID, public_url=public_base)
 
     result = filter_.outlet(
         {"messages": [{"role": "assistant", "content": f"Finished: {file_url}{sentence_punctuation}"}]},
-        __metadata__={"chat_id": "abc"},
+        __metadata__={"chat_id": CHAT_ID},
     )
 
     content = result["messages"][0]["content"]
@@ -565,16 +569,16 @@ def test_outlet_trims_terminal_exclamation_and_question_marks_from_bare_file_url
     ("message_content", "literal_file"),
     (
         (
-            "Open [report](https://webui.example/ocu/files/abc/report.html.)",
-            "https://webui.example/ocu/files/abc/report.html.",
+            f"Open [report](https://webui.example/ocu/files/{CHAT_ID}/report.html.)",
+            f"https://webui.example/ocu/files/{CHAT_ID}/report.html.",
         ),
         (
-            "Open <https://webui.example/ocu/files/abc/report.html!>",
-            "https://webui.example/ocu/files/abc/report.html!",
+            f"Open <https://webui.example/ocu/files/{CHAT_ID}/report.html!>",
+            f"https://webui.example/ocu/files/{CHAT_ID}/report.html!",
         ),
         (
-            "Open [report](https://webui.example/ocu/files/abc/report.html?)",
-            "https://webui.example/ocu/files/abc/report.html?",
+            f"Open [report](https://webui.example/ocu/files/{CHAT_ID}/report.html?)",
+            f"https://webui.example/ocu/files/{CHAT_ID}/report.html?",
         ),
     ),
 )
@@ -583,11 +587,11 @@ def test_outlet_preserves_trailing_punctuation_in_explicit_file_url_destinations
 ):
     _configure_filter_token(monkeypatch)
     filter_ = _make_filter()
-    _prime_cache(filter_, "abc", public_url="https://webui.example/ocu")
+    _prime_cache(filter_, CHAT_ID, public_url="https://webui.example/ocu")
 
     result = filter_.outlet(
         {"messages": [{"role": "assistant", "content": message_content}]},
-        __metadata__={"chat_id": "abc"},
+        __metadata__={"chat_id": CHAT_ID},
     )
 
     assert f"[🖥️ Open preview]({literal_file})" in result["messages"][0]["content"]
@@ -599,7 +603,7 @@ class OrchestratorUrlNormalisation(unittest.TestCase):
         self._urlopen_patcher = patch(
             "urllib.request.OpenerDirector.open",
             return_value=_urlopen_mock(
-                "System prompt with http://localhost:8081/files/abc baked",
+                f"System prompt with http://localhost:8081/files/{CHAT_ID} baked",
                 public_base_url="http://localhost:8081",
             ),
         )
@@ -608,7 +612,7 @@ class OrchestratorUrlNormalisation(unittest.TestCase):
 
     def test_inlet_does_not_emit_double_slash(self):
         f = _make_filter("http://localhost:8081/")
-        body = f.inlet(_active_body(), __metadata__={"chat_id": "abc"})
+        body = f.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
         self.assertNotIn("//files/", _system_content(body))
 
 
@@ -633,23 +637,24 @@ class BaselineBehaviour(unittest.TestCase):
     def setUp(self):
         self._urlopen_patcher = patch(
             "urllib.request.OpenerDirector.open",
-            return_value=_urlopen_mock("System prompt with http://localhost:8081/files/abc baked"),
+            return_value=_urlopen_mock(f"System prompt with http://localhost:8081/files/{CHAT_ID} baked"),
         )
         self._urlopen_patcher.start()
         self.addCleanup(self._urlopen_patcher.stop)
 
     def test_inlet_injects_when_tool_active_and_chat_id_present(self):
         f = _make_filter()
-        body = f.inlet(_active_body(), __metadata__={"chat_id": "abc"})
-        self.assertIn("http://localhost:8081/files/abc", _system_content(body))
+        body = f.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
+        self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", _system_content(body))
 
-    def test_inlet_no_injection_when_tool_inactive(self):
+    def test_inlet_attaches_tool_and_prompt_when_no_tool_selected(self):
         f = _make_filter()
         body = f.inlet(
             {"tool_ids": [], "messages": [{"role": "user", "content": "hi"}]},
-            __metadata__={"chat_id": "abc"},
+            __metadata__={"chat_id": CHAT_ID},
         )
-        self.assertEqual("", _system_content(body))
+        self.assertEqual(body["tool_ids"], ["ai_computer_use"])
+        self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", _system_content(body))
 
     def test_inlet_handles_non_string_system_content(self):
         """Open WebUI multimodal flows can deliver system `content` as a list of
@@ -665,19 +670,19 @@ class BaselineBehaviour(unittest.TestCase):
                 {"role": "user", "content": "hi"},
             ],
         }
-        result = f.inlet(body, __metadata__={"chat_id": "abc"})
+        result = f.inlet(body, __metadata__={"chat_id": CHAT_ID})
         # Did not raise; injection still happened somewhere in the system slot
         system_content = result["messages"][0]["content"]
         self.assertIsInstance(system_content, str)
-        self.assertIn("http://localhost:8081/files/abc", system_content)
+        self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", system_content)
 
     def test_outlet_appends_archive_button_once(self):
         f = _make_filter()
-        _prime_cache(f, "abc")
-        link = "http://localhost:8081/files/abc/report.pdf"
+        _prime_cache(f, CHAT_ID)
+        link = f"http://localhost:8081/files/{CHAT_ID}/report.pdf"
         body = {"messages": [{"role": "assistant", "content": f"see {link}"}]}
-        out1 = f.outlet(body, __metadata__={"chat_id": "abc"})
-        out2 = f.outlet(out1, __metadata__={"chat_id": "abc"})
+        out1 = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+        out2 = f.outlet(out1, __metadata__={"chat_id": CHAT_ID})
         self.assertEqual(
             out1["messages"][0]["content"],
             out2["messages"][0]["content"],
@@ -687,8 +692,8 @@ class BaselineBehaviour(unittest.TestCase):
     def test_outlet_does_not_modify_non_assistant_messages(self):
         """User/system/tool messages must be left untouched even if they contain a file URL."""
         f = _make_filter()
-        _prime_cache(f, "abc")
-        link = "http://localhost:8081/files/abc/report.pdf"
+        _prime_cache(f, CHAT_ID)
+        link = f"http://localhost:8081/files/{CHAT_ID}/report.pdf"
         original_user = f"check {link}"
         original_system = f"context with {link}"
         body = {
@@ -698,7 +703,7 @@ class BaselineBehaviour(unittest.TestCase):
                 {"role": "tool", "content": f"tool output {link}"},
             ]
         }
-        out = f.outlet(body, __metadata__={"chat_id": "abc"})
+        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
         self.assertEqual(out["messages"][0]["content"], original_user)
         self.assertEqual(out["messages"][1]["content"], original_system)
         self.assertNotIn("archive", out["messages"][2]["content"].lower())
@@ -709,17 +714,82 @@ class BaselineBehaviour(unittest.TestCase):
         Regression guard for W-01: outlet previously matched any chat_id via `[^/]+`.
         """
         f = _make_filter()
-        _prime_cache(f, "abc")
+        _prime_cache(f, CHAT_ID)
         other_link = "http://localhost:8081/files/other-chat/report.pdf"
         original_content = f"see artefact from the other chat: {other_link}"
         body = {"messages": [{"role": "assistant", "content": original_content}]}
-        out = f.outlet(body, __metadata__={"chat_id": "abc"})
+        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
         self.assertEqual(
             out["messages"][0]["content"],
             original_content,
             "Message referencing a file URL for a different chat_id must be left untouched",
         )
         self.assertNotIn("archive", out["messages"][0]["content"].lower())
+
+
+class HarnessToolInjection(unittest.TestCase):
+    """Every saved-chat request gets ai_computer_use, whatever the model (#590)."""
+
+    def setUp(self):
+        self._urlopen_patcher = patch(
+            "urllib.request.OpenerDirector.open",
+            return_value=_urlopen_mock(f"System prompt with http://localhost:8081/files/{CHAT_ID} baked"),
+        )
+        self.urlopen = self._urlopen_patcher.start()
+        self.addCleanup(self._urlopen_patcher.stop)
+
+    @staticmethod
+    def _body(**fields) -> dict:
+        return {**fields, "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_missing_tool_key_is_created_with_the_tool(self):
+        body = _make_filter().inlet(self._body(), __metadata__={"chat_id": CHAT_ID})
+        self.assertEqual(body["tool_ids"], ["ai_computer_use"])
+        self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", _system_content(body))
+
+    def test_user_selected_tools_stay_first_and_in_order(self):
+        body = _make_filter().inlet(
+            self._body(tool_ids=["web_search", "calculator"]),
+            __metadata__={"chat_id": CHAT_ID},
+        )
+        self.assertEqual(body["tool_ids"], ["web_search", "calculator", "ai_computer_use"])
+
+    def test_already_selected_tool_appears_exactly_once(self):
+        body = _make_filter().inlet(
+            self._body(tool_ids=["web_search", "ai_computer_use", "calculator"]),
+            __metadata__={"chat_id": CHAT_ID},
+        )
+        self.assertEqual(body["tool_ids"], ["web_search", "ai_computer_use", "calculator"])
+
+    def test_prompt_valve_off_still_attaches_the_tool(self):
+        f = _make_filter()
+        f.valves.INJECT_SYSTEM_PROMPT = False
+        body = f.inlet(self._body(tool_ids=["web_search"]), __metadata__={"chat_id": CHAT_ID})
+        self.assertEqual(body["tool_ids"], ["web_search", "ai_computer_use"])
+        self.assertEqual("", _system_content(body))
+        self.urlopen.assert_not_called()
+
+    def test_upper_case_saved_chat_id_gets_the_tool_and_prompt(self):
+        body = _make_filter().inlet(self._body(tool_ids=[]), __metadata__={"chat_id": CHAT_ID.upper()})
+        self.assertEqual(body["tool_ids"], ["ai_computer_use"])
+        self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", _system_content(body))
+
+    def test_requests_without_a_saved_chat_id_are_unchanged(self):
+        for metadata in (
+            None,
+            {},
+            {"chat_id": None},
+            {"chat_id": ""},
+            {"chat_id": f"channel:{CHAT_ID}"},
+            {"chat_id": f"temporary:{CHAT_ID}"},
+            {"chat_id": f"local:{CHAT_ID}"},
+            {"chat_id": "abc"},
+        ):
+            for original in (self._body(), self._body(tool_ids=["web_search"])):
+                with self.subTest(metadata=metadata, original=original):
+                    body = _make_filter().inlet(copy.deepcopy(original), __metadata__=metadata)
+                    self.assertEqual(body, original)
+        self.urlopen.assert_not_called()
 
 
 class SystemPromptFetchCache(unittest.TestCase):
@@ -858,20 +928,20 @@ class PreviewButton(unittest.TestCase):
 
     def _filter(self, public_url: str = "http://localhost:8081") -> "computer_link_filter.Filter":
         f = _make_filter()
-        _prime_cache(f, "abc", public_url=public_url)
+        _prime_cache(f, CHAT_ID, public_url=public_url)
         return f
 
     def test_outlet_appends_preview_button_by_default(self):
         f = self._filter()
-        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": "abc"})
+        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID})
         content = body["messages"][0]["content"]
         self.assertIn(
-            "[🖥️ Open preview](http://localhost:8081/files/abc/report.pdf)", content
+            f"[🖥️ Open preview](http://localhost:8081/files/{CHAT_ID}/report.pdf)", content
         )
 
     def test_outlet_never_emits_fenced_html_or_iframe(self):
         f = self._filter()
-        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": "abc"})
+        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID})
         content = body["messages"][0]["content"]
         self.assertNotIn("<iframe", content)
         self.assertNotIn("```html", content)
@@ -879,8 +949,8 @@ class PreviewButton(unittest.TestCase):
     def test_outlet_preview_button_is_idempotent(self):
         f = self._filter()
         body = _assistant_body_with_file()
-        out1 = f.outlet(body, __metadata__={"chat_id": "abc"})
-        out2 = f.outlet(out1, __metadata__={"chat_id": "abc"})
+        out1 = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+        out2 = f.outlet(out1, __metadata__={"chat_id": CHAT_ID})
         self.assertEqual(out1["messages"][0]["content"], out2["messages"][0]["content"])
         self.assertEqual(
             out2["messages"][0]["content"].count("[🖥️ Open preview]"),
@@ -890,20 +960,20 @@ class PreviewButton(unittest.TestCase):
     def test_outlet_preview_mode_off_skips_button(self):
         f = self._filter()
         f.valves.PREVIEW_MODE = "off"
-        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": "abc"})
+        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID})
         self.assertNotIn("[🖥️ Open preview]", body["messages"][0]["content"])
         self.assertIn(
-            "[📦 Download all files as archive](http://localhost:8081/files/abc/archive)",
+            f"[📦 Download all files as archive](http://localhost:8081/files/{CHAT_ID}/archive)",
             body["messages"][0]["content"],
         )
 
     def test_outlet_archive_button_off_skips_archive_without_disabling_preview(self):
         f = self._filter()
         f.valves.ARCHIVE_BUTTON = "off"
-        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": "abc"})
+        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID})
         content = body["messages"][0]["content"]
         self.assertIn(
-            "[🖥️ Open preview](http://localhost:8081/files/abc/report.pdf)", content
+            f"[🖥️ Open preview](http://localhost:8081/files/{CHAT_ID}/report.pdf)", content
         )
         self.assertNotIn("[📦 Download all files as archive]", content)
 
@@ -912,12 +982,12 @@ class PreviewButton(unittest.TestCase):
         other_link = "http://localhost:8081/files/other-chat/report.pdf"
         original = f"see artefact from another chat: {other_link}"
         body = {"messages": [{"role": "assistant", "content": original}]}
-        out = f.outlet(body, __metadata__={"chat_id": "abc"})
+        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
         self.assertEqual(out["messages"][0]["content"], original)
 
     def test_outlet_not_added_to_non_assistant_roles(self):
         f = self._filter()
-        link = "http://localhost:8081/files/abc/report.pdf"
+        link = f"http://localhost:8081/files/{CHAT_ID}/report.pdf"
         body = {
             "messages": [
                 {"role": "user", "content": f"u {link}"},
@@ -925,7 +995,7 @@ class PreviewButton(unittest.TestCase):
                 {"role": "tool", "content": f"t {link}"},
             ]
         }
-        out = f.outlet(body, __metadata__={"chat_id": "abc"})
+        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
         for msg in out["messages"]:
             self.assertNotIn("[🖥️ Open preview]", msg["content"])
             self.assertNotIn("archive", msg["content"].lower())
@@ -955,14 +1025,14 @@ class OutletCacheRecovery(unittest.TestCase):
 
     def test_outlet_skips_all_decoration_when_refetch_fails(self):
         f = _make_filter()
-        link = "http://localhost:8081/files/abc/report.pdf"
+        link = f"http://localhost:8081/files/{CHAT_ID}/report.pdf"
         original = f"assistant said: {link}"
         body = {"messages": [{"role": "assistant", "content": original}]}
         with patch(
             "urllib.request.OpenerDirector.open",
             side_effect=urllib.error.URLError("connection refused"),
         ):
-            out = f.outlet(body, __metadata__={"chat_id": "abc"})
+            out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
         self.assertEqual(
             out["messages"][0]["content"],
             original,
@@ -972,17 +1042,17 @@ class OutletCacheRecovery(unittest.TestCase):
     def test_outlet_falls_back_to_email_keyed_cache_when_user_missing(self):
         """A re-render without __user__ can use only the current chat's public base."""
         f = _make_filter()
-        _prime_cache(f, "abc", user_email="alice@example.com")
-        link = "http://localhost:8081/files/abc/report.pdf"
+        _prime_cache(f, CHAT_ID, user_email="alice@example.com")
+        link = f"http://localhost:8081/files/{CHAT_ID}/report.pdf"
         body = {"messages": [{"role": "assistant", "content": f"see {link}"}]}
         # Note: no __user__ passed
-        out = f.outlet(body, __metadata__={"chat_id": "abc"})
+        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
         decorated = out["messages"][0]["content"]
         self.assertIn(
-            "[🖥️ Open preview](http://localhost:8081/files/abc/report.pdf)", decorated
+            f"[🖥️ Open preview](http://localhost:8081/files/{CHAT_ID}/report.pdf)", decorated
         )
         self.assertIn(
-            "[📦 Download all files as archive](http://localhost:8081/files/abc/archive)",
+            f"[📦 Download all files as archive](http://localhost:8081/files/{CHAT_ID}/archive)",
             decorated,
         )
 
@@ -990,14 +1060,14 @@ class OutletCacheRecovery(unittest.TestCase):
         """Cache for chat-X must not decorate a message sent in chat-Y."""
         f = _make_filter()
         _prime_cache(f, "other-chat")
-        link = "http://localhost:8081/files/abc/report.pdf"
+        link = f"http://localhost:8081/files/{CHAT_ID}/report.pdf"
         original = f"assistant said: {link}"
         body = {"messages": [{"role": "assistant", "content": original}]}
         with patch(
             "urllib.request.OpenerDirector.open",
             side_effect=urllib.error.URLError("connection refused"),
         ):
-            out = f.outlet(body, __metadata__={"chat_id": "abc"})
+            out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
         self.assertEqual(out["messages"][0]["content"], original)
 
 

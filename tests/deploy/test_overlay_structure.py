@@ -250,6 +250,8 @@ class OverlayStructureTests(unittest.TestCase):
             interpolate_value(core_env["OCU_SANDBOX_DNS"], {})
         self.assertTrue(interpolated(webui_env["OCU_INTERNAL_TOKEN"], "OCU_INTERNAL_TOKEN"))
         self.assertEqual(webui_env["ENABLE_OCU_WORKSPACE"], "true")
+        # Every provider model is visible to ordinary users without per-model rows (#590).
+        self.assertEqual(webui_env["BYPASS_MODEL_ACCESS_CONTROL"], "true")
         self.assertEqual(webui_env["OCU_INTERNAL_URL"], "http://computer-use-server:8081")
         self.assertEqual(webui_env["ORCHESTRATOR_URL"], "http://computer-use-server:8081")
         self.assertEqual(webui_env["OFFLINE_MODE"], "true")

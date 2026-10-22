@@ -5,12 +5,14 @@ title: Computer Use Filter
 author: Open Computer Use Contributors
 version: 5.0.0
 required_open_webui_version: 0.5.17
-description: Authenticated HTTP-fetches the Computer Use system prompt from the internal orchestrator, with an LRU cache for transient failures. outlet() decorates assistant messages with a concrete-file preview link and optional archive link.
+description: Attaches the Computer Use tool to every saved chat and authenticated HTTP-fetches the Computer Use system prompt from the internal orchestrator, with an LRU cache for transient failures. outlet() decorates assistant messages with a concrete-file preview link and optional archive link.
 
 This filter works in conjunction with Computer Use Tools (computer_use_tools.py).
 
 FUNCTIONALITY:
-- inlet(): When tool "ai_computer_use" is active and chat_id is present, fetches the
+- inlet(): For every saved chat (a UUID chat_id; channel, temporary and local chats
+  are excluded), adds the "ai_computer_use" tool to the request after any tools the
+  user selected, whatever the model. Then, unless INJECT_SYSTEM_PROMPT is off, fetches the
   fully-baked system prompt from the orchestrator's /system-prompt endpoint using the
   process OCU_INTERNAL_TOKEN as Bearer authentication. It derives user_email only from
   injected __user__, requires the X-Public-Base-URL response header, and caches that
@@ -43,7 +45,7 @@ Security:
             response header on /system-prompt.
         INJECT_SYSTEM_PROMPT (bool, default True):
             If False, inlet() skips system-prompt injection entirely (useful when
-            another filter owns the prompt).
+            another filter owns the prompt). The tool is still attached.
         PREVIEW_MODE (Literal["button","off"], default "button"):
             Whether to append a markdown [{PREVIEW_BUTTON_TEXT}]({public}/files/{chat_id}/{file})
             link for the first current-chat concrete file URL. "off" emits no preview
@@ -84,6 +86,17 @@ TEMPLATE_PATTERN = r"^.*\{\{\s*(?:" + "|".join(OPENWEBUI_TEMPLATE_VARS) + r")\s*
 # Cache TTL and size (module-level so tests can patch them)
 _PROMPT_TTL_SECONDS = 300
 _PROMPT_CACHE_MAX_SIZE = 100
+
+# Saved Open WebUI chats have UUID ids. Channel replies ("channel:<id>") and
+# temporary or local chats ("temporary:<id>", "local:<id>") have no workspace.
+_SAVED_CHAT_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def _saved_chat_id(chat_id: object) -> bool:
+    """True only for a saved chat's id, the only kind with a Computer Use workspace."""
+    return isinstance(chat_id, str) and _SAVED_CHAT_ID_RE.fullmatch(chat_id) is not None
 
 
 def _find_block_start(content: str, pos: int) -> int:
@@ -204,7 +217,7 @@ class Filter:
         )
         INJECT_SYSTEM_PROMPT: bool = Field(
             default=True,
-            description="Inject Computer Use system prompt when tools are active. Turn off only if another filter owns the prompt.",
+            description="Inject the Computer Use system prompt into saved chats. Turn off only if another filter owns the prompt; the tool stays attached.",
         )
         PREVIEW_MODE: Literal["button", "off"] = Field(
             default="button",
@@ -334,16 +347,18 @@ class Filter:
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ) -> dict:
-        """Inject Computer Use system prompt BEFORE LLM processing."""
-        if not self.valves.INJECT_SYSTEM_PROMPT:
-            return body
-
-        tool_ids = body.get("tool_ids", [])
-        if "ai_computer_use" not in tool_ids:
-            return body
-
+        """Attach the Computer Use tool and inject its system prompt BEFORE LLM processing."""
         chat_id = __metadata__.get("chat_id") if __metadata__ else None
-        if not chat_id:
+        if not _saved_chat_id(chat_id):
+            return body
+
+        # The tool belongs to the harness, not to a model: append it after the
+        # user's own tools, keeping their order and listing it exactly once.
+        body["tool_ids"] = list(
+            dict.fromkeys([*(body.get("tool_ids") or []), "ai_computer_use"])
+        )
+
+        if not self.valves.INJECT_SYSTEM_PROMPT:
             return body
 
         user_email = __user__.get("email", "") if __user__ else ""

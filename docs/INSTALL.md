@@ -37,13 +37,9 @@ docker compose -f docker-compose.webui.yml up --build
 
 `scripts/check-config.sh` reports `[OK]` / `[WARN]` / `[ERR]` for each setting and exits 1 if anything is likely to break end-to-end (e.g. `PUBLIC_BASE_URL` left at the internal-DNS default, half-configured Vision group). WARNs are fine for local dev.
 
-**Re-seeding Valves after editing `.env`.** The `open-webui` container runs an init script that writes the persistent `ORCHESTRATOR_URL` Valve on **first start only** — a marker file (`/app/backend/data/.computer-use-initialized`) guards re-runs so your admin UI edits are never clobbered. `OCU_INTERNAL_TOKEN` stays in the Open WebUI server environment and the tool and filter read it directly on every call; it is not a Valve and is never written to the persistent Valve payload. To pick up a changed `ORCHESTRATOR_URL`, delete the marker on `open-webui` and restart it:
+**Re-seeding Valves after editing `.env`.** `openwebui/init.sh` installs the tool and filter and writes the persistent `ORCHESTRATOR_URL` Valve once; a marker file (`MARKER_FILE`, default `/app/backend/data/.computer-use-initialized`) makes later runs exit without changes, so admin UI edits are kept. `OCU_INTERNAL_TOKEN` stays in the Open WebUI server environment and the tool and filter read it directly on every call; it is not a Valve and is never written to the persistent Valve payload.
 
-```bash
-docker compose -f docker-compose.webui.yml exec open-webui \
-    rm /app/backend/data/.computer-use-initialized
-docker compose -f docker-compose.webui.yml restart open-webui
-```
+The example `docker-compose.webui.yml` runs the stock upstream image and does **not** run `init.sh`, so restarting `open-webui` re-seeds nothing. Change the Valves in **Admin → Functions** and **Workspace → Tools**, or run `init.sh` yourself with `WEBUI_URL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ORCHESTRATOR_URL`, `MCP_API_KEY` and a writable `MARKER_FILE` set. The production-like deployment runs `init.sh` in its one-shot `open-webui-init` service; to re-run it there, follow [Re-running the initializer](../deploy/production-like-test/NETWORK-HARDENING.md#re-running-the-initializer-and-removing-the-wrapper-model-590).
 
 `PUBLIC_BASE_URL` lives only on the `computer-use-server` container — it is **not** propagated into Open WebUI Valves. It must not end with `/`. If you change it in `.env`, restart the server container instead: `docker compose up -d --force-recreate computer-use-server`.
 
@@ -78,7 +74,7 @@ After login, go to your model settings and set:
 | **Function Calling** | `Native` | Required for tools to work |
 | **Stream Chat Response** | `On` | Real-time output |
 
-The init script auto-creates a workspace model with these settings, but verify if using a different model.
+`init.sh` sets both as defaults for every model (`DEFAULT_MODEL_PARAMS`). A model's own Advanced Params override them, so check those if a model behaves differently. No model needs a tool setting: the global filter attaches the Computer Use tool to every saved chat.
 
 ## Verification
 
@@ -99,7 +95,8 @@ curl -s http://localhost:3000 | head -1
 ## Troubleshooting
 
 ### "Model not found" or tool calls fail
-- Check **Function Calling** is set to `Native` in model settings
+- Check **Function Calling** is `Native` for the model (see [Model Settings](#model-settings))
+- Non-admin users see only models they may read. The production-like deployment sets `BYPASS_MODEL_ACCESS_CONTROL=true`, so every provider model is visible to every user; other deployments need a read grant for each model
 - Verify `OPENAI_API_KEY` is correct: `curl -H "Authorization: Bearer $OPENAI_API_KEY" $OPENAI_API_BASE_URL/models`
 
 ### Container creation timeout

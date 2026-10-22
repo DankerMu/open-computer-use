@@ -65,7 +65,7 @@ Each tool call authenticates the transport and carries only server-provided user
 
 The `computer_link_filter.py` function is **required** alongside this tool:
 
-- **Inlet** (system prompt injection): Adds `<available_skills>` XML block so the model knows which skills exist
+- **Inlet** (tool attachment and system prompt injection): Attaches this tool to every saved chat and adds the `<available_skills>` XML block so the model knows which skills exist
 - **Outlet** (response post-processing): Detects file URLs in responses and injects preview links, "View file" and "Download archive" buttons
 
 ## Troubleshooting
@@ -73,7 +73,7 @@ The `computer_link_filter.py` function is **required** alongside this tool:
 | Problem | Solution |
 |---------|----------|
 | "Could not connect to Computer Use Server" | Check `ORCHESTRATOR_URL` valve. Inside Docker-compose: use `http://computer-use-server:8081` (service DNS). |
-| Tools not showing in chat | Enable tool in chat settings. Set **Function Calling = Native** in model settings |
+| Tool not used in chat | The global filter attaches the tool to every saved chat, whatever the model; temporary chats get no tool. Check that `computer_link_filter.py` is installed, **Active** and **Global**, and that **Function Calling** is `Native` (`init.sh` sets it for every model in `DEFAULT_MODEL_PARAMS`) |
 | Skills not in system prompt | Install and enable `computer_link_filter.py` globally |
 | File preview not working | Check `PUBLIC_BASE_URL` env var on the Computer Use server (it's baked into /system-prompt links and returned to the filter via response header — no separate filter Valve). |
 | Sub-agent not starting | Set `ANTHROPIC_AUTH_TOKEN` in server `.env` |
