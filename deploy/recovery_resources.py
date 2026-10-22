@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import errno
 import json
 import math
 import os
@@ -26,6 +27,13 @@ from recovery import RecoveryError, docker, require_command, sha256_file
 OFFICE_LIVENESS_SECONDS = 600
 OFFICE_QUIESCE_TIMEOUT_SECONDS = 900
 OFFICE_SHUTDOWN_COMMAND = "/usr/bin/documentserver-prepare4shutdown.sh"
+# Model-written trees keep their links verbatim; deployment-owned trees stay confined.
+LINK_POLICY = {
+    "webui-data": "confined",
+    "skills-cache": "confined",
+    "chat-data": "verbatim",
+    "workspaces": "verbatim",
+}
 
 
 def _office_timeout() -> float:
@@ -37,6 +45,21 @@ def _office_timeout() -> float:
     if not math.isfinite(value) or value <= OFFICE_LIVENESS_SECONDS:
         raise RecoveryError(f"{name} must exceed the Office liveness interval")
     return value
+
+
+def _open_regular_nofollow(held: ExitStack, parts: tuple, *, dir_fd: int | None = None) -> int:
+    """Open parts[-1] below parts[:-1] read-only, never following a link at any level."""
+    parent = dir_fd
+    for index, part in enumerate(parts):
+        if stat.S_ISLNK(os.stat(part, dir_fd=parent, follow_symlinks=False).st_mode):
+            raise OSError(errno.ELOOP, "path component is a symbolic link", str(part))
+        last = index == len(parts) - 1
+        flags = os.O_RDONLY | os.O_NOFOLLOW | (os.O_NONBLOCK if last else os.O_DIRECTORY)
+        parent = os.open(part, flags, dir_fd=parent)
+        held.callback(os.close, parent)
+    if not stat.S_ISREG(os.fstat(parent).st_mode):
+        raise ValueError(f"{parts[-1]} is not a regular file")
+    return parent
 
 
 def _office_blockers(root: Path) -> dict:
@@ -52,18 +75,12 @@ def _office_blockers(root: Path) -> dict:
                     continue
                 chat = recovery.canonical_chat_id(child)
                 with ExitStack() as held:
-                    parent = root_fd
                     try:
-                        for part in (child, ".ocu", "office"):
-                            parent = os.open(part, directories, dir_fd=parent)
-                            held.callback(os.close, parent)
-                        fd = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                                     dir_fd=parent)
+                        fd = _open_regular_nofollow(
+                            held, (child, ".ocu", "office", "state.json"), dir_fd=root_fd
+                        )
                     except FileNotFoundError:
                         continue
-                    held.callback(os.close, fd)
-                    if not stat.S_ISREG(os.fstat(fd).st_mode):
-                        raise ValueError("not a regular state file")
                     with os.fdopen(fd, encoding="utf-8", closefd=False) as stream:
                         # int rejects the JSON decoder's nonstandard NaN/Infinity constants.
                         state = json.load(stream, object_pairs_hook=release._reject_duplicate_keys,
@@ -642,7 +659,7 @@ def _helper_detail(result) -> str:
     return str(result.stderr or result.stdout or "").strip()[-2000:]
 
 
-def capture_volume(volume: str, archive: Path, image: str) -> dict:
+def capture_volume(volume: str, archive: Path, image: str, *, links: str) -> dict:
     archive.parent.mkdir(parents=True, exist_ok=True)
     inspect_volume(volume)
     result = run_volume_helper(
@@ -651,33 +668,33 @@ def capture_volume(volume: str, archive: Path, image: str) -> dict:
             (volume, "/source", "ro"),
             (str(archive.parent), "/output", "rw"),
         ],
-        ["capture", "/source", f"/output/{archive.name}"],
+        ["capture", f"--links={links}", "/source", f"/output/{archive.name}"],
     )
     if result.returncode != 0:
         raise RecoveryError(f"volume helper failed for {volume}: {_helper_detail(result)}")
     if not archive.exists() or archive.stat().st_size == 0:
         raise RecoveryError(f"volume helper did not publish {archive.name}")
-    recovery_fs.validate_archive(archive)
+    recovery_fs.validate_archive(archive, links=links)
     return {"path": archive.name, "sha256": sha256_file(archive), "volume": volume}
 
 
-def restore_volume(volume: str, archive: Path, image: str) -> None:
+def restore_volume(volume: str, archive: Path, image: str, *, links: str) -> None:
     inspect_volume(volume)
-    recovery_fs.validate_archive(archive)
+    recovery_fs.validate_archive(archive, links=links)
     result = run_volume_helper(
         image,
         [
             (volume, "/target", "rw"),
             (str(archive.parent), "/input", "ro"),
         ],
-        ["extract", f"/input/{archive.name}", "/target"],
+        ["extract", f"--links={links}", f"/input/{archive.name}", "/target"],
     )
     if result.returncode != 0:
         raise RecoveryError(f"volume helper failed for {volume}: {_helper_detail(result)}")
 
 
-def _copy_tree_archive(source: Path, archive: Path) -> dict:
-    record = recovery_fs.capture_tree(source, archive)
+def _copy_tree_archive(source: Path, archive: Path, *, links: str) -> dict:
+    record = recovery_fs.capture_tree(source, archive, links=links)
     return {"path": archive.name, "sha256": record["sha256"]}
 
 
@@ -706,18 +723,21 @@ def backup_deployment(*, deploy_root: Path, destination: Path, runtime_file: Pat
             workspace_image = helper_image(runtime, "workspace")
             webui_archive = stage / "webui-data.tar.gz"
             components["webui-data"] = capture_volume(
-                identity["webui_volume"], webui_archive, workspace_image
+                identity["webui_volume"], webui_archive, workspace_image,
+                links=LINK_POLICY["webui-data"],
             )
             components["webui-data"]["path"] = "webui-data.tar.gz"
-            if not _archive_contains(webui_archive, recovery.MARKER_NAME):
+            if not _archive_contains(webui_archive, recovery.MARKER_NAME,
+                                     links=LINK_POLICY["webui-data"]):
                 raise RecoveryError("WebUI initializer marker is missing from the data volume")
             components["webui-data"]["marker"] = recovery.MARKER_NAME
             components["chat-data"] = _copy_tree_archive(
-                identity["chat_dir"], stage / "chat-data.tar.gz"
+                identity["chat_dir"], stage / "chat-data.tar.gz", links=LINK_POLICY["chat-data"]
             )
             components["chat-data"]["path"] = "chat-data.tar.gz"
             components["skills-cache"] = _copy_tree_archive(
-                identity["skills_dir"], stage / "skills-cache.tar.gz"
+                identity["skills_dir"], stage / "skills-cache.tar.gz",
+                links=LINK_POLICY["skills-cache"],
             )
             components["skills-cache"]["path"] = "skills-cache.tar.gz"
             workspaces = {}
@@ -726,7 +746,8 @@ def backup_deployment(*, deploy_root: Path, destination: Path, runtime_file: Pat
             os.chmod(workspace_dir, 0o700)
             for chat_id, volume in sorted(quiesced["volumes"].items()):
                 archive = workspace_dir / f"{chat_id}.tar.gz"
-                record = capture_volume(volume, archive, workspace_image)
+                record = capture_volume(volume, archive, workspace_image,
+                                        links=LINK_POLICY["workspaces"])
                 record["path"] = f"workspaces/{chat_id}.tar.gz"
                 record["chat_id"] = chat_id
                 record["volume"] = volume
@@ -797,8 +818,8 @@ def backup_deployment(*, deploy_root: Path, destination: Path, runtime_file: Pat
         session.cleanup()
 
 
-def _archive_contains(archive: Path, relative: str) -> bool:
-    return recovery_fs.archive_has_regular_root_member(archive, relative)
+def _archive_contains(archive: Path, relative: str, *, links: str) -> bool:
+    return recovery_fs.archive_has_regular_root_member(archive, relative, links=links)
 
 
 def _normalized_component_path(relative: str) -> str:
@@ -849,16 +870,20 @@ def verify_recovery_set(root: Path, *, require_published: bool = True) -> dict:
     if not _archive_contains(
         recovery.confined_component_path(root, components["webui-data"]["path"]),
         recovery.MARKER_NAME,
+        links=LINK_POLICY["webui-data"],
     ):
         raise RecoveryError("WebUI initializer marker is missing from the recovery set")
     recovery_fs.validate_archive(
-        recovery.confined_component_path(root, components["webui-data"]["path"])
+        recovery.confined_component_path(root, components["webui-data"]["path"]),
+        links=LINK_POLICY["webui-data"],
     )
     recovery_fs.validate_archive(
-        recovery.confined_component_path(root, components["chat-data"]["path"])
+        recovery.confined_component_path(root, components["chat-data"]["path"]),
+        links=LINK_POLICY["chat-data"],
     )
     recovery_fs.validate_archive(
-        recovery.confined_component_path(root, components["skills-cache"]["path"])
+        recovery.confined_component_path(root, components["skills-cache"]["path"]),
+        links=LINK_POLICY["skills-cache"],
     )
     workspaces = components["workspaces"]
     if not isinstance(workspaces, dict):
@@ -874,7 +899,7 @@ def verify_recovery_set(root: Path, *, require_published: bool = True) -> dict:
         if str(record.get("volume") or "") != expected_volume:
             raise RecoveryError(f"workspace {chat_id} is not bound to its declared volume")
         path = claim_path(record["path"], record["sha256"])
-        recovery_fs.validate_archive(path)
+        recovery_fs.validate_archive(path, links=LINK_POLICY["workspaces"])
     release.load_inventory(
         recovery.confined_component_path(root, components["release-inventory"]["path"])
     )
@@ -1325,10 +1350,12 @@ def restore_deployment(
             recovery_fs.extract_tree(
                 recovery_set / payload["components"]["chat-data"]["path"],
                 stage / "data" / "chat",
+                links=LINK_POLICY["chat-data"],
             )
             recovery_fs.extract_tree(
                 recovery_set / payload["components"]["skills-cache"]["path"],
                 stage / "data" / "skills-cache",
+                links=LINK_POLICY["skills-cache"],
             )
             version = payload["components"]["version-record"]
             if version.get("path"):
@@ -1362,6 +1389,7 @@ def restore_deployment(
                     recovery_set, payload["components"]["webui-data"]["path"]
                 ),
                 workspace_image,
+                links=LINK_POLICY["webui-data"],
             )
             if not _volume_has_marker(identity["webui_volume"], workspace_image):
                 raise RecoveryError("restored WebUI data is missing the initializer marker")
@@ -1374,6 +1402,7 @@ def restore_deployment(
                     volume,
                     recovery.confined_component_path(recovery_set, record["path"]),
                     workspace_image,
+                    links=LINK_POLICY["workspaces"],
                 )
             with release._blocked_signals():
                 postgres = start_isolated_postgres(identity, runtime, postgres_image)
@@ -1454,10 +1483,18 @@ def _broker_listing(chat_dir: Path, chat_id: str, image: str) -> dict:
 
 
 def _index_snapshot(chat_dir: Path, chat_id: str) -> dict:
-    path = chat_dir / chat_id / ".ocu" / "index.json"
-    if not path.exists():
+    """Read the restored broker index without following a link in its path."""
+    try:
+        with ExitStack() as held:
+            fd = _open_regular_nofollow(held, (str(chat_dir), chat_id, ".ocu", "index.json"))
+            with os.fdopen(fd, encoding="utf-8", closefd=False) as stream:
+                index = json.load(stream)
+    except FileNotFoundError:
         return {"counter": 0, "active": {}, "missing": True}
-    index = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RecoveryError(f"chat {chat_id} index path is a symlink") from exc
+        raise
     return {"counter": int(index["counter"]), "active": index.get("active") or {}, "missing": False}
 
 

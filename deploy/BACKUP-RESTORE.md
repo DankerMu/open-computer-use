@@ -45,15 +45,29 @@ are not recovery components. Image archives stay in the retained delivery and ar
 referenced by inventory identity. Writers stay stopped; sandboxes are not started.
 Unrelated managed-looking sandboxes are refused without being stopped.
 
-Captured trees keep relative symbolic links that stay inside the captured root,
-such as the HuggingFace cache links `snapshots/<rev>/<file> -> ../../blobs/<sha>`
-in WebUI data, with their targets unchanged. A link with an empty or absolute target,
-a `..` after a normal component, or more leading `..` components than its directory
-depth below the root fails capture, verification and restore with `unsafe symlink`.
-Verify and restore a set that holds `..` links with recovery tooling that has this
-rule: older `deploy/recovery.py` refuses such links with `unsafe symlink`, and the
-volume helper mounts the running checkout's `deploy/`, so run verify and restore
-from a checkout that includes this rule.
+Each captured tree has a link policy, fixed by its recovery component:
+
+- **Deployment-owned trees** (the WebUI data volume and `skills-cache`) are
+  `confined`. They keep relative symbolic links that stay inside the captured root,
+  such as the HuggingFace cache links `snapshots/<rev>/<file> -> ../../blobs/<sha>`
+  in WebUI data, with their targets unchanged. A link with an empty or absolute
+  target, a `..` after a normal component, or more leading `..` components than its
+  directory depth below the root fails capture, verification and restore with
+  `unsafe symlink`.
+- **Model-written trees** (every `chat-<id>-workspace` volume and the chat data
+  tree, including `outputs/`) are `verbatim`. Any link with a non-empty target is
+  captured and restored with its target unchanged, including absolute and escaping
+  links such as the sandbox entrypoint's `.claude/agents/<name>.md -> /opt/...` and
+  `.claude/skills/<name> -> /mnt/skills/public/<name>/`, or a venv's
+  `bin/python3 -> /usr/bin/python3`. Links are never followed.
+
+Under both policies a member below a link, a hardlink to a link or to a path
+outside the archive, and device files are refused, and no restore step reads,
+writes, changes the mode of or changes the owner of a link's target. The archive
+does not record the policy. Verify and restore a set with recovery tooling that has
+these rules: older `deploy/recovery.py` refuses absolute or `..` links with
+`unsafe symlink`, and the volume helper mounts the running checkout's `deploy/`, so
+run verify and restore from a checkout that includes them.
 
 `restore` requires `DOCKER_HOST=unix:///var/run/docker.sock` on a daemon identity different from the captured source, an absent destination root, and no colliding `ocu-test-*` / `owui-chat-*` / selected volumes. A different Compose project name is not isolation. Helpers, `up.sh`, and runtime socket consumers are pinned to that endpoint. Captured dotenv is parsed as inert assignments. Existing target files are not overwritten. `--retained-delivery` imports the selected release's verified images onto an empty image cache before helpers or isolated PostgreSQL run; conflicting tags are refused. Selected source and all seven image references, including `DOCUMENTSERVER_IMAGE`, replace captured release identity together. External chat/skills roots are refused rather than silently relocated. Isolated PostgreSQL occupancy and restore wait for the final TCP-authenticated server, not the official entrypoint's temporary Unix-socket initializer. Provider inspection uses the selected WebUI `config` table (`key`, `value`, `updated_at`) and does not rewrite persistent database credentials.
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import io
 import json
 import os
 import signal
@@ -56,6 +57,12 @@ CHAT_ID = "chat-live"
 ORPHAN_ID = "chat-orphan"
 PROVIDER_A = "credential-A"
 PROVIDER_B = "credential-B"
+MODEL_LINKS = {
+    "bin/python3": "/usr/bin/python3",
+    ".claude/agents/x.md": "/opt/skills-external/a/x.md",
+    ".claude/skills/s": "/mnt/skills/public/s/",
+    "a/x": "../../outside",
+}
 
 
 def stack_container(name: str, *, running=True, paused=False, extra=None, image=None, service=None):
@@ -1089,7 +1096,7 @@ else:
         extracted = self.root / "detached-out"
         import recovery_fs
 
-        recovery_fs.extract_tree(archive, extracted)
+        recovery_fs.extract_tree(archive, extracted, links="verbatim")
         self.assertEqual((extracted / "README.md").read_bytes(), b"sandbox-home\n")
         ops = (self.state / "ops.log").read_text(encoding="utf-8")
         self.assertNotIn("docker start", ops)
@@ -1336,7 +1343,7 @@ else:
         (nested / "lookalike" / ".computer-use-initialized").write_bytes(b"1\n")
         import recovery_fs
 
-        recovery_fs.capture_tree(nested, backup / "webui-data.tar.gz")
+        recovery_fs.capture_tree(nested, backup / "webui-data.tar.gz", links="confined")
         manifest = json.loads((backup / "recovery.json").read_text(encoding="utf-8"))
         manifest["components"]["webui-data"]["sha256"] = hashlib.sha256(
             (backup / "webui-data.tar.gz").read_bytes()
@@ -2505,7 +2512,7 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         extracted = self.root / "helper-out"
         import recovery_fs
 
-        recovery_fs.extract_tree(archive, extracted)
+        recovery_fs.extract_tree(archive, extracted, links="verbatim")
         self.assertEqual((extracted / "README.md").read_bytes(), b"sandbox-home\n")
         runs = json.loads((self.state / "runs.json").read_text(encoding="utf-8"))
         helpers = [row for row in runs if row.get("command")[:1] == ["/recovery/recovery_helper.py"]]
@@ -2691,6 +2698,140 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertTrue((dest / ".restored").exists())
 
+    def _seed_model_links(self):
+        workspace = self.state / "volume-data" / f"chat-{CHAT_ID}-workspace"
+        outputs = self.chat_dir / CHAT_ID / "outputs"
+        for root in (workspace, outputs):
+            for name, target in MODEL_LINKS.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(target, path)
+        return workspace, outputs
+
+    def _backup(self, dest):
+        return self.run_cli(
+            ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
+             "--runtime-file", str(self.runtime)]
+        )
+
+    def _helper_runs(self, state):
+        runs = json.loads((state / "runs.json").read_text(encoding="utf-8"))
+        return [
+            {"command": row["command"], "mounts": row["mounts"]}
+            for row in runs
+            if row.get("command")[:1] == ["/recovery/recovery_helper.py"]
+        ]
+
+    def _assert_helper_policy(self, runs, subcommand, mount, policy):
+        commands = [row["command"] for row in runs if row["command"][1] == subcommand and mount in row["mounts"]]
+        self.assertTrue(commands, runs)
+        for command in commands:
+            self.assertIn(f"--links={policy}", command)
+
+    def test_model_written_absolute_links_back_up_verbatim(self):
+        self._seed_model_links()
+        dest = self.root / "backup-model-links"
+        result = self._backup(dest)
+        runs = self._helper_runs(self.state)
+        self.assertEqual(result.returncode, 0, result.stderr + "\nhelper argv: " + json.dumps(runs))
+        self.assertTrue((dest / "recovery.json").is_file())
+        self._assert_helper_policy(runs, "capture", f"chat-{CHAT_ID}-workspace:/source:ro", "verbatim")
+        self._assert_helper_policy(runs, "capture", "ocu-test_open-webui-data:/source:ro", "confined")
+        for archive, prefix in (
+            (dest / "workspaces" / f"{CHAT_ID}.tar.gz", ""),
+            (dest / "chat-data.tar.gz", f"{CHAT_ID}/outputs/"),
+        ):
+            with tarfile.open(archive, "r:*") as bundle:
+                links = {member.name.removeprefix("./"): member.linkname
+                         for member in bundle.getmembers() if member.issym()}
+            for name, target in MODEL_LINKS.items():
+                self.assertEqual(links.get(prefix + name), target, (archive.name, name))
+        verified = self.run_cli(["verify", "--recovery-set", str(dest)])
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_deployment_owned_absolute_link_refuses_backup(self):
+        for owner, root in (
+            ("skills-cache", self.skills_dir / "demo"),
+            ("webui-data", self.state / "volume-data" / "ocu-test_open-webui-data"),
+        ):
+            with self.subTest(owner=owner):
+                self._seed_volumes_and_db()
+                link = root / "abs"
+                os.symlink("/etc/passwd", link)
+                dest = self.root / f"backup-owned-{owner}"
+                result = self._backup(dest)
+                link.unlink()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("unsafe symlink", result.stderr)
+                self.assertFalse(dest.exists())
+
+    def _add_link_member(self, archive, name, target):
+        with tarfile.open(archive, "r:*") as bundle:
+            members = bundle.getmembers()
+            contents = {member.name: bundle.extractfile(member).read() for member in members if member.isfile()}
+        with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as bundle:
+            for member in members:
+                bundle.addfile(member, io.BytesIO(contents[member.name]) if member.isfile() else None)
+            link = tarfile.TarInfo(name=name)
+            link.type = tarfile.SYMTYPE
+            link.linkname = target
+            bundle.addfile(link)
+
+    def test_verify_applies_the_component_link_policy(self):
+        backup = self.root / "policy-backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        for component, relative, accepted in (
+            ("skills-cache", "skills-cache.tar.gz", False),
+            ("webui-data", "webui-data.tar.gz", False),
+            ("workspaces", f"workspaces/{CHAT_ID}.tar.gz", True),
+            ("chat-data", "chat-data.tar.gz", True),
+        ):
+            with self.subTest(component=component):
+                copy = self.root / f"policy-{component}"
+                shutil.copytree(backup, copy)
+                self._add_link_member(copy / relative, "abs-link", "/usr/bin/python3")
+                manifest = json.loads((copy / "recovery.json").read_text(encoding="utf-8"))
+                record = manifest["components"][component]
+                if component == "workspaces":
+                    record = record[CHAT_ID]
+                record["sha256"] = hashlib.sha256((copy / relative).read_bytes()).hexdigest()
+                (copy / "recovery.json").write_text(json.dumps(manifest), encoding="utf-8")
+                result = self.run_cli(["verify", "--recovery-set", str(copy)])
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unsafe symlink", result.stderr)
+
+    def test_restore_recreates_model_written_links_verbatim(self):
+        self._seed_model_links()
+        backup = self.root / "model-links-backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self._seed_restore_target("model-links-state")
+        dest = self.root / "model-links-root"
+        restored = self.run_cli(
+            ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+             "--provider-file", str(provider)],
+            extra={"FAKE_DOCKER_STATE": str(target_state)},
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertTrue((dest / ".restored").exists())
+        for root in (
+            target_state / "volume-data" / f"chat-{CHAT_ID}-workspace",
+            dest / "data" / "chat" / CHAT_ID / "outputs",
+        ):
+            for name, target in MODEL_LINKS.items():
+                self.assertTrue((root / name).is_symlink(), root / name)
+                self.assertEqual(os.readlink(root / name), target, root / name)
+        runs = self._helper_runs(target_state)
+        self._assert_helper_policy(runs, "extract", f"chat-{CHAT_ID}-workspace:/target:rw", "verbatim")
+        self._assert_helper_policy(runs, "extract", "ocu-test_open-webui-data:/target:rw", "confined")
+
 
 class VolumeHelperFailureTests(unittest.TestCase):
     VOLUME = "ocu-test_open-webui-data"
@@ -2712,13 +2853,13 @@ class VolumeHelperFailureTests(unittest.TestCase):
             self.resources, "run_volume_helper", return_value=failed
         ):
             with self.assertRaises(recovery.RecoveryError) as raised:
-                operation(self.VOLUME, self.archive, "helper:image")
+                operation(self.VOLUME, self.archive, "helper:image", links="confined")
         return str(raised.exception)
 
     def _valid_archive(self):
         source = self.root / "empty"
         source.mkdir()
-        self.resources.recovery_fs.capture_tree(source, self.archive)
+        self.resources.recovery_fs.capture_tree(source, self.archive, links="confined")
 
     def _assert_reports_helper_reason(self, operation):
         reason = "RecoveryError: /output/x.tar.gz: unsafe symlink a/b"
@@ -2744,6 +2885,84 @@ class VolumeHelperFailureTests(unittest.TestCase):
     def test_restore_volume_failure_carries_helper_reason(self):
         self._valid_archive()
         self._assert_reports_helper_reason(self.resources.restore_volume)
+
+
+class IndexSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        import recovery_resources
+
+        self.resources = recovery_resources
+        self.context = tmp_dir()
+        self.root = Path(self.context.name)
+        self.decoy = self.root / "decoy"
+        (self.decoy / ".ocu").mkdir(parents=True)
+        decoy = {"counter": 7, "active": {"decoy.txt": {"file_id": "decoy", "revision": 7}}}
+        (self.decoy / ".ocu" / "index.json").write_text(json.dumps(decoy), encoding="utf-8")
+
+    def tearDown(self):
+        self.context.cleanup()
+
+    def _spied_snapshot(self, chat_dir):
+        opened = []
+        real_os_open = os.open
+        real_io_open = io.open
+
+        def os_open(path, flags, *args, **kwargs):
+            opened.append(("os.open", os.fspath(path), flags))
+            return real_os_open(path, flags, *args, **kwargs)
+
+        def io_open(file, *args, **kwargs):
+            if not isinstance(file, int):
+                opened.append(("io.open", os.fspath(file), 0))
+            return real_io_open(file, *args, **kwargs)
+
+        with patch.object(os, "open", os_open), patch.object(io, "open", io_open):
+            try:
+                return self.resources._index_snapshot(chat_dir, CHAT_ID), opened
+            except recovery.RecoveryError as exc:
+                return exc, opened
+
+    def test_link_in_index_path_is_refused_without_opening_its_target(self):
+        cases = {
+            "chat": lambda chat: os.symlink(self.decoy, chat),
+            ".ocu": lambda chat: (chat.mkdir(), os.symlink(self.decoy / ".ocu", chat / ".ocu")),
+            "index.json": lambda chat: (
+                (chat / ".ocu").mkdir(parents=True),
+                os.symlink(self.decoy / ".ocu" / "index.json", chat / ".ocu" / "index.json"),
+            ),
+        }
+        decoy = os.path.realpath(self.decoy)
+        for index, (case, plant) in enumerate(cases.items()):
+            with self.subTest(link=case):
+                chat_dir = self.root / f"chat-root-{index}"
+                chat_dir.mkdir()
+                plant(chat_dir / CHAT_ID)
+                result, opened = self._spied_snapshot(chat_dir)
+                if not isinstance(result, recovery.RecoveryError):
+                    self.fail(f"followed the {case} link: {result}; opened {opened}")
+                self.assertIn("index path is a symlink", str(result))
+                for kind, path, flags in opened:
+                    if kind == "os.open":
+                        self.assertTrue(flags & os.O_NOFOLLOW, (kind, path))
+                    self.assertFalse(os.path.realpath(path).startswith(decoy), (kind, path))
+
+    def test_missing_and_regular_index_read_as_before(self):
+        chat_dir = self.root / "chat"
+        chat_dir.mkdir()
+        missing = {"counter": 0, "active": {}, "missing": True}
+        self.assertEqual(self.resources._index_snapshot(chat_dir, CHAT_ID), missing)
+        (chat_dir / CHAT_ID).mkdir()
+        self.assertEqual(self.resources._index_snapshot(chat_dir, CHAT_ID), missing)
+        (chat_dir / CHAT_ID / ".ocu").mkdir()
+        self.assertEqual(self.resources._index_snapshot(chat_dir, CHAT_ID), missing)
+        active = {"result.txt": {"file_id": "f-1", "revision": 3}}
+        (chat_dir / CHAT_ID / ".ocu" / "index.json").write_text(
+            json.dumps({"counter": 3, "active": active}), encoding="utf-8"
+        )
+        self.assertEqual(
+            self.resources._index_snapshot(chat_dir, CHAT_ID),
+            {"counter": 3, "active": active, "missing": False},
+        )
 
 
 if __name__ == "__main__":
