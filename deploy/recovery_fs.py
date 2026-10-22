@@ -80,6 +80,18 @@ def destination_member_name(name: str) -> str:
     return canonical_member_name(name)
 
 
+def _symlink_target_confined(member_name: str, target: str) -> bool:
+    if not target or target.startswith("/") or "\x00" in target:
+        return False
+    parts = [part for part in target.split("/") if part not in ("", ".")]
+    climbs = 0
+    while climbs < len(parts) and parts[climbs] == "..":
+        climbs += 1
+    if ".." in parts[climbs:]:
+        return False
+    return climbs <= member_name.count("/")
+
+
 
 def _lstat(path: Path):
     try:
@@ -170,8 +182,8 @@ def _python_capture(root: Path, archive: Path, rows: list[tuple[Path, str, os.st
                 continue
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(path)
-                if target.startswith("/") or ".." in Path(target).parts:
-                    fail(f"{path}: absolute or parent symlink target is unsupported")
+                if not _symlink_target_confined(relative, target):
+                    fail(f"{path}: unsafe symlink")
                 member.type = tarfile.SYMTYPE
                 member.linkname = target
                 member.size = 0
@@ -216,11 +228,29 @@ def _apply_metadata(path: Path, member: tarfile.TarInfo) -> None:
         os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
 
 
+def _require_safe_target(archive: Path, dest: Path, name: str, member: tarfile.TarInfo) -> None:
+    current = dest
+    parts = Path(name).parts
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        if index < len(parts) - 1:
+            if not stat.S_ISDIR(info.st_mode):
+                fail(f"{archive}: unsafe parent {name}")
+        elif not (member.isdir() and stat.S_ISDIR(info.st_mode)):
+            fail(f"{archive}: existing target {name}")
+
+
 def _python_extract(archive: Path, dest: Path, members: list[tarfile.TarInfo]) -> None:
     with tarfile.open(archive, "r:*") as bundle:
         for member in members:
             name = canonical_member_name(member.name)
             target = dest if name == "." else dest / name
+            if name != ".":
+                _require_safe_target(archive, dest, name, member)
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
             elif member.issym():
@@ -350,9 +380,7 @@ def inspect_archive(archive: Path) -> list[tarfile.TarInfo]:
         kind = _member_kind(member)
         if kind == "unsupported" or member.isdev() or member.isfifo():
             fail(f"{archive}: unsupported member type {member.name}")
-        if member.issym() and (
-            member.linkname.startswith("/") or ".." in Path(member.linkname).parts
-        ):
+        if member.issym() and not _symlink_target_confined(name, member.linkname):
             fail(f"{archive}: unsafe symlink {member.name}")
         if member.islnk() and (
             member.linkname.startswith("/") or ".." in Path(member.linkname).parts
