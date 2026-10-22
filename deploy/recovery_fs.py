@@ -245,7 +245,8 @@ def _apply_metadata(path: Path, member: tarfile.TarInfo) -> None:
         os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
 
 
-def _require_safe_target(archive: Path, dest: Path, name: str, member: tarfile.TarInfo) -> None:
+def _on_disk_chain(dest: Path, name: str):
+    """Yield (is_last, lstat or None) for each component of name under dest; stop at the first missing one."""
     current = dest
     parts = Path(name).parts
     for index, part in enumerate(parts):
@@ -253,12 +254,30 @@ def _require_safe_target(archive: Path, dest: Path, name: str, member: tarfile.T
         try:
             info = current.lstat()
         except FileNotFoundError:
+            yield index == len(parts) - 1, None
             return
-        if index < len(parts) - 1:
+        yield index == len(parts) - 1, info
+
+
+def _require_safe_target(archive: Path, dest: Path, name: str, member: tarfile.TarInfo) -> None:
+    for last, info in _on_disk_chain(dest, name):
+        if info is None:
+            return
+        if not last:
             if not stat.S_ISDIR(info.st_mode):
                 fail(f"{archive}: unsafe parent {name}")
         elif not (member.isdir() and stat.S_ISDIR(info.st_mode)):
             fail(f"{archive}: existing target {name}")
+
+
+def _require_hardlink_source(archive: Path, dest: Path, name: str) -> Path:
+    if name == ".":
+        fail(f"{archive}: unsafe hardlink source {name}")
+    for last, info in _on_disk_chain(dest, name):
+        wanted = stat.S_ISREG if last else stat.S_ISDIR
+        if info is None or not wanted(info.st_mode):
+            fail(f"{archive}: unsafe hardlink source {name}")
+    return dest / name
 
 
 def _python_extract(archive: Path, dest: Path, members: list[tarfile.TarInfo]) -> None:
@@ -274,9 +293,9 @@ def _python_extract(archive: Path, dest: Path, members: list[tarfile.TarInfo]) -
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.symlink(member.linkname, target)
             elif member.islnk():
-                source = dest / canonical_member_name(member.linkname)
+                source = _require_hardlink_source(archive, dest, canonical_member_name(member.linkname))
                 target.parent.mkdir(parents=True, exist_ok=True)
-                os.link(source, target)
+                os.link(source, target, follow_symlinks=False)
             elif member.isfile():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 extracted = bundle.extractfile(member)

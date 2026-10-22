@@ -341,7 +341,9 @@ class RecoveryFilesystemTests(unittest.TestCase):
         if not insensitive:
             self.skipTest("temporary filesystem is case-sensitive")
 
-    def _owned_archive(self, archive: Path, members: list[tuple[str, str, str | bytes]]) -> list:
+    def _owned_archive(
+        self, archive: Path, members: list[tuple[str, str, str | bytes]], *, links: str = "confined"
+    ) -> list:
         with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as bundle:
             for name, kind, value in members:
                 member = tarfile.TarInfo(name=name)
@@ -351,15 +353,15 @@ class RecoveryFilesystemTests(unittest.TestCase):
                 if kind == "dir":
                     member.type = tarfile.DIRTYPE
                     bundle.addfile(member)
-                elif kind == "link":
-                    member.type = tarfile.SYMTYPE
+                elif kind in ("link", "hardlink"):
+                    member.type = tarfile.SYMTYPE if kind == "link" else tarfile.LNKTYPE
                     member.linkname = value
                     bundle.addfile(member)
                 else:
                     member.size = len(value)
                     member.mode = 0o644
                     bundle.addfile(member, io.BytesIO(value))
-        return recovery_fs.inspect_archive(archive, links="confined")
+        return recovery_fs.inspect_archive(archive, links=links)
 
     def _assert_case_alias_refused(self, members, expected: str):
         self._require_case_insensitive()
@@ -415,6 +417,88 @@ class RecoveryFilesystemTests(unittest.TestCase):
             recovery_fs._python_extract(archive, dest, members)
         self.assertEqual(os.listdir(outside), [])
         self.assertIn("unsafe parent d/l/m/evil", str(raised.exception))
+
+    def _hardlink_sentinels(self) -> tuple[Path, Path, list[Path]]:
+        outside = self.root / "outside"
+        outside.mkdir()
+        sentinel = outside / "x"
+        sentinel.write_bytes(b"outside sentinel\n")
+        os.chmod(sentinel, 0o640)
+        os.utime(sentinel, (1_000_000_000, 1_000_000_000))
+        os.utime(outside, (1_000_000_000, 1_000_000_000))
+        return outside, sentinel, [outside, sentinel]
+
+    def _assert_hardlink_source_refused(self, run, dest: Path, observed: list[Path], name: str):
+        before = self._observe(observed)
+        with patch.object(recovery_fs, "_gnu_tar", return_value=False):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                run()
+        self.assertEqual(self._observe(observed), before)
+        self.assertEqual(observed[-1].lstat().st_nlink, 1, "hardlink created to an outside inode")
+        self.assertFalse(os.path.lexists(dest / "h"))
+        self.assertIn(f"unsafe hardlink source {name}", str(raised.exception))
+
+    def test_case_alias_hardlink_source_symlink_is_refused(self):
+        self._require_case_insensitive()
+        _outside, sentinel, observed = self._hardlink_sentinels()
+        archive = self.root / "alias-hardlink.tar.gz"
+        self._owned_archive(
+            archive,
+            [(".", "dir", ""), ("f2", "link", str(sentinel)), ("h", "hardlink", "F2"), ("F2", "file", b"in\n")],
+            links="verbatim",
+        )
+        dest = self.root / "dest"
+        self._assert_hardlink_source_refused(
+            lambda: recovery_fs.extract_tree(archive, dest, links="verbatim"), dest, observed, "F2"
+        )
+
+    def test_case_alias_hardlink_source_parent_symlink_is_refused(self):
+        self._require_case_insensitive()
+        outside, _sentinel, observed = self._hardlink_sentinels()
+        archive = self.root / "alias-hardlink-parent.tar.gz"
+        self._owned_archive(
+            archive,
+            [(".", "dir", ""), ("d", "link", str(outside)), ("h", "hardlink", "D/x"), ("D/x", "file", b"in\n")],
+            links="verbatim",
+        )
+        dest = self.root / "dest"
+        self._assert_hardlink_source_refused(
+            lambda: recovery_fs.extract_tree(archive, dest, links="verbatim"), dest, observed, "D/x"
+        )
+
+    def test_python_extract_refuses_on_disk_symlink_hardlink_source(self):
+        outside, sentinel, observed = self._hardlink_sentinels()
+        cases = {"f": sentinel, "d/x": outside}
+        for index, (source, link_target) in enumerate(cases.items()):
+            with self.subTest(source=source):
+                dest = self.root / f"dest-{index}"
+                dest.mkdir()
+                os.symlink(link_target, dest / Path(source).parts[0])
+                archive = self.root / f"on-disk-{index}.tar.gz"
+                members = self._owned_archive(
+                    archive,
+                    [(".", "dir", ""), ("h", "hardlink", source), (source, "file", b"in\n")],
+                    links="verbatim",
+                )
+                self._assert_hardlink_source_refused(
+                    lambda: recovery_fs._python_extract(archive, dest, members), dest, observed, source
+                )
+
+    def test_python_extract_refuses_missing_or_non_regular_hardlink_source(self):
+        cases = {
+            "f": [(".", "dir", ""), ("h", "hardlink", "f"), ("f", "file", b"in\n")],
+            ".": [(".", "dir", ""), ("h", "hardlink", ".")],
+        }
+        for index, (source, members) in enumerate(cases.items()):
+            with self.subTest(source=source):
+                archive = self.root / f"source-order-{index}.tar.gz"
+                self._owned_archive(archive, members, links="verbatim")
+                dest = self.root / f"source-order-out-{index}"
+                with patch.object(recovery_fs, "_gnu_tar", return_value=False):
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        recovery_fs.extract_tree(archive, dest, links="verbatim")
+                self.assertIn(f"unsafe hardlink source {source}", str(raised.exception))
+                self.assertEqual(os.listdir(dest), [])
 
     def test_python_extract_refuses_existing_target(self):
         dest = self.root / "dest"
@@ -569,7 +653,7 @@ class RecoveryFilesystemTests(unittest.TestCase):
 
         spies = [
             patch.object(os, name, spy(name, getattr(os, name)))
-            for name in ("lchown", "utime", "chmod", "setxattr")
+            for name in ("lchown", "chown", "utime", "chmod", "setxattr")
             if hasattr(os, name)
         ]
         spies.append(patch("recovery_fs.open", spy("open", open), create=True))
