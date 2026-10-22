@@ -51,6 +51,9 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       ORCHESTRATOR_URL: http://computer-use-server:8081
       ENABLE_OCU_WORKSPACE: "true"
+      # Without this, non-admins see no provider model unless each model has a
+      # Models row with a read grant; every provider model is meant for every user.
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
       ENABLE_OCU_OFFICE_EDIT: ${ENABLE_OCU_OFFICE_EDIT:?ENABLE_OCU_OFFICE_EDIT is required}
       OCU_INTERNAL_URL: http://computer-use-server:8081
       MCP_API_KEY: ${MCP_API_KEY}
@@ -85,8 +88,8 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       ADMIN_NAME: AI Workbench Test Admin
-      # The initializer validates this against /api/models and refuses to
-      # select an arbitrary first provider model.
+      # WebUI's default model. The initializer validates it against
+      # /api/models and refuses to finish when the provider does not offer it.
       PRIMARY_CHAT_MODEL: qwen3.8-27b
       ORCHESTRATOR_URL: http://computer-use-server:8081
       MCP_API_KEY: ${MCP_API_KEY}

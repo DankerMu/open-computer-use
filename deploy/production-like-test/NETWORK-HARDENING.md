@@ -217,6 +217,67 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 
 `OCU_SMOKE_DOCUMENTSERVER_URL` 指向应当关闭的直接入口，不是内部 control-plane 地址或第二个 proxy 端口。它与 `OCU_SMOKE_FORMER_URL` 接受 IPv4 `host:port` 或带显式端口的 `http://IPv4:port/...`；端口范围为1–65535。缺失或格式错误以退出码2命名输入。两个入口分别检查：连接成功、超时或非 `ECONNREFUSED` 错误均以退出码1命名对应断言，不能用另一个入口的拒绝代替。
 
+## Re-running the initializer and removing the wrapper model (#590)
+
+The Computer Use tool reaches every model through the global `computer_use_filter`; no model carries it any more, and `BYPASS_MODEL_ACCESS_CONTROL=true` on `open-webui` makes every provider model visible to every user. A deployment initialized before #590 still has the old filter, which acts only when the request already names the tool, and a wrapper row `<PRIMARY_CHAT_MODEL> (Computer Use)` that names it. The filter source lives in the WebUI database. Only the one-shot `open-webui-init` service writes it, and `init.sh` exits without changes while the `.computer-use-initialized` marker exists in the `open-webui-data` volume. Upgrade in this order, as root, from the deployed source checkout (`DEPLOY_ROOT` defaults to `/opt/ai-workbench-test/open-computer-use`):
+
+```bash
+cd "$DEPLOY_ROOT/source"
+set -a; . "$DEPLOY_ROOT/config/runtime.env"; set +a
+# The provider key is not in runtime.env. Load it from the provider env file as
+# a normal deploy shell does: DMX_ENV_FILE in runtime.env names it on recovered
+# targets; otherwise it is the file bootstrap-test.sh read.
+provider_env=${DMX_ENV_FILE:-/home/ubuntu/.config/ocu-test/dmxapi.env}
+set -a; . "$provider_env"; set +a
+# Never print this environment.
+```
+
+The WebUI overlay interpolates `${DMXAPI_API_KEY}` without a required-value check, so a shell without it starts `open-webui` with an empty provider key.
+
+1. Deploy the new release with `deploy/up.sh` as usual. `BYPASS_MODEL_ACCESS_CONTROL` is now live; `open-webui-init` still finds the marker and skips.
+2. Delete the marker, then re-run `open-webui-init`:
+
+   ```bash
+   docker volume inspect "${COMPOSE_PROJECT_NAME}_open-webui-data" >/dev/null
+   docker run --rm --network none --user 0:0 \
+       -v "${COMPOSE_PROJECT_NAME}_open-webui-data:/data" \
+       --entrypoint rm "$OPENWEBUI_IMAGE" /data/.computer-use-initialized
+   deploy/up.sh
+   docker inspect -f '{{.State.StartedAt}} exit={{.State.ExitCode}}' ocu-test-open-webui-init
+   docker logs ocu-test-open-webui-init 2>&1 | tail -n 3   # expect "[init] Done!"
+   ```
+
+   `up -d` starts the exited one-shot again; a `StartedAt` from this run and exit code 0 confirm it. If the container did not run again, start that one service explicitly:
+
+   ```bash
+   COMPOSE_REMOVE_ORPHANS=false COMPOSE_PROFILES= docker compose -p "$COMPOSE_PROJECT_NAME" \
+       --project-directory "$PWD" --env-file /dev/null \
+       -f docker-compose.webui.yml -f deploy/production-like-test/compose.webui.override.yml \
+       up -d --no-build --pull never --no-deps --force-recreate open-webui-init
+   ```
+
+3. Remove the wrapper row with a one-off container on the private network. It uses the same `ADMIN_EMAIL` and `ADMIN_PASSWORD` as `open-webui-init`, passed by name, and the same `openwebui/` source mount:
+
+   ```bash
+   docker run --rm --network "$OCU_PRIVATE_NETWORK" --user 0:0 \
+       --security-opt no-new-privileges:true \
+       -e WEBUI_URL=http://open-webui:8080 -e ADMIN_EMAIL -e ADMIN_PASSWORD \
+       -v "$PWD/openwebui:/app/source:ro" \
+       -v "$PWD/deploy/production-like-test/init/remove-wrapper-model.py:/bootstrap/remove-wrapper-model.py:ro" \
+       --entrypoint python3 "$OPENWEBUI_IMAGE" /bootstrap/remove-wrapper-model.py
+   ```
+
+   The script refuses, exit 1, until the stored `computer_use_filter` content equals `/app/source/functions/computer_link_filter.py` byte for byte, which is what step 2 writes. It then lists rows from two admin endpoints and merges them by id. `GET /api/v1/models/base` is needed because the old initializer gave the wrapper the raw provider model's id, so WebUI stored it as a base-model override (`base_model_id` empty), and `GET /api/v1/models/export` lists only rows derived from another model. From that list the script deletes, with `POST /api/v1/models/model/delete`, only rows whose name ends with ` (Computer Use)` and whose `meta.toolIds` contains `ai_computer_use`. Deleting a row also revokes its access grants. A second run prints `nothing to remove` and exits 0. It never prints the password or the session token.
+
+The wrapper's id equals the raw provider model id, so its row only overrode that model. After step 3 the id resolves to the raw provider model, and existing wrapper chats continue on it with the tool attached by the filter.
+
+Re-running `open-webui-init` has side effects:
+
+- `DEFAULT_MODELS` is written again as `PRIMARY_CHAT_MODEL`, and `DEFAULT_MODEL_PARAMS` gets `function_calling: native` and `stream_response: true` again.
+- The tool and filter sources are replaced with the shipped files, and their valves are re-seeded from the environment (`ORCHESTRATOR_URL`, `MCP_API_KEY`, `DEBUG_LOGGING=false`; `ARCHIVE_BUTTON=on`, `INJECT_SYSTEM_PROMPT=true`). Valve edits made in the admin UI are lost.
+- The tool is set back to public-read, and the filter back to active and global.
+- Init signs in with `ADMIN_PASSWORD` from the runtime configuration. Signup is disabled (`ENABLE_SIGNUP=false`), so if the admin password was changed in the UI, init fails without writing the marker. Set the admin password back to the runtime value before step 2; the removal script has the same requirement.
+
 ## 已知边界
 
 部署入口在建网之后、启动应用之前核对 sandbox DNS 并安装出站策略：IPv4 经 `DOCKER-USER` 与 `INPUT` 的接口挂钩，且 `FORWARD` 的第一条规则必须是无条件 `-j DOCKER-USER`；IPv6 经 `INPUT` 与 `FORWARD` 默认 DROP。允许列表只豁免本守卫，不绕过后续宿主机策略；control-plane 子网与 metadata `169.254.169.254/32` 即使被宽网段覆盖也仍 DROP。控制面发起的 CDP/ttyd 应答走 conntrack `REPLY`，sandbox 发起的 ORIGINAL 已建立流仍受当前允许列表约束。control-plane 网桥在首次 Compose 启动前可以不存在，安装器此时使用已校验的配置 CIDR；已存在的 control-plane 网仍按 #24 校验。DNS 预检拒绝继承宿主机 nameserver 或不兼容的受保护网桥容器 DNS，但不声称真实数据包隔离；该证据属于 #36。`computer-use-server` 仍挂载 Docker socket，是高权限可信组件。未经授权的直接 OCU 入口不得用作回滚方案。

@@ -292,7 +292,8 @@ worker draining supplies neither forced thread termination nor a shutdown deadli
 `orchestrator/_http_origin.py` owns the Office origins, tool redirect origin
 (`test_tools.py`), font archive origin (`deploy/support.py`), deployment smoke
 fixture and control listeners (`deploy/test_deployment_smoke.py`), initializer
-fake WebUI (`deploy/test_init_wrapper.py`) and native HTTP/TTY fixtures
+fake WebUI (`deploy/test_init_wrapper.py`), wrapper-removal fake WebUI
+(`deploy/test_remove_wrapper_model.py`) and native HTTP/TTY fixtures
 (`deploy/test_smoke_native.py`).
 
 Owner exit retires admitted workers and accepted/listening sockets within a finite
@@ -315,7 +316,7 @@ uv run --python 3.12 --no-project --with pytest \
   --with-requirements computer-use-server/requirements.txt -- \
   python -m pytest tests/ -q \
   --import-mode=importlib --ignore=tests/integration \
-  -k 'test_office_commands.py or test_office_router.py or test_office_callback_processing.py or test_office_download.py or test_http_origin.py or test_office_http_holders.py or test_tools.py or test_http_origin_consumers.py or test_deployment_smoke.py or test_init_wrapper.py or test_smoke_native.py or test_prepare_fonts.py or test_offline_release.py'
+  -k 'test_office_commands.py or test_office_router.py or test_office_callback_processing.py or test_office_download.py or test_http_origin.py or test_office_http_holders.py or test_tools.py or test_http_origin_consumers.py or test_deployment_smoke.py or test_init_wrapper.py or test_remove_wrapper_model.py or test_smoke_native.py or test_prepare_fonts.py or test_offline_release.py'
 ```
 
 Use the same Python dependencies for deploy unittest discovery and direct-script

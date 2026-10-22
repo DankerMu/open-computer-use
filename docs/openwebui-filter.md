@@ -2,7 +2,11 @@
 
 ## Purpose
 
-`openwebui/functions/computer_link_filter.py` fetches the server-rendered Computer Use prompt when `ai_computer_use` is active, then adds links only for concrete files in the current chat.
+`openwebui/functions/computer_link_filter.py` attaches the `ai_computer_use` tool to every saved chat, whatever the model, and fetches the server-rendered Computer Use prompt for it. It then adds links only for concrete files in the current chat.
+
+## Tool attachment
+
+The filter is active and global, so its inlet runs for every chat completion. When the request's `chat_id` is a saved chat's UUID (any letter case), the inlet appends `ai_computer_use` to the request's `tool_ids`, after any tools the user selected, keeping their order and listing it once. Channel replies (`channel:<id>`), temporary and local chats (`temporary:<id>`, `local:<id>`) and requests without a `chat_id` are left unchanged. No model needs its own tool setting, and there is no per-model opt-out.
 
 ## Installation
 
@@ -37,7 +41,7 @@ The archive toggle retains its separate `{PUBLIC_BASE_URL}/files/{chat_id}/archi
 | Valve | Default | Behavior |
 | --- | --- | --- |
 | `ORCHESTRATOR_URL` | `http://computer-use-server:8081` | Internal endpoint for authenticated `/system-prompt` retrieval. |
-| `INJECT_SYSTEM_PROMPT` | `true` | Enables prompt injection when the Computer Use tool is active. |
+| `INJECT_SYSTEM_PROMPT` | `true` | Enables prompt injection into saved chats. When off, the tool is still attached. |
 | `PREVIEW_MODE` | `button` | `button` appends a labeled link to the first concrete current-chat file; `off` does not. |
 | `ARCHIVE_BUTTON` | `on` | Appends the current-chat archive link only when a concrete current-chat file is present. |
 | `PREVIEW_BUTTON_TEXT` | filter default | Label for the concrete-file preview link. |

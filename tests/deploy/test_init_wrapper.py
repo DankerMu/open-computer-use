@@ -37,7 +37,6 @@ ALLOWED_GET = {
     "/api/v1/tools/id/ai_computer_use",
     "/api/v1/functions/id/computer_use_filter",
     "/api/v1/configs/models",
-    f"/api/v1/models/model?id={PRIMARY_MODEL}",
 }
 ALLOWED_POST = {
     "/api/v1/auths/signin",
@@ -52,9 +51,6 @@ ALLOWED_POST = {
     "/api/v1/functions/id/computer_use_filter/toggle",
     "/api/v1/functions/id/computer_use_filter/toggle/global",
     "/api/v1/configs/models",
-    "/api/v1/models/create",
-    f"/api/v1/models/model/update?id={PRIMARY_MODEL}",
-    "/api/v1/models/model/access/update",
 }
 
 
@@ -126,11 +122,9 @@ class FakeWebUI:
         self.posted_config = None
         self.tools: dict[str, dict] = {}
         self.functions: dict[str, dict] = {}
-        self.workspace_models: dict[str, dict] = {}
         self.tool_valves = None
         self.filter_valves = None
         self.tool_access = None
-        self.workspace_access = None
         self._lifetime = None
         self.server = None
 
@@ -189,6 +183,8 @@ class FakeWebUI:
                     self.send_error(503)
                     return
                 if path == "/api/models":
+                    if owner.mode == "primary-model-unavailable":
+                        return self._json(200, {"data": [{"id": "other-model"}]})
                     return self._json(200, {"data": [{"id": PRIMARY_MODEL}]})
                 if path == "/api/v1/tools/id/ai_computer_use":
                     tool = owner.tools.get("ai_computer_use")
@@ -215,15 +211,6 @@ class FakeWebUI:
                         self.wfile.write(body)
                         return
                     return self._json(200, owner.existing_config)
-                if path == "/api/v1/models/model":
-                    if owner.mode == "workspace-lookup-failure":
-                        self.send_error(503)
-                        return
-                    model = owner.workspace_models.get(PRIMARY_MODEL)
-                    if model is None:
-                        self.send_error(404)
-                        return
-                    return self._json(200, model)
                 self.send_error(404)
 
             def do_POST(self):
@@ -296,36 +283,6 @@ class FakeWebUI:
                     owner.posted_config = payload
                     owner.existing_config = payload
                     return self._json(200, payload)
-                if path == "/api/v1/models/create":
-                    if owner.mode == "workspace-create-failure":
-                        self.send_error(503)
-                        return
-                    model_id = (payload or {}).get("id", PRIMARY_MODEL)
-                    owner.workspace_models[model_id] = payload or {}
-                    return self._json(200, payload)
-                if path == "/api/v1/models/model/update":
-                    if owner.mode == "workspace-update-null":
-                        return self._json(200, None)
-                    model_id = (payload or {}).get("id", PRIMARY_MODEL)
-                    owner.workspace_models[model_id] = payload or {}
-                    return self._json(200, payload)
-                if path == "/api/v1/models/model/access/update":
-                    if owner.mode == "workspace-access-failure":
-                        self.send_error(503)
-                        return
-                    model_id = (payload or {}).get("id") or PRIMARY_MODEL
-                    if model_id not in owner.workspace_models:
-                        owner.workspace_models[model_id] = {
-                            "id": model_id,
-                            "name": (payload or {}).get("name") or model_id,
-                            "meta": {},
-                            "params": {},
-                        }
-                    owner.workspace_access = payload
-                    owner.workspace_models[model_id]["access_grants"] = (
-                        payload or {}
-                    ).get("access_grants")
-                    return self._json(200, owner.workspace_models[model_id])
                 self.send_error(404)
 
             def _json(self, status, payload):
@@ -435,13 +392,20 @@ class InitWrapperTests(unittest.TestCase):
         self.assertEqual(self.webui.posted_config["DEFAULT_PINNED_MODELS"], "keep-pinned")
         self.assertEqual(self.webui.posted_config["MODEL_ORDER_LIST"], ["keep-order"])
         self.assertEqual(self.webui.posted_config["DEFAULT_MODEL_METADATA"], {"keep": True})
-        workspace = self.webui.workspace_models[PRIMARY_MODEL]
-        self.assertEqual(workspace["id"], PRIMARY_MODEL)
-        self.assertEqual(workspace["base_model_id"], PRIMARY_MODEL)
-        self.assertEqual(workspace["meta"]["toolIds"], ["ai_computer_use"])
-        self.assertEqual(workspace["meta"]["filterIds"], ["computer_use_filter"])
-        self.assertEqual(self.webui.workspace_access["id"], PRIMARY_MODEL)
-        self.assertEqual(self.webui.workspace_access["access_grants"], PUBLIC_GRANTS)
+        self.assert_no_wrapper_model()
+
+    def assert_no_wrapper_model(self):
+        # The tool reaches every model through the global filter (#590); no
+        # model row may carry it, and no "(Computer Use)" model may be written.
+        self.assertIn("GET /api/models", self.webui.calls)
+        self.assertEqual(
+            [call for call in self.webui.calls if call.split(" ", 1)[1].startswith("/api/v1/models")],
+            [],
+        )
+        for payload in self.webui.bodies.values():
+            text = json.dumps(payload)
+            self.assertNotIn("(Computer Use)", text)
+            self.assertNotIn("toolIds", text)
 
     def test_unavailable_api_exits_nonzero_without_marker_or_secret(self):
         self.webui.mode = "unavailable"
@@ -475,14 +439,12 @@ class InitWrapperTests(unittest.TestCase):
         self.assertIn("POST /api/v1/configs/models", self.webui.calls)
         self.assertTrue(self.webui.tools)
         self.assertTrue(self.webui.functions)
-        self.assertIn(PRIMARY_MODEL, self.webui.workspace_models)
         self.webui.mode = "success"
         succeeded = self.run_wrapper()
         self.assertEqual(succeeded.returncode, 0, self.combined(succeeded))
         self.assertTrue((self.data / MARKER_NAME).is_file())
         self.assert_no_secret(succeeded)
         self.assert_required_setup()
-        self.assertIn(f"POST /api/v1/models/model/update?id={PRIMARY_MODEL}", self.webui.calls)
         skipped = self.run_wrapper()
         self.assertEqual(skipped.returncode, 0, self.combined(skipped))
         self.assertIn("Already initialized", skipped.stdout)
@@ -511,99 +473,54 @@ class InitWrapperTests(unittest.TestCase):
         self.assertIsNone(self.webui.posted_config)
         self.assertEqual(self.webui.existing_config, original)
 
-    def test_workspace_create_failure_does_not_write_marker(self):
-        self.webui.mode = "workspace-create-failure"
-        result = self.run_wrapper()
-        self.assertNotEqual(result.returncode, 0, self.combined(result))
-        self.assertFalse((self.data / MARKER_NAME).exists())
-        self.assert_no_secret(result)
-        self.assertIn("POST /api/v1/models/create", self.webui.calls)
-        self.assertNotIn("POST /api/v1/models/model/access/update", self.webui.calls)
-        self.assertEqual(self.webui.workspace_models, {})
-        self.assertIsNone(self.webui.workspace_access)
-
-    def test_workspace_lookup_failure_does_not_create_or_write_marker(self):
-        self.webui.mode = "workspace-lookup-failure"
-        result = self.run_wrapper()
-        self.assertNotEqual(result.returncode, 0, self.combined(result))
-        self.assertFalse((self.data / MARKER_NAME).exists())
-        self.assert_no_secret(result)
-        self.assertTrue(any(call.startswith("GET /api/v1/models/model") for call in self.webui.calls))
-        self.assertNotIn("POST /api/v1/models/create", self.webui.calls)
-        self.assertNotIn("POST /api/v1/models/model/update", self.webui.calls)
-        self.assertNotIn(f"POST /api/v1/models/model/update?id={PRIMARY_MODEL}", self.webui.calls)
-        self.assertNotIn("POST /api/v1/models/model/access/update", self.webui.calls)
-        self.assertEqual(self.webui.workspace_models, {})
-        self.assertIsNone(self.webui.workspace_access)
-
-    def test_workspace_access_failure_keeps_created_model_unmarked(self):
-        self.webui.mode = "workspace-access-failure"
-        result = self.run_wrapper()
-        self.assertNotEqual(result.returncode, 0, self.combined(result))
-        self.assertFalse((self.data / MARKER_NAME).exists())
-        self.assert_no_secret(result)
-        self.assertIn(PRIMARY_MODEL, self.webui.workspace_models)
-        self.assertIsNone(self.webui.workspace_access)
-
-    def test_workspace_update_null_does_not_grant_or_write_marker(self):
-        stale = {
-            "id": PRIMARY_MODEL,
-            "name": "stale-name",
-            "base_model_id": PRIMARY_MODEL,
-            "meta": {"description": "stale", "toolIds": [], "filterIds": []},
-            "params": {"function_calling": "off", "stream_response": False},
-        }
-        self.webui.workspace_models[PRIMARY_MODEL] = dict(stale)
-        self.webui.mode = "workspace-update-null"
-        result = self.run_wrapper()
-        self.assertNotEqual(result.returncode, 0, self.combined(result))
-        self.assertFalse((self.data / MARKER_NAME).exists())
-        self.assert_no_secret(result)
-        self.assertIn(f"POST /api/v1/models/model/update?id={PRIMARY_MODEL}", self.webui.calls)
-        self.assertNotIn("POST /api/v1/models/model/access/update", self.webui.calls)
-        self.assertEqual(self.webui.workspace_models[PRIMARY_MODEL], stale)
-        self.assertIsNone(self.webui.workspace_access)
-
-    def test_workspace_update_null_then_success_persists_model_and_grants(self):
-        stale = {
-            "id": PRIMARY_MODEL,
-            "name": "stale-name",
-            "base_model_id": PRIMARY_MODEL,
-            "meta": {"description": "stale", "toolIds": [], "filterIds": []},
-            "params": {"function_calling": "off", "stream_response": False},
-        }
-        self.webui.workspace_models[PRIMARY_MODEL] = dict(stale)
-        self.webui.mode = "workspace-update-null"
+    def test_unavailable_primary_model_fails_after_default_models_without_marker(self):
+        self.webui.mode = "primary-model-unavailable"
         failed = self.run_wrapper()
         self.assertNotEqual(failed.returncode, 0, self.combined(failed))
         self.assertFalse((self.data / MARKER_NAME).exists())
-        self.assertEqual(self.webui.workspace_models[PRIMARY_MODEL], stale)
-        self.assertIsNone(self.webui.workspace_access)
+        self.assert_no_secret(failed)
+        self.assertIn(f"PRIMARY_CHAT_MODEL is unavailable: {PRIMARY_MODEL}", failed.stderr)
+        self.assertEqual(self.webui.posted_config["DEFAULT_MODELS"], PRIMARY_MODEL)
+        self.assertLess(
+            self.webui.calls.index("POST /api/v1/configs/models"),
+            self.webui.calls.index("GET /api/models"),
+        )
+        self.assert_no_wrapper_model()
         self.webui.mode = "success"
         succeeded = self.run_wrapper()
         self.assertEqual(succeeded.returncode, 0, self.combined(succeeded))
         self.assertTrue((self.data / MARKER_NAME).is_file())
-        self.assert_no_secret(succeeded)
         self.assert_required_setup()
-        workspace = self.webui.workspace_models[PRIMARY_MODEL]
-        self.assertEqual(workspace["meta"]["toolIds"], ["ai_computer_use"])
-        self.assertEqual(workspace["meta"]["filterIds"], ["computer_use_filter"])
-        self.assertEqual(workspace["params"]["function_calling"], "native")
-        self.assertTrue(workspace["params"]["stream_response"])
 
-    def test_workspace_create_failure_then_success_persists_model_and_grants(self):
-        self.webui.mode = "workspace-create-failure"
-        failed = self.run_wrapper()
-        self.assertNotEqual(failed.returncode, 0, self.combined(failed))
+    def test_missing_primary_model_refuses_before_any_request(self):
+        result = self.run_wrapper({"PRIMARY_CHAT_MODEL": " "})
+        self.assertNotEqual(result.returncode, 0, self.combined(result))
+        self.assertIn("PRIMARY_CHAT_MODEL is required", result.stderr)
         self.assertFalse((self.data / MARKER_NAME).exists())
-        self.assertEqual(self.webui.workspace_models, {})
-        self.assertIsNone(self.webui.workspace_access)
-        self.webui.mode = "success"
-        succeeded = self.run_wrapper()
-        self.assertEqual(succeeded.returncode, 0, self.combined(succeeded))
-        self.assertTrue((self.data / MARKER_NAME).is_file())
-        self.assert_no_secret(succeeded)
-        self.assert_required_setup()
+        self.assertEqual(self.webui.calls, [])
+
+    def _refuses_changed_anchor(self, anchor: str, expected: str):
+        init = self.source / "init.sh"
+        text = init.read_text(encoding="utf-8")
+        self.assertEqual(text.count(anchor), 1, anchor)
+        init.write_text(text.replace(anchor, anchor.replace(" ", "  ", 1)), encoding="utf-8")
+        result = self.run_wrapper()
+        self.assertNotEqual(result.returncode, 0, self.combined(result))
+        self.assertIn(expected, result.stderr)
+        self.assertFalse((self.data / MARKER_NAME).exists())
+        self.assertEqual(self.webui.calls, [])
+
+    def test_changed_default_models_anchor_refuses_to_bootstrap(self):
+        self._refuses_changed_anchor(
+            "cfg.setdefault('DEFAULT_MODELS', cfg.get('DEFAULT_MODELS') or '')",
+            "expected DEFAULT_MODELS config line changed upstream",
+        )
+
+    def test_changed_marker_anchor_refuses_to_bootstrap(self):
+        self._refuses_changed_anchor(
+            "# Mark as initialized — only if every required step succeeded.",
+            "could not locate initialization marker section",
+        )
 
     def test_success_after_failure_writes_marker_without_secret(self):
         self.webui.mode = "auth-failure"
@@ -690,20 +607,9 @@ class InitWrapperTests(unittest.TestCase):
         self._signal_during_held_http(signal.SIGHUP)
 
     def test_term_during_held_model_lookup_leaves_no_lookup_tempfile(self):
-        self.webui.workspace_models[PRIMARY_MODEL] = {
-            "id": PRIMARY_MODEL,
-            "name": "existing (Computer Use)",
-            "base_model_id": PRIMARY_MODEL,
-            "meta": {
-                "description": "existing workspace model without secrets",
-                "toolIds": ["ai_computer_use"],
-                "filterIds": ["computer_use_filter"],
-            },
-            "params": {"function_calling": "native", "stream_response": True},
-        }
         self._signal_during_held_http(
             signal.SIGTERM,
-            hold_request="GET /api/v1/models/model",
+            hold_request="GET /api/models",
         )
 
 
