@@ -92,6 +92,21 @@ def _symlink_target_confined(member_name: str, target: str) -> bool:
     return climbs <= member_name.count("/")
 
 
+LINK_POLICIES = ("confined", "verbatim")
+
+
+def _require_link_policy(links: str) -> None:
+    if links not in LINK_POLICIES:
+        raise ValueError(f"unknown link policy: {links}")
+
+
+def _symlink_target_allowed(member_name: str, target: str, links: str) -> bool:
+    _require_link_policy(links)
+    if links == "verbatim":
+        return bool(target) and "\0" not in target
+    return _symlink_target_confined(member_name, target)
+
+
 
 def _lstat(path: Path):
     try:
@@ -158,7 +173,9 @@ def _pax_headers(path: Path) -> dict[str, str]:
     return headers
 
 
-def _python_capture(root: Path, archive: Path, rows: list[tuple[Path, str, os.stat_result]]) -> None:
+def _python_capture(
+    root: Path, archive: Path, rows: list[tuple[Path, str, os.stat_result]], *, links: str
+) -> None:
     inode_names: dict[tuple[int, int], str] = {}
     with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT, dereference=False) as bundle:
         for path, relative, info in rows:
@@ -182,7 +199,7 @@ def _python_capture(root: Path, archive: Path, rows: list[tuple[Path, str, os.st
                 continue
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(path)
-                if not _symlink_target_confined(relative, target):
+                if not _symlink_target_allowed(relative, target, links):
                     fail(f"{path}: unsafe symlink")
                 member.type = tarfile.SYMTYPE
                 member.linkname = target
@@ -296,7 +313,8 @@ def _walk_tree(root: Path) -> list[tuple[Path, str, os.stat_result]]:
     return rows
 
 
-def capture_tree(root: Path, archive: Path) -> dict:
+def capture_tree(root: Path, archive: Path, *, links: str) -> dict:
+    _require_link_policy(links)
     if not root.exists():
         fail(f"{root}: missing")
     root_info = _lstat(root)
@@ -329,8 +347,8 @@ def capture_tree(root: Path, archive: Path) -> dict:
         finally:
             listing.unlink(missing_ok=True)
     else:
-        _python_capture(root, archive, rows)
-    members = validate_archive(archive)
+        _python_capture(root, archive, rows, links=links)
+    members = validate_archive(archive, links=links)
     archived = {record["name"] for record in members}
     if archived != set(names):
         fail(f"{root}: captured archive members do not match the source tree")
@@ -354,7 +372,8 @@ def _member_kind(member: tarfile.TarInfo) -> str:
     return "unsupported"
 
 
-def inspect_archive(archive: Path) -> list[tarfile.TarInfo]:
+def inspect_archive(archive: Path, *, links: str) -> list[tarfile.TarInfo]:
+    _require_link_policy(links)
     if not archive.exists():
         fail(f"{archive}: missing")
     try:
@@ -380,7 +399,7 @@ def inspect_archive(archive: Path) -> list[tarfile.TarInfo]:
         kind = _member_kind(member)
         if kind == "unsupported" or member.isdev() or member.isfifo():
             fail(f"{archive}: unsupported member type {member.name}")
-        if member.issym() and not _symlink_target_confined(name, member.linkname):
+        if member.issym() and not _symlink_target_allowed(name, member.linkname, links):
             fail(f"{archive}: unsafe symlink {member.name}")
         if member.islnk() and (
             member.linkname.startswith("/") or ".." in Path(member.linkname).parts
@@ -454,8 +473,8 @@ def _reject_destination_conflicts(destinations: dict[str, tarfile.TarInfo]) -> N
                 fail(f"archive member {name} traverses link {ancestor}")
 
 
-def validate_archive(archive: Path) -> list[dict]:
-    members = inspect_archive(archive)
+def validate_archive(archive: Path, *, links: str) -> list[dict]:
+    members = inspect_archive(archive, links=links)
     records = []
     for member in members:
         records.append(
@@ -499,8 +518,8 @@ def _destination_empty(dest: Path) -> None:
         fail(f"{dest}: restore destination is not empty")
 
 
-def extract_tree(archive: Path, dest: Path) -> None:
-    members = inspect_archive(archive)
+def extract_tree(archive: Path, dest: Path, *, links: str) -> None:
+    members = inspect_archive(archive, links=links)
     _destination_empty(dest)
     if _gnu_tar():
         _run_tar([*EXTRACT_FLAGS, str(archive), "-C", str(dest)])
@@ -508,7 +527,7 @@ def extract_tree(archive: Path, dest: Path) -> None:
     else:
         _python_extract(archive, dest, members)
     restored = {relative for _path, relative, _info in _walk_tree(dest)}
-    expected = {record["name"] for record in validate_archive(archive)}
+    expected = {record["name"] for record in validate_archive(archive, links=links)}
     if not expected.issubset(restored):
         fail(f"{archive}: extraction omitted members")
 
@@ -524,9 +543,9 @@ def _apply_archive_root_metadata(dest: Path, members: list[tarfile.TarInfo]) -> 
     _apply_metadata(dest, root_member)
 
 
-def archive_has_regular_root_member(archive: Path, relative: str) -> bool:
+def archive_has_regular_root_member(archive: Path, relative: str, *, links: str) -> bool:
     wanted = canonical_member_name(relative)
-    for member in inspect_archive(archive):
+    for member in inspect_archive(archive, links=links):
         if canonical_member_name(member.name) == wanted and member.isfile() and not member.issym():
             return True
     return False

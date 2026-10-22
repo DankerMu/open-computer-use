@@ -31,9 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     capture = sub.add_parser("capture")
+    capture.add_argument("--links", required=True, choices=("confined", "verbatim"))
     capture.add_argument("source")
     capture.add_argument("archive")
     extract = sub.add_parser("extract")
+    extract.add_argument("--links", required=True, choices=("confined", "verbatim"))
     extract.add_argument("archive")
     extract.add_argument("target")
     probe = sub.add_parser("probe")
@@ -50,10 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     import recovery_fs
 
     if args.command == "capture":
-        recovery_fs.capture_tree(Path(args.source), Path(args.archive))
+        recovery_fs.capture_tree(Path(args.source), Path(args.archive), links=args.links)
         return 0
     if args.command == "extract":
-        recovery_fs.extract_tree(Path(args.archive), Path(args.target))
+        recovery_fs.extract_tree(Path(args.archive), Path(args.target), links=args.links)
         return 0
     marker = Path(args.path)
     if marker.is_file() and not marker.is_symlink():
