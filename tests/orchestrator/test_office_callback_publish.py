@@ -218,6 +218,37 @@ def test_later_successful_save_clears_earlier_storage_low(office_world, monkeypa
     assert status() == ("editing", None, 2, published)
 
 
+def test_nothing_new_persist_over_unpublished_latest_keeps_storage_low(office_world, monkeypatch):
+    import office.versions as versions_mod
+
+    http, data, _origin, _manager, _broker, _content, session = _autosaved(office_world, monkeypatch)
+    with _forcesave(monkeypatch, session["document_key"]):
+        assert _save(http, session["session_id"], "publish").status_code == 202
+    original = versions_mod.check_free_space
+    low = {"active": True}
+
+    def floor(store, chat_id, min_free_bytes):
+        if low["active"]:
+            raise versions_mod.StorageLowError("office storage is below the configured floor")
+        return original(store, chat_id, min_free_bytes)
+
+    def status():
+        answer = _status(http, session["session_id"]).json()
+        return answer["state"], answer["reason"], answer["last_committed_seq"], answer["last_published_seq"]
+
+    monkeypatch.setattr(versions_mod, "check_free_space", floor)
+    with _content_origin({"/publish.docx": CHANGED + b"publish"}) as server, _bind_internal(monkeypatch, server.url):
+        _assert_refusal(_post(http, session, recorded_status_6_payload(
+            document_key=session["document_key"], url=server.url + "/publish.docx", save_seq=2, intent="publish",
+        )), 503, "storage_low")
+    assert status() == ("editing", "storage_low", 1, 0)
+    low["active"] = False
+    with _forcesave(monkeypatch, session["document_key"], code=4):
+        assert _save(http, session["session_id"], "persist").status_code == 202
+    assert _read(data)["documents"][session["file_id"]]["versions"][-1]["published"] is False
+    assert status() == ("editing", "storage_low", 3, 0)
+
+
 @pytest.mark.parametrize("conflict", (False, True), ids=("published", "conflict"))
 def test_status4_after_autosave_reaches_final_outcome_and_complete_replay_is_inert(office_world, monkeypatch, conflict):
     http, data, _origin, _manager, broker, content, session = _autosaved(office_world, monkeypatch)

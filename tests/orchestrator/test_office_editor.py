@@ -643,6 +643,8 @@ def test_transient_status_failure_keeps_loaded_editor_usable_and_polling(tmp_pat
     assert (outage["state"], outage["dirty"], outage["reason"]) == ("editing", True, None)
     assert _poll_delays(result["actionResources"][1]) == [1000]
     assert _poll_delays(result["actionResources"][2]) == [1000]
+    assert result["actionResources"][1]["timerDelays"].count(300000) == 1
+    assert result["actionResources"][2]["timerDelays"].count(300000) == 1
     assert result["actionResources"][2]["calls"] == result["actionResources"][1]["calls"] + 1
     assert result["actionResources"][3]["saves"] == 1
     assert all(state["state"] != "error" for state in _states(result))
@@ -670,17 +672,45 @@ def test_consecutive_status_failures_back_off_to_ten_seconds_then_reset(tmp_path
     ({"status": 403, "raw": True}, "session_status_failed"),
     ({"status": 404, "raw": True}, "session_status_failed"),
     ({"status": 500, "body": {"reason": "state_corrupt"}}, "state_corrupt"),
+    ({"status": 500, "raw": True}, "session_status_failed"),
+    ({"status": 400, "raw": True}, "session_status_failed"),
+    ({"status": 400, "body": {"reason": "invalid_request"}}, "invalid_request"),
+    ({"status": 429, "raw": True}, "session_status_failed"),
+    ({"status": 429, "body": {"reason": "rate_limited"}}, "rate_limited"),
     ({"status": 200, "body": _FOREIGN_STATUS}, "invalid_session_status"),
-], ids=["401-json", "401-html", "403-html", "404-html", "500-json", "foreign-session"])
+], ids=["401-json", "401-html", "403-html", "404-html", "500-json", "500-html", "400-html", "400-json",
+        "429-html", "429-json", "foreign-session"])
 def test_terminal_status_answer_still_ends_editor(tmp_path, reply, reason):
     result = _run(tmp_path, open=True, modify=[True, False], actions=[
         {"kind": "statusReplies", "replies": [reply]}, {"kind": "tick", "ms": 1000},
         {"kind": "command", "command": "save"}, {"kind": "tick", "ms": 30000},
     ])
+    assert (result["actionStates"][1]["state"], result["actionStates"][1]["reason"]) == ("error", reason)
+    assert result["actionResources"][1]["timerDelays"] == []
     assert (_states(result)[-1]["state"], _states(result)[-1]["reason"]) == ("error", reason)
     assert result["timers"] == 0
     assert len(_polls(result)) == 2
     assert result["actionResources"][-1]["saves"] == 0
+
+
+@pytest.mark.parametrize(("transients", "backoff"), [
+    ([{"status": 502, "raw": True}], [1000]),
+    ([{"status": 502, "raw": True}, {"throw": True}], [1000, 2000]),
+], ids=["after-one-502", "after-502-and-throw"])
+def test_terminal_answer_after_transient_failures_ends_editor(tmp_path, transients, backoff):
+    result = _run(tmp_path, open=True, modify=[True, False], actions=[
+        {"kind": "statusReplies", "replies": [*transients, {"status": 401, "raw": True}]},
+        *({"kind": "tick", "ms": ms} for ms in [1000, *backoff]), {"kind": "tick", "ms": 30000},
+    ])
+    outage, ended, after = len(transients), len(transients) + 1, len(transients) + 2
+    assert (result["actionStates"][outage]["state"], result["actionStates"][outage]["reason"]) == ("editing", None)
+    assert _poll_delays(result["actionResources"][outage]) == backoff[-1:]
+    assert (result["actionStates"][ended]["state"], result["actionStates"][ended]["reason"]) == (
+        "error", "session_status_failed")
+    assert result["actionResources"][ended]["timerDelays"] == []
+    assert result["actionResources"][after]["calls"] == result["actionResources"][ended]["calls"]
+    assert len(_polls(result)) == len(transients) + 2
+    assert result["timers"] == 0
 
 
 @pytest.mark.parametrize(("reply", "reason"), [
@@ -707,6 +737,7 @@ def test_dispose_during_status_outage_leaves_no_poll(tmp_path, moment):
     before = result["actionResources"][1]
     assert _poll_delays(before) == ([1000] if moment == "backoff" else [])
     assert result["actionStates"][1]["state"] == "editing"
+    assert result["actionResources"][2]["timerDelays"] == []
     assert result["timers"] == 0
     assert result["actionResources"][-1]["calls"] == before["calls"]
     assert all(result["signals"])
