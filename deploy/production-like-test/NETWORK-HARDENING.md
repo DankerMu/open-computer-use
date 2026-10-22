@@ -223,8 +223,16 @@ The Computer Use tool reaches every model through the global `computer_use_filte
 
 ```bash
 cd "$DEPLOY_ROOT/source"
-set -a; . "$DEPLOY_ROOT/config/runtime.env"; set +a   # never print this environment
+set -a; . "$DEPLOY_ROOT/config/runtime.env"; set +a
+# The provider key is not in runtime.env. Load it from the provider env file as
+# a normal deploy shell does: DMX_ENV_FILE in runtime.env names it on recovered
+# targets; otherwise it is the file bootstrap-test.sh read.
+provider_env=${DMX_ENV_FILE:-/home/ubuntu/.config/ocu-test/dmxapi.env}
+set -a; . "$provider_env"; set +a
+# Never print this environment.
 ```
+
+The WebUI overlay interpolates `${DMXAPI_API_KEY}` without a required-value check, so a shell without it starts `open-webui` with an empty provider key.
 
 1. Deploy the new release with `deploy/up.sh` as usual. `BYPASS_MODEL_ACCESS_CONTROL` is now live; `open-webui-init` still finds the marker and skips.
 2. Delete the marker, then re-run `open-webui-init`:
@@ -259,7 +267,7 @@ set -a; . "$DEPLOY_ROOT/config/runtime.env"; set +a   # never print this environ
        --entrypoint python3 "$OPENWEBUI_IMAGE" /bootstrap/remove-wrapper-model.py
    ```
 
-   The script refuses, exit 1, until the stored `computer_use_filter` content equals `/app/source/functions/computer_link_filter.py` byte for byte, which is what step 2 writes. It then lists rows with `GET /api/v1/models/export` and deletes, with `POST /api/v1/models/model/delete`, only rows whose name ends with ` (Computer Use)` and whose `meta.toolIds` contains `ai_computer_use`. Deleting a row also revokes its access grants. A second run prints `nothing to remove` and exits 0. It never prints the password or the session token.
+   The script refuses, exit 1, until the stored `computer_use_filter` content equals `/app/source/functions/computer_link_filter.py` byte for byte, which is what step 2 writes. It then lists rows from two admin endpoints and merges them by id. `GET /api/v1/models/base` is needed because the old initializer gave the wrapper the raw provider model's id, so WebUI stored it as a base-model override (`base_model_id` empty), and `GET /api/v1/models/export` lists only rows derived from another model. From that list the script deletes, with `POST /api/v1/models/model/delete`, only rows whose name ends with ` (Computer Use)` and whose `meta.toolIds` contains `ai_computer_use`. Deleting a row also revokes its access grants. A second run prints `nothing to remove` and exits 0. It never prints the password or the session token.
 
 The wrapper's id equals the raw provider model id, so its row only overrode that model. After step 3 the id resolves to the raw provider model, and existing wrapper chats continue on it with the tool attached by the filter.
 

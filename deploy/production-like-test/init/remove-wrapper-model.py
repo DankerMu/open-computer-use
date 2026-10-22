@@ -10,6 +10,12 @@ delete anything until the stored computer_use_filter equals the shipped file
 byte for byte, then deletes only rows whose name ends with " (Computer Use)"
 and whose meta.toolIds contains ai_computer_use. A second run removes nothing.
 
+Rows come from two admin endpoints. The old initializer gave the wrapper the
+raw provider model's id, so Open WebUI stored it as a base-model override
+(base_model_id NULL): GET /api/v1/models/base lists such rows, while
+GET /api/v1/models/export lists only derived rows (base_model_id set). Both
+lists are merged and de-duplicated by id.
+
 Inputs come from the environment, as for run-init.sh: WEBUI_URL, ADMIN_EMAIL,
 ADMIN_PASSWORD and OCU_INIT_SOURCE_ROOT (default /app/source). The password and
 the session token are never printed.
@@ -112,10 +118,15 @@ def remove_wrappers(base: str, email: str, password: str, shipped: bytes) -> Non
             "delete the init marker and re-run open-webui-init first"
         )
 
-    rows = _call(base, "GET", "/api/v1/models/export", token)
-    if not isinstance(rows, list):
-        raise Refusal("GET /api/v1/models/export did not return a list")
-    wrappers = [row for row in rows if _is_wrapper(row)]
+    rows: dict[str, dict] = {}
+    for path in ("/api/v1/models/base", "/api/v1/models/export"):
+        listed = _call(base, "GET", path, token)
+        if not isinstance(listed, list):
+            raise Refusal(f"GET {path} did not return a list")
+        for row in listed:
+            if _is_wrapper(row):
+                rows.setdefault(row["id"], row)
+    wrappers = list(rows.values())
     if not wrappers:
         print("nothing to remove")
         return

@@ -24,12 +24,22 @@ SENTINEL = "sentinel-admin-password-5b1e"
 TOKEN = "sentinel-session-token-77ad"
 ADMIN_EMAIL = "admin@example.test"
 
+# The old init.sh created the wrapper with id == base_model_id; Open WebUI
+# stores such a row as a base-model override (base_model_id None), which
+# /api/v1/models/export omits and /api/v1/models/base lists.
 WRAPPER = {
     "id": "qwen3.8-27b",
     "name": "qwen3.8-27b (Computer Use)",
-    "base_model_id": "qwen3.8-27b",
+    "base_model_id": None,
     "meta": {"toolIds": ["ai_computer_use"], "filterIds": ["computer_use_filter"]},
     "params": {"function_calling": "native"},
+}
+DERIVED_WRAPPER = {
+    "id": "custom-computer-use",
+    "name": "custom-computer-use (Computer Use)",
+    "base_model_id": "deepseek-flash-guan",
+    "meta": {"toolIds": ["ai_computer_use"]},
+    "params": {},
 }
 SUFFIX_ONLY = {
     "id": "custom-suffix",
@@ -96,8 +106,16 @@ class FakeWebUI:
                     return self._json(
                         200, {"id": "computer_use_filter", "content": owner.stored_filter}
                     )
+                # Mirrors the fork: export lists derived rows only
+                # (base_model_id set), base lists base-model rows only.
                 if self.path == "/api/v1/models/export":
-                    return self._json(200, owner.models)
+                    return self._json(
+                        200, [m for m in owner.models if m["base_model_id"] is not None]
+                    )
+                if self.path == "/api/v1/models/base":
+                    return self._json(
+                        200, [m for m in owner.models if m["base_model_id"] is None]
+                    )
                 return self._json(404, {"detail": "unexpected"})
 
             def do_POST(self):
@@ -142,7 +160,7 @@ class RemoveWrapperModelTests(unittest.TestCase):
         self.addCleanup(self.webui.stop)
         self.webui.start()
         self.shipped = SHIPPED_FILTER.read_text(encoding="utf-8")
-        self.rows = [WRAPPER, SUFFIX_ONLY, TOOL_ONLY, UNRELATED]
+        self.rows = [WRAPPER, DERIVED_WRAPPER, SUFFIX_ONLY, TOOL_ONLY, UNRELATED]
         self.webui.models = copy.deepcopy(self.rows)
 
     def run_script(self, password=SENTINEL):
@@ -186,22 +204,28 @@ class RemoveWrapperModelTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("re-run open-webui-init", result.stderr)
                 self.assertNotIn("GET /api/v1/models/export", self.webui.calls)
+                self.assertNotIn("GET /api/v1/models/base", self.webui.calls)
                 self.assertEqual(self.webui.deleted, [])
                 self.assertEqual(self.webui.models, self.rows)
 
-    def test_removes_only_the_wrapper_then_reports_nothing_to_remove(self):
+    def test_removes_base_and_derived_wrappers_then_reports_nothing_to_remove(self):
         self.webui.stored_filter = self.shipped
         first = self.run_script()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(self.webui.deleted, [{"id": WRAPPER["id"]}])
+        removed = [{"id": WRAPPER["id"]}, {"id": DERIVED_WRAPPER["id"]}]
+        self.assertCountEqual(self.webui.deleted, removed)
+        self.assertEqual(len(self.webui.deleted), 2)
         self.assertEqual(self.webui.models, [SUFFIX_ONLY, TOOL_ONLY, UNRELATED])
+        self.assertIn("GET /api/v1/models/base", self.webui.calls)
+        self.assertIn("GET /api/v1/models/export", self.webui.calls)
         self.assertIn(f"removed {WRAPPER['id']}", first.stdout)
+        self.assertIn(f"removed {DERIVED_WRAPPER['id']}", first.stdout)
         self.assertNotIn("nothing to remove", first.stdout)
 
         second = self.run_script()
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn("nothing to remove", second.stdout)
-        self.assertEqual(self.webui.deleted, [{"id": WRAPPER["id"]}])
+        self.assertEqual(len(self.webui.deleted), 2)
         self.assertEqual(self.webui.models, [SUFFIX_ONLY, TOOL_ONLY, UNRELATED])
 
     def test_failed_admin_sign_in_refuses_before_reading_anything(self):
