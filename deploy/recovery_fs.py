@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 import stat
@@ -108,10 +109,16 @@ def _symlink_target_allowed(member_name: str, target: str, links: str) -> bool:
 
 
 
-def _lstat(path: Path):
+def _vanished(exc: OSError, live: bool) -> bool:
+    return live and exc.errno in (errno.ENOENT, errno.ENOTDIR)
+
+
+def _lstat(path: Path, *, live: bool = False):
     try:
         return path.lstat()
     except OSError as exc:
+        if _vanished(exc, live):
+            return None
         raise RecoveryError(f"cannot inspect {path}: {exc}") from exc
 
 
@@ -173,9 +180,7 @@ def _pax_headers(path: Path) -> dict[str, str]:
     return headers
 
 
-def _python_capture(
-    root: Path, archive: Path, rows: list[tuple[Path, str, os.stat_result]], *, links: str
-) -> None:
+def _python_capture(root: Path, archive: Path, rows: list[tuple[Path, str, os.stat_result]]) -> None:
     inode_names: dict[tuple[int, int], str] = {}
     with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT, dereference=False) as bundle:
         for path, relative, info in rows:
@@ -198,11 +203,8 @@ def _python_capture(
                 bundle.addfile(member)
                 continue
             if stat.S_ISLNK(info.st_mode):
-                target = os.readlink(path)
-                if not _symlink_target_allowed(relative, target, links):
-                    fail(f"{path}: unsafe symlink")
                 member.type = tarfile.SYMTYPE
-                member.linkname = target
+                member.linkname = os.readlink(path)
                 member.size = 0
                 bundle.addfile(member)
             elif stat.S_ISDIR(info.st_mode):
@@ -312,12 +314,14 @@ def _python_extract(archive: Path, dest: Path, members: list[tarfile.TarInfo]) -
             _apply_metadata(target, member)
 
 
-def _walk_tree(root: Path) -> list[tuple[Path, str, os.stat_result]]:
+def _walk_tree(root: Path, *, live: bool = False) -> list[tuple[Path, str, os.stat_result]]:
     stack = [root]
     rows: list[tuple[Path, str, os.stat_result]] = []
     while stack:
         current = stack.pop()
-        info = _lstat(current)
+        info = _lstat(current, live=live)
+        if info is None:
+            continue
         relative = "." if current == root else confined_relative(root, current)
         if _is_unsupported_type(info.st_mode):
             fail(f"{current}: unsupported file type")
@@ -326,29 +330,62 @@ def _walk_tree(root: Path) -> list[tuple[Path, str, os.stat_result]]:
             try:
                 names = sorted(os.listdir(current), reverse=True)
             except OSError as cop:
+                if _vanished(cop, live):
+                    continue
                 raise RecoveryError(f"cannot list {current}: {cop}") from cop
             for name in names:
                 stack.append(current / name)
     return rows
 
 
-def capture_tree(root: Path, archive: Path, *, links: str) -> dict:
+def scan_tree(root: Path, *, links: str, live: bool = False) -> list[tuple[Path, str, os.stat_result]]:
+    """Read-only walk applying every source-side refusal of the GNU-tar capture.
+
+    live=True is for a running tree only: entries that vanish mid-walk are skipped.
+    """
     _require_link_policy(links)
     if not root.exists():
         fail(f"{root}: missing")
     root_info = _lstat(root)
     if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
         fail(f"{root}: capture root must be a directory")
-    archive.parent.mkdir(parents=True, exist_ok=True)
-    rows = _walk_tree(root)
+    rows = _walk_tree(root, live=live)
     if len(rows) > MAX_ARCHIVE_MEMBERS:
         fail(f"{root}: archive member limit exceeded")
-    names = [relative for _path, relative, _info in rows]
     seen: set[str] = set()
-    for name in names:
-        if name in seen:
-            fail(f"{root}: duplicate member {name}")
-        seen.add(name)
+    symlinks: dict[tuple[int, int], str] = {}
+    files: set[tuple[int, int]] = set()
+    total = 0
+    for path, relative, info in rows:
+        if relative in seen:
+            fail(f"{root}: duplicate member {relative}")
+        seen.add(relative)
+        key = (info.st_dev, info.st_ino)
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                target = os.readlink(path)
+            except OSError as cop:
+                if _vanished(cop, live):
+                    continue
+                raise RecoveryError(f"cannot read link {path}: {cop}") from cop
+            if not _symlink_target_allowed(relative, target, links):
+                fail(f"{path}: unsafe symlink")
+            # GNU tar archives a second in-tree name as a hardlink, which validation refuses.
+            if info.st_nlink > 1 and key in symlinks:
+                fail(f"{path}: hardlink {relative} may not target a symlink {symlinks[key]}")
+            symlinks[key] = relative
+        elif stat.S_ISREG(info.st_mode) and key not in files:
+            files.add(key)
+            total += info.st_size
+            if total > MAX_ARCHIVE_BYTES:
+                fail(f"{root}: archive size limit exceeded")
+    return rows
+
+
+def capture_tree(root: Path, archive: Path, *, links: str) -> dict:
+    rows = scan_tree(root, links=links)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    names = [relative for _path, relative, _info in rows]
     if _gnu_tar():
         listing = archive.parent / (archive.name + ".list")
         listing.write_bytes(b"\0".join(os.fsencode(name) for name in names) + b"\0")
@@ -366,7 +403,7 @@ def capture_tree(root: Path, archive: Path, *, links: str) -> dict:
         finally:
             listing.unlink(missing_ok=True)
     else:
-        _python_capture(root, archive, rows, links=links)
+        _python_capture(root, archive, rows)
     members = validate_archive(archive, links=links)
     archived = {record["name"] for record in members}
     if archived != set(names):

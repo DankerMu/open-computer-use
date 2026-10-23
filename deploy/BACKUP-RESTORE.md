@@ -17,6 +17,20 @@ python3 deploy/recovery.py activate --destination-root <restored-root> --retaine
 the selected runtime/release before stopping anything. OCU and DocumentServer must
 still be running when maintenance begins; do not stop them before invoking backup.
 
+It then scans, read-only and with each tree's link policy (below), every tree it will
+capture: the chat and skills directories on the host, and the WebUI data volume and
+each deployment workspace volume through the workspace helper image with a read-only
+mount. The scan applies the capture refusals: socket, FIFO or device members, too
+many members or bytes, a symlink the policy refuses, and a second name inside the
+tree for one symlink. It also requires the WebUI initializer marker and refuses an
+unattributable workspace volume. Any refusal fails the backup with every service
+still running: no container is stopped, DocumentServer gets no shutdown command, and
+no stage is created. An entry deleted while the running tree is scanned is skipped.
+The capture after quiesce repeats every check. A tree that changes between the scan
+and the stop, Python-fallback extended-attribute or ACL refusals, and failures the
+scan cannot predict, such as a full disk, still fail after the stop and leave the
+stack stopped, as described below.
+
 1. Stop the proxy to close browser admission to WebUI, OCU and DocumentServer.
 2. Run `/usr/bin/documentserver-prepare4shutdown.sh` inside DocumentServer while
    OCU remains running to persist and publish final callbacks over the control plane.

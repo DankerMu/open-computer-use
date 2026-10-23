@@ -7,6 +7,7 @@ from contextlib import ExitStack, redirect_stderr
 import io
 import os
 from pathlib import Path
+import socket
 import stat
 import tarfile
 import unittest
@@ -771,6 +772,166 @@ class RecoveryFilesystemTests(unittest.TestCase):
                     recovery_fs.extract_tree(archive, dest, links="verbatim")
                 self.assertEqual(os.listdir(dest), [])
 
+    def _bind_socket(self, path: Path) -> None:
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        cwd = os.getcwd()
+        os.chdir(path.parent)
+        try:
+            server.bind(path.name)
+        finally:
+            os.chdir(cwd)
+
+    def _scan_source(self, name: str) -> Path:
+        source = self.root / name
+        source.mkdir()
+        (source / "keep.txt").write_bytes(b"keep\n")
+        return source
+
+    def _refusing_trees(self):
+        fifo = self._scan_source("fifo")
+        os.mkfifo(fifo / "pipe")
+        sock = self._scan_source("socket")
+        self._bind_socket(sock / "s")
+        members = self._scan_source("members")
+        (members / "a").write_bytes(b"a")
+        size = self._scan_source("size")
+        (size / "big").write_bytes(b"x" * 8)
+        absolute = self._scan_source("absolute")
+        os.symlink("/etc/passwd", absolute / "abs")
+        hardlinked = self._scan_source("hardlinked-symlink")
+        os.symlink("keep.txt", hardlinked / "first")
+        os.link(hardlinked / "first", hardlinked / "second", follow_symlinks=False)
+        missing = self.root / "missing"
+        regular = self.root / "regular"
+        regular.write_bytes(b"not a directory\n")
+        return [
+            ("fifo", fifo, {}, "unsupported file type"),
+            ("socket", sock, {}, "unsupported file type"),
+            ("members", members, {"MAX_ARCHIVE_MEMBERS": 2}, "archive member limit exceeded"),
+            ("bytes", size, {"MAX_ARCHIVE_BYTES": 12}, "archive size limit exceeded"),
+            ("absolute", absolute, {}, "unsafe symlink"),
+            ("hardlinked-symlink", hardlinked, {}, "may not target a symlink"),
+            ("missing", missing, {}, "missing"),
+            ("regular", regular, {}, "capture root must be a directory"),
+        ]
+
+    def test_scan_refuses_what_capture_refuses_with_the_same_message(self):
+        for case, source, limits, reason in self._refusing_trees():
+            for gnu in (True, False):
+                with self.subTest(case=case, gnu=gnu), ExitStack() as stack:
+                    for name, value in limits.items():
+                        stack.enter_context(patch.object(recovery_fs, name, value))
+                    stack.enter_context(patch.object(recovery_fs, "_gnu_tar", return_value=gnu))
+                    with self.assertRaises(recovery.RecoveryError) as scanned:
+                        recovery_fs.scan_tree(source, links="confined")
+                    self.assertIn(reason, str(scanned.exception))
+                    archive = self.root / f"{case}-{gnu}.tar.gz"
+                    with self.assertRaises(recovery.RecoveryError) as captured:
+                        recovery_fs.capture_tree(source, archive, links="confined")
+                    self.assertEqual(str(captured.exception), str(scanned.exception))
+                    self.assertFalse(archive.exists())
+
+    def test_scan_counts_hardlinked_bytes_once_and_accepts_outside_symlink_links(self):
+        source = self._scan_source("accepted")
+        (source / "data").write_bytes(b"y" * 6)
+        os.link(source / "data", source / "data-hard")
+        outside = self.root / "outside-links"
+        outside.mkdir()
+        os.symlink("keep.txt", outside / "elsewhere")
+        os.link(outside / "elsewhere", source / "alias", follow_symlinks=False)
+        os.symlink("/usr/bin/python3", source / "verbatim-abs")
+        rows = recovery_fs.scan_tree(source, links="verbatim")
+        self.assertEqual(
+            sorted(relative for _path, relative, _info in rows),
+            [".", "alias", "data", "data-hard", "keep.txt", "verbatim-abs"],
+        )
+        for gnu in (True, False):
+            with self.subTest(gnu=gnu):
+                if gnu:
+                    self._require_gnu_tar()
+                with patch.object(recovery_fs, "MAX_ARCHIVE_BYTES", 11), patch.object(
+                    recovery_fs, "_gnu_tar", return_value=gnu
+                ):
+                    archive = self.root / f"accepted-{gnu}.tar.gz"
+                    recovery_fs.capture_tree(source, archive, links="verbatim")
+                links = {record["name"]: record["linkname"]
+                         for record in recovery_fs.validate_archive(archive, links="verbatim")
+                         if record["type"] == "symlink"}
+                self.assertEqual(links, {"alias": "keep.txt", "verbatim-abs": "/usr/bin/python3"})
+
+    def _vanishing(self, point: str, source: Path):
+        real_listdir = os.listdir
+        real_readlink = os.readlink
+
+        def listdir(path):
+            if point == "listdir" and Path(path) == source / "dir":
+                (source / "dir" / "inner").unlink()
+                (source / "dir").rmdir()
+            names = real_listdir(path)
+            if point == "lstat" and Path(path) == source:
+                (source / "gone").unlink()
+            return names
+
+        def readlink(path, *args, **kwargs):
+            if point == "readlink" and Path(path) == source / "link":
+                (source / "link").unlink()
+            return real_readlink(path, *args, **kwargs)
+
+        stack = ExitStack()
+        stack.enter_context(patch.object(recovery_fs.os, "listdir", listdir))
+        stack.enter_context(patch.object(recovery_fs.os, "readlink", readlink))
+        return stack
+
+    def test_live_scan_skips_entries_that_vanish_and_capture_scan_refuses(self):
+        for point in ("lstat", "listdir", "readlink"):
+            for live in (True, False):
+                with self.subTest(point=point, live=live):
+                    source = self._scan_source(f"vanish-{point}-{live}")
+                    (source / "gone").write_bytes(b"gone\n")
+                    (source / "dir").mkdir()
+                    (source / "dir" / "inner").write_bytes(b"inner\n")
+                    os.symlink("/etc/passwd", source / "link")
+                    with self._vanishing(point, source):
+                        if live:
+                            rows = recovery_fs.scan_tree(source, links="verbatim", live=True)
+                        else:
+                            with self.assertRaises(recovery.RecoveryError) as raised:
+                                recovery_fs.scan_tree(source, links="verbatim")
+                    if live:
+                        names = {relative for _path, relative, _info in rows}
+                        self.assertIn("keep.txt", names)
+                        if point == "lstat":
+                            self.assertNotIn("gone", names)
+                    else:
+                        self.assertIn(str(source / {"lstat": "gone", "listdir": "dir",
+                                                    "readlink": "link"}[point]),
+                                      str(raised.exception))
+
+    def test_scan_writes_nothing(self):
+        source = self._scan_source("read-only")
+        (source / "dir").mkdir()
+        (source / "dir" / "file").write_bytes(b"file\n")
+        os.link(source / "dir" / "file", source / "hard")
+        os.symlink("dir/file", source / "rel")
+        os.symlink("/usr/bin/python3", source / "abs")
+
+        def observe():
+            observed = {}
+            for current, dirs, files in os.walk(source):
+                for name in [".", *dirs, *files]:
+                    info = os.lstat(os.path.join(current, name))
+                    observed[os.path.join(current, name)] = (info.st_mode, info.st_mtime_ns, info.st_size)
+            return observed
+
+        before = observe()
+        with self.assertRaises(recovery.RecoveryError):
+            recovery_fs.scan_tree(source, links="confined")
+        recovery_fs.scan_tree(source, links="verbatim")
+        recovery_fs.scan_tree(source, links="verbatim", live=True)
+        self.assertEqual(observe(), before)
+        self.assertEqual(sorted(os.listdir(self.root)), ["read-only"])
+
     def test_link_policy_is_required_and_known(self):
         source = self.root / "plain"
         source.mkdir()
@@ -781,6 +942,7 @@ class RecoveryFilesystemTests(unittest.TestCase):
         dest = self.root / "plain-out"
         calls = {
             "capture_tree": lambda **policy: recovery_fs.capture_tree(source, unused, **policy),
+            "scan_tree": lambda **policy: recovery_fs.scan_tree(source, **policy),
             "validate_archive": lambda **policy: recovery_fs.validate_archive(archive, **policy),
             "inspect_archive": lambda **policy: recovery_fs.inspect_archive(archive, **policy),
             "extract_tree": lambda **policy: recovery_fs.extract_tree(archive, dest, **policy),
@@ -809,6 +971,8 @@ class RecoveryFilesystemTests(unittest.TestCase):
             ["capture", str(source), str(archive)],
             ["capture", "--links=bogus", str(source), str(archive)],
             ["extract", str(archive), str(self.root / "never")],
+            ["scan", str(source)],
+            ["scan", "--links=bogus", "--live", str(source)],
         ):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
@@ -818,6 +982,12 @@ class RecoveryFilesystemTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery_helper.main(["capture", "--links=confined", str(source), str(archive)])
         self.assertIn("unsafe symlink", str(raised.exception))
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery_helper.main(["scan", "--links=confined", "--live", str(source)])
+        self.assertIn("unsafe symlink", str(raised.exception))
+        self.assertEqual(recovery_helper.main(["scan", "--links=verbatim", "--live", str(source)]), 0)
+        self.assertEqual(recovery_helper.main(["scan", "--links=verbatim", str(source)]), 0)
+        self.assertEqual(sorted(os.listdir(source)), ["bin"])
         archive.unlink(missing_ok=True)
         self.assertEqual(recovery_helper.main(["capture", "--links=verbatim", str(source), str(archive)]), 0)
         dest = self.root / "helper-out"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
-"""In-image capture, extract, marker probe, and first recovered broker listing."""
+"""In-image scan, capture, extract, marker probe, and first recovered broker listing."""
 
 from __future__ import annotations
 
@@ -30,6 +30,10 @@ def _listing(chat_dir: Path, chat_id: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    scan = sub.add_parser("scan")
+    scan.add_argument("--links", required=True, choices=("confined", "verbatim"))
+    scan.add_argument("--live", action="store_true")
+    scan.add_argument("source")
     capture = sub.add_parser("capture")
     capture.add_argument("--links", required=True, choices=("confined", "verbatim"))
     capture.add_argument("source")
@@ -51,6 +55,9 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import recovery_fs
 
+    if args.command == "scan":
+        recovery_fs.scan_tree(Path(args.source), links=args.links, live=args.live)
+        return 0
     if args.command == "capture":
         recovery_fs.capture_tree(Path(args.source), Path(args.archive), links=args.links)
         return 0
