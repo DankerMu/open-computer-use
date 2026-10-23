@@ -177,8 +177,9 @@ class RecoveryFilesystemTests(unittest.TestCase):
 
         os.lchown = refuse
         try:
-            with self.assertRaises(recovery.RecoveryError) as raised:
-                recovery_fs.extract_tree(rewritten, dest, links="confined")
+            with patch.object(recovery_fs, "_gnu_tar", return_value=False):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    recovery_fs.extract_tree(rewritten, dest, links="confined")
         finally:
             os.lchown = original
         self.assertIn("cannot restore ownership", str(raised.exception))
