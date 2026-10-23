@@ -915,6 +915,8 @@ def verify_recovery_set(root: Path, *, require_published: bool = True) -> dict:
         raise RecoveryError("workspace volume archives are missing")
     for chat_id, record in workspaces.items():
         canonical = recovery.canonical_chat_id(chat_id)
+        if chat_id != canonical:
+            raise RecoveryError(f"workspace {chat_id!r} is not a canonical chat id")
         if str(record.get("chat_id") or "") != canonical:
             raise RecoveryError(f"workspace {chat_id} is not bound to its declared chat")
         expected_path = f"workspaces/{canonical}.tar.gz"
