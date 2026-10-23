@@ -12,6 +12,7 @@ import os
 import signal
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -996,10 +997,22 @@ else:
                 else:
                     state.mkdir()
                 dest = self.root / ("unsafe-office-" + defect)
+                containers = (self.state / "containers.json").read_bytes()
                 result = self.run_cli(
                     ["backup", "--deploy-root", str(self.deploy_root), "--destination", str(dest),
                      "--runtime-file", str(self.runtime)])
                 self.assertEqual(result.returncode, 1, result.stderr)
+                if defect == "fifo":
+                    # The pre-quiesce scan refuses a FIFO in the chat tree before any stop (#608);
+                    # the Office reader keeps its own refusal for one that appears after the scan.
+                    self.assertIn(f"{state}: unsupported file type", result.stderr)
+                    self.assertFalse(dest.exists())
+                    self.assertEqual((self.state / "containers.json").read_bytes(), containers)
+                    import recovery_resources
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        recovery_resources._office_blockers(self.chat_dir)
+                    self.assertIn(f"cannot safely read Office state for {CHAT_ID}", str(raised.exception))
+                    continue
                 self.assertIn("cannot safely read Office state", result.stderr)
                 self.assertIn(CHAT_ID, result.stderr)
                 self.assertFalse(dest.exists())
@@ -2740,6 +2753,10 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self.assertTrue((dest / "recovery.json").is_file())
         self._assert_helper_policy(runs, "capture", f"chat-{CHAT_ID}-workspace:/source:ro", "verbatim")
         self._assert_helper_policy(runs, "capture", "ocu-test_open-webui-data:/source:ro", "confined")
+        self._assert_scan_runs(runs, ["ocu-test_open-webui-data", f"chat-{CHAT_ID}-workspace"])
+        subcommands = [row["command"][1] for row in runs]
+        self.assertLess(max(i for i, sub in enumerate(subcommands) if sub == "scan"),
+                        subcommands.index("capture"))
         for archive, prefix in (
             (dest / "workspaces" / f"{CHAT_ID}.tar.gz", ""),
             (dest / "chat-data.tar.gz", f"{CHAT_ID}/outputs/"),
@@ -2752,21 +2769,143 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         verified = self.run_cli(["verify", "--recovery-set", str(dest)])
         self.assertEqual(verified.returncode, 0, verified.stderr)
 
+    def _assert_scan_runs(self, runs, scanned):
+        policies = {}
+        for row in runs:
+            if row["command"][1] != "scan":
+                continue
+            mounts = [mount for mount in row["mounts"] if not mount.endswith(":/recovery:ro")]
+            self.assertEqual(len(mounts), 1, row)
+            volume, _, rest = mounts[0].partition(":")
+            self.assertEqual(rest, "/source:ro", row)
+            policy = "confined" if volume == "ocu-test_open-webui-data" else "verbatim"
+            self.assertEqual(
+                row["command"],
+                ["/recovery/recovery_helper.py", "scan", f"--links={policy}", "--live", "/source"],
+            )
+            policies[volume] = policy
+        self.assertEqual(set(policies), set(scanned), runs)
+
+    def _assert_refused_before_quiesce(self, dest, reason, *, scanned):
+        for name in ("stopped.log", "office-shutdown.json", "runs.json", "ops.log"):
+            (self.state / name).unlink(missing_ok=True)
+        containers = (self.state / "containers.json").read_bytes()
+        result = self._backup(dest)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(reason, result.stderr)
+        self.assertFalse(dest.exists())
+        self.assertEqual(sorted(dest.parent.glob(dest.name + ".stage-*")), [])
+        self.assertEqual((self.state / "containers.json").read_bytes(), containers)
+        self.assertFalse((self.state / "stopped.log").exists())
+        self.assertFalse((self.state / "office-shutdown.json").exists())
+        calls = ops(self.state)
+        self.assertEqual([call for call in calls if call.startswith(("docker stop", "docker exec"))], [])
+        runs = self._helper_runs(self.state) if (self.state / "runs.json").exists() else []
+        self.assertEqual([row for row in runs if row["command"][1] == "capture"], [])
+        self._assert_scan_runs(runs, scanned)
+        return result
+
     def test_deployment_owned_absolute_link_refuses_backup(self):
-        for owner, root in (
-            ("skills-cache", self.skills_dir / "demo"),
-            ("webui-data", self.state / "volume-data" / "ocu-test_open-webui-data"),
+        webui = "ocu-test_open-webui-data"
+        for owner, root, scanned in (
+            ("skills-cache", self.skills_dir / "demo", []),
+            ("webui-data", self.state / "volume-data" / webui, [webui]),
         ):
             with self.subTest(owner=owner):
                 self._seed_volumes_and_db()
                 link = root / "abs"
                 os.symlink("/etc/passwd", link)
                 dest = self.root / f"backup-owned-{owner}"
-                result = self._backup(dest)
-                link.unlink()
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("unsafe symlink", result.stderr)
-                self.assertFalse(dest.exists())
+                try:
+                    result = self._assert_refused_before_quiesce(dest, "unsafe symlink", scanned=scanned)
+                finally:
+                    link.unlink()
+                self.assertIn("abs", result.stderr)
+
+    def test_special_file_refuses_backup_before_quiesce(self):
+        workspace = self.state / "volume-data" / f"chat-{CHAT_ID}-workspace"
+        webui = "ocu-test_open-webui-data"
+        for case, path, scanned in (
+            ("workspace-fifo", workspace / "pipe", [webui, workspace.name]),
+            ("workspace-socket", workspace / "sock", [webui, workspace.name]),
+            ("chat-fifo", self.chat_dir / CHAT_ID / "outputs" / "pipe", []),
+        ):
+            with self.subTest(case=case):
+                self._seed_volumes_and_db()
+                if case.endswith("socket"):
+                    server = socket.socket(socket.AF_UNIX)
+                    cwd = os.getcwd()
+                    os.chdir(path.parent)
+                    try:
+                        server.bind(path.name)
+                    finally:
+                        os.chdir(cwd)
+                    server.close()
+                else:
+                    os.mkfifo(path)
+                try:
+                    result = self._assert_refused_before_quiesce(
+                        self.root / f"backup-{case}", "unsupported file type", scanned=scanned
+                    )
+                finally:
+                    path.unlink()
+                self.assertIn(path.name, result.stderr)
+
+    def test_hardlinked_symlinks_in_workspace_refuse_backup_before_quiesce(self):
+        workspace = self.state / "volume-data" / f"chat-{CHAT_ID}-workspace"
+        os.symlink("README.md", workspace / "first")
+        os.link(workspace / "first", workspace / "second", follow_symlinks=False)
+        result = self._assert_refused_before_quiesce(
+            self.root / "backup-hardlinked-symlink", "may not target a symlink",
+            scanned=["ocu-test_open-webui-data", workspace.name],
+        )
+        self.assertIn("second", result.stderr)
+
+    def test_missing_webui_marker_refuses_backup_before_quiesce(self):
+        marker = self.state / "volume-data" / "ocu-test_open-webui-data" / ".computer-use-initialized"
+        marker.unlink()
+        dest = self.root / "backup-no-marker"
+        self._assert_refused_before_quiesce(
+            dest, "WebUI initializer marker is missing", scanned=["ocu-test_open-webui-data"]
+        )
+
+    def test_chat_created_during_pre_quiesce_scan_is_attributed(self):
+        new_chat = "chat-created-mid-scan"
+        volume = f"chat-{new_chat}-workspace"
+        mount = self.state / "volume-data" / volume
+        # A user opens a chat after host_chats is read but before the scan discovers
+        # workspace volumes: its directory and workspace volume appear in that window.
+        injection = f"""
+import json
+from pathlib import Path
+import recovery_resources
+_real_scan_volume = recovery_resources.scan_volume
+def scan_volume_while_a_chat_is_created(*args, **kwargs):
+    outputs = Path({str(self.chat_dir / new_chat / "outputs")!r})
+    if not outputs.exists():
+        outputs.mkdir(parents=True)
+        mount = Path({str(mount)!r})
+        mount.mkdir(parents=True)
+        (mount / "README.md").write_bytes(b"new-sandbox-home\\n")
+        registry = Path({str(self.state / "volumes.json")!r})
+        volumes = json.loads(registry.read_text(encoding="utf-8"))
+        volumes[{volume!r}] = {{"Name": {volume!r}, "Mountpoint": str(mount)}}
+        registry.write_text(json.dumps(volumes), encoding="utf-8")
+    return _real_scan_volume(*args, **kwargs)
+recovery_resources.scan_volume = scan_volume_while_a_chat_is_created
+"""
+        marker = "runpy.run_module('recovery', run_name='__main__')"
+        self.launcher.write_text(self.launcher.read_text().replace(marker, injection + "\n" + marker))
+        dest = self.root / "backup-chat-created-mid-scan"
+        result = self._backup(dest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.chat_dir / new_chat / "outputs").is_dir())
+        self.assertTrue((dest / "recovery.json").is_file())
+        self.assertTrue((dest / "workspaces" / f"{new_chat}.tar.gz").is_file())
+        self._assert_scan_runs(
+            self._helper_runs(self.state),
+            ["ocu-test_open-webui-data", f"chat-{CHAT_ID}-workspace", volume],
+        )
 
     def _add_link_member(self, archive, name, target):
         with tarfile.open(archive, "r:*") as bundle:
@@ -2913,6 +3052,11 @@ class VolumeHelperFailureTests(unittest.TestCase):
 
     def test_capture_volume_failure_carries_helper_reason(self):
         self._assert_reports_helper_reason(self.resources.capture_volume)
+
+    def test_scan_volume_failure_carries_helper_reason(self):
+        self._assert_reports_helper_reason(
+            lambda volume, _archive, image, *, links: self.resources.scan_volume(volume, image, links=links)
+        )
 
     def test_restore_volume_failure_carries_helper_reason(self):
         self._valid_archive()

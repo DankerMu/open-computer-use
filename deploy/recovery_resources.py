@@ -513,8 +513,11 @@ def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dic
         seen_chats.add(sandbox["chat_id"])
         if container_paused(sandbox["payload"]):
             raise RecoveryError(f"{sandbox['name']} is paused and cannot be captured")
+    image = helper_image(runtime, "workspace")
+    # Outside the try: a refusal here must not run the failure path that stops writers.
+    _scan_before_quiesce(identity, image, host_chats)
     try:
-        return _quiesce_and_discover(identity, writers, timeout)
+        return {**_quiesce_and_discover(identity, writers, timeout), "image": image}
     except BaseException as failure:
         errors = _stop_after_office_failure(identity, writers, initial, host_chats)
         if isinstance(failure, (SystemExit, KeyboardInterrupt)):
@@ -528,6 +531,17 @@ def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dic
             detail = str(exc)
         reason = str(failure) if isinstance(failure, RecoveryError) else type(failure).__name__
         raise RecoveryError("; ".join([reason, detail, *errors])) from failure
+
+
+def _scan_before_quiesce(identity: dict, image: str, chats: set[str]) -> None:
+    recovery_fs.scan_tree(identity["chat_dir"], links=LINK_POLICY["chat-data"], live=True)
+    recovery_fs.scan_tree(identity["skills_dir"], links=LINK_POLICY["skills-cache"], live=True)
+    scan_volume(identity["webui_volume"], image, links=LINK_POLICY["webui-data"])
+    if not _volume_has_marker(identity["webui_volume"], image):
+        raise RecoveryError("WebUI initializer marker is missing from the data volume")
+    # Re-read the chat directories: a chat created during the scans above owns its new volume.
+    for _chat_id, volume in sorted(discover_workspace_volumes(chats | _host_chats(identity)).items()):
+        scan_volume(volume, image, links=LINK_POLICY["workspaces"])
 
 
 def _quiesce_and_discover(identity: dict, writers: list[str], timeout: float) -> dict:
@@ -659,6 +673,17 @@ def _helper_detail(result) -> str:
     return str(result.stderr or result.stdout or "").strip()[-2000:]
 
 
+def scan_volume(volume: str, image: str, *, links: str) -> None:
+    inspect_volume(volume)
+    result = run_volume_helper(
+        image,
+        [(volume, "/source", "ro")],
+        ["scan", f"--links={links}", "--live", "/source"],
+    )
+    if result.returncode != 0:
+        raise RecoveryError(f"volume helper failed for {volume}: {_helper_detail(result)}")
+
+
 def capture_volume(volume: str, archive: Path, image: str, *, links: str) -> dict:
     archive.parent.mkdir(parents=True, exist_ok=True)
     inspect_volume(volume)
@@ -720,7 +745,7 @@ def backup_deployment(*, deploy_root: Path, destination: Path, runtime_file: Pat
                 identity["postgres_container"], db_dir
             )
             components["database"]["path"] = "database/openwebui.dump"
-            workspace_image = helper_image(runtime, "workspace")
+            workspace_image = quiesced["image"]
             webui_archive = stage / "webui-data.tar.gz"
             components["webui-data"] = capture_volume(
                 identity["webui_volume"], webui_archive, workspace_image,
