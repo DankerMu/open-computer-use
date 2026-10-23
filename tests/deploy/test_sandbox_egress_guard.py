@@ -905,6 +905,11 @@ class EgressGuardTests(unittest.TestCase):
         self.assertEqual(target.stat().st_mode & 0o777, 0o644)
         self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root can create the default lock directory, so the install succeeds instead of naming it, "
+        "and a root run would create the host's /run/ocu-sandbox-egress (#623)",
+    )
     def test_default_lock_path_is_host_stable(self):
         env = dict(self.env)
         del env["OCU_SANDBOX_EGRESS_LOCK"]
