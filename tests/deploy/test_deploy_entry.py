@@ -64,6 +64,25 @@ def compose_up_ops(state_dir: Path) -> list[str]:
     return [line for line in ops(state_dir) if " compose " in f" {line} " and line.split()[-1:] != ["config"] and " up " in f" {line} "]
 
 
+def restarts(state_dir: Path) -> list[str]:
+    log = state_dir / "restarts.log"
+    if not log.exists():
+        return []
+    return [line for line in log.read_text(encoding="utf-8").splitlines() if line]
+
+
+def compose_ops(state_dir: Path) -> list[list[str]]:
+    return [line.split() for line in ops(state_dir) if line.split()[:2] == ["docker", "compose"]]
+
+
+def proxy_snapshot_ops(state_dir: Path, verb: str) -> list[list[str]]:
+    return [
+        argv
+        for argv in compose_ops(state_dir)
+        if verb in argv and any(Path(token).name == "proxy.up.json" for token in argv)
+    ]
+
+
 def executed_rows(state_dir: Path) -> list[dict]:
     path = state_dir / "executed.json"
     if not path.exists():
@@ -646,6 +665,60 @@ class DeployEntryTests(unittest.TestCase):
             {"workspace", "computer-use-server", "retention-guard", "documentserver"},
         )
         self.assertNotIn("proxy", starts(self.state))
+        self.assertEqual(restarts(self.state), [])
+        self.assertEqual(proxy_snapshot_ops(self.state, "restart"), [])
+        self.assertEqual(leftover_tmp(self.state), [])
+        self.assert_no_destructive()
+
+    def test_successful_entry_restarts_proxy_after_its_start(self):
+        result = self.up()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
+        self.assertEqual(restarts(self.state), ["proxy"])
+        self.assertEqual([row["stack"] for row in executed_rows(self.state)], ["core", "webui", "proxy"])
+        compose = compose_ops(self.state)
+        proxy_up = proxy_snapshot_ops(self.state, "up")
+        self.assertEqual(len(proxy_up), 1)
+        restart = compose[-1]
+        self.assertEqual(restart[-2:], ["restart", "proxy"])
+        self.assertLess(compose.index(proxy_up[0]), compose.index(restart))
+        prefix = proxy_up[0][: proxy_up[0].index("up")]
+        self.assertEqual(restart[:-2], prefix)
+        self.assertEqual(prefix[2:4], ["-p", self.env["COMPOSE_PROJECT_NAME"]])
+        self.assertEqual(prefix[4], "--project-directory")
+        self.assertEqual(Path(prefix[5]).name, "production-like-test")
+        self.assertEqual(Path(prefix[7]).name, "empty.env")
+        snapshot = Path(prefix[prefix.index("-f") + 1])
+        self.assertEqual(snapshot.name, "proxy.up.json")
+        self.assertEqual(Path(prefix[7]).parent, snapshot.parent)
+        self.assertTrue(snapshot.parent.name.startswith("ocu-deploy-config."))
+        self.assertIn(f"deploy: proxy restarted for {snapshot}", result.stderr.splitlines())
+        self.assertEqual(leftover_tmp(self.state), [])
+        self.assert_no_destructive()
+
+    def test_proxy_restart_failure_fails_entry_and_cleans_temp_files(self):
+        (self.state / "restart-fail-proxy").write_text("1", encoding="utf-8")
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
+        self.assertEqual(restarts(self.state), ["proxy:failed"])
+        restart = proxy_snapshot_ops(self.state, "restart")
+        self.assertEqual(len(restart), 1)
+        snapshot = Path(restart[0][restart[0].index("-f") + 1])
+        self.assertIn(f"deploy: proxy restart failed for {snapshot}", result.stderr.splitlines())
+        self.assertNotIn("deploy: proxy restarted for", result.stderr)
+        self.assertEqual(leftover_tmp(self.state), [])
+        self.assert_no_destructive()
+
+    def test_proxy_start_failure_does_not_restart_proxy(self):
+        (self.state / "up-fail-proxy").write_text("1", encoding="utf-8")
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(starts(self.state), ["core", "webui", "proxy:failed"])
+        self.assertEqual(restarts(self.state), [])
+        self.assertEqual(proxy_snapshot_ops(self.state, "restart"), [])
+        self.assertIn("deploy: compose up failed for", result.stderr)
+        self.assertNotIn("deploy: proxy restart", result.stderr)
         self.assertEqual(leftover_tmp(self.state), [])
         self.assert_no_destructive()
 
@@ -712,8 +785,9 @@ class DeployEntryTests(unittest.TestCase):
 
         children: set[int] = set()
         try:
+            # Later holds (up, restart) arrive past 5 s on slow runners; the wait ends at the marker.
             self.assertTrue(
-                wait_for(lambda: (self.state / entered_name).exists()),
+                wait_for(lambda: (self.state / entered_name).exists(), timeout=30),
                 f"entry never reached {entered_name}",
             )
             private = leftover_tmp(self.state)
@@ -769,6 +843,26 @@ class DeployEntryTests(unittest.TestCase):
 
     def test_int_during_entry_removes_temporary_configs(self):
         self._signal_during_held_up(signal.SIGINT)
+
+    def _signal_during_held_restart(self, sig):
+        self._signal_during_hold(
+            sig,
+            hold_env="FAKE_DOCKER_HOLD_RESTART",
+            entered_name="entered-restart",
+            require_resolved=True,
+            require_snapshots=True,
+        )
+        self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
+        self.assertEqual(restarts(self.state), [])
+
+    def test_term_during_proxy_restart_removes_temporary_configs_and_children(self):
+        self._signal_during_held_restart(signal.SIGTERM)
+
+    def test_int_during_proxy_restart_removes_temporary_configs_and_children(self):
+        self._signal_during_held_restart(signal.SIGINT)
+
+    def test_hup_during_proxy_restart_removes_temporary_configs_and_children(self):
+        self._signal_during_held_restart(signal.SIGHUP)
 
     def test_int_during_config_removes_temporary_configs_and_children(self):
         self._signal_during_hold(
