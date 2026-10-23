@@ -2946,6 +2946,34 @@ recovery_resources.scan_volume = scan_volume_while_a_chat_is_created
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("unsafe symlink", result.stderr)
 
+    def test_verify_and_restore_refuse_non_canonical_workspace_keys(self):
+        backup = self.root / "key-backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        for label, key in (("upper", CHAT_ID.upper()), ("padded", " " + CHAT_ID)):
+            with self.subTest(key=key):
+                copy = self.root / f"key-{label}"
+                shutil.copytree(backup, copy)
+                manifest = json.loads((copy / "recovery.json").read_text(encoding="utf-8"))
+                workspaces = manifest["components"]["workspaces"]
+                workspaces[key] = workspaces.pop(CHAT_ID)
+                (copy / "recovery.json").write_text(json.dumps(manifest), encoding="utf-8")
+                verified = self.run_cli(["verify", "--recovery-set", str(copy)])
+                self.assertNotEqual(verified.returncode, 0)
+                self.assertIn("is not a canonical chat id", verified.stderr)
+                target_state = self._seed_restore_target(f"key-{label}-state")
+                restored = self.run_cli(
+                    ["restore", "--recovery-set", str(copy), "--destination-root",
+                     str(self.root / f"key-{label}-root"), "--provider-file", str(provider)],
+                    extra={"FAKE_DOCKER_STATE": str(target_state)},
+                )
+                self.assertNotEqual(restored.returncode, 0)
+                self.assertIn("is not a canonical chat id", restored.stderr)
+                self.assertFalse((target_state / "volumes.json").exists())
+
     def test_restore_recreates_model_written_links_verbatim(self):
         self._seed_model_links()
         backup = self.root / "model-links-backup"
@@ -2963,6 +2991,13 @@ recovery_resources.scan_volume = scan_volume_while_a_chat_is_created
         )
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertTrue((dest / ".restored").exists())
+        manifest = json.loads((backup / "recovery.json").read_text(encoding="utf-8"))
+        (record,) = manifest["components"]["workspaces"].values()
+        volumes = json.loads((target_state / "volumes.json").read_text(encoding="utf-8"))
+        workspace_volumes = {
+            name for name in volumes if name.startswith("chat-") and name.endswith("-workspace")
+        }
+        self.assertEqual(workspace_volumes, {record["volume"]})
         for root in (
             target_state / "volume-data" / f"chat-{CHAT_ID}-workspace",
             dest / "data" / "chat" / CHAT_ID / "outputs",
