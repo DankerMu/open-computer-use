@@ -377,6 +377,11 @@ def fake_env(state_dir: Path, extra=None):
     })
     env["OCU_SANDBOX_EGRESS_LOCK"] = str(state_dir / "ocu-sandbox-egress.lock")
     env["DOCKER_HOST"] = "unix://" + str(state_dir / "docker.sock")
+    # A non-root runner cannot write stdlib bytecode in the stock image, so
+    # every fake-binary start would recompile it: up.sh then reaches a held
+    # step after a 5 s marker wait expires, and recovery activate exceeds
+    # run_cli's 30 s budget. The cache stays inside the per-test directory.
+    env["PYTHONPYCACHEPREFIX"] = str(state_dir / "pycache")
     if extra:
         env.update(extra)
     return env
