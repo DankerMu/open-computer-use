@@ -688,6 +688,9 @@ recovery_resources.time = SimpleNamespace(
         env["DEPLOY_ROOT"] = str(self.deploy_root)
         env["PYTHONPATH"] = str(self.recovery_pkg) + os.pathsep + env.get("PYTHONPATH", "")
         env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+        # Without this the backup falls back to /root/..., whose exists() raises
+        # PermissionError for a non-root runner. The file is deliberately absent.
+        env["OCU_ADMIN_CREDENTIALS_FILE"] = str(self.root / "admin-credentials.txt")
         if extra:
             env.update(extra)
         env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
@@ -2963,6 +2966,48 @@ class IndexSnapshotTests(unittest.TestCase):
             self.resources._index_snapshot(chat_dir, CHAT_ID),
             {"counter": 3, "active": active, "missing": False},
         )
+
+
+class CursorLagChatIdTests(unittest.TestCase):
+    def setUp(self):
+        import recovery_resources
+
+        self.resources = recovery_resources
+        self.chat_dir = Path("/nonexistent-chat-root")
+
+    def test_path_like_live_chat_id_is_refused_before_reading_host_state(self):
+        def refuse(name):
+            return lambda *args: self.fail(f"{name} called with {args}")
+
+        restored = {
+            "live_chats": ["../x"],
+            "chat_state": [{"chat_id": "../x", "last_seen_revision": 0}],
+        }
+        with patch.object(
+            self.resources, "_index_snapshot", side_effect=refuse("_index_snapshot")
+        ) as snapshot, patch.object(
+            self.resources, "_broker_listing", side_effect=refuse("_broker_listing")
+        ) as listing:
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                self.resources._require_cursor_lag(restored, self.chat_dir, "helper:image")
+        self.assertEqual(str(raised.exception), "invalid chat id '../x'")
+        snapshot.assert_not_called()
+        listing.assert_not_called()
+
+    def test_mixed_case_live_chat_id_is_read_under_its_canonical_id(self):
+        restored = {
+            "live_chats": ["Chat-Mixed"],
+            "chat_state": [{"chat_id": "Chat-Mixed", "last_seen_revision": 2}],
+        }
+        indexed = {"counter": 2, "active": {}, "missing": False}
+        with patch.object(
+            self.resources, "_index_snapshot", return_value=indexed
+        ) as snapshot, patch.object(
+            self.resources, "_broker_listing", return_value={"revision": 2, "files": []}
+        ) as listing:
+            self.resources._require_cursor_lag(restored, self.chat_dir, "helper:image")
+        snapshot.assert_called_once_with(self.chat_dir, "chat-mixed")
+        listing.assert_called_once_with(self.chat_dir, "chat-mixed", "helper:image")
 
 
 if __name__ == "__main__":
