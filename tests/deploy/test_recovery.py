@@ -692,6 +692,10 @@ recovery_resources.time = SimpleNamespace(
         # Without this the backup falls back to /root/..., whose exists() raises
         # PermissionError for a non-root runner. The file is deliberately absent.
         env["OCU_ADMIN_CREDENTIALS_FILE"] = str(self.root / "admin-credentials.txt")
+        # A non-root runner cannot write stdlib bytecode in the stock image, so
+        # each fake-docker start would recompile it and activate would exceed
+        # run_cli's 30 s budget.
+        env["PYTHONPYCACHEPREFIX"] = str(self.root / "pycache")
         if extra:
             env.update(extra)
         env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
