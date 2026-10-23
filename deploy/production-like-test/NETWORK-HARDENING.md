@@ -278,6 +278,52 @@ Re-running `open-webui-init` has side effects:
 - The tool is set back to public-read, and the filter back to active and global.
 - Init signs in with `ADMIN_PASSWORD` from the runtime configuration. Signup is disabled (`ENABLE_SIGNUP=false`), so if the admin password was changed in the UI, init fails without writing the marker. Set the admin password back to the runtime value before step 2; the removal script has the same requirement.
 
+## Tearing down and rebuilding the test deployment
+
+Use this only when a deployment must start from an empty database, for example to prove a fresh bootstrap. It destroys every user, chat, workspace volume and Office version of the selected Compose project. Take a backup first ([BACKUP-RESTORE.md](../BACKUP-RESTORE.md)) if anything must survive. Run every step as root. The networks named by `OCU_PRIVATE_NETWORK` and `OCU_SANDBOX_NETWORK` and the `DOCKER-USER` firewall rules are shared host state: they stay, and the next `deploy/up.sh` reuses them. Below, `PROJECT` is the Compose project (`ocu-test`) and `DEPLOY_ROOT` the current install root.
+
+1. Import the new release next to the current root. `import` refuses an existing install root, so use a new path:
+
+   ```bash
+   python3 deploy/release.py import --delivery <release-dir> --install-root "$DEPLOY_ROOT.next"
+   ```
+
+2. Note the non-secret inputs that `bootstrap-test.sh` needs and the current `runtime.env` already holds: `OCU_WEBUI_ORIGIN`, `OCU_OFFICE_DOCSERVER_ORIGIN`, `ENABLE_OCU_OFFICE_EDIT`, `OCU_SANDBOX_EGRESS_ALLOW`, `OCU_SANDBOX_DNS`, `OCU_PROXY_PORT`, `OCU_OFFICE_PROXY_PORT`, `OCU_PRIVATE_NETWORK`, `OCU_PRIVATE_SUBNET`, `OCU_PRIVATE_GATEWAY`, `OCU_SANDBOX_NETWORK`, `OCU_SANDBOX_SUBNET`, `OCU_SANDBOX_GATEWAY`, `OPENWEBUI_VERSION`. Read them by name; do not print the file, which also holds secrets. Secrets are not carried over: bootstrap generates new ones.
+3. List the deployment's containers and volumes, and keep the exact names:
+
+   ```bash
+   docker ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}'
+   docker ps -a --filter label=managed-by=mcp-computer-use-orchestrator --format '{{.Names}} {{.Label "chat-id"}}'
+   docker volume ls --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Name}}'
+   docker volume ls --format '{{.Name}}' | grep -E '^chat-[0-9a-f-]{36}-workspace$'
+   ```
+
+   Sandboxes (`owui-chat-<chat>`) and workspace volumes (`chat-<chat>-workspace`) are not Compose resources. Keep only those whose chat id has a directory under `$DEPLOY_ROOT/data/chat/`. On a host that runs another deployment, the rest belong to it.
+4. Remove exactly those names, without patterns: `docker rm -f <containers>`, then `docker volume rm <volumes>`. Do not use `docker compose down -v`: it misses the sandboxes and workspace volumes, and it acts on whatever project files the shell points at.
+5. Move the old root and the admin credential file aside. `bootstrap-test.sh` refuses to overwrite either. Then move the new root into place, and carry the operator fonts over when they live under the root (`OCU_OFFICE_FONTS_DIR` defaults to `$DEPLOY_ROOT/data/office-fonts`):
+
+   ```bash
+   mv "$DEPLOY_ROOT" "$DEPLOY_ROOT.before-rebuild"
+   mv /root/ocu-test-openwebui-admin-credentials.txt /root/ocu-test-openwebui-admin-credentials.txt.before-rebuild
+   mv "$DEPLOY_ROOT.next" "$DEPLOY_ROOT"
+   mkdir -p "$DEPLOY_ROOT/data/office-fonts"
+   cp -a "$DEPLOY_ROOT.before-rebuild/data/office-fonts/." "$DEPLOY_ROOT/data/office-fonts/"
+   ```
+
+6. Bootstrap from `$DEPLOY_ROOT/source` with the inputs from step 2 passed by name, in a clean environment so nothing stale leaks in:
+
+   ```bash
+   cd "$DEPLOY_ROOT/source"
+   env -i PATH="$PATH" HOME=/root \
+       SOURCE_SHA="$(git rev-parse HEAD)" OCU_RELEASE_MANIFEST="$DEPLOY_ROOT/release.json" \
+       OCU_OFFICE_FONTS_DIR="$DEPLOY_ROOT/data/office-fonts" <inputs from step 2> \
+       deploy/production-like-test/scripts/bootstrap-test.sh > /dev/null
+   ```
+
+   It writes a new `config/runtime.env` and a new `/root/ocu-test-openwebui-admin-credentials.txt`, both root-only `0600`. Redirect its output: it is the generated configuration.
+7. Load `runtime.env` and the provider key as in the #590 section above, then run `deploy/up.sh` and `deploy/production-like-test/scripts/write-deployed-version.sh`.
+8. Check: `open-webui-init` exited 0 and its `[init]` log lines show the filter, tool and default model were written; `docker ps` shows `computer-use-server`, `open-webui`, `proxy`, `postgres`, `retention-guard` and `documentserver` running; the admin from the new credential file can sign in through `OCU_PROXY_PORT`. Users other than that admin must be created again. Delete `$DEPLOY_ROOT.before-rebuild` and the `.before-rebuild` credential file once the check passes.
+
 ## 已知边界
 
 部署入口在建网之后、启动应用之前核对 sandbox DNS 并安装出站策略：IPv4 经 `DOCKER-USER` 与 `INPUT` 的接口挂钩，且 `FORWARD` 的第一条规则必须是无条件 `-j DOCKER-USER`；IPv6 经 `INPUT` 与 `FORWARD` 默认 DROP。允许列表只豁免本守卫，不绕过后续宿主机策略；control-plane 子网与 metadata `169.254.169.254/32` 即使被宽网段覆盖也仍 DROP。控制面发起的 CDP/ttyd 应答走 conntrack `REPLY`，sandbox 发起的 ORIGINAL 已建立流仍受当前允许列表约束。control-plane 网桥在首次 Compose 启动前可以不存在，安装器此时使用已校验的配置 CIDR；已存在的 control-plane 网仍按 #24 校验。DNS 预检拒绝继承宿主机 nameserver 或不兼容的受保护网桥容器 DNS，但不声称真实数据包隔离；该证据属于 #36。`computer-use-server` 仍挂载 Docker socket，是高权限可信组件。未经授权的直接 OCU 入口不得用作回滚方案。
