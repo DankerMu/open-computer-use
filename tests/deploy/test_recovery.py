@@ -2835,6 +2835,35 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self._assert_helper_policy(runs, "extract", f"chat-{CHAT_ID}-workspace:/target:rw", "verbatim")
         self._assert_helper_policy(runs, "extract", "ocu-test_open-webui-data:/target:rw", "confined")
 
+    def test_workspace_non_utf8_name_backs_up_verifies_and_restores(self):
+        name = b"\xd6\xd0.txt"
+        workspace = os.fsencode(self.state / "volume-data" / f"chat-{CHAT_ID}-workspace")
+        try:
+            with open(os.path.join(workspace, name), "wb") as stream:
+                stream.write(b"gbk\n")
+        except OSError as exc:
+            self.skipTest(f"filesystem refuses non-UTF-8 names: {exc}")
+        backup = self.root / "non-utf8-backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        verified = self.run_cli(["verify", "--recovery-set", str(backup)])
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self._seed_restore_target("non-utf8-state")
+        dest = self.root / "non-utf8-root"
+        restored = self.run_cli(
+            ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+             "--provider-file", str(provider)],
+            extra={"FAKE_DOCKER_STATE": str(target_state)},
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        restored_workspace = os.fsencode(target_state / "volume-data" / f"chat-{CHAT_ID}-workspace")
+        self.assertEqual(sorted(os.listdir(restored_workspace)), sorted([b"README.md", name]))
+        with open(os.path.join(restored_workspace, name), "rb") as stream:
+            self.assertEqual(stream.read(), b"gbk\n")
+
 
 class VolumeHelperFailureTests(unittest.TestCase):
     VOLUME = "ocu-test_open-webui-data"

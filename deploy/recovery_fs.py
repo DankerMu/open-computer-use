@@ -351,7 +351,7 @@ def capture_tree(root: Path, archive: Path, *, links: str) -> dict:
         seen.add(name)
     if _gnu_tar():
         listing = archive.parent / (archive.name + ".list")
-        listing.write_bytes(b"\0".join(name.encode("utf-8") for name in names) + b"\0")
+        listing.write_bytes(b"\0".join(os.fsencode(name) for name in names) + b"\0")
         try:
             _run_tar(
                 [

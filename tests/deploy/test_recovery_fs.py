@@ -29,6 +29,9 @@ MODEL_LINKS = {
     "a/x": "../../outside",
     "x": "..",
 }
+NON_UTF8_FILE = b"\xd6\xd0.txt"
+NON_UTF8_DIR = b"\xb9\xfa"
+NON_UTF8_TARGET = b"\xd6\xd0-target"
 
 
 class RecoveryFilesystemTests(unittest.TestCase):
@@ -524,6 +527,63 @@ class RecoveryFilesystemTests(unittest.TestCase):
     def test_model_links_round_trip_verbatim_with_python_fallback(self):
         with patch.object(recovery_fs, "_gnu_tar", return_value=False):
             self._assert_model_links_round_trip()
+
+    def _non_utf8_source(self) -> Path:
+        source = self.root / "non-utf8"
+        source.mkdir()
+        base = os.fsencode(source)
+        try:
+            with open(os.path.join(base, NON_UTF8_FILE), "wb") as stream:
+                stream.write(b"gbk\n")
+            os.mkdir(os.path.join(base, NON_UTF8_DIR))
+            with open(os.path.join(base, NON_UTF8_DIR, b"inner.txt"), "wb") as stream:
+                stream.write(b"inner\n")
+            os.symlink(NON_UTF8_TARGET, os.path.join(base, b"link"))
+        except OSError as exc:
+            self.skipTest(f"filesystem refuses non-UTF-8 names: {exc}")
+        return source
+
+    def _assert_non_utf8_round_trip(self, *, capture_gnu: bool, extract_gnu: bool):
+        source = self._non_utf8_source()
+        if capture_gnu or extract_gnu:
+            self._require_gnu_tar()
+        archive = self.root / "non-utf8.tar.gz"
+        with ExitStack() as stack:
+            if not capture_gnu:
+                stack.enter_context(patch.object(recovery_fs, "_gnu_tar", return_value=False))
+            recovery_fs.capture_tree(source, archive, links="verbatim")
+        records = {record["name"]: record for record in recovery_fs.validate_archive(archive, links="verbatim")}
+        self.assertEqual(
+            set(records),
+            {".", os.fsdecode(NON_UTF8_FILE), os.fsdecode(NON_UTF8_DIR),
+             os.fsdecode(NON_UTF8_DIR + b"/inner.txt"), "link"},
+        )
+        self.assertEqual(records["link"]["linkname"], os.fsdecode(NON_UTF8_TARGET))
+        dest = self.root / "non-utf8-out"
+        with ExitStack() as stack:
+            if not extract_gnu:
+                stack.enter_context(patch.object(recovery_fs, "_gnu_tar", return_value=False))
+            recovery_fs.extract_tree(archive, dest, links="verbatim")
+        out = os.fsencode(dest)
+        self.assertEqual(sorted(os.listdir(out)), sorted([NON_UTF8_FILE, NON_UTF8_DIR, b"link"]))
+        self.assertEqual(os.listdir(os.path.join(out, NON_UTF8_DIR)), [b"inner.txt"])
+        with open(os.path.join(out, NON_UTF8_FILE), "rb") as stream:
+            self.assertEqual(stream.read(), b"gbk\n")
+        with open(os.path.join(out, NON_UTF8_DIR, b"inner.txt"), "rb") as stream:
+            self.assertEqual(stream.read(), b"inner\n")
+        self.assertEqual(os.readlink(os.path.join(out, b"link")), NON_UTF8_TARGET)
+
+    def test_non_utf8_names_round_trip_with_gnu_tar(self):
+        self._assert_non_utf8_round_trip(capture_gnu=True, extract_gnu=True)
+
+    def test_non_utf8_names_round_trip_with_python_fallback(self):
+        self._assert_non_utf8_round_trip(capture_gnu=False, extract_gnu=False)
+
+    def test_non_utf8_names_gnu_capture_python_extract(self):
+        self._assert_non_utf8_round_trip(capture_gnu=True, extract_gnu=False)
+
+    def test_non_utf8_names_python_capture_gnu_extract(self):
+        self._assert_non_utf8_round_trip(capture_gnu=False, extract_gnu=True)
 
     def _link_target_sentinels(self) -> tuple[Path, dict[str, str], list[Path]]:
         outer = self.root / "outer"
