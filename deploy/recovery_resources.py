@@ -1504,6 +1504,7 @@ def _require_cursor_lag(restored: dict, chat_dir: Path, image: str) -> None:
         chat_id = row["chat_id"]
         if chat_id not in live:
             continue
+        chat_id = recovery.canonical_chat_id(chat_id)
         snapshot = _index_snapshot(chat_dir, chat_id)
         cursor = int(row["last_seen_revision"])
         if snapshot["missing"]:
