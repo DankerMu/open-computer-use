@@ -203,7 +203,7 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 
 支持的归档形式限于经典 Docker `manifest.json`/`repositories` 以及 Moby/containerd 导出的单目标平台 hybrid（`oci-layout` + `index.json` + `manifest.json` + content-addressed blobs）。嵌套 index 与 exporter 添加的 attestation/referrer 必须被显式核算；不支持的 metadata 在 load 前拒绝。
 
-从源码 checkout 根目录配置运行环境后运行 `deploy/up.sh`。入口依次解析 core、WebUI、proxy 三套 Compose 配置为私有临时 JSON，运行 `deploy/check-ports.sh` 与 `deploy/provision-networks.sh`，再通过 `run_owned` 运行 `deploy/check-sandbox-dns.sh`、`deploy/firewall/docker-user-rules.sh` 与 `deploy/firewall/check.sh`，然后用已检查的快照启动 core 和 WebUI，最后启动 proxy。core/WebUI 的项目目录是源码根；proxy 的项目目录是 overlay，以保持 `../proxy` 构建上下文。启动时覆盖 `COMPOSE_REMOVE_ORPHANS=false` 和 `COMPOSE_PROFILES=`，避免拆除共享项目中的兄弟栈或激活 cleanup。nginx 在配置校验时解析 `open-webui:8080`、`computer-use-server:8081` 和 `documentserver:80`，因此三个上游必须先存在。入口监督配置解析、快照冻结、检查、建网、DNS 预检、防火墙安装和启动子进程；TERM/INT/HUP 会结束所属进程组并删除私有临时文件，但不会 `down`、删除卷、迁移网络、刷新共享防火墙链或修改现存 sandbox。
+从源码 checkout 根目录配置运行环境后运行 `deploy/up.sh`。入口依次解析 core、WebUI、proxy 三套 Compose 配置为私有临时 JSON，运行 `deploy/check-ports.sh` 与 `deploy/provision-networks.sh`，再通过 `run_owned` 运行 `deploy/check-sandbox-dns.sh`、`deploy/firewall/docker-user-rules.sh` 与 `deploy/firewall/check.sh`，然后用已检查的快照启动 core 和 WebUI，最后启动 proxy。core/WebUI 的项目目录是源码根；proxy 的项目目录是 overlay，以保持 `../proxy` 构建上下文。启动时覆盖 `COMPOSE_REMOVE_ORPHANS=false` 和 `COMPOSE_PROFILES=`，避免拆除共享项目中的兄弟栈或激活 cleanup。nginx 在配置校验时解析 `open-webui:8080`、`computer-use-server:8081` 和 `documentserver:80`，因此三个上游必须先存在。nginx 只在启动时解析这三个名字，不会跟随后端重建更新地址；旧地址可能已分配给另一个服务（#612）。因此 proxy 启动后，入口再用同一项目、项目目录、env 文件和快照运行 `docker compose … restart proxy`，成功时在 stderr 输出 `deploy: proxy restarted for <proxy 快照>`，失败时输出 `deploy: proxy restart failed for <proxy 快照>` 并以非零退出。每次运行都会重启，包括没有变更的重跑，`${OCU_PROXY_PORT}` 与 `${OCU_OFFICE_PROXY_PORT}` 会短暂中断。在 `up.sh` 之外重建的后端（例如手动 `docker compose up`，或通过恢复激活早于此变更的保留版本，其自带的 `up.sh` 不重启 proxy）需要在已加载 `runtime.env` 的部署 shell 中从源码根手动运行 `docker compose -p "$COMPOSE_PROJECT_NAME" --project-directory deploy/production-like-test --env-file /dev/null -f deploy/production-like-test/compose.proxy.yml restart proxy`。入口监督配置解析、快照冻结、检查、建网、DNS 预检、防火墙安装和启动子进程；TERM/INT/HUP 会结束所属进程组并删除私有临时文件，但不会 `down`、删除卷、迁移网络、刷新共享防火墙链或修改现存 sandbox。
 
 - 只有 proxy 发布两个 TCP 端口：`${OCU_PROXY_PORT}:8082` 和 `${OCU_OFFICE_PROXY_PORT}:8083`。WebUI、Computer Use、DocumentServer、PostgreSQL、initializer 和维护服务不得发布宿主机端口，即使只绑定 loopback 也不允许。
 - 应用服务仅连接由 `${OCU_PRIVATE_NETWORK}` 命名、`${OCU_PRIVATE_SUBNET}` 与 `${OCU_PRIVATE_GATEWAY}` 定址的 control-plane bridge；proxy 通过同一 bridge 的 Docker DNS 找到应用。显式 `network_mode`（包括 `bridge`）不得代替该命名网。
@@ -234,7 +234,7 @@ set -a; . "$provider_env"; set +a
 
 The WebUI overlay interpolates `${DMXAPI_API_KEY}` without a required-value check, so a shell without it starts `open-webui` with an empty provider key.
 
-1. Deploy the new release with `deploy/up.sh` as usual. `BYPASS_MODEL_ACCESS_CONTROL` is now live; `open-webui-init` still finds the marker and skips.
+1. Deploy the new release with `deploy/up.sh` as usual. It starts the proxy last and then restarts it, so nginx resolves `open-webui`, `computer-use-server` and `documentserver` to the containers this run recreated. `BYPASS_MODEL_ACCESS_CONTROL` is now live; `open-webui-init` still finds the marker and skips.
 2. Delete the marker, then re-run `open-webui-init`:
 
    ```bash

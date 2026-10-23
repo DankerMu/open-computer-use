@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
-# Resolve privately, preflight, provision, start upstream applications then proxy.
+# Resolve privately, preflight, provision, start upstream applications, then start and restart proxy.
 set -euo pipefail
 set -m
 umask 077
@@ -298,3 +298,10 @@ start_stack() {
 start_stack "$ROOT" "$CONFIG_DIR/core.up.json"
 start_stack "$ROOT" "$CONFIG_DIR/webui.up.json"
 start_stack "$OVERLAY" "$CONFIG_DIR/proxy.up.json"
+# nginx resolves its upstreams only at start; re-resolve against this run's backends.
+if ! run_owned docker compose -p "$PROJECT" --project-directory "$OVERLAY" \
+    --env-file "$CONFIG_DIR/empty.env" -f "$CONFIG_DIR/proxy.up.json" restart proxy; then
+    printf '%s\n' "deploy: proxy restart failed for ${CONFIG_DIR}/proxy.up.json" >&2
+    exit 1
+fi
+printf '%s\n' "deploy: proxy restarted for ${CONFIG_DIR}/proxy.up.json" >&2
