@@ -539,7 +539,8 @@ def _scan_before_quiesce(identity: dict, image: str, chats: set[str]) -> None:
     scan_volume(identity["webui_volume"], image, links=LINK_POLICY["webui-data"])
     if not _volume_has_marker(identity["webui_volume"], image):
         raise RecoveryError("WebUI initializer marker is missing from the data volume")
-    for _chat_id, volume in sorted(discover_workspace_volumes(chats).items()):
+    # Re-read the chat directories: a chat created during the scans above owns its new volume.
+    for _chat_id, volume in sorted(discover_workspace_volumes(chats | _host_chats(identity)).items()):
         scan_volume(volume, image, links=LINK_POLICY["workspaces"])
 
 

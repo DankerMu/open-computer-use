@@ -25,11 +25,12 @@ many members or bytes, a symlink the policy refuses, and a second name inside th
 tree for one symlink. It also requires the WebUI initializer marker and refuses an
 unattributable workspace volume. Any refusal fails the backup with every service
 still running: no container is stopped, DocumentServer gets no shutdown command, and
-no stage is created. An entry deleted while the running tree is scanned is skipped.
-The capture after quiesce repeats every check. A tree that changes between the scan
-and the stop, Python-fallback extended-attribute or ACL refusals, and failures the
-scan cannot predict, such as a full disk, still fail after the stop and leave the
-stack stopped, as described below.
+no stage is created. The host scan opens each directory relative to its parent and
+never follows a link; an entry deleted, or a directory replaced, while the running
+tree is scanned is skipped. The capture after quiesce repeats every check. A tree
+that changes between the scan and the stop, Python-fallback extended-attribute or
+ACL refusals, and failures the scan cannot predict, such as a full disk, still fail
+after the stop and leave the stack stopped, as described below.
 
 1. Stop the proxy to close browser admission to WebUI, OCU and DocumentServer.
 2. Run `/usr/bin/documentserver-prepare4shutdown.sh` inside DocumentServer while

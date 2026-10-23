@@ -110,15 +110,14 @@ def _symlink_target_allowed(member_name: str, target: str, links: str) -> bool:
 
 
 def _vanished(exc: OSError, live: bool) -> bool:
-    return live and exc.errno in (errno.ENOENT, errno.ENOTDIR)
+    # ELOOP: an O_NOFOLLOW directory open met a link that replaced the directory.
+    return live and exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
 
 
-def _lstat(path: Path, *, live: bool = False):
+def _lstat(path: Path):
     try:
         return path.lstat()
     except OSError as exc:
-        if _vanished(exc, live):
-            return None
         raise RecoveryError(f"cannot inspect {path}: {exc}") from exc
 
 
@@ -314,27 +313,87 @@ def _python_extract(archive: Path, dest: Path, members: list[tarfile.TarInfo]) -
             _apply_metadata(target, member)
 
 
-def _walk_tree(root: Path, *, live: bool = False) -> list[tuple[Path, str, os.stat_result]]:
-    stack = [root]
-    rows: list[tuple[Path, str, os.stat_result]] = []
-    while stack:
-        current = stack.pop()
-        info = _lstat(current, live=live)
-        if info is None:
-            continue
-        relative = "." if current == root else confined_relative(root, current)
-        if _is_unsupported_type(info.st_mode):
-            fail(f"{current}: unsupported file type")
-        rows.append((current, relative, info))
-        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-            try:
-                names = sorted(os.listdir(current), reverse=True)
-            except OSError as cop:
-                if _vanished(cop, live):
-                    continue
-                raise RecoveryError(f"cannot list {current}: {cop}") from cop
-            for name in names:
-                stack.append(current / name)
+WalkRow = tuple[Path, str, os.stat_result, str | None]
+
+
+def _open_directory(name, dir_fd: int | None, path: Path, info: os.stat_result, *, live: bool):
+    """Open the directory just lstat-ed as name below dir_fd; None if it vanished or was swapped live."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError as cop:
+        if _vanished(cop, live):
+            return None
+        raise RecoveryError(f"cannot list {path}: {cop}") from cop
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino):
+            return fd, sorted(os.listdir(fd))
+    except OSError as cop:
+        os.close(fd)
+        if _vanished(cop, live):
+            return None
+        raise RecoveryError(f"cannot list {path}: {cop}") from cop
+    except BaseException:
+        os.close(fd)
+        raise
+    os.close(fd)
+    if live:
+        return None
+    fail(f"cannot list {path}: directory changed during the walk")
+
+
+def _walk_entry(root: Path, name, dir_fd: int | None, path: Path, rows: list[WalkRow],
+                frames: list, *, live: bool) -> None:
+    try:
+        info = os.lstat(name, dir_fd=dir_fd)
+    except OSError as cop:
+        if _vanished(cop, live):
+            return
+        raise RecoveryError(f"cannot inspect {path}: {cop}") from cop
+    relative = "." if dir_fd is None else confined_relative(root, path)
+    if _is_unsupported_type(info.st_mode):
+        fail(f"{path}: unsupported file type")
+    target = None
+    opened = None
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            target = os.readlink(name, dir_fd=dir_fd)
+        except OSError as cop:
+            if _vanished(cop, live):
+                return
+            raise RecoveryError(f"cannot read link {path}: {cop}") from cop
+    elif stat.S_ISDIR(info.st_mode):
+        opened = _open_directory(name, dir_fd, path, info, live=live)
+        if opened is None:
+            return
+    rows.append((path, relative, info, target))
+    if opened is not None:
+        frames.append((opened[0], path, iter(opened[1])))
+    if len(rows) > MAX_ARCHIVE_MEMBERS:
+        fail(f"{root}: archive member limit exceeded")
+
+
+def _walk_tree(root: Path, *, live: bool = False) -> list[WalkRow]:
+    """Preorder walk by directory fd: no path is resolved through a link (#608).
+
+    Each directory is opened O_NOFOLLOW relative to its parent and must be the inode just
+    lstat-ed. Rows are (path, relative, lstat, link target or None), children in name order.
+    """
+    rows: list[WalkRow] = []
+    frames: list = []
+    try:
+        _walk_entry(root, root, None, root, rows, frames, live=live)
+        while frames:
+            dir_fd, directory, names = frames[-1]
+            name = next(names, None)
+            if name is None:
+                frames.pop()
+                os.close(dir_fd)
+                continue
+            _walk_entry(root, name, dir_fd, directory / name, rows, frames, live=live)
+    finally:
+        for dir_fd, _directory, _names in frames:
+            os.close(dir_fd)
     return rows
 
 
@@ -349,25 +408,17 @@ def scan_tree(root: Path, *, links: str, live: bool = False) -> list[tuple[Path,
     root_info = _lstat(root)
     if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
         fail(f"{root}: capture root must be a directory")
-    rows = _walk_tree(root, live=live)
-    if len(rows) > MAX_ARCHIVE_MEMBERS:
-        fail(f"{root}: archive member limit exceeded")
+    walked = _walk_tree(root, live=live)
     seen: set[str] = set()
     symlinks: dict[tuple[int, int], str] = {}
     files: set[tuple[int, int]] = set()
     total = 0
-    for path, relative, info in rows:
+    for path, relative, info, target in walked:
         if relative in seen:
             fail(f"{root}: duplicate member {relative}")
         seen.add(relative)
         key = (info.st_dev, info.st_ino)
-        if stat.S_ISLNK(info.st_mode):
-            try:
-                target = os.readlink(path)
-            except OSError as cop:
-                if _vanished(cop, live):
-                    continue
-                raise RecoveryError(f"cannot read link {path}: {cop}") from cop
+        if target is not None:
             if not _symlink_target_allowed(relative, target, links):
                 fail(f"{path}: unsafe symlink")
             # GNU tar archives a second in-tree name as a hardlink, which validation refuses.
@@ -379,11 +430,11 @@ def scan_tree(root: Path, *, links: str, live: bool = False) -> list[tuple[Path,
             total += info.st_size
             if total > MAX_ARCHIVE_BYTES:
                 fail(f"{root}: archive size limit exceeded")
-    return rows
+    return [(path, relative, info) for path, relative, info, _target in walked]
 
 
 def capture_tree(root: Path, archive: Path, *, links: str) -> dict:
-    rows = scan_tree(root, links=links)
+    rows = scan_tree(root, links=links, live=False)
     archive.parent.mkdir(parents=True, exist_ok=True)
     names = [relative for _path, relative, _info in rows]
     if _gnu_tar():
@@ -582,7 +633,7 @@ def extract_tree(archive: Path, dest: Path, *, links: str) -> None:
         _apply_archive_root_metadata(dest, members)
     else:
         _python_extract(archive, dest, members)
-    restored = {relative for _path, relative, _info in _walk_tree(dest)}
+    restored = {row[1] for row in _walk_tree(dest)}
     expected = {record["name"] for record in validate_archive(archive, links=links)}
     if not expected.issubset(restored):
         fail(f"{archive}: extraction omitted members")

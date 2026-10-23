@@ -2869,6 +2869,44 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
             dest, "WebUI initializer marker is missing", scanned=["ocu-test_open-webui-data"]
         )
 
+    def test_chat_created_during_pre_quiesce_scan_is_attributed(self):
+        new_chat = "chat-created-mid-scan"
+        volume = f"chat-{new_chat}-workspace"
+        mount = self.state / "volume-data" / volume
+        # A user opens a chat after host_chats is read but before the scan discovers
+        # workspace volumes: its directory and workspace volume appear in that window.
+        injection = f"""
+import json
+from pathlib import Path
+import recovery_resources
+_real_scan_volume = recovery_resources.scan_volume
+def scan_volume_while_a_chat_is_created(*args, **kwargs):
+    outputs = Path({str(self.chat_dir / new_chat / "outputs")!r})
+    if not outputs.exists():
+        outputs.mkdir(parents=True)
+        mount = Path({str(mount)!r})
+        mount.mkdir(parents=True)
+        (mount / "README.md").write_bytes(b"new-sandbox-home\\n")
+        registry = Path({str(self.state / "volumes.json")!r})
+        volumes = json.loads(registry.read_text(encoding="utf-8"))
+        volumes[{volume!r}] = {{"Name": {volume!r}, "Mountpoint": str(mount)}}
+        registry.write_text(json.dumps(volumes), encoding="utf-8")
+    return _real_scan_volume(*args, **kwargs)
+recovery_resources.scan_volume = scan_volume_while_a_chat_is_created
+"""
+        marker = "runpy.run_module('recovery', run_name='__main__')"
+        self.launcher.write_text(self.launcher.read_text().replace(marker, injection + "\n" + marker))
+        dest = self.root / "backup-chat-created-mid-scan"
+        result = self._backup(dest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.chat_dir / new_chat / "outputs").is_dir())
+        self.assertTrue((dest / "recovery.json").is_file())
+        self.assertTrue((dest / "workspaces" / f"{new_chat}.tar.gz").is_file())
+        self._assert_scan_runs(
+            self._helper_runs(self.state),
+            ["ocu-test_open-webui-data", f"chat-{CHAT_ID}-workspace", volume],
+        )
+
     def _add_link_member(self, archive, name, target):
         with tarfile.open(archive, "r:*") as bundle:
             members = bundle.getmembers()
