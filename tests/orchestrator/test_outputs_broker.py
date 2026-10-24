@@ -2429,6 +2429,41 @@ def test_validator_requires_null_hash_exactly_for_unsupported_paths(world):
         assert _index(data).read_bytes() == encoded
 
 
+@pytest.mark.parametrize(
+    "raw_relative",
+    (b"report\\final.docx", b"bad\xff.docx", b"dir\xfe/a.docx"),
+    ids=("backslash", "non-utf8-file", "non-utf8-directory"),
+)
+def test_register_host_write_refuses_unsupported_name_before_any_read(world, monkeypatch, raw_relative):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    _put(data, "keep.docx", b"keep")
+    broker.reconcile(CHAT)
+    before = _index(data).read_bytes()
+    outputs = os.fsencode(_outputs(data))
+    parent, _, _name = raw_relative.rpartition(b"/")
+    try:
+        if parent:
+            os.mkdir(outputs + b"/" + parent)
+        fd = os.open(outputs + b"/" + raw_relative, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        guarded = []  # macOS APFS refuses the name; the refusal must not depend on the file
+    else:
+        os.write(fd, b"bytes that must never be read")
+        os.close(fd)
+        guarded = [Path(os.fsdecode(outputs + b"/" + raw_relative))]
+    hashed = _spy_hashes(broker_module, monkeypatch)
+    _forbid_inode_open(broker_module, monkeypatch, *guarded)
+
+    with pytest.raises(broker_module.UnsupportedNameError):
+        broker.register_host_write(CHAT, os.fsdecode(raw_relative))
+
+    assert hashed == []
+    assert _index(data).read_bytes() == before
+
+
 # The README's per-chat finder, verbatim, run where outputs_broker imports.
 _README_UNSUPPORTED_FINDER = """import glob, json, os, sys
 from outputs_broker import _unsupported

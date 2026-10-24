@@ -774,6 +774,36 @@ def test_listing_marks_unsupported_names_without_url_and_keeps_etag_stable(
         assert unchanged.status_code == 304
 
 
+def test_oversized_file_with_unsupported_name_is_not_marked_too_large(tmp_path, monkeypatch):
+    with _isolated_app(tmp_path) as (loaded, _docker_manager, broker_module, data):
+        limit = 8
+        _put(data, "small.txt", b"small")
+        _put(data, "big.txt", b"over the limit")
+        _put(data, "report\\big.html", b"over the limit")
+        monkeypatch.setattr(loaded, "_OUTPUTS_BROKER", broker_module.OutputsBroker(max_file_size=limit))
+        http = _client(loaded)
+
+        first = http.get(_list_url(), headers=_auth())
+        second = http.get(_list_url(), headers=_auth())
+
+        assert first.status_code == 200, first.text
+        files = _by_path(first.json())
+        entry = files["report\\big.html"]
+        assert entry["size"] > limit
+        assert entry["unsupported_name"] is True
+        assert entry["too_large"] is False
+        assert entry["hash"] is None
+        assert entry["url"] is None
+        assert files["big.txt"]["too_large"] is True
+        assert files["big.txt"]["unsupported_name"] is False
+        assert files["small.txt"]["too_large"] is False
+        assert second.status_code == 200, second.text
+        assert second.headers["ETag"] == first.headers["ETag"]
+        persisted = json.loads(_index(data).read_bytes())
+        assert persisted["active"]["report\\big.html"]["hash"] is None
+        assert broker_module.OutputsBroker(max_file_size=limit)._read_index(CHAT) == persisted
+
+
 def test_listing_index_limit_with_oversized_file_is_413_without_index_write(tmp_path, monkeypatch):
     with _isolated_app(tmp_path) as (loaded, _docker_manager, broker_module, data):
         _put(data, "keep.txt", b"keep")

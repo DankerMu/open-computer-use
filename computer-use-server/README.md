@@ -42,9 +42,10 @@ without a scan or index create. Broker defaults remain 100 items per page
 A regular file over the per-file limit does not fail the listing. It becomes
 an index entry with `hash: null`: it gets a `file_id` and revision events like
 any other entry, still counts toward the active-file limit, and its bytes are
-never read. The listing reports it with `too_large: true`; every other entry
-has `too_large: false`. Oversized entries have no content fingerprint, so a
-moved oversized file gets a new `file_id` and the old one is tombstoned.
+never read. The listing reports it with `too_large: true` unless its name is
+unsupported (below); every other entry has `too_large: false`. Oversized
+entries have no content fingerprint, so a moved oversized file gets a new
+`file_id` and the old one is tombstoned.
 Crossing the limit in either direction is a size change that keeps the
 `file_id`. Registering a host write over the limit (Office publish) and every
 other bound still fail with 413. The preview page never auto-selects a
@@ -85,13 +86,14 @@ stays even after the file is deleted or renamed, and an older image rejects
 the index as corrupt (500) on every listing of that chat: an image without
 oversized-file support rejects `hash: null`, and an image without
 unsupported-name support rejects the path. A recovery set holding such an
-index is therefore not a valid previous-release rollback candidate; restoring
-it onto such a release fails that release's broker check before `.restored`.
-Stay on the new image, or restore a pre-change `index.json` for each affected
-chat from a backup, losing the revisions and file_ids created after it. Roll
-back the WebUI fork first, then OCU. To find affected chats, with `<chat_dir>`
-set to `BASE_DATA_DIR` (the index is compact JSON; this matches oversized and
-unsupported entries alike):
+index is therefore not a valid previous-release rollback candidate. Restored
+onto such a release, it fails that release's broker check before `.restored`
+only when the affected chat is live with an `ocu_chat_state` cursor; any other
+affected chat fails on its first listing. Stay on the new image, or restore a
+pre-change `index.json` for each affected chat from a backup, losing the
+revisions and file_ids created after it. Roll back the WebUI fork first, then
+OCU. To find affected chats, with `<chat_dir>` set to `BASE_DATA_DIR` (the
+index is compact JSON; this matches oversized and unsupported entries alike):
 
 ```bash
 grep -l '"hash":null' <chat_dir>/*/.ocu/index.json
