@@ -911,6 +911,23 @@ async function run() {
       keptRefresh: api.applyListingSelection([{ ...big, revision: 8 }, small], big, null, true),
     };
   }
+  if (scenario === 'unsupported-selection') {
+    const odd = { file_id: 'odd', path: 'bad\\xff.html', revision: 5, type: 'html', too_large: false,
+      unsupported_name: true, url: null };
+    const oddDocx = { file_id: 'odddocx', path: 'report\\final.docx', revision: 6, type: 'docx', too_large: false,
+      unsupported_name: true, url: null };
+    const small = { file_id: 'small', path: 'small.txt', revision: 4, type: 'text', too_large: false,
+      unsupported_name: false, url: '/ocu/files/chat/small.txt' };
+    const fresh = new Map();
+    return {
+      autoSkips: api.pickAutoSelect([odd, small], fresh),
+      autoOnlyUnsupported: api.pickAutoSelect([odd, oddDocx], fresh),
+      fallbackSkips: api.applyListingSelection([odd, oddDocx, small], null, null, false),
+      fallbackOnlyUnsupported: api.applyListingSelection([odd, oddDocx], null, null, false),
+      directTarget: api.applyListingSelection([odd, small], null, odd, false),
+      keptExplicit: api.applyListingSelection([odd, small], odd, small, true),
+    };
+  }
   if (scenario === 'stale-cursor') {
     let hits = 0;
     context.__respond = async (url) => {
@@ -1136,6 +1153,16 @@ def test_auto_selection_skips_too_large_files_but_keeps_an_explicit_choice(tmp_p
     assert recorded["keptRefresh"]["revision"] == 8
 
 
+def test_auto_selection_skips_unsupported_names_but_keeps_an_explicit_choice(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "unsupported-selection")
+    assert recorded["autoSkips"]["path"] == "small.txt"
+    assert recorded["autoOnlyUnsupported"] is None
+    assert recorded["fallbackSkips"]["path"] == "small.txt"
+    assert recorded["fallbackOnlyUnsupported"] is None
+    assert recorded["directTarget"]["path"] == "small.txt"
+    assert recorded["keptExplicit"]["file_id"] == "odd"
+
+
 _PREVIEW_RENDER_HARNESS = r"""
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -1259,6 +1286,66 @@ def test_too_large_selection_renders_download_fallback_without_fetching(tmp_path
     assert recorded["scripts"] == []
     # Control: the same harness observes the fetch a normal HTML preview makes.
     assert small["fetches"] == ["/ocu/files/chat/small.html"]
+
+
+UNSUPPORTED_NAME_TEXT = "This file name cannot be opened here. Rename it in the terminal to open or download it."
+
+
+def test_unsupported_name_selection_renders_reason_without_link_or_fetch(tmp_path):
+    if not NODE:
+        pytest.fail("node is required for preview render tests; install Node 22 or set OCU_TEST_NODE")
+    harness = tmp_path / "preview_render_harness.mjs"
+    harness.write_text(_PREVIEW_RENDER_HARNESS)
+    unsupported = [
+        {"name": name, "path": name, "type": file_type, "too_large": False, "unsupported_name": True,
+         "size": 7, "url": None, "revision": 1}
+        for name, file_type in (
+            ("bad\\xff.html", "html"), ("report\\final.docx", "docx"),
+            ("photo\\xfe.png", "image"), ("notes\\xfd.txt", "text"), ("clip\\xfc.mp4", "video"),
+        )
+    ]
+    control = {"name": "small.html", "path": "small.html", "type": "html", "too_large": False,
+               "unsupported_name": False, "size": 5, "url": "/ocu/files/chat/small.html", "revision": 1}
+    completed = subprocess.run(
+        [
+            NODE,
+            "--experimental-vm-modules",
+            str(harness),
+            str(SERVER_DIR / "static") + "/",
+            "https://webui.example/ocu/static/preview.js",
+            json.dumps([*unsupported, control]),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    recorded = json.loads(completed.stdout)
+    *rendered, small = recorded["results"]
+    assert len(rendered) == len(unsupported)
+    for result, file in zip(rendered, unsupported):
+        assert result["fetches"] == [], result
+        assert result["failed"] is None, result
+        assert 'class="download-prompt"' in result["html"]
+        assert file["name"] in result["html"]
+        assert UNSUPPORTED_NAME_TEXT in result["html"]
+        assert "<a" not in result["html"]
+        assert "href" not in result["html"]
+        assert "null" not in result["html"]
+        assert "src=" not in result["html"]
+    assert recorded["scripts"] == []
+    assert small["fetches"] == ["/ocu/files/chat/small.html"]
+
+
+def test_toolbar_download_link_is_withheld_for_unsupported_names():
+    # The toolbar is a Preact component the Node harness does not render; its
+    # only per-file anchor must sit behind the unsupported-name guard.
+    source = (SERVER_DIR / "static" / "preview.js").read_text(encoding="utf-8")
+    assert source.count("?download=1") == 1
+    before = source[:source.index("?download=1")]
+    opener = before.rindex("&& html`")
+    guard = before[before.rindex("${", 0, opener):opener]
+    assert "selectedFile.unsupported_name !== true" in guard, guard
 
 
 def test_listing_body_parse_failure_does_not_commit_partial_page(tmp_path):

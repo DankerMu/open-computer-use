@@ -89,6 +89,7 @@ export const TRANSLATIONS = {
     load_fail: 'Не удалось загрузить файл',
     loading: 'Загрузка...',
     download: 'Скачать',
+    unsupported_name: 'Это имя файла нельзя открыть здесь. Переименуйте файл в терминале, чтобы открыть или скачать его.',
     audio_unsupported: 'Ваш браузер не поддерживает аудио.',
     video_unsupported: 'Ваш браузер не поддерживает видео.',
 
@@ -193,6 +194,7 @@ export const TRANSLATIONS = {
     load_fail: 'Failed to load file',
     loading: 'Loading...',
     download: 'Download',
+    unsupported_name: 'This file name cannot be opened here. Rename it in the terminal to open or download it.',
     audio_unsupported: 'Your browser does not support audio.',
     video_unsupported: 'Your browser does not support video.',
 

@@ -347,7 +347,7 @@ def test_resolved_conflict_uses_publication_state_not_sticky_dirty(tmp_path):
 @pytest.mark.parametrize(("status", "reason"), [
     (404, "unknown_file"), (415, "unsupported_type"), (413, "file_too_large"),
     (422, "unsafe_path"), (422, "corrupt_document"), (503, "storage_low"),
-    (409, "unpublished_version"),
+    (409, "unpublished_version"), (422, "unsupported_name"),
 ])
 def test_admission_refusal_is_final_without_a_session(tmp_path, status, reason):
     result = _run(tmp_path, open=True, refusal={"status": status, "reason": reason},

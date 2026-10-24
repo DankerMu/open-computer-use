@@ -9,7 +9,7 @@ const FINAL_STATES = new Set(['closed', 'error', 'orphaned']);
 const REFUSALS = new Map([
   ['unknown_file', 404], ['unsupported_type', 415], ['file_too_large', 413],
   ['unsafe_path', 422], ['corrupt_document', 422], ['storage_low', 503],
-  ['unpublished_version', 409],
+  ['unpublished_version', 409], ['unsupported_name', 422],
 ]);
 // A stalled API script must become a visible failure instead of leaving opening forever.
 const API_LOAD_TIMEOUT_MS = 10000;

@@ -42,39 +42,73 @@ without a scan or index create. Broker defaults remain 100 items per page
 A regular file over the per-file limit does not fail the listing. It becomes
 an index entry with `hash: null`: it gets a `file_id` and revision events like
 any other entry, still counts toward the active-file limit, and its bytes are
-never read. The listing reports it with `too_large: true`; every other entry
-has `too_large: false`. Oversized entries have no content fingerprint, so a
-moved oversized file gets a new `file_id` and the old one is tombstoned.
+never read. The listing reports it with `too_large: true` unless its name is
+unsupported (below); every other entry has `too_large: false`. Oversized
+entries have no content fingerprint, so a moved oversized file gets a new
+`file_id` and the old one is tombstoned.
 Crossing the limit in either direction is a size change that keeps the
 `file_id`. Registering a host write over the limit (Office publish) and every
 other bound still fail with 413. The preview page never auto-selects a
 too-large file and shows only its download link.
 
-Once a chat has indexed an oversized file, rolling OCU back is one-way for
-that chat. Tombstones are never pruned, so the `hash: null` record stays even
-after the file is deleted, and an older image rejects the index as corrupt
-(500) on every listing of that chat. A recovery set holding such an index is
-therefore not a valid previous-release rollback candidate. Stay on the new
-image, or restore a pre-change `index.json` for each affected chat from a
-backup, losing the revisions and file_ids created after it. Roll back the
-WebUI fork first, then OCU. To find affected chats, with `<chat_dir>` set to
-`BASE_DATA_DIR` (the index is compact JSON):
+A path with a segment that is not valid UTF-8, or that contains a backslash,
+is an unsupported name; hidden names are still skipped first. It does not fail
+the listing either. Links and special files with such a name are skipped like
+any other, directories are descended, and a regular file becomes a
+`hash: null` entry treated like an oversized one: its own `file_id`, revision
+events, a place in the active-file count, no fingerprint (a moved file gets a
+new `file_id`), and its bytes are never read. The listing reports it with
+`unsupported_name: true`, `url: null`, `too_large: false`, and `path` and
+`name` in a display form where each undecodable byte reads `\xNN`; every other
+entry has `unsupported_name: false` and a URL. The index keeps the real name,
+with each undecodable byte as a `\udcXX` escape in ASCII JSON. Office refuses
+the file with 422 `unsupported_name`. The zip archive leaves it out, including
+backslash-named files that earlier releases packed, and returns 404 when a chat
+holds only such files. The preview page never auto-selects it and shows no
+download link. Rename the file in the terminal to open, download or archive
+it. The listing's `unsupported_name: true` finds such files; to list them per
+chat from the index, run this in the OCU server container, whose working
+directory holds `outputs_broker.py`, with `<chat_dir>` set to `BASE_DATA_DIR`;
+it prints each index and the listing's display path:
+
+```bash
+python3 -c 'import glob, json, os, sys
+from outputs_broker import _unsupported
+for index in sorted(glob.glob(sys.argv[1] + "/*/.ocu/index.json")):
+    for path in json.load(open(index))["active"]:
+        if _unsupported(path):
+            print(index, os.fsencode(path).decode("utf-8", "backslashreplace"))' <chat_dir>
+```
+
+Once a chat has indexed an oversized file or an unsupported name, rolling OCU
+back is one-way for that chat. Tombstones are never pruned, so the record
+stays even after the file is deleted or renamed, and an older image rejects
+the index as corrupt (500) on every listing of that chat: an image without
+oversized-file support rejects `hash: null`, and an image without
+unsupported-name support rejects the path. A recovery set holding such an
+index is therefore not a valid previous-release rollback candidate. Restored
+onto such a release, it fails that release's broker check before `.restored`
+only when the affected chat is live with an `ocu_chat_state` cursor; any other
+affected chat fails on its first listing. Stay on the new image, or restore a
+pre-change `index.json` for each affected chat from a backup, losing the
+revisions and file_ids created after it. Roll back the WebUI fork first, then
+OCU. To find affected chats, with `<chat_dir>` set to `BASE_DATA_DIR` (the
+index is compact JSON; this matches oversized and unsupported entries alike):
 
 ```bash
 grep -l '"hash":null' <chat_dir>/*/.ocu/index.json
 ```
 
 Raising the per-file limit later needs a one-time rehash of null-hash entries
-below the new limit, because the validator rejects a null hash on a file
-within the limit.
+with supported names below the new limit, because the validator rejects a null
+hash on such a file within the limit. Unsupported entries keep `hash: null` at
+any size.
 
 Polling cannot detect a same-size in-place edit or a delete/recreate completed
 between reconciliations. A stale cached hash after the former can also prevent
 continuity from being recognised on a later rename. A missing outputs root is
 empty only on first use or with no active entries; if active identities already
-exist, reconciliation fails retryably and preserves the index. Live names that
-cannot be persisted as relative POSIX paths fail explicitly rather than being
-rewritten as a corrupt index.
+exist, reconciliation fails retryably and preserves the index.
 
 ### Office save and callback publication
 

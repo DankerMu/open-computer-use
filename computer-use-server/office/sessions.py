@@ -18,7 +18,7 @@ import docker_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from descriptor_io import CommittedCloseError
-from outputs_broker import CorruptIndexError, FileIdNotFoundError, OutputsBroker, OutputsBrokerError
+from outputs_broker import CorruptIndexError, FileIdNotFoundError, OutputsBroker, OutputsBrokerError, _unsupported
 
 from . import commands, config, epoch, notice, ooxml, tokens, versions
 from .epoch import RestoreEpochError
@@ -70,6 +70,13 @@ class UnsupportedTypeError(ValueError):
         super().__init__("file name is not a supported Office type")
 
 
+class UnsupportedNameAdmissionError(ValueError):
+    reason = "unsupported_name"
+
+    def __init__(self) -> None:
+        super().__init__("file name cannot be opened (not UTF-8 or contains a backslash)")
+
+
 class SessionNotEditingError(RuntimeError):
     reason = "session_not_editing"
 
@@ -97,6 +104,8 @@ async def create_session(request: Request) -> JSONResponse:
         return _error(404, "unknown_file")
     except UnsupportedTypeError:
         return _error(415, "unsupported_type")
+    except UnsupportedNameAdmissionError:
+        return _error(422, "unsupported_name")
     except ooxml.CorruptDocumentError:
         return _error(422, "corrupt_document")
     except UnsafePathError:
@@ -198,6 +207,9 @@ def _create_session(
     store._assert_chat_root_safe(chat, allow_missing=True)
     def admit():
         relative_path = broker.resolve_file_id(chat, file_id)
+        # Refused before any content read, like an oversized or wrong-type file.
+        if _unsupported(relative_path):
+            raise UnsupportedNameAdmissionError()
         if _document_type(relative_path) is None:
             raise UnsupportedTypeError()
 
