@@ -34,7 +34,7 @@ from tests.orchestrator.test_office_ooxml import (
 )
 from tests.orchestrator.test_office_router import OFFICE_SETTINGS, _office_app
 from tests.orchestrator.test_office_workspace import _forbid_inode_open
-from tests.orchestrator.test_outputs_endpoint import CHAT, CHAT_B, INTERNAL, MCP_KEY, _auth
+from tests.orchestrator.test_outputs_endpoint import CHAT, CHAT_B, INTERNAL, MCP_KEY, _auth, _put_raw
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 JWT_SECRET = OFFICE_SETTINGS["OCU_OFFICE_JWT_SECRET"]
@@ -228,6 +228,34 @@ def test_unsupported_extensions_are_unsupported_type(office_world, name, body):
     downloaded = http.get(f"/files/{CHAT}/{name}", headers=_auth())
     assert downloaded.status_code == 200
     assert downloaded.content == body
+    assert origin.hits == 0
+
+
+@pytest.mark.parametrize(
+    "raw_name", (b"report\\final.docx", b"bad\xff.docx"), ids=("backslash", "non-utf8"),
+)
+def test_unsupported_name_docx_is_refused_without_reading(office_world, monkeypatch, raw_name):
+    http, data, origin, _docker_manager, broker_module = office_world
+    import office.workspace as workspace_mod
+
+    _put_raw(data, raw_name, intact_docx())
+    file_id = _index_file(broker_module, data, os.fsdecode(raw_name))
+    identity = os.stat(os.fsencode(_outputs(data)) + b"/" + raw_name)
+    reads = {"count": 0}
+    original_read = workspace_mod.os.read
+
+    def count_read(fd, size):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            reads["count"] += 1
+        return original_read(fd, size)
+
+    monkeypatch.setattr(workspace_mod.os, "read", count_read)
+    _seed_refusal_history()
+    before = _snapshot(data)
+    _assert_refusal(_create(http, file_id), 422, "unsupported_name")
+    assert reads["count"] == 0
+    assert _snapshot(data) == before
     assert origin.hits == 0
 
 

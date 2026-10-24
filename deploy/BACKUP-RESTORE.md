@@ -105,9 +105,10 @@ file IDs, revisions and counters stay exactly as captured. Files in `outputs/`
 that the index does not record, because an agent added, deleted or resized them
 after the chat's last listing, do not fail restore; the chat's first listing after
 activation indexes them, as it would have on the source. Restore therefore no
-longer proves that a chat's `outputs/` tree can be scanned: scan limits,
-unsupported names and unsafe paths surface on that chat's first listing after
-activation.
+longer proves that a chat's `outputs/` tree can be scanned: scan limits and
+unsafe paths surface on that chat's first listing after activation. A name
+that is not valid UTF-8 or contains a backslash does not fail that listing; it
+is listed as an entry that cannot be opened (see `computer-use-server/README.md`).
 
 An epoch write or synchronization failure prevents `.restored`, success output
 and application startup. A post-replacement synchronization failure may leave the

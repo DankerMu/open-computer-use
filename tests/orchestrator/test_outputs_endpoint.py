@@ -8,6 +8,7 @@ on listing; describe uses a MagicMock engine client.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -234,6 +235,7 @@ def test_listing_returns_broker_fields_prefixed_encoded_url_and_modified(tmp_pat
         assert entry["type"] == file_type
         assert entry["mime"] == mime
         assert entry["url"] == expected_url
+        assert entry["unsupported_name"] is False
         assert entry["modified"] == pytest.approx(path.stat().st_mtime_ns / 1e9)
         assert expected_url.startswith(f"{PREFIX}/files/{CHAT}/")
         assert " " not in expected_url
@@ -696,6 +698,80 @@ def test_listing_marks_oversized_files_too_large_and_etag_follows_crossing(tmp_p
         assert shrunk_entry["hash"] == hashlib.sha256(b"shrunk").hexdigest()
         assert shrunk.headers["ETag"] == _expected_etag(shrunk_body, 100)
         assert shrunk.headers["ETag"] not in {first.headers["ETag"], grown.headers["ETag"]}
+
+
+NON_UTF8_SKIP = (
+    "the filesystem refuses non-UTF-8 names (macOS APFS returns EILSEQ); "
+    "the Linux container run is the evidence"
+)
+
+
+def _put_raw(data: Path, raw_relative: bytes, body: bytes) -> None:
+    """Create a real file under outputs through a bytes path, or skip naming why."""
+    outputs = os.fsencode(_outputs(data))
+    parent, _, _name = raw_relative.rpartition(b"/")
+    try:
+        if parent:
+            os.makedirs(outputs + b"/" + parent, exist_ok=True)
+        else:
+            os.makedirs(outputs, exist_ok=True)
+        fd = os.open(outputs + b"/" + raw_relative, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as exc:
+        if exc.errno == errno.EILSEQ:
+            pytest.skip(f"{NON_UTF8_SKIP}: {exc}")
+        raise
+    try:
+        os.write(fd, body)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    ("raw_relative", "display_path", "display_name", "file_type"),
+    (
+        (b"report\\final.html", "report\\final.html", "report\\final.html", "html"),
+        (b"bad\xff.html", "bad\\xff.html", "bad\\xff.html", "html"),
+        (b"dir\xfe/inner.txt", "dir\\xfe/inner.txt", "inner.txt", "text"),
+    ),
+    ids=("backslash", "non-utf8-file", "non-utf8-directory"),
+)
+def test_listing_marks_unsupported_names_without_url_and_keeps_etag_stable(
+    tmp_path, raw_relative, display_path, display_name, file_type,
+):
+    with _isolated_app(tmp_path) as (loaded, _docker_manager, _broker, data):
+        _put(data, "a.txt", b"alpha")
+        _put(data, "z/b.txt", b"beta")
+        _put_raw(data, raw_relative, b"unsupported bytes")
+        http = _client(loaded)
+
+        first = http.get(_list_url(), headers=_auth())
+        second = http.get(_list_url(), headers=_auth())
+
+        assert first.status_code == 200, first.text
+        body = first.json()
+        assert body["total"] == 3
+        files = _by_path(body)
+        assert set(files) == {"a.txt", "z/b.txt", display_path}
+        entry = files[display_path]
+        assert entry["unsupported_name"] is True
+        assert entry["url"] is None
+        assert entry["hash"] is None
+        assert entry["too_large"] is False
+        assert entry["name"] == display_name
+        assert entry["size"] == len(b"unsupported bytes")
+        assert entry["type"] == file_type
+        persisted = json.loads(_index(data).read_bytes())
+        assert entry["file_id"] == persisted["active"][os.fsdecode(raw_relative)]["file_id"]
+        for path in ("a.txt", "z/b.txt"):
+            assert files[path]["unsupported_name"] is False
+            assert files[path]["url"] == _expected_url(path)
+            assert files[path]["too_large"] is False
+        _assert_cache_headers(first, _expected_etag(body, 100))
+        assert second.status_code == 200
+        assert second.json()["files"] == body["files"]
+        assert second.headers["ETag"] == first.headers["ETag"]
+        unchanged = http.get(_list_url(), headers={**_auth(), "If-None-Match": first.headers["ETag"]})
+        assert unchanged.status_code == 304
 
 
 def test_listing_index_limit_with_oversized_file_is_413_without_index_write(tmp_path, monkeypatch):

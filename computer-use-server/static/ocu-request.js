@@ -248,9 +248,9 @@ export function renderKey(file) {
   return String(file.path) + '\0' + String(file.revision);
 }
 
-// Too-large files are listed but never fetched; only an explicit choice selects one.
+// Too-large and unsupported-name files are listed but never fetched; only an explicit choice selects one.
 function autoSelectable(file) {
-  return file.too_large !== true;
+  return file.too_large !== true && file.unsupported_name !== true;
 }
 
 export function pickAutoSelect(files, previousRevisions) {

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import hashlib
 import io
 import json
@@ -19,6 +20,7 @@ import sys
 import tarfile
 import unittest
 from unittest.mock import patch
+import uuid
 from test_deployment_smoke import wait_for
 
 from support import (
@@ -2030,6 +2032,46 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self.assertIn("selected-release broker", restored.stderr)
         self.assertIn("broker active entry has an invalid schema", restored.stderr)
         self.assertFalse((dest / ".restored").exists())
+
+    def test_index_recording_unsupported_names_restores_unchanged(self):
+        # A real reconcile cannot build this index before #617, so plant it as
+        # the source would hold it: hashless active entries, ASCII-escaped.
+        outputs = self.chat_dir / CHAT_ID / "outputs"
+        raw_name = b"bad\xff.txt"
+        raw_body = b"bytes behind a non-UTF-8 name\n"
+        try:
+            fd = os.open(os.fsencode(outputs) + b"/" + raw_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except OSError as exc:
+            if exc.errno != errno.EILSEQ:
+                raise
+            real_file = False  # macOS APFS refuses the name; the index part still runs
+        else:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw_body)
+            real_file = True
+        index = self.chat_dir / CHAT_ID / ".ocu" / "index.json"
+        payload = json.loads(index.read_text(encoding="utf-8"))
+        for path in (os.fsdecode(raw_name), "report\\final.txt"):
+            payload["active"][path] = {
+                "file_id": str(uuid.uuid4()),
+                "path": path,
+                "name": path.rsplit("/", 1)[-1],
+                "size": len(raw_body),
+                "mtime_ns": 1,
+                "revision": payload["counter"],
+                "hash": None,
+            }
+        index.write_text(json.dumps(payload, ensure_ascii=True), encoding="ascii")
+        captured = index.read_bytes()
+        restored, dest = self._backup_and_restore("unsupported-names")
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertTrue((dest / ".restored").exists())
+        self.assertEqual(index.read_bytes(), captured)
+        self.assertEqual((dest / "data" / "chat" / CHAT_ID / ".ocu" / "index.json").read_bytes(), captured)
+        if real_file:
+            restored_outputs = os.fsencode(dest / "data" / "chat" / CHAT_ID / "outputs")
+            with open(restored_outputs + b"/" + raw_name, "rb") as stream:
+                self.assertEqual(stream.read(), raw_body)
 
     def test_activation_uses_selected_up_and_leaves_sandboxes_stopped(self):
         backup = self.root / "backup"

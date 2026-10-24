@@ -42,6 +42,18 @@ _CURSOR = re.compile(r"(0|[1-9][0-9]*):(0|[1-9][0-9]*)\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
+def _unsupported(path: str) -> bool:
+    """True when a segment is not UTF-8-encodable (a surrogate-escaped byte) or holds a backslash.
+
+    Such a name is listed but never read, hashed, linked or packed (#617).
+    """
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return "\\" in path
+
+
 class OutputsBrokerError(RuntimeError):
     """Base failure for the pure outputs broker."""
 
@@ -79,7 +91,7 @@ class CommitDurabilityError(OutputsBrokerError):
 
 
 class UnsupportedNameError(OutputsBrokerError):
-    """A live filesystem name cannot be persisted as a relative POSIX path."""
+    """A host write names an unsupported or structurally invalid relative path."""
 
 
 @dataclass(frozen=True)
@@ -156,7 +168,7 @@ class OutputsBroker:
             self._assert_chat_root_safe(chat, allow_missing=False)
             if type(path) is not str:
                 raise UnsupportedNameError("unsupported output name")
-            self._require_representable_name(path.rsplit("/", 1)[-1], path)
+            self._require_representable_name(path)
             index = self._read_index(chat)
             if index is None:
                 index = self._empty_index()
@@ -419,11 +431,15 @@ class OutputsBroker:
         revision = entry["revision"]
         if type(revision) is not int or revision <= 0 or revision > counter:
             raise CorruptIndexError(f"broker {collection} revision is invalid")
-        # A file over the per-file limit is indexed but never read: hash is
-        # null exactly when size exceeds the limit.
+        # A file over the per-file limit or with an unsupported name is indexed
+        # but never read: an unsupported path always has a null hash, and a
+        # supported one has it exactly when size exceeds the limit.
+        unsupported = _unsupported(path)
         if entry["hash"] is None:
-            if entry["size"] <= self.max_file_size:
+            if not unsupported and entry["size"] <= self.max_file_size:
                 raise CorruptIndexError(f"broker {collection} hash is invalid")
+        elif unsupported:
+            raise CorruptIndexError(f"broker {collection} hash is invalid")
         elif entry["size"] > self.max_file_size:
             raise CorruptIndexError(f"broker {collection} size is invalid")
         elif type(entry["hash"]) is not str or not _HASH.fullmatch(entry["hash"]):
@@ -439,29 +455,15 @@ class OutputsBroker:
 
     @staticmethod
     def _valid_relative_path(path: str) -> bool:
-        if not path or path.startswith("/") or "\\" in path or "\x00" in path:
-            return False
-        try:
-            path.encode("utf-8")
-        except UnicodeEncodeError:
+        """Structural rules only; whether the name is supported is ``_unsupported``."""
+        if not path or path.startswith("/") or "\x00" in path:
             return False
         pieces = path.split("/")
         return all(piece and piece not in (".", "..") and not piece.startswith(".") for piece in pieces)
 
     @classmethod
-    def _require_representable_name(cls, name: str, relative_path: str) -> None:
-        if "\x00" in name or "\\" in name:
-            raise UnsupportedNameError(
-                f"unsupported output name {relative_path.encode('utf-8', 'backslashreplace')!r}"
-            )
-        try:
-            name.encode("utf-8")
-            relative_path.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise UnsupportedNameError(
-                f"unsupported output name {relative_path.encode('utf-8', 'backslashreplace')!r}"
-            ) from exc
-        if not cls._valid_relative_path(relative_path):
+    def _require_representable_name(cls, relative_path: str) -> None:
+        if _unsupported(relative_path) or not cls._valid_relative_path(relative_path):
             raise UnsupportedNameError(
                 f"unsupported output name {relative_path.encode('utf-8', 'backslashreplace')!r}"
             )
@@ -547,7 +549,6 @@ class OutputsBroker:
                             if name.startswith("."):
                                 continue
                             relative_path = "/".join((*prefix, name))
-                            self._require_representable_name(name, relative_path)
                             try:
                                 item_stat = entry.stat(follow_symlinks=False)
                             except OSError as exc:
@@ -710,7 +711,7 @@ class OutputsBroker:
         additions = sorted(current_paths - active_paths)
 
         refreshed_hashes = {
-            path: None if observations[path].size > self.max_file_size
+            path: None if observations[path].size > self.max_file_size or _unsupported(path)
             else self._hash_observation(chat, observations[path])
             for path in [*size_changes, *additions]
         }
@@ -824,7 +825,8 @@ class OutputsBroker:
         }
 
     def _write_index(self, chat: str, index: dict[str, Any]) -> None:
-        encoded = json.dumps(index, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        # ASCII keeps lone surrogates of unsupported names as lossless \udcXX escapes.
+        encoded = json.dumps(index, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
         if len(encoded) > self.max_index_size:
             raise LimitExceededError("proposed broker index exceeds configured size limit")
         control_fd = self._control_fd(chat, create=True)

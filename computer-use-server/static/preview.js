@@ -1382,18 +1382,22 @@ async function renderDrawioPreview(container, file) {
 }
 
 function renderDownloadFallback(container, file, iconType, errorMsg) {
+  // An unsupported name has no URL: state why instead of linking.
+  const action = file.unsupported_name === true
+    ? `<div class="dl-error">${escapeHtml(t('unsupported_name'))}</div>`
+    : `<a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>`;
   container.innerHTML = `<div class="download-prompt">
     <div class="dl-icon">${fileIconLarge(file.type)}</div>
     <div class="dl-name">${escapeHtml(file.name)}</div>
     <div class="dl-size">${formatSize(file.size)}</div>
     ${errorMsg ? `<div class="dl-error">${escapeHtml(errorMsg)}</div>` : ''}
-    <a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>
+    ${action}
   </div>`;
 }
 
 export function renderPreviewContent(container, file, files, onSelectFile, embedded = false) {
-  // Over the listing's per-file limit: offer the download, never fetch the bytes.
-  if (file.too_large === true) return renderDownloadFallback(container, file);
+  // Over the listing's per-file limit or an unsupported name: never fetch the bytes.
+  if (file.too_large === true || file.unsupported_name === true) return renderDownloadFallback(container, file);
   switch (file.type) {
     case 'html': return renderHtmlPreview(container, file);
     case 'image':
@@ -2672,7 +2676,7 @@ function App() {
         <div class="status">
           <span class="dot" ref=${syncDotRef} title="${t('waiting_files')}"></span>
         </div>
-        ${currentView === 'files' && selectedFile && html`
+        ${currentView === 'files' && selectedFile && selectedFile.unsupported_name !== true && html`
           <a class="btn btn-icon" href="${selectedFile.url}?download=1" download title="${t('download_file')}">
             <span class="icon-inline" dangerouslySetInnerHTML=${{ __html: icon('download') }}></span>
           </a>

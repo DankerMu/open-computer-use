@@ -94,6 +94,7 @@ from outputs_broker import (
     OutputsBrokerError,
     StaleCursorError,
     UnstableReadError,
+    _unsupported,
 )
 from office.publish import RecoveryRequiredError, SandboxStateError, recover_publications
 from office.store import StateCorruptError, StateDurabilityError
@@ -175,22 +176,31 @@ def _output_file_url(chat_id: str, relative_path: str) -> str:
     return f"{OCU_PUBLIC_PREFIX}/files/{chat_id}/{quote(relative_path, safe='/')}"
 
 
+def _display_name(name: str) -> str:
+    """JSON-safe, deterministic form of a name; identity for a UTF-8 name, bytes become ``\\xNN``."""
+    return os.fsencode(name).decode("utf-8", "backslashreplace")
+
+
 def _listing_files(chat_id: str, entries: list[dict]) -> list[dict]:
     files = []
     for entry in entries:
-        file_type, mime = classify_file(entry["path"])
+        # An unsupported name is listed but has no URL; file_id stays its identity.
+        unsupported = _unsupported(entry["path"])
+        path = _display_name(entry["path"])
+        file_type, mime = classify_file(path)
         files.append({
             "file_id": entry["file_id"],
-            "path": entry["path"],
-            "name": entry["name"],
+            "path": path,
+            "name": _display_name(entry["name"]),
             "size": entry["size"],
             "mtime_ns": entry["mtime_ns"],
             "revision": entry["revision"],
             "hash": entry["hash"],
-            "too_large": entry["hash"] is None,
+            "too_large": entry["hash"] is None and not unsupported,
+            "unsupported_name": unsupported,
             "type": file_type,
             "mime": mime,
-            "url": _output_file_url(chat_id, entry["path"]),
+            "url": None if unsupported else _output_file_url(chat_id, entry["path"]),
             "modified": entry["mtime_ns"] / 1e9,
         })
     return files
@@ -779,9 +789,11 @@ async def download_archive(chat_id: str):
             detail="Path is not a directory"
         )
 
+    # Hidden paths and unsupported names (#617) are never packed.
     files = [
         path for path in outputs_dir.rglob("*")
         if not any(part.startswith(".") for part in path.relative_to(outputs_dir).parts)
+        and not _unsupported(path.relative_to(outputs_dir).as_posix())
         and path.is_file()
     ]
 

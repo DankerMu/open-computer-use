@@ -1483,9 +1483,12 @@ def test_corrupt_or_wrong_schema_index_fails_closed_without_reset(world):
     valid = json.loads(_index(data).read_text(encoding="utf-8"))
     file_id = next(iter(valid["active"].values()))["file_id"]
     digest = next(iter(valid["active"].values()))["hash"]
-    for bad_path, encoder in (
-        ("nul\x00name.txt", lambda payload: json.dumps(payload, ensure_ascii=False)),
-        ("bad\udcff.txt", lambda payload: json.dumps(payload, ensure_ascii=True)),
+    # A NUL is structurally invalid; an unsupported name is a valid path whose
+    # entry must stay hashless, so a digest on it is the corruption (#617).
+    for bad_path, encoder, message in (
+        ("nul\x00name.txt", lambda payload: json.dumps(payload, ensure_ascii=False), "path is invalid"),
+        ("bad\udcff.txt", lambda payload: json.dumps(payload, ensure_ascii=True), "hash is invalid"),
+        ("report\\final.txt", lambda payload: json.dumps(payload, ensure_ascii=True), "hash is invalid"),
     ):
         poisoned = {
             "schema_version": 1,
@@ -1506,7 +1509,7 @@ def test_corrupt_or_wrong_schema_index_fails_closed_without_reset(world):
         }
         encoded = encoder(poisoned)
         index_path.write_text(encoded, encoding="utf-8")
-        with pytest.raises(broker_module.CorruptIndexError, match="path is invalid"):
+        with pytest.raises(broker_module.CorruptIndexError, match=message):
             broker.current_revision(CHAT)
         assert index_path.read_text(encoding="utf-8") == encoded
 
@@ -2291,65 +2294,207 @@ def test_fifo_replacement_after_scan_fails_promptly_and_releases_lock(world):
     assert listing["entries"] == []
 
 
-def test_backslash_name_is_rejected_and_removing_it_restores_reconciliation(world):
+NON_UTF8_SKIP = (
+    "the filesystem refuses non-UTF-8 names (macOS APFS returns EILSEQ); "
+    "the Linux container run is the evidence"
+)
+
+
+def _non_utf8(create) -> None:
+    """Create one real non-UTF-8 name through a bytes path, or skip naming why."""
+    try:
+        create()
+    except OSError as exc:
+        if exc.errno == errno.EILSEQ:
+            pytest.skip(f"{NON_UTF8_SKIP}: {exc}")
+        raise
+
+
+def _put_raw(directory: Path, raw_name: bytes, body: bytes) -> Path:
+    def create():
+        fd = os.open(os.fsencode(directory) + b"/" + raw_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, body)
+        finally:
+            os.close(fd)
+
+    directory.mkdir(parents=True, exist_ok=True)
+    _non_utf8(create)
+    return directory / os.fsdecode(raw_name)
+
+
+def test_non_utf8_and_backslash_names_are_listed_hashless_and_never_read(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    outputs = _outputs(data)
+    _put(data, "a.txt", b"alpha")
+    _put(data, "nested/b.txt", b"beta")
+    raw_file = _put_raw(outputs, b"bad\xff.txt", b"raw file bytes")
+    raw_dir = outputs / os.fsdecode(b"dir\xfe")
+    _non_utf8(lambda: os.mkdir(os.fsencode(raw_dir)))
+    inner = _put(data, os.fsdecode(b"dir\xfe") + "/inner.txt", b"inner bytes")
+    _non_utf8(lambda: os.symlink(b"a.txt", os.fsencode(outputs) + b"/link\xfd"))
+    backslash = _put(data, "report\\final.txt", b"backslash bytes")
+    hashed = _spy_hashes(broker_module, monkeypatch)
+    _forbid_inode_open(broker_module, monkeypatch, raw_file, inner, backslash)
+    broker = broker_module.OutputsBroker()
+
+    listing = broker.reconcile(CHAT)
+
+    unsupported = {"bad\udcff.txt", "dir\udcfe/inner.txt", "report\\final.txt"}
+    assert [entry["path"] for entry in listing["entries"]] == sorted({"a.txt", "nested/b.txt", *unsupported})
+    assert listing["revision"] == 5
+    for path in unsupported:
+        entry = _entry_by_path(listing, path)
+        _assert_uuid(entry["file_id"])
+        assert entry["hash"] is None
+        assert entry["name"] == path.rsplit("/", 1)[-1]
+        assert 1 <= entry["revision"] <= listing["revision"]
+    assert _entry_by_path(listing, "a.txt")["hash"] == hashlib.sha256(b"alpha").hexdigest()
+    assert _entry_by_path(listing, "nested/b.txt")["hash"] == hashlib.sha256(b"beta").hexdigest()
+    assert sorted(hashed) == ["a.txt", "nested/b.txt"]
+
+    encoded = _index(data).read_bytes()
+    assert encoded.isascii()
+    persisted = json.loads(encoded)
+    assert set(persisted["active"]) == {"a.txt", "nested/b.txt", *unsupported}
+    _assert_no_null_fingerprints(persisted)
+    assert broker_module.OutputsBroker()._read_index(CHAT) == persisted
+
+    again = broker.reconcile(CHAT)
+    assert again["unchanged"] is True
+    assert again["entries"] == listing["entries"]
+    assert _index(data).read_bytes() == encoded
+    assert sorted(hashed) == ["a.txt", "nested/b.txt"]
+    # Unsupported entries occupy active-file capacity like any other.
+    with pytest.raises(broker_module.LimitExceededError):
+        broker_module.OutputsBroker(max_active_files=4).reconcile(CHAT)
+
+
+def test_backslash_name_is_listed_without_hash_and_its_move_is_never_paired(world, monkeypatch):
+    broker_module, _docker_manager, data = world
+    broker = broker_module.OutputsBroker()
+    _put(data, "ok.txt", b"same bytes")
+    bad = _put(data, "report\\final.txt", b"same bytes")
+    _forbid_inode_open(broker_module, monkeypatch, bad)
+    before = broker.reconcile(CHAT)
+    old_id = _entry_by_path(before, "report\\final.txt")["file_id"]
+    assert _entry_by_path(before, "report\\final.txt")["hash"] is None
+
+    bad.rename(bad.with_name("report\\moved.txt"))
+    after = broker.reconcile(CHAT)
+
+    moved = _entry_by_path(after, "report\\moved.txt")
+    assert moved["hash"] is None
+    assert moved["file_id"] != old_id
+    persisted = _read_index(data)
+    assert persisted["tombstones"][old_id]["path"] == "report\\final.txt"
+    assert persisted["tombstones"][old_id]["hash"] is None
+    assert _ids(after)["ok.txt"] == _ids(before)["ok.txt"]
+    _assert_no_null_fingerprints(persisted)
+
+
+def test_validator_requires_null_hash_exactly_for_unsupported_paths(world):
     broker_module, _docker_manager, data = world
     broker = broker_module.OutputsBroker()
     _put(data, "ok.txt", b"ok")
     broker.reconcile(CHAT)
-    before = _index(data).read_bytes()
-    bad = _outputs(data) / "report\\final.txt"
-    bad.write_bytes(b"bad-name")
+    valid = _read_index(data)
+    counter = valid["counter"]
 
-    with pytest.raises(broker_module.OutputsBrokerError) as raised:
-        broker.reconcile(CHAT)
-    assert type(raised.value).__name__ == "UnsupportedNameError"
-    assert "unsupported output name" in str(raised.value)
-    assert "final.txt" in str(raised.value)
-    assert not isinstance(raised.value, broker_module.CorruptIndexError)
-    assert _index(data).read_bytes() == before
+    def entry(path, file_id, digest):
+        return {"file_id": file_id, "path": path, "name": path.rsplit("/", 1)[-1],
+                "size": 2, "mtime_ns": 1, "revision": counter, "hash": digest}
 
-    bad.unlink()
-    restored = broker.reconcile(CHAT)
-    assert restored["unchanged"] is True
-    assert [entry["path"] for entry in restored["entries"]] == ["ok.txt"]
+    accepted = json.loads(json.dumps(valid))
+    for path in ("bad\udcff.txt", "dir\udcfe/inner.txt", "report\\final.txt"):
+        accepted["active"][path] = entry(path, str(uuid.uuid4()), None)
+    tombstone_id = str(uuid.uuid4())
+    accepted["tombstones"][tombstone_id] = entry("gone\udcff.txt", tombstone_id, None)
+    encoded = json.dumps(accepted, ensure_ascii=True).encode("ascii")
+    _index(data).write_bytes(encoded)
+    assert broker.current_revision(CHAT) == counter
+    assert broker._read_index(CHAT) == accepted
+    assert _index(data).read_bytes() == encoded
+
+    for corrupt_path in ("bad\udcff.txt", "report\\final.txt"):
+        digest = hashlib.sha256(b"ok").hexdigest()
+        corrupt = json.loads(json.dumps(valid))
+        file_id = str(uuid.uuid4())
+        corrupt["active"][corrupt_path] = entry(corrupt_path, file_id, digest)
+        corrupt["fingerprints"][f"2:{digest}"] = sorted([*corrupt["fingerprints"][f"2:{digest}"], file_id])
+        encoded = json.dumps(corrupt, ensure_ascii=True).encode("ascii")
+        _index(data).write_bytes(encoded)
+        with pytest.raises(broker_module.CorruptIndexError, match="active hash is invalid"):
+            broker.current_revision(CHAT)
+        assert _index(data).read_bytes() == encoded
 
 
-def test_surrogate_names_are_rejected_at_the_scan_name_policy(world, monkeypatch):
+# The README's per-chat finder, verbatim, run where outputs_broker imports.
+_README_UNSUPPORTED_FINDER = """import glob, json, os, sys
+from outputs_broker import _unsupported
+for index in sorted(glob.glob(sys.argv[1] + "/*/.ocu/index.json")):
+    for path in json.load(open(index))["active"]:
+        if _unsupported(path):
+            print(index, os.fsencode(path).decode("utf-8", "backslashreplace"))"""
+
+
+def test_readme_finder_prints_unsupported_entries_in_listing_display_form(world):
     broker_module, _docker_manager, data = world
     broker = broker_module.OutputsBroker()
     _put(data, "ok.txt", b"ok")
+    _put(data, "report\\final.txt", b"bad")
     broker.reconcile(CHAT)
-    before = _index(data).read_bytes()
+    _put(data, "plain.txt", b"plain", OTHER_CHAT)
+    broker.reconcile(OTHER_CHAT)
+    planted = _read_index(data, OTHER_CHAT)
+    file_id = str(uuid.uuid4())
+    planted["active"]["bad\udcff.txt"] = {
+        "file_id": file_id, "path": "bad\udcff.txt", "name": "bad\udcff.txt", "size": 1,
+        "mtime_ns": 1, "revision": planted["counter"], "hash": None,
+    }
+    _index(data, OTHER_CHAT).write_text(json.dumps(planted), encoding="ascii")
+    assert broker.current_revision(OTHER_CHAT) == planted["counter"]
+    environment = {**os.environ, "BASE_DATA_DIR": str(data), "DOCKER_HOST": NO_DOCKER_SOCKET,
+                   "DOCKER_SOCKET": NO_DOCKER_SOCKET}
 
-    class SurrogateDirEntry:
-        name = "bad\udcff.txt"
+    completed = subprocess.run(
+        [sys.executable, "-c", _README_UNSUPPORTED_FINDER, str(data)],
+        cwd=str(SERVER_DIR), env=environment, capture_output=True, text=True, timeout=30,
+    )
 
-        def stat(self, follow_symlinks=False):
-            return os.stat(_outputs(data) / "ok.txt", follow_symlinks=follow_symlinks)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == sorted([
+        f"{_index(data)} report\\final.txt",
+        f"{_index(data, OTHER_CHAT)} bad\\xff.txt",
+    ])
+    readme = (SERVER_DIR / "README.md").read_text(encoding="utf-8")
+    assert f"python3 -c '{_README_UNSUPPORTED_FINDER}' <chat_dir>" in readme
 
-    class SurrogateListing:
-        def __iter__(self):
-            yield SurrogateDirEntry()
 
-        def __enter__(self):
-            return self
+def test_index_with_non_ascii_names_loads_unchanged_and_is_rewritten_escaped(world):
+    broker_module, _docker_manager, data = world
+    body = "报告".encode("utf-8")
+    path = _put(data, "报告.txt", body)
+    file_id = str(uuid.uuid4())
+    digest = hashlib.sha256(body).hexdigest()
+    entry = {"file_id": file_id, "path": "报告.txt", "name": "报告.txt", "size": len(body),
+             "mtime_ns": path.stat().st_mtime_ns, "revision": 1, "hash": digest}
+    legacy = {"schema_version": 1, "counter": 1, "active": {"报告.txt": entry},
+              "fingerprints": {f"{len(body)}:{digest}": [file_id]}, "tombstones": {}}
+    _index(data).parent.mkdir(parents=True)
+    encoded = json.dumps(legacy, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    assert not encoded.isascii()
+    _index(data).write_bytes(encoded)
+    broker = broker_module.OutputsBroker()
 
-        def __exit__(self, *_exc):
-            return False
+    assert broker.reconcile(CHAT)["unchanged"] is True
+    assert _index(data).read_bytes() == encoded
 
-    monkeypatch.setattr(broker_module.os, "scandir", lambda _fd: SurrogateListing())
-    monkeypatch.setattr(broker_module.os, "listdir", lambda _fd: ["bad\udcff.txt"])
-    with pytest.raises(broker_module.OutputsBrokerError) as raised:
-        broker.reconcile(CHAT)
-    assert type(raised.value).__name__ == "UnsupportedNameError"
-    assert "unsupported output name" in str(raised.value)
-    assert "bad" in str(raised.value)
-    assert not isinstance(raised.value, broker_module.CorruptIndexError)
-    monkeypatch.undo()
-
-    restored = broker.reconcile(CHAT)
-    assert restored["unchanged"] is True
-    assert [entry["path"] for entry in restored["entries"]] == ["ok.txt"]
+    _put(data, "新.txt", b"new")
+    broker.reconcile(CHAT)
+    rewritten = _index(data).read_bytes()
+    assert rewritten.isascii()
+    assert json.loads(rewritten)["active"]["报告.txt"] == entry
 
 
 def test_mtime_only_change_keeps_identity_without_content_reads(world, monkeypatch):

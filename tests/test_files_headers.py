@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import builtins
+import errno
 import mimetypes
 import os
 import sys
@@ -1259,6 +1260,49 @@ def test_archive_omits_hidden_paths_without_removing_them(client, output_dir, vi
             assert response.json() == {"detail": "No files found in outputs directory"}
     hidden[".upload-active"] = b"in-progress staging"
     assert {name: (output_dir / name).read_bytes() for name in hidden} == hidden
+
+
+@pytest.mark.parametrize("visible", (True, False), ids=("mixed", "unsupported-only"))
+@pytest.mark.parametrize(
+    "raw_names",
+    ((b"report\\final.txt",), (b"bad\xff.txt", b"dir\xfe/inner.txt")),
+    ids=("backslash", "non-utf8"),
+)
+def test_archive_skips_unsupported_names(client, output_dir, visible, raw_names):
+    root = os.fsencode(output_dir)
+    for raw in raw_names:
+        parent = raw.rpartition(b"/")[0]
+        try:
+            if parent:
+                os.makedirs(root + b"/" + parent, exist_ok=True)
+            fd = os.open(root + b"/" + raw, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except OSError as exc:
+            if exc.errno == errno.EILSEQ:
+                pytest.skip(
+                    "the filesystem refuses non-UTF-8 names (macOS APFS returns EILSEQ); "
+                    f"the Linux container run is the evidence: {exc}"
+                )
+            raise
+        try:
+            os.write(fd, b"unsupported bytes")
+        finally:
+            os.close(fd)
+    if visible:
+        (output_dir / "ok.txt").write_bytes(b"supported bytes")
+
+    response = client.get(_file_url("archive"), headers=_auth_headers())
+
+    if visible:
+        assert response.status_code == 200
+        with zipfile.ZipFile(BytesIO(response.content)) as archive:
+            assert archive.namelist() == ["ok.txt"]
+            assert archive.read("ok.txt") == b"supported bytes"
+    else:
+        assert response.status_code == 404
+        assert response.json() == {"detail": "No files found in outputs directory"}
+    for raw in raw_names:
+        with open(root + b"/" + raw, "rb") as kept:
+            assert kept.read() == b"unsupported bytes"
 
 
 def _assert_confined_archive(response, expected, canaries, optional=()):
