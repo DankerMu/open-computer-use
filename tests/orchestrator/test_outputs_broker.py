@@ -2130,7 +2130,7 @@ def test_unstable_hash_read_rejects_successor_without_partial_index(world, monke
             and reading.st_ino == target_stat.st_ino
         ):
             changed["done"] = True
-            target.write_bytes(b"ABCDEFGH")
+            target.write_bytes(b"ABCDEFGHI")
         return chunk
 
     monkeypatch.setattr(broker_module.os, "read", mutate_after_first_chunk)
