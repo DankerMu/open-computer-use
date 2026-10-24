@@ -12,6 +12,8 @@ OCU_RELEASE_MANIFEST=<DEPLOY_ROOT>/release.json deploy/up.sh
 OCU_RELEASE_MANIFEST=<DEPLOY_ROOT>/release.json deploy/production-like-test/scripts/write-deployed-version.sh
 ```
 
+To upgrade a running deployment and keep its data, see [Upgrading an existing deployment](#upgrading-an-existing-deployment).
+
 `build` uses clean committed OCU/WebUI snapshots to build six source images, including DocumentServer, and pull the selected PostgreSQL image. PostgreSQL is the only pulled role: the exact selected upstream reference is reused when cached, and a content-addressed output reference with a different image identity is rejected rather than overwritten. Changing the upstream reference is an explicit choice in the tracked compose declaration or via `--postgres-image`; the build does not force-refresh the same cached reference. It exports named linux/amd64 archives and an OCU Git bundle. The content-derived workspace name retains `open-computer-use` and uses the full configuration digest as its tag. The inventory binds both source commits, the selected `source_consumer_contract`, seven named image/configuration identities, archive SHA-256 values, non-secret build arguments and material input versions/hashes. Input hashes are not installed-package versions. Configuration identity comes from configuration bytes, not a registry manifest; engines may expose a manifest as image `.Id`. General containerd release-path compatibility remains tracked in [issue 337](https://github.com/DankerMu/open-webui/issues/337); local DocumentServer qualification does not certify the complete export/import path on that engine.
 
 `import` 在加载任何镜像前校验 schema、七角色集合、受约束的普通文件路径、全部校验和、归档内部 Docker/OCI 引用与配置字节、所选源消费者契约以及已有本地标签冲突。检查和 `docker load` 使用同一份私有暂存字节。合作构建/导入对同一本机 Docker 守护进程的镜像库写入通过 `/run/ocu-image-store/<daemon-id>.lock` 串行化；该 flock 文件在进程生命周期内持有、不在等待者仍引用其 inode 时 unlink。远程 Docker 守护进程协调不受支持。失败不发布安装根或成功记录；一旦尝试过 load，会披露可能残留的镜像缓存，但不会删除无关镜像。已有目标目录和竞争发布锁都会失败。任意外部 Docker 写者与宿主机管理员不在该保证内。
@@ -217,13 +219,56 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 
 `OCU_SMOKE_DOCUMENTSERVER_URL` 指向应当关闭的直接入口，不是内部 control-plane 地址或第二个 proxy 端口。它与 `OCU_SMOKE_FORMER_URL` 接受 IPv4 `host:port` 或带显式端口的 `http://IPv4:port/...`；端口范围为1–65535。缺失或格式错误以退出码2命名输入。两个入口分别检查：连接成功、超时或非 `ECONNREFUSED` 错误均以退出码1命名对应断言，不能用另一个入口的拒绝代替。
 
-## Re-running the initializer and removing the wrapper model (#590)
+## Upgrading an existing deployment
 
-The Computer Use tool reaches every model through the global `computer_use_filter`; no model carries it any more, and `BYPASS_MODEL_ACCESS_CONTROL=true` on `open-webui` makes every provider model visible to every user. A deployment initialized before #590 still has the old filter, which acts only when the request already names the tool, and a wrapper row `<PRIMARY_CHAT_MODEL> (Computer Use)` that names it. The filter source lives in the WebUI database. Only the one-shot `open-webui-init` service writes it, and `init.sh` exits without changes while the `.computer-use-initialized` marker exists in the `open-webui-data` volume. Upgrade in this order, as root, from the deployed source checkout (`DEPLOY_ROOT` defaults to `/opt/ai-workbench-test/open-computer-use`):
+An upgrade keeps the deployment's data and configuration where they are: `$DEPLOY_ROOT/config/`, `$DEPLOY_ROOT/data/` and the Docker volumes. Each release gets its own install root, because `release.py import` refuses an existing one. `OCU_RELEASE_MANIFEST` in `runtime.env` selects the running release. `deploy/up.sh` and `write-deployed-version.sh` use the `source` checkout next to that manifest. On a fresh install the release root is `$DEPLOY_ROOT` itself.
+
+Run steps 2 to 7 as root on the deployment host, with `DEPLOY_ROOT` exported as the deployment root (default `/opt/ai-workbench-test/open-computer-use`).
+
+1. Build the release from committed OCU and WebUI checkouts, as in the quick start above.
+2. Transfer the delivery directory to the deployment host. Compare `sha256sum release.json` on both hosts, then check the bundle and archives against it from the current release's source checkout:
+
+   ```bash
+   python3 deploy/release.py verify --inventory <delivery>/release.json --mode delivery --delivery <delivery>
+   ```
+
+3. Import into a new root next to the current one:
+
+   ```bash
+   new_root=/opt/ai-workbench-test/release-<ocu-short-sha>
+   python3 deploy/release.py import --delivery <delivery> --install-root "$new_root"
+   ```
+
+   `import` copies the source bundle, fonts and image archives into a private staging directory before loading them, so the disk needs room for about twice the delivery plus the loaded images. It deletes its staged copies when it finishes. Keep the delivery of every release you may later restore or activate: `recovery.py restore` and `activate` take it as `--retained-delivery`, and the recovery set holds no image archives ([BACKUP-RESTORE.md](../BACKUP-RESTORE.md)).
+4. If you may need the newer release's database changes undone, first take a cold backup with the current release's `recovery.py backup` ([BACKUP-RESTORE.md](../BACKUP-RESTORE.md)). It must run before this step: `backup` checks the running containers against the release that `runtime.env` names, and refuses once `runtime.env` names the new release. It leaves the writers stopped until step 5's `up.sh`. Then point `runtime.env` at the new root with the new release's own `recovery.py`:
+
+   ```bash
+   python3 "$new_root/source/deploy/recovery.py" retarget \
+       --runtime-file "$DEPLOY_ROOT/config/runtime.env" --release-root "$new_root"
+   ```
+
+   It checks the new root's `release.json` and `source` checkout, then rewrites only `SOURCE_SHA`, `WEBUI_SOURCE_SHA`, `OCU_RELEASE_MANIFEST` and the seven image variables. Every other line stays byte for byte. The previous file is kept as `runtime.env.before-<first 12 hex digits of the new OCU commit>`, mode `0600`. The command prints one line per identity key, `same` or `changed` with the release value, then the backup path. It never prints any other key. It refuses, and changes nothing, if `runtime.env` contains a comment or blank line (the rewrite re-renders the file, so remove them first), an identity key is missing, the backup name already exists, or the release does not verify.
+5. Load `runtime.env` and the provider key as in the [#590 preamble](#re-running-the-initializer-and-removing-the-wrapper-model-590). It changes into the new root's `source`. Then run `deploy/up.sh`.
+6. Run `deploy/production-like-test/scripts/write-deployed-version.sh`. `$DEPLOY_ROOT/DEPLOYED_VERSION.md` now names the new OCU and WebUI commits.
+7. Check: `up.sh` stderr shows `deploy: proxy restarted for …`. `docker ps` shows `computer-use-server`, `open-webui`, `proxy`, `postgres`, `retention-guard` and `documentserver` running. `${OCU_PROXY_PORT}` and `${OCU_OFFICE_PROXY_PORT}` answer through the proxy. If the release needs the initializer re-run, continue with the #590 section.
+
+Rollback: the backup named after the release you upgraded to holds the previous configuration. Copy it back and repeat step 5; the preamble now changes into the previous root's `source`. Then run the newer root's version writer by absolute path, `"$new_root/source/deploy/production-like-test/scripts/write-deployed-version.sh"`, instead of step 6: it reads the manifest from `runtime.env` and the `source` next to it, while the writer of a release older than #626 reads `$DEPLOY_ROOT/source`.
 
 ```bash
-cd "$DEPLOY_ROOT/source"
+install -m 0600 "$DEPLOY_ROOT/config/runtime.env.before-<new-12-hex>" "$DEPLOY_ROOT/config/runtime.env"
+```
+
+If the previous release predates #612, its `up.sh` does not restart the proxy. Run the manual `docker compose … restart proxy` from [部署入口与端口边界](#部署入口与端口边界) as well. Rollback restores configuration and images, not data: database changes made by the newer release stay. Undoing them needs the cold backup from step 4. To upgrade to the same release again later, move the `runtime.env.before-<new-12-hex>` file aside first, because `retarget` refuses an existing backup name.
+
+Old release roots are not removed automatically. Delete a previous root by hand only after the new release has passed its checks and you will not roll back to it. Never delete the root that `OCU_RELEASE_MANIFEST` names, and never delete `$DEPLOY_ROOT`, which also holds the data.
+
+## Re-running the initializer and removing the wrapper model (#590)
+
+The Computer Use tool reaches every model through the global `computer_use_filter`; no model carries it any more, and `BYPASS_MODEL_ACCESS_CONTROL=true` on `open-webui` makes every provider model visible to every user. A deployment initialized before #590 still has the old filter, which acts only when the request already names the tool, and a wrapper row `<PRIMARY_CHAT_MODEL> (Computer Use)` that names it. The filter source lives in the WebUI database. Only the one-shot `open-webui-init` service writes it, and `init.sh` exits without changes while the `.computer-use-initialized` marker exists in the `open-webui-data` volume. Upgrade in this order, as root, from the selected release's source checkout (`DEPLOY_ROOT` defaults to `/opt/ai-workbench-test/open-computer-use`):
+
+```bash
 set -a; . "$DEPLOY_ROOT/config/runtime.env"; set +a
+cd "$(dirname "$OCU_RELEASE_MANIFEST")/source"
 # The provider key is not in runtime.env. Load it from the provider env file as
 # a normal deploy shell does: DMX_ENV_FILE in runtime.env names it on recovered
 # targets; otherwise it is the file bootstrap-test.sh read.
@@ -234,7 +279,7 @@ set -a; . "$provider_env"; set +a
 
 The WebUI overlay interpolates `${DMXAPI_API_KEY}` without a required-value check, so a shell without it starts `open-webui` with an empty provider key.
 
-1. Deploy the new release with `deploy/up.sh` as usual. It starts the proxy last and then restarts it, so nginx resolves `open-webui`, `computer-use-server` and `documentserver` to the containers this run recreated. `BYPASS_MODEL_ACCESS_CONTROL` is now live; `open-webui-init` still finds the marker and skips.
+1. Deploy the new release as described in [Upgrading an existing deployment](#upgrading-an-existing-deployment). `deploy/up.sh` starts the proxy last and then restarts it, so nginx resolves `open-webui`, `computer-use-server` and `documentserver` to the containers this run recreated. `BYPASS_MODEL_ACCESS_CONTROL` is now live; `open-webui-init` still finds the marker and skips.
 2. Delete the marker, then re-run `open-webui-init`:
 
    ```bash

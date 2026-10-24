@@ -983,36 +983,13 @@ def persist_selected_runtime_identity(
 ) -> dict[str, str]:
     dest = destination_root / "config" / "runtime.env"
     recovery.require_regular_file(dest)
+    manifest = destination_root / "release.json"
     values = dict(current)
-    bound = bind_selected_runtime(current, inventory, destination_root)
-    for key in recovery.IDENTITY_KEYS:
-        values[key] = bound[key]
+    values.update(recovery.selected_runtime_identity(inventory, manifest))
     release.verify_runtime_binding(inventory, values)
-    staged = dest.with_name(
-        f"{dest.name}.identity-{os.getpid()}-{os.urandom(4).hex()}"
-    )
-    try:
-        recovery.write_private_bytes(staged, recovery.render_dotenv(values).encode("utf-8"))
-        info = dest.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise RecoveryError(f"{dest}: owned replacement target must be a regular file")
-        if info.st_uid != os.geteuid():
-            raise RecoveryError(f"{dest}: owned replacement target is not owned by the current user")
-        os.replace(staged, dest)
-        os.chmod(dest, 0o600)
-    except BaseException as cop:
-        staged.unlink(missing_ok=True)
-        raise RecoveryError(
-            "selected release identity was not published to the target runtime"
-        ) from cop
-    published = recovery.parse_dotenv(dest)
-    try:
-        release.verify_runtime_binding(inventory, published)
-    except release.ReleaseError as cop:
-        raise RecoveryError(
-            "published target runtime does not agree with the selected release"
-        ) from cop
-    if published.get("OCU_RELEASE_MANIFEST") != str(destination_root / "release.json"):
+    recovery.write_runtime_values(dest, values)
+    published = recovery.verify_published_runtime(dest, inventory, values)
+    if published.get("OCU_RELEASE_MANIFEST") != str(manifest):
         raise RecoveryError("published target runtime does not name the selected inventory")
     return published
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
-"""Cold backup, isolated restore, and previous-release activation."""
+"""Cold backup, isolated restore, previous-release activation, and release retargeting."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -451,6 +452,123 @@ def render_dotenv(values: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def selected_runtime_identity(inventory: dict, manifest: Path) -> dict[str, str]:
+    """The ten identity values that bind a runtime configuration to one release."""
+    images = release.derive_runtime_images(inventory)
+    selected = {
+        "SOURCE_SHA": inventory["ocu_source_sha"],
+        "WEBUI_SOURCE_SHA": inventory["webui_source_sha"],
+        "OCU_RELEASE_MANIFEST": str(manifest),
+        **{name: images[name] for name in release.RUNTIME_IMAGE_VARS.values()},
+    }
+    return {key: selected[key] for key in IDENTITY_KEYS}
+
+
+def write_runtime_values(dest: Path, values: dict[str, str]) -> None:
+    """Stage privately and atomically replace an owned runtime file; nothing is left on failure."""
+    staged = dest.with_name(f"{dest.name}.identity-{os.getpid()}-{os.urandom(4).hex()}")
+    try:
+        write_private_bytes(staged, render_dotenv(values).encode("utf-8"))
+        info = dest.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RecoveryError(f"{dest}: owned replacement target must be a regular file")
+        if info.st_uid != os.geteuid():
+            raise RecoveryError(f"{dest}: owned replacement target is not owned by the current user")
+        os.replace(staged, dest)
+    except BaseException as cop:
+        staged.unlink(missing_ok=True)
+        if isinstance(cop, (SystemExit, KeyboardInterrupt)):
+            raise
+        raise RecoveryError(
+            "selected release identity was not published to the target runtime"
+        ) from cop
+
+
+def verify_published_runtime(dest: Path, inventory: dict, values: dict[str, str]) -> dict[str, str]:
+    """Protect, re-read and check a replaced runtime file against its values and release."""
+    try:
+        os.chmod(dest, 0o600)
+        if dest.read_bytes() != render_dotenv(values).encode("utf-8"):
+            raise RecoveryError(f"{dest}: published bytes differ from the rendered configuration")
+        published = parse_dotenv(dest)
+        release.verify_runtime_binding(inventory, published)
+    except (OSError, RecoveryError, release.ReleaseError) as cop:
+        raise RecoveryError(
+            "published target runtime does not agree with the selected release"
+        ) from cop
+    return published
+
+
+def _require_retargetable_runtime(path: Path) -> dict[str, str]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise RecoveryError(f"{path}: missing") from None
+    if stat.S_ISLNK(info.st_mode):
+        raise RecoveryError(f"{path}: runtime configuration must not be a symbolic link")
+    if not stat.S_ISREG(info.st_mode):
+        raise RecoveryError(f"{path}: runtime configuration must be a regular file")
+    if info.st_uid != os.geteuid():
+        raise RecoveryError(f"{path}: runtime configuration is not owned by the current user")
+    current = parse_dotenv(path)
+    data = path.read_bytes()
+    for index, line in enumerate(data.decode("utf-8").splitlines(), start=1):
+        if not line or line.startswith("#"):
+            raise RecoveryError(
+                f"{path}:{index}: comment or blank line would be lost by the rewrite; remove it first"
+            )
+    if render_dotenv(current).encode("utf-8") != data:
+        raise RecoveryError(
+            f"{path}: only LF-terminated NAME=value lines survive the rewrite unchanged"
+        )
+    missing = [key for key in IDENTITY_KEYS if key not in current]
+    if missing:
+        raise RecoveryError(f"{path}: missing identity keys {', '.join(missing)}")
+    return current
+
+
+def retarget_runtime(runtime_file: Path, release_root: Path) -> tuple[list[tuple[str, str, str]], Path]:
+    """Point an existing runtime configuration at a release imported into its own root."""
+    release_root = Path(os.path.abspath(release_root))
+    current = _require_retargetable_runtime(runtime_file)
+    manifest, inventory = release.load_installed_inventory(release_root / "release.json")
+    source = release_root / "source"
+    if not (source / ".git").exists():
+        raise RecoveryError(f"{source}: release source checkout is missing")
+    release.verify_tracked_source(source, inventory["ocu_source_sha"])
+    release.require_supported_source_contract(source, inventory["source_consumer_contract"])
+    values = dict(current)
+    values.update(selected_runtime_identity(inventory, manifest))
+    release.verify_runtime_binding(inventory, values)
+    backup = runtime_file.with_name(
+        f"{runtime_file.name}.before-{inventory['ocu_source_sha'][:12].lower()}"
+    )
+    if os.path.lexists(backup):
+        raise RecoveryError(
+            f"{backup} already exists; move it aside to retarget to this release again"
+        )
+    original = runtime_file.lstat()
+    try:
+        copy_private(runtime_file, backup)
+        write_runtime_values(runtime_file, values)
+    except BaseException:
+        # os.replace gives runtime_file the staged inode; until then the backup is a spare copy.
+        # An unreadable runtime path keeps the backup; the original exception still propagates.
+        with contextlib.suppress(OSError):
+            if os.path.samestat(runtime_file.lstat(), original):
+                backup.unlink(missing_ok=True)
+        raise
+    try:
+        verify_published_runtime(runtime_file, inventory, values)
+    except RecoveryError as cop:
+        raise RecoveryError(f"{cop}; previous configuration kept at {backup}") from cop
+    changes = [
+        (key, "same" if current[key] == values[key] else "changed", values[key])
+        for key in IDENTITY_KEYS
+    ]
+    return changes, backup
+
+
 def redact_secrets(text: str, secrets: list[str]) -> str:
     redacted = text
     for secret in secrets:
@@ -708,6 +826,18 @@ def cmd_activate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_retarget(args: argparse.Namespace) -> int:
+    try:
+        require_root()
+        changes, backup = retarget_runtime(Path(args.runtime_file), Path(args.release_root))
+    except (RecoveryError, release.ReleaseError, OSError, ValueError) as cop:
+        fail(str(cop))
+    for key, status, value in changes:
+        print(f"{key} {status} {value}")
+    print(f"backup {backup}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -731,6 +861,18 @@ def build_parser() -> argparse.ArgumentParser:
     activate.add_argument("--retained-delivery", required=True)
     activate.add_argument("--docker-host", default=SUPPORTED_DOCKER_HOST)
     activate.set_defaults(func=cmd_activate)
+    retarget = sub.add_parser(
+        "retarget",
+        help="point an existing runtime configuration at a newly imported release",
+        description=(
+            "Rewrite the release identity keys of an existing runtime configuration "
+            "to a release root created by release.py import. Other lines stay "
+            "byte-identical; the previous file is kept as <runtime-file>.before-<commit>. Run as root."
+        ),
+    )
+    retarget.add_argument("--runtime-file", required=True, help="existing runtime.env to rewrite")
+    retarget.add_argument("--release-root", required=True, help="install root of the imported release")
+    retarget.set_defaults(func=cmd_retarget)
     return parser
 
 

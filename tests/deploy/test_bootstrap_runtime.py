@@ -26,6 +26,7 @@ from support import (
     WEBUI_SYNTHETIC_SHA,
     committed_up_fixture,
     default_config_id,
+    git_init_commit,
     intended_docs,
     seed_healthy_host,
     seed_images,
@@ -170,7 +171,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.env["OCU_SANDBOX_DNS"] = ""
         self.env.update(IMAGES)
         self.inventory = write_release_for_sha(
-            self.root / "release.json",
+            self.deploy_root / "release.json",
             self.sha,
             self.webui_sha,
         )
@@ -796,7 +797,69 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
             timeout=20,
         )
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("proxy image " + runtime["OCU_PROXY_IMAGE"] + " has unverified engine image identity", result.stderr)
         self.assertEqual(existing.read_text(encoding="utf-8"), "keep-me\n")
+
+    def write_version_record(self, env):
+        return subprocess.run(
+            ["bash", str(WRITE_VERSION)], cwd=str(ROOT), env=env,
+            capture_output=True, text=True, check=False, timeout=20,
+        )
+
+    def separate_release_root(self) -> Path:
+        release_root = self.root / "release-next"
+        source = release_root / "source"
+        source.mkdir(parents=True)
+        committed_up_fixture(source, lock_dir=self.state / "image-store-lock")
+        (source / "IDENTITY").write_text("next release\n", encoding="utf-8")
+        sha = git_init_commit(source, "next release")
+        self.assertNotEqual(sha, self.sha)
+        write_release_for_sha(release_root / "release.json", sha, self.webui_sha)
+        return release_root
+
+    def test_version_record_follows_the_selected_release_root(self):
+        created = self.run_bootstrap()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        release_root = self.separate_release_root()
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(release_root / "source"), text=True
+        ).strip()
+        runtime = self.runtime_path().read_text(encoding="utf-8")
+        runtime = runtime.replace(f"SOURCE_SHA={self.sha}\n", f"SOURCE_SHA={sha}\n")
+        runtime = runtime.replace(
+            f"OCU_RELEASE_MANIFEST={self.inventory}\n",
+            f"OCU_RELEASE_MANIFEST={release_root / 'release.json'}\n",
+        )
+        self.runtime_path().write_text(runtime, encoding="utf-8")
+        env = dict(self.env)
+        env.pop("OCU_RELEASE_MANIFEST")
+        result = self.write_version_record(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = (self.deploy_root / "DEPLOYED_VERSION.md").read_text(encoding="utf-8")
+        self.assertIn(sha, record)
+        self.assertNotIn(self.sha, record)
+
+    def test_version_record_follows_a_symlinked_recovery_source(self):
+        created = self.run_bootstrap()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        selected = self.root / "selected-source"
+        os.rename(self.deploy_root / "source", selected)
+        (self.deploy_root / "source").symlink_to(selected)
+        result = self.write_version_record(dict(self.env))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.sha, (self.deploy_root / "DEPLOYED_VERSION.md").read_text(encoding="utf-8"))
+
+    def test_version_record_refuses_a_manifest_without_its_source(self):
+        created = self.run_bootstrap()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        release_root = self.separate_release_root()
+        shutil.rmtree(release_root / "source")
+        env = dict(self.env)
+        env["OCU_RELEASE_MANIFEST"] = str(release_root / "release.json")
+        result = self.write_version_record(env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(release_root / "source"), result.stderr)
+        self.assertFalse((self.deploy_root / "DEPLOYED_VERSION.md").exists())
 
 
 

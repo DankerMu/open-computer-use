@@ -13,6 +13,8 @@ python3 deploy/recovery.py restore --recovery-set <backup-dir> --destination-roo
 python3 deploy/recovery.py activate --destination-root <restored-root> --retained-delivery <previous-release-delivery>
 ```
 
+To point a deployment that was not restored at a newly imported release, use `recovery.py retarget`; see [Upgrading an existing deployment](production-like-test/NETWORK-HARDENING.md#upgrading-an-existing-deployment).
+
 `backup` inspects actual stack images, Compose identity and sandbox mounts against
 the selected runtime/release before stopping anything. OCU and DocumentServer must
 still be running when maintenance begins; do not stop them before invoking backup.
