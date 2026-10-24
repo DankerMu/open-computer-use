@@ -10,12 +10,11 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 deploy_root=${DEPLOY_ROOT:-/opt/ai-workbench-test/open-computer-use}
-source_dir="$deploy_root/source"
 runtime_file="$deploy_root/config/runtime.env"
 output_file="$deploy_root/DEPLOYED_VERSION.md"
 
-if [ ! -d "$source_dir/.git" ] || [ ! -r "$runtime_file" ]; then
-    printf '%s\n' 'source checkout or protected runtime configuration is missing' >&2
+if [ ! -r "$runtime_file" ]; then
+    printf '%s\n' 'protected runtime configuration is missing' >&2
     exit 1
 fi
 
@@ -23,10 +22,21 @@ env_value() {
     sed -n "s/^$1=//p" "$runtime_file"
 }
 
-source_sha=$(git -C "$source_dir" rev-parse HEAD)
 manifest=${OCU_RELEASE_MANIFEST:-$(env_value OCU_RELEASE_MANIFEST)}
 if [ -z "$manifest" ]; then
     printf '%s\n' 'OCU_RELEASE_MANIFEST is required' >&2
+    exit 1
+fi
+# The selected release's own checkout sits next to its manifest; after an
+# upgrade it is a separate install root, not $deploy_root/source.
+if ! release_root=$(CDPATH='' cd -- "$(dirname -- "$manifest")" 2>/dev/null && pwd -P); then
+    printf '%s\n' "release root of $manifest is missing" >&2
+    exit 1
+fi
+manifest="$release_root/$(basename -- "$manifest")"
+source_dir="$release_root/source"
+if [ ! -d "$source_dir/.git" ]; then
+    printf '%s\n' "source checkout is missing: expected $source_dir next to $manifest" >&2
     exit 1
 fi
 generated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
