@@ -95,6 +95,17 @@ with the old epoch becomes `orphaned`, and reopening creates a new session/key.
 Final closed/error/orphaned records remain final. A late callback from an old
 session cannot overwrite restored workspace content.
 
+Before `.restored`, `restore` checks the broker state of each live chat that has a
+restored `ocu_chat_state` cursor. A missing `.ocu/index.json` under a positive
+cursor is refused. Otherwise the selected release's broker reads and validates the
+restored index without scanning `outputs/` or writing the index: an index that is
+not valid JSON is refused, an index the broker rejects is refused with the
+broker's error, and a cursor greater than the index counter is refused. Broker
+file IDs, revisions and counters stay exactly as captured. Files in `outputs/`
+that the index does not record, because an agent added, deleted or resized them
+after the chat's last listing, do not fail restore; the chat's first listing after
+activation indexes them, as it would have on the source.
+
 An epoch write or synchronization failure prevents `.restored`, success output
 and application startup. A post-replacement synchronization failure may leave the
 new token visible in the owned, unready target; it does not imply rollback.

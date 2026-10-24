@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
-"""In-image scan, capture, extract, marker probe, and first recovered broker listing."""
+"""In-image scan, capture, extract, marker probe, and read-only broker revision probe."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 
 
-def _listing(chat_dir: Path, chat_id: str) -> dict:
+def _revision(chat_dir: Path, chat_id: str) -> dict:
     os.environ["BASE_DATA_DIR"] = str(chat_dir)
     os.environ.pop("DOCKER_HOST", None)
     os.environ.pop("DOCKER_CONTEXT", None)
@@ -24,7 +24,7 @@ def _listing(chat_dir: Path, chat_id: str) -> dict:
     import outputs_broker
 
     docker_manager.BASE_DATA_DIR = chat_dir
-    return outputs_broker.OutputsBroker().reconcile(chat_id)
+    return {"revision": outputs_broker.OutputsBroker().current_revision(chat_id)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,12 +44,12 @@ def main(argv: list[str] | None = None) -> int:
     extract.add_argument("target")
     probe = sub.add_parser("probe")
     probe.add_argument("path")
-    listing = sub.add_parser("listing")
-    listing.add_argument("chat_dir")
-    listing.add_argument("chat_id")
+    revision = sub.add_parser("revision")
+    revision.add_argument("chat_dir")
+    revision.add_argument("chat_id")
     args = parser.parse_args(argv)
-    if args.command == "listing":
-        payload = _listing(Path(args.chat_dir), args.chat_id)
+    if args.command == "revision":
+        payload = _revision(Path(args.chat_dir), args.chat_id)
         sys.stdout.write(json.dumps(payload, separators=(",", ":")))
         return 0
     sys.path.insert(0, str(Path(__file__).resolve().parent))

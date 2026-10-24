@@ -1968,6 +1968,69 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self.assertNotEqual(lead.returncode, 0)
         self.assertIn("leads recovered broker counter", lead.stderr)
 
+    def _backup_and_restore(self, name):
+        backup = self.root / f"{name}-backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / f"{name}-provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        dest = self.root / f"{name}-root"
+        restored = self.run_cli(
+            ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+             "--provider-file", str(provider)],
+            extra={"FAKE_DOCKER_STATE": str(self._seed_restore_target(f"{name}-state"))},
+        )
+        return restored, dest
+
+    def _assert_drift_restores_captured_index(self, name, drift):
+        index = self.chat_dir / CHAT_ID / ".ocu" / "index.json"
+        drift(self.chat_dir / CHAT_ID / "outputs")
+        captured = index.read_bytes()
+        restored, dest = self._backup_and_restore(name)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertTrue((dest / ".restored").exists())
+        self.assertEqual(index.read_bytes(), captured)
+        self.assertEqual((dest / "data" / "chat" / CHAT_ID / ".ocu" / "index.json").read_bytes(), captured)
+
+    def test_file_added_after_last_listing_restores_captured_index(self):
+        self._assert_drift_restores_captured_index(
+            "drift-added", lambda outputs: (outputs / "unindexed.txt").write_bytes(b"agent\n"))
+
+    def test_indexed_file_deleted_after_last_listing_restores_captured_index(self):
+        self._assert_drift_restores_captured_index(
+            "drift-deleted", lambda outputs: (outputs / "result.txt").unlink())
+
+    def test_indexed_file_grown_after_last_listing_restores_captured_index(self):
+        self._assert_drift_restores_captured_index(
+            "drift-grown",
+            lambda outputs: (outputs / "result.txt").write_bytes(b"broker-bytes\ngrown by an agent\n"))
+
+    def test_missing_index_under_positive_cursor_refuses_before_restored(self):
+        shutil.rmtree(self.chat_dir / CHAT_ID / ".ocu")
+        restored, dest = self._backup_and_restore("missing-index")
+        self.assertNotEqual(restored.returncode, 0)
+        self.assertIn(f"chat {CHAT_ID} cursor 2 leads recovered broker counter 0", restored.stderr)
+        self.assertFalse((dest / ".restored").exists())
+
+    def test_malformed_index_refuses_before_restored(self):
+        (self.chat_dir / CHAT_ID / ".ocu" / "index.json").write_bytes(b"{not json\n")
+        restored, dest = self._backup_and_restore("malformed-index")
+        self.assertNotEqual(restored.returncode, 0)
+        self.assertIn("JSONDecodeError", restored.stderr)
+        self.assertFalse((dest / ".restored").exists())
+
+    def test_index_rejected_by_selected_broker_refuses_with_its_cause(self):
+        index = self.chat_dir / CHAT_ID / ".ocu" / "index.json"
+        payload = json.loads(index.read_text(encoding="utf-8"))
+        del payload["active"]["result.txt"]["file_id"]
+        index.write_text(json.dumps(payload), encoding="utf-8")
+        restored, dest = self._backup_and_restore("rejected-index")
+        self.assertNotEqual(restored.returncode, 0)
+        self.assertIn("selected-release broker", restored.stderr)
+        self.assertIn("broker active entry has an invalid schema", restored.stderr)
+        self.assertFalse((dest / ".restored").exists())
+
     def test_activation_uses_selected_up_and_leaves_sandboxes_stopped(self):
         backup = self.root / "backup"
         self.assertNotIn("OCU_RELEASE_FONTS_DIR=", self.runtime.read_text())
@@ -3176,6 +3239,66 @@ class IndexSnapshotTests(unittest.TestCase):
         )
 
 
+class RevisionProbeTests(unittest.TestCase):
+    def setUp(self):
+        import recovery_resources
+
+        self.resources = recovery_resources
+        self.context = tmp_dir()
+        self.chat_dir = Path(self.context.name) / "chat"
+        (self.chat_dir / CHAT_ID / "outputs").mkdir(parents=True)
+        self.env = os.environ.copy()
+        self.env["DOCKER_HOST"] = "unix:///tmp/ocu-recovery-fixture-no-docker.sock"
+
+    def tearDown(self):
+        self.context.cleanup()
+
+    def _probe(self):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "deploy" / "recovery_helper.py"), "revision",
+             str(self.chat_dir), CHAT_ID],
+            cwd=ROOT / "computer-use-server", env=self.env, capture_output=True, text=True,
+        )
+
+    def test_probe_reports_counter_without_indexing_new_files(self):
+        (self.chat_dir / CHAT_ID / "outputs" / "indexed.txt").write_bytes(b"indexed\n")
+        subprocess.run(
+            [sys.executable, "-c",
+             "import sys, outputs_broker; outputs_broker.OutputsBroker().reconcile(sys.argv[1])",
+             CHAT_ID],
+            env={**self.env, "BASE_DATA_DIR": str(self.chat_dir),
+                 "PYTHONPATH": str(ROOT / "computer-use-server")},
+            capture_output=True, text=True, check=True,
+        )
+        index = self.chat_dir / CHAT_ID / ".ocu" / "index.json"
+        captured = index.read_bytes()
+        self.assertEqual(json.loads(captured)["counter"], 1)
+        (self.chat_dir / CHAT_ID / "outputs" / "unindexed.txt").write_bytes(b"agent\n")
+        result = self._probe()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"revision":1}')
+        self.assertEqual(index.read_bytes(), captured)
+
+    def test_probe_without_index_reports_zero_and_creates_none(self):
+        result = self._probe()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"revision":0}')
+        self.assertFalse((self.chat_dir / CHAT_ID / ".ocu").exists())
+
+    def test_probe_counter_differing_from_recovered_index_is_refused(self):
+        snapshot = {"counter": 3, "active": {}, "missing": False}
+        with patch.object(self.resources, "_index_snapshot", return_value=snapshot), patch.object(
+            self.resources, "run_broker_helper",
+            return_value=subprocess.CompletedProcess([], 0, stdout='{"revision":4}', stderr=""),
+        ):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                self.resources._broker_revision(self.chat_dir, CHAT_ID, "helper:image")
+        self.assertEqual(
+            str(raised.exception),
+            f"chat {CHAT_ID} broker revision 4 differs from recovered index counter 3",
+        )
+
+
 class CursorLagChatIdTests(unittest.TestCase):
     def setUp(self):
         import recovery_resources
@@ -3194,13 +3317,13 @@ class CursorLagChatIdTests(unittest.TestCase):
         with patch.object(
             self.resources, "_index_snapshot", side_effect=refuse("_index_snapshot")
         ) as snapshot, patch.object(
-            self.resources, "_broker_listing", side_effect=refuse("_broker_listing")
-        ) as listing:
+            self.resources, "_broker_revision", side_effect=refuse("_broker_revision")
+        ) as revision:
             with self.assertRaises(recovery.RecoveryError) as raised:
                 self.resources._require_cursor_lag(restored, self.chat_dir, "helper:image")
         self.assertEqual(str(raised.exception), "invalid chat id '../x'")
         snapshot.assert_not_called()
-        listing.assert_not_called()
+        revision.assert_not_called()
 
     def test_mixed_case_live_chat_id_is_read_under_its_canonical_id(self):
         restored = {
@@ -3211,11 +3334,11 @@ class CursorLagChatIdTests(unittest.TestCase):
         with patch.object(
             self.resources, "_index_snapshot", return_value=indexed
         ) as snapshot, patch.object(
-            self.resources, "_broker_listing", return_value={"revision": 2, "files": []}
-        ) as listing:
+            self.resources, "_broker_revision", return_value=2
+        ) as revision:
             self.resources._require_cursor_lag(restored, self.chat_dir, "helper:image")
         snapshot.assert_called_once_with(self.chat_dir, "chat-mixed")
-        listing.assert_called_once_with(self.chat_dir, "chat-mixed", "helper:image")
+        revision.assert_called_once_with(self.chat_dir, "chat-mixed", "helper:image")
 
 
 if __name__ == "__main__":

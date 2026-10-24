@@ -1478,35 +1478,40 @@ def _volume_has_marker(volume: str, image: str) -> bool:
     return result.returncode == 0
 
 
-def _broker_listing(chat_dir: Path, chat_id: str, image: str) -> dict:
+def _broker_revision(chat_dir: Path, chat_id: str, image: str) -> int:
+    """Validate the restored index with the selected release's broker without scanning outputs."""
     chat_id = recovery.canonical_chat_id(chat_id)
     before = _index_snapshot(chat_dir, chat_id)
     if before["missing"] and before["counter"] == 0:
-        return {"revision": 0, "files": []}
+        return 0
     result = run_broker_helper(
         image,
         [(str(chat_dir), "/chat", "rw")],
-        ["listing", "/chat", chat_id],
+        ["revision", "/chat", chat_id],
     )
     if result.returncode != 0:
-        raise RecoveryError(f"selected-release broker listing failed: {_helper_detail(result)}")
+        raise RecoveryError(f"selected-release broker revision probe failed: {_helper_detail(result)}")
     raw = result.stdout or ""
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
     try:
-        listing = json.loads(raw)
-    except json.JSONDecodeError as cop:
-        raise RecoveryError("selected-release broker listing returned malformed JSON") from cop
+        revision = int(json.loads(raw)["revision"])
+    except (ValueError, KeyError, TypeError) as cop:
+        raise RecoveryError("selected-release broker revision probe returned malformed output") from cop
+    if revision != before["counter"]:
+        raise RecoveryError(
+            f"chat {chat_id} broker revision {revision} differs from recovered index counter {before['counter']}"
+        )
     after = _index_snapshot(chat_dir, chat_id)
     if after["counter"] != before["counter"]:
-        raise RecoveryError(f"chat {chat_id} first recovered listing rewrote broker identity")
+        raise RecoveryError(f"chat {chat_id} broker revision probe rewrote broker identity")
     for path, entry in before["active"].items():
         restored = after["active"].get(path)
         if restored is None or restored.get("file_id") != entry.get("file_id"):
-            raise RecoveryError(f"chat {chat_id} recovered listing changed file identity")
+            raise RecoveryError(f"chat {chat_id} broker revision probe changed file identity")
         if restored.get("revision") != entry.get("revision"):
-            raise RecoveryError(f"chat {chat_id} recovered listing changed revision identity")
-    return listing
+            raise RecoveryError(f"chat {chat_id} broker revision probe changed revision identity")
+    return revision
 
 
 def _index_snapshot(chat_dir: Path, chat_id: str) -> dict:
@@ -1540,8 +1545,7 @@ def _require_cursor_lag(restored: dict, chat_dir: Path, image: str) -> None:
                     f"chat {chat_id} cursor {cursor} leads recovered broker counter 0"
                 )
             continue
-        listing = _broker_listing(chat_dir, chat_id, image)
-        counter = int(listing["revision"])
+        counter = _broker_revision(chat_dir, chat_id, image)
         if cursor > counter:
             raise RecoveryError(
                 f"chat {chat_id} cursor {cursor} leads recovered broker counter {counter}"
