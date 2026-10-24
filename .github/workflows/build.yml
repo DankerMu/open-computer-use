@@ -252,6 +252,7 @@ jobs:
           pytest tests/test_auth_guard.py -v
           pytest tests/test_upload_claim.py tests/test_tools.py -v
           python -m unittest discover -s tests/deploy -v
+          python -m pytest tests/test_files_headers.py -v
 
   smoke-mcp-endpoint:
     name: Smoke — POST /mcp returns 200
