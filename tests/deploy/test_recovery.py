@@ -3279,7 +3279,7 @@ class RevisionProbeTests(unittest.TestCase):
         self.assertEqual(result.stdout, '{"revision":1}')
         self.assertEqual(index.read_bytes(), captured)
 
-    def test_probe_without_index_reports_zero_and_creates_none(self):
+    def test_probe_without_index_reports_zero_and_creates_no_index(self):
         result = self._probe()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '{"revision":0}')
@@ -3297,6 +3297,22 @@ class RevisionProbeTests(unittest.TestCase):
             str(raised.exception),
             f"chat {CHAT_ID} broker revision 4 differs from recovered index counter 3",
         )
+
+    def test_probe_malformed_output_is_refused(self):
+        snapshot = {"counter": 3, "active": {}, "missing": False}
+        for stdout in ("", "[]", '{"rev":1}'):
+            with self.subTest(stdout=stdout), patch.object(
+                self.resources, "_index_snapshot", return_value=snapshot
+            ), patch.object(
+                self.resources, "run_broker_helper",
+                return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr=""),
+            ):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    self.resources._broker_revision(self.chat_dir, CHAT_ID, "helper:image")
+                self.assertEqual(
+                    str(raised.exception),
+                    "selected-release broker revision probe returned malformed output",
+                )
 
 
 class CursorLagChatIdTests(unittest.TestCase):
