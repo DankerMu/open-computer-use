@@ -58,12 +58,7 @@ class RetargetTests(unittest.TestCase):
         self.source = self.release_root / "source"
         self.source.mkdir(parents=True)
         self.sha = committed_up_fixture(self.source)
-        write_release_for_sha(
-            self.release_root / "release.json",
-            self.sha,
-            NEW_WEBUI_SHA,
-            images={role: {"reference": new_reference(role)} for role in RUNTIME_IMAGE_VARS},
-        )
+        self.write_release()
         self.deploy_root = self.root / "deploy-root"
         self.config = self.deploy_root / "config"
         self.config.mkdir(parents=True)
@@ -91,6 +86,14 @@ class RetargetTests(unittest.TestCase):
 
     def tearDown(self):
         self.context.cleanup()
+
+    def write_release(self):
+        write_release_for_sha(
+            self.release_root / "release.json",
+            self.sha,
+            NEW_WEBUI_SHA,
+            images={role: {"reference": new_reference(role)} for role in RUNTIME_IMAGE_VARS},
+        )
 
     def write_runtime(self, lines, *, raw: str | None = None):
         text = raw if raw is not None else "".join(f"{k}={v}\n" for k, v in lines)
@@ -259,6 +262,78 @@ class RetargetTests(unittest.TestCase):
         self.assertTrue(self.runtime.is_symlink())
         self.assertEqual(target.read_bytes(), self.before)
         self.assertEqual({p.name for p in self.config.iterdir()}, names)
+
+    def test_missing_final_newline_is_refused(self):
+        self.write_runtime(None, raw="".join(f"{k}={v}\n" for k, v in self.lines).rstrip("\n"))
+        self.assert_refused("LF-terminated")
+
+    def test_unsupported_source_contract_is_refused(self):
+        script = self.source / "deploy" / "release.py"
+        text = script.read_text(encoding="utf-8")
+        literal = f"SOURCE_CONSUMER_CONTRACT = {release.SOURCE_CONSUMER_CONTRACT}\n"
+        self.assertIn(literal, text)
+        script.write_text(text.replace(literal, "SOURCE_CONSUMER_CONTRACT = 99\n"), encoding="utf-8")
+        self.sha = git_init_commit(self.source, "unsupported contract")
+        self.write_release()
+        self.assert_refused("source consumer contract 99 is unsupported")
+
+    def test_directory_at_runtime_path_is_refused(self):
+        self.runtime.unlink()
+        self.runtime.mkdir(mode=0o700)
+        names = {p.name for p in self.config.iterdir()}
+        code, stdout, stderr = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(stderr.splitlines()), 1, stderr)
+        self.assertIn("must be a regular file", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertTrue(self.runtime.is_dir())
+        self.assertEqual(list(self.runtime.iterdir()), [])
+        self.assertEqual({p.name for p in self.config.iterdir()}, names)
+
+    def test_failed_backup_copy_leaves_no_backup(self):
+        names = {p.name for p in self.config.iterdir()}
+        with patch.object(recovery.shutil, "copyfileobj", side_effect=OSError("injected copy failure")):
+            with self.assertRaises(OSError):
+                recovery.retarget_runtime(self.runtime, self.release_root)
+        self.assert_unchanged(names)
+
+    def test_cancellation_after_replacement_keeps_the_backup(self):
+        real_replace = os.replace
+
+        def replace_then_cancel(source, dest):
+            real_replace(source, dest)
+            raise SystemExit(143)
+
+        with patch.object(recovery.os, "replace", side_effect=replace_then_cancel):
+            with self.assertRaises(SystemExit) as raised:
+                recovery.retarget_runtime(self.runtime, self.release_root)
+        self.assertEqual(raised.exception.code, 143)
+        self.assertEqual(self.backup_path().read_bytes(), self.before)
+        self.assertIn(f"SOURCE_SHA={self.sha}\n", self.runtime.read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(p.name for p in self.config.iterdir()),
+            sorted(["runtime.env", self.backup_path().name]),
+        )
+
+    def test_short_write_is_refused_and_names_the_backup(self):
+        real_write = recovery.write_private_bytes
+
+        def short_write(path, data, mode=0o600):
+            real_write(path, data[:-1], mode)
+
+        with patch.object(recovery, "write_private_bytes", side_effect=short_write):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.retarget_runtime(self.runtime, self.release_root)
+        self.assertIn(str(self.backup_path()), str(raised.exception))
+        self.assertEqual(self.backup_path().read_bytes(), self.before)
+        published = self.runtime.read_text(encoding="utf-8")
+        self.assertIn(f"SOURCE_SHA={self.sha}\n", published)
+        self.assertFalse(published.endswith("\n"))
+        self.assertEqual(
+            sorted(p.name for p in self.config.iterdir()),
+            sorted(["runtime.env", self.backup_path().name]),
+        )
 
     def test_failure_before_replacement_removes_backup_and_staging(self):
         names = {p.name for p in self.config.iterdir()}

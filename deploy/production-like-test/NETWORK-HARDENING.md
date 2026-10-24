@@ -223,7 +223,7 @@ WebUI overlay 打开既有 `OFFLINE_MODE` / `ENABLE_VERSION_UPDATE_CHECK=false` 
 
 An upgrade keeps the deployment's data and configuration where they are: `$DEPLOY_ROOT/config/`, `$DEPLOY_ROOT/data/` and the Docker volumes. Each release gets its own install root, because `release.py import` refuses an existing one. `OCU_RELEASE_MANIFEST` in `runtime.env` selects the running release. `deploy/up.sh` and `write-deployed-version.sh` use the `source` checkout next to that manifest. On a fresh install the release root is `$DEPLOY_ROOT` itself.
 
-Run steps 2 to 7 as root on the deployment host.
+Run steps 2 to 7 as root on the deployment host, with `DEPLOY_ROOT` exported as the deployment root (default `/opt/ai-workbench-test/open-computer-use`).
 
 1. Build the release from committed OCU and WebUI checkouts, as in the quick start above.
 2. Transfer the delivery directory to the deployment host. Compare `sha256sum release.json` on both hosts, then check the bundle and archives against it from the current release's source checkout:
@@ -239,8 +239,8 @@ Run steps 2 to 7 as root on the deployment host.
    python3 deploy/release.py import --delivery <delivery> --install-root "$new_root"
    ```
 
-   `import` copies the source bundle, fonts and image archives into a private staging directory before loading them, so the disk needs room for about twice the delivery plus the loaded images. It deletes its staged copies when it finishes. You can delete the delivery once the import has succeeded.
-4. Point `runtime.env` at the new root with the new release's own `recovery.py`:
+   `import` copies the source bundle, fonts and image archives into a private staging directory before loading them, so the disk needs room for about twice the delivery plus the loaded images. It deletes its staged copies when it finishes. Keep the delivery of every release you may later restore or activate: `recovery.py restore` and `activate` take it as `--retained-delivery`, and the recovery set holds no image archives ([BACKUP-RESTORE.md](../BACKUP-RESTORE.md)).
+4. If you may need the newer release's database changes undone, first take a cold backup with the current release's `recovery.py backup` ([BACKUP-RESTORE.md](../BACKUP-RESTORE.md)). It must run before this step: `backup` checks the running containers against the release that `runtime.env` names, and refuses once `runtime.env` names the new release. It leaves the writers stopped until step 5's `up.sh`. Then point `runtime.env` at the new root with the new release's own `recovery.py`:
 
    ```bash
    python3 "$new_root/source/deploy/recovery.py" retarget \
@@ -252,13 +252,13 @@ Run steps 2 to 7 as root on the deployment host.
 6. Run `deploy/production-like-test/scripts/write-deployed-version.sh`. `$DEPLOY_ROOT/DEPLOYED_VERSION.md` now names the new OCU and WebUI commits.
 7. Check: `up.sh` stderr shows `deploy: proxy restarted for …`. `docker ps` shows `computer-use-server`, `open-webui`, `proxy`, `postgres`, `retention-guard` and `documentserver` running. `${OCU_PROXY_PORT}` and `${OCU_OFFICE_PROXY_PORT}` answer through the proxy. If the release needs the initializer re-run, continue with the #590 section.
 
-Rollback: the backup named after the release you upgraded to holds the previous configuration. Copy it back, then repeat steps 5 and 6. The preamble now changes into the previous root's `source`.
+Rollback: the backup named after the release you upgraded to holds the previous configuration. Copy it back and repeat step 5; the preamble now changes into the previous root's `source`. Then run the newer root's version writer by absolute path, `"$new_root/source/deploy/production-like-test/scripts/write-deployed-version.sh"`, instead of step 6: it reads the manifest from `runtime.env` and the `source` next to it, while the writer of a release older than #626 reads `$DEPLOY_ROOT/source`.
 
 ```bash
 install -m 0600 "$DEPLOY_ROOT/config/runtime.env.before-<new-12-hex>" "$DEPLOY_ROOT/config/runtime.env"
 ```
 
-If the previous release predates #612, its `up.sh` does not restart the proxy. Run the manual `docker compose … restart proxy` from [部署入口与端口边界](#部署入口与端口边界) as well. Rollback restores configuration and images, not data: database changes made by the newer release stay. Take a cold backup ([BACKUP-RESTORE.md](../BACKUP-RESTORE.md)) before step 5 if you may need them undone. To upgrade to the same release again later, move that backup aside first, because `retarget` refuses an existing backup name.
+If the previous release predates #612, its `up.sh` does not restart the proxy. Run the manual `docker compose … restart proxy` from [部署入口与端口边界](#部署入口与端口边界) as well. Rollback restores configuration and images, not data: database changes made by the newer release stay. Undoing them needs the cold backup from step 4. To upgrade to the same release again later, move the `runtime.env.before-<new-12-hex>` file aside first, because `retarget` refuses an existing backup name.
 
 Old release roots are not removed automatically. Delete a previous root by hand only after the new release has passed its checks and you will not roll back to it. Never delete the root that `OCU_RELEASE_MANIFEST` names, and never delete `$DEPLOY_ROOT`, which also holds the data.
 

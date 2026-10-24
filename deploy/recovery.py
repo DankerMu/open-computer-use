@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -476,15 +477,19 @@ def write_runtime_values(dest: Path, values: dict[str, str]) -> None:
         os.replace(staged, dest)
     except BaseException as cop:
         staged.unlink(missing_ok=True)
+        if isinstance(cop, (SystemExit, KeyboardInterrupt)):
+            raise
         raise RecoveryError(
             "selected release identity was not published to the target runtime"
         ) from cop
 
 
-def verify_published_runtime(dest: Path, inventory: dict) -> dict[str, str]:
-    """Protect, re-read and check a replaced runtime file against its release."""
+def verify_published_runtime(dest: Path, inventory: dict, values: dict[str, str]) -> dict[str, str]:
+    """Protect, re-read and check a replaced runtime file against its values and release."""
     try:
         os.chmod(dest, 0o600)
+        if dest.read_bytes() != render_dotenv(values).encode("utf-8"):
+            raise RecoveryError(f"{dest}: published bytes differ from the rendered configuration")
         published = parse_dotenv(dest)
         release.verify_runtime_binding(inventory, published)
     except (OSError, RecoveryError, release.ReleaseError) as cop:
@@ -542,14 +547,19 @@ def retarget_runtime(runtime_file: Path, release_root: Path) -> tuple[list[tuple
         raise RecoveryError(
             f"{backup} already exists; move it aside to retarget to this release again"
         )
-    copy_private(runtime_file, backup)
+    original = runtime_file.lstat()
     try:
+        copy_private(runtime_file, backup)
         write_runtime_values(runtime_file, values)
     except BaseException:
-        backup.unlink(missing_ok=True)
+        # os.replace gives runtime_file the staged inode; until then the backup is a spare copy.
+        # An unreadable runtime path keeps the backup; the original exception still propagates.
+        with contextlib.suppress(OSError):
+            if os.path.samestat(runtime_file.lstat(), original):
+                backup.unlink(missing_ok=True)
         raise
     try:
-        verify_published_runtime(runtime_file, inventory)
+        verify_published_runtime(runtime_file, inventory, values)
     except RecoveryError as cop:
         raise RecoveryError(f"{cop}; previous configuration kept at {backup}") from cop
     changes = [

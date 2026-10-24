@@ -988,7 +988,7 @@ def persist_selected_runtime_identity(
     values.update(recovery.selected_runtime_identity(inventory, manifest))
     release.verify_runtime_binding(inventory, values)
     recovery.write_runtime_values(dest, values)
-    published = recovery.verify_published_runtime(dest, inventory)
+    published = recovery.verify_published_runtime(dest, inventory, values)
     if published.get("OCU_RELEASE_MANIFEST") != str(manifest):
         raise RecoveryError("published target runtime does not name the selected inventory")
     return published
