@@ -621,6 +621,35 @@ def test_store_write_failures_stay_explicit(office_world, monkeypatch):
     assert origin.hits == 0
 
 
+def test_out_of_space_state_write_is_transient_storage_low(office_world, monkeypatch):
+    http, data, origin, _docker, _broker = office_world
+    import office.store as store_mod
+    _file_id, first = _created(office_world, "editing")
+    original_write = store_mod.os.write
+    faults = {"count": 0}
+
+    def fill_disk(fd, payload):
+        if payload[:1] == b"{":
+            faults["count"] += 1
+            raise OSError(errno.ENOSPC, "injected full chat filesystem")
+        return original_write(fd, payload)
+
+    before = _snapshot(data)
+    with monkeypatch.context() as trap:
+        trap.setattr(store_mod.os, "write", fill_disk)
+        for _ in range(2):
+            response = _status(http, first["session_id"])
+            _assert_refusal(response, 503, "storage_low")
+            assert response.content == b'{"reason":"storage_low"}'
+    assert faults["count"] == 2
+    assert _snapshot(data) == before
+
+    resumed = _status_fields(http, first["session_id"])
+    assert (resumed["session_id"], resumed["state"], resumed["reason"]) == (first["session_id"], "editing", None)
+    assert _snapshot(data) != before
+    assert origin.hits == 0
+
+
 def test_oversized_file_reports_true_without_content_read(office_world, monkeypatch):
     http, data, origin, _docker, _broker = office_world
     import office.workspace as workspace

@@ -577,7 +577,9 @@ def session_status(request: Request) -> JSONResponse:
         return JSONResponse(status_code=500, content=extra.public_detail())
     except StateDurabilityError:
         return _error(500, "state_durability")
-    except OSError:
+    except OSError as extra:
+        if extra.errno == errno.ENOSPC:
+            return _error(503, "storage_low")
         return _error(500, "state_corrupt")
     return JSONResponse(status_code=200, content=status)
 
