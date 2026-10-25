@@ -16,7 +16,8 @@ const API_LOAD_TIMEOUT_MS = 10000;
 const POLL_DELAY_MS = 1000;
 // An OCU restart or proxy blip must not end the editor; retries stay bounded only by its lifetime.
 const POLL_BACKOFF_MAX_MS = 10000;
-// The gateway's static upstream answers these while OCU is down; the broker never sends them as a verdict.
+// The gateway answers these while OCU is down, and OCU's status read answers 503 storage_low on a full disk;
+// after the first status they are retried, before it they end the editor.
 const TRANSIENT_STATUS_CODES = new Set([502, 503, 504]);
 const AUTO_SAVE_DELAY_MS = 5 * 60 * 1000;
 
