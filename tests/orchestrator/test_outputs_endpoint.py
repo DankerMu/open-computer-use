@@ -489,6 +489,51 @@ def test_injected_broker_errors_map_without_false_success(tmp_path, monkeypatch)
         assert restored.json()["files"][0]["path"] == "keep.txt"
 
 
+@pytest.mark.parametrize(
+    ("target", "fault", "status", "retry_after"),
+    (
+        ("recover", "enospc", 503, "1"),
+        ("reconcile", "enospc", 503, "1"),
+        ("recover", "storage_low", 503, "1"),
+        ("recover", "eio", 500, None),
+        ("reconcile", "eio", 500, None),
+    ),
+)
+def test_out_of_space_listing_is_transient_and_other_os_errors_stay_500(
+    tmp_path, monkeypatch, target, fault, status, retry_after
+):
+    with _isolated_app(tmp_path) as (loaded, _docker_manager, _broker_module, data):
+        from office.versions import StorageLowError
+
+        _put(data, "keep.txt", b"keep")
+        http = _client(loaded)
+        assert http.get(_list_url(), headers=_auth()).status_code == 200
+        host_file = "/host/path/.office/state.json" if target == "recover" else "/host/path/.ocu/index.json"
+        exc = {
+            "enospc": OSError(errno.ENOSPC, "No space left on device", host_file),
+            "storage_low": StorageLowError(f"below floor at {host_file}"),
+            "eio": OSError(errno.EIO, "I/O error", host_file),
+        }[fault]
+
+        def boom(*_args, **_kwargs):
+            raise exc
+
+        if target == "recover":
+            monkeypatch.setattr(loaded, "recover_publications", boom)
+        else:
+            monkeypatch.setattr(loaded._OUTPUTS_BROKER, "reconcile", boom)
+        response = http.get(_list_url(), headers={**_auth(), "If-None-Match": "*"})
+        assert response.status_code == status
+        detail = str(response.json()["detail"])
+        assert detail == GENERIC_FAILURE
+        assert "/host/path" not in detail
+        assert response.headers.get("Retry-After") == retry_after
+        monkeypatch.undo()
+        restored = http.get(_list_url(), headers=_auth())
+        assert restored.status_code == 200
+        assert restored.json()["files"][0]["path"] == "keep.txt"
+
+
 def _container(name, status="running", container_id="cid-1"):
     container = MagicMock(name=name)
     container.name = name

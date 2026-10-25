@@ -12,6 +12,7 @@ See /docs for Swagger UI, /redoc for ReDoc, / for HTML documentation.
 
 import os
 import asyncio
+import errno
 import html as html_module
 import hashlib
 import json
@@ -98,6 +99,7 @@ from outputs_broker import (
 )
 from office.publish import RecoveryRequiredError, SandboxStateError, recover_publications
 from office.store import StateCorruptError, StateDurabilityError
+from office.versions import StorageLowError
 import docker
 import skill_manager
 
@@ -115,7 +117,9 @@ def _outputs_http_error(exc: BaseException) -> HTTPException:
         status = 409
     elif isinstance(exc, CursorError):
         status = 400
-    elif isinstance(exc, UnstableReadError):
+    elif isinstance(exc, (UnstableReadError, StorageLowError)):
+        status = 503
+    elif isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
         status = 503
     elif isinstance(exc, LimitExceededError):
         status = 413
@@ -949,7 +953,7 @@ async def list_outputs(
         raise _outputs_http_error(UnstableReadError(str(exc))) from exc
     except (CommittedCloseError, StateCorruptError, StateDurabilityError) as extra:
         raise _outputs_http_error(extra) from extra
-    except (OutputsBrokerError, OSError) as extra:
+    except (OutputsBrokerError, OSError, StorageLowError) as extra:
         raise _outputs_http_error(extra) from extra
     response.headers["ETag"] = listing["etag"]
     if _if_none_match_hits(if_none_match, listing["etag"]):
