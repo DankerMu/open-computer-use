@@ -2385,6 +2385,7 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
             extra=extra,
         )
         self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(self._assert_placeholder_probes(target_state), 1)
         matching, matching_payload, _matching_source = self._write_retained_delivery("matching-b")
         other, other_payload, _other_source = self._write_retained_delivery("incompatible-c")
         self.assertNotEqual(matching_payload["ocu_source_sha"], other_payload["ocu_source_sha"])
@@ -2442,6 +2443,7 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
             extra=extra,
         )
         self.assertEqual(activated.returncode, 0, activated.stderr)
+        self.assertGreater(self._assert_placeholder_probes(target_state), 1)
         installed = json.loads((dest / "release.json").read_text(encoding="utf-8"))
         self.assertEqual(installed["ocu_source_sha"], matching_payload["ocu_source_sha"])
         persisted = {}
@@ -2826,6 +2828,65 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         )
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertTrue((dest / ".restored").exists())
+
+    def _assert_placeholder_probes(self, state: Path) -> int:
+        runs = json.loads((state / "runs.json").read_text(encoding="utf-8"))
+        probes = [
+            row
+            for row in runs
+            if "-c" in row["command"]
+            and "ScriptDirectory" in row["command"][row["command"].index("-c") + 1]
+        ]
+        for probe in probes:
+            self.assertEqual(
+                probe["env"], {"WEBUI_SECRET_KEY": "recovery-migration-probe-placeholder"}
+            )
+            self.assertEqual(probe["network"], "none")
+            self.assertIsNone(probe["env_file"])
+            self.assertEqual(probe["mounts"], [])
+        return len(probes)
+
+    def test_restore_refuses_target_database_holding_a_user_table(self):
+        backup = self.root / "backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self.root / "occupied-state"
+        target_state.mkdir()
+        seed_images(target_state)
+        seed_healthy_host(target_state)
+        write_network(target_state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+        write_network(target_state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+        write_fake_configs(target_state)
+        (target_state / "docker-info.json").write_text(json.dumps({"ID": "occupied-daemon"}), encoding="utf-8")
+        (target_state / "postgres-relations.json").write_text(
+            json.dumps(
+                [
+                    {"schema": "pg_toast", "name": "pg_toast_1255"},
+                    {"schema": "public", "name": "chat"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        dest = self.root / "occupied-root"
+        refused = self.run_cli(
+            [
+                "restore",
+                "--recovery-set",
+                str(backup),
+                "--destination-root",
+                str(dest),
+                "--provider-file",
+                str(provider),
+            ],
+            extra={"FAKE_DOCKER_STATE": str(target_state)},
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("target database is not empty", refused.stderr)
+        self.assertFalse((dest / ".restored").exists())
+        self.assertEqual(self._assert_placeholder_probes(target_state), 1)
 
     def _seed_model_links(self):
         workspace = self.state / "volume-data" / f"chat-{CHAT_ID}-workspace"
