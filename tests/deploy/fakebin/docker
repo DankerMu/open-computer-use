@@ -1660,6 +1660,9 @@ def docker_run(state: Path, argv: list[str]) -> int:
         save_containers(state, containers)
         db = load_database(state)
         payload = empty_database()
+        seeded = state / "postgres-relations.json"
+        if seeded.exists():
+            payload["relations"] = json.loads(seeded.read_text(encoding="utf-8"))
         if env_file:
             payload["env_file"] = env_file
             payload["env_file_mode"] = oct(stat.S_IMODE(Path(env_file).stat().st_mode))
@@ -1672,6 +1675,10 @@ def docker_run(state: Path, argv: list[str]) -> int:
     if entrypoint in {"/usr/local/bin/python3", "python3"} and "-c" in command:
         script = command[command.index("-c") + 1]
         if "ScriptDirectory" in script or "alembic.ini" in script:
+            if not env.get("WEBUI_SECRET_KEY"):
+                # WebUI env.py exits at import when WEBUI_AUTH is on and the key is empty.
+                sys.stderr.write("ValueError: Required environment variable not found. Terminating now.\n")
+                return 1
             graph_path = state / "migration-graph.json"
             if graph_path.exists():
                 graph = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -1737,8 +1744,22 @@ def execute_python_helper(
     return result.returncode
 
 
+# A fresh PostgreSQL 17 database holds pg_toast relations and nothing in user schemas.
+FRESH_RELATIONS = [
+    {"schema": "pg_toast", "name": "pg_toast_1255"},
+    {"schema": "pg_toast", "name": "pg_toast_1255_index"},
+    {"schema": "pg_toast", "name": "pg_toast_2618"},
+    {"schema": "pg_toast", "name": "pg_toast_2618_index"},
+]
+RESTORED_RELATIONS = [
+    {"schema": "public", "name": name}
+    for name in ("alembic_version", "chat", "config", "ocu_chat_state")
+]
+
+
 def empty_database() -> dict:
     return {
+        "relations": list(FRESH_RELATIONS),
         "alembic_revision": "e6f7a8b9c0d1",
         "server_version": "17.5",
         "extensions": ["plpgsql=1.0"],
@@ -1831,6 +1852,9 @@ def handle_postgres_command(state: Path, container: str, command: list[str], *, 
             record["server_version"] = restored.get("server_version") or record.get(
                 "server_version"
             )
+            record["relations"] = list(record.get("relations", FRESH_RELATIONS)) + list(
+                RESTORED_RELATIONS
+            )
             save_database(state, db)
         return 0, "", ""
     if command and command[0] in {"pg_dump", "pg_restore", "psql", "postgres"} and "--version" in command:
@@ -1880,6 +1904,18 @@ def handle_pg_isready(record: dict, state: Path, container: str, argv: list[str]
             return 0, "127.0.0.1:5432 - accepting connections\n", ""
         return 0, "openwebui:5432 - accepting connections\n", ""
     return 1, "", "no response"
+
+
+def count_relations(record: dict, text: str) -> tuple[int, str, str]:
+    """Evaluate the schema predicate the query actually carries."""
+    schemas = [item["schema"] for item in record.get("relations", FRESH_RELATIONS)]
+    if "WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema';" in text:
+        kept = [name for name in schemas if not name.startswith("pg_") and name != "information_schema"]
+    elif "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema');" in text:
+        kept = [name for name in schemas if name not in {"pg_catalog", "information_schema"}]
+    else:
+        return 1, "", "unsupported pg_class predicate"
+    return 0, f"{len(kept)}\n", ""
 
 
 def handle_psql(record: dict, sql: str, state: Path, container: str, argv: list[str]) -> tuple[int, str, str]:
@@ -1947,7 +1983,7 @@ def handle_psql(record: dict, sql: str, state: Path, container: str, argv: list[
     if "to_regclass" in text:
         return 0, "ocu_chat_state\n", ""
     if "FROM pg_class" in text:
-        return 0, "0\n", ""
+        return count_relations(record, text)
     if "FROM config" in text:
         if any(token in text for token in (" data", "ORDER BY id", "FROM config ORDER BY id")) and "json_build_object" not in text:
             return 1, "", 'column "data" does not exist'

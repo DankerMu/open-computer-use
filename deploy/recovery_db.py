@@ -48,7 +48,7 @@ ORPHAN_DELETE = (
 EMPTY_DB_QUERY = (
     "SELECT count(*) FROM pg_class c "
     "JOIN pg_namespace n ON n.oid = c.relnamespace "
-    "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema');"
+    "WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema';"
 )
 MIGRATION_GRAPH_SCRIPT = (
     "from alembic.config import Config\n"
@@ -330,6 +330,8 @@ def inspect_migration_graph(image: str) -> dict:
         "/usr/local/bin/python3",
         "--pull",
         "never",
+        "-e",
+        "WEBUI_SECRET_KEY=recovery-migration-probe-placeholder",
         image,
         "-c",
         MIGRATION_GRAPH_SCRIPT,

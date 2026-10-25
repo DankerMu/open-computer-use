@@ -152,6 +152,95 @@ class RecoveryDatabaseTests(unittest.TestCase):
         self.assertIn("cannot restore dump", str(tools.exception))
 
 
+    def _probe_runs(self) -> list[dict]:
+        runs = json.loads((self.state / "runs.json").read_text(encoding="utf-8"))
+        return [
+            row
+            for row in runs
+            if "-c" in row["command"]
+            and "ScriptDirectory" in row["command"][row["command"].index("-c") + 1]
+        ]
+
+    def _set_relations(self, relations: list[dict]) -> None:
+        path = self.state / "postgres.json"
+        db = json.loads(path.read_text(encoding="utf-8"))
+        db[self.container]["relations"] = relations
+        path.write_text(json.dumps(db), encoding="utf-8")
+
+    def _dump(self) -> Path:
+        dump = self.root / "openwebui.dump"
+        dump.write_text(
+            json.dumps(
+                {
+                    "chats": ["chat-restored"],
+                    "alembic_revision": "e6f7a8b9c0d1",
+                    "server_version": "17.5",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return dump
+
+    def test_migration_probe_receives_only_the_placeholder_secret(self):
+        graph = recovery_db.inspect_migration_graph(DEFAULT_RELEASE_IMAGES["open-webui"])
+        self.assertEqual(graph["heads"], ["e6f7a8b9c0d1"])
+        self.assertEqual(
+            graph["revisions"], {"e6f7a8b9c0d1": "d4c1a8e37b62", "d4c1a8e37b62": ""}
+        )
+        probes = self._probe_runs()
+        self.assertEqual(len(probes), 1)
+        probe = probes[0]
+        self.assertEqual(
+            probe["env"], {"WEBUI_SECRET_KEY": "recovery-migration-probe-placeholder"}
+        )
+        self.assertEqual(probe["network"], "none")
+        self.assertIsNone(probe["env_file"])
+        self.assertEqual(probe["mounts"], [])
+
+    def test_probe_without_a_graph_still_refuses(self):
+        message = "selected WebUI image did not report a migration graph"
+        schema = {"alembic_revision": "e6f7a8b9c0d1"}
+        with self.assertRaises(recovery.RecoveryError) as failed:
+            recovery_db.require_compatible_revision(schema, "ocu-open-webui:not-loaded")
+        self.assertEqual(str(failed.exception), message)
+        (self.state / "migration-graph.json").write_text(
+            json.dumps({"heads": [], "revisions": {}}), encoding="utf-8"
+        )
+        with self.assertRaises(recovery.RecoveryError) as empty:
+            recovery_db.require_compatible_revision(schema, DEFAULT_RELEASE_IMAGES["open-webui"])
+        self.assertEqual(str(empty.exception), message)
+
+    def test_restore_accepts_target_holding_only_system_relations(self):
+        self._set_relations(
+            [
+                {"schema": "pg_toast", "name": "pg_toast_1255"},
+                {"schema": "pg_toast", "name": "pg_toast_1255_index"},
+                {"schema": "pg_temp_3", "name": "scratch"},
+                {"schema": "pg_toast_temp_3", "name": "pg_toast_16390"},
+                {"schema": "pg_catalog", "name": "pg_class"},
+                {"schema": "information_schema", "name": "sql_features"},
+            ]
+        )
+        recovery_db.restore_database(self.container, self._dump())
+        restored = recovery_db.inspect_restored_state(self.container)
+        self.assertEqual(restored["live_chats"], ["chat-restored"])
+
+    def test_restore_refuses_target_holding_user_relations(self):
+        for relation in (
+            {"schema": "public", "name": "t"},
+            {"schema": "public", "name": "s"},
+            {"schema": "app", "name": "v"},
+            {"schema": "pgx", "name": "t"},
+        ):
+            with self.subTest(relation=relation):
+                self._set_relations([{"schema": "pg_toast", "name": "pg_toast_1255"}, relation])
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    recovery_db.restore_database(self.container, self._dump())
+                self.assertEqual(str(raised.exception), "target database is not empty")
+                restored = recovery_db.inspect_restored_state(self.container)
+                self.assertEqual(restored["live_chats"], ["chat-live"])
+
+
 class RecoveryDatabaseEnvironmentTests(unittest.TestCase):
     def test_successful_recovery_restores_complete_environment(self):
         observed_docker = []
