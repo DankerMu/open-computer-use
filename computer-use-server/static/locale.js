@@ -63,6 +63,7 @@ export const TRANSLATIONS = {
     // Terminal
     starting_terminal: 'Запуск терминала...',
     terminal_fail: 'Не удалось запустить терминал (контейнер не найден)',
+    terminal_refused: 'Терминал не запущен: {detail}',
     server_fail: 'Не удалось подключиться к серверу',
     restore_fail: 'Не удалось восстановить контейнер',
     container_stopped: 'Контейнер остановлен',
@@ -168,6 +169,7 @@ export const TRANSLATIONS = {
     // Terminal
     starting_terminal: 'Starting terminal...',
     terminal_fail: 'Failed to start terminal (container not found)',
+    terminal_refused: 'Terminal not started: {detail}',
     server_fail: 'Failed to connect to server',
     restore_fail: 'Failed to restore container',
     container_stopped: 'Container stopped',

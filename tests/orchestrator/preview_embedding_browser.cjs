@@ -58,7 +58,7 @@ async function captureProductionPreviews(docserverOrigin) {
     const captures = captured.responses;
     secretCanaries = captured.secretCanaries;
     assert(Array.isArray(secretCanaries) && secretCanaries.length === 6);
-    if (!Array.isArray(captures) || captures.length !== 36)
+    if (!Array.isArray(captures) || captures.length !== 42)
       throw new Error('production preview capture omitted required prefix/mode responses');
     const byRoute = new Map();
     for (const response of captures) {
@@ -72,7 +72,8 @@ async function captureProductionPreviews(docserverOrigin) {
       for (const query of ['', '?embed=files', '?embed=files&embed=files', '?embed=browser',
         '?embed=browser&embed=browser', '?embed=terminal', '?embed=unknown', '?embed=office',
         '?embed=office&embed=office', '?embed=office&embed=files',
-        '?embed=office&office_fixture=absent', '?embed=office&office_fixture=blank'])
+        '?embed=office&office_fixture=absent', '?embed=office&office_fixture=blank',
+        '?embed=terminal&model=m-1', '?model=m-1'])
         assert(byRoute.has(prefix + query), `missing production preview capture: ${prefix}${query}`);
     }
     return byRoute;
@@ -148,6 +149,9 @@ const socketMessages = [];
 const upgradeAttempts = [];
 let browserFixture = 'inactive';
 let terminalFixture = 'inactive';
+const GATEWAY_DETAIL = 'Claude Code gateway: the chat has no usable model id (1-256 printable ASCII ' +
+  'characters without spaces); select a model and reopen the terminal';
+const startBody = row => JSON.parse(row.body);
 const FAULT_DETAIL = '9222/tcp publication on 172.31.0.1 was accepted by the engine but never assigned a host port; gateway publication is unsupported on this engine profile (computer-use-server/README.md, Sandbox network host support)';
 let browserPagesHeld = false;
 let upgradesHeld = false;
@@ -369,6 +373,14 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === `${prefix}/terminal/${CHAT}/heartbeat`)
       return respond(res, 200, '{"ok":true}');
     if (url.pathname === `${prefix}/terminal/${CHAT}/start-ttyd` && req.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      record.body = Buffer.concat(chunks).toString('utf8');
+      if (terminalFixture === 'refused' || terminalFixture === 'refused-nonstring') {
+        record.status = 422;
+        return respond(res, 422, JSON.stringify({ detail: terminalFixture === 'refused'
+          ? GATEWAY_DETAIL : [{ loc: ['body', 'model'], msg: GATEWAY_DETAIL }] }));
+      }
       if (terminalFixture === 'stopped') {
         record.status = 503;
         return respond(res, 503, '{}');
@@ -905,7 +917,7 @@ async function main() {
         expectedRuntimeFailures.push(text);
         return;
       }
-      if (text.includes('503') &&
+      if ((text.includes('503') || (text.includes('422') && terminalFixture.startsWith('refused'))) &&
           (url.includes(`/terminal/${CHAT}/start-ttyd`) || text.includes(`/terminal/${CHAT}/start-ttyd`))) {
         expectedRuntimeFailures.push(text);
         return;
@@ -2265,6 +2277,109 @@ async function main() {
     await retireFrame();
     await waitUntil(() => activeSockets.size === 0, 'terminal status-error socket cleanup');
     terminalFixture = 'inactive';
+    const statusErrorStart = requests.slice(beforeTerminalStatusError).find(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd`);
+    assert.deepEqual(startBody(statusErrorStart), { dangerous_mode: false },
+      'terminal embed without a model parameter sent a model');
+
+    const beforeModelStart = requests.length;
+    const messagesBeforeModelStart = socketMessages.length;
+    await page.evaluate(() => window.mount('?embed=terminal&model=m-1'));
+    await frame().locator('.dash-btn-primary').click();
+    await waitUntil(() => socketMessages.slice(messagesBeforeModelStart).some(row =>
+      row.path === `/ocu/terminal/${CHAT}/ws` && row.method === 'ttyd-init') &&
+      activeSockets.size === 1, 'terminal start with a model');
+    const modelStarts = requests.slice(beforeModelStart).filter(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd`);
+    assert.deepEqual(modelStarts.map(startBody), [{ dangerous_mode: false, model: 'm-1' }],
+      'terminal start omitted the model parameter');
+    await retireFrame();
+    await waitUntil(() => activeSockets.size === 0, 'terminal model socket cleanup');
+
+    terminalFixture = 'stopped';
+    const beforeModelRecovery = requests.length;
+    const messagesBeforeModelRecovery = socketMessages.length;
+    await page.evaluate(() => window.mount('?embed=terminal&model=m-1'));
+    await frame().locator('.dash-btn-primary').click();
+    await frame().getByText('Container stopped').waitFor();
+    terminalFixture = 'inactive';
+    await frame().locator('.dash-btn-primary').click();
+    await waitUntil(() => socketMessages.slice(messagesBeforeModelRecovery).some(row =>
+      row.path === `/ocu/terminal/${CHAT}/ws` && row.method === 'ttyd-init') &&
+      activeSockets.size === 1, 'recovered terminal start with a model');
+    assert.deepEqual(requests.slice(beforeModelRecovery).filter(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd`).map(startBody),
+    [{ dangerous_mode: false, model: 'm-1' }, { dangerous_mode: false, model: 'm-1' }],
+    'terminal recovery omitted the model parameter');
+    await retireFrame();
+    await waitUntil(() => activeSockets.size === 0, 'recovered model terminal socket cleanup');
+
+    terminalFixture = 'refused';
+    const beforeRefusal = requests.length;
+    const upgradesBeforeRefusal = upgradeAttempts.length;
+    await page.evaluate(() => window.mount('?embed=terminal'));
+    await frame().locator('.dash-btn-primary').click();
+    await frame().getByRole('alert').getByText(`Terminal not started: ${GATEWAY_DETAIL}`).waitFor();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const refusalRequests = requests.slice(beforeRefusal);
+    const refusalIndex = refusalRequests.findIndex(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd`);
+    assert(refusalIndex >= 0 && refusalRequests[refusalIndex].status === 422, 'gateway refusal was not a 422');
+    assert.deepEqual(startBody(refusalRequests[refusalIndex]), { dangerous_mode: false });
+    assert.equal(refusalRequests.slice(refusalIndex + 1).filter(row =>
+      row.path === `/ocu/terminal/${CHAT}/status` ||
+      row.path === `/ocu/terminal/${CHAT}/restart-container`).length, 0,
+    'gateway refusal probed the container status or restarted it');
+    assert.equal(upgradeAttempts.length, upgradesBeforeRefusal, 'gateway refusal opened a WebSocket');
+    assert.equal(await frame().locator('.dash-btn-primary').count(), 0, 'gateway refusal offered a recover action');
+    assert.equal(await frame().getByText('Container stopped').count(), 0);
+    await page.screenshot({ path: path.join(artifacts, 'embedded-terminal-gateway-refusal.png'), animations: 'disabled' });
+    await retireFrame();
+
+    terminalFixture = 'refused-nonstring';
+    const beforeOpaqueRefusal = requests.length;
+    await page.evaluate(() => window.mount('?embed=terminal&model=m-1'));
+    await frame().locator('.dash-btn-primary').click();
+    await frame().getByText('Failed to start terminal (container not found)').waitFor();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(await frame().getByText(GATEWAY_DETAIL, { exact: false }).count(), 0,
+      'non-string refusal detail reached the page');
+    const opaqueRequests = requests.slice(beforeOpaqueRefusal);
+    const opaqueIndex = opaqueRequests.findIndex(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd`);
+    assert(opaqueIndex >= 0 && opaqueRequests[opaqueIndex].status === 422);
+    assert.equal(opaqueRequests.slice(opaqueIndex + 1).filter(row =>
+      row.path === `/ocu/terminal/${CHAT}/status` ||
+      row.path === `/ocu/terminal/${CHAT}/restart-container`).length, 0,
+    'non-string refusal probed the container status or restarted it');
+    await retireFrame();
+
+    terminalFixture = 'stopped';
+    await page.evaluate(() => window.mount('?embed=terminal&model=m-1'));
+    await frame().locator('.dash-btn-primary').click();
+    await frame().getByText('Container stopped').waitFor();
+    terminalFixture = 'refused';
+    const beforeRecoveryRefusal = requests.length;
+    const upgradesBeforeRecoveryRefusal = upgradeAttempts.length;
+    await frame().locator('.dash-btn-primary').click();
+    await frame().getByRole('alert').getByText(`Terminal not started: ${GATEWAY_DETAIL}`).waitFor();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(await frame().getByText('Failed to restore container').count(), 0,
+      'recovery refusal showed the generic restore failure');
+    const recoveryRequests = requests.slice(beforeRecoveryRefusal);
+    assert.equal(recoveryRequests.filter(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/restart-container`).length, 1);
+    const recoveryStart = recoveryRequests.findIndex(row => row.method === 'POST' &&
+      row.path === `/ocu/terminal/${CHAT}/start-ttyd`);
+    assert(recoveryStart >= 0 && recoveryRequests[recoveryStart].status === 422);
+    assert.deepEqual(startBody(recoveryRequests[recoveryStart]), { dangerous_mode: false, model: 'm-1' });
+    assert.equal(recoveryRequests.slice(recoveryStart + 1).filter(row =>
+      row.path === `/ocu/terminal/${CHAT}/status`).length, 0, 'recovery refusal probed the container status');
+    assert.equal(upgradeAttempts.length, upgradesBeforeRecoveryRefusal, 'recovery refusal opened a WebSocket');
+    await retireFrame();
+    terminalFixture = 'inactive';
+    console.log(JSON.stringify({ terminalGateway: 'ok', model: true, recoveryModel: true, refusal: true,
+      opaqueRefusal: true, recoveryRefusal: true }));
 
     upgradesHeld = true;
     await page.evaluate(() => window.mount('?embed=terminal'));
@@ -2422,7 +2537,7 @@ async function main() {
       const beforeErrors = consoleErrors.length;
       standaloneFirstFile = options.firstFile || null;
       try {
-        await page.goto(`${origin}${prefix}/preview/${CHAT}`, {
+        await page.goto(`${origin}${prefix}/preview/${CHAT}${options.query || ''}`, {
           waitUntil: options.sanitizerRoute ? 'domcontentloaded' : 'load',
         });
         await page.locator('.file-selector-btn').waitFor();
@@ -3237,6 +3352,22 @@ async function main() {
       browserFixture = 'inactive';
     }
 
+    const beforeShellTerminal = requests.length;
+    const messagesBeforeShellTerminal = socketMessages.length;
+    const shellTerminalSession = await openStandalone('/ocu', { query: '?model=m-1' });
+    try {
+      await shellTerminalSession.page.locator('.view-tab').filter({ hasText: 'Sub-agent' }).click();
+      await shellTerminalSession.page.locator('.dash-btn-primary').click();
+      await waitUntil(() => socketMessages.slice(messagesBeforeShellTerminal).some(row =>
+        row.path === `/ocu/terminal/${CHAT}/ws` && row.method === 'ttyd-init'), 'standalone terminal start');
+      assert.deepEqual(requests.slice(beforeShellTerminal).filter(row => row.method === 'POST' &&
+        row.path === `/ocu/terminal/${CHAT}/start-ttyd`).map(startBody), [{ dangerous_mode: false }],
+      'standalone preview sent a model');
+    } finally {
+      await closeStandalone(shellTerminalSession);
+    }
+    await waitUntil(() => activeSockets.size === 0, 'standalone terminal socket cleanup');
+
     assert.equal(activeSockets.size, 0, 'sticky viewer case started with a connection');
     const messagesBeforeSticky = socketMessages.length;
     const stickySession = await openStandalone('/ocu');
@@ -3288,7 +3419,7 @@ async function main() {
       browserFixture = 'inactive';
     }
     console.log(JSON.stringify({ runtimeFault: 'ok', embeddedBrowser: true, shellBrowser: true,
-      terminal: true, terminalRecovery: true }));
+      terminal: true, terminalRecovery: true, shellTerminalWithoutModel: true }));
 
     const compatibilityResults = [];
     const compatibilityExpected = [];

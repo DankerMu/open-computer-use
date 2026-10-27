@@ -27,6 +27,8 @@ QUERIES = (
     "?embed=office&embed=files",
     "?embed=office&office_fixture=absent",
     "?embed=office&office_fixture=blank",
+    "?embed=terminal&model=m-1",
+    "?model=m-1",
 )
 PREFIXES = ("", "/ocu", "/tools/ocu")
 HEADERS = ("content-type", "cache-control", "content-security-policy", "x-content-type-options")

@@ -91,9 +91,8 @@ def _is_exact_auth_url(value: str) -> bool:
     return True
 
 
-def handshake_cookie(websocket: WebSocket) -> str | None:
-    headers = websocket.headers
-    cookie_header = headers.get("cookie")
+def token_cookie(cookie_header: str | None) -> str | None:
+    """Return the non-empty Open WebUI `token` cookie value, or None."""
     if not cookie_header or not cookie_header.strip():
         return None
     parsed = SimpleCookie()
@@ -105,6 +104,13 @@ def handshake_cookie(websocket: WebSocket) -> str | None:
     if morsel is None:
         return None
     if not morsel.value:
+        return None
+    return morsel.value
+
+
+def handshake_cookie(websocket: WebSocket) -> str | None:
+    cookie_header = websocket.headers.get("cookie")
+    if token_cookie(cookie_header) is None:
         return None
     return cookie_header
 

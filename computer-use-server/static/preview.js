@@ -16,6 +16,8 @@ import {
   startWorkspaceHeartbeat,
   loadCliBadge,
   recoverStoppedContainer,
+  terminalStartBody,
+  terminalRefusal,
   loadOutputsWindow,
   renderKey,
   pickAutoSelect,
@@ -34,6 +36,9 @@ const EMBED_MODE = embedParams.length === 0 ? 'standalone'
     && (['files', 'browser', 'terminal'].includes(embedParams[0])
       || embedParams[0] === 'office' && window.__CONFIG__.officeDocserverOrigin)
     && window.parent !== window ? embedParams[0] : 'invalid';
+// The framing chat's model reaches Claude Code in the terminal; other views never send it.
+const TERMINAL_MODEL = EMBED_MODE === 'terminal'
+  ? new URLSearchParams(location.search).get('model') || null : null;
 const EMBED_PAGES = 100;
 const EMBED_DEADLINE_MS = 10000;
 const DISCOVERY_REASONS = new Set([
@@ -1902,6 +1907,7 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
   const [selectMode, setSelectMode] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const faultRef = useRef(null);
+  const refusalRef = useRef('');
   const mountedRef = useRef(true);
   const timersRef = useRef(new Map());
   const reconnectTimerRef = useRef(null);
@@ -2037,9 +2043,16 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           signal: controller.signal,
-          body: JSON.stringify({ dangerous_mode: dangerousModeRef.current }),
+          body: terminalStartBody(dangerousModeRef.current, TERMINAL_MODEL),
         });
         if (cancelled || !mountedRef.current) return;
+        if (resp.status === 422) {
+          const detail = await terminalRefusal(resp);
+          if (cancelled || !mountedRef.current) return;
+          if (detail) { refusalRef.current = detail; setStartError('__refused__'); }
+          else setStartError(t('terminal_fail'));
+          return;
+        }
         if (!resp.ok) {
           if (!cancelled) {
             // Check if container is stopped (can be restarted) or removed with meta (can be resurrected)
@@ -2208,14 +2221,21 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     const isStopped = startError === '__stopped__';
     const isMetaExists = startError === '__meta_exists__';
     const isFault = startError === '__fault__';
+    const isRefused = startError === '__refused__';
     const canRecover = isStopped || isMetaExists;
 
     const handleRestart = async () => {
       if (!mountedRef.current) return;
       setRestarting(true);
       try {
-        const recovered = await recoverStoppedContainer(chatId, dangerousModeRef.current);
+        const recovered = await recoverStoppedContainer(chatId, dangerousModeRef.current, TERMINAL_MODEL);
         if (!mountedRef.current) return;
+        if (recovered.refused) {
+          refusalRef.current = recovered.refused;
+          setStartError('__refused__');
+          setRestarting(false);
+          return;
+        }
         if (recovered.ok) {
           const fault = await readTerminalFault();
           if (!mountedRef.current) return;
@@ -2232,20 +2252,21 @@ function TerminalSession({ chatId, resumeId, dangerousMode, onBack }) {
     };
 
     return html`
-      <div class="empty-state" role=${isFault ? 'alert' : null}>
+      <div class="empty-state" role=${isFault || isRefused ? 'alert' : null}>
         <div class="empty-icon" dangerouslySetInnerHTML=${{ __html: icon('terminal', 48) }}></div>
         <div class="empty-title">${
           isFault ? t('terminal_fault_title')
+          : isRefused ? t('terminal_refused', { detail: refusalRef.current })
           : isStopped ? t('container_stopped')
           : isMetaExists ? t('container_removed')
           : startError
         }</div>
-        <div class="empty-desc">${
+        ${!isRefused && html`<div class="empty-desc">${
           isFault ? t('runtime_fault_desc', { reason: faultRef.current.reason })
           : isStopped ? t('container_stopped_desc')
           : isMetaExists ? t('container_removed_desc')
           : t('container_generic_desc')
-        }</div>
+        }</div>`}
         ${isFault && html`<div class="empty-example runtime-fault-detail">${faultRef.current.detail}</div>`}
         ${canRecover && html`
           <button class="dash-btn-primary" onClick=${handleRestart} disabled=${restarting}>

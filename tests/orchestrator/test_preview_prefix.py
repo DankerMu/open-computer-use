@@ -843,6 +843,21 @@ async function run() {
     const failed = await api.recoverStoppedContainer('chat-1', false);
     return { ok, failed, calls: context.__calls };
   }
+  if (scenario === 'recover-gateway') {
+    let refusal = { detail: 'Claude Code gateway: the chat has no usable model id' };
+    context.__respond = async (url) => {
+      if (String(url).includes('restart-container')) return { ok: true, status: 200, json: async () => ({ state: 'running' }) };
+      if (refusal === null) return { ok: true, status: 200, json: async () => ({ already_running: false }) };
+      return { ok: false, status: 422, json: async () => refusal };
+    };
+    const refused = await api.recoverStoppedContainer('chat-1', false, 'm-1');
+    refusal = { detail: [{ loc: ['body', 'model'], msg: 'bad' }] };
+    const nonString = await api.recoverStoppedContainer('chat-1', true, null);
+    refusal = null;
+    const started = await api.recoverStoppedContainer('chat-1', false, 'vendor/model: v2');
+    const bodies = context.__calls.filter(row => row.url.endsWith('/start-ttyd')).map(row => JSON.parse(row.body));
+    return { refused, nonString, started, bodies, calls: context.__calls };
+  }
   if (scenario === 'listing') {
     const pages = {
       1: { files: [{ file_id: 'a', path: 'a.txt', revision: 7, type: 'text' }], revision: 7, next_cursor: '7:100', total: 101 },
@@ -1125,6 +1140,23 @@ def test_both_stopped_branches_use_restart_alias_and_skip_ttyd_on_failure(tmp_pa
     assert recorded["ok"]["ok"] is True
     assert recorded["failed"]["ok"] is False
     assert urls.count("/ocu/terminal/chat-1/start-ttyd") == 1
+
+
+def test_recovery_sends_the_chat_model_and_reports_a_gateway_refusal(tmp_path):
+    recorded = _run_js_scenario(tmp_path, "recover-gateway")
+    assert recorded["bodies"] == [
+        {"dangerous_mode": False, "model": "m-1"},
+        {"dangerous_mode": True},
+        {"dangerous_mode": False, "model": "vendor/model: v2"},
+    ]
+    assert recorded["refused"]["ok"] is False
+    assert recorded["refused"]["refused"] == "Claude Code gateway: the chat has no usable model id"
+    assert recorded["nonString"]["ok"] is False
+    assert recorded["nonString"]["refused"] == ""
+    assert recorded["started"]["ok"] is True
+    assert "refused" not in recorded["started"]
+    urls = [row["url"] for row in recorded["calls"]]
+    assert not any("/status" in url for url in urls)
 
 
 def test_listing_keeps_later_pages_and_rejects_stale_generation(tmp_path):

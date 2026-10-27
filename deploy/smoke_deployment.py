@@ -822,7 +822,8 @@ def proxy_headers(origin: str, token: str) -> dict[str, str]:
 def start_product_terminal(origin: str, chat_id: str, token: str) -> None:
     global _PENDING_START
     url = f"{origin}/ocu/terminal/{chat_id}/start-ttyd"
-    body = json.dumps({"dangerous_mode": False}).encode("utf-8")
+    # Gateway mode needs a model; the smoke checks the bash default and never runs Claude Code.
+    body = json.dumps({"dangerous_mode": False, "model": "ocu-smoke-terminal"}).encode("utf-8")
     status, _headers, payload = http_request(
         url,
         method="POST",
