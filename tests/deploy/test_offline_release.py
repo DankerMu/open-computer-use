@@ -680,7 +680,9 @@ class OfflineReleaseTests(unittest.TestCase):
             "if occupied is not None:",
             "    state=Path(os.environ['FAKE_DOCKER_STATE'])/'images.json'",
             "    images=json.loads(state.read_text())",
-            "    images[f'ocu-build-postgres-{os.getpid()}']=occupied",
+            "    alias=release.build_scratch_reference('postgres')",
+            "    release.build_scratch_reference=lambda role: alias",
+            "    images[alias]=occupied",
             "    state.write_text(json.dumps(images))",
             "try:",
             "    record=release.export_built_image(role='postgres',plan=p,archive_dir=Path(sys.argv[2]))",
@@ -1050,6 +1052,114 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(destination.exists())
         self.assertFalse((self.state / "load-count").exists())
+
+    def engine_images(self):
+        return json.loads((self.state / "images.json").read_text())
+
+    def built_tags(self, role):
+        return [row["tag"] for row in self.recorded_builds()
+                if row["kind"] == "build" and row["tag"].startswith(f"ocu-build-{role}-")]
+
+    def build_seeded(self, seed: str, ocu: Path, webui: Path, dest: Path):
+        anchor = "    session = PublicationSession(destination)\n"
+        return self.build_with(self.patched_release((anchor, seed + anchor)), ocu, webui, dest)
+
+    def test_successful_build_retires_every_scratch_tag(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        destination = self.root / "scratch-free-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        built = [row["tag"] for row in self.recorded_builds() if row["kind"] == "build"]
+        self.assertEqual(len(built), 6)
+        images = self.engine_images()
+        self.assertEqual([name for name in images if name.startswith("ocu-build-")], [])
+        inventory = json.loads((destination / "release.json").read_text())
+        for record in inventory["images"].values():
+            self.assertEqual(images[record["reference"]]["Id"], record["configuration_digest"])
+        self.assertIn("postgres:17-alpine", images)
+
+    def test_failed_export_retires_the_scratch_tag_and_reports_the_original_error(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        (self.state / "save-script.json").write_text(json.dumps([{
+            "ConfigBytes": config_payload(digest_for("wrong-workspace-export")).decode(),
+        }]))
+        destination = self.root / "failed-export-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("engine image identity is not verified by the archive", result.stderr)
+        self.assertEqual(len(self.built_tags("workspace")), 1)
+        self.assertFalse(any(name.startswith("ocu-build-workspace-") for name in self.engine_images()))
+        self.assertFalse(destination.exists())
+
+    def test_build_failing_before_tagging_reports_its_error_and_removes_nothing(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        (self.state / "build-script.json").write_text(json.dumps({"message": "scripted build failure"}))
+        destination = self.root / "failed-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("scripted build failure", result.stderr)
+        self.assertFalse(any(" image rm " in line for line in ops(self.state)))
+        self.assertFalse(destination.exists())
+
+    def test_stale_scratch_tag_with_the_same_pid_is_not_a_conflict_and_is_kept(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        stale = {"Id": "sha256:" + "5" * 64, "Os": "linux", "Architecture": "amd64"}
+        seed = (
+            "    _path = Path(os.environ['FAKE_DOCKER_STATE']) / 'images.json'\n"
+            "    _images = json.loads(_path.read_text()) if _path.exists() else {}\n"
+            "    for _role in ROLE_ORDER:\n"
+            f"        _images[f'ocu-build-{{_role}}-{{os.getpid()}}'] = {stale!r}\n"
+            "    _path.write_text(json.dumps(_images))\n"
+        )
+        destination = self.root / "stale-scratch-build"
+        result = self.build_seeded(seed, ocu, webui, destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        remaining = {name: record for name, record in self.engine_images().items()
+                     if name.startswith("ocu-build-")}
+        [pid] = {name.rsplit("-", 1)[1] for name in remaining}
+        self.assertEqual(remaining, {f"ocu-build-{role}-{pid}": stale for role in ROLE_ORDER})
+
+    def test_scratch_names_are_unique_and_an_occupied_name_aborts_before_building(self):
+        first = release.build_scratch_reference("workspace")
+        second = release.build_scratch_reference("workspace")
+        self.assertNotEqual(first, second)
+        for name in (first, second):
+            self.assertRegex(name, rf"^ocu-build-workspace-{os.getpid()}-[0-9a-f]{{12}}$")
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        occupied = {"Id": "sha256:" + "6" * 64, "Os": "linux", "Architecture": "amd64"}
+        seeded = seed_images(self.state, {"ocu-build-occupied": occupied})
+        seed = "    globals()['build_scratch_reference'] = lambda role: 'ocu-build-occupied'\n"
+        destination = self.root / "occupied-scratch-build"
+        result = self.build_seeded(seed, ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("existing image ocu-build-occupied conflicts with the release", result.stderr)
+        self.assertEqual(self.engine_images(), seeded)
+        self.assertEqual(self.recorded_builds(), [])
+        self.assertFalse(any(" image rm " in line for line in ops(self.state)))
+        self.assertFalse(destination.exists())
+
+    def test_scratch_cleanup_failure_fails_success_and_warns_after_a_failure(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        (self.state / "image-rm-fail").touch()
+        destination = self.root / "cleanup-failed-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        [scratch] = self.built_tags("workspace")
+        self.assertIn(scratch, self.engine_images())
+        self.assertIn(scratch, result.stderr)
+        self.assertIn("image reference removal failed", result.stderr)
+        self.assertNotIn("may remain", result.stderr)
+        self.assertFalse(destination.exists())
+        (self.state / "save-script.json").write_text(json.dumps([{
+            "ConfigBytes": config_payload(digest_for("wrong-export-and-cleanup")).decode(),
+        }]))
+        destination = self.root / "export-and-cleanup-failed-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("engine image identity is not verified by the archive", result.stderr)
+        scratch = self.built_tags("workspace")[-1]
+        self.assertIn(f"{scratch} may remain", result.stderr)
+        self.assertFalse(destination.exists())
 
     def test_descriptor_store_build_uses_config_names_and_verified_final_archives(self):
         ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()

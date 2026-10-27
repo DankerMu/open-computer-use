@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -2306,116 +2307,143 @@ def plan_role(
         "materials": materials,
         "input_manifest_sha256": input_manifest_hash_from_entries(entries),
         "image_kind": spec["image_kind"],
-        "temp_tag": f"ocu-build-{role}-{os.getpid()}",
+        "temp_tag": build_scratch_reference(role),
     }
+
+
+def build_scratch_reference(role: str) -> str:
+    return f"ocu-build-{role}-{os.getpid()}-{secrets.token_hex(6)}"
 
 
 def export_built_image(*, role: str, plan: dict, archive_dir: Path) -> dict:
     temp_tag = plan["temp_tag"]
-    if plan["image_kind"] == "pull":
-        existing = existing_reference(temp_tag, upstream=True)
-        if existing is None:
-            pull_image(temp_tag)
-            payload = inspect_image(temp_tag)
-        else:
-            payload = existing
-    else:
+    built = plan["image_kind"] != "pull"
+    if built:
         reject_occupied_reference(temp_tag)
-        build_image(
-            context=plan["context"],
-            dockerfile=plan["dockerfile"],
-            tag=temp_tag,
-            arguments=plan["arguments"],
-        )
-        payload = inspect_image(temp_tag)
-    image_id, _platform = image_identity(payload)
-    export_reference = temp_tag
-    if "@sha256:" in temp_tag:
-        export_reference = f"ocu-build-{role}-{os.getpid()}"
-        reject_occupied_reference(export_reference)
-    archive_path = archive_dir / f"{role}.tar"
-    export_failure: BaseException | None = None
+    build_failure: BaseException | None = None
     try:
-        if export_reference != temp_tag:
-            tag_image(temp_tag, export_reference)
-        save_image(export_reference, archive_path)
-        initial = inspect_archive_bytes(archive_path)
+        if not built:
+            existing = existing_reference(temp_tag, upstream=True)
+            if existing is None:
+                pull_image(temp_tag)
+                payload = inspect_image(temp_tag)
+            else:
+                payload = existing
+        else:
+            build_image(
+                context=plan["context"],
+                dockerfile=plan["dockerfile"],
+                tag=temp_tag,
+                arguments=plan["arguments"],
+            )
+            payload = inspect_image(temp_tag)
+        image_id, _platform = image_identity(payload)
+        export_reference = temp_tag
+        if "@sha256:" in temp_tag:
+            export_reference = build_scratch_reference(role)
+            reject_occupied_reference(export_reference)
+        archive_path = archive_dir / f"{role}.tar"
+        export_failure: BaseException | None = None
+        try:
+            if export_reference != temp_tag:
+                tag_image(temp_tag, export_reference)
+            save_image(export_reference, archive_path)
+            initial = inspect_archive_bytes(archive_path)
+        except BaseException as exc:
+            export_failure = exc
+            raise
+        finally:
+            if export_reference != temp_tag:
+                try:
+                    with _blocked_signals():
+                        owned = existing_reference(export_reference, identities={image_id})
+                        if owned is not None:
+                            require_command(
+                                docker("image", "rm", "--no-prune", export_reference),
+                                f"retire temporary export reference {export_reference}",
+                            )
+                except BaseException as cleanup_error:
+                    if export_failure is None:
+                        raise
+                    print(
+                        f"release: temporary export reference {export_reference} may remain; cleanup failed: {cleanup_error}",
+                        file=sys.stderr,
+                    )
+        aliases = alias_set(export_reference)
+        selected = next((initial[alias] for alias in aliases if alias in initial), None)
+        if selected is None or set(initial) != aliases:
+            raise ReleaseError(f"{role}: initial archive references do not match {temp_tag}")
+        if selected["platform"] != PLATFORM:
+            raise ReleaseError(f"{role}: initial archive platform is not {PLATFORM}")
+        if image_id not in accepted_image_identities(selected["digest"], selected["descriptor_digests"]):
+            raise ReleaseError(f"{role}: engine image identity is not verified by the archive")
+        reference = content_reference(role, selected["digest"])
+        reject_output_conflict(reference, selected)
+        archive_path.unlink()
+        if reference != temp_tag:
+            tag_image(temp_tag, reference)
+        save_image(reference, archive_path)
+        final = inspect_archive_bytes(archive_path)
+        if set(final) != alias_set(reference):
+            raise ReleaseError(f"{role}: final archive references do not match {reference}")
+        selected_final = final[reference]
+        if selected_final["digest"] != selected["digest"] or selected_final["platform"] != PLATFORM:
+            raise ReleaseError(f"{role}: final archive configuration or platform changed")
+        if image_id not in accepted_image_identities(selected_final["digest"], selected_final["descriptor_digests"]):
+            raise ReleaseError(f"{role}: final archive does not verify the engine image identity")
+        final_image_id, _platform = image_identity(inspect_image(reference))
+        if final_image_id not in accepted_image_identities(selected_final["digest"], selected_final["descriptor_digests"]):
+            raise ReleaseError(f"{role}: final reference has an unverified engine image identity")
+        repo_digests = payload.get("RepoDigests") or []
+        if not isinstance(repo_digests, list):
+            repo_digests = []
+        dockerfile = plan["dockerfile"]
+        source_root = plan["source_root"]
+        context = plan["context"]
+        record = {
+            "reference": reference,
+            "configuration_digest": selected_final["digest"],
+            "archive": {
+                "path": f"images/{role}.tar",
+                "sha256": sha256_file(archive_path),
+            },
+            "build": {
+                "dockerfile": str(dockerfile.relative_to(source_root)),
+                "dockerfile_sha256": sha256_file(dockerfile),
+                "context": str(context.relative_to(source_root))
+                if context != source_root
+                else ".",
+                "arguments": plan["arguments"],
+                "argument_defaults": plan["argument_defaults"],
+                "argument_overrides": plan["argument_overrides"],
+                "input_manifest_sha256": plan["input_manifest_sha256"],
+                "materials": plan["materials"],
+            },
+        }
+        if selected_final["descriptor_digests"]:
+            record["descriptor_digests"] = selected_final["descriptor_digests"]
+        if repo_digests:
+            record["registry_digests"] = [str(item) for item in repo_digests]
+        return record
     except BaseException as exc:
-        export_failure = exc
+        build_failure = exc
         raise
     finally:
-        if export_reference != temp_tag:
+        if built:
             try:
                 with _blocked_signals():
-                    owned = existing_reference(export_reference, identities={image_id})
-                    if owned is not None:
+                    if existing_reference(temp_tag) is not None:
                         require_command(
-                            docker("image", "rm", "--no-prune", export_reference),
-                            f"retire temporary export reference {export_reference}",
+                            docker("image", "rm", "--no-prune", temp_tag),
+                            f"retire build scratch reference {temp_tag}",
                         )
             except BaseException as cleanup_error:
-                if export_failure is None:
+                if build_failure is None:
                     raise
                 print(
-                    f"release: temporary export reference {export_reference} may remain; cleanup failed: {cleanup_error}",
+                    f"release: build scratch reference {temp_tag} may remain; cleanup failed: {cleanup_error}",
                     file=sys.stderr,
                 )
-    aliases = alias_set(export_reference)
-    selected = next((initial[alias] for alias in aliases if alias in initial), None)
-    if selected is None or set(initial) != aliases:
-        raise ReleaseError(f"{role}: initial archive references do not match {temp_tag}")
-    if selected["platform"] != PLATFORM:
-        raise ReleaseError(f"{role}: initial archive platform is not {PLATFORM}")
-    if image_id not in accepted_image_identities(selected["digest"], selected["descriptor_digests"]):
-        raise ReleaseError(f"{role}: engine image identity is not verified by the archive")
-    reference = content_reference(role, selected["digest"])
-    reject_output_conflict(reference, selected)
-    archive_path.unlink()
-    if reference != temp_tag:
-        tag_image(temp_tag, reference)
-    save_image(reference, archive_path)
-    final = inspect_archive_bytes(archive_path)
-    if set(final) != alias_set(reference):
-        raise ReleaseError(f"{role}: final archive references do not match {reference}")
-    selected_final = final[reference]
-    if selected_final["digest"] != selected["digest"] or selected_final["platform"] != PLATFORM:
-        raise ReleaseError(f"{role}: final archive configuration or platform changed")
-    if image_id not in accepted_image_identities(selected_final["digest"], selected_final["descriptor_digests"]):
-        raise ReleaseError(f"{role}: final archive does not verify the engine image identity")
-    final_image_id, _platform = image_identity(inspect_image(reference))
-    if final_image_id not in accepted_image_identities(selected_final["digest"], selected_final["descriptor_digests"]):
-        raise ReleaseError(f"{role}: final reference has an unverified engine image identity")
-    repo_digests = payload.get("RepoDigests") or []
-    if not isinstance(repo_digests, list):
-        repo_digests = []
-    dockerfile = plan["dockerfile"]
-    source_root = plan["source_root"]
-    context = plan["context"]
-    record = {
-        "reference": reference,
-        "configuration_digest": selected_final["digest"],
-        "archive": {
-            "path": f"images/{role}.tar",
-            "sha256": sha256_file(archive_path),
-        },
-        "build": {
-            "dockerfile": str(dockerfile.relative_to(source_root)),
-            "dockerfile_sha256": sha256_file(dockerfile),
-            "context": str(context.relative_to(source_root))
-            if context != source_root
-            else ".",
-            "arguments": plan["arguments"],
-            "argument_defaults": plan["argument_defaults"],
-            "argument_overrides": plan["argument_overrides"],
-            "input_manifest_sha256": plan["input_manifest_sha256"],
-            "materials": plan["materials"],
-        },
-    }
-    if selected_final["descriptor_digests"]:
-        record["descriptor_digests"] = selected_final["descriptor_digests"]
-    if repo_digests:
-        record["registry_digests"] = [str(item) for item in repo_digests]
-    return record
 
 
 def build_release(
