@@ -39,7 +39,9 @@ DOCUMENTSERVER = "documentserver"
 POSTGRES = "postgres"
 RETENTION = "retention-guard"
 CLEANUP = "cleanup"
-REQUIRED_RUNNING = (OCU, WEBUI, PROXY, POSTGRES, RETENTION, DOCUMENTSERVER)
+MESSAGES_INGRESS = "messages-ingress"
+REQUIRED_RUNNING = (OCU, WEBUI, PROXY, POSTGRES, RETENTION, DOCUMENTSERVER, MESSAGES_INGRESS)
+MESSAGES_TARGET = 8080
 PROXY_TARGET = "8082"
 OFFICE_PROXY_TARGET = "8083"
 OCU_TARGET = 8081
@@ -496,7 +498,8 @@ def parse_curl_writeout(text: str) -> dict[str, str]:
     return fields
 
 
-def sandbox_curl(container: str, url: str, *, connect: str = SANDBOX_CONNECT, maximum: str = SANDBOX_MAX) -> dict:
+def sandbox_curl(container: str, url: str, *, connect: str = SANDBOX_CONNECT, maximum: str = SANDBOX_MAX,
+                 request: tuple[str, ...] = ()) -> dict:
     argv = [
         "docker",
         "exec",
@@ -518,6 +521,7 @@ def sandbox_curl(container: str, url: str, *, connect: str = SANDBOX_CONNECT, ma
         "/dev/null",
         "-w",
         CURL_WRITE_OUT,
+        *request,
         url,
     ]
     result = run_cmd(argv, timeout=float(maximum) + 5)
@@ -585,6 +589,26 @@ def require_allowed(fields: dict[str, str]) -> None:
         fail(f"allowlisted egress HTTP status {status} is not success")
 
 
+def require_ingress_status(fields: dict[str, str], expected: int, name: str) -> None:
+    try:
+        code = int(fields.get("exitcode") or fields.get("process_exit"))
+        status = int(fields.get("http_code") or "0")
+    except (TypeError, ValueError):
+        fail(f"messages ingress {name}: write-out is malformed")
+    if code != 0 or status != expected:
+        fail(f"messages ingress {name}: HTTP status {status} (curl exit {code}), expected {expected}")
+
+
+def probe_messages_ingress(container: str, address: str) -> None:
+    base = f"http://{address}:{MESSAGES_TARGET}"
+    # No credentials: only Open WebUI answers 401, so 401 proves forwarding.
+    forwarded = sandbox_curl(container, f"{base}/api/v1/messages/count_tokens", request=(
+        "-X", "POST", "-H", "Content-Type: application/json", "--data", "{}"))
+    require_ingress_status(forwarded, 401, "count_tokens forwarding")
+    # Open WebUI would answer 401 here; the ingress's own 404 proves it refused locally.
+    require_ingress_status(sandbox_curl(container, f"{base}/api/v1/chats/"), 404, "local refusal")
+
+
 def exec_text(container: str, command: str, *, timeout: float = 10.0) -> subprocess.CompletedProcess:
     return docker(
         "exec",
@@ -632,8 +656,10 @@ def load_inputs() -> dict:
     if not egress_raw:
         fail("OCU_SMOKE_EGRESS_URL is required", 2)
     lan_raw = require_nonempty("OCU_SMOKE_HOST_LAN_IPV4")
+    messages_raw = require_nonempty("OCU_SANDBOX_MESSAGES_ADDRESS")
     try:
         lan = parse_ipv4_address("OCU_SMOKE_HOST_LAN_IPV4", lan_raw)
+        messages = parse_ipv4_address("OCU_SANDBOX_MESSAGES_ADDRESS", messages_raw)
         control = parse_ipv4_network("OCU_PRIVATE_SUBNET", os.environ["OCU_PRIVATE_SUBNET"])
         allow = parse_allowlist(os.environ["OCU_SANDBOX_EGRESS_ALLOW"])
     except NetworkInspectError as exc:
@@ -671,6 +697,7 @@ def load_inputs() -> dict:
         "documentserver_port": documentserver_port,
         "egress_url": f"http://{egress_host}:{egress_port}{egress_path}",
         "lan": str(lan),
+        "messages_address": str(messages),
     }
 
 
@@ -1070,6 +1097,7 @@ def run(argv: list[str]) -> int:
     for url in control_urls.values():
         require_http_status(url, allow_any=True)
     require_allowed(sandbox_curl(sandbox["id"], inputs["egress_url"]))
+    probe_messages_ingress(sandbox["id"], inputs["messages_address"])
     for name, url in control_urls.items():
         require_blocked(sandbox_curl(sandbox["id"], url), name)
     precheck_terminal(sandbox["id"])

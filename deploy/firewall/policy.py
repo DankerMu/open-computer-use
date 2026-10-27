@@ -33,6 +33,7 @@ REQUIRED_SYSCTLS = (
     "net.bridge.bridge-nf-call-ip6tables",
 )
 CTSTATE_ORDER = ("INVALID", "NEW", "RELATED", "ESTABLISHED", "UNTRACKED", "SNAT", "DNAT")
+MESSAGES_ADDRESS = "OCU_SANDBOX_MESSAGES_ADDRESS"
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -646,12 +647,38 @@ def _check_first_unique(parent: str, rules: list[list[str]], hook: list[str], co
         fail(f"{parent} has duplicate owned hooks to {target}")
 
 
+def validate_messages_address() -> None:
+    """Deployment preflight for the Messages ingress; reads the environment only."""
+    raw = os.environ.get(MESSAGES_ADDRESS, "")
+    if not raw.strip():
+        fail(f"{MESSAGES_ADDRESS} is required")
+    try:
+        address = parse_ipv4_address(MESSAGES_ADDRESS, raw)
+        subnet = parse_ipv4_network("OCU_SANDBOX_SUBNET", require_nonempty("OCU_SANDBOX_SUBNET"))
+        gateway = parse_ipv4_address("OCU_SANDBOX_GATEWAY", require_nonempty("OCU_SANDBOX_GATEWAY"))
+    except NetworkInspectError as exc:
+        fail(str(exc))
+    if address not in subnet:
+        fail(f"{MESSAGES_ADDRESS} is outside OCU_SANDBOX_SUBNET")
+    if address in (subnet.network_address, subnet.broadcast_address):
+        fail(f"{MESSAGES_ADDRESS} is the network or broadcast address of OCU_SANDBOX_SUBNET")
+    if address == gateway:
+        fail(f"{MESSAGES_ADDRESS} is OCU_SANDBOX_GATEWAY")
+    if "OCU_SANDBOX_EGRESS_ALLOW" not in os.environ:
+        fail(f"OCU_SANDBOX_EGRESS_ALLOW is unset; it must cover {MESSAGES_ADDRESS}")
+    allow = parse_allowlist(os.environ["OCU_SANDBOX_EGRESS_ALLOW"])
+    if not any(address in network for network in allow):
+        fail(f"{MESSAGES_ADDRESS} is not covered by OCU_SANDBOX_EGRESS_ALLOW")
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1] not in {"install", "check"}:
-        fail("usage: policy.py install|check")
+    if len(argv) != 2 or argv[1] not in {"install", "check", "messages-address"}:
+        fail("usage: policy.py install|check|messages-address")
     try:
         if argv[1] == "install":
             install()
+        elif argv[1] == "messages-address":
+            validate_messages_address()
         else:
             check()
     except SystemExit:

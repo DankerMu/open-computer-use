@@ -75,6 +75,7 @@ SERVICE_IMAGE_VARS = {
     "computer-use-server": "COMPUTER_USE_SERVER_IMAGE",
     "retention-guard": "RETENTION_GUARD_IMAGE",
     "proxy": "OCU_PROXY_IMAGE",
+    "messages-ingress": "OCU_PROXY_IMAGE",
     "open-webui": "OPENWEBUI_IMAGE",
     "postgres": "POSTGRES_IMAGE",
     "open-webui-init": "OPENWEBUI_IMAGE",

@@ -3,6 +3,8 @@
 #
 # Start after core and WebUI: nginx resolves service DNS names while validating
 # the rendered configuration. This stack has no application services.
+# messages-ingress is the only Compose service on the sandbox network (#655):
+# it forwards POST /api/v1/messages[/count_tokens] to open-webui and nothing else.
 
 services:
   proxy:
@@ -25,8 +27,27 @@ services:
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+  messages-ingress:
+    image: ${OCU_PROXY_IMAGE:?OCU_PROXY_IMAGE is required}
+    container_name: ocu-test-messages-ingress
+    # Static config shipped in the proxy image; render.py and its token never run here.
+    entrypoint: ["nginx", "-e", "stderr", "-p", "/var/lib/nginx/", "-c", "/opt/ocu-proxy/messages-ingress.conf"]
+    labels:
+      ocu.role: messages-ingress
+    networks:
+      default: {}
+      sandbox:
+        ipv4_address: ${OCU_SANDBOX_MESSAGES_ADDRESS:?OCU_SANDBOX_MESSAGES_ADDRESS is required}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
 networks:
   default:
     external: true
     name: ${OCU_PRIVATE_NETWORK:?OCU_PRIVATE_NETWORK is required}
+  sandbox:
+    external: true
+    name: ${OCU_SANDBOX_NETWORK:?OCU_SANDBOX_NETWORK is required}

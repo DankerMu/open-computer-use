@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
-# Resolve privately, preflight, provision, start upstream applications, then start and restart proxy.
+# Resolve privately, preflight, provision, start upstream applications, then start and restart proxy
+# and messages-ingress.
 set -euo pipefail
 set -m
 umask 077
@@ -261,6 +262,13 @@ then
 fi
 
 
+# The sandbox Messages ingress address must sit inside the sandbox subnet and
+# be covered by the egress allowlist (#655); check-ports.sh reads it too.
+export OCU_SANDBOX_MESSAGES_ADDRESS
+if ! run_owned python3 "$ROOT/deploy/firewall/policy.py" messages-address; then
+    printf '%s\n' 'deploy: OCU_SANDBOX_MESSAGES_ADDRESS check failed' >&2
+    exit 1
+fi
 if ! run_owned bash "$ROOT/deploy/check-ports.sh" \
     "$CONFIG_DIR/core.json" "$CONFIG_DIR/webui.json" "$CONFIG_DIR/proxy.json"; then
     printf '%s\n' 'deploy: publication check failed' >&2
@@ -300,8 +308,8 @@ start_stack "$ROOT" "$CONFIG_DIR/webui.up.json"
 start_stack "$OVERLAY" "$CONFIG_DIR/proxy.up.json"
 # nginx resolves its upstreams only at start; re-resolve against this run's backends.
 if ! run_owned docker compose -p "$PROJECT" --project-directory "$OVERLAY" \
-    --env-file "$CONFIG_DIR/empty.env" -f "$CONFIG_DIR/proxy.up.json" restart proxy; then
-    printf '%s\n' "deploy: proxy restart failed for ${CONFIG_DIR}/proxy.up.json" >&2
+    --env-file "$CONFIG_DIR/empty.env" -f "$CONFIG_DIR/proxy.up.json" restart proxy messages-ingress; then
+    printf '%s\n' "deploy: proxy and messages-ingress restart failed for ${CONFIG_DIR}/proxy.up.json" >&2
     exit 1
 fi
-printf '%s\n' "deploy: proxy restarted for ${CONFIG_DIR}/proxy.up.json" >&2
+printf '%s\n' "deploy: proxy and messages-ingress restarted for ${CONFIG_DIR}/proxy.up.json" >&2

@@ -9,6 +9,8 @@ import unittest
 
 from support import (
     DOCUMENTSERVER_SERVICE,
+    MESSAGES_ADDRESS,
+    MESSAGES_SERVICE,
     OCU_SERVICE,
     PROXY_SERVICE,
     SANDBOX_NETWORK,
@@ -250,6 +252,49 @@ class CheckPortsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(OCU_SERVICE, result.stderr)
         self.assertIn(SANDBOX_NETWORK, result.stderr)
+
+    def test_messages_ingress_is_the_only_sandbox_member(self):
+        result = self.check(intended_docs())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for defect in ("ports", "third-network", "other-address", "no-address",
+                       "no-control", "unset-address", "list-networks"):
+            with self.subTest(defect=defect):
+                docs = intended_docs()
+                proxy_doc = docs["proxy.json"]
+                ingress = proxy_doc["services"][MESSAGES_SERVICE]
+                extra_env = None
+                if defect == "ports":
+                    ingress["ports"] = [proxy_mapping(published="18080", target=8080)]
+                elif defect == "third-network":
+                    proxy_doc["networks"]["other"] = {"name": "other-bridge"}
+                    ingress["networks"]["other"] = None
+                elif defect == "other-address":
+                    ingress["networks"]["sandbox"] = {"ipv4_address": "172.31.0.200"}
+                elif defect == "no-address":
+                    ingress["networks"]["sandbox"] = None
+                elif defect == "no-control":
+                    ingress["networks"].pop("default")
+                elif defect == "unset-address":
+                    extra_env = {"OCU_SANDBOX_MESSAGES_ADDRESS": ""}
+                else:
+                    ingress["networks"] = ["default", "sandbox"]
+                result = self.check(docs, extra_env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(MESSAGES_SERVICE, result.stderr)
+
+    def test_other_services_on_the_sandbox_network_still_fail(self):
+        for owner, name in (("proxy.json", PROXY_SERVICE), ("core.json", "retention-guard"),
+                            ("webui.json", WEBUI_SERVICE), ("proxy.json", "messages-ingress-2")):
+            with self.subTest(name=name):
+                docs = intended_docs()
+                stack_doc = docs[owner]
+                stack_doc["networks"]["sandbox"] = {"name": SANDBOX_NETWORK, "external": True}
+                body = stack_doc["services"].setdefault(name, service(networks={"default": None}))
+                body["networks"] = {"default": None, "sandbox": {"ipv4_address": MESSAGES_ADDRESS}}
+                result = self.check(docs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stderr)
+                self.assertIn(SANDBOX_NETWORK, result.stderr)
 
     def test_proxy_must_share_control_plane_with_applications(self):
         docs = intended_docs()

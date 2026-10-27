@@ -2008,6 +2008,30 @@ class OfflineReleaseTests(unittest.TestCase):
         mutations = {"load", "pull", "build", "create", "up", "iptables-restore", "ip6tables-restore"}
         self.assertFalse(any(set(row.split()) & mutations for row in ops(self.state)[before_ops:]))
 
+    def test_messages_ingress_image_is_release_verified_before_mutation(self):
+        for case in ("mismatch", "missing"):
+            with self.subTest(case=case):
+                env, script, _source = prepare_up_context(self.state)
+                docs = intended_docs()
+                if case == "mismatch":
+                    docs["proxy.json"]["services"]["messages-ingress"]["image"] = "unselected-proxy:mutant"
+                else:
+                    docs["proxy.json"]["services"].pop("messages-ingress")
+                write_fake_configs(self.state, docs)
+                seed_healthy_host(self.state)
+                write_network(self.state, "ocu-test-private", subnet="172.30.0.0/24", gateway="172.30.0.1")
+                write_network(self.state, "ocu-sandbox", subnet="172.31.0.0/24", gateway="172.31.0.1")
+                before_firewall = (self.state / "firewall.json").read_bytes()
+                before_ops = len(ops(self.state))
+                result = run_script(script, env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("messages-ingress", result.stderr)
+                self.assertIn("image", result.stderr)
+                self.assertFalse((self.state / "starts.log").exists())
+                self.assertEqual((self.state / "firewall.json").read_bytes(), before_firewall)
+                mutations = {"load", "pull", "build", "create", "up", "iptables-restore", "ip6tables-restore"}
+                self.assertFalse(any(set(row.split()) & mutations for row in ops(self.state)[before_ops:]))
+
     def test_import_rejects_old_pulled_documentserver_before_loading_images(self):
         delivery, inventory, _sha = self.write_delivery()
         build = inventory["images"]["documentserver"]["build"]

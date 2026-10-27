@@ -9,13 +9,14 @@
 #   OCU_WEBUI_ORIGIN — absolute HTTP(S) origin, no path/credentials/query/fragment/slash
 #   OCU_OFFICE_DOCSERVER_ORIGIN — DocumentServer browser origin, distinct from WebUI
 #   ENABLE_OCU_OFFICE_EDIT — explicit true or false; does not change service settings
-#   OCU_SANDBOX_EGRESS_ALLOW — must be present; empty is deny-all
+#   OCU_SANDBOX_EGRESS_ALLOW — must be present and cover OCU_SANDBOX_MESSAGES_ADDRESS
 #   OCU_SANDBOX_DNS — must be present; empty disables external sandbox DNS
 # Optional:
 #   OPENWEBUI_IMAGE DOCKER_IMAGE COMPUTER_USE_SERVER_IMAGE RETENTION_GUARD_IMAGE
 #   OCU_PROXY_IMAGE POSTGRES_IMAGE DOCUMENTSERVER_IMAGE — inventory-bound references
 #   OCU_ADMIN_CREDENTIALS_FILE — isolated-test output path; default unchanged
 #   OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
+#   OCU_SANDBOX_MESSAGES_ADDRESS — Messages ingress IPv4, default 172.31.0.254
 #   OCU_OFFICE_PROXY_PORT OCU_OFFICE_FONTS_DIR — port and operator-font directory
 
 
@@ -246,6 +247,11 @@ private_gateway=${OCU_PRIVATE_GATEWAY:-172.30.0.1}
 sandbox_network=${OCU_SANDBOX_NETWORK:-ocu-sandbox}
 sandbox_subnet=${OCU_SANDBOX_SUBNET:-172.31.0.0/24}
 sandbox_gateway=${OCU_SANDBOX_GATEWAY:-172.31.0.1}
+# Highest usable host of the default subnet; IPAM hands out the lowest free first.
+messages_address=${OCU_SANDBOX_MESSAGES_ADDRESS:-172.31.0.254}
+OCU_SANDBOX_SUBNET=$sandbox_subnet OCU_SANDBOX_GATEWAY=$sandbox_gateway \
+    OCU_SANDBOX_MESSAGES_ADDRESS=$messages_address \
+    python3 "$source_root/deploy/firewall/policy.py" messages-address || exit 1
 public_base_url="${OCU_WEBUI_ORIGIN}/ocu"
 internal_auth_url='http://open-webui:8080/api/v1/ocu/auth'
 chat_data_dir="$deploy_root/data/chat"
@@ -276,6 +282,7 @@ for pair in \
     OCU_SANDBOX_NETWORK:"$sandbox_network" \
     OCU_SANDBOX_SUBNET:"$sandbox_subnet" \
     OCU_SANDBOX_GATEWAY:"$sandbox_gateway" \
+    OCU_SANDBOX_MESSAGES_ADDRESS:"$messages_address" \
     PUBLIC_BASE_URL:"$public_base_url" \
     OCU_WEBUI_AUTH_URL:"$internal_auth_url" \
     OCU_CHAT_DATA_DIR:"$chat_data_dir" \
@@ -337,6 +344,7 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' "OCU_SANDBOX_SUBNET=$sandbox_subnet"
     printf '%s\n' "OCU_SANDBOX_GATEWAY=$sandbox_gateway"
     printf '%s\n' "OCU_SANDBOX_EGRESS_ALLOW=$OCU_SANDBOX_EGRESS_ALLOW"
+    printf '%s\n' "OCU_SANDBOX_MESSAGES_ADDRESS=$messages_address"
     printf '%s\n' "OCU_SANDBOX_DNS=$OCU_SANDBOX_DNS"
     printf '%s\n' "OCU_PROXY_PORT=$proxy_port"
     printf '%s\n' "OCU_WEBUI_ORIGIN=$OCU_WEBUI_ORIGIN"

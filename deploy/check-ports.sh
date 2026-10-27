@@ -20,6 +20,8 @@ PROXY = "proxy"
 WEBUI = "open-webui"
 OCU = "computer-use-server"
 DOCUMENTSERVER = "documentserver"
+MESSAGES = "messages-ingress"
+MESSAGES_ADDRESS = os.environ.get("OCU_SANDBOX_MESSAGES_ADDRESS", "")
 TARGET = "8082"
 PUBLISHED = os.environ.get("OCU_PROXY_PORT", "8082")
 OFFICE_TARGET = "8083"
@@ -45,6 +47,29 @@ def load(path: str):
     if not isinstance(networks, dict):
         fail("resolved Compose networks are malformed")
     return payload["services"], networks
+
+
+def sandbox_address(service: dict, networks: dict) -> str:
+    declared = service.get("networks")
+    if not isinstance(declared, dict):
+        return ""
+    for alias, options in declared.items():
+        definition = networks.get(alias, {})
+        if (isinstance(definition, dict) and (definition.get("name") or alias) == SANDBOX
+                and isinstance(options, dict)):
+            return str(options.get("ipv4_address") or "")
+    return ""
+
+
+def require_messages_ingress(name: str, service: dict, networks: dict, attached: set[str]) -> None:
+    # The single sandbox-network exception (#655): control plus sandbox only,
+    # at the validated fixed address, never published.
+    if attached != {CONTROL, SANDBOX}:
+        fail(f"{name}: must join exactly the control-plane and sandbox network {SANDBOX}")
+    if not MESSAGES_ADDRESS:
+        fail(f"{name}: OCU_SANDBOX_MESSAGES_ADDRESS is required")
+    if sandbox_address(service, networks) != MESSAGES_ADDRESS:
+        fail(f"{name}: sandbox ipv4_address must equal OCU_SANDBOX_MESSAGES_ADDRESS")
 
 
 def networks_for(name: str, service: dict, networks: dict, mode) -> set[str]:
@@ -91,7 +116,9 @@ for services, networks in docs:
             if not isinstance(mode, str) or mode != "none":
                 fail(f"{name}: forbidden host or shared network mode")
         attached = networks_for(name, service, networks, mode)
-        if SANDBOX in attached:
+        if name == MESSAGES and SANDBOX in attached:
+            require_messages_ingress(name, service, networks, attached)
+        elif SANDBOX in attached:
             fail(f"{name}: joined sandbox network {SANDBOX}")
         if CONTROL not in attached:
             fail(f"{name}: not attached to the control-plane network")

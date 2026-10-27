@@ -18,6 +18,7 @@ from unittest.mock import patch
 from support import (
     DEFAULT_RELEASE_IMAGES,
     FAKE_DOCKER,
+    MESSAGES_ADDRESS,
     OCU_SERVICE,
     PROXY_SERVICE,
     ROOT,
@@ -85,6 +86,7 @@ REQUIRED_RUNTIME = (
     "OCU_SANDBOX_SUBNET",
     "OCU_SANDBOX_GATEWAY",
     "OCU_SANDBOX_EGRESS_ALLOW",
+    "OCU_SANDBOX_MESSAGES_ADDRESS",
     "OCU_SANDBOX_DNS",
     "OCU_PROXY_PORT",
     "OCU_WEBUI_ORIGIN",
@@ -167,7 +169,7 @@ class BootstrapRuntimeTests(unittest.TestCase):
         self.env["OCU_WEBUI_ORIGIN"] = ORIGIN
         self.env["OCU_OFFICE_DOCSERVER_ORIGIN"] = "https://workbench.example.test:8083"
         self.env["ENABLE_OCU_OFFICE_EDIT"] = "false"
-        self.env["OCU_SANDBOX_EGRESS_ALLOW"] = "8.8.8.8/32"
+        self.env["OCU_SANDBOX_EGRESS_ALLOW"] = f"8.8.8.8/32,{MESSAGES_ADDRESS}/32"
         self.env["OCU_SANDBOX_DNS"] = ""
         self.env.update(IMAGES)
         self.inventory = write_release_for_sha(
@@ -446,7 +448,8 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         self.assertEqual(runtime["OCU_SANDBOX_SUBNET"], "172.31.0.0/24")
         self.assertEqual(runtime["OCU_SANDBOX_GATEWAY"], "172.31.0.1")
         self.assertEqual(runtime["OCU_PROXY_PORT"], "8082")
-        self.assertEqual(runtime["OCU_SANDBOX_EGRESS_ALLOW"], "8.8.8.8/32")
+        self.assertEqual(runtime["OCU_SANDBOX_EGRESS_ALLOW"], f"8.8.8.8/32,{MESSAGES_ADDRESS}/32")
+        self.assertEqual(runtime["OCU_SANDBOX_MESSAGES_ADDRESS"], MESSAGES_ADDRESS)
         for name, value in IMAGES.items():
             self.assertEqual(runtime[name], value, name)
         self.assertEqual(runtime["POSTGRES_IMAGE"], "postgres:17-alpine")
@@ -567,13 +570,39 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         for name in GENERATED_SECRETS:
             self.assertNotEqual(first_runtime[name], second_runtime[name], name)
 
-    def test_explicit_empty_egress_is_preserved(self):
-        result = self.run_bootstrap({"OCU_SANDBOX_EGRESS_ALLOW": ""})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        runtime = parse_env_file(self.runtime_path())
-        self.assertEqual(runtime["OCU_SANDBOX_EGRESS_ALLOW"], "")
-        self.assertIn("OCU_SANDBOX_EGRESS_ALLOW=", self.runtime_path().read_text(encoding="utf-8"))
-        self.assert_no_temp_residue()
+    def test_allowlist_must_cover_the_messages_address(self):
+        cases = (
+            {"OCU_SANDBOX_EGRESS_ALLOW": ""},
+            {"OCU_SANDBOX_EGRESS_ALLOW": "8.8.8.8/32"},
+            {"OCU_SANDBOX_MESSAGES_ADDRESS": "172.31.0.1"},
+            {"OCU_SANDBOX_MESSAGES_ADDRESS": "172.32.0.254",
+             "OCU_SANDBOX_EGRESS_ALLOW": "172.32.0.254/32"},
+            {"OCU_SANDBOX_MESSAGES_ADDRESS": "not-an-address"},
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                result = self.run_bootstrap(extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("OCU_SANDBOX_MESSAGES_ADDRESS", result.stderr)
+                self.assert_unpublished()
+
+    def test_messages_address_host_route_alone_is_published(self):
+        for extra, address in (
+            ({"OCU_SANDBOX_EGRESS_ALLOW": f"{MESSAGES_ADDRESS}/32"}, MESSAGES_ADDRESS),
+            ({"OCU_SANDBOX_EGRESS_ALLOW": "10.40.0.200/32",
+              "OCU_SANDBOX_SUBNET": "10.40.0.0/24", "OCU_SANDBOX_GATEWAY": "10.40.0.1",
+              "OCU_SANDBOX_MESSAGES_ADDRESS": "10.40.0.200"}, "10.40.0.200"),
+        ):
+            with self.subTest(address=address):
+                for path in (self.runtime_path(), self.credentials):
+                    if path.exists():
+                        path.unlink()
+                result = self.run_bootstrap(extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                runtime = parse_env_file(self.runtime_path())
+                self.assertEqual(runtime["OCU_SANDBOX_EGRESS_ALLOW"], extra["OCU_SANDBOX_EGRESS_ALLOW"])
+                self.assertEqual(runtime["OCU_SANDBOX_MESSAGES_ADDRESS"], address)
+                self.assert_no_temp_residue()
 
     def test_explicit_empty_dns_is_preserved(self):
         result = self.run_bootstrap({"OCU_SANDBOX_DNS": ""})

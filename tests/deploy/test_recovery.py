@@ -202,7 +202,8 @@ class RecoveryCliTests(unittest.TestCase):
             "OCU_SANDBOX_NETWORK": "ocu-sandbox",
             "OCU_SANDBOX_SUBNET": "172.31.0.0/24",
             "OCU_SANDBOX_GATEWAY": "172.31.0.1",
-            "OCU_SANDBOX_EGRESS_ALLOW": "8.8.8.8/32",
+            "OCU_SANDBOX_EGRESS_ALLOW": "8.8.8.8/32,172.31.0.254/32",
+            "OCU_SANDBOX_MESSAGES_ADDRESS": "172.31.0.254",
             "OCU_SANDBOX_DNS": "8.8.8.8",
             "OCU_PROXY_PORT": "8082",
         }

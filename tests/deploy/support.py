@@ -50,9 +50,12 @@ PROXY_SERVICE = "proxy"
 WEBUI_SERVICE = "open-webui"
 OCU_SERVICE = "computer-use-server"
 DOCUMENTSERVER_SERVICE = "documentserver"
+MESSAGES_SERVICE = "messages-ingress"
+MESSAGES_ADDRESS = "172.31.0.254"
 PROXY_TARGET = 8082
 PROXY_PUBLISHED = "8082"
 DEFAULT_ALLOW = "8.8.8.8/32,1.1.1.1/32"
+MESSAGES_ALLOW = f"{DEFAULT_ALLOW},{MESSAGES_ADDRESS}/32"
 DEFAULT_DNS = "8.8.8.8"
 METADATA_ADDR = "169.254.169.254"
 OWNED_IPV4 = "OCU-SANDBOX-EGRESS"
@@ -257,9 +260,13 @@ def intended_proxy():
                     "OCU_OFFICE_PROXY_UPSTREAM": "http://documentserver",
                 },
                 image=DEFAULT_RELEASE_IMAGES["proxy"],
-            )
-
-        }
+            ),
+            MESSAGES_SERVICE: service(
+                networks={"default": {}, "sandbox": {"ipv4_address": MESSAGES_ADDRESS}},
+                image=DEFAULT_RELEASE_IMAGES["proxy"],
+            ),
+        },
+        {**control_networks(), "sandbox": {"name": SANDBOX_NETWORK, "external": True}},
     )
 
 
@@ -307,6 +314,7 @@ def intended_docs_for_images(images: dict) -> dict:
     webui["services"]["postgres"]["image"] = mapping["postgres"]
     webui["services"]["open-webui-init"]["image"] = mapping["open-webui"]
     docs["proxy.json"]["services"][PROXY_SERVICE]["image"] = mapping["proxy"]
+    docs["proxy.json"]["services"][MESSAGES_SERVICE]["image"] = mapping["proxy"]
     return docs
 
 
@@ -332,6 +340,7 @@ def run_checker(paths, *, env=None, extra_env=None):
             "OCU_SANDBOX_NETWORK": SANDBOX_NETWORK,
             "OCU_PROXY_PORT": PROXY_PUBLISHED,
             "OCU_OFFICE_PROXY_PORT": "8083",
+            "OCU_SANDBOX_MESSAGES_ADDRESS": MESSAGES_ADDRESS,
         })
     if extra_env:
         merged.update(extra_env)
@@ -364,7 +373,8 @@ def fake_env(state_dir: Path, extra=None):
     env["OCU_WEBUI_AUTH_URL"] = "http://open-webui:8080/api/v1/ocu/auth"
     env["PUBLIC_BASE_URL"] = "http://localhost:8082/ocu"
     env["OCU_PROXY_IMAGE"] = "ocu-test-proxy:synthetic"
-    env["OCU_SANDBOX_EGRESS_ALLOW"] = DEFAULT_ALLOW
+    env["OCU_SANDBOX_MESSAGES_ADDRESS"] = MESSAGES_ADDRESS
+    env["OCU_SANDBOX_EGRESS_ALLOW"] = MESSAGES_ALLOW
     env["OCU_SANDBOX_DNS"] = DEFAULT_DNS
     env.update({
         "OCU_OFFICE_JWT_SECRET": "synthetic-office-jwt-secret",

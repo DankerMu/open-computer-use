@@ -12,6 +12,7 @@ COPY render.py /opt/ocu-proxy/render.py
 COPY nginx.conf.in /opt/ocu-proxy/nginx.conf.in
 COPY routes.json /opt/ocu-proxy/routes.json
 COPY entrypoint.sh /opt/ocu-proxy/entrypoint.sh
+COPY messages-ingress.conf /opt/ocu-proxy/messages-ingress.conf
 RUN chown -R ocu-proxy:ocu-proxy /opt/ocu-proxy \
     && chmod 0555 /opt/ocu-proxy/entrypoint.sh
 
