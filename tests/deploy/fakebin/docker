@@ -29,7 +29,7 @@ from support import write_hybrid_image_archive
 
 CORE_SERVICES = ("workspace", "computer-use-server", "retention-guard", "documentserver")
 WEBUI_SERVICES = ("open-webui", "postgres", "open-webui-init")
-PROXY_SERVICES = ("proxy",)
+PROXY_SERVICES = ("proxy", "messages-ingress")
 CLEANUP_SERVICE = "cleanup"
 
 

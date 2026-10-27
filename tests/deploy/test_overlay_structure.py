@@ -69,7 +69,10 @@ PUBLIC_COPY_SOURCES = (
     "nginx.conf.in",
     "routes.json",
     "entrypoint.sh",
+    "messages-ingress.conf",
 )
+MESSAGES_CONFIG = "/opt/ocu-proxy/messages-ingress.conf"
+MESSAGES_ENTRYPOINT = ["nginx", "-e", "stderr", "-p", "/var/lib/nginx/", "-c", MESSAGES_CONFIG]
 
 
 class ComposeLoader(yaml.SafeLoader):
@@ -120,6 +123,7 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None) -> d
         "OCU_PRIVATE_GATEWAY": "172.30.0.1", "OCU_SANDBOX_NETWORK": "ocu-sandbox",
         "OCU_SANDBOX_SUBNET": "172.31.0.0/24", "OCU_SANDBOX_GATEWAY": "172.31.0.1",
         "OCU_SANDBOX_DNS": "8.8.8.8", "OCU_PROXY_PORT": "8082",
+        "OCU_SANDBOX_MESSAGES_ADDRESS": "172.31.0.254",
         "OCU_OFFICE_PROXY_PORT": "8083",
         "OCU_WEBUI_ORIGIN": "http://workbench.test:8082",
         "OCU_WEBUI_AUTH_URL": "http://open-webui:8080/api/v1/ocu/auth",
@@ -228,6 +232,26 @@ class OverlayStructureTests(unittest.TestCase):
                 self.assertEqual(gateway["environment"]["OCU_OFFICE_PROXY_LISTEN"], "0.0.0.0:8083")
                 self.assertEqual(gateway["environment"]["OCU_OFFICE_PROXY_UPSTREAM"],
                                  environment[office_config.OCU_OFFICE_DOCSERVER_URL])
+                self.assertEqual(set(gateway["networks"]), {"default"})
+                self.assertEqual(sorted(proxy["services"]), ["messages-ingress", "proxy"])
+                ingress = proxy["services"]["messages-ingress"]
+                self.assertEqual(ingress["image"], DEFAULT_RELEASE_IMAGES["proxy"])
+                self.assertEqual(ingress["image"], gateway["image"])
+                self.assertEqual(ingress["entrypoint"], MESSAGES_ENTRYPOINT)
+                self.assertEqual(ingress["container_name"], "ocu-test-messages-ingress")
+                self.assertEqual(ingress["labels"], {"ocu.role": "messages-ingress"})
+                self.assertIn("http://127.0.0.1:8080/healthz", " ".join(ingress["healthcheck"]["test"]))
+                self.assertFalse(ingress.get("ports"))
+                self.assertFalse(ingress.get("environment"))
+                self.assertFalse(ingress.get("env_file"))
+                self.assertNotIn("build", ingress)
+                self.assertFalse(ingress.get("network_mode"))
+                self.assertEqual(set(ingress["networks"]), {"default", "sandbox"})
+                self.assertEqual(ingress["networks"]["sandbox"], {"ipv4_address": "172.31.0.254"})
+                self.assertFalse((ingress["networks"]["default"] or {}).get("ipv4_address"))
+                self.assertEqual(proxy["networks"]["sandbox"]["name"], "ocu-sandbox")
+                self.assertIs(proxy["networks"]["sandbox"]["external"], True)
+                self.assertEqual(proxy["networks"]["default"]["name"], "ocu-test-private")
                 states.append((service, {name: core["volumes"][name] for name in expected_mounts.values()}))
         self.assertEqual(states[0], states[1])
 
@@ -294,7 +318,16 @@ class OverlayStructureTests(unittest.TestCase):
         proxy_context = (PROXY_COMPOSE.parent / proxy["services"]["proxy"]["build"]["context"]).resolve()
         self.assertEqual(proxy_context, ROOT / "deploy" / "proxy")
         self.assertTrue((proxy_context / proxy["services"]["proxy"]["build"]["dockerfile"]).is_file())
-        self.assertEqual(list(proxy["services"]), ["proxy"])
+        self.assertEqual(list(proxy["services"]), ["proxy", "messages-ingress"])
+        ingress = proxy["services"]["messages-ingress"]
+        self.assertTrue(interpolated(ingress["image"], "OCU_PROXY_IMAGE"))
+        self.assertEqual(ingress["entrypoint"], MESSAGES_ENTRYPOINT)
+        self.assertTrue(interpolated(ingress["networks"]["sandbox"]["ipv4_address"],
+                                     "OCU_SANDBOX_MESSAGES_ADDRESS"))
+        self.assertTrue(interpolated(proxy["networks"]["sandbox"]["name"], "OCU_SANDBOX_NETWORK"))
+        self.assertIs(proxy["networks"]["sandbox"]["external"], True)
+        self.assertNotIn("OCU_INTERNAL_TOKEN", json.dumps(ingress))
+        self.assertNotIn("OCU_WEBUI_ORIGIN", json.dumps(ingress))
 
     def test_adopted_local_dependencies_exist(self):
         for path in ADOPTED:
@@ -323,6 +356,22 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertIn("nginx.conf", dockerignore)
         self.assertIn("runtime/", dockerignore)
         self.assertNotIn("nginx.conf", copies)
+        destinations = {
+            line.split()[1]: line.split()[2]
+            for line in dockerfile.splitlines()
+            if line.startswith("COPY ")
+        }
+        self.assertEqual(destinations["messages-ingress.conf"], MESSAGES_CONFIG)
+        self.assertEqual(MESSAGES_ENTRYPOINT[MESSAGES_ENTRYPOINT.index("-c") + 1], MESSAGES_CONFIG)
+
+    def test_release_verifies_the_messages_ingress_image(self):
+        deploy = str(ROOT / "deploy")
+        if deploy not in sys.path:
+            sys.path.insert(0, deploy)
+        import release
+
+        self.assertEqual(release.SERVICE_IMAGE_VARS["messages-ingress"], "OCU_PROXY_IMAGE")
+        self.assertEqual(release.SERVICE_IMAGE_VARS["proxy"], "OCU_PROXY_IMAGE")
 
     def test_obsolete_private_binding_patch_is_absent(self):
         patch = ROOT / "deploy" / "production-like-test" / "patches" / "private-sandbox-port-bindings.patch"

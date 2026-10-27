@@ -18,6 +18,7 @@ import unittest
 
 from support import (
     CONTROL_NETWORK,
+    MESSAGES_ADDRESS,
     ROOT,
     SANDBOX_NETWORK,
     SMOKE,
@@ -40,6 +41,9 @@ CHAT = "smoke-chat"
 SANDBOX = "sandbox-smoke"
 TOKEN = "synthetic-owner-token"
 INTERNAL = "synthetic-internal-token"
+INGRESS = f"http://{MESSAGES_ADDRESS}:8080"
+COUNT_TOKENS = f"{INGRESS}/api/v1/messages/count_tokens"
+LOCAL_REFUSAL = f"{INGRESS}/api/v1/chats/"
 
 
 def wait_for(predicate, timeout=5):
@@ -318,7 +322,8 @@ class OverlaySmokeCliTests(unittest.TestCase):
             ],
         )
         proxy_pubs = extra_publishers.get("proxy", [publisher(), publisher("8083", 8083)])
-        rows = [ps_row("proxy", "cid-proxy", publishers=proxy_pubs)]
+        rows = [ps_row("proxy", "cid-proxy", publishers=proxy_pubs),
+                ps_row("messages-ingress", "cid-ingress")]
         if extra_rows:
             rows.extend(extra_rows)
         write_ps(self.state, "proxy", rows)
@@ -368,7 +373,7 @@ class OverlaySmokeCliTests(unittest.TestCase):
             },
         )
 
-    def seed_probes(self, *, blocked=None, allowed=None):
+    def seed_probes(self, *, blocked=None, allowed=None, forwarded="401", refused="404"):
         blocked = blocked or {
             "code": 28,
             "num_connects": 0,
@@ -382,7 +387,13 @@ class OverlaySmokeCliTests(unittest.TestCase):
             "remote_ip": "8.8.8.8",
             "http_code": "200",
         }
-        rows = [allowed]
+        rows = [
+            {"url": COUNT_TOKENS, "code": 0, "num_connects": 1, "remote_ip": MESSAGES_ADDRESS,
+             "http_code": forwarded},
+            {"url": LOCAL_REFUSAL, "code": 0, "num_connects": 1, "remote_ip": MESSAGES_ADDRESS,
+             "http_code": refused},
+            allowed,
+        ]
         for match in ("8081", "8080", "8082", str(self.env["OCU_PROXY_PORT"])):
             row = dict(blocked)
             row["match"] = match
@@ -518,7 +529,8 @@ class OverlaySmokeCliTests(unittest.TestCase):
         write_ps(
             self.state,
             "proxy",
-            json.dumps([ps_row("proxy", "cid-proxy", publishers=[publisher(), publisher("8083", 8083)])]),
+            json.dumps([ps_row("proxy", "cid-proxy", publishers=[publisher(), publisher("8083", 8083)]),
+                        ps_row("messages-ingress", "cid-ingress")]),
         )
         result = self.run_smoke()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -903,6 +915,63 @@ raise SystemExit(smoke_deployment.main(['smoke']))
             json.loads((self.state / "sandbox-terminal.json").read_text())["processes"],
             ["9200 1 9200 -1 9200 ? harmless-idle"],
         )
+
+    def test_messages_ingress_probes_run_from_the_sandbox(self):
+        self.start_http()
+        self.seed_inventory()
+        self.seed_probes()
+        result = self.run_smoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        probes = [line.split() for line in ops(self.state)
+                  if " exec " in f" {line} " and " curl " in f" {line} "]
+        forwarded = [argv for argv in probes if argv[-1] == COUNT_TOKENS]
+        refused = [argv for argv in probes if argv[-1] == LOCAL_REFUSAL]
+        self.assertEqual(len(forwarded), 1)
+        self.assertEqual(len(refused), 1)
+        self.assertIn(SANDBOX, forwarded[0])
+        self.assertIn(SANDBOX, refused[0])
+        self.assertEqual(forwarded[0][forwarded[0].index("-X") + 1], "POST")
+        self.assertNotIn("-X", refused[0])
+        for argv in forwarded + refused:
+            self.assertFalse(any(token.lower().startswith(("authorization", "x-api-key", "cookie"))
+                                 for token in argv))
+        self.assert_no_secrets(result)
+
+    def test_messages_ingress_probe_mismatch_fails_named(self):
+        self.start_http()
+        for forwarded, refused in (("404", "404"), ("200", "404"), ("401", "401"), ("401", "200")):
+            with self.subTest(forwarded=forwarded, refused=refused):
+                self.seed_inventory()
+                self.seed_probes(forwarded=forwarded, refused=refused)
+                result = self.run_smoke()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("messages ingress", result.stderr)
+
+    def test_messages_ingress_must_be_running(self):
+        self.start_http()
+        self.seed_probes()
+        self.seed_inventory()
+        write_ps(self.state, "proxy", [ps_row("proxy", "cid-proxy", publishers=[publisher(), publisher("8083", 8083)])])
+        result = self.run_smoke()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("messages-ingress", result.stderr)
+        write_ps(self.state, "proxy", [ps_row("proxy", "cid-proxy", publishers=[publisher(), publisher("8083", 8083)]),
+                                       ps_row("messages-ingress", "cid-ingress", state="exited")])
+        result = self.run_smoke()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("messages-ingress", result.stderr)
+
+    def test_messages_address_is_a_prerequisite(self):
+        for value in (None, "", "not-an-address"):
+            with self.subTest(value=value):
+                extra = dict(self.env)
+                extra.pop("OCU_SANDBOX_MESSAGES_ADDRESS")
+                if value is not None:
+                    extra["OCU_SANDBOX_MESSAGES_ADDRESS"] = value
+                result = subprocess.run(["bash", str(SMOKE)], cwd=str(ROOT), capture_output=True,
+                                        text=True, env=extra, check=False, timeout=20)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("OCU_SANDBOX_MESSAGES_ADDRESS", result.stderr)
 
     def test_terminal_cannot_pass_without_product_ws_initialization(self):
         self.start_http(ws_mode="ignore-init")

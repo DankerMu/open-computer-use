@@ -85,6 +85,24 @@ Code at LiteLLM. Typical model-ID overrides look like
 `ANTHROPIC_DEFAULT_*_MODEL` vars above so every `sub_agent` call
 automatically routes to the right deployment.
 
+### Open WebUI as the gateway (production-like overlay)
+
+In the `deploy/production-like-test` overlay, sandboxes have no route to
+Open WebUI, Computer Use or the host. The one reachable endpoint is the
+Messages ingress at `OCU_SANDBOX_MESSAGES_ADDRESS`, which forwards only
+`POST /api/v1/messages` and `POST /api/v1/messages/count_tokens` to Open
+WebUI. Point Claude Code at it with the user's own Open WebUI API token:
+
+```
+ANTHROPIC_BASE_URL=http://<OCU_SANDBOX_MESSAGES_ADDRESS>:8080/api
+ANTHROPIC_AUTH_TOKEN=<the user's Open WebUI API key>
+```
+
+Open WebUI authenticates the token and applies the user's model access;
+the ingress adds no identity. Every other path answers 404 at the ingress.
+Behaviour, validation and limits are in
+[NETWORK-HARDENING.md](../deploy/production-like-test/NETWORK-HARDENING.md#sandbox-messages-ingress-655).
+
 ## Full variable reference
 
 | Variable | Type | Default | Purpose | Example (placeholder) |

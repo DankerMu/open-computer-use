@@ -22,6 +22,10 @@ from netinspect import (
 )
 import sandbox_dns
 
+# The Messages ingress (#655) is not a sandbox; it resolves open-webui through
+# Docker DNS. Real `docker inspect` carries labels only under Config.Labels.
+MESSAGES_INGRESS_ROLE = ("ocu.role", "messages-ingress")
+
 
 def fail(message: str, code: int = 1) -> None:
     print(f"sandbox-dns: {message}", file=sys.stderr)
@@ -119,6 +123,13 @@ def destination_context():
     }
 
 
+def is_messages_ingress(payload: dict) -> bool:
+    config = payload.get("Config") if isinstance(payload, dict) else None
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    key, value = MESSAGES_INGRESS_ROLE
+    return isinstance(labels, dict) and labels.get(key) == value
+
+
 def inspect_protected_containers(expected: list[str], ctx) -> None:
     try:
         ids = list_container_ids()
@@ -138,7 +149,7 @@ def inspect_protected_containers(expected: list[str], ctx) -> None:
         )
         if membership is None:
             fail(f"{identity}: protected-bridge membership cannot be classified")
-        if membership is False:
+        if membership is False or is_messages_ingress(payload):
             continue
         host = payload.get("HostConfig") if isinstance(payload, dict) else None
         if not sandbox_dns.dns_compatible(sandbox_dns.inspected_dns(host), expected):

@@ -18,6 +18,8 @@ from support import (
     CONTROL_NETWORK,
     FONT_FILES,
     DEFAULT_DNS,
+    MESSAGES_ADDRESS,
+    MESSAGES_SERVICE,
     METADATA_ADDR,
     OCU_SERVICE,
     PROVISION,
@@ -645,9 +647,38 @@ class DeployEntryTests(unittest.TestCase):
                 "postgres",
                 "open-webui-init",
                 "proxy",
+                MESSAGES_SERVICE,
             },
         )
         self.assert_no_destructive()
+
+    def test_invalid_messages_address_starts_nothing(self):
+        cases = (
+            ("unset", None, None),
+            ("outside", "172.32.0.254", None),
+            ("uncovered", MESSAGES_ADDRESS, "8.8.8.8/32"),
+            ("empty-allowlist", MESSAGES_ADDRESS, ""),
+        )
+        for label, address, allow in cases:
+            with self.subTest(case=label):
+                before_firewall = (self.state / "firewall.json").read_text(encoding="utf-8")
+                before_ops = len(ops(self.state))
+                env = dict(self.env)
+                env.pop("OCU_SANDBOX_MESSAGES_ADDRESS")
+                if address is not None:
+                    env["OCU_SANDBOX_MESSAGES_ADDRESS"] = address
+                if allow is not None:
+                    env["OCU_SANDBOX_EGRESS_ALLOW"] = allow
+                result = self.up(env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("OCU_SANDBOX_MESSAGES_ADDRESS", result.stderr)
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual(compose_up_ops(self.state), [])
+                self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before_firewall)
+                self.assertFalse(any("network create" in line or "iptables" in line
+                                     for line in ops(self.state)[before_ops:]))
+                self.assertEqual(leftover_tmp(self.state), [])
+                self.assert_no_destructive()
 
     def test_application_start_failure_preserves_earlier_stack(self):
         write_network(
@@ -680,10 +711,10 @@ class DeployEntryTests(unittest.TestCase):
         proxy_up = proxy_snapshot_ops(self.state, "up")
         self.assertEqual(len(proxy_up), 1)
         restart = compose[-1]
-        self.assertEqual(restart[-2:], ["restart", "proxy"])
+        self.assertEqual(restart[-3:], ["restart", "proxy", MESSAGES_SERVICE])
         self.assertLess(compose.index(proxy_up[0]), compose.index(restart))
         prefix = proxy_up[0][: proxy_up[0].index("up")]
-        self.assertEqual(restart[:-2], prefix)
+        self.assertEqual(restart[:-3], prefix)
         self.assertEqual(prefix[2:4], ["-p", self.env["COMPOSE_PROJECT_NAME"]])
         self.assertEqual(prefix[4], "--project-directory")
         self.assertEqual(Path(prefix[5]).name, "production-like-test")
@@ -692,7 +723,8 @@ class DeployEntryTests(unittest.TestCase):
         self.assertEqual(snapshot.name, "proxy.up.json")
         self.assertEqual(Path(prefix[7]).parent, snapshot.parent)
         self.assertTrue(snapshot.parent.name.startswith("ocu-deploy-config."))
-        self.assertIn(f"deploy: proxy restarted for {snapshot}", result.stderr.splitlines())
+        self.assertIn(f"deploy: proxy and {MESSAGES_SERVICE} restarted for {snapshot}",
+                      result.stderr.splitlines())
         self.assertEqual(leftover_tmp(self.state), [])
         self.assert_no_destructive()
 
@@ -705,8 +737,10 @@ class DeployEntryTests(unittest.TestCase):
         restart = proxy_snapshot_ops(self.state, "restart")
         self.assertEqual(len(restart), 1)
         snapshot = Path(restart[0][restart[0].index("-f") + 1])
-        self.assertIn(f"deploy: proxy restart failed for {snapshot}", result.stderr.splitlines())
-        self.assertNotIn("deploy: proxy restarted for", result.stderr)
+        self.assertEqual(restart[0][-3:], ["restart", "proxy", MESSAGES_SERVICE])
+        self.assertIn(f"deploy: proxy and {MESSAGES_SERVICE} restart failed for {snapshot}",
+                      result.stderr.splitlines())
+        self.assertNotIn("restarted for", result.stderr)
         self.assertEqual(leftover_tmp(self.state), [])
         self.assert_no_destructive()
 
@@ -718,7 +752,7 @@ class DeployEntryTests(unittest.TestCase):
         self.assertEqual(restarts(self.state), [])
         self.assertEqual(proxy_snapshot_ops(self.state, "restart"), [])
         self.assertIn("deploy: compose up failed for", result.stderr)
-        self.assertNotIn("deploy: proxy restart", result.stderr)
+        self.assertNotIn(f"deploy: proxy and {MESSAGES_SERVICE} restart", result.stderr)
         self.assertEqual(leftover_tmp(self.state), [])
         self.assert_no_destructive()
 
@@ -988,6 +1022,51 @@ class DeployEntryTests(unittest.TestCase):
         self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before_firewall)
         self.assertFalse(any("iptables" in line or "ip6tables" in line for line in ops(self.state)))
         self.assert_no_destructive()
+
+    def test_messages_ingress_label_alone_is_exempt_from_sandbox_dns(self):
+        self._seed_bridge()
+        ingress = {"ocu.role": "messages-ingress", "com.docker.compose.service": MESSAGES_SERVICE}
+        # Real `docker inspect` carries labels only under Config.Labels; the
+        # helper writes both places, so "where" keeps one of them.
+        cases = (
+            ("labelled", ingress, "both", 0),
+            ("config-labels-only", ingress, "config", 0),
+            ("top-level-labels-only", ingress, "top", 1),
+            ("unlabelled", {"com.docker.compose.service": MESSAGES_SERVICE}, "both", 1),
+            ("other-role", {"ocu.role": "proxy"}, "both", 1),
+        )
+        for label, labels, where, expected in cases:
+            with self.subTest(case=label):
+                (self.state / "starts.log").unlink(missing_ok=True)
+                container = sandbox_container(
+                    cid="cid-ingress",
+                    name="ocu-test-messages-ingress",
+                    state="running",
+                    dns=[],
+                    labels=labels,
+                    config_env=[],
+                    networks={
+                        SANDBOX_NETWORK: {"NetworkID": f"id-{SANDBOX_NETWORK}",
+                                          "IPAddress": MESSAGES_ADDRESS},
+                        CONTROL_NETWORK: {"NetworkID": f"id-{CONTROL_NETWORK}",
+                                          "IPAddress": "172.30.0.20"},
+                    },
+                    network_mode=CONTROL_NETWORK,
+                )
+                if where == "config":
+                    container["Labels"] = {}
+                elif where == "top":
+                    container["Config"]["Labels"] = {}
+                write_containers(self.state, [container])
+                result = self.up()
+                if expected == 0:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("ocu-test-messages-ingress", result.stderr)
+                    self.assertEqual(starts(self.state), [])
+                self.assert_no_destructive()
 
     def test_inspect_failure_starts_no_service(self):
         self._seed_bridge()

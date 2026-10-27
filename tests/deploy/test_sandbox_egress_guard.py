@@ -21,6 +21,7 @@ from support import (
     DEFAULT_ALLOW,
     FIREWALL_CHECK,
     FIREWALL_INSTALL,
+    MESSAGES_ADDRESS,
     METADATA_ADDR,
     OCU_SERVICE,
     OWNED_IPV4,
@@ -675,14 +676,16 @@ class EgressGuardTests(unittest.TestCase):
         docs = intended_docs()
         docs["core.json"]["services"][OCU_SERVICE]["environment"]["OCU_SANDBOX_DNS"] = ""
         write_fake_configs(self.state, docs)
+        before = (self.state / "firewall.json").read_text(encoding="utf-8")
         result = self.up(env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(starts(self.state), ["core", "webui", "proxy"])
-        firewall = load_firewall(self.state)
-        self.assertEqual(
-            evaluate_packet(firewall, family="ipv4", chain="DOCKER-USER", in_iface=BRIDGE, src="172.31.0.20", dst="8.8.8.8"),
-            "DROP",
-        )
+        # A blank allowlist is still deny-all at install level (see
+        # test_empty_allowlist_installs_deny_all_and_check_passes), but the
+        # deployment refuses it because it cannot reach the Messages ingress.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OCU_SANDBOX_MESSAGES_ADDRESS", result.stderr)
+        self.assertNotIn("unset", result.stderr)
+        self.assertEqual(starts(self.state), [])
+        self.assertEqual((self.state / "firewall.json").read_text(encoding="utf-8"), before)
 
     def test_installer_restore_failure_in_up_starts_no_service(self):
         (self.state / "ipv4-restore-fail").write_text("1", encoding="utf-8")
@@ -918,6 +921,75 @@ class EgressGuardTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("/run/ocu-sandbox-egress", result.stderr)
         self.assertNotIn(str(self.state / "xdg-ignored"), result.stderr)
+
+
+class MessagesAddressTests(unittest.TestCase):
+    """The policy.py messages-address subcommand reads its environment only."""
+
+    def run_policy(self, **overrides):
+        env = {
+            "PATH": os.environ["PATH"],
+            "PYTHONPATH": str(ROOT / "deploy"),
+            "OCU_SANDBOX_SUBNET": "172.31.0.0/24",
+            "OCU_SANDBOX_GATEWAY": "172.31.0.1",
+            "OCU_SANDBOX_MESSAGES_ADDRESS": MESSAGES_ADDRESS,
+            "OCU_SANDBOX_EGRESS_ALLOW": f"8.8.8.8/32,{MESSAGES_ADDRESS}/32",
+        }
+        for name, value in overrides.items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
+        return subprocess.run(
+            [sys.executable, str(ROOT / "deploy" / "firewall" / "policy.py"), "messages-address"],
+            capture_output=True, text=True, env=env, check=False, timeout=20,
+        )
+
+    def test_invalid_addresses_fail_naming_the_variable(self):
+        name = "OCU_SANDBOX_MESSAGES_ADDRESS"
+        cases = {
+            "missing": {name: None},
+            "empty": {name: ""},
+            "non-ipv4": {name: "fd00::254"},
+            "not-an-address": {name: "messages-ingress"},
+            "cidr": {name: f"{MESSAGES_ADDRESS}/32"},
+            "padded": {name: f" {MESSAGES_ADDRESS}"},
+            "outside-subnet": {name: "172.32.0.254", "OCU_SANDBOX_EGRESS_ALLOW": "172.32.0.254/32"},
+            "gateway": {name: "172.31.0.1", "OCU_SANDBOX_EGRESS_ALLOW": "172.31.0.1/32"},
+            "network": {name: "172.31.0.0", "OCU_SANDBOX_EGRESS_ALLOW": "172.31.0.0/24"},
+            "broadcast": {name: "172.31.0.255", "OCU_SANDBOX_EGRESS_ALLOW": "172.31.0.255/32"},
+            "uncovered": {"OCU_SANDBOX_EGRESS_ALLOW": "8.8.8.8/32,172.31.0.253/32"},
+            "empty-allowlist": {"OCU_SANDBOX_EGRESS_ALLOW": ""},
+            "unset-allowlist": {"OCU_SANDBOX_EGRESS_ALLOW": None},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(case=label):
+                result = self.run_policy(**overrides)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(name, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_covered_address_passes_without_engine_contact(self):
+        for allow in (f"{MESSAGES_ADDRESS}/32", f"8.8.8.8/32,{MESSAGES_ADDRESS}",
+                      "172.31.0.128/25", "8.8.8.8/32, 172.31.0.0/24"):
+            with self.subTest(allow=allow):
+                with tmp_dir() as raw:
+                    trap = Path(raw) / "docker"
+                    trap.write_text("#!/bin/sh\necho engine-contacted >&2\nexit 99\n", encoding="utf-8")
+                    trap.chmod(0o755)
+                    result = self.run_policy(OCU_SANDBOX_EGRESS_ALLOW=allow,
+                                             PATH=f"{raw}{os.pathsep}{os.environ['PATH']}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+
+    def test_usage_names_the_new_subcommand(self):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "deploy" / "firewall" / "policy.py"), "bogus"],
+            capture_output=True, text=True, check=False, timeout=20,
+            env={"PATH": os.environ["PATH"], "PYTHONPATH": str(ROOT / "deploy")},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("messages-address", result.stderr)
 
 
 if __name__ == "__main__":
