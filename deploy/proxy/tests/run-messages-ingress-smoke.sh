@@ -136,6 +136,7 @@ import sys
 import time
 
 port, record, release, access_log = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+stub_port = int(sys.argv[5])
 LIMIT = 32 * 1024 * 1024
 failures = 0
 
@@ -234,6 +235,29 @@ for target in ("/api/v1/messages", "/api/v1/messages/count_tokens?beta=true"):
     check(not extra, f"{target}: no other header is forwarded ({sorted(extra)})")
 
 before = len(rows())
+body = b'{"model":"canary-model","chunked":true}'
+status, data = raw("POST", "/api/v1/messages", {"Content-Type": "application/json"}, body, chunked=True)
+after = rows()
+check(status == 200 and len(after) == before + 1, f"chunked POST /api/v1/messages is forwarded once (got {status})")
+if len(after) == before + 1:
+    seen = after[-1]
+    names = {name for name, _ in seen["headers"]}
+    check(seen["body_sha256"] == hashlib.sha256(body).hexdigest(), "chunked body arrives intact")
+    check("content-length" in names and "transfer-encoding" not in names,
+          "chunked body arrives with Content-Length and no Transfer-Encoding")
+
+before = len(rows())
+body = b'{"model":"canary-model","absolute":true}'
+status, data = raw("POST", "http://anything/api/v1/messages", {"Content-Type": "application/json"}, body)
+after = rows()
+check(status == 200 and len(after) == before + 1, f"absolute-form POST /api/v1/messages is forwarded once (got {status})")
+if len(after) == before + 1:
+    seen = after[-1]
+    hosts = [value for name, value in seen["headers"] if name == "host"]
+    check(seen["uri"] == "/api/v1/messages", f"absolute-form request arrives as URI /api/v1/messages ({seen['uri']})")
+    check(hosts == [f"127.0.0.1:{stub_port}"], f"absolute-form request keeps the upstream Host ({hosts})")
+
+before = len(rows())
 sock = socket.create_connection(("127.0.0.1", port), timeout=15)
 body = b'{"stream":true}'
 sock.sendall((
@@ -271,6 +295,7 @@ refused = (
     ("POST", "/api/v1/messages/../chats/"),
     ("POST", "//api/v1/messages"),
     ("POST", "/api/v1/%6Dessages/../chats"),
+    ("POST", "http://anything/api/v1/chats/"),
 )
 for method, target in refused:
     status, _ = raw(method, target, {"Content-Type": "application/json"},
@@ -327,7 +352,8 @@ if [[ "$ready" -ne 1 ]]; then
 fi
 
 set +e
-python3 "$WORKDIR/client.py" "$LISTEN_PORT" "$WORKDIR/record/requests.jsonl" "$WORKDIR/release" "$WORKDIR/access.log"
+python3 "$WORKDIR/client.py" "$LISTEN_PORT" "$WORKDIR/record/requests.jsonl" "$WORKDIR/release" "$WORKDIR/access.log" \
+    "$STUB_PORT"
 status=$?
 set -e
 if [[ "$status" -ne 0 ]]; then

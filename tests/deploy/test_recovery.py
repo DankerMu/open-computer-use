@@ -2265,6 +2265,46 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         )
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
 
+    def test_activation_of_backup_without_messages_address_fails_before_any_stack(self):
+        # A recovery set captured before #655: no ingress address, no /32 for it.
+        lines = [
+            line for line in self.runtime.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("OCU_SANDBOX_MESSAGES_ADDRESS=")
+        ]
+        lines = ["OCU_SANDBOX_EGRESS_ALLOW=8.8.8.8/32" if line.startswith("OCU_SANDBOX_EGRESS_ALLOW=")
+                 else line for line in lines]
+        self.runtime.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # The operator's shell does not export the key either; activation
+        # inherits the process environment beneath the restored runtime.env.
+        self.env.pop("OCU_SANDBOX_MESSAGES_ADDRESS", None)
+        backup = self.root / "backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self._seed_restore_target("no-address-state")
+        write_fake_configs(target_state, font_mount_docs())
+        dest = self.root / "no-address-root"
+        extra = {"FAKE_DOCKER_STATE": str(target_state)}
+        restored = self.run_cli(
+            ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+             "--provider-file", str(provider)],
+            extra=extra,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertNotIn("OCU_SANDBOX_MESSAGES_ADDRESS", (dest / "config/runtime.env").read_text())
+        delivery, _payload, _source = self._write_retained_delivery()
+        activated = self.run_cli(
+            ["activate", "--destination-root", str(dest), "--retained-delivery", str(delivery)],
+            extra=extra,
+        )
+        self.assertNotEqual(activated.returncode, 0)
+        self.assertIn("OCU_SANDBOX_MESSAGES_ADDRESS is required", activated.stderr)
+        self.assertIn("deploy: OCU_SANDBOX_MESSAGES_ADDRESS check failed", activated.stderr)
+        self.assertFalse((target_state / "starts.log").exists())
+        self.assertFalse((target_state / "executed.json").exists())
+
 
     def test_activation_refuses_mixed_identity_and_tampered_source(self):
         backup = self.root / "backup"

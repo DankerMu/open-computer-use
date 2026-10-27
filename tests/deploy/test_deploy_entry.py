@@ -752,7 +752,7 @@ class DeployEntryTests(unittest.TestCase):
         self.assertEqual(restarts(self.state), [])
         self.assertEqual(proxy_snapshot_ops(self.state, "restart"), [])
         self.assertIn("deploy: compose up failed for", result.stderr)
-        self.assertNotIn("deploy: proxy restart", result.stderr)
+        self.assertNotIn(f"deploy: proxy and {MESSAGES_SERVICE} restart", result.stderr)
         self.assertEqual(leftover_tmp(self.state), [])
         self.assert_no_destructive()
 
@@ -1026,34 +1026,38 @@ class DeployEntryTests(unittest.TestCase):
     def test_messages_ingress_label_alone_is_exempt_from_sandbox_dns(self):
         self._seed_bridge()
         ingress = {"ocu.role": "messages-ingress", "com.docker.compose.service": MESSAGES_SERVICE}
+        # Real `docker inspect` carries labels only under Config.Labels; the
+        # helper writes both places, so "where" keeps one of them.
         cases = (
-            ("labelled", ingress, 0),
-            ("unlabelled", {"com.docker.compose.service": MESSAGES_SERVICE}, 1),
-            ("other-role", {"ocu.role": "proxy"}, 1),
+            ("labelled", ingress, "both", 0),
+            ("config-labels-only", ingress, "config", 0),
+            ("top-level-labels-only", ingress, "top", 1),
+            ("unlabelled", {"com.docker.compose.service": MESSAGES_SERVICE}, "both", 1),
+            ("other-role", {"ocu.role": "proxy"}, "both", 1),
         )
-        for label, labels, expected in cases:
+        for label, labels, where, expected in cases:
             with self.subTest(case=label):
                 (self.state / "starts.log").unlink(missing_ok=True)
-                write_containers(
-                    self.state,
-                    [
-                        sandbox_container(
-                            cid="cid-ingress",
-                            name="ocu-test-messages-ingress",
-                            state="running",
-                            dns=[],
-                            labels=labels,
-                            config_env=[],
-                            networks={
-                                SANDBOX_NETWORK: {"NetworkID": f"id-{SANDBOX_NETWORK}",
-                                                  "IPAddress": MESSAGES_ADDRESS},
-                                CONTROL_NETWORK: {"NetworkID": f"id-{CONTROL_NETWORK}",
-                                                  "IPAddress": "172.30.0.20"},
-                            },
-                            network_mode=CONTROL_NETWORK,
-                        )
-                    ],
+                container = sandbox_container(
+                    cid="cid-ingress",
+                    name="ocu-test-messages-ingress",
+                    state="running",
+                    dns=[],
+                    labels=labels,
+                    config_env=[],
+                    networks={
+                        SANDBOX_NETWORK: {"NetworkID": f"id-{SANDBOX_NETWORK}",
+                                          "IPAddress": MESSAGES_ADDRESS},
+                        CONTROL_NETWORK: {"NetworkID": f"id-{CONTROL_NETWORK}",
+                                          "IPAddress": "172.30.0.20"},
+                    },
+                    network_mode=CONTROL_NETWORK,
                 )
+                if where == "config":
+                    container["Labels"] = {}
+                elif where == "top":
+                    container["Config"]["Labels"] = {}
+                write_containers(self.state, [container])
                 result = self.up()
                 if expected == 0:
                     self.assertEqual(result.returncode, 0, result.stderr)
