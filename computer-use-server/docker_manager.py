@@ -1385,8 +1385,11 @@ def _reset_shutdown_timer(container, timeout: int = None, now=None):
         extend_idle(chat_id, container, effective, now=time.time() if now is None else now)
 
 
-def _execute_bash(container, command: str, timeout: int = None) -> dict:
-    """Execute bash command in container with timeout."""
+def _execute_bash(container, command: str, timeout: int = None, environment: dict = None) -> dict:
+    """Execute bash command in container with timeout.
+
+    `environment` reaches the exec process only, never the command string.
+    """
     user, workdir = _get_container_user_and_workdir()
 
     try:
@@ -1394,12 +1397,14 @@ def _execute_bash(container, command: str, timeout: int = None) -> dict:
         shutdown_timeout = max(CONTAINER_IDLE_TIMEOUT, cmd_timeout + 60)
         _reset_shutdown_timer(container, shutdown_timeout, now=time.time())
         timed_command = f"timeout {cmd_timeout} bash -c {shlex.quote(command)}"
+        extra = {} if environment is None else {"environment": environment}
         exec_result = container.exec_run(
             cmd=["bash", "-c", timed_command],
             stdout=True,
             stderr=True,
             demux=True,
-            workdir=workdir
+            workdir=workdir,
+            **extra
         )
 
         stdout_data, stderr_data = exec_result.output if exec_result.output else (b"", b"")

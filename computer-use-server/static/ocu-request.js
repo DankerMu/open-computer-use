@@ -108,14 +108,33 @@ export async function loadCliBadge(describeUrl) {
   }
 }
 
-export async function recoverStoppedContainer(chatId, dangerousMode) {
+export function terminalStartBody(dangerousMode, model) {
+  const body = { dangerous_mode: Boolean(dangerousMode) };
+  if (model) body.model = model;
+  return JSON.stringify(body);
+}
+
+// A 422 from start-ttyd is a gateway refusal: its string detail, or '' for any other shape.
+export async function terminalRefusal(resp) {
+  try {
+    const body = await resp.json();
+    return body && typeof body.detail === 'string' ? body.detail : '';
+  } catch {
+    return '';
+  }
+}
+
+export async function recoverStoppedContainer(chatId, dangerousMode, model) {
   const launch = await ocuFetch(`/terminal/${chatId}/restart-container`, { method: 'POST' });
   if (!launch.ok) return { ok: false, launched: false };
   const ttyd = await ocuFetch(`/terminal/${chatId}/start-ttyd`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ dangerous_mode: Boolean(dangerousMode) }),
+    body: terminalStartBody(dangerousMode, model),
   });
+  if (ttyd.status === 422) {
+    return { ok: false, launched: true, already_running: false, refused: await terminalRefusal(ttyd) };
+  }
   let alreadyRunning = false;
   if (ttyd.ok) {
     try {

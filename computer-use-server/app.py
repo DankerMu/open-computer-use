@@ -15,6 +15,7 @@ import asyncio
 import errno
 import html as html_module
 import hashlib
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -41,6 +42,7 @@ from ws_recheck import (
     forward_cdp_client,
     forward_ttyd_backend,
     forward_ttyd_client,
+    token_cookie,
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse, HTMLResponse, PlainTextResponse
@@ -472,6 +474,7 @@ async def lifespan(app):
         raise RuntimeError("OCU authorization startup preflight failed")
     validate_idle_configuration()
     validate_sandbox_dns_configuration()
+    terminal_gateway_base_url()
     warn_if_public_base_url_is_default()
     warn_if_mcp_api_key_missing()
     warn_subagent_cli()
@@ -1129,21 +1132,119 @@ async def terminal_status(chat_id: str, response: Response):
 
 class StartTtydRequest(BaseModel):
     dangerous_mode: bool = False
+    # Chat model for terminal Claude Code; validated by the handler in gateway mode only.
+    model: Optional[str] = None
+
+
+MESSAGES_ADDRESS_ENV = "OCU_SANDBOX_MESSAGES_ADDRESS"
+TERMINAL_STOP_COMMAND = "pkill -x ttyd 2>/dev/null; tmux kill-server 2>/dev/null; true"
+_TERMINAL_MODEL = re.compile(r"[\x21-\x7e]{1,256}")
+_GATEWAY_NO_TOKEN = (
+    "Claude Code gateway: the request carries no Open WebUI login token; "
+    "sign in again and reopen the terminal"
+)
+_GATEWAY_NO_MODEL = (
+    "Claude Code gateway: the chat has no usable model id (1-256 printable ASCII "
+    "characters without spaces); select a model and reopen the terminal"
+)
+
+
+class TerminalGatewayConfigError(RuntimeError):
+    """OCU_SANDBOX_MESSAGES_ADDRESS is set but is not an IPv4 address."""
+
+
+def terminal_gateway_base_url() -> Optional[str]:
+    """Messages ingress base URL for terminal Claude Code, or None when gateway mode is off.
+
+    Off when the address is unset or the sandbox CLI is not Claude Code. A set value that
+    is not an IPv4 literal (including empty) refuses startup, naming the variable.
+    """
+    if MESSAGES_ADDRESS_ENV not in os.environ:
+        return None
+    try:
+        address = ipaddress.IPv4Address(os.environ[MESSAGES_ADDRESS_ENV])
+    except ValueError:
+        raise TerminalGatewayConfigError(
+            f"{MESSAGES_ADDRESS_ENV} must be an IPv4 address; refusing to start"
+        ) from None
+    from docker_manager import SUBAGENT_CLI
+    if SUBAGENT_CLI != "claude":
+        return None
+    return f"http://{address}:8080/api"
+
+
+def _ttyd_start_command(dangerous_mode: bool) -> str:
+    env_prefix = "NO_AUTOSTART=1 " if dangerous_mode else ""
+    return f"cd /home/assistant && echo 'set -g mouse on' > ~/.tmux.conf && LANG=C.UTF-8 {env_prefix}nohup ttyd -W -p 7681 tmux -u new-session -A -s main bash > /dev/null 2>&1 &"
+
+
+def _terminal_gateway_environment(base_url: str, cookie_header: Optional[str], model) -> Dict[str, str]:
+    """Per-start Claude Code environment; 422 with a string detail when an input is missing."""
+    token = token_cookie(cookie_header)
+    if token is None:
+        raise HTTPException(422, _GATEWAY_NO_TOKEN)
+    if not isinstance(model, str) or not _TERMINAL_MODEL.fullmatch(model):
+        raise HTTPException(422, _GATEWAY_NO_MODEL)
+    fingerprint = hashlib.sha256(f"{base_url}\0{model}\0{token}".encode()).hexdigest()
+    return {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_AUTH_TOKEN": token,
+        "ANTHROPIC_MODEL": model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+        "CLAUDE_CODE_SUBAGENT_MODEL": model,
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DISABLE_TELEMETRY": "1",
+        "OCU_TERMINAL_FINGERPRINT": fingerprint,
+    }
+
+
+def _start_gateway_terminal(container, chat_id: str, environment: Dict[str, str], dangerous_mode: bool) -> dict:
+    """Reuse a ttyd started with this fingerprint, else stop ttyd and tmux and start fresh.
+
+    Runs in one worker thread: the chat lock is a per-thread RLock that `_execute_bash`
+    re-enters through the shutdown timer, so every exec runs here while it is held.
+    A tmux server can outlive ttyd, so a start that is not a reuse always stops first.
+    """
+    from docker_manager import _execute_bash
+    probe = (
+        "pid=$(pgrep -o -x ttyd 2>/dev/null) || { echo NONE; exit 0; }; "
+        "tr '\\0' '\\n' 2>/dev/null < /proc/$pid/environ | "
+        f"grep -qxF 'OCU_TERMINAL_FINGERPRINT={environment['OCU_TERMINAL_FINGERPRINT']}' "
+        "&& echo MATCH || echo OTHER"
+    )
+    with _combined_lock(chat_id):
+        state = _execute_bash(container, probe, 5).get("output", "").strip()
+        if state == "MATCH":
+            return {"started": False, "already_running": True}
+        _execute_bash(container, TERMINAL_STOP_COMMAND, 5)
+        _execute_bash(container, _ttyd_start_command(dangerous_mode), 5, environment=environment)
+        time.sleep(0.5)
+    return {"started": True, "already_running": False, "restarted": state == "OTHER"}
 
 
 @app.post("/terminal/{chat_id}/start-ttyd", tags=["Terminal"])
-async def start_ttyd(chat_id: str, body: StartTtydRequest = Body(default=StartTtydRequest())):
+async def start_ttyd(chat_id: str, request: Request, body: StartTtydRequest = Body(default=StartTtydRequest())):
     """Start ttyd + tmux in the container (lazy start).
 
     Uses tmux -A (attach-if-exists) so reconnections work without errors.
     If dangerous_mode=True, sets NO_AUTOSTART=1 so .bashrc skips auto-launch —
     the frontend will inject `claude --dangerously-skip-permissions` after connecting.
+    In gateway mode (#656) Claude Code gets the requester's `token` cookie and `model`
+    through the exec environment, checked before the container lookup.
     """
     chat_id = sanitize_chat_id(chat_id)
+    gateway = terminal_gateway_base_url()
+    if gateway is not None:
+        environment = _terminal_gateway_environment(gateway, request.headers.get("cookie"), body.model)
     from docker_manager import _execute_bash
     container = _get_container_for_terminal(chat_id)
     if not container:
         raise HTTPException(404, "Container not running")
+    if gateway is not None:
+        return await asyncio.to_thread(
+            _start_gateway_terminal, container, chat_id, environment, body.dangerous_mode)
     # Check if already running
     check = await asyncio.to_thread(
         _execute_bash, container,
@@ -1151,10 +1252,7 @@ async def start_ttyd(chat_id: str, body: StartTtydRequest = Body(default=StartTt
     if "RUNNING" in check.get("output", ""):
         return {"started": False, "already_running": True}
     # Start ttyd + tmux in background (-A = attach if session exists, create if not)
-    env_prefix = "NO_AUTOSTART=1 " if body.dangerous_mode else ""
-    await asyncio.to_thread(
-        _execute_bash, container,
-        f"cd /home/assistant && echo 'set -g mouse on' > ~/.tmux.conf && LANG=C.UTF-8 {env_prefix}nohup ttyd -W -p 7681 tmux -u new-session -A -s main bash > /dev/null 2>&1 &", 5)
+    await asyncio.to_thread(_execute_bash, container, _ttyd_start_command(body.dangerous_mode), 5)
     # Wait briefly for ttyd to start
     await asyncio.sleep(0.5)
     return {"started": True}
@@ -1168,9 +1266,7 @@ async def stop_ttyd(chat_id: str):
     container = _get_container_for_terminal(chat_id)
     if not container:
         raise HTTPException(404, "Container not running")
-    await asyncio.to_thread(
-        _execute_bash, container,
-        "pkill -x ttyd 2>/dev/null; tmux kill-server 2>/dev/null; true", 5)
+    await asyncio.to_thread(_execute_bash, container, TERMINAL_STOP_COMMAND, 5)
     return {"stopped": True}
 
 

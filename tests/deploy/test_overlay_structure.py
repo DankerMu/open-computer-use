@@ -51,6 +51,8 @@ REQUIRED_CORE_NAMES = (
     "PUBLIC_BASE_URL",
     "OCU_SANDBOX_NETWORK",
     "OCU_SANDBOX_SUBNET",
+    # Terminal Claude Code gateway mode (#656): OCU derives the ingress base URL from it.
+    "OCU_SANDBOX_MESSAGES_ADDRESS",
 )
 REQUIRED_PROXY_INTERPOLATED = (
     "OCU_INTERNAL_TOKEN",

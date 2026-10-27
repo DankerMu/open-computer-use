@@ -91,12 +91,40 @@ In the `deploy/production-like-test` overlay, sandboxes have no route to
 Open WebUI, Computer Use or the host. The one reachable endpoint is the
 Messages ingress at `OCU_SANDBOX_MESSAGES_ADDRESS`, which forwards only
 `POST /api/v1/messages` and `POST /api/v1/messages/count_tokens` to Open
-WebUI. Point Claude Code at it with the user's own Open WebUI API token:
+WebUI.
+
+The workspace terminal configures Claude Code automatically. The overlay
+passes `OCU_SANDBOX_MESSAGES_ADDRESS` to Computer Use; when it is set and
+`SUBAGENT_CLI` is `claude`, every terminal start gives ttyd, tmux, bash and
+Claude Code this environment through the container exec, never through a
+command line:
 
 ```
 ANTHROPIC_BASE_URL=http://<OCU_SANDBOX_MESSAGES_ADDRESS>:8080/api
-ANTHROPIC_AUTH_TOKEN=<the user's Open WebUI API key>
+ANTHROPIC_AUTH_TOKEN=<the Open WebUI login token of the user who opened the terminal>
+ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL, CLAUDE_CODE_SUBAGENT_MODEL=<the chat's model>
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+DISABLE_TELEMETRY=1
 ```
+
+The token is the user's Open WebUI login JWT, taken from the `token`
+cookie of the terminal start request. It lives as long as the login
+(`JWT_EXPIRES_IN`, default `4w`). An expired token shows as a 401 in
+Claude Code; sign in to Open WebUI again and reopen the terminal, which
+restarts it with the new token. The model is the chat's model when the
+terminal view opens. Changing the chat's model does not touch a running
+terminal; reopening the terminal (switching views away and back, or
+reloading) restarts it with the current model, ending a running Claude
+Code (`claude --resume` recovers the conversation). Two tabs of one chat
+on different models restart each other's terminal; the last one opened
+wins. Without a login token or a model the terminal does not start and
+shows why. Any process in the sandbox can read the token, so it is as
+trusted as the chat owner's own session.
+
+Where `OCU_SANDBOX_MESSAGES_ADDRESS` is unset (the development
+`docker-compose.yml`), the terminal starts as before. A set value that is
+not an IPv4 address, including an empty one, stops Computer Use at startup
+with an error naming the variable.
 
 Open WebUI authenticates the token and applies the user's model access;
 the ingress adds no identity. Every other path answers 404 at the ingress.

@@ -902,7 +902,9 @@ raise SystemExit(smoke_deployment.main(['smoke']))
         posts = [item for item in self.http.record if item[0] == "POST"]
         self.assertTrue(any(item[1].endswith("/start-ttyd") for item in posts))
         start = next(item for item in posts if item[1].endswith("/start-ttyd"))
-        self.assertEqual(json.loads(start[3].decode()), {"dangerous_mode": False})
+        self.assertEqual(
+            json.loads(start[3].decode()), {"dangerous_mode": False, "model": "ocu-smoke-terminal"}
+        )
         self.assertEqual(start[2].get("X-Requested-With"), "ocu-workspace")
         self.assertTrue(self.http.ws_started.is_set())
         self.assertTrue(self.http.ws_init.is_set())
