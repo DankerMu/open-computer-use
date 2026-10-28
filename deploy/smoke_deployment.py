@@ -55,6 +55,8 @@ CURL_WRITE_OUT = (
 BASH_NAMES = {"bash", "-bash"}
 CONNECT_TIMEOUT = 3.0
 HTTP_TIMEOUT = 5.0
+# start-ttyd may take about 11 s on a failing start; HTTP_TIMEOUT would turn its named 503 into a timeout.
+TERMINAL_START_TIMEOUT = 20.0
 SANDBOX_CONNECT = "5"
 SANDBOX_MAX = "15"
 TERMINAL_DEADLINE = 10.0
@@ -819,8 +821,8 @@ def proxy_headers(origin: str, token: str) -> dict[str, str]:
     }
 
 
-def start_product_terminal(origin: str, chat_id: str, token: str) -> None:
-    global _PENDING_START
+def post_start_ttyd(origin: str, chat_id: str, token: str) -> tuple[int, object]:
+    """POST start-ttyd; return the status and the decoded JSON answer, or None when it does not decode."""
     url = f"{origin}/ocu/terminal/{chat_id}/start-ttyd"
     # Gateway mode needs a model; the smoke checks the bash default and never runs Claude Code.
     body = json.dumps({"dangerous_mode": False, "model": "ocu-smoke-terminal"}).encode("utf-8")
@@ -829,18 +831,39 @@ def start_product_terminal(origin: str, chat_id: str, token: str) -> None:
         method="POST",
         headers=proxy_headers(origin, token),
         body=body,
+        timeout=TERMINAL_START_TIMEOUT,
     )
-    if status != 200:
-        fail(f"start-ttyd refused HTTP {status}", 2)
     try:
         document = json.loads(payload.decode("utf-8") or "{}")
     except (UnicodeError, json.JSONDecodeError):
+        return status, None
+    return status, document
+
+
+def start_product_terminal(origin: str, chat_id: str, token: str) -> None:
+    global _PENDING_START
+    status, document = post_start_ttyd(origin, chat_id, token)
+    if status != 200:
+        fail(f"start-ttyd refused HTTP {status}", 2)
+    if document is None:
         fail("start-ttyd returned malformed JSON", 2)
     if document.get("already_running") is True:
         _PENDING_START = None
         fail("start-ttyd reported already_running; refusing shared terminal", 2)
     if document.get("started") is not True:
         fail("start-ttyd did not start a new terminal", 2)
+
+
+def check_terminal_reuse(origin: str, chat_id: str, token: str) -> None:
+    """A second start with the same token and model must reuse the owned terminal."""
+    try:
+        status, document = post_start_ttyd(origin, chat_id, token)
+    except SmokeError as cop:
+        fail(f"terminal reuse check: second start-ttyd failed ({cop})")
+    if status != 200:
+        fail(f"terminal reuse check: second start-ttyd answered HTTP {status}")
+    if not isinstance(document, dict) or document.get("already_running") is not True:
+        fail("terminal reuse check: second start-ttyd did not report already_running")
 
 
 def stop_product_terminal(origin: str, chat_id: str, token: str) -> None:
@@ -1114,6 +1137,7 @@ def run(argv: list[str]) -> int:
     start_product_terminal(inputs["origin"], inputs["chat_id"], inputs["token"])
     _OWNED_CLEANUP = _PENDING_START
     _PENDING_START = None
+    check_terminal_reuse(inputs["origin"], inputs["chat_id"], inputs["token"])
     _OWNED_SESSION = open_terminal_session(inputs["origin"], inputs["chat_id"], inputs["token"])
     observe_foreground(sandbox["id"], _OWNED_SESSION, baseline)
     return cleanup_owned(0)
