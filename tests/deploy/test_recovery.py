@@ -375,6 +375,8 @@ recovery_resources.time = SimpleNamespace(
                 service="open-webui-init",
             ),
             stack_container("ocu-test-proxy", image=images["proxy"], service="proxy"),
+            stack_container("ocu-test-messages-ingress", image=images["proxy"],
+                            service="messages-ingress"),
             stack_container("ocu-test-documentserver-1", image=images["documentserver"],
                             service="documentserver"),
             stack_container(
@@ -742,7 +744,12 @@ recovery_resources.time = SimpleNamespace(
         calls = ops(self.state)
         command = "docker exec ocu-test-documentserver-1 /usr/bin/documentserver-prepare4shutdown.sh"
         self.assertIn(command, calls)
-        self.assertLess(calls.index("docker stop --time 30 ocu-test-proxy"), calls.index(command))
+        self.assertLess(calls.index("docker stop --time 30 ocu-test-proxy"),
+                        calls.index("docker stop --time 30 ocu-test-messages-ingress"))
+        self.assertLess(calls.index("docker stop --time 30 ocu-test-messages-ingress"), calls.index(command))
+        ingress = next(row for row in json.loads((self.state / "containers.json").read_text())
+                       if row["Name"] == "ocu-test-messages-ingress")
+        self.assertFalse(ingress["State"]["Running"])
         for name in ("ocu-test-documentserver-1", "ocu-test-computer-use-server",
                      "ocu-test-open-webui-1"):
             self.assertGreater(calls.index("docker stop --time 30 " + name), calls.index(command))
@@ -1065,6 +1072,58 @@ else:
                     if row["Name"] not in ("ocu-test-postgres-1", "ocu-test-documentserver-1"):
                         self.assertFalse(row["State"]["Running"], row["Name"])
                 self.assertFalse(any("pg_dump" in op for op in ops(self.state)))
+
+    def test_proxy_stop_failure_still_stops_messages_ingress(self):
+        path = self.state / "containers.json"
+        rows = json.loads(path.read_text())
+        next(row for row in rows if row["Name"] == "ocu-test-proxy")["unstoppable"] = True
+        path.write_text(json.dumps(rows))
+        dest = self.root / "unstoppable-proxy"
+        result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                               "--destination", str(dest), "--runtime-file", str(self.runtime)])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(dest.exists())
+        self.assertIn("docker stop --time 30 ocu-test-messages-ingress", ops(self.state))
+        ingress = next(row for row in json.loads(path.read_text())
+                       if row["Name"] == "ocu-test-messages-ingress")
+        self.assertFalse(ingress["State"]["Running"])
+
+    def test_foreign_messages_ingress_refuses_before_any_stop(self):
+        path = self.state / "containers.json"
+        original = path.read_text()
+        for defect in ("image", "project", "service"):
+            with self.subTest(defect=defect):
+                rows = json.loads(original)
+                index = next(i for i, row in enumerate(rows) if row["Name"] == "ocu-test-messages-ingress")
+                if defect == "image":
+                    rows[index] = stack_container("ocu-test-messages-ingress",
+                                                  image=DEFAULT_RELEASE_IMAGES["documentserver"],
+                                                  service="messages-ingress")
+                else:
+                    key = "com.docker.compose." + defect
+                    for labels in (rows[index]["Labels"], rows[index]["Config"]["Labels"]):
+                        labels[key] = "other-project" if defect == "project" else "proxy"
+                path.write_text(json.dumps(rows))
+                dest = self.root / ("foreign-ingress-" + defect)
+                result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                                       "--destination", str(dest), "--runtime-file", str(self.runtime)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("ocu-test-messages-ingress", result.stderr)
+                self.assertFalse(dest.exists())
+                self.assertFalse((self.state / "stopped.log").exists())
+                self.assertFalse(any(call.startswith("docker stop") for call in ops(self.state)))
+
+    def test_deployment_without_messages_ingress_backs_up(self):
+        path = self.state / "containers.json"
+        rows = [row for row in json.loads(path.read_text()) if row["Name"] != "ocu-test-messages-ingress"]
+        path.write_text(json.dumps(rows))
+        dest = self.root / "no-ingress"
+        result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                               "--destination", str(dest), "--runtime-file", str(self.runtime)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue((dest / "recovery.json").is_file())
+        self.assertIn("docker stop --time 30 ocu-test-proxy", ops(self.state))
 
     def test_late_office_journal_after_drain_prevents_capture(self):
         state, _ = self._seed_office()
@@ -2961,6 +3020,73 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self.assertIn("target database is not empty", refused.stderr)
         self.assertFalse((dest / ".restored").exists())
         self.assertEqual(self._assert_placeholder_probes(target_state), 1)
+
+    def test_restore_refuses_target_holding_a_messages_ingress(self):
+        backup = self.root / "backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self._seed_restore_target("ingress-occupied-state")
+        containers = target_state / "containers.json"
+        containers.write_text(json.dumps([stack_container(
+            "ocu-test-messages-ingress", image=DEFAULT_RELEASE_IMAGES["proxy"], service="messages-ingress")]))
+        before = containers.read_bytes()
+        dest = self.root / "ingress-occupied-root"
+        refused = self.run_cli(
+            ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+             "--provider-file", str(provider)],
+            extra={"FAKE_DOCKER_STATE": str(target_state)},
+        )
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("target already contains", refused.stderr)
+        self.assertIn("ocu-test-messages-ingress", refused.stderr)
+        self.assertEqual(refused.stdout, "")
+        self.assertFalse(dest.exists())
+        self.assertEqual(containers.read_bytes(), before)
+        for name in ("volumes.json", "postgres.json", "starts.log", "stopped.log"):
+            self.assertFalse((target_state / name).exists(), name)
+
+    def test_os_errors_are_one_line_refusals(self):
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        provider.chmod(0o600)
+        launcher = self.launcher.read_text()
+        entry = "runpy.run_module('recovery', run_name='__main__')"
+        cases = (
+            ("backup", "backup_deployment", "PermissionError(errno.EACCES, 'injected denial', 'stage')",
+             ["--deploy-root", str(self.deploy_root), "--destination", str(self.root / "os-backup"),
+              "--runtime-file", str(self.runtime)]),
+            ("verify", "verify_recovery_set", "OSError(errno.ENOSPC, 'injected disk full')",
+             ["--recovery-set", str(self.root / "os-set")]),
+            ("restore", "restore_deployment", "PermissionError(errno.EACCES, 'injected denial', 'target')",
+             ["--recovery-set", str(self.root / "os-set"), "--destination-root", str(self.root / "os-root"),
+              "--provider-file", str(provider)]),
+            ("activate", "activate_release", "OSError(errno.ENOSPC, 'injected disk full')",
+             ["--destination-root", str(self.root / "os-root"),
+              "--retained-delivery", str(self.root / "os-delivery")]),
+        )
+        for command, function, error, args in cases:
+            with self.subTest(command=command):
+                injection = (
+                    "import errno\n"
+                    "import recovery_resources\n"
+                    "def injected(*args, **kwargs):\n"
+                    f"    raise {error}\n"
+                    f"recovery_resources.{function} = injected\n"
+                )
+                self.launcher.write_text(launcher.replace(entry, injection + entry))
+                result = self.run_cli([command, *args])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn("Traceback", result.stderr)
+                lines = result.stderr.splitlines()
+                self.assertEqual(len(lines), 1, result.stderr)
+                self.assertTrue(lines[0].startswith("recovery: "), result.stderr)
+                self.assertIn("injected denial" if "denial" in error else "injected disk full", lines[0])
+        self.assertFalse((self.root / "os-backup").exists())
+        self.assertFalse((self.root / "os-root").exists())
 
     def _seed_model_links(self):
         workspace = self.state / "volume-data" / f"chat-{CHAT_ID}-workspace"

@@ -102,7 +102,7 @@ for services, _ in docs:
         if name in seen:
             fail(f"{name}: duplicate service across resolved stacks")
         seen.add(name)
-for critical in (PROXY, WEBUI, OCU, DOCUMENTSERVER):
+for critical in (PROXY, WEBUI, OCU, DOCUMENTSERVER, MESSAGES):
     if critical not in seen:
         fail(f"{critical}: required service is missing")
 
@@ -116,7 +116,7 @@ for services, networks in docs:
             if not isinstance(mode, str) or mode != "none":
                 fail(f"{name}: forbidden host or shared network mode")
         attached = networks_for(name, service, networks, mode)
-        if name == MESSAGES and SANDBOX in attached:
+        if name == MESSAGES:
             require_messages_ingress(name, service, networks, attached)
         elif SANDBOX in attached:
             fail(f"{name}: joined sandbox network {SANDBOX}")
