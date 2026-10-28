@@ -165,7 +165,7 @@ class World:
         monkeypatch.setattr(mcp_tools.skill_manager, "get_user_skills_sync", lambda *a, **k: [])
         monkeypatch.setattr(mcp_tools.skill_manager, "build_sub_agent_skills_text", lambda *a, **k: "")
 
-    def call(self, *, token=None, chat_model=None, email=None, **kwargs) -> str:
+    def call(self, *, token=None, chat_model=None, email=None, anthropic_token=None, **kwargs) -> str:
         fn = getattr(self.tools.sub_agent, "fn", None) or self.tools.sub_agent
         ctx = MagicMock()
         ctx.report_progress = AsyncMock()
@@ -177,6 +177,7 @@ class World:
             current_user_email.set(email)
             current_gateway_token.set(token)
             current_chat_model.set(chat_model)
+            current_anthropic_auth_token.set(anthropic_token)
             return await fn(ctx=ctx, **arguments)
 
         return asyncio.run(run())
@@ -195,10 +196,11 @@ def gateway_off(monkeypatch):
     return World(monkeypatch, "claude", gateway=False)
 
 
-def _assert_secret_absent(world, result, capsys, caplog, token=TOKEN):
+def _assert_secret_absent(world, result, capsys, caplog, *tokens):
     captured = capsys.readouterr()
     for text in [result, captured.out, captured.err, caplog.text, *world.texts()]:
-        assert token not in text
+        for token in tokens or (TOKEN,):
+            assert token not in text
 
 
 # --- a: token and chat model bind the call -------------------------------
@@ -247,6 +249,21 @@ def test_missing_token_or_model_refuses_before_any_container_work(gateway, capsy
     assert gateway.captures == []
     assert gateway.gitlab.await_count == 0
     _assert_secret_absent(gateway, result, capsys, caplog)
+
+
+def test_missing_gateway_token_is_not_replaced_by_other_anthropic_tokens(monkeypatch, capsys, caplog):
+    caplog.set_level(logging.DEBUG)
+    with monkeypatch.context() as scoped:
+        scoped.setenv("ANTHROPIC_AUTH_TOKEN", "srv-canary")
+        world = World(scoped, "claude", gateway=True)
+        assert world.dm.ANTHROPIC_AUTH_TOKEN == "srv-canary"
+        result = world.call(token=None, chat_model="m-1", anthropic_token="req-canary")
+    importlib.reload(sys.modules["docker_manager"])
+    assert result == f"Error: {NO_TOKEN}"
+    assert world.lookups == []
+    assert world.bash == []
+    assert world.captures == []
+    _assert_secret_absent(world, result, capsys, caplog, "srv-canary", "req-canary")
 
 
 def test_longest_valid_chat_model_is_used(gateway):
@@ -410,5 +427,7 @@ def test_forwarded_values_do_not_outlive_their_request(gateway, monkeypatch):
 
     assert asyncio.run(two_requests()) == (None, None)
     assert seen == [(TOKEN, "m-1"), (None, None)]
+    assert gateway.lookups[0]["anthropic_token"] is None
+    assert gateway.lookups[0]["anthropic_base"] is None
     assert "**Model:** m-1 |" in results[0]
     assert results[1] == f"Error: {NO_TOKEN}"

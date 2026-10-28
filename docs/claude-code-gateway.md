@@ -145,10 +145,18 @@ tool sends them:
 
 - `X-OCU-Gateway-Token`: the token that authenticated the chat request. This
   is the user's login token, or the user's Open WebUI API key when the chat
-  request used one.
-- `X-Chat-Model`: the id of the model the chat request runs on. When Open
-  WebUI replaced a custom model with its fallback model, this is the
-  fallback model.
+  request used one. An API key does not expire like the 4-week login token.
+  The Tool sends the token only when the caller owns the chat. An admin may
+  run completions in another user's chat; there `sub_agent` gets no token and
+  is refused, so the admin's token never reaches the owner's sandbox.
+- `X-Chat-Model`: the id of the model the chat request runs on, taken from
+  the chat request's metadata. It is not the `__model__` that Open WebUI
+  hands to Tools, which is the task model. When Open WebUI replaced a custom
+  model with its fallback model, this is the fallback model. The model is
+  sent whether or not the caller owns the chat.
+
+The Tool sends both headers on every `sub_agent` call, also when Computer
+Use is not in gateway mode; Computer Use then ignores them.
 
 Claude Code then runs on that model verbatim, on new and resumed sessions:
 the `model` argument the language model passes is ignored, aliases such as
@@ -162,9 +170,13 @@ refusal shows in the sub-agent's result.
 
 The sub-agent runs model-chosen commands without permission prompts, and
 any process it starts in the sandbox can read the token, including after
-the call ends. Claude Code can also print its own environment into its
-output, which Computer Use does not filter. Treat the sandbox as trusted as
-the chat owner's own session.
+the call ends. Claude Code can also print its own environment, token
+included, into its output and into the progress lines that Computer Use
+prints to its own stdout (`[SUB-AGENT-PROGRESS]`); Computer Use filters
+neither. The exposure is therefore wider than the terminal's: no user has
+to open a terminal, the token can be an API key without the login token's
+expiry, and it can land in Computer Use's own logs. Treat the sandbox as
+trusted as the chat owner's own session.
 
 ## Full variable reference
 
