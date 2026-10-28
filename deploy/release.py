@@ -2717,10 +2717,11 @@ def _require_import_space(
         relative_archive_path(delivery, payload["images"][role]["archive"]["path"]).stat().st_size
         for role in to_load
     )
-    bundle_bytes = sum(
-        relative_archive_path(delivery, payload[name]["path"]).stat().st_size
-        for name in ("source_bundle", "font_bundle")
-    )
+    bundle_bytes = 0
+    for name in ("source_bundle", "font_bundle"):
+        bundle = relative_archive_path(delivery, payload[name]["path"])
+        require_regular_file(bundle)
+        bundle_bytes += bundle.stat().st_size
     staged_bytes = load_bytes + 2 * bundle_bytes
     unpacked_bytes = IMPORT_UNPACK_FACTOR * load_bytes
     raw_root = local_daemon_info().get("DockerRootDir")

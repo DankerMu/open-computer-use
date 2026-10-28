@@ -2266,7 +2266,11 @@ class OfflineReleaseTests(unittest.TestCase):
                 ):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("font", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    if defect == "missing":
+                        self.assertIn(f"{delivery.name}/fonts.tar: missing", result.stderr)
                 self.assertFalse(installed.exists())
+                self.assertFalse(list(self.root.glob(f"install-{defect}.stage-*")))
                 self.assertFalse((self.state / "load-count").exists())
                 # Import checks which images are present before it stages the fonts.
                 self.assertEqual([
@@ -3240,6 +3244,16 @@ class OfflineReleaseTests(unittest.TestCase):
         bundle.unlink()
         absent = self.verify_cmd(inventory_path, mode="delivery", delivery=delivery)
         self.assertNotEqual(absent.returncode, 0)
+        refusal = f"{delivery.name}/{bundle.name}: missing"
+        self.assertIn(refusal, absent.stderr)
+        install = self.root / "install-no-source-bundle"
+        imported = self.import_cmd(delivery, install)
+        self.assertNotEqual(imported.returncode, 0)
+        self.assertIn(refusal, imported.stderr)
+        self.assertNotIn("Traceback", imported.stderr)
+        self.assertFalse(install.exists())
+        self.assertFalse(list(self.root.glob("install-no-source-bundle.stage-*")))
+        self.assertFalse((self.state / "load-count").exists())
         bundle.write_bytes(b"not-a-git-bundle")
         corrupt = self.verify_cmd(inventory_path, mode="delivery", delivery=delivery)
         self.assertNotEqual(corrupt.returncode, 0)
@@ -3553,6 +3567,48 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.loaded_archives(full_state)), len(ROLE_ORDER))
         self.assertEqual(self.published_tree(install), self.published_tree(full))
+
+    def test_present_role_removed_during_load_fails_without_publishing(self):
+        delivery, inventory, _sha = self.write_delivery()
+        self.seed_present(inventory, ("workspace",))
+        install = self.root / "install-vanished"
+        hold = self.root / "hold-vanished"
+        hold.touch()
+        process = subprocess.Popen(
+            [sys.executable, str(self.release_script), "import",
+             "--delivery", str(delivery), "--install-root", str(install)],
+            env={**self.env, "FAKE_DOCKER_HOLD_LOAD": str(hold)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.state / "entered-load").exists():
+                self.assertIsNone(process.poll(), "import exited before load")
+                self.assertLess(time.monotonic(), deadline, "load barrier not reached")
+                time.sleep(0.02)
+            images_path = self.state / "images.json"
+            images = json.loads(images_path.read_text(encoding="utf-8"))
+            images.pop(inventory["images"]["workspace"]["reference"])
+            images_path.write_text(json.dumps(images), encoding="utf-8")
+            hold.unlink()
+            stdout, stderr = process.communicate(timeout=30)
+        finally:
+            hold.unlink(missing_ok=True)
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        self.assertNotEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual(self.summary_line(stderr), import_summary(("workspace",)))
+        self.assertIn("missing image", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(
+            [Path(archive).name for archive in self.loaded_archives()],
+            [f"{role}.tar" for role in ROLE_ORDER if role != "workspace"],
+        )
+        self.assertFalse(install.exists())
+        self.assertFalse(list(self.root.glob("install-vanished.stage-*")))
+        self.assertFalse(install.with_name(install.name + ".publish.lock").exists())
 
     def test_corrupt_present_archive_fails_before_any_copy_or_load(self):
         delivery, inventory, _sha = self.write_delivery()
