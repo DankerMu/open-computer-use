@@ -41,6 +41,8 @@ def state_dir() -> Path:
     path = Path(raw)
     path.mkdir(parents=True, exist_ok=True)
     (path / "networks").mkdir(exist_ok=True)
+    # A real daemon's data root exists; docker info reports this one by default.
+    (path / "docker-root").mkdir(exist_ok=True)
     return path
 
 

@@ -140,6 +140,12 @@ SAFE_WHEEL_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 PINNED_ASSIGNMENT_RE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*=\s*([\"'])([^\"']+)\2\s*$")
 
 _PINNED_DOCKER_HOST: str | None = None
+# Room beyond the counted bytes for the source clone's working tree and
+# filesystem overhead; without it an exact-fit import fills the disk.
+IMPORT_SPACE_HEADROOM = 1 << 30
+# docker load unpacked a 1.8G archive to about 5.3G (#663); counting only the
+# archive let an upgrade run out of space halfway through the load.
+IMPORT_UNPACK_FACTOR = 3
 
 
 ROLE_SPECS = {
@@ -190,6 +196,14 @@ ROLE_SPECS = {
 
 class ReleaseError(Exception):
     """Operator-visible release, import, or verification failure."""
+
+
+class MissingImageError(ReleaseError):
+    """The reference does not resolve in the local image store."""
+
+
+class ImagePlatformError(ReleaseError):
+    """The local image for a reference is not built for PLATFORM."""
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -402,7 +416,7 @@ def pin_local_docker_host() -> str:
     return host
 
 
-def local_daemon_identity() -> str:
+def local_daemon_info() -> dict:
     pin_local_docker_host()
     result = docker("info", "--format", "{{json .}}")
     require_command(result, "inspect local Docker daemon")
@@ -412,6 +426,11 @@ def local_daemon_identity() -> str:
         raise ReleaseError("docker info returned malformed JSON") from exc
     if not isinstance(payload, dict):
         raise ReleaseError("docker info returned malformed JSON")
+    return payload
+
+
+def local_daemon_identity() -> str:
+    payload = local_daemon_info()
     identity = str(payload.get("ID") or payload.get("id") or "").strip()
     if not identity:
         raise ReleaseError("docker info did not report a daemon identity")
@@ -1846,7 +1865,7 @@ def inspect_image(reference: str) -> dict:
         detail = (result.stderr or "").strip()
         lowered = detail.lower()
         if "no such image" in lowered or "not found" in lowered:
-            raise ReleaseError(f"missing image {reference}")
+            raise MissingImageError(f"missing image {reference}")
         raise ReleaseError(
             f"inspect {reference} failed: {detail or f'exit {result.returncode}'}"
         )
@@ -1856,7 +1875,7 @@ def inspect_image(reference: str) -> dict:
         raise ReleaseError(f"inspect {reference} returned malformed JSON") from exc
     if isinstance(payload, list):
         if not payload:
-            raise ReleaseError(f"missing image {reference}")
+            raise MissingImageError(f"missing image {reference}")
         payload = payload[0]
     if not isinstance(payload, dict):
         raise ReleaseError(f"inspect {reference} returned an unexpected payload")
@@ -1878,7 +1897,7 @@ def image_identity(payload: dict) -> tuple[str, str]:
         )
     platform = f"{os_name}/{architecture}"
     if platform != PLATFORM:
-        raise ReleaseError(f"image platform is {platform}, expected {PLATFORM}")
+        raise ImagePlatformError(f"image platform is {platform}, expected {PLATFORM}")
     return image_id, platform
 
 
@@ -2675,6 +2694,66 @@ def verify_loaded_images(payload: dict) -> None:
             raise ReleaseError(f"{role}: loaded platform is {platform}")
 
 
+def _present_roles(payload: dict) -> list[str]:
+    """Roles whose reference already resolves to an accepted identity on PLATFORM."""
+    present = []
+    for role in ROLE_ORDER:
+        record = payload["images"][role]
+        try:
+            image_id, _platform = image_identity(inspect_image(record["reference"]))
+        except (MissingImageError, ImagePlatformError):
+            continue
+        if image_id in accepted_image_identities(
+            record["configuration_digest"], record.get("descriptor_digests", [])
+        ):
+            present.append(role)
+    return present
+
+
+def _require_import_space(
+    delivery: Path, payload: dict, to_load: list[str], stage_root: Path
+) -> None:
+    load_bytes = sum(
+        relative_archive_path(delivery, payload["images"][role]["archive"]["path"]).stat().st_size
+        for role in to_load
+    )
+    bundle_bytes = sum(
+        relative_archive_path(delivery, payload[name]["path"]).stat().st_size
+        for name in ("source_bundle", "font_bundle")
+    )
+    staged_bytes = load_bytes + 2 * bundle_bytes
+    unpacked_bytes = IMPORT_UNPACK_FACTOR * load_bytes
+    raw_root = local_daemon_info().get("DockerRootDir")
+    if not isinstance(raw_root, str) or not raw_root:
+        raise ReleaseError("docker info did not report DockerRootDir")
+    docker_root = Path(raw_root)
+    try:
+        root_device = os.stat(docker_root).st_dev
+    except OSError as cop:
+        raise ReleaseError(
+            f"Docker data root {docker_root} cannot be inspected: {cop.strerror or cop}"
+        ) from cop
+    if os.stat(stage_root).st_dev == root_device:
+        needs = [(
+            f"stage filesystem {stage_root}, shared with Docker data root {docker_root}",
+            stage_root, staged_bytes + unpacked_bytes + IMPORT_SPACE_HEADROOM,
+        )]
+    else:
+        needs = [
+            (f"stage filesystem {stage_root}", stage_root,
+             staged_bytes + IMPORT_SPACE_HEADROOM),
+            (f"Docker data root {docker_root}", docker_root,
+             unpacked_bytes + IMPORT_SPACE_HEADROOM),
+        ]
+    for label, path, needed in needs:
+        available = shutil.disk_usage(path).free
+        if available < needed:
+            raise ReleaseError(
+                f"insufficient free space on {label}: need {needed} bytes, "
+                f"available {available} bytes; free space or delete old images"
+            )
+
+
 def import_release(*, delivery: Path, install_root: Path, recovery_owner: dict | None = None) -> dict:
     if destination_occupied(install_root):
         raise ReleaseError(f"install root already exists: {install_root}")
@@ -2684,6 +2763,24 @@ def import_release(*, delivery: Path, install_root: Path, recovery_owner: dict |
     attempted_load = False
     try:
         session.acquire()
+        pin_local_docker_host()
+        seen_paths = set()
+        for role in ROLE_ORDER:
+            original = payload["images"][role]["archive"]["path"]
+            if original in seen_paths:
+                raise ReleaseError(
+                    f"{role}: archive path {original} collides with another role"
+                )
+            seen_paths.add(original)
+        imported = verify_archive_set(delivery, payload)
+        present = _present_roles(payload)
+        to_load = [role for role in ROLE_ORDER if role not in present]
+        print(
+            "release: present roles skipped: " + (", ".join(present) or "none")
+            + "; roles to load: " + (", ".join(to_load) or "none"),
+            file=sys.stderr,
+        )
+        _require_import_space(delivery, payload, to_load, install_root.parent)
         stage = session.allocate_stage()
         if recovery_owner is not None:
             fd = os.open(stage / ".recovery-owner.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -2713,25 +2810,17 @@ def import_release(*, delivery: Path, install_root: Path, recovery_owner: dict |
         staged_fonts.unlink()
         staged_images = stage / "images"
         staged_images.mkdir()
-        seen_paths = set()
-        for role in ROLE_ORDER:
+        for role in to_load:
             record = staged_payload["images"][role]
-            original = record["archive"]["path"]
-            if original in seen_paths:
-                raise ReleaseError(
-                    f"{role}: archive path {original} collides with another role"
-                )
-            seen_paths.add(original)
             dest = staged_images / f"{role}.tar"
-            copy_regular(relative_archive_path(delivery, original), dest)
+            copy_regular(relative_archive_path(delivery, record["archive"]["path"]), dest)
             record["archive"]["path"] = f"images/{role}.tar"
             if sha256_file(dest) != record["archive"]["sha256"]:
                 raise ReleaseError(f"{role}: staged archive checksum mismatch")
-        imported = verify_archive_set(stage, staged_payload)
         with ImageStoreLock(image_store_lock_path(local_daemon_identity())):
             reject_existing_conflicts(imported)
             attempted_load = True
-            for role in ROLE_ORDER:
+            for role in to_load:
                 archive = stage / staged_payload["images"][role]["archive"]["path"]
                 try:
                     load_image(archive)
