@@ -571,6 +571,16 @@ def tmp_dir():
     return tempfile.TemporaryDirectory(prefix="ocu-deploy-test-")
 
 
+def import_summary(present) -> str:
+    """The stderr line release.py import writes once it knows which roles to skip."""
+    skipped = [role for role in ROLE_ORDER if role in present]
+    loading = [role for role in ROLE_ORDER if role not in present]
+    return (
+        "release: present roles skipped: " + (", ".join(skipped) or "none")
+        + "; roles to load: " + (", ".join(loading) or "none")
+    )
+
+
 FONT_FILES = {
     "fixture-cjk.otf": b"OTTO synthetic CJK font bytes\n",
     "fixture-LICENSE.txt": b"SIL Open Font License 1.1 fixture\n",

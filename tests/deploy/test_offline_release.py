@@ -31,6 +31,7 @@ from support import (
     fake_env,
     git_init_commit,
     image_id_for_config,
+    import_summary,
     intended_docs,
     intended_docs_for_images,
     ops,
@@ -57,6 +58,12 @@ import release
 
 def digest_for(tag: str) -> str:
     return "sha256:" + hashlib.sha256(tag.encode("utf-8")).hexdigest()
+
+
+# The import free-space precheck: its headroom and the two probes tests substitute.
+SPACE_HEADROOM = 1 << 30
+SPACE_FREE_PROBE = "        available = shutil.disk_usage(path).free\n"
+SPACE_DEVICE_PROBE = "    if os.stat(stage_root).st_dev == root_device:\n"
 
 
 PYODIDE_WHEELS = (
@@ -2259,9 +2266,17 @@ class OfflineReleaseTests(unittest.TestCase):
                 ):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("font", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    if defect == "missing":
+                        self.assertIn(f"{delivery.name}/fonts.tar: missing", result.stderr)
                 self.assertFalse(installed.exists())
+                self.assertFalse(list(self.root.glob(f"install-{defect}.stage-*")))
                 self.assertFalse((self.state / "load-count").exists())
-                self.assertEqual(ops(self.state), [])
+                # Import checks which images are present before it stages the fonts.
+                self.assertEqual([
+                    line for line in ops(self.state)
+                    if not line.startswith(("docker info ", "docker image inspect "))
+                ], [])
                 self.assertEqual(outside.read_bytes(), b"unrelated bytes")
 
     def test_build_exports_documentserver_as_source_built_role(self):
@@ -2896,7 +2911,10 @@ class OfflineReleaseTests(unittest.TestCase):
         first = self.root / "install-first"
         second = self.root / "install-second"
         ready = self.root / "second-store-ready"
-        needle = "        imported = verify_archive_set(stage, staged_payload)\n"
+        needle = (
+            "        with ImageStoreLock(image_store_lock_path(local_daemon_identity())):\n"
+            "            reject_existing_conflicts(imported)\n"
+        )
         source = self.release_script.read_text(encoding="utf-8")
         self.assertIn(needle, source)
         self._script_serial = getattr(self, "_script_serial", 0) + 1
@@ -2904,7 +2922,7 @@ class OfflineReleaseTests(unittest.TestCase):
         script_b.write_text(
             source.replace(
                 needle,
-                needle + f"        Path({str(ready)!r}).write_text('1')\n",
+                f"        Path({str(ready)!r}).write_text('1')\n" + needle,
                 1,
             ),
             encoding="utf-8",
@@ -3226,6 +3244,16 @@ class OfflineReleaseTests(unittest.TestCase):
         bundle.unlink()
         absent = self.verify_cmd(inventory_path, mode="delivery", delivery=delivery)
         self.assertNotEqual(absent.returncode, 0)
+        refusal = f"{delivery.name}/{bundle.name}: missing"
+        self.assertIn(refusal, absent.stderr)
+        install = self.root / "install-no-source-bundle"
+        imported = self.import_cmd(delivery, install)
+        self.assertNotEqual(imported.returncode, 0)
+        self.assertIn(refusal, imported.stderr)
+        self.assertNotIn("Traceback", imported.stderr)
+        self.assertFalse(install.exists())
+        self.assertFalse(list(self.root.glob("install-no-source-bundle.stage-*")))
+        self.assertFalse((self.state / "load-count").exists())
         bundle.write_bytes(b"not-a-git-bundle")
         corrupt = self.verify_cmd(inventory_path, mode="delivery", delivery=delivery)
         self.assertNotEqual(corrupt.returncode, 0)
@@ -3380,6 +3408,383 @@ class OfflineReleaseTests(unittest.TestCase):
                 self.assertNotIn("network create", recorded)
                 self.assertNotIn("compose up", recorded)
                 self.assertFalse((self.state / "builds.json").exists())
+
+    def accepted_image(self, role: str, architecture="amd64") -> dict:
+        config = config_payload(DEFAULT_RELEASE_DIGESTS[role])
+        return {
+            "Id": image_id_for_config(config),
+            "Os": "linux",
+            "Architecture": architecture,
+            "ConfigBytes": config.decode("utf-8"),
+        }
+
+    def seed_present(self, inventory: dict, roles) -> None:
+        seed_images(self.state, {
+            inventory["images"][role]["reference"]: self.accepted_image(role)
+            for role in roles
+        })
+
+    def copy_probe(self, log: Path) -> tuple[str, str]:
+        anchor = "def copy_regular(source: Path, dest: Path) -> None:\n"
+        return (
+            anchor,
+            anchor
+            + f"    with open({str(log)!r}, 'a', encoding='utf-8') as copies:\n"
+            + "        copies.write(str(dest) + '\\n')\n",
+        )
+
+    def space_script(self, free: dict, *, shared: bool, extra=()) -> Path:
+        mapping = {str(path.resolve()): value for path, value in free.items()}
+        replacements = [(
+            SPACE_FREE_PROBE,
+            f"        available = {mapping!r}[str(Path(path).resolve())]\n",
+        )]
+        if not shared:
+            replacements.append((SPACE_DEVICE_PROBE, "    if False:\n"))
+        return self.patched_release(*replacements, *extra)
+
+    def space_need(self, delivery: Path, inventory: dict, to_load) -> tuple[int, int]:
+        load = sum(
+            (delivery / inventory["images"][role]["archive"]["path"]).stat().st_size
+            for role in to_load
+        )
+        bundles = sum(
+            (delivery / inventory[name]["path"]).stat().st_size
+            for name in ("source_bundle", "font_bundle")
+        )
+        return load + 2 * bundles, 3 * load
+
+    def loaded_archives(self, state: Path | None = None) -> list[str]:
+        return [
+            line.split()[-1]
+            for line in ops(state or self.state)
+            if line.startswith("docker load ")
+        ]
+
+    def summary_line(self, stderr: str) -> str:
+        lines = [
+            line for line in stderr.splitlines()
+            if line.startswith("release: present roles skipped:")
+        ]
+        self.assertEqual(len(lines), 1, stderr)
+        return lines[0]
+
+    def published_tree(self, root: Path) -> dict[str, bytes]:
+        return {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file() and ".git" not in path.relative_to(root).parts
+        }
+
+    def assert_published(self, install: Path, delivery: Path, name="delivery") -> None:
+        self.assertEqual(
+            sorted(path.name for path in install.iterdir()),
+            ["fonts", "release.json", "source"],
+        )
+        tree = self.published_tree(install)
+        self.assertEqual(tree["release.json"], (delivery / "release.json").read_bytes())
+        source = {
+            key[len("source/"):]: value
+            for key, value in tree.items() if key.startswith("source/")
+        }
+        self.assertEqual(source, self.published_tree(self.root / f"{name}-ocu-src"))
+        fonts = {
+            Path(key).name: value
+            for key, value in tree.items() if key.startswith("fonts/")
+        }
+        self.assertEqual(fonts, FONT_FILES)
+
+    def assert_untouched(self, install: Path, copies: Path) -> None:
+        self.assertFalse(copies.exists(), copies.read_text() if copies.exists() else "")
+        self.assertEqual(self.loaded_archives(), [])
+        self.assertFalse(install.exists())
+        self.assertFalse(list(install.parent.glob(install.name + ".stage-*")))
+        self.assertFalse(install.with_name(install.name + ".publish.lock").exists())
+
+    def reset_observations(self) -> None:
+        for name in ("ops.log", "load-count"):
+            (self.state / name).unlink(missing_ok=True)
+
+    def test_present_roles_are_verified_but_neither_staged_nor_loaded(self):
+        delivery, inventory, _sha = self.write_delivery()
+        present = ("workspace", "documentserver")
+        to_load = [role for role in ROLE_ORDER if role not in present]
+        self.seed_present(inventory, present)
+        install = self.root / "install-partial"
+        hold = self.root / "hold-partial"
+        hold.touch()
+        process = subprocess.Popen(
+            [sys.executable, str(self.release_script), "import",
+             "--delivery", str(delivery), "--install-root", str(install)],
+            env={**self.env, "FAKE_DOCKER_HOLD_LOAD": str(hold)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.state / "entered-load").exists():
+                self.assertIsNone(process.poll(), "import exited before load")
+                self.assertLess(time.monotonic(), deadline, "load barrier not reached")
+                time.sleep(0.02)
+            stages = list(self.root.glob("install-partial.stage-*"))
+            self.assertEqual(len(stages), 1)
+            self.assertEqual(
+                sorted(path.name for path in (stages[0] / "images").iterdir()),
+                sorted(f"{role}.tar" for role in to_load),
+            )
+            hold.unlink()
+            stdout, stderr = process.communicate(timeout=30)
+        finally:
+            hold.unlink(missing_ok=True)
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual(self.summary_line(stderr), import_summary(present))
+        self.assertEqual(
+            [Path(archive).name for archive in self.loaded_archives()],
+            [f"{role}.tar" for role in to_load],
+        )
+        recorded = ops(self.state)
+        last_load = max(
+            index for index, line in enumerate(recorded) if line.startswith("docker load ")
+        )
+        verified = {
+            line.split()[-1] for line in recorded[last_load + 1:]
+            if line.startswith("docker image inspect ")
+        }
+        self.assertEqual(
+            verified, {record["reference"] for record in inventory["images"].values()}
+        )
+        self.assert_published(install, delivery)
+        full_state = self.root / "full-state"
+        full_state.mkdir()
+        full = self.root / "install-full"
+        result = self.import_with(
+            self.release_script, delivery, full,
+            extra_env={"FAKE_DOCKER_STATE": str(full_state)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.loaded_archives(full_state)), len(ROLE_ORDER))
+        self.assertEqual(self.published_tree(install), self.published_tree(full))
+
+    def test_present_role_removed_during_load_fails_without_publishing(self):
+        delivery, inventory, _sha = self.write_delivery()
+        self.seed_present(inventory, ("workspace",))
+        install = self.root / "install-vanished"
+        hold = self.root / "hold-vanished"
+        hold.touch()
+        process = subprocess.Popen(
+            [sys.executable, str(self.release_script), "import",
+             "--delivery", str(delivery), "--install-root", str(install)],
+            env={**self.env, "FAKE_DOCKER_HOLD_LOAD": str(hold)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.state / "entered-load").exists():
+                self.assertIsNone(process.poll(), "import exited before load")
+                self.assertLess(time.monotonic(), deadline, "load barrier not reached")
+                time.sleep(0.02)
+            images_path = self.state / "images.json"
+            images = json.loads(images_path.read_text(encoding="utf-8"))
+            images.pop(inventory["images"]["workspace"]["reference"])
+            images_path.write_text(json.dumps(images), encoding="utf-8")
+            hold.unlink()
+            stdout, stderr = process.communicate(timeout=30)
+        finally:
+            hold.unlink(missing_ok=True)
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        self.assertNotEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual(self.summary_line(stderr), import_summary(("workspace",)))
+        self.assertIn("missing image", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(
+            [Path(archive).name for archive in self.loaded_archives()],
+            [f"{role}.tar" for role in ROLE_ORDER if role != "workspace"],
+        )
+        self.assertFalse(install.exists())
+        self.assertFalse(list(self.root.glob("install-vanished.stage-*")))
+        self.assertFalse(install.with_name(install.name + ".publish.lock").exists())
+
+    def test_corrupt_present_archive_fails_before_any_copy_or_load(self):
+        delivery, inventory, _sha = self.write_delivery()
+        self.seed_present(inventory, ("workspace",))
+        archive = delivery / inventory["images"]["workspace"]["archive"]["path"]
+        data = bytearray(archive.read_bytes())
+        data[len(data) // 2] ^= 0x01
+        archive.write_bytes(bytes(data))
+        copies = self.root / "copies-corrupt.log"
+        install = self.root / "install-corrupt-present"
+        result = self.import_with(self.patched_release(self.copy_probe(copies)), delivery, install)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("workspace: archive checksum mismatch", result.stderr)
+        self.assert_untouched(install, copies)
+
+    def test_nothing_present_stages_and_loads_every_role_in_order(self):
+        delivery, _inventory, _sha = self.write_delivery()
+        copies = self.root / "copies-full.log"
+        install = self.root / "install-nothing-present"
+        result = self.import_with(self.patched_release(self.copy_probe(copies)), delivery, install)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.summary_line(result.stderr), import_summary(()))
+        archives = self.loaded_archives()
+        stage = Path(archives[0]).parent.parent
+        self.assertTrue(stage.name.startswith("install-nothing-present.stage-"), stage)
+        self.assertEqual(archives, [str(stage / "images" / f"{role}.tar") for role in ROLE_ORDER])
+        self.assertEqual(
+            copies.read_text(encoding="utf-8").splitlines(),
+            [str(stage / name) for name in ("release.json", "source.bundle", "fonts.tar")]
+            + [str(stage / "images" / f"{role}.tar") for role in ROLE_ORDER],
+        )
+        self.assert_published(install, delivery)
+
+    def test_present_reference_with_foreign_identity_is_not_skipped(self):
+        delivery, inventory, _sha = self.write_delivery()
+        seed_images(self.state, {inventory["images"]["workspace"]["reference"]: {
+            "Id": digest_for("foreign-workspace"), "Os": "linux", "Architecture": "amd64",
+        }})
+        before = (self.state / "images.json").read_bytes()
+        install = self.root / "install-foreign-present"
+        result = self.import_cmd(delivery, install)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.summary_line(result.stderr), import_summary(()))
+        self.assertRegex(result.stderr, r"existing image \S+ conflicts with the release")
+        self.assertEqual(self.loaded_archives(), [])
+        self.assertFalse(install.exists())
+        self.assertEqual((self.state / "images.json").read_bytes(), before)
+
+    def test_present_reference_on_wrong_platform_is_not_skipped(self):
+        delivery, inventory, _sha = self.write_delivery()
+        seed_images(self.state, {
+            inventory["images"]["workspace"]["reference"]: self.accepted_image(
+                "workspace", architecture="arm64"
+            ),
+        })
+        install = self.root / "install-wrong-platform"
+        result = self.import_cmd(delivery, install)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.summary_line(result.stderr), import_summary(()))
+        self.assertIn("image platform is linux/arm64, expected linux/amd64", result.stderr)
+        self.assertEqual(self.loaded_archives(), [])
+        self.assertFalse(install.exists())
+
+    def test_free_space_precheck_refuses_before_any_copy_or_load(self):
+        delivery, inventory, _sha = self.write_delivery()
+        self.seed_present(inventory, ("workspace",))
+        staged, unpacked = self.space_need(
+            delivery, inventory, [role for role in ROLE_ORDER if role != "workspace"]
+        )
+        stage_root = self.root.resolve()
+        docker_root = self.state / "docker-root"
+        plenty = 1 << 50
+        shared_free = staged + unpacked + SPACE_HEADROOM - 1
+        self.assertLessEqual(staged + SPACE_HEADROOM, shared_free)
+        self.assertLessEqual(unpacked + SPACE_HEADROOM, shared_free)
+        cases = (
+            ("stage", False, {stage_root: staged + SPACE_HEADROOM - 1, docker_root: plenty},
+             stage_root, staged + SPACE_HEADROOM),
+            ("docker-root", False, {stage_root: plenty, docker_root: unpacked + SPACE_HEADROOM - 1},
+             docker_root, unpacked + SPACE_HEADROOM),
+            ("shared", True, {stage_root: shared_free, docker_root: shared_free},
+             stage_root, staged + unpacked + SPACE_HEADROOM),
+        )
+        for name, shared, free, path, needed in cases:
+            with self.subTest(layout=name):
+                self.reset_observations()
+                copies = self.root / f"copies-space-{name}.log"
+                install = self.root / f"install-space-{name}"
+                script = self.space_script(free, shared=shared, extra=(self.copy_probe(copies),))
+                result = self.import_with(script, delivery, install)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(path), result.stderr)
+                self.assertIn(f"need {needed} bytes", result.stderr)
+                self.assertIn(f"available {needed - 1} bytes", result.stderr)
+                self.assert_untouched(install, copies)
+        absent = self.root / "absent-docker-root"
+        for name, reported, message in (
+            ("absent", str(absent), f"Docker data root {absent}"),
+            ("unreported", "", "docker info did not report DockerRootDir"),
+        ):
+            with self.subTest(docker_root=name):
+                self.reset_observations()
+                (self.state / "docker-info.json").write_text(
+                    json.dumps({"DockerRootDir": reported}), encoding="utf-8"
+                )
+                copies = self.root / f"copies-space-{name}.log"
+                install = self.root / f"install-space-{name}"
+                script = self.patched_release(self.copy_probe(copies))
+                result = self.import_with(script, delivery, install)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assert_untouched(install, copies)
+
+    def test_free_space_exactly_at_the_requirement_imports(self):
+        delivery, inventory, _sha = self.write_delivery()
+        staged, unpacked = self.space_need(
+            delivery, inventory, [role for role in ROLE_ORDER if role != "workspace"]
+        )
+        stage_root = self.root
+        docker_root = self.state / "docker-root"
+        shared_free = staged + unpacked + SPACE_HEADROOM
+        cases = (
+            ("separate", False,
+             {stage_root: staged + SPACE_HEADROOM, docker_root: unpacked + SPACE_HEADROOM}),
+            ("shared", True, {stage_root: shared_free, docker_root: shared_free}),
+        )
+        for name, shared, free in cases:
+            with self.subTest(layout=name):
+                self.reset_observations()
+                self.seed_present(inventory, ("workspace",))
+                install = self.root / f"install-boundary-{name}"
+                result = self.import_with(self.space_script(free, shared=shared), delivery, install)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.loaded_archives()), len(ROLE_ORDER) - 1)
+                self.assert_published(install, delivery)
+
+    def test_all_present_import_copies_and_loads_nothing_and_still_verifies(self):
+        delivery, inventory, _sha = self.write_delivery()
+        seed_images(self.state)
+        staged, unpacked = self.space_need(delivery, inventory, ())
+        self.assertEqual(unpacked, 0)
+        stage_root = self.root
+        docker_root = self.state / "docker-root"
+        marker = self.root / "verified-loaded-images"
+        anchor = "def verify_loaded_images(payload: dict) -> None:\n"
+        verify_probe = (anchor, anchor + f"    Path({str(marker)!r}).write_text('ran')\n")
+        short = self.root / "install-all-present-short"
+        result = self.import_with(
+            self.space_script(
+                {stage_root: staged + SPACE_HEADROOM, docker_root: SPACE_HEADROOM - 1},
+                shared=False,
+            ),
+            delivery, short,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"need {SPACE_HEADROOM} bytes", result.stderr)
+        self.assertFalse(short.exists())
+        self.reset_observations()
+        copies = self.root / "copies-all-present.log"
+        install = self.root / "install-all-present"
+        result = self.import_with(
+            self.space_script(
+                {stage_root: staged + SPACE_HEADROOM, docker_root: SPACE_HEADROOM},
+                shared=False, extra=(self.copy_probe(copies), verify_probe),
+            ),
+            delivery, install,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.summary_line(result.stderr), import_summary(ROLE_ORDER))
+        self.assertEqual(self.loaded_archives(), [])
+        self.assertEqual(
+            [Path(line).name for line in copies.read_text(encoding="utf-8").splitlines()],
+            ["release.json", "source.bundle", "fonts.tar"],
+        )
+        self.assertEqual(marker.read_text(), "ran")
+        self.assert_published(install, delivery)
 
 
 

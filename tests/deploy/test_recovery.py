@@ -36,6 +36,7 @@ from support import (
     copy_tracked,
     font_mount_docs,
     git_init_commit,
+    import_summary,
     ops,
     prepare_up_context,
     seed_healthy_host,
@@ -2202,6 +2203,8 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
             extra=extra,
         )
         self.assertEqual(activated.returncode, 0, activated.stderr)
+        self.assertEqual(activated.stdout, "")
+        self.assertIn(import_summary(ROLE_ORDER), activated.stderr.splitlines())
         self.assertTrue((dest / "source" / "deploy" / "up.sh").is_file())
         self.assertTrue((dest / "source" / ".git").exists())
         self.assertTrue(font_entry.is_symlink())
@@ -2264,6 +2267,36 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
              "--retained-delivery", str(delivery)], extra=extra
         )
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
+
+    def test_restore_importing_partly_present_retained_delivery_keeps_stdout_contract(self):
+        backup = self.root / "backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self._seed_restore_target("partly-present-state")
+        images_path = target_state / "images.json"
+        images = json.loads(images_path.read_text(encoding="utf-8"))
+        del images[DEFAULT_RELEASE_IMAGES["proxy"]]
+        images_path.write_text(json.dumps(images), encoding="utf-8")
+        delivery, _payload, _source = self._write_retained_delivery()
+        dest = self.root / "partly-present-root"
+        restored = self.run_cli(
+            ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+             "--provider-file", str(provider), "--retained-delivery", str(delivery)],
+            extra={"FAKE_DOCKER_STATE": str(target_state)},
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        document = json.loads(restored.stdout)
+        self.assertEqual(list(document), ["owned_resources"])
+        self.assertEqual(
+            restored.stdout, json.dumps({"owned_resources": document["owned_resources"]}) + "\n"
+        )
+        present = [role for role in ROLE_ORDER if role != "proxy"]
+        self.assertIn(import_summary(present), restored.stderr.splitlines())
+        loads = [line for line in ops(target_state) if line.startswith("docker load ")]
+        self.assertEqual([Path(line.split()[-1]).name for line in loads], ["proxy.tar"])
 
     def test_activation_of_backup_without_messages_address_fails_before_any_stack(self):
         # A recovery set captured before #655: no ingress address, no /32 for it.
