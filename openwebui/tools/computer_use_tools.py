@@ -71,6 +71,19 @@ def _is_transmittable_mcp_api_key(value: object) -> bool:
     )
 
 
+def _gateway_headers(request, model) -> dict:
+    """sub_agent-only Claude Code gateway inputs (#662): the token that authenticated
+    this chat request and the chat's model id, each sent only when header-safe."""
+    headers = {}
+    token = getattr(getattr(getattr(request, "state", None), "token", None), "credentials", None)
+    if _is_http_safe_credential(token):
+        headers["X-OCU-Gateway-Token"] = token
+    model_id = model.get("id") if isinstance(model, dict) else None
+    if _is_http_safe_credential(model_id):
+        headers["X-Chat-Model"] = model_id
+    return headers
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Reject redirects before authenticated probe headers leave the configured origin."""
 
@@ -715,6 +728,7 @@ class Tools:
         err_desc: str,
         timeout: int = CLIENT_HTTP_TIMEOUT,
         sync_warning: str = "",
+        extra_headers: Optional[dict] = None,
     ) -> str:
         """One transport-aware MCP call with consistent SSE status events.
 
@@ -753,6 +767,8 @@ class Tools:
         invoked = False
         try:
             headers = self._build_mcp_headers(chat_id, __user__, request=request)
+            if extra_headers:
+                headers.update(extra_headers)
             client = self.mcp_client
             invoked = True
             result = await client.call_tool(
@@ -915,13 +931,14 @@ class Tools:
         __user__: dict = None,
         __files__: Optional[List[dict]] = None,
         __request__=None,
+        __model__: dict = None,
     ) -> str:
         """
         Delegate complex, multi-step tasks to an autonomous sub-agent.
 
         :param task: Structured task description
         :param description: Why you are delegating this task
-        :param model: AI model - "sonnet" (fast, default) or "opus" (powerful)
+        :param model: AI model - "sonnet" (fast, default) or "opus" (powerful); in gateway deployments the chat's model is used and this is ignored
         :param max_turns: Max iterations, default 25 (raise to 50-80 for large multi-file refactors)
         :param mode: "act" (execute) or "plan" (plan only)
         :param working_directory: Work dir, default /home/assistant
@@ -945,6 +962,7 @@ class Tools:
             ok_desc="Sub-agent completed", err_desc="Sub-agent failed",
             timeout=SUB_AGENT_CLIENT_TIMEOUT,
             sync_warning=sync_warning,
+            extra_headers=_gateway_headers(__request__, __model__),
         )
 
 

@@ -1,8 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # One-shot Open WebUI bootstrap wrapper for the production-like test deployment.
-# It does not expose the upstream sub_agent capability until a fully internal
-# sub-agent runtime is available.
+# It installs the shipped Computer Use Tool whole; its sub_agent runs Claude Code
+# through the sandbox Messages ingress with the calling user's own token (#662).
 set -euo pipefail
 set -m
 
@@ -90,16 +90,8 @@ primary_model = os.environ.get("PRIMARY_CHAT_MODEL", "").strip()
 if not primary_model:
     raise SystemExit("refusing to bootstrap: PRIMARY_CHAT_MODEL is required")
 
-tool_source = (source_root / "tools" / "computer_use_tools.py").read_text(encoding="utf-8")
-method_start = tool_source.find("    async def sub_agent(\n")
-method_end = tool_source.find(
-    "\n\n# ============================================================================\n# File sync helper",
-    method_start,
-)
-if method_start < 0 or method_end < 0:
-    raise SystemExit("refusing to bootstrap: could not locate the upstream sub_agent method")
-(work_root / "tools" / "computer_use_tools.py").write_text(
-    tool_source[:method_start] + tool_source[method_end:], encoding="utf-8"
+(work_root / "tools" / "computer_use_tools.py").write_bytes(
+    (source_root / "tools" / "computer_use_tools.py").read_bytes()
 )
 
 init_source = (source_root / "init.sh").read_text(encoding="utf-8")

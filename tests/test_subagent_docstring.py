@@ -116,6 +116,12 @@ class TestSubagentDocstringForCli(unittest.TestCase):
     def test_claude_mentions_claude_env(self):
         assert "CLAUDE_SUB_AGENT_DEFAULT_MODEL" in self._doc("claude")
 
+    def test_claude_says_gateway_deployments_use_the_chat_model(self):
+        doc = self._doc("claude")
+        assert "gateway" in doc
+        assert "chat's model" in doc
+        assert "ignored" in doc
+
     def test_opencode_mentions_opencode_env(self):
         assert "OPENCODE_SUB_AGENT_DEFAULT_MODEL" in self._doc("opencode")
 

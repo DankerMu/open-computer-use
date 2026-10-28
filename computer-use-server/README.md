@@ -23,6 +23,7 @@ See [docs/architecture.svg](../docs/architecture.svg) for the full diagram.
 | `skill_manager.py` | Skill registry: fetch user skills, cache ZIPs, generate system prompt XML |
 | `system_prompt.py` | System prompt templates with skill injection |
 | `context_vars.py` | Per-request context (chat_id, user_email, etc.) via ContextVar |
+| `claude_gateway.py` | Claude Code through Open WebUI's Messages ingress: gateway mode switch and per-call environment for the terminal and `sub_agent` |
 | `docs_html.py` | HTML documentation page generator |
 
 ### Output identity broker

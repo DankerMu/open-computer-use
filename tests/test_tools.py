@@ -1507,5 +1507,91 @@ def test_cancellation_propagates_without_workspace_hint(monkeypatch):
     assert emitter.hint_attempts == 0
 
 
+GATEWAY_HEADERS = ("X-OCU-Gateway-Token", "X-Chat-Model")
+
+
+def _capture_call_headers(monkeypatch):
+    sent = []
+
+    async def call_tool(self, tool_name, args, headers=None, **kwargs):
+        sent.append({"tool": tool_name, "args": args, "headers": dict(headers)})
+        return "sandbox output"
+
+    monkeypatch.setattr(computer_use_tools._MCPClient, "call_tool", call_tool)
+    return sent
+
+
+def _chat_request(token):
+    state = types.SimpleNamespace()
+    if token is not None:
+        state.token = types.SimpleNamespace(scheme="Bearer", credentials=token)
+    return types.SimpleNamespace(state=state)
+
+
+@pytest.mark.parametrize(
+    ("request_token", "model", "expected"),
+    (
+        ("tok-1", {"id": "m-1"}, {"X-OCU-Gateway-Token": "tok-1", "X-Chat-Model": "m-1"}),
+        (None, {"id": "m-1"}, {"X-Chat-Model": "m-1"}),
+        ("", {"id": "m-1"}, {"X-Chat-Model": "m-1"}),
+        ("tok-1", None, {"X-OCU-Gateway-Token": "tok-1"}),
+        ("tok-1", {"id": ""}, {"X-OCU-Gateway-Token": "tok-1"}),
+        ("tok-1", {"name": "no id"}, {"X-OCU-Gateway-Token": "tok-1"}),
+    ),
+    ids=("both", "no-token", "empty-token", "no-model", "empty-model-id", "model-without-id"),
+)
+def test_sub_agent_forwards_the_callers_token_and_chat_model(monkeypatch, request_token, model, expected):
+    sent = _capture_call_headers(monkeypatch)
+    tools = _tools_with_token(monkeypatch)
+    result = asyncio.run(
+        tools.sub_agent(
+            "write and run hello.py",
+            "delegate",
+            __metadata__={"chat_id": "chat-gateway"},
+            __user__={"id": "u1", "email": "u@example.test", "name": "U"},
+            __request__=_chat_request(request_token),
+            __model__=model,
+        )
+    )
+    assert result == "sandbox output"
+    [call] = sent
+    assert call["tool"] == "sub_agent"
+    assert {name: call["headers"][name] for name in GATEWAY_HEADERS if name in call["headers"]} == expected
+    assert call["headers"]["X-Chat-Id"] == "chat-gateway"
+    assert call["headers"]["X-OCU-Internal-Token"] == INTERNAL_TOKEN
+    assert "tok-1" not in json.dumps(call["args"])
+
+
+def test_sub_agent_without_request_sends_no_gateway_token(monkeypatch):
+    sent = _capture_call_headers(monkeypatch)
+    tools = _tools_with_token(monkeypatch)
+    asyncio.run(tools.sub_agent("t", "d", __metadata__={"chat_id": "chat-gateway"}, __model__={"id": "m-1"}))
+    assert "X-OCU-Gateway-Token" not in sent[0]["headers"]
+    assert sent[0]["headers"]["X-Chat-Model"] == "m-1"
+
+
+@pytest.mark.parametrize("method", ("bash_tool", "str_replace", "create_file", "view"))
+def test_other_tools_never_send_gateway_headers(monkeypatch, method):
+    sent = _capture_call_headers(monkeypatch)
+    tools = _tools_with_token(monkeypatch)
+    common = {"__metadata__": {"chat_id": "chat-gateway"}, "__request__": _chat_request("tok-1")}
+    calls = {
+        "bash_tool": lambda: tools.bash_tool("echo hi", "run", **common),
+        "str_replace": lambda: tools.str_replace("edit", "a", "/home/assistant/a.txt", "b", **common),
+        "create_file": lambda: tools.create_file("create", "x", "/home/assistant/a.txt", **common),
+        "view": lambda: tools.view("read", "/home/assistant/a.txt", **common),
+    }
+    asyncio.run(calls[method]())
+    [call] = sent
+    assert set(call["headers"]) == {"X-Chat-Id", "X-OCU-Internal-Token", "Authorization"}
+
+
+def test_sub_agent_docstring_says_the_chat_model_is_used_in_gateway_deployments():
+    doc = computer_use_tools.Tools.sub_agent.__doc__
+    assert "gateway" in doc
+    assert "chat's model" in doc
+    assert '"sonnet"' in doc and '"opus"' in doc
+
+
 if __name__ == "__main__":
     unittest.main()

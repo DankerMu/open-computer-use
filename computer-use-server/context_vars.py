@@ -15,6 +15,10 @@ current_anthropic_base_url: ContextVar[Optional[str]] = ContextVar("current_anth
 current_mcp_tokens_url: ContextVar[str] = ContextVar("current_mcp_tokens_url", default="")
 current_mcp_tokens_api_key: ContextVar[str] = ContextVar("current_mcp_tokens_api_key", default="")
 current_mcp_servers: ContextVar[str] = ContextVar("current_mcp_servers", default="")
+# sub_agent gateway inputs (#662): the caller's Open WebUI token and the chat's model.
+# Read only by the sub_agent gateway path, never by container creation.
+current_gateway_token: ContextVar[Optional[str]] = ContextVar("current_gateway_token", default=None)
+current_chat_model: ContextVar[Optional[str]] = ContextVar("current_chat_model", default=None)
 
 
 # "request" reads the calling context. "server" ignores request credentials and

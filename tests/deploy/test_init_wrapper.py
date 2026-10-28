@@ -522,6 +522,18 @@ class InitWrapperTests(unittest.TestCase):
             "could not locate initialization marker section",
         )
 
+    def test_installed_tool_is_the_shipped_tool_with_sub_agent(self):
+        self.webui.mode = "success"
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, self.combined(result))
+        shipped = (SOURCE / "tools" / "computer_use_tools.py").read_text(encoding="utf-8")
+        installed = self.webui.tools["ai_computer_use"]["content"]
+        self.assertEqual(installed, shipped)
+        self.assertIn("    async def sub_agent(\n", installed)
+        wrapper = WRAPPER.read_text(encoding="utf-8")
+        self.assertNotIn("sub_agent method", wrapper)
+        self.assertNotIn("method_start", wrapper)
+
     def test_success_after_failure_writes_marker_without_secret(self):
         self.webui.mode = "auth-failure"
         failed = self.run_wrapper()
