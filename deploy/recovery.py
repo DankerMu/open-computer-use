@@ -46,6 +46,7 @@ FIXED_CONTAINER_NAMES = (
     "ocu-test-retention-guard",
     "ocu-test-open-webui-init",
     "ocu-test-proxy",
+    "ocu-test-messages-ingress",
 )
 POSTGRES_SERVICE = "postgres"
 SANDBOX_LABEL = "managed-by=mcp-computer-use-orchestrator"
@@ -773,7 +774,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
             destination=Path(args.destination),
             runtime_file=Path(args.runtime_file) if args.runtime_file else None,
         )
-    except (RecoveryError, release.ReleaseError) as cop:
+    except (RecoveryError, release.ReleaseError, OSError) as cop:
         fail(str(cop))
     report(f"published complete recovery set {published}")
     return 0
@@ -784,7 +785,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     try:
         manifest = verify_recovery_set(Path(args.recovery_set))
-    except (RecoveryError, release.ReleaseError) as cop:
+    except (RecoveryError, release.ReleaseError, OSError) as cop:
         fail(str(cop))
     report(f"recovery set {args.recovery_set} is complete")
     print(json.dumps({"source_daemon": manifest["source_daemon"], "components": sorted(manifest["components"])}))
@@ -803,7 +804,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
             retained_delivery=Path(args.retained_delivery) if args.retained_delivery else None,
             docker_host=args.docker_host,
         )
-    except (RecoveryError, release.ReleaseError) as cop:
+    except (RecoveryError, release.ReleaseError, OSError) as cop:
         fail(str(cop))
     report("restored into empty target; application remains stopped")
     print(json.dumps({"owned_resources": owned}))
@@ -820,7 +821,7 @@ def cmd_activate(args: argparse.Namespace) -> int:
             retained_delivery=Path(args.retained_delivery),
             docker_host=args.docker_host,
         )
-    except (RecoveryError, release.ReleaseError) as cop:
+    except (RecoveryError, release.ReleaseError, OSError) as cop:
         fail(str(cop))
     report("selected release started; complete the operator readiness checklist before traffic switch")
     return 0

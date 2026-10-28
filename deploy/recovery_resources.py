@@ -127,7 +127,7 @@ def _host_chats(identity: dict) -> set[str]:
 def _stop_after_office_failure(identity: dict, writers: list[str], known: list[dict],
                               chats: set[str]) -> list[str]:
     errors = []
-    for name in [identity["proxy_container"], *writers]:
+    for name in [*_admission_containers(identity), *writers]:
         try:
             _stop_writer(name)
         except (RecoveryError, release.ReleaseError, OSError) as exc:
@@ -288,6 +288,7 @@ def deployment_identity(runtime: dict[str, str], deploy_root: Path) -> dict:
         "retention_container": "ocu-test-retention-guard",
         "init_container": "ocu-test-open-webui-init",
         "proxy_container": "ocu-test-proxy",
+        "messages_ingress_container": "ocu-test-messages-ingress",
         "documentserver_container": recovery.compose_name(project, "documentserver"),
     }
 
@@ -427,6 +428,7 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
         identity["init_container"]: inventory["images"]["open-webui"],
         identity["webui_container"]: inventory["images"]["open-webui"],
         identity["proxy_container"]: inventory["images"]["proxy"],
+        identity["messages_ingress_container"]: inventory["images"]["proxy"],
         identity["documentserver_container"]: inventory["images"]["documentserver"],
         identity["postgres_container"]: inventory["images"]["postgres"],
     }
@@ -436,6 +438,7 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
         identity["init_container"]: "open-webui-init",
         identity["webui_container"]: "open-webui",
         identity["proxy_container"]: "proxy",
+        identity["messages_ingress_container"]: "messages-ingress",
         identity["documentserver_container"]: "documentserver",
         identity["postgres_container"]: "postgres",
     }
@@ -544,9 +547,15 @@ def _scan_before_quiesce(identity: dict, image: str, chats: set[str]) -> None:
         scan_volume(volume, image, links=LINK_POLICY["workspaces"])
 
 
+def _admission_containers(identity: dict) -> list[str]:
+    # Browser admission through the proxy, sandbox admission through the Messages ingress.
+    return [identity["proxy_container"], identity["messages_ingress_container"]]
+
+
 def _quiesce_and_discover(identity: dict, writers: list[str], timeout: float) -> dict:
-    proxy = identity["proxy_container"]
-    _stop_writer(proxy)
+    admission = _admission_containers(identity)
+    for name in admission:
+        _stop_writer(name)
     server = inspect_required_container(identity["server_container"])
     if not container_running(server) or container_paused(server):
         raise RecoveryError("OCU must remain running for Office shutdown")
@@ -596,7 +605,7 @@ def _quiesce_and_discover(identity: dict, writers: list[str], timeout: float) ->
             raise RecoveryError(
                 f"sandbox {sandbox['name']} cannot be attributed to the selected deployment"
             )
-    for name in [proxy, *writers]:
+    for name in [*admission, *writers]:
         result = docker("inspect", name)
         if result.returncode != 0:
             if "No such" in result.stderr or "not found" in result.stderr:

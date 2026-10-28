@@ -34,7 +34,8 @@ that changes between the scan and the stop, Python-fallback extended-attribute o
 ACL refusals, and failures the scan cannot predict, such as a full disk, still fail
 after the stop and leave the stack stopped, as described below.
 
-1. Stop the proxy to close browser admission to WebUI, OCU and DocumentServer.
+1. Stop the proxy to close browser admission to WebUI, OCU and DocumentServer,
+   then the Messages ingress to close sandbox admission to WebUI.
 2. Run `/usr/bin/documentserver-prepare4shutdown.sh` inside DocumentServer while
    OCU remains running to persist and publish final callbacks over the control plane.
 3. Read each chat's Office state until no session is `opening`, `editing`, `saving`
@@ -50,7 +51,8 @@ it is not a total backup deadline. Command failure or drain timeout names the
 persisted blockers and attempts all safely attributed writer stops. A stop failure
 is reported, never treated as quiescence. No failed run publishes a complete set.
 There is no automatic restart or shutdown-mode reset: the next normal deployment
-start clears DocumentServer's shutdown mode.
+start clears DocumentServer's shutdown mode and restarts the proxy and the
+Messages ingress.
 
 The complete directory contains the logical dump, WebUI data with its root
 regular-file `.computer-use-initialized`, chat/skills trees, every existing

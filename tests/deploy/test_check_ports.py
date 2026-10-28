@@ -282,6 +282,19 @@ class CheckPortsTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(MESSAGES_SERVICE, result.stderr)
 
+    def test_messages_ingress_missing_or_off_the_sandbox_network_fails(self):
+        for defect in ("missing", "off-sandbox"):
+            with self.subTest(defect=defect):
+                docs = intended_docs()
+                services = docs["proxy.json"]["services"]
+                if defect == "missing":
+                    services.pop(MESSAGES_SERVICE)
+                else:
+                    services[MESSAGES_SERVICE]["networks"].pop("sandbox")
+                result = self.check(docs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(MESSAGES_SERVICE, result.stderr)
+
     def test_other_services_on_the_sandbox_network_still_fail(self):
         for owner, name in (("proxy.json", PROXY_SERVICE), ("core.json", "retention-guard"),
                             ("webui.json", WEBUI_SERVICE), ("proxy.json", "messages-ingress-2")):
