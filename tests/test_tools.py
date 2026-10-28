@@ -9,6 +9,7 @@ import sys
 import unittest
 import asyncio
 import errno
+import inspect
 import os
 import urllib.parse
 import json
@@ -1505,6 +1506,174 @@ def test_cancellation_propagates_without_workspace_hint(monkeypatch):
     asyncio.run(run())
     assert _workspace_hints(emitter.events) == []
     assert emitter.hint_attempts == 0
+
+
+GATEWAY_HEADERS = ("X-OCU-Gateway-Token", "X-Chat-Model")
+
+
+def _capture_call_headers(monkeypatch):
+    sent = []
+
+    async def call_tool(self, tool_name, args, headers=None, **kwargs):
+        sent.append({"tool": tool_name, "args": args, "headers": dict(headers)})
+        return "sandbox output"
+
+    monkeypatch.setattr(computer_use_tools._MCPClient, "call_tool", call_tool)
+    return sent
+
+
+def _chat_request(token):
+    state = types.SimpleNamespace()
+    if token is not None:
+        state.token = types.SimpleNamespace(scheme="Bearer", credentials=token)
+    return types.SimpleNamespace(state=state)
+
+
+GATEWAY_USER = {"id": "u1", "email": "u@example.test", "name": "U"}
+
+
+def _chat_ownership(monkeypatch, outcome):
+    """Install a fake open_webui.models.chats whose is_chat_owner returns or raises outcome."""
+    calls = []
+
+    class Chats:
+        @staticmethod
+        async def is_chat_owner(chat_id, user_id):
+            calls.append((chat_id, user_id))
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    package = types.ModuleType("open_webui")
+    models = types.ModuleType("open_webui.models")
+    chats = types.ModuleType("open_webui.models.chats")
+    chats.Chats = Chats
+    package.models = models
+    models.chats = chats
+    monkeypatch.setitem(sys.modules, "open_webui", package)
+    monkeypatch.setitem(sys.modules, "open_webui.models", models)
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats)
+    return calls
+
+
+def _gateway_call(monkeypatch, request_token="tok-1", metadata_extra=None, user=GATEWAY_USER, task_model=None):
+    """Call sub_agent the way Open WebUI injects reserved arguments: it offers every extra
+    parameter, including the task model as __model__ (middleware.py:2916-2925), and passes
+    only those the signature names (utils/tools.py:220)."""
+    sent = _capture_call_headers(monkeypatch)
+    tools = _tools_with_token(monkeypatch)
+    offered = {
+        "__metadata__": {"chat_id": "chat-gateway", **(metadata_extra or {})},
+        "__user__": user,
+        "__request__": _chat_request(request_token),
+        "__model__": task_model,
+    }
+    accepted = inspect.signature(tools.sub_agent).parameters
+    injected = {name: value for name, value in offered.items() if name in accepted}
+    result = asyncio.run(tools.sub_agent("write and run hello.py", "delegate", **injected))
+    assert result == "sandbox output"
+    [call] = sent
+    assert call["tool"] == "sub_agent"
+    assert call["headers"]["X-Chat-Id"] == "chat-gateway"
+    assert call["headers"]["X-OCU-Internal-Token"] == INTERNAL_TOKEN
+    assert "tok-1" not in json.dumps(call["args"])
+    return {name: call["headers"][name] for name in GATEWAY_HEADERS if name in call["headers"]}
+
+
+@pytest.mark.parametrize(
+    ("request_token", "metadata_extra", "expected"),
+    (
+        ("tok-1", {"model": {"id": "m-1"}}, {"X-OCU-Gateway-Token": "tok-1", "X-Chat-Model": "m-1"}),
+        (None, {"model": {"id": "m-1"}}, {"X-Chat-Model": "m-1"}),
+        ("", {"model": {"id": "m-1"}}, {"X-Chat-Model": "m-1"}),
+        ("tok-1", {}, {"X-OCU-Gateway-Token": "tok-1"}),
+        ("tok-1", {"model": None}, {"X-OCU-Gateway-Token": "tok-1"}),
+        ("tok-1", {"model": {"id": ""}}, {"X-OCU-Gateway-Token": "tok-1"}),
+        ("tok-1", {"model": {"name": "no id"}}, {"X-OCU-Gateway-Token": "tok-1"}),
+        ("tok-1", {"model": "m-1"}, {"X-OCU-Gateway-Token": "tok-1", "X-Chat-Model": "m-1"}),
+    ),
+    ids=("both", "no-token", "empty-token", "no-model", "null-model", "empty-model-id",
+         "model-without-id", "string-model-id"),
+)
+def test_sub_agent_forwards_the_owners_token_and_chat_model(monkeypatch, request_token, metadata_extra, expected):
+    calls = _chat_ownership(monkeypatch, True)
+    assert _gateway_call(monkeypatch, request_token, metadata_extra) == expected
+    assert calls == ([("chat-gateway", "u1")] if request_token else [])
+
+
+def test_sub_agent_takes_the_chat_model_from_metadata_not_the_task_model(monkeypatch):
+    _chat_ownership(monkeypatch, True)
+    headers = _gateway_call(
+        monkeypatch, metadata_extra={"model": {"id": "m-1"}}, task_model={"id": "cheap-m"},
+    )
+    assert headers == {"X-OCU-Gateway-Token": "tok-1", "X-Chat-Model": "m-1"}
+
+
+def test_sub_agent_without_chat_model_in_metadata_sends_no_model_even_with_a_task_model(monkeypatch):
+    _chat_ownership(monkeypatch, True)
+    headers = _gateway_call(monkeypatch, task_model={"id": "cheap-m"})
+    assert headers == {"X-OCU-Gateway-Token": "tok-1"}
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    (False, RuntimeError("database unavailable")),
+    ids=("caller-is-not-owner", "ownership-lookup-raises"),
+)
+def test_sub_agent_sends_no_token_unless_the_caller_owns_the_chat(monkeypatch, outcome):
+    calls = _chat_ownership(monkeypatch, outcome)
+    admin = {"id": "admin-1", "email": "admin@example.test", "name": "Admin", "role": "admin"}
+    headers = _gateway_call(monkeypatch, metadata_extra={"model": {"id": "m-1"}}, user=admin)
+    assert headers == {"X-Chat-Model": "m-1"}
+    assert calls == [("chat-gateway", "admin-1")]
+
+
+def test_sub_agent_sends_no_token_when_open_webui_is_not_importable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", None)
+    headers = _gateway_call(monkeypatch, metadata_extra={"model": {"id": "m-1"}})
+    assert headers == {"X-Chat-Model": "m-1"}
+
+
+def test_sub_agent_without_user_sends_no_token(monkeypatch):
+    calls = _chat_ownership(monkeypatch, True)
+    headers = _gateway_call(monkeypatch, metadata_extra={"model": {"id": "m-1"}}, user=None)
+    assert headers == {"X-Chat-Model": "m-1"}
+    assert calls == []
+
+
+def test_sub_agent_without_request_sends_no_gateway_token(monkeypatch):
+    calls = _chat_ownership(monkeypatch, True)
+    sent = _capture_call_headers(monkeypatch)
+    tools = _tools_with_token(monkeypatch)
+    asyncio.run(tools.sub_agent(
+        "t", "d", __metadata__={"chat_id": "chat-gateway", "model": {"id": "m-1"}}, __user__=GATEWAY_USER,
+    ))
+    assert "X-OCU-Gateway-Token" not in sent[0]["headers"]
+    assert sent[0]["headers"]["X-Chat-Model"] == "m-1"
+    assert calls == []
+
+
+@pytest.mark.parametrize("method", ("bash_tool", "str_replace", "create_file", "view"))
+def test_other_tools_never_send_gateway_headers(monkeypatch, method):
+    sent = _capture_call_headers(monkeypatch)
+    tools = _tools_with_token(monkeypatch)
+    common = {"__metadata__": {"chat_id": "chat-gateway"}, "__request__": _chat_request("tok-1")}
+    calls = {
+        "bash_tool": lambda: tools.bash_tool("echo hi", "run", **common),
+        "str_replace": lambda: tools.str_replace("edit", "a", "/home/assistant/a.txt", "b", **common),
+        "create_file": lambda: tools.create_file("create", "x", "/home/assistant/a.txt", **common),
+        "view": lambda: tools.view("read", "/home/assistant/a.txt", **common),
+    }
+    asyncio.run(calls[method]())
+    [call] = sent
+    assert set(call["headers"]) == {"X-Chat-Id", "X-OCU-Internal-Token", "Authorization"}
+
+
+def test_sub_agent_docstring_says_the_chat_model_is_used_in_gateway_deployments():
+    doc = computer_use_tools.Tools.sub_agent.__doc__
+    assert "gateway" in doc
+    assert "chat's model" in doc
+    assert '"sonnet"' in doc and '"opus"' in doc
 
 
 if __name__ == "__main__":

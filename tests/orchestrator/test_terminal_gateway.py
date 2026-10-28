@@ -49,6 +49,14 @@ LEGACY_START = (
     "{prefix}nohup ttyd -W -p 7681 tmux -u new-session -A -s main bash > /dev/null 2>&1 &"
 )
 TTYD_PID = "4242"
+NO_TOKEN_DETAIL = (
+    "Claude Code gateway: the request carries no Open WebUI login token; "
+    "sign in again and reopen the terminal"
+)
+NO_MODEL_DETAIL = (
+    "Claude Code gateway: the chat has no usable model id (1-256 printable ASCII "
+    "characters without spaces); select a model and reopen the terminal"
+)
 
 
 def fingerprint(base_url: str, model: str, token: str) -> str:
@@ -505,12 +513,33 @@ def test_invalid_messages_address_refuses_startup_naming_the_variable(tmp_path, 
 
 
 def test_gateway_base_url_is_derived_from_a_valid_address(world, monkeypatch):
-    app = world["app"]
-    assert app.terminal_gateway_base_url() is None
+    import claude_gateway
+
+    assert claude_gateway.gateway_base_url() is None
     _gateway_on(monkeypatch)
-    assert app.terminal_gateway_base_url() == BASE_URL
+    assert claude_gateway.gateway_base_url() == BASE_URL
     monkeypatch.setattr(world["dm"], "SUBAGENT_CLI", "opencode")
-    assert app.terminal_gateway_base_url() is None
+    assert claude_gateway.gateway_base_url() is None
+
+
+@pytest.mark.parametrize(
+    "cookie, body, detail",
+    [
+        (None, {"model": MODEL}, NO_TOKEN_DETAIL),
+        (f"token={CANARY}", {"model": "m 1"}, NO_MODEL_DETAIL),
+        (f"token={CANARY}", None, NO_MODEL_DETAIL),
+    ],
+    ids=["no-token", "bad-model", "no-model"],
+)
+def test_refusals_keep_the_exact_detail_strings(world, monkeypatch, cookie, body, detail):
+    _gateway_on(monkeypatch)
+    headers = {"Authorization": f"Bearer {INTERNAL}"}
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    response = world["client"].post(START_TTYD, headers=headers, json=body)
+    assert response.status_code == 422
+    assert response.json() == {"detail": detail}
+    assert world["lookups"] == []
 
 
 # --- h: one cookie parser --------------------------------------------------

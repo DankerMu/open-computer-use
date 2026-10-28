@@ -257,6 +257,8 @@ async def dispatch(
     resume_session_id: str = "",
     plan_file: str = "",
     headers_env: str = "",
+    environment: "dict | None" = None,
+    model_verbatim: bool = False,
 ) -> "tuple[SubAgentResult, str, str]":
     """Build argv via active adapter, execute inside container, parse result.
 
@@ -272,10 +274,17 @@ async def dispatch(
     already shlex.quote'd by mcp_tools.sub_agent BEFORE being passed in
     (preserves v0.9.2.0 contract — the dispatch helper does NOT re-quote
     headers_env; it concatenates verbatim).
+
+    Claude Code gateway (#662): `environment` reaches the CLI exec only, never
+    the command string. `model_verbatim` (gateway mode, so always claude) skips
+    alias resolution and also passes `--model` on resume.
     """
     cli = resolve_cli()
     adapter = get_adapter(cli)
-    model_id, model_display = resolve_subagent_model(model, cli)
+    if model_verbatim:
+        model_id = model_display = model
+    else:
+        model_id, model_display = resolve_subagent_model(model, cli)
 
     # Per-CLI workdir setup. Codex requires --cd <existing dir>; we
     # extract the workdir from the argv (it is the value following --cd)
@@ -288,6 +297,7 @@ async def dispatch(
         timeout_s=timeout_s,
         resume_session_id=resume_session_id,
         plan_file=plan_file,
+        **({"model_on_resume": True} if model_verbatim else {}),
     )
 
     if cli == Cli.CODEX and "--cd" in argv:
@@ -305,8 +315,9 @@ async def dispatch(
         f"{headers_env}{quoted_argv}"
     )
 
+    extra = {} if environment is None else {"environment": environment}
     proc = await asyncio.to_thread(
-        _execute_bash_capture, container, shell_cmd, timeout_s,
+        _execute_bash_capture, container, shell_cmd, timeout_s, **extra,
     )
     result = adapter.parse_result(
         stdout=proc.stdout,

@@ -15,7 +15,6 @@ import asyncio
 import errno
 import html as html_module
 import hashlib
-import ipaddress
 import json
 import logging
 import mimetypes
@@ -30,6 +29,7 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
+import claude_gateway
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from office.router import OfficeAvailabilityMiddleware, create_office_router
 from office import config as office_config
@@ -474,7 +474,7 @@ async def lifespan(app):
         raise RuntimeError("OCU authorization startup preflight failed")
     validate_idle_configuration()
     validate_sandbox_dns_configuration()
-    terminal_gateway_base_url()
+    claude_gateway.gateway_base_url()
     warn_if_public_base_url_is_default()
     warn_if_mcp_api_key_missing()
     warn_subagent_cli()
@@ -1136,68 +1136,12 @@ class StartTtydRequest(BaseModel):
     model: Optional[str] = None
 
 
-MESSAGES_ADDRESS_ENV = "OCU_SANDBOX_MESSAGES_ADDRESS"
 TERMINAL_STOP_COMMAND = "pkill -x ttyd 2>/dev/null; tmux kill-server 2>/dev/null; true"
-_TERMINAL_MODEL = re.compile(r"[\x21-\x7e]{1,256}")
-_GATEWAY_NO_TOKEN = (
-    "Claude Code gateway: the request carries no Open WebUI login token; "
-    "sign in again and reopen the terminal"
-)
-_GATEWAY_NO_MODEL = (
-    "Claude Code gateway: the chat has no usable model id (1-256 printable ASCII "
-    "characters without spaces); select a model and reopen the terminal"
-)
-
-
-class TerminalGatewayConfigError(RuntimeError):
-    """OCU_SANDBOX_MESSAGES_ADDRESS is set but is not an IPv4 address."""
-
-
-def terminal_gateway_base_url() -> Optional[str]:
-    """Messages ingress base URL for terminal Claude Code, or None when gateway mode is off.
-
-    Off when the address is unset or the sandbox CLI is not Claude Code. A set value that
-    is not an IPv4 literal (including empty) refuses startup, naming the variable.
-    """
-    if MESSAGES_ADDRESS_ENV not in os.environ:
-        return None
-    try:
-        address = ipaddress.IPv4Address(os.environ[MESSAGES_ADDRESS_ENV])
-    except ValueError:
-        raise TerminalGatewayConfigError(
-            f"{MESSAGES_ADDRESS_ENV} must be an IPv4 address; refusing to start"
-        ) from None
-    from docker_manager import SUBAGENT_CLI
-    if SUBAGENT_CLI != "claude":
-        return None
-    return f"http://{address}:8080/api"
 
 
 def _ttyd_start_command(dangerous_mode: bool) -> str:
     env_prefix = "NO_AUTOSTART=1 " if dangerous_mode else ""
     return f"cd /home/assistant && echo 'set -g mouse on' > ~/.tmux.conf && LANG=C.UTF-8 {env_prefix}nohup ttyd -W -p 7681 tmux -u new-session -A -s main bash > /dev/null 2>&1 &"
-
-
-def _terminal_gateway_environment(base_url: str, cookie_header: Optional[str], model) -> Dict[str, str]:
-    """Per-start Claude Code environment; 422 with a string detail when an input is missing."""
-    token = token_cookie(cookie_header)
-    if token is None:
-        raise HTTPException(422, _GATEWAY_NO_TOKEN)
-    if not isinstance(model, str) or not _TERMINAL_MODEL.fullmatch(model):
-        raise HTTPException(422, _GATEWAY_NO_MODEL)
-    fingerprint = hashlib.sha256(f"{base_url}\0{model}\0{token}".encode()).hexdigest()
-    return {
-        "ANTHROPIC_BASE_URL": base_url,
-        "ANTHROPIC_AUTH_TOKEN": token,
-        "ANTHROPIC_MODEL": model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-        "CLAUDE_CODE_SUBAGENT_MODEL": model,
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "DISABLE_TELEMETRY": "1",
-        "OCU_TERMINAL_FINGERPRINT": fingerprint,
-    }
 
 
 def _start_gateway_terminal(container, chat_id: str, environment: Dict[str, str], dangerous_mode: bool) -> dict:
@@ -1235,9 +1179,13 @@ async def start_ttyd(chat_id: str, request: Request, body: StartTtydRequest = Bo
     through the exec environment, checked before the container lookup.
     """
     chat_id = sanitize_chat_id(chat_id)
-    gateway = terminal_gateway_base_url()
+    gateway = claude_gateway.gateway_base_url()
     if gateway is not None:
-        environment = _terminal_gateway_environment(gateway, request.headers.get("cookie"), body.model)
+        try:
+            environment = claude_gateway.gateway_environment(
+                gateway, token_cookie(request.headers.get("cookie")), body.model)
+        except claude_gateway.GatewayInputError as refused:
+            raise HTTPException(422, refused.detail) from None
     from docker_manager import _execute_bash
     container = _get_container_for_terminal(chat_id)
     if not container:

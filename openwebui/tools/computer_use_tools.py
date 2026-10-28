@@ -71,6 +71,35 @@ def _is_transmittable_mcp_api_key(value: object) -> bool:
     )
 
 
+async def _gateway_headers(request, metadata: dict, user) -> dict:
+    """sub_agent-only Claude Code gateway inputs (#662), each sent only when header-safe.
+
+    X-OCU-Gateway-Token is the token that authenticated this chat request, sent only
+    when the caller owns the chat: an admin may run completions in another user's chat,
+    and that admin's token must not reach the owner's sandbox. X-Chat-Model is the chat
+    request's model (metadata["model"]); Open WebUI injects __model__ as the task model.
+    """
+    headers = {}
+    token = getattr(getattr(getattr(request, "state", None), "token", None), "credentials", None)
+    if _is_http_safe_credential(token) and await _caller_owns_chat(metadata.get("chat_id"), user):
+        headers["X-OCU-Gateway-Token"] = token
+    model = metadata.get("model")
+    model_id = model.get("id") if isinstance(model, dict) else model
+    if _is_http_safe_credential(model_id):
+        headers["X-Chat-Model"] = model_id
+    return headers
+
+
+async def _caller_owns_chat(chat_id, user) -> bool:
+    try:
+        from open_webui.models.chats import Chats
+        return bool(await Chats.is_chat_owner(chat_id, user["id"]))
+    except Exception:
+        # Open WebUI absent, no user, or a failed lookup: ownership is unproven, so the
+        # token is withheld and OCU refuses the gateway call with its missing-token error.
+        return False
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Reject redirects before authenticated probe headers leave the configured origin."""
 
@@ -715,6 +744,7 @@ class Tools:
         err_desc: str,
         timeout: int = CLIENT_HTTP_TIMEOUT,
         sync_warning: str = "",
+        extra_headers: Optional[dict] = None,
     ) -> str:
         """One transport-aware MCP call with consistent SSE status events.
 
@@ -753,6 +783,8 @@ class Tools:
         invoked = False
         try:
             headers = self._build_mcp_headers(chat_id, __user__, request=request)
+            if extra_headers:
+                headers.update(extra_headers)
             client = self.mcp_client
             invoked = True
             result = await client.call_tool(
@@ -921,7 +953,7 @@ class Tools:
 
         :param task: Structured task description
         :param description: Why you are delegating this task
-        :param model: AI model - "sonnet" (fast, default) or "opus" (powerful)
+        :param model: AI model - "sonnet" (fast, default) or "opus" (powerful); in gateway deployments the chat's model is used and this is ignored
         :param max_turns: Max iterations, default 25 (raise to 50-80 for large multi-file refactors)
         :param mode: "act" (execute) or "plan" (plan only)
         :param working_directory: Work dir, default /home/assistant
@@ -945,6 +977,7 @@ class Tools:
             ok_desc="Sub-agent completed", err_desc="Sub-agent failed",
             timeout=SUB_AGENT_CLIENT_TIMEOUT,
             sync_warning=sync_warning,
+            extra_headers=await _gateway_headers(__request__, __metadata__, __user__),
         )
 
 

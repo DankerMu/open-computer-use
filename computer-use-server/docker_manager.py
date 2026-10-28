@@ -1450,8 +1450,10 @@ def _execute_bash(container, command: str, timeout: int = None, environment: dic
 # are written against that idiom). SimpleNamespace is imported at the top of
 # the module (PEP 8 — do NOT inline the import here).
 # ---------------------------------------------------------------------------
-def _execute_bash_capture(container, command: str, timeout: int = None):
+def _execute_bash_capture(container, command: str, timeout: int = None, environment: dict = None):
     """Execute bash in container; return SimpleNamespace(stdout, stderr, returncode).
+
+    `environment` reaches the exec process only, never the command string.
 
     Stdout/stderr are kept separate (unlike _execute_bash which concatenates).
     Used by cli_runtime.dispatch to feed adapter.parse_result, which is
@@ -1470,13 +1472,14 @@ def _execute_bash_capture(container, command: str, timeout: int = None):
         shutdown_timeout = max(CONTAINER_IDLE_TIMEOUT, cmd_timeout + 60)
         _reset_shutdown_timer(container, shutdown_timeout)
         timed_command = f"timeout {cmd_timeout} bash -c {shlex.quote(command)}"
-
+        extra = {} if environment is None else {"environment": environment}
         exec_result = container.exec_run(
             cmd=["bash", "-c", timed_command],
             stdout=True,
             stderr=True,
             demux=True,
             workdir=workdir,
+            **extra
         )
 
         stdout_data, stderr_data = exec_result.output if exec_result.output else (b"", b"")

@@ -73,8 +73,9 @@ services:
 
   # Current upstream compose no longer invokes openwebui/init.sh. This job
   # explicitly performs the one-time setup once the API is reachable. The
-  # wrapper removes sub_agent from the installed client tool before executing
-  # the canonical initializer.
+  # wrapper installs the shipped client tool whole, including sub_agent, which
+  # runs only through the Messages ingress (#662), then executes the canonical
+  # initializer.
   open-webui-init:
     image: ${OPENWEBUI_IMAGE}
     container_name: ocu-test-open-webui-init

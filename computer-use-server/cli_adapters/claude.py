@@ -40,6 +40,7 @@ class ClaudeAdapter:
         *,
         resume_session_id: str = "",
         plan_file: str = "",
+        model_on_resume: bool = False,
     ) -> list[str]:
         """Return the argv list for invoking `claude --print ...`.
 
@@ -56,6 +57,10 @@ class ClaudeAdapter:
         existing v0.9.2.0 invocation enforces timeout via the asyncio wrapper
         in mcp_tools.sub_agent, NOT via a CLI flag. Accepted for Protocol
         uniformity; codex/opencode adapters will use it.
+
+        model_on_resume (Claude Code gateway, #662): the RESUME branch also
+        carries `--model <model>` so a resumed session runs on the chat's
+        current model. Off by default, keeping the resume argv byte-identical.
 
         Note: plan_file is part of the Protocol but not consumed here — the
         short-prompt construction (`Read and execute your task plan from
@@ -75,6 +80,7 @@ class ClaudeAdapter:
                 "claude",
                 "-p", task,
                 "--resume", resume_session_id,
+                *(["--model", model] if model_on_resume else []),
                 *common,
             ]
 

@@ -50,10 +50,11 @@ services:
       SUB_AGENT_TIMEOUT: ${SUB_AGENT_TIMEOUT}
       ENABLE_NETWORK: "true"
       OCU_SANDBOX_DNS: ${OCU_SANDBOX_DNS?OCU_SANDBOX_DNS is required}
-      # Terminal Claude Code reaches Open WebUI through the Messages ingress here (#656).
+      # Terminal and sub_agent Claude Code reach Open WebUI through the Messages
+      # ingress here, with the calling user's own token (#656, #662).
       OCU_SANDBOX_MESSAGES_ADDRESS: ${OCU_SANDBOX_MESSAGES_ADDRESS:?OCU_SANDBOX_MESSAGES_ADDRESS is required}
-      # The injected Open WebUI Tool intentionally omits sub_agent. Do not pass
-      # credentials for Claude, Codex, OpenCode, or other external sub-agents.
+      # Do not pass credentials for Claude, Codex, OpenCode, or other external
+      # sub-agents.
 
   documentserver:
     image: ${DOCUMENTSERVER_IMAGE:?DOCUMENTSERVER_IMAGE is required}

@@ -28,6 +28,7 @@ from context_vars import (
     current_gitlab_host,
     current_anthropic_auth_token,
     current_anthropic_base_url,
+    current_gateway_token,
 )
 
 
@@ -268,6 +269,28 @@ class TestDockerManagerEnvInjection(_RuntimeEnvironmentCase):
                 # other nine gateway names also absent — none were set
                 for name in GATEWAY_VAR_NAMES:
                     self.assertNotIn(name, env_dict, f"{name} unexpectedly present")
+        self._run_isolated(body)
+
+    def test_gateway_headers_never_reach_the_container_environment(self):
+        """#662: x-ocu-gateway-token / x-chat-model set through the real header path stay
+        out of the environment _create_container hands to Docker."""
+        def body():
+            with patch.dict(os.environ, {}, clear=False):
+                docker_manager = self._reload_docker_manager({})
+                _reset_context_vars()
+                from mcp_tools import set_context_from_headers
+
+                set_context_from_headers({"x-ocu-gateway-token": "tok-1", "x-chat-model": "m-1"})
+                self.assertEqual(current_gateway_token.get(), "tok-1")
+                client = _build_mock_docker_client()
+                with patch("docker_manager.get_docker_client", return_value=client):
+                    docker_manager._create_container("test-chat", "owui-chat-test")
+
+                env_dict = client.containers.create.call_args.kwargs["environment"]
+                self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env_dict)
+                for key, value in env_dict.items():
+                    self.assertNotIn("tok-1", str(value), key)
+                client.containers.run.assert_not_called()
         self._run_isolated(body)
 
     def test_anthropic_custom_headers_injection_regression_guard(self):

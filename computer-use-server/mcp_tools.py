@@ -35,6 +35,8 @@ aliases after service authorization.
 | MCP Tokens URL    | X-Mcp-Tokens-Url       | X-OpenWebUI-Mcp-Tokens-Url     | No       | MCP_TOKENS_URL env              |
 | MCP Tokens API Key| X-Mcp-Tokens-Api-Key   | X-OpenWebUI-Mcp-Tokens-Api-Key | No       | MCP_TOKENS_API_KEY env          |
 | MCP Servers       | X-Mcp-Servers          | X-OpenWebUI-Mcp-Servers        | No       | —                               |
+| Gateway token     | X-OCU-Gateway-Token    | —                              | No       | — (sub_agent gateway mode only) |
+| Chat model        | X-Chat-Model           | —                              | No       | — (sub_agent gateway mode only) |
 
 Environment Variables (computer-use-orchestrator defaults):
 - MCP_TOKENS_URL: MCP Tokens Wrapper service (optional, for centralized token management)
@@ -90,8 +92,9 @@ from context_vars import (
     current_gitlab_token, current_gitlab_host,
     current_anthropic_auth_token, current_anthropic_base_url,
     current_mcp_tokens_url, current_mcp_tokens_api_key, current_mcp_servers,
-    current_instructions,
+    current_instructions, current_gateway_token, current_chat_model,
 )
+import claude_gateway
 from system_prompt import render_system_prompt
 
 
@@ -855,6 +858,8 @@ Args:
     model: Claude model alias or id. Aliases: 'sonnet' (default, fast), 'opus' (powerful,
            slower), 'haiku' (cheapest). Pass an empty string to use the per-CLI default
            (claude -> sonnet). Operator override: CLAUDE_SUB_AGENT_DEFAULT_MODEL env.
+           In Open WebUI gateway deployments the chat's model is used and this
+           argument is ignored.
     max_turns: Maximum number of agentic turns (default from env, typically 25)
     working_directory: Working directory for the agent (default: /home/assistant)
     resume_session_id: Session ID to resume a previous sub-agent session (from previous result)
@@ -968,6 +973,18 @@ async def sub_agent(
         max_turns = SUB_AGENT_MAX_TURNS
     # Resolve the active CLI runtime — single source of truth.
     cli = resolve_cli()
+
+    # Gateway mode (#662): Claude Code runs on the caller's token and the chat's
+    # model, which reach it only through this call's exec environment.
+    gateway_env = None
+    gateway = claude_gateway.gateway_base_url()
+    if gateway is not None:
+        try:
+            gateway_env = claude_gateway.gateway_environment(
+                gateway, current_gateway_token.get(), current_chat_model.get())
+        except claude_gateway.GatewayInputError as refused:
+            return f"Error: {refused.detail}"
+        model = gateway_env["ANTHROPIC_MODEL"]
 
     try:
         # Resolve default model inside try so ValueError surfaces as "Sub-agent error: ..."
@@ -1188,6 +1205,8 @@ Use `cat <skill-location>` to read skill instructions.
                 resume_session_id=resume_session_id,
                 plan_file=plan_file,
                 headers_env=headers_env,
+                environment=gateway_env,
+                model_verbatim=gateway_env is not None,
             )
             # When caller omitted `model` and we resolved the default above,
             # restore the friendly display_name (e.g. "sonnet"); dispatch()
@@ -1366,6 +1385,12 @@ def set_context_from_headers(headers: dict):
     elif "x-openwebui-mcp-servers" in headers:
         current_mcp_servers.set(headers["x-openwebui-mcp-servers"])
 
+    # sub_agent gateway inputs (#662), sent by the Open WebUI tool on sub_agent only
+    if "x-ocu-gateway-token" in headers:
+        current_gateway_token.set(headers["x-ocu-gateway-token"])
+    if "x-chat-model" in headers:
+        current_chat_model.set(headers["x-chat-model"])
+
 
 
 
@@ -1380,6 +1405,8 @@ _CONTEXT_DEFAULTS = (
     (current_mcp_tokens_url, ""),
     (current_mcp_tokens_api_key, ""),
     (current_mcp_servers, ""),
+    (current_gateway_token, None),
+    (current_chat_model, None),
     (current_instructions, None),
 )
 

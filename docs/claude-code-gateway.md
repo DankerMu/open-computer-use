@@ -4,15 +4,20 @@
 # Claude Code Gateway Configuration
 
 Every sandbox container spawned by Open Computer Use runs the Claude Code CLI
-as a sub-agent (via the `sub_agent` MCP tool). Operators choose where that
-CLI sends its API traffic by setting a handful of host-side environment
-variables before `docker compose up`. Three paths are supported; each is
-additive - set only what your deployment needs.
+as a sub-agent (via the `sub_agent` MCP tool) and in the workspace terminal.
+The deployment default is
+[Open WebUI as the gateway](#open-webui-as-the-gateway-deployment-default):
+both reach Open WebUI's Messages endpoint through the sandbox ingress, with
+the user's own token and the chat's model. Without that ingress, operators
+choose where the CLI sends its API traffic by setting a handful of host-side
+environment variables before `docker compose up`. Three such paths are
+supported; each is additive - set only what your deployment needs.
 
 ## Supported paths at a glance
 
 | Path | Operator sets on host | Claude Code inside sandbox |
 |------|------------------------|----------------------------|
+| **Open WebUI gateway** (deployment default) | `OCU_SANDBOX_MESSAGES_ADDRESS` | Terminal and `sub_agent` talk to Open WebUI with the user's own token and the chat's model |
 | **A - Zero-config** | Nothing | Shows the native `/login` OAuth flow in the terminal |
 | **B - Public Anthropic** | `ANTHROPIC_AUTH_TOKEN` | Talks to `https://api.anthropic.com` with the supplied token |
 | **C - Custom gateway** | `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` + optional compatibility flags | Talks to the gateway (LiteLLM / Azure / Bedrock) with the gateway-scoped token |
@@ -25,8 +30,8 @@ Leave every `ANTHROPIC_*` and `CLAUDE_CODE_*` variable unset on the host.
 launches inside the sandbox and prompts for OAuth login in the ttyd
 terminal - the same experience as running `claude` on a fresh laptop.
 
-Nothing else to configure. This is the default and will keep working even
-if you never touch this file.
+Nothing else to configure. This is the default without the Messages
+ingress and will keep working even if you never touch this file.
 
 ## Path B - Public Anthropic with your own key
 
@@ -85,7 +90,7 @@ Code at LiteLLM. Typical model-ID overrides look like
 `ANTHROPIC_DEFAULT_*_MODEL` vars above so every `sub_agent` call
 automatically routes to the right deployment.
 
-### Open WebUI as the gateway (production-like overlay)
+## Open WebUI as the gateway (deployment default)
 
 In the `deploy/production-like-test` overlay, sandboxes have no route to
 Open WebUI, Computer Use or the host. The one reachable endpoint is the
@@ -93,19 +98,30 @@ Messages ingress at `OCU_SANDBOX_MESSAGES_ADDRESS`, which forwards only
 `POST /api/v1/messages` and `POST /api/v1/messages/count_tokens` to Open
 WebUI.
 
-The workspace terminal configures Claude Code automatically. The overlay
-passes `OCU_SANDBOX_MESSAGES_ADDRESS` to Computer Use; when it is set and
-`SUBAGENT_CLI` is `claude`, every terminal start gives ttyd, tmux, bash and
-Claude Code this environment through the container exec, never through a
-command line:
+The overlay passes `OCU_SANDBOX_MESSAGES_ADDRESS` to Computer Use. When it
+is set and `SUBAGENT_CLI` is `claude`, both the workspace terminal and every
+`sub_agent` call give Claude Code this environment through the container
+exec, never through a command line or the container's own environment:
 
 ```
 ANTHROPIC_BASE_URL=http://<OCU_SANDBOX_MESSAGES_ADDRESS>:8080/api
-ANTHROPIC_AUTH_TOKEN=<the Open WebUI login token of the user who opened the terminal>
+ANTHROPIC_AUTH_TOKEN=<the calling user's Open WebUI token>
 ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL, CLAUDE_CODE_SUBAGENT_MODEL=<the chat's model>
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 DISABLE_TELEMETRY=1
 ```
+
+Open WebUI authenticates the token and applies the user's model access;
+the ingress adds no identity. Every other path answers 404 at the ingress.
+Behaviour, validation and limits are in
+[NETWORK-HARDENING.md](../deploy/production-like-test/NETWORK-HARDENING.md#sandbox-messages-ingress-655).
+
+Where `OCU_SANDBOX_MESSAGES_ADDRESS` is unset (the development
+`docker-compose.yml`), the terminal and `sub_agent` behave as on the paths
+below. A set value that is not an IPv4 address, including an empty one,
+stops Computer Use at startup with an error naming the variable.
+
+### Workspace terminal
 
 The token is the user's Open WebUI login JWT, taken from the `token`
 cookie of the terminal start request. It lives as long as the login
@@ -121,15 +137,46 @@ wins. Without a login token or a model the terminal does not start and
 shows why. Any process in the sandbox can read the token, so it is as
 trusted as the chat owner's own session.
 
-Where `OCU_SANDBOX_MESSAGES_ADDRESS` is unset (the development
-`docker-compose.yml`), the terminal starts as before. A set value that is
-not an IPv4 address, including an empty one, stops Computer Use at startup
-with an error naming the variable.
+### `sub_agent`
 
-Open WebUI authenticates the token and applies the user's model access;
-the ingress adds no identity. Every other path answers 404 at the ingress.
-Behaviour, validation and limits are in
-[NETWORK-HARDENING.md](../deploy/production-like-test/NETWORK-HARDENING.md#sandbox-messages-ingress-655).
+The overlay installs the shipped Open WebUI Tool with `sub_agent`. On each
+`sub_agent` call the Tool forwards two headers to Computer Use, and no other
+tool sends them:
+
+- `X-OCU-Gateway-Token`: the token that authenticated the chat request. This
+  is the user's login token, or the user's Open WebUI API key when the chat
+  request used one. An API key does not expire like the 4-week login token.
+  The Tool sends the token only when the caller owns the chat. An admin may
+  run completions in another user's chat; there `sub_agent` gets no token and
+  is refused, so the admin's token never reaches the owner's sandbox.
+- `X-Chat-Model`: the id of the model the chat request runs on, taken from
+  the chat request's metadata. It is not the `__model__` that Open WebUI
+  hands to Tools, which is the task model. When Open WebUI replaced a custom
+  model with its fallback model, this is the fallback model. The model is
+  sent whether or not the caller owns the chat.
+
+The Tool sends both headers on every `sub_agent` call, also when Computer
+Use is not in gateway mode; Computer Use then ignores them.
+
+Claude Code then runs on that model verbatim, on new and resumed sessions:
+the `model` argument the language model passes is ignored, aliases such as
+`sonnet` are not expanded, and the result banner names the chat's model.
+Every call uses the token and model of that call, so the next call after a
+model switch, including a `resume_session_id` call, runs on the new model.
+A call without a token or a usable model returns
+`Error: Claude Code gateway: ...` before any sandbox work. A model the user
+may not use is refused by Open WebUI on Claude Code's first request, and the
+refusal shows in the sub-agent's result.
+
+The sub-agent runs model-chosen commands without permission prompts, and
+any process it starts in the sandbox can read the token, including after
+the call ends. Claude Code can also print its own environment, token
+included, into its output and into the progress lines that Computer Use
+prints to its own stdout (`[SUB-AGENT-PROGRESS]`); Computer Use filters
+neither. The exposure is therefore wider than the terminal's: no user has
+to open a terminal, the token can be an API key without the login token's
+expiry, and it can land in Computer Use's own logs. Treat the sandbox as
+trusted as the chat owner's own session.
 
 ## Full variable reference
 

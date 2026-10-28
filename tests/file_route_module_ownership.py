@@ -18,6 +18,7 @@ _SERVER_MODULES = {
     "app", "auth_guard", "ws_recheck", "mcp_tools", "docker_manager", "outputs_broker",
     "context_vars", "security", "system_prompt", "skill_manager", "uploads", "file_response",
     "descriptor_io", "docs_html", "sandbox_dns", "cli_runtime", "cli_adapters", "office",
+    "claude_gateway",
 }
 _SERVER_PREFIXES = ("mcp_resources", "office.", "cli_adapters.")
 
