@@ -1136,12 +1136,41 @@ class StartTtydRequest(BaseModel):
     model: Optional[str] = None
 
 
-TERMINAL_STOP_COMMAND = "pkill -x ttyd 2>/dev/null; tmux kill-server 2>/dev/null; true"
+# Signals ttyd and tmux, then waits up to 3 s for no ttyd to remain; exits 1 if one does.
+TERMINAL_STOP_COMMAND = (
+    "pkill -x ttyd 2>/dev/null; tmux kill-server 2>/dev/null; "
+    "SECONDS=0; while pgrep -x ttyd >/dev/null 2>&1; do [ $SECONDS -ge 3 ] && exit 1; sleep 0.1; done"
+)
+# Bash /dev/tcp: no connect tool is added to the sandbox image.
+TERMINAL_LISTENER_TEST = "(exec 3<>/dev/tcp/127.0.0.1/7681) 2>/dev/null"
+# Exec timeouts cover the 3 s stop wait and the 5 s readiness wait; a timeout is a failure.
+TERMINAL_STOP_TIMEOUT = 5
+TERMINAL_READY_TIMEOUT = 8
+TERMINAL_OLD_TTYD_DETAIL = "terminal did not start: the previous ttyd did not exit"
+TERMINAL_NOT_LISTENING_DETAIL = "terminal did not start: no ttyd with this request's settings is listening on 7681"
 
 
 def _ttyd_start_command(dangerous_mode: bool) -> str:
     env_prefix = "NO_AUTOSTART=1 " if dangerous_mode else ""
     return f"cd /home/assistant && echo 'set -g mouse on' > ~/.tmux.conf && LANG=C.UTF-8 {env_prefix}nohup ttyd -W -p 7681 tmux -u new-session -A -s main bash > /dev/null 2>&1 &"
+
+
+def _terminal_fingerprint_probe(fingerprint: str) -> str:
+    """Print MATCH when the oldest ttyd carries this fingerprint, OTHER when not, NONE without ttyd."""
+    return (
+        "pid=$(pgrep -o -x ttyd 2>/dev/null) || { echo NONE; exit 0; }; "
+        "tr '\\0' '\\n' 2>/dev/null < /proc/$pid/environ | "
+        f"grep -qxF 'OCU_TERMINAL_FINGERPRINT={fingerprint}' "
+        "&& echo MATCH || echo OTHER"
+    )
+
+
+def _terminal_ready_probe(fingerprint: str) -> str:
+    """Exit 0 once the fingerprint probe says MATCH and 7681 accepts a connection; exit 1 after 5 s."""
+    return (
+        f'SECONDS=0; until [ "$({_terminal_fingerprint_probe(fingerprint)})" = MATCH ] && {TERMINAL_LISTENER_TEST}; '
+        "do [ $SECONDS -ge 5 ] && exit 1; sleep 0.1; done"
+    )
 
 
 def _start_gateway_terminal(container, chat_id: str, environment: Dict[str, str], dangerous_mode: bool) -> dict:
@@ -1150,21 +1179,21 @@ def _start_gateway_terminal(container, chat_id: str, environment: Dict[str, str]
     Runs in one worker thread: the chat lock is a per-thread RLock that `_execute_bash`
     re-enters through the shutdown timer, so every exec runs here while it is held.
     A tmux server can outlive ttyd, so a start that is not a reuse always stops first.
+    The start counts only once a ttyd with this fingerprint listens on 7681; a start that
+    does not is stopped again so the next start cannot take it as already running.
     """
     from docker_manager import _execute_bash
-    probe = (
-        "pid=$(pgrep -o -x ttyd 2>/dev/null) || { echo NONE; exit 0; }; "
-        "tr '\\0' '\\n' 2>/dev/null < /proc/$pid/environ | "
-        f"grep -qxF 'OCU_TERMINAL_FINGERPRINT={environment['OCU_TERMINAL_FINGERPRINT']}' "
-        "&& echo MATCH || echo OTHER"
-    )
+    fingerprint = environment["OCU_TERMINAL_FINGERPRINT"]
     with _combined_lock(chat_id):
-        state = _execute_bash(container, probe, 5).get("output", "").strip()
+        state = _execute_bash(container, _terminal_fingerprint_probe(fingerprint), 5).get("output", "").strip()
         if state == "MATCH":
             return {"started": False, "already_running": True}
-        _execute_bash(container, TERMINAL_STOP_COMMAND, 5)
+        if _execute_bash(container, TERMINAL_STOP_COMMAND, TERMINAL_STOP_TIMEOUT)["exit_code"] != 0:
+            raise HTTPException(503, TERMINAL_OLD_TTYD_DETAIL)
         _execute_bash(container, _ttyd_start_command(dangerous_mode), 5, environment=environment)
-        time.sleep(0.5)
+        if _execute_bash(container, _terminal_ready_probe(fingerprint), TERMINAL_READY_TIMEOUT)["exit_code"] != 0:
+            _execute_bash(container, TERMINAL_STOP_COMMAND, TERMINAL_STOP_TIMEOUT)
+            raise HTTPException(503, TERMINAL_NOT_LISTENING_DETAIL)
     return {"started": True, "already_running": False, "restarted": state == "OTHER"}
 
 
@@ -1214,7 +1243,8 @@ async def stop_ttyd(chat_id: str):
     container = _get_container_for_terminal(chat_id)
     if not container:
         raise HTTPException(404, "Container not running")
-    await asyncio.to_thread(_execute_bash, container, TERMINAL_STOP_COMMAND, 5)
+    # Answers stopped even when ttyd outlives the bounded wait; the browser ignores the result.
+    await asyncio.to_thread(_execute_bash, container, TERMINAL_STOP_COMMAND, TERMINAL_STOP_TIMEOUT)
     return {"stopped": True}
 
 

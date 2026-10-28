@@ -366,7 +366,7 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertEqual(destinations["messages-ingress.conf"], MESSAGES_CONFIG)
         self.assertEqual(MESSAGES_ENTRYPOINT[MESSAGES_ENTRYPOINT.index("-c") + 1], MESSAGES_CONFIG)
 
-    def test_release_verifies_the_messages_ingress_image(self):
+    def test_messages_ingress_maps_to_the_proxy_image_variable(self):
         deploy = str(ROOT / "deploy")
         if deploy not in sys.path:
             sys.path.insert(0, deploy)

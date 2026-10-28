@@ -212,6 +212,13 @@ class FixtureHandler(OriginRequestHandler):
                 self._json({"detail": "no"}, 500)
                 return
             terminal = json.loads(self.server.terminal_path.read_text(encoding="utf-8"))
+            if terminal["ttyd"] and self.server.start_mode == "second-fail":
+                self._json({"detail": "no"}, 500)
+                return
+            if terminal["ttyd"] and self.server.start_mode != "second-started":
+                # The real server reuses a ttyd that carries this request's fingerprint.
+                self._json({"started": False, "already_running": True})
+                return
             terminal["ttyd"] = True
             self.server.terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
             self.server.start_entered.set()
@@ -900,12 +907,19 @@ raise SystemExit(smoke_deployment.main(['smoke']))
             any(" compose " in line and " --all " in f" {line} " and " ps " in f" {line} " for line in ops(self.state))
         )
         posts = [item for item in self.http.record if item[0] == "POST"]
-        self.assertTrue(any(item[1].endswith("/start-ttyd") for item in posts))
-        start = next(item for item in posts if item[1].endswith("/start-ttyd"))
-        self.assertEqual(
-            json.loads(start[3].decode()), {"dangerous_mode": False, "model": "ocu-smoke-terminal"}
-        )
-        self.assertEqual(start[2].get("X-Requested-With"), "ocu-workspace")
+        starts = [index for index, item in enumerate(self.http.record)
+                  if item[0] == "POST" and item[1].endswith("/start-ttyd")]
+        first_ws = next(index for index, item in enumerate(self.http.record) if item[0] == "WS")
+        self.assertEqual(len(starts), 2)
+        self.assertTrue(all(index < first_ws for index in starts))
+        for index in starts:
+            start = self.http.record[index]
+            self.assertEqual(
+                json.loads(start[3].decode()), {"dangerous_mode": False, "model": "ocu-smoke-terminal"}
+            )
+            self.assertEqual(start[2].get("X-Requested-With"), "ocu-workspace")
+            self.assertEqual(start[2].get("Cookie"), f"token={TOKEN}")
+        self.assertEqual(len([item for item in posts if item[1].endswith("/stop-ttyd")]), 1)
         self.assertTrue(self.http.ws_started.is_set())
         self.assertTrue(self.http.ws_init.is_set())
         ws = next(item for item in self.http.record if item[0] == "WS")
@@ -1011,6 +1025,71 @@ raise SystemExit(smoke_deployment.main(['smoke']))
         self.assertEqual(result.returncode, 2)
         self.assertIn("already_running", result.stderr)
         self.assertFalse(self.http.stopped.is_set())
+
+    def assert_reuse_failure_cleaned(self, result):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("terminal reuse check", result.stderr)
+        self.assertFalse(any(item[0] == "WS" for item in self.http.record))
+        stops = [item for item in self.http.record if item[0] == "POST" and item[1].endswith("/stop-ttyd")]
+        self.assertEqual(len(stops), 1)
+        self.assertFalse(json.loads((self.state / "sandbox-terminal.json").read_text())["ttyd"])
+        self.assert_no_secrets(result)
+
+    def test_second_start_that_is_not_reused_fails_named_and_cleans(self):
+        self.start_http(start_mode="second-started")
+        self.seed_inventory()
+        self.seed_probes()
+        self.assert_reuse_failure_cleaned(self.run_smoke())
+
+    def test_second_start_http_error_fails_named_and_cleans(self):
+        self.start_http(start_mode="second-fail")
+        self.seed_inventory()
+        self.seed_probes()
+        self.assert_reuse_failure_cleaned(self.run_smoke())
+
+    def test_start_posts_pass_twenty_seconds_and_second_start_request_failures_are_wrapped(self):
+        self.start_http()
+        self.seed_probes()
+        program = """
+import sys, urllib.error
+import smoke_deployment
+original = smoke_deployment.http_request
+original_opener = smoke_deployment._http_opener
+starts = []
+class Broken:
+    def open(self, request, timeout):
+        if sys.argv[1] == 'timeout':
+            raise TimeoutError()
+        raise urllib.error.URLError(ConnectionRefusedError())
+def http_request(url, **kwargs):
+    if url.endswith('/start-ttyd'):
+        starts.append(kwargs.get('timeout'))
+        print(f"start-ttyd timeout={kwargs.get('timeout')!r}", flush=True)
+        if len(starts) == 2 and sys.argv[1] != 'record':
+            smoke_deployment._http_opener = Broken
+            try:
+                return original(url, **kwargs)
+            finally:
+                smoke_deployment._http_opener = original_opener
+    return original(url, **kwargs)
+smoke_deployment.http_request = http_request
+raise SystemExit(smoke_deployment.main(['smoke']))
+"""
+        for fault in ("record", "timeout", "error"):
+            with self.subTest(fault=fault):
+                self.http.record.clear()
+                self.seed_inventory()
+                result = subprocess.run(
+                    [sys.executable, "-c", program, fault],
+                    cwd=ROOT / "deploy", env=self.env, capture_output=True,
+                    text=True, timeout=30,
+                )
+                timeouts = [line for line in result.stdout.splitlines() if line.startswith("start-ttyd timeout=")]
+                self.assertEqual(timeouts, ["start-ttyd timeout=20.0"] * 2, result.stderr)
+                if fault == "record":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assert_reuse_failure_cleaned(result)
 
     def test_failed_cleanup_makes_command_fail(self):
         self.start_http(stop_mode="fail")

@@ -3,10 +3,12 @@
 """Terminal Claude Code gateway (#656): start-ttyd with the opener's token and the chat model.
 
 Seams: the real FastAPI app over TestClient, the real per-chat lifecycle lock and the
-real `_execute_bash`, against a fake container whose `exec_run` runs the probe script
-in a local bash with a stub `pgrep` and a fake `/proc`. Startup refusal runs the real
-lifespan in a subprocess. Expected values are the ocu-terminal-claude-gateway fixture
-literals (design evidence a-h), not recomputed from the implementation.
+real `_execute_bash`, against a fake container whose `exec_run` runs the probe, stop and
+readiness scripts in a local bash with stub `pgrep`, `pkill` and `tmux`, a fake `/proc`,
+and a fake listening file in place of the `/dev/tcp` listener test, so nothing on the host
+is signalled or connected to. Startup refusal runs the real lifespan in a subprocess.
+Expected values are the ocu-terminal-claude-gateway and ocu-terminal-start-race fixture
+literals (design evidence a-h and a-g), not recomputed from the implementation.
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ CANARY = "CANARY-webui-jwt-must-never-leak-7f3a"
 OTHER_TOKEN = "CANARY-second-jwt-must-never-leak-91c2"  # gitleaks:allow fake test canary, not a credential
 MODEL = "m-1"
 START_TTYD = f"/terminal/{CHAT}/start-ttyd"
-STOP = "pkill -x ttyd 2>/dev/null; tmux kill-server 2>/dev/null; true"
+LISTENER = "(exec 3<>/dev/tcp/127.0.0.1/7681)"
 LEGACY_CHECK = "pgrep -x ttyd > /dev/null 2>&1 && echo RUNNING || echo STOPPED"
 LEGACY_START = (
     "cd /home/assistant && echo 'set -g mouse on' > ~/.tmux.conf && LANG=C.UTF-8 "
@@ -57,6 +59,9 @@ NO_MODEL_DETAIL = (
     "Claude Code gateway: the chat has no usable model id (1-256 printable ASCII "
     "characters without spaces); select a model and reopen the terminal"
 )
+OLD_TTYD_DETAIL = "terminal did not start: the previous ttyd did not exit"
+NOT_LISTENING_DETAIL = "terminal did not start: no ttyd with this request's settings is listening on 7681"
+NEVER_EXITS = 1_000_000
 
 
 def fingerprint(base_url: str, model: str, token: str) -> str:
@@ -79,9 +84,13 @@ def gateway_environment(model: str, token: str) -> dict:
 
 
 class FakeSandbox:
-    """A running chat container. Probe scripts run in real bash against a fake /proc."""
+    """A running chat container. Shell scripts run in real bash against a fake /proc.
 
-    def __init__(self, root: Path, docker_manager):
+    `pkill` arms a countdown of `linger` `pgrep` polls after which ttyd's pid is gone;
+    `tmux` does nothing. The listener test reads a file that exists while ttyd listens.
+    """
+
+    def __init__(self, root: Path, docker_manager, server):
         self.name = f"owui-chat-{CHAT}"
         self.id = "cid-terminal"
         self.short_id = self.id
@@ -89,28 +98,58 @@ class FakeSandbox:
         self.labels = {"chat-id": CHAT}
         self.attrs = {"Id": self.id, "Config": {"Labels": {"chat-id": CHAT}}, "State": {"Status": "running"}}
         self._dm = docker_manager
+        self._server = server
         self._root = root
         self._proc = root / "proc"
         self._bin = root / "bin"
         self._pidfile = root / "ttyd.pid"
+        self._listening = root / "ttyd.listening"
+        self._countdown = root / "ttyd.countdown"
+        self._linger = root / "ttyd.linger"
         self._bin.mkdir(parents=True, exist_ok=True)
-        stub = self._bin / "pgrep"
-        stub.write_text(f'#!/bin/sh\n[ -f "{self._pidfile}" ] || exit 1\ncat "{self._pidfile}"\n')
-        stub.chmod(0o755)
+        stubs = {
+            "pgrep": textwrap.dedent(f"""\
+                #!/bin/sh
+                [ -f "{self._pidfile}" ] || exit 1
+                if [ -f "{self._countdown}" ]; then
+                    left=$(cat "{self._countdown}")
+                    if [ "$left" -le 0 ]; then
+                        rm -f "{self._pidfile}" "{self._listening}" "{self._countdown}"
+                        exit 1
+                    fi
+                    echo $((left - 1)) > "{self._countdown}"
+                fi
+                cat "{self._pidfile}"
+                """),
+            "pkill": f'#!/bin/sh\n[ -f "{self._pidfile}" ] && cat "{self._linger}" > "{self._countdown}"\nexit 0\n',
+            "tmux": "#!/bin/sh\nexit 0\n",
+        }
+        for name, text in stubs.items():
+            (self._bin / name).write_text(text)
+            (self._bin / name).chmod(0o755)
         self.calls: list[dict] = []
         self.events: list[str] = []
         self.ttyd_env: dict | None = None
         self.tmux_env: dict | None = None
         self.lock_held: list[bool] = []
+        self.pid_at_start: list[bool] = []
         self.probe_delay = 0.0
+        self.linger = 0
+        self.listens = True
+        self.surviving_tmux = False
 
-    def run_ttyd(self, environment: dict | None) -> None:
-        self.ttyd_env = dict(environment or {})
-        self.tmux_env = dict(environment or {})
+    def _spawn(self, environment: dict) -> None:
+        self.ttyd_env = dict(environment)
         (self._proc / TTYD_PID).mkdir(parents=True, exist_ok=True)
         payload = b"".join(f"{key}={value}".encode() + b"\0" for key, value in self.ttyd_env.items())
         (self._proc / TTYD_PID / "environ").write_bytes(b"PATH=/usr/bin\0" + payload)
         self._pidfile.write_text(TTYD_PID + "\n")
+        if self.listens:
+            self._listening.write_text("")
+
+    def run_ttyd(self, environment: dict | None) -> None:
+        self.tmux_env = dict(environment or {})
+        self._spawn(environment or {})
 
     def stale_tmux(self, environment: dict) -> None:
         self.tmux_env = dict(environment)
@@ -118,40 +157,51 @@ class FakeSandbox:
     def reload(self):
         return None
 
-    def exec_run(self, cmd, **kwargs):
-        argv = shlex.split(cmd[2])
-        assert argv[:2] == ["timeout", "5"] and argv[2:4] == ["bash", "-c"], argv
-        script = argv[4]
-        lock = self._dm.get_chat_lock(CHAT)
-        self.lock_held.append(lock._is_owned())
-        self.calls.append({"cmd": cmd, "kwargs": kwargs, "script": script})
-        if script == STOP:
-            self.events.append("stop")
-            self.ttyd_env = None
-            self.tmux_env = None
-            self._pidfile.unlink(missing_ok=True)
-            return MagicMock(exit_code=0, output=(b"", b""))
-        if "nohup ttyd" in script:
-            self.events.append("start")
-            if self.tmux_env is not None and self.ttyd_env is None:
-                # tmux new-session -A reattaches the surviving server and its old environment.
-                self.ttyd_env = dict(self.tmux_env)
-                self._pidfile.write_text(TTYD_PID + "\n")
-            else:
-                self.run_ttyd(kwargs.get("environment"))
-            return MagicMock(exit_code=0, output=(b"", b""))
-        assert "pgrep" in script, script
-        self.events.append("probe")
-        if self.probe_delay:
-            threading.Event().wait(self.probe_delay)
-        local = script.replace("/proc/", f"{self._proc}/")
+    def _bash(self, script: str):
+        local = script.replace("/proc/", f"{self._proc}/").replace(LISTENER, f'[ -f "{self._listening}" ]')
+        assert "/dev/tcp" not in local, local
+        assert all((self._bin / name).is_file() for name in ("pgrep", "pkill", "tmux"))
+        self._linger.write_text(f"{self.linger}\n")
         completed = subprocess.run(
             ["bash", "-c", local],
             env={"PATH": f"{self._bin}:{os.environ.get('PATH', '/usr/bin:/bin')}"},
             capture_output=True,
-            timeout=10,
+            timeout=15,
         )
         return MagicMock(exit_code=completed.returncode, output=(completed.stdout, completed.stderr))
+
+    def exec_run(self, cmd, **kwargs):
+        argv = shlex.split(cmd[2])
+        assert argv[0] == "timeout" and argv[1].isdigit() and argv[2:4] == ["bash", "-c"], argv
+        script = argv[4]
+        lock = self._dm.get_chat_lock(CHAT)
+        self.lock_held.append(lock._is_owned())
+        self.calls.append({"cmd": cmd, "kwargs": kwargs, "script": script, "timeout": int(argv[1])})
+        if script == self._server.TERMINAL_STOP_COMMAND:
+            self.events.append("stop")
+            result = self._bash(script)
+            if not self._pidfile.exists():
+                self.ttyd_env = None
+            if not self.surviving_tmux:
+                self.tmux_env = None
+            return result
+        if "nohup ttyd" in script:
+            self.events.append("start")
+            self.pid_at_start.append(self._pidfile.exists())
+            if self.tmux_env is not None and self.ttyd_env is None:
+                # tmux new-session -A reattaches the surviving server and its old environment.
+                self._spawn(self.tmux_env)
+            else:
+                self.run_ttyd(kwargs.get("environment"))
+            return MagicMock(exit_code=0, output=(b"", b""))
+        if LISTENER in script:
+            self.events.append("ready")
+            return self._bash(script)
+        assert "pgrep" in script, script
+        self.events.append("probe")
+        if self.probe_delay:
+            threading.Event().wait(self.probe_delay)
+        return self._bash(script)
 
 
 @pytest.fixture
@@ -175,7 +225,7 @@ def world(monkeypatch, tmp_path):
         monkeypatch.setattr(docker_manager, "SUBAGENT_CLI", "claude")
         docker_manager._chat_locks.clear()
         docker_manager._FLOCK_DEPTH.clear()
-        sandbox = FakeSandbox(tmp_path / "sandbox", docker_manager)
+        sandbox = FakeSandbox(tmp_path / "sandbox", docker_manager, loaded)
         lookups = []
 
         def get(name):
@@ -211,6 +261,22 @@ def _post(world, body=None, token=CANARY, cookie=None):
     if body is None:
         return world["client"].post(START_TTYD, headers=headers)
     return world["client"].post(START_TTYD, headers=headers, json=body)
+
+
+def _assert_lock_released(world):
+    acquired = {}
+
+    def take():
+        lock = world["dm"].get_chat_lock(CHAT)
+        acquired["ok"] = lock.acquire(timeout=2)
+        if acquired["ok"]:
+            lock.release()
+
+    other = threading.Thread(target=take)
+    other.start()
+    other.join(timeout=5)
+    assert acquired == {"ok": True}
+    assert world["dm"]._FLOCK_DEPTH == {}
 
 
 def _assert_no_secret(world, response, capsys, caplog, *tokens):
@@ -285,7 +351,7 @@ def test_changed_or_missing_fingerprint_stops_then_starts(world, monkeypatch, ca
     response = _post(world, {"dangerous_mode": False, "model": MODEL})
     assert response.status_code == 200
     assert response.json() == {"started": True, "already_running": False, "restarted": True}
-    assert sandbox.events == ["probe", "stop", "start"]
+    assert sandbox.events == ["probe", "stop", "start", "ready"]
     assert sandbox.ttyd_env == gateway_environment(MODEL, CANARY)
     _assert_no_secret(world, response, capsys, caplog, CANARY, OTHER_TOKEN)
 
@@ -297,7 +363,7 @@ def test_no_ttyd_with_stale_tmux_still_stops_before_start(world, monkeypatch):
     response = _post(world, {"dangerous_mode": False, "model": MODEL})
     assert response.status_code == 200
     assert response.json() == {"started": True, "already_running": False, "restarted": False}
-    assert sandbox.events == ["probe", "stop", "start"]
+    assert sandbox.events == ["probe", "stop", "start", "ready"]
     assert sandbox.ttyd_env == gateway_environment(MODEL, CANARY)
 
 
@@ -315,22 +381,10 @@ def test_gateway_sequence_runs_under_the_chat_lock_and_releases_it(world, monkey
     worker.join(timeout=15)
     assert not worker.is_alive(), "gateway start deadlocked on the chat lock"
     assert outcome["response"].status_code == 200
-    assert sandbox.events == ["probe", "stop", "start"]
-    assert sandbox.lock_held == [True, True, True]
+    assert sandbox.events == ["probe", "stop", "start", "ready"]
+    assert sandbox.lock_held == [True, True, True, True]
     assert (world["tmp"] / "data" / CHAT / ".idle.json").is_file(), "shutdown timer did not re-enter the lock"
-    acquired = {}
-
-    def take():
-        lock = world["dm"].get_chat_lock(CHAT)
-        acquired["ok"] = lock.acquire(timeout=2)
-        if acquired["ok"]:
-            lock.release()
-
-    other = threading.Thread(target=take)
-    other.start()
-    other.join(timeout=5)
-    assert acquired == {"ok": True}
-    assert world["dm"]._FLOCK_DEPTH == {}
+    _assert_lock_released(world)
 
 
 def test_concurrent_starts_serialize_and_second_reuses(world, monkeypatch):
@@ -350,7 +404,7 @@ def test_concurrent_starts_serialize_and_second_reuses(world, monkeypatch):
     for thread in threads:
         thread.join(timeout=20)
     assert not any(thread.is_alive() for thread in threads)
-    assert sandbox.events == ["probe", "stop", "start", "probe"]
+    assert sandbox.events == ["probe", "stop", "start", "ready", "probe"]
     assert sorted(responses, key=json.dumps) == sorted(
         [
             {"started": True, "already_running": False, "restarted": False},
@@ -578,11 +632,90 @@ def test_handshake_cookie_still_returns_the_whole_header(world):
     assert ws_recheck.handshake_cookie(Socket(None)) is None
 
 
-def test_unreadable_ttyd_environment_counts_as_a_running_terminal(world, monkeypatch):
+def test_unreadable_ttyd_environment_restarts_the_terminal(world, monkeypatch):
     _gateway_on(monkeypatch)
     sandbox = world["sandbox"]
     sandbox.run_ttyd(gateway_environment(MODEL, CANARY))
     (sandbox._proc / TTYD_PID / "environ").unlink()
     response = _post(world, {"dangerous_mode": False, "model": MODEL})
     assert response.json() == {"started": True, "already_running": False, "restarted": True}
-    assert sandbox.events == ["probe", "stop", "start"]
+    assert sandbox.events == ["probe", "stop", "start", "ready"]
+
+
+# --- start race (ocu-terminal-start-race) ----------------------------------
+
+
+def test_old_ttyd_exiting_late_is_awaited_before_the_new_start(world, monkeypatch):
+    _gateway_on(monkeypatch)
+    sandbox = world["sandbox"]
+    sandbox.run_ttyd(gateway_environment("m-0", CANARY))
+    sandbox.linger = 3
+    response = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"started": True, "already_running": False, "restarted": True}
+    assert sandbox.events == ["probe", "stop", "start", "ready"]
+    assert sandbox.pid_at_start == [False]
+    assert sandbox.ttyd_env == gateway_environment(MODEL, CANARY)
+
+
+def test_old_ttyd_that_never_exits_answers_503_without_starting(world, monkeypatch, capsys, caplog):
+    _gateway_on(monkeypatch)
+    sandbox = world["sandbox"]
+    sandbox.run_ttyd(gateway_environment("m-0", OTHER_TOKEN))
+    sandbox.linger = NEVER_EXITS
+    response = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert response.status_code == 503
+    assert response.json() == {"detail": OLD_TTYD_DETAIL}
+    assert sandbox.events == ["probe", "stop"]
+    assert not any("nohup ttyd" in call["script"] for call in sandbox.calls)
+    _assert_lock_released(world)
+    _assert_no_secret(world, response, capsys, caplog, CANARY, OTHER_TOKEN)
+
+
+def test_ttyd_not_listening_after_start_answers_503_and_is_stopped(world, monkeypatch, capsys, caplog):
+    _gateway_on(monkeypatch)
+    sandbox = world["sandbox"]
+    sandbox.listens = False
+    response = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert response.status_code == 503
+    assert response.json() == {"detail": NOT_LISTENING_DETAIL}
+    assert sandbox.events == ["probe", "stop", "start", "ready", "stop"]
+    assert not sandbox._pidfile.exists()
+    _assert_lock_released(world)
+    _assert_no_secret(world, response, capsys, caplog)
+    sandbox.listens = True
+    again = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert again.json() == {"started": True, "already_running": False, "restarted": False}
+
+
+def test_fingerprint_mismatch_after_start_answers_503_and_is_stopped(world, monkeypatch, capsys, caplog):
+    _gateway_on(monkeypatch)
+    sandbox = world["sandbox"]
+    sandbox.run_ttyd(gateway_environment("m-0", OTHER_TOKEN))
+    sandbox.surviving_tmux = True
+    response = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert response.status_code == 503
+    assert response.json() == {"detail": NOT_LISTENING_DETAIL}
+    assert sandbox.events == ["probe", "stop", "start", "ready", "stop"]
+    assert not sandbox._pidfile.exists()
+    _assert_no_secret(world, response, capsys, caplog, CANARY, OTHER_TOKEN)
+
+
+def test_bounded_waits_fit_inside_their_exec_timeouts(world, monkeypatch):
+    _gateway_on(monkeypatch)
+    sandbox = world["sandbox"]
+    sandbox.run_ttyd({"HOME": "/home/assistant"})
+    assert _post(world, {"dangerous_mode": False, "model": MODEL}).status_code == 200
+    timeouts = dict(zip(sandbox.events, (call["timeout"] for call in sandbox.calls)))
+    assert timeouts["stop"] > 3
+    assert timeouts["ready"] > 5
+
+
+def test_stop_ttyd_answers_stopped_even_when_ttyd_outlives_the_wait(world):
+    sandbox = world["sandbox"]
+    sandbox.run_ttyd({"HOME": "/home/assistant"})
+    sandbox.linger = NEVER_EXITS
+    response = world["client"].post(f"/terminal/{CHAT}/stop-ttyd", headers={"Authorization": f"Bearer {INTERNAL}"})
+    assert response.status_code == 200
+    assert response.json() == {"stopped": True}
+    assert sandbox.events == ["stop"]
