@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# Real-SPA preview embedding browser harness
+# (`tests/orchestrator/preview_embedding_browser.cjs`) in Chromium:
+# terminal start body, refusal display, prefix handling, Office embedding,
+# 503 handling and the Draw.io viewer.
+#
+# Lives here rather than in build.yml: build.yml builds and pushes images
+# and is disabled on the fork, so a job there never runs. This workflow
+# uses no secrets, builds no images and pushes nothing.
+
+name: preview-harness
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "computer-use-server/static/**"
+      - "computer-use-server/**/*.py"
+      - "computer-use-server/drawio/**"
+      - "computer-use-server/requirements.txt"
+      - "tests/orchestrator/preview_embedding_browser.cjs"
+      - "tests/orchestrator/_preview_capture.py"
+      # _preview_capture.py imports its app fixtures from here.
+      - "tests/orchestrator/test_preview_prefix.py"
+      - ".github/workflows/preview-harness.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    name: preview embedding browser harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "22"
+      - name: Scratch paths
+        run: |
+          {
+            echo "OCU_PREVIEW_VENV=$RUNNER_TEMP/preview-venv"
+            echo "OCU_PREVIEW_PYTHON=$RUNNER_TEMP/preview-venv/bin/python"
+            echo "PLAYWRIGHT_PREFIX=$RUNNER_TEMP/playwright"
+            echo "OCU_PREVIEW_ARTIFACTS=$RUNNER_TEMP/preview-artifacts"
+          } >> "$GITHUB_ENV"
+      # _preview_capture.py refuses any Python but 3.12; pytest comes from
+      # the server requirements.
+      - name: Python 3.12 venv with server requirements
+        run: |
+          set -euo pipefail
+          python -m venv "$OCU_PREVIEW_VENV"
+          "$OCU_PREVIEW_PYTHON" -m pip install --disable-pip-version-check -r computer-use-server/requirements.txt
+          "$OCU_PREVIEW_PYTHON" --version
+      # static/drawio/ is gitignored; the harness reads the viewer, stencils,
+      # images and math4 from it. The archive is pinned by SHA-256.
+      - name: Prepare Draw.io viewer materials
+        run: |
+          "$OCU_PREVIEW_PYTHON" computer-use-server/drawio/prepare_drawio.py
+      # Exactly the harness's Playwright, without the repository's full
+      # package.json dependency set (no lockfile, heavy unrelated packages).
+      - name: Install Playwright 1.62.1
+        run: |
+          set -euo pipefail
+          npm install --prefix "$PLAYWRIGHT_PREFIX" --no-save --no-package-lock playwright@1.62.1
+          node "$PLAYWRIGHT_PREFIX/node_modules/playwright/cli.js" --version
+      - name: Install Chromium and its system packages
+        run: node "$PLAYWRIGHT_PREFIX/node_modules/playwright/cli.js" install --with-deps chromium
+      - name: Run the harness
+        run: |
+          set -euo pipefail
+          NODE_PATH="$PLAYWRIGHT_PREFIX/node_modules" node tests/orchestrator/preview_embedding_browser.cjs
+      - name: Upload harness artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: preview-harness-artifacts
+          path: ${{ env.OCU_PREVIEW_ARTIFACTS }}
+          if-no-files-found: ignore

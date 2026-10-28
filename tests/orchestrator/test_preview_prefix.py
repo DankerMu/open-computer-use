@@ -32,8 +32,6 @@ CHAT = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 INTERNAL = "ocu-preview-prefix-test-token"
 MCP_KEY = "ocu-preview-prefix-mcp-key"
 NODE = os.environ.get("OCU_TEST_NODE") or shutil.which("node")
-if not NODE and os.path.isfile("/Users/danker/.nvm/versions/node/v22.23.2/bin/node"):
-    NODE = "/Users/danker/.nvm/versions/node/v22.23.2/bin/node"
 VIEWER = SERVER_DIR / "static" / "browser-viewer.js"
 
 _APP_MODULES = (
