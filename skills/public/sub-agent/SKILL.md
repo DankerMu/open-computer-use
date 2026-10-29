@@ -135,7 +135,7 @@ and fixture mocks that still reference the old name.
 | `model` | "discover via list-subagent-models" | Concrete model id from list-subagent-models output. Pass empty string for the per-CLI default (claude → baseline; opencode/codex → requires env). |
 | `max_turns` | 25 | Max iterations (default; raise to 50-80 for large multi-file refactors) |
 | `working_directory` | /home/assistant | Agent's working directory |
-| `resume_session_id` | "" | Session ID to resume (from previous result) |
+| `resume_session_id` | "" | Session ID to resume (from previous result); on resume, `task` carries the follow-up instruction and the original task stays in the plan file |
 
 ## Session Management
 
