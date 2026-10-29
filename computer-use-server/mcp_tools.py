@@ -862,7 +862,9 @@ Args:
            argument is ignored.
     max_turns: Maximum number of agentic turns (default from env, typically 25)
     working_directory: Working directory for the agent (default: /home/assistant)
-    resume_session_id: Session ID to resume a previous sub-agent session (from previous result)
+    resume_session_id: Session ID to resume a previous sub-agent session (from previous result);
+           on resume, task carries the follow-up instruction and the original task stays
+           in the plan file
 
 Returns:
     Sub-agent's response with task results, cost, turn count, and session_id for resume
@@ -1032,20 +1034,32 @@ async def sub_agent(
             )
 
         if resume_session_id and cli == Cli.CLAUDE:
-            # Resume path: short prompt, system_prompt empty (claude --resume
-            # restores it from the session).
+            # Resume path: the caller's task is the follow-up instruction,
+            # system_prompt empty (claude --resume restores it from the
+            # session), and the plan file keeps the original task (#677).
+            # The prompt starts with fixed text because the adapter puts it
+            # right after `-p`: caller text such as a `- item` list would
+            # otherwise parse as an option or a subcommand. An empty or
+            # whitespace task falls back to the plain continue prompt.
             #
             # Codex/opencode adapters do NOT support session resume — they
             # emit a stderr warning and start fresh. If we collapsed the
             # prompt + cleared system_prompt for them too, the "fresh" run
-            # would launch with the generic "Continue working..." stub and
-            # no system context, silently losing the user's task. So gate
-            # the rewrite on claude — codex/opencode keep the original
-            # task + system_prompt and start a fresh, fully-briefed run.
-            task_for_dispatch = (
-                f"Continue working on the task. If needed, re-read "
-                f"{plan_file} for full context."
-            )
+            # would launch without the plan file rewrite and no system
+            # context, silently losing the user's task. So gate the rewrite
+            # on claude — codex/opencode keep the original task +
+            # system_prompt and start a fresh, fully-briefed run.
+            if task.strip():
+                task_for_dispatch = (
+                    f"Follow-up instruction for this resumed session:\n\n"
+                    f"{task}\n\n"
+                    f"If needed, re-read {plan_file} for the original task."
+                )
+            else:
+                task_for_dispatch = (
+                    f"Continue working on the task. If needed, re-read "
+                    f"{plan_file} for full context."
+                )
             system_prompt = ""
         else:
             # New session: write the task plan file (survives context compaction)

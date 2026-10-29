@@ -12,6 +12,7 @@ the implementation.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import importlib
 import json
@@ -52,7 +53,12 @@ NO_MODEL = (
 )
 PLAN = "/home/assistant/task_plan.md"
 NEW_PROMPT = f"Read and execute your task plan from {PLAN}"
-RESUME_PROMPT = f"Continue working on the task. If needed, re-read {PLAN} for full context."
+CONTINUE_PROMPT = f"Continue working on the task. If needed, re-read {PLAN} for full context."
+RESUME_PROMPT = (
+    "Follow-up instruction for this resumed session:\n\n"
+    "write and run hello.py\n\n"
+    "If needed, re-read /home/assistant/task_plan.md for the original task."
+)
 MAX_TURNS = 7
 COMMON = [
     "--max-turns", str(MAX_TURNS),
@@ -293,7 +299,42 @@ def test_resume_without_gateway_has_no_model_flag(gateway_off):
     [run] = gateway_off.captures
     assert run["kwargs"] == {}
     assert argv_of(run["command"]) == ["claude", "-p", RESUME_PROMPT, "--resume", "s-1", *COMMON]
+    assert not any("base64 -d" in command for command in gateway_off.bash)
     assert "**Model:** sonnet |" in result
+
+
+def test_resume_task_starting_with_a_dash_never_begins_the_prompt(gateway_off):
+    gateway_off.call(task="- add tests\n- fix lint", resume_session_id="s-1")
+    [run] = gateway_off.captures
+    argv = argv_of(run["command"])
+    assert argv == ["claude", "-p", (
+        "Follow-up instruction for this resumed session:\n\n"
+        "- add tests\n- fix lint\n\n"
+        "If needed, re-read /home/assistant/task_plan.md for the original task."
+    ), "--resume", "s-1", *COMMON]
+    assert argv[argv.index("-p") + 1].startswith("Follow-up instruction")
+    assert not any(element.startswith("- add") for element in argv)
+    assert not any("base64 -d" in command for command in gateway_off.bash)
+
+
+@pytest.mark.parametrize("task", ["", "  \n"], ids=["empty", "whitespace"])
+def test_resume_with_empty_task_keeps_the_continue_prompt(gateway_off, task):
+    gateway_off.call(task=task, resume_session_id="s-1")
+    [run] = gateway_off.captures
+    assert argv_of(run["command"]) == ["claude", "-p", CONTINUE_PROMPT, "--resume", "s-1", *COMMON]
+    assert not any("base64 -d" in command for command in gateway_off.bash)
+
+
+def test_codex_resume_still_starts_a_fully_briefed_fresh_run(monkeypatch):
+    world = World(monkeypatch, "codex", gateway=False)
+    task = "write and run hello.py"
+    world.call(task=task, model="gpt-5-codex", resume_session_id="s-1")
+    encoded = base64.b64encode(task.encode("utf-8")).decode("ascii")
+    assert f"echo {encoded} | base64 -d > {PLAN}" in world.bash
+    prompt = shlex.split(world.captures[-1]["command"])[-1]
+    assert prompt.startswith(f"<critical_instruction>\nYour task plan is saved at {PLAN}\n")
+    assert "<available_skills>" in prompt
+    assert prompt.endswith(f"</available_skills>\n\n---\n\n{NEW_PROMPT}")
 
 
 # --- d: gateway off keeps today's behaviour -------------------------------

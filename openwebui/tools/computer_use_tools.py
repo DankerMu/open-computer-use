@@ -957,7 +957,7 @@ class Tools:
         :param max_turns: Max iterations, default 25 (raise to 50-80 for large multi-file refactors)
         :param mode: "act" (execute) or "plan" (plan only)
         :param working_directory: Work dir, default /home/assistant
-        :param resume_session_id: Session ID to resume (from previous result)
+        :param resume_session_id: Session ID to resume (from previous result); on resume, task carries the follow-up instruction and the original task stays in the plan file
         :return: Sub-agent's response with results, cost, turn count, session_id
         """
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
