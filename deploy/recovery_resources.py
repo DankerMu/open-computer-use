@@ -1520,17 +1520,26 @@ def _index_snapshot(chat_dir: Path, chat_id: str) -> dict:
             fd = _open_regular_nofollow(held, (str(chat_dir), chat_id, ".ocu", "index.json"))
             with os.fdopen(fd, encoding="utf-8", closefd=False) as stream:
                 index = json.load(stream)
-        return {"counter": int(index["counter"]), "active": index.get("active") or {}, "missing": False}
+        counter = index["counter"]
+        active = index.get("active") or {}
     except FileNotFoundError:
         return {"counter": 0, "active": {}, "missing": True}
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise RecoveryError(f"chat {chat_id} index path is a symlink") from exc
-        raise
-    # ValueError covers invalid JSON or UTF-8 and a non-regular index; KeyError, TypeError
-    # and OverflowError (an Infinity counter) cover an index without an integer counter.
-    except (ValueError, KeyError, TypeError, OverflowError) as cop:
+        # A non-directory component, a denied path or an index that cannot be opened.
+        name = errno.errorcode.get(exc.errno, type(exc).__name__)
+        raise RecoveryError(f"chat {chat_id} index is unreadable ({name})") from exc
+    # ValueError covers invalid JSON or UTF-8 and a non-regular index; KeyError and
+    # TypeError cover an index that is not an object with a counter.
+    except (ValueError, KeyError, TypeError) as cop:
         raise RecoveryError(f"chat {chat_id} index is unreadable ({type(cop).__name__}: {cop})") from cop
+    # The broker's own rule: a bool, float, string or negative counter is refused at restore.
+    if type(counter) is not int or counter < 0:
+        raise RecoveryError(
+            f"chat {chat_id} index is unreadable (counter is not a non-negative integer: {counter!r})"
+        )
+    return {"counter": counter, "active": active, "missing": False}
 
 
 def _cursor_remedy(resets: list[tuple[str, int]]) -> str:
@@ -1557,11 +1566,11 @@ def _require_cursors_behind(state: dict, chat_dir: Path, counter, noun: str) -> 
         chat_id = recovery.canonical_chat_id(row["chat_id"])
         try:
             snapshot = _index_snapshot(chat_dir, chat_id)
+            value = 0 if snapshot["missing"] else counter(chat_id, snapshot)
         except RecoveryError as cop:
             problems.append(str(cop))
             continue
         cursor = int(row["last_seen_revision"])
-        value = 0 if snapshot["missing"] else counter(chat_id, snapshot)
         if cursor > value:
             problems.append(f"chat {chat_id} cursor {cursor} leads {noun} {value}")
             resets.append((row["chat_id"], value))

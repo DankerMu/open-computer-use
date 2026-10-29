@@ -3703,6 +3703,8 @@ class IndexSnapshotTests(unittest.TestCase):
             ("not-json", b"{not json"), ("not-utf8", b'{"counter": 1, "x": "\xff"}'),
             ("no-counter", b'{"active": {}}'), ("not-object", b"[3]"),
             ("text-counter", b'{"counter": "three"}'), ("infinite-counter", b'{"counter": Infinity}'),
+            ("numeric-text-counter", b'{"counter": "3"}'), ("float-counter", b'{"counter": 3.0}'),
+            ("bool-counter", b'{"counter": true}'), ("negative-counter", b'{"counter": -1}'),
             ("directory", None),
         ):
             with self.subTest(case=case):
@@ -3720,6 +3722,14 @@ class IndexSnapshotTests(unittest.TestCase):
                         index.unlink()
                 self.assertTrue(str(raised.exception).startswith(f"chat {CHAT_ID} index is unreadable ("))
                 self.assertNotIn("\n", str(raised.exception))
+
+    def test_non_directory_in_index_path_is_a_refusal_naming_the_chat(self):
+        chat_dir = self.root / "chat-root-file"
+        (chat_dir / CHAT_ID).mkdir(parents=True)
+        (chat_dir / CHAT_ID / ".ocu").write_bytes(b"{}")
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            self.resources._index_snapshot(chat_dir, CHAT_ID)
+        self.assertEqual(str(raised.exception), f"chat {CHAT_ID} index is unreadable (ENOTDIR)")
 
     def test_missing_and_regular_index_read_as_before(self):
         chat_dir = self.root / "chat"
@@ -3856,6 +3866,31 @@ class CursorLagChatIdTests(unittest.TestCase):
             self.resources._require_cursor_lag(restored, self.chat_dir, "helper:image")
         snapshot.assert_called_once_with(self.chat_dir, "chat-mixed")
         revision.assert_called_once_with(self.chat_dir, "chat-mixed", "helper:image")
+
+    def test_restore_counter_failure_joins_problems_already_collected(self):
+        restored = {
+            "live_chats": ["chat-a", "chat-b"],
+            "chat_state": [
+                {"chat_id": "chat-a", "last_seen_revision": 5},
+                {"chat_id": "chat-b", "last_seen_revision": 0},
+            ],
+        }
+        indexed = {"counter": 3, "active": {}, "missing": False}
+
+        def revision(_chat_dir, chat_id, _image):
+            if chat_id == "chat-b":
+                raise recovery.RecoveryError("chat chat-b broker revision probe rewrote broker identity")
+            return 3
+
+        with patch.object(self.resources, "_index_snapshot", return_value=indexed), patch.object(
+            self.resources, "_broker_revision", side_effect=revision
+        ):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                self.resources._require_cursor_lag(restored, self.chat_dir, "helper:image")
+        message = str(raised.exception)
+        self.assertIn("chat chat-a cursor 5 leads recovered broker counter 3", message)
+        self.assertIn("UPDATE ocu_chat_state SET last_seen_revision = 3 WHERE chat_id = 'chat-a';", message)
+        self.assertIn("chat chat-b broker revision probe rewrote broker identity", message)
 
 
 if __name__ == "__main__":
