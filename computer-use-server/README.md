@@ -507,6 +507,8 @@ arbitrary text and truncated records cannot masquerade as an Office workbook.
 The local real-SPA browser harness is
 `node tests/orchestrator/preview_embedding_browser.cjs` (Playwright 1.62.1
 and its Chromium required); its assets and Office fixtures are local.
+The `preview-harness` workflow (`.github/workflows/preview-harness.yml`)
+runs it on pull requests that touch the SPA, the server or the harness.
 Prepare Draw.io viewer materials with `python3 computer-use-server/drawio/prepare_drawio.py`
 before native preview verification. The same command runs during the server
 image build. Viewer materials are served from `{prefix}/static/drawio/`.
