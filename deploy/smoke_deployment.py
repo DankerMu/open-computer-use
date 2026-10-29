@@ -55,8 +55,9 @@ CURL_WRITE_OUT = (
 BASH_NAMES = {"bash", "-bash"}
 CONNECT_TIMEOUT = 3.0
 HTTP_TIMEOUT = 5.0
-# start-ttyd may take about 11 s on a failing start; HTTP_TIMEOUT would turn its named 503 into a timeout.
-TERMINAL_START_TIMEOUT = 20.0
+# start-ttyd may take about 18 s on a failing start and stop-ttyd about 6 s when it escalates to SIGKILL;
+# HTTP_TIMEOUT would turn a named answer into a timeout.
+TERMINAL_HTTP_TIMEOUT = 30.0
 SANDBOX_CONNECT = "5"
 SANDBOX_MAX = "15"
 TERMINAL_DEADLINE = 10.0
@@ -831,7 +832,7 @@ def post_start_ttyd(origin: str, chat_id: str, token: str) -> tuple[int, object]
         method="POST",
         headers=proxy_headers(origin, token),
         body=body,
-        timeout=TERMINAL_START_TIMEOUT,
+        timeout=TERMINAL_HTTP_TIMEOUT,
     )
     try:
         document = json.loads(payload.decode("utf-8") or "{}")
@@ -873,6 +874,7 @@ def stop_product_terminal(origin: str, chat_id: str, token: str) -> None:
         method="POST",
         headers=proxy_headers(origin, token),
         body=b"",
+        timeout=TERMINAL_HTTP_TIMEOUT,
     )
     if status != 200:
         fail("owned stop-ttyd cleanup failed")

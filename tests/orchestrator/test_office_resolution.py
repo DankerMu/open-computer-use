@@ -1781,7 +1781,7 @@ def _resolve_http_worker(data, session, action, origin, *, cut=""):
                 if child.poll() is not None or time.monotonic() >= deadline:
                     pytest.fail("resolve HTTP worker did not bind")
                 time.sleep(0.01)
-        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=15) as http:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=15, trust_env=False) as http:
             yield http, child, marker, environment
     finally:
         _stop_child(child)
