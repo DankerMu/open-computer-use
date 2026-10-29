@@ -216,6 +216,8 @@ process.stdout.write(JSON.stringify({calls,messages,scripts,configs:configs.map(
 
 
 def _run(tmp_path, **options):
+    if not NODE:
+        pytest.fail("node is required for Office editor tests; install Node 22 or set OCU_TEST_NODE")
     harness = tmp_path / "office-editor-scenario.mjs"
     harness.write_text(_HARNESS)
     result = subprocess.run(

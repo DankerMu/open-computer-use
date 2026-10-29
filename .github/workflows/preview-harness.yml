@@ -31,6 +31,11 @@ on:
 permissions:
   contents: read
 
+# The harness only tests the head commit; a superseded run is worthless.
+concurrency:
+  group: preview-harness-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   harness:
     name: preview embedding browser harness
