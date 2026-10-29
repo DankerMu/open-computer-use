@@ -1651,7 +1651,7 @@ def _fresh_files(data):
                 time.sleep(0.01)
         # Socket readiness makes no HTTP request; Files is the first request,
         # and lifespan=off prevents sweep/startup recovery from doing its work.
-        return httpx.get(f"http://127.0.0.1:{port}/api/outputs/{CHAT}", headers=_auth(), timeout=15)
+        return httpx.get(f"http://127.0.0.1:{port}/api/outputs/{CHAT}", headers=_auth(), timeout=15, trust_env=False)
     finally:
         _stop_child(child)
 

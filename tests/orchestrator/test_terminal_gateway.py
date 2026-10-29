@@ -7,8 +7,9 @@ real `_execute_bash`, against a fake container whose `exec_run` runs the probe, 
 readiness scripts in a local bash with stub `pgrep`, `pkill` and `tmux`, a fake `/proc`,
 and a fake listening file in place of the `/dev/tcp` listener test, so nothing on the host
 is signalled or connected to. Startup refusal runs the real lifespan in a subprocess.
-Expected values are the ocu-terminal-claude-gateway and ocu-terminal-start-race fixture
-literals (design evidence a-h and a-g), not recomputed from the implementation.
+Expected values are the ocu-terminal-claude-gateway, ocu-terminal-start-race and
+ocu-review-followups fixture literals (design evidence a-h, a-g and a-d), not recomputed
+from the implementation.
 """
 from __future__ import annotations
 
@@ -86,8 +87,10 @@ def gateway_environment(model: str, token: str) -> dict:
 class FakeSandbox:
     """A running chat container. Shell scripts run in real bash against a fake /proc.
 
-    `pkill` arms a countdown of `linger` `pgrep` polls after which ttyd's pid is gone;
-    `tmux` does nothing. The listener test reads a file that exists while ttyd listens.
+    A plain `pkill` (SIGTERM) arms a countdown of `linger` `pgrep` polls after which ttyd's
+    pid is gone; `pkill -KILL` removes it at once unless `survives_kill` is set. Every `pkill`
+    argument list is logged. `tmux` does nothing. The listener test reads a file that exists
+    while ttyd listens.
     """
 
     def __init__(self, root: Path, docker_manager, server):
@@ -106,6 +109,8 @@ class FakeSandbox:
         self._listening = root / "ttyd.listening"
         self._countdown = root / "ttyd.countdown"
         self._linger = root / "ttyd.linger"
+        self._survives = root / "ttyd.survives-kill"
+        self._signals = root / "pkill.log"
         self._bin.mkdir(parents=True, exist_ok=True)
         stubs = {
             "pgrep": textwrap.dedent(f"""\
@@ -121,7 +126,17 @@ class FakeSandbox:
                 fi
                 cat "{self._pidfile}"
                 """),
-            "pkill": f'#!/bin/sh\n[ -f "{self._pidfile}" ] && cat "{self._linger}" > "{self._countdown}"\nexit 0\n',
+            "pkill": textwrap.dedent(f"""\
+                #!/bin/sh
+                echo "$*" >> "{self._signals}"
+                [ -f "{self._pidfile}" ] || exit 0
+                if [ "$1" = -KILL ]; then
+                    [ -f "{self._survives}" ] || rm -f "{self._pidfile}" "{self._listening}" "{self._countdown}"
+                else
+                    cat "{self._linger}" > "{self._countdown}"
+                fi
+                exit 0
+                """),
             "tmux": "#!/bin/sh\nexit 0\n",
         }
         for name, text in stubs.items():
@@ -133,8 +148,10 @@ class FakeSandbox:
         self.tmux_env: dict | None = None
         self.lock_held: list[bool] = []
         self.pid_at_start: list[bool] = []
+        self.probe_answers: list[str] = []
         self.probe_delay = 0.0
         self.linger = 0
+        self.survives_kill = False
         self.listens = True
         self.surviving_tmux = False
 
@@ -157,11 +174,18 @@ class FakeSandbox:
     def reload(self):
         return None
 
+    def signals(self) -> list[str]:
+        return self._signals.read_text().splitlines() if self._signals.exists() else []
+
     def _bash(self, script: str):
         local = script.replace("/proc/", f"{self._proc}/").replace(LISTENER, f'[ -f "{self._listening}" ]')
         assert "/dev/tcp" not in local, local
         assert all((self._bin / name).is_file() for name in ("pgrep", "pkill", "tmux"))
         self._linger.write_text(f"{self.linger}\n")
+        if self.survives_kill:
+            self._survives.write_text("")
+        else:
+            self._survives.unlink(missing_ok=True)
         completed = subprocess.run(
             ["bash", "-c", local],
             env={"PATH": f"{self._bin}:{os.environ.get('PATH', '/usr/bin:/bin')}"},
@@ -194,14 +218,16 @@ class FakeSandbox:
             else:
                 self.run_ttyd(kwargs.get("environment"))
             return MagicMock(exit_code=0, output=(b"", b""))
-        if LISTENER in script:
+        if script.startswith("SECONDS=0; until"):
             self.events.append("ready")
             return self._bash(script)
         assert "pgrep" in script, script
         self.events.append("probe")
         if self.probe_delay:
             threading.Event().wait(self.probe_delay)
-        return self._bash(script)
+        result = self._bash(script)
+        self.probe_answers.append(result.output[0].decode().strip())
+        return result
 
 
 @pytest.fixture
@@ -663,10 +689,12 @@ def test_old_ttyd_that_never_exits_answers_503_without_starting(world, monkeypat
     sandbox = world["sandbox"]
     sandbox.run_ttyd(gateway_environment("m-0", OTHER_TOKEN))
     sandbox.linger = NEVER_EXITS
+    sandbox.survives_kill = True
     response = _post(world, {"dangerous_mode": False, "model": MODEL})
     assert response.status_code == 503
     assert response.json() == {"detail": OLD_TTYD_DETAIL}
     assert sandbox.events == ["probe", "stop"]
+    assert sandbox.signals() == ["-x ttyd", "-KILL -x ttyd"]
     assert not any("nohup ttyd" in call["script"] for call in sandbox.calls)
     _assert_lock_released(world)
     _assert_no_secret(world, response, capsys, caplog, CANARY, OTHER_TOKEN)
@@ -701,21 +729,78 @@ def test_fingerprint_mismatch_after_start_answers_503_and_is_stopped(world, monk
     _assert_no_secret(world, response, capsys, caplog, CANARY, OTHER_TOKEN)
 
 
-def test_bounded_waits_fit_inside_their_exec_timeouts(world, monkeypatch):
+def test_bounded_waits_are_minimums_inside_their_exec_timeouts(world, monkeypatch):
+    # $SECONDS counts whole seconds: -gt N waits N to N+1 s. Worst cases: stop 4 + 2 s, readiness 6 s.
     _gateway_on(monkeypatch)
     sandbox = world["sandbox"]
     sandbox.run_ttyd({"HOME": "/home/assistant"})
     assert _post(world, {"dangerous_mode": False, "model": MODEL}).status_code == 200
-    timeouts = dict(zip(sandbox.events, (call["timeout"] for call in sandbox.calls)))
-    assert timeouts["stop"] > 3
-    assert timeouts["ready"] > 5
+    calls = dict(zip(sandbox.events, sandbox.calls))
+    stop, ready = calls["stop"]["script"], calls["ready"]["script"]
+    assert "-gt 3" in stop and "-gt 1" in stop and "-ge" not in stop
+    assert "-gt 5" in ready and "-ge" not in ready
+    assert calls["stop"]["timeout"] > 6
+    assert calls["ready"]["timeout"] > 6
+    assert world["app"].TERMINAL_STOP_TIMEOUT > 6
+    assert world["app"].TERMINAL_READY_TIMEOUT > 6
 
 
 def test_stop_ttyd_answers_stopped_even_when_ttyd_outlives_the_wait(world):
     sandbox = world["sandbox"]
     sandbox.run_ttyd({"HOME": "/home/assistant"})
     sandbox.linger = NEVER_EXITS
+    sandbox.survives_kill = True
     response = world["client"].post(f"/terminal/{CHAT}/stop-ttyd", headers={"Authorization": f"Bearer {INTERNAL}"})
     assert response.status_code == 200
     assert response.json() == {"stopped": True}
     assert sandbox.events == ["stop"]
+    assert sandbox.signals() == ["-x ttyd", "-KILL -x ttyd"]
+    assert sandbox._pidfile.exists()
+
+
+# --- review follow-ups (ocu-review-followups) -------------------------------
+
+
+def test_fingerprinted_ttyd_that_does_not_listen_is_restarted_not_reused(world, monkeypatch):
+    _gateway_on(monkeypatch)
+    sandbox = world["sandbox"]
+    sandbox.listens = False
+    sandbox.run_ttyd(gateway_environment(MODEL, CANARY))
+    sandbox.listens = True
+    response = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"started": True, "already_running": False, "restarted": True}
+    assert sandbox.events == ["probe", "stop", "start", "ready"]
+    assert sandbox.ttyd_env == gateway_environment(MODEL, CANARY)
+
+
+def test_ttyd_ignoring_sigterm_after_a_failed_start_is_killed_and_never_reused(world, monkeypatch, capsys, caplog):
+    _gateway_on(monkeypatch)
+    sandbox = world["sandbox"]
+    sandbox.listens = False
+    sandbox.linger = NEVER_EXITS
+    first = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert first.status_code == 503
+    assert first.json() == {"detail": NOT_LISTENING_DETAIL}
+    assert sandbox.events == ["probe", "stop", "start", "ready", "stop"]
+    _assert_lock_released(world)
+    second = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert second.json() == {"detail": NOT_LISTENING_DETAIL}
+    assert second.status_code == 503
+    assert sandbox.events[5:] == ["probe", "stop", "start", "ready", "stop"]
+    assert sandbox.probe_answers == ["NONE", "NONE"]
+    # Per start: the first stop finds no ttyd; the cleanup stop escalates.
+    assert sandbox.signals() == ["-x ttyd", "-x ttyd", "-KILL -x ttyd"] * 2
+    assert not sandbox._pidfile.exists()
+    _assert_lock_released(world)
+    _assert_no_secret(world, second, capsys, caplog)
+
+
+def test_stop_escalates_to_sigkill_for_a_ttyd_ignoring_sigterm(world):
+    sandbox = world["sandbox"]
+    sandbox.run_ttyd({"HOME": "/home/assistant"})
+    sandbox.linger = NEVER_EXITS
+    result = world["dm"]._execute_bash(sandbox, world["app"].TERMINAL_STOP_COMMAND, world["app"].TERMINAL_STOP_TIMEOUT)
+    assert result["exit_code"] == 0
+    assert sandbox.signals() == ["-x ttyd", "-KILL -x ttyd"]
+    assert not sandbox._pidfile.exists()

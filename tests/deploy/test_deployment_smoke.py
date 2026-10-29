@@ -1047,7 +1047,7 @@ raise SystemExit(smoke_deployment.main(['smoke']))
         self.seed_probes()
         self.assert_reuse_failure_cleaned(self.run_smoke())
 
-    def test_start_posts_pass_twenty_seconds_and_second_start_request_failures_are_wrapped(self):
+    def test_start_and_stop_posts_pass_thirty_seconds_and_second_start_request_failures_are_wrapped(self):
         self.start_http()
         self.seed_probes()
         program = """
@@ -1062,6 +1062,8 @@ class Broken:
             raise TimeoutError()
         raise urllib.error.URLError(ConnectionRefusedError())
 def http_request(url, **kwargs):
+    if url.endswith('/stop-ttyd'):
+        print(f"stop-ttyd timeout={kwargs.get('timeout')!r}", flush=True)
     if url.endswith('/start-ttyd'):
         starts.append(kwargs.get('timeout'))
         print(f"start-ttyd timeout={kwargs.get('timeout')!r}", flush=True)
@@ -1085,7 +1087,9 @@ raise SystemExit(smoke_deployment.main(['smoke']))
                     text=True, timeout=30,
                 )
                 timeouts = [line for line in result.stdout.splitlines() if line.startswith("start-ttyd timeout=")]
-                self.assertEqual(timeouts, ["start-ttyd timeout=20.0"] * 2, result.stderr)
+                self.assertEqual(timeouts, ["start-ttyd timeout=30.0"] * 2, result.stderr)
+                stops = [line for line in result.stdout.splitlines() if line.startswith("stop-ttyd timeout=")]
+                self.assertEqual(stops, ["stop-ttyd timeout=30.0"], result.stderr)
                 if fault == "record":
                     self.assertEqual(result.returncode, 0, result.stderr)
                 else:

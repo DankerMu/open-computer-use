@@ -1136,15 +1136,19 @@ class StartTtydRequest(BaseModel):
     model: Optional[str] = None
 
 
-# Signals ttyd and tmux, then waits up to 3 s for no ttyd to remain; exits 1 if one does.
+# SIGTERM to ttyd and the tmux server, then at least 3 s for no ttyd to remain; SIGKILL to every
+# ttyd still there and at least 1 s more; exits 1 only if one remains. $SECONDS counts whole
+# seconds, so `-gt N` waits between N and N+1 s.
 TERMINAL_STOP_COMMAND = (
     "pkill -x ttyd 2>/dev/null; tmux kill-server 2>/dev/null; "
-    "SECONDS=0; while pgrep -x ttyd >/dev/null 2>&1; do [ $SECONDS -ge 3 ] && exit 1; sleep 0.1; done"
+    "SECONDS=0; while pgrep -x ttyd >/dev/null 2>&1; do [ $SECONDS -gt 3 ] && break; sleep 0.1; done; "
+    "pgrep -x ttyd >/dev/null 2>&1 || exit 0; pkill -KILL -x ttyd 2>/dev/null; "
+    "SECONDS=0; while pgrep -x ttyd >/dev/null 2>&1; do [ $SECONDS -gt 1 ] && exit 1; sleep 0.1; done"
 )
 # Bash /dev/tcp: no connect tool is added to the sandbox image.
 TERMINAL_LISTENER_TEST = "(exec 3<>/dev/tcp/127.0.0.1/7681) 2>/dev/null"
-# Exec timeouts cover the 3 s stop wait and the 5 s readiness wait; a timeout is a failure.
-TERMINAL_STOP_TIMEOUT = 5
+# Exec timeouts cover the worst cases, about 6 s for the stop and 6 s for readiness; a timeout is a failure.
+TERMINAL_STOP_TIMEOUT = 8
 TERMINAL_READY_TIMEOUT = 8
 TERMINAL_OLD_TTYD_DETAIL = "terminal did not start: the previous ttyd did not exit"
 TERMINAL_NOT_LISTENING_DETAIL = "terminal did not start: no ttyd with this request's settings is listening on 7681"
@@ -1165,16 +1169,24 @@ def _terminal_fingerprint_probe(fingerprint: str) -> str:
     )
 
 
+def _terminal_reuse_probe(fingerprint: str) -> str:
+    """Print MATCH when the fingerprint probe says MATCH and 7681 accepts a connection, else OTHER or NONE."""
+    return (
+        f'state=$({_terminal_fingerprint_probe(fingerprint)}); '
+        f'if [ "$state" = MATCH ] && ! {TERMINAL_LISTENER_TEST}; then state=OTHER; fi; echo "$state"'
+    )
+
+
 def _terminal_ready_probe(fingerprint: str) -> str:
-    """Exit 0 once the fingerprint probe says MATCH and 7681 accepts a connection; exit 1 after 5 s."""
+    """Exit 0 once the fingerprint probe says MATCH and 7681 accepts a connection; exit 1 after at least 5 s."""
     return (
         f'SECONDS=0; until [ "$({_terminal_fingerprint_probe(fingerprint)})" = MATCH ] && {TERMINAL_LISTENER_TEST}; '
-        "do [ $SECONDS -ge 5 ] && exit 1; sleep 0.1; done"
+        "do [ $SECONDS -gt 5 ] && exit 1; sleep 0.1; done"
     )
 
 
 def _start_gateway_terminal(container, chat_id: str, environment: Dict[str, str], dangerous_mode: bool) -> dict:
-    """Reuse a ttyd started with this fingerprint, else stop ttyd and tmux and start fresh.
+    """Reuse a listening ttyd started with this fingerprint, else stop ttyd and tmux and start fresh.
 
     Runs in one worker thread: the chat lock is a per-thread RLock that `_execute_bash`
     re-enters through the shutdown timer, so every exec runs here while it is held.
@@ -1185,7 +1197,7 @@ def _start_gateway_terminal(container, chat_id: str, environment: Dict[str, str]
     from docker_manager import _execute_bash
     fingerprint = environment["OCU_TERMINAL_FINGERPRINT"]
     with _combined_lock(chat_id):
-        state = _execute_bash(container, _terminal_fingerprint_probe(fingerprint), 5).get("output", "").strip()
+        state = _execute_bash(container, _terminal_reuse_probe(fingerprint), 5).get("output", "").strip()
         if state == "MATCH":
             return {"started": False, "already_running": True}
         if _execute_bash(container, TERMINAL_STOP_COMMAND, TERMINAL_STOP_TIMEOUT)["exit_code"] != 0:

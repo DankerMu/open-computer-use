@@ -1489,14 +1489,14 @@ def _broker_revision(chat_dir: Path, chat_id: str, image: str) -> int:
         ["revision", "/chat", chat_id],
     )
     if result.returncode != 0:
-        raise RecoveryError(f"selected-release broker revision probe failed: {_helper_detail(result)}")
+        raise RecoveryError(f"chat {chat_id} selected-release broker revision probe failed: {_helper_detail(result)}")
     raw = result.stdout or ""
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
     try:
         revision = int(json.loads(raw)["revision"])
     except (ValueError, KeyError, TypeError) as cop:
-        raise RecoveryError("selected-release broker revision probe returned malformed output") from cop
+        raise RecoveryError(f"chat {chat_id} selected-release broker revision probe returned malformed output") from cop
     if revision != before["counter"]:
         raise RecoveryError(
             f"chat {chat_id} broker revision {revision} differs from recovered index counter {before['counter']}"

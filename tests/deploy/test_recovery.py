@@ -3822,8 +3822,21 @@ class RevisionProbeTests(unittest.TestCase):
                     self.resources._broker_revision(self.chat_dir, CHAT_ID, "helper:image")
                 self.assertEqual(
                     str(raised.exception),
-                    "selected-release broker revision probe returned malformed output",
+                    f"chat {CHAT_ID} selected-release broker revision probe returned malformed output",
                 )
+
+    def test_probe_failure_names_the_chat(self):
+        snapshot = {"counter": 3, "active": {}, "missing": False}
+        with patch.object(self.resources, "_index_snapshot", return_value=snapshot), patch.object(
+            self.resources, "run_broker_helper",
+            return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="helper image broken\n"),
+        ):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                self.resources._broker_revision(self.chat_dir, CHAT_ID, "helper:image")
+        self.assertEqual(
+            str(raised.exception),
+            f"chat {CHAT_ID} selected-release broker revision probe failed: helper image broken",
+        )
 
 
 class CursorLagChatIdTests(unittest.TestCase):
