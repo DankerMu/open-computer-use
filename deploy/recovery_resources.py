@@ -519,6 +519,7 @@ def establish_quiescence(identity: dict, runtime: dict[str, str], inventory: dic
     image = helper_image(runtime, "workspace")
     # Outside the try: a refusal here must not run the failure path that stops writers.
     _scan_before_quiesce(identity, image, host_chats)
+    _require_source_cursor_lag(identity)
     try:
         return {**_quiesce_and_discover(identity, writers, timeout), "image": image}
     except BaseException as failure:
@@ -545,6 +546,18 @@ def _scan_before_quiesce(identity: dict, image: str, chats: set[str]) -> None:
     # Re-read the chat directories: a chat created during the scans above owns its new volume.
     for _chat_id, volume in sorted(discover_workspace_volumes(chats | _host_chats(identity)).items()):
         scan_volume(volume, image, links=LINK_POLICY["workspaces"])
+
+
+def _require_source_cursor_lag(identity: dict) -> None:
+    """Refuse, before anything stops, a set that restore's cursor check would refuse."""
+    postgres = inspect_required_container(identity["postgres_container"])
+    if not container_running(postgres) or container_paused(postgres):
+        raise RecoveryError("postgres must be running for the cursor check")
+    # Rows before indexes: a live cursor never passes a counter that existed when it was
+    # read, so later counter reads cannot refuse falsely; the reverse order could.
+    state = recovery_db.inspect_chat_state(identity["postgres_container"])
+    _require_cursors_behind(state, identity["chat_dir"],
+                            lambda _chat_id, snapshot: snapshot["counter"], "source broker counter")
 
 
 def _admission_containers(identity: dict) -> list[str]:
@@ -1501,41 +1514,78 @@ def _broker_revision(chat_dir: Path, chat_id: str, image: str) -> int:
 
 
 def _index_snapshot(chat_dir: Path, chat_id: str) -> dict:
-    """Read the restored broker index without following a link in its path."""
+    """Read a source or restored broker index without following a link in its path."""
     try:
         with ExitStack() as held:
             fd = _open_regular_nofollow(held, (str(chat_dir), chat_id, ".ocu", "index.json"))
             with os.fdopen(fd, encoding="utf-8", closefd=False) as stream:
                 index = json.load(stream)
+        counter = index["counter"]
+        active = index.get("active") or {}
     except FileNotFoundError:
         return {"counter": 0, "active": {}, "missing": True}
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise RecoveryError(f"chat {chat_id} index path is a symlink") from exc
-        raise
-    return {"counter": int(index["counter"]), "active": index.get("active") or {}, "missing": False}
+        # A non-directory component, a denied path or an index that cannot be opened.
+        name = errno.errorcode.get(exc.errno, type(exc).__name__)
+        raise RecoveryError(f"chat {chat_id} index is unreadable ({name})") from exc
+    # ValueError covers invalid JSON or UTF-8 and a non-regular index; KeyError and
+    # TypeError cover an index that is not an object with a counter.
+    except (ValueError, KeyError, TypeError) as cop:
+        raise RecoveryError(f"chat {chat_id} index is unreadable ({type(cop).__name__}: {cop})") from cop
+    # The broker's own rule: a bool, float, string or negative counter is refused at restore.
+    if type(counter) is not int or counter < 0:
+        raise RecoveryError(
+            f"chat {chat_id} index is unreadable (counter is not a non-negative integer: {counter!r})"
+        )
+    return {"counter": counter, "active": active, "missing": False}
+
+
+def _cursor_remedy(resets: list[tuple[str, int]]) -> str:
+    updates = []
+    for chat_id, counter in resets:
+        quoted = chat_id.replace("'", "''")
+        updates.append(f"UPDATE ocu_chat_state SET last_seen_revision = {counter} WHERE chat_id = '{quoted}';")
+    return (
+        "to fix, delete each such chat in Open WebUI (archiving is not enough) and back up again, "
+        "or stop open-webui and the OCU server with PostgreSQL still running, run "
+        + " ".join(updates)
+        + " then start the stack with deploy/up.sh and back up again"
+    )
+
+
+def _require_cursors_behind(state: dict, chat_dir: Path, counter, noun: str) -> None:
+    """Refuse every live chat whose cursor leads its counter or whose index is unreadable."""
+    live = set(state["live_chats"])
+    problems = []
+    resets = []
+    for row in state["chat_state"]:
+        if row["chat_id"] not in live:
+            continue
+        chat_id = recovery.canonical_chat_id(row["chat_id"])
+        try:
+            snapshot = _index_snapshot(chat_dir, chat_id)
+            value = 0 if snapshot["missing"] else counter(chat_id, snapshot)
+        except RecoveryError as cop:
+            problems.append(str(cop))
+            continue
+        cursor = int(row["last_seen_revision"])
+        if cursor > value:
+            problems.append(f"chat {chat_id} cursor {cursor} leads {noun} {value}")
+            resets.append((row["chat_id"], value))
+    if resets:
+        problems.append(_cursor_remedy(resets))
+    if problems:
+        raise RecoveryError("; ".join(problems))
 
 
 def _require_cursor_lag(restored: dict, chat_dir: Path, image: str) -> None:
-    live = set(restored["live_chats"])
-    for row in restored["chat_state"]:
-        chat_id = row["chat_id"]
-        if chat_id not in live:
-            continue
-        chat_id = recovery.canonical_chat_id(chat_id)
-        snapshot = _index_snapshot(chat_dir, chat_id)
-        cursor = int(row["last_seen_revision"])
-        if snapshot["missing"]:
-            if cursor > 0:
-                raise RecoveryError(
-                    f"chat {chat_id} cursor {cursor} leads recovered broker counter 0"
-                )
-            continue
-        counter = _broker_revision(chat_dir, chat_id, image)
-        if cursor > counter:
-            raise RecoveryError(
-                f"chat {chat_id} cursor {cursor} leads recovered broker counter {counter}"
-            )
+    _require_cursors_behind(
+        restored, chat_dir,
+        lambda chat_id, _snapshot: _broker_revision(chat_dir, chat_id, image),
+        "recovered broker counter",
+    )
 
 
 def _require_provider_precedence(rows: list[dict], provider: dict[str, str]) -> None:

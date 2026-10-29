@@ -114,6 +114,17 @@ unsafe paths surface on that chat's first listing after activation. A name
 that is not valid UTF-8 or contains a backslash does not fail that listing; it
 is listed as an entry that cannot be opened (see `computer-use-server/README.md`).
 
+Backup refuses the same states before stopping anything. After the pre-quiesce
+scan it requires PostgreSQL to be running and not paused, reads the
+`ocu_chat_state` rows and the live chat IDs, and only then reads each live chat's
+source `.ocu/index.json` without following a link and without running the broker.
+It refuses a cursor greater than the index counter, a positive cursor without an
+index, and an index that is not a regular file holding JSON with a non-negative
+integer counter. One refusal line names every such chat; for a cursor that leads, it
+also names the counter and the remedy in [Failure recovery](#failure-recovery).
+Live chats without a row, and rows of deleted chats, are not checked. Restore
+keeps its own check, and its refusal names the same remedy.
+
 An epoch write or synchronization failure prevents `.restored`, success output
 and application startup. A post-replacement synchronization failure may leave the
 new token visible in the owned, unready target; it does not imply rollback.
@@ -181,6 +192,14 @@ Retry evidence covers handled exceptions and completed publication boundaries. S
 ## Failure recovery
 
 - Backup failure never publishes `recovery.json` and does not delete unrelated resources.
+- A chat whose cursor leads its broker counter makes backup refuse, and makes restore refuse any set that holds it. It arises when a chat's data directory is removed out of band: the next listing recreates the index at counter 0, while the WebUI cursor `ocu_chat_state.last_seen_revision` only moves forward. Fix each chat the refusal names in one of two ways:
+  1. Delete the chat in Open WebUI, then back up again. Archiving is not enough: an archived chat stays live. The chat's `ocu_chat_state` row becomes an orphan, which backup skips and restore prunes.
+  2. Or reset the cursor to the counter the refusal names:
+     1. Stop `open-webui` and the OCU server. Keep PostgreSQL running.
+     2. Run `UPDATE ocu_chat_state SET last_seen_revision = <counter> WHERE chat_id = '<chat id>';`. The refusal prints this statement for each chat.
+     3. Start the stack with `deploy/up.sh`.
+     4. Back up again.
+- A chat whose index is unreadable makes backup and restore refuse as well. Delete that chat in Open WebUI (archiving is not enough) and back up again; resetting the cursor does not repair a broken index.
 - Restore failure leaves owned partial volumes/containers/files without `.restored` or application start. Discard that disposable target or choose a new empty one.
 - Activation failure may leave partial stopped or running core/WebUI/proxy resources. Do not `down -v` or delete sandboxes. An incompatible retained delivery is refused before selected source/inventory/runtime publication, so the restored target can retry its originally compatible delivery. Re-run `activate` only after naming the incompatibility; do not downgrade the database.
 

@@ -277,12 +277,15 @@ def inspect_chat_owners(container: str) -> dict[str, str]:
 
 
 
-def inspect_restored_state(container: str) -> dict:
+def inspect_chat_state(container: str) -> dict:
     return {
         "chat_state": _chat_state_rows(container),
         "live_chats": _live_chat_ids(container),
-        "owners": inspect_chat_owners(container),
     }
+
+
+def inspect_restored_state(container: str) -> dict:
+    return {**inspect_chat_state(container), "owners": inspect_chat_owners(container)}
 
 
 
