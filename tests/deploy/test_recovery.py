@@ -456,6 +456,12 @@ recovery_resources.time = SimpleNamespace(
             encoding="utf-8",
         )
 
+    def _edit_db(self, edit):
+        path = self.state / "postgres.json"
+        db = json.loads(path.read_text(encoding="utf-8"))
+        edit(db["ocu-test-postgres-1"])
+        path.write_text(json.dumps(db), encoding="utf-8")
+
 
     def _write_launcher(self) -> Path:
         package = self.root / "recovery-pkg"
@@ -1185,6 +1191,8 @@ else:
     def test_empty_and_unlaunched_chats_are_valid_complete_backups(self):
         shutil.rmtree(self.chat_dir)
         self.chat_dir.mkdir()
+        # No broker activity: the live chat's cursor has not advanced either.
+        self._edit_db(lambda record: record["chat_state"][0].update(last_seen_revision=0))
         volumes = json.loads((self.state / "volumes.json").read_text(encoding="utf-8"))
         volumes.pop(f"chat-{CHAT_ID}-workspace", None)
         (self.state / "volumes.json").write_text(json.dumps(volumes), encoding="utf-8")
@@ -2030,12 +2038,166 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
             extra={"FAKE_DOCKER_STATE": str(target_state)},
         )
         self.assertNotEqual(lead.returncode, 0)
-        self.assertIn("leads recovered broker counter", lead.stderr)
+        self.assertIn(f"chat {CHAT_ID} cursor 99 leads recovered broker counter 3", lead.stderr)
+        self._assert_cursor_remedy(lead.stderr, CHAT_ID, 3)
 
-    def _backup_and_restore(self, name):
+    def _assert_cursor_remedy(self, stderr, chat_id, counter):
+        for text in ("delete", "in Open WebUI", "archiving is not enough", "back up again",
+                     "stop open-webui and the OCU server with PostgreSQL still running",
+                     f"UPDATE ocu_chat_state SET last_seen_revision = {counter} WHERE chat_id = '{chat_id}';",
+                     "start the stack with deploy/up.sh"):
+            self.assertIn(text, stderr)
+
+    def _assert_cursor_check_refuses(self, name, *reasons):
+        for log in ("stopped.log", "ops.log"):
+            (self.state / log).unlink(missing_ok=True)
+        dest = self.root / f"backup-{name}"
+        result = self._backup(dest)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for reason in reasons:
+            self.assertIn(reason, result.stderr)
+        self.assertFalse(dest.exists())
+        self.assertEqual(sorted(dest.parent.glob(dest.name + ".stage-*")), [])
+        self.assertFalse((self.state / "stopped.log").exists())
+        self.assertEqual([call for call in ops(self.state) if call.startswith("docker stop")], [])
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        return result.stderr
+
+    def _set_live_cursor(self, cursor):
+        self._edit_db(lambda record: record["chat_state"][0].update(last_seen_revision=cursor))
+
+    def test_backup_refuses_a_cursor_leading_its_source_counter_before_stopping(self):
+        self._set_live_cursor(4)
+        stderr = self._assert_cursor_check_refuses(
+            "cursor-lead", f"chat {CHAT_ID} cursor 4 leads source broker counter 3")
+        self._assert_cursor_remedy(stderr, CHAT_ID, 3)
+
+    def test_backup_refuses_a_positive_cursor_without_source_index(self):
+        shutil.rmtree(self.chat_dir / CHAT_ID / ".ocu")
+        stderr = self._assert_cursor_check_refuses(
+            "cursor-no-index", f"chat {CHAT_ID} cursor 2 leads source broker counter 0")
+        self._assert_cursor_remedy(stderr, CHAT_ID, 0)
+
+    def test_backup_names_every_chat_whose_cursor_leads(self):
+        def two_leading(record):
+            record["chats"].append("chat-second")
+            record["chat_state"][0]["last_seen_revision"] = 4
+            record["chat_state"].append({"chat_id": "chat-second", "last_seen_revision": 1,
+                                         "prefs": {}, "updated_at": 1700000002})
+
+        self._edit_db(two_leading)
+        stderr = self._assert_cursor_check_refuses(
+            "two-leads", f"chat {CHAT_ID} cursor 4 leads source broker counter 3",
+            "chat chat-second cursor 1 leads source broker counter 0")
+        self._assert_cursor_remedy(stderr, CHAT_ID, 3)
+        self._assert_cursor_remedy(stderr, "chat-second", 0)
+
+    def test_backup_proceeds_when_no_live_cursor_leads(self):
+        def live_without_row(record):
+            record["chats"].append("chat-no-row")
+
+        for case, edit in (
+            ("equal", lambda record: record["chat_state"][0].update(last_seen_revision=3)),
+            # The seeded fixture: cursor 2 under counter 3, plus an orphan row at cursor 9.
+            ("below-with-orphan", lambda record: None),
+            ("live-without-row", live_without_row),
+        ):
+            with self.subTest(case=case):
+                self._seed_volumes_and_db()
+                self._edit_db(edit)
+                dest = self.root / f"backup-healthy-{case}"
+                result = self._backup(dest)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((dest / "recovery.json").is_file())
+
+    def test_backup_refuses_an_unreadable_source_index_in_one_line(self):
+        index = self.chat_dir / CHAT_ID / ".ocu" / "index.json"
+        real = index.with_name("index.real.json")
+        damages = {
+            "not-json": (lambda: index.write_bytes(b"{not json\n"),
+                         f"chat {CHAT_ID} index is unreadable (JSONDecodeError"),
+            "no-counter": (lambda: index.write_text(json.dumps({"active": {}}), encoding="utf-8"),
+                           f"chat {CHAT_ID} index is unreadable (KeyError: 'counter')"),
+            "directory": (lambda: (index.unlink(), index.mkdir()),
+                          f"chat {CHAT_ID} index is unreadable (ValueError: index.json is not a regular file)"),
+            "symlink": (lambda: (index.rename(real), os.symlink(real.name, index)),
+                        f"chat {CHAT_ID} index path is a symlink"),
+        }
+        captured = index.read_bytes()
+        for case, (damage, reason) in damages.items():
+            with self.subTest(case=case):
+                self._seed_volumes_and_db()
+                damage()
+                try:
+                    self._assert_cursor_check_refuses(f"index-{case}", reason)
+                finally:
+                    if index.is_dir() and not index.is_symlink():
+                        index.rmdir()
+                    index.unlink(missing_ok=True)
+                    real.unlink(missing_ok=True)
+                    index.write_bytes(captured)
+
+    def test_backup_refuses_a_stopped_or_paused_postgres_before_stopping(self):
+        for case, state in (
+            ("stopped", {"Status": "exited", "Running": False, "Paused": False}),
+            ("paused", {"Status": "paused", "Running": False, "Paused": True}),
+        ):
+            with self.subTest(case=case):
+                self._seed_volumes_and_db()
+                path = self.state / "containers.json"
+                containers = json.loads(path.read_text(encoding="utf-8"))
+                for item in containers:
+                    if item["Name"] == "ocu-test-postgres-1":
+                        item["State"] = state
+                path.write_text(json.dumps(containers), encoding="utf-8")
+                self._assert_cursor_check_refuses(
+                    f"postgres-{case}", "postgres must be running for the cursor check")
+
+    def test_backup_cursor_check_canonicalizes_live_chat_ids_as_restore(self):
+        def unsafe(record):
+            record["chats"].append("../x")
+            record["chat_state"].insert(0, {"chat_id": "../x", "last_seen_revision": 0,
+                                            "prefs": {}, "updated_at": 1700000003})
+
+        self._edit_db(unsafe)
+        self._assert_cursor_check_refuses("unsafe-id", "invalid chat id '../x'")
+
+        def mixed_case(cursor):
+            def edit(record):
+                record["chats"] = ["Chat-Live"]
+                record["chat_state"][0].update(chat_id="Chat-Live", last_seen_revision=cursor)
+            return edit
+
+        self._seed_volumes_and_db()
+        self._edit_db(mixed_case(3))
+        healthy = self._backup(self.root / "backup-mixed-case")
+        self.assertEqual(healthy.returncode, 0, healthy.stderr)
+        self._seed_volumes_and_db()
+        self._edit_db(mixed_case(4))
+        stderr = self._assert_cursor_check_refuses(
+            "mixed-case-lead", f"chat {CHAT_ID} cursor 4 leads source broker counter 3")
+        # The remedy's SQL must match the row as stored, not its canonical id.
+        self._assert_cursor_remedy(stderr, "Chat-Live", 3)
+
+    def _recapture_chat_data(self, backup):
+        import recovery_fs
+
+        archive = backup / "chat-data.tar.gz"
+        archive.unlink()
+        record = recovery_fs.capture_tree(self.chat_dir, archive, links="verbatim")
+        manifest = json.loads((backup / "recovery.json").read_text(encoding="utf-8"))
+        manifest["components"]["chat-data"]["sha256"] = record["sha256"]
+        (backup / "recovery.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def _backup_and_restore(self, name, damage_captured=None):
         backup = self.root / f"{name}-backup"
         created = self._backup(backup)
         self.assertEqual(created.returncode, 0, created.stderr)
+        if damage_captured is not None:
+            # Backup refuses a damaged source index, so damage the captured set instead.
+            damage_captured(self.chat_dir / CHAT_ID / ".ocu")
+            self._recapture_chat_data(backup)
         provider = self.root / f"{name}-provider.env"
         provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
         os.chmod(provider, 0o600)
@@ -2071,17 +2233,20 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
             lambda outputs: (outputs / "result.txt").write_bytes(b"broker-bytes\ngrown by an agent\n"))
 
     def test_missing_index_under_positive_cursor_refuses_before_restored(self):
-        shutil.rmtree(self.chat_dir / CHAT_ID / ".ocu")
-        restored, dest = self._backup_and_restore("missing-index")
+        restored, dest = self._backup_and_restore("missing-index", shutil.rmtree)
         self.assertNotEqual(restored.returncode, 0)
         self.assertIn(f"chat {CHAT_ID} cursor 2 leads recovered broker counter 0", restored.stderr)
+        self._assert_cursor_remedy(restored.stderr, CHAT_ID, 0)
         self.assertFalse((dest / ".restored").exists())
 
     def test_malformed_index_refuses_before_restored(self):
-        (self.chat_dir / CHAT_ID / ".ocu" / "index.json").write_bytes(b"{not json\n")
-        restored, dest = self._backup_and_restore("malformed-index")
+        restored, dest = self._backup_and_restore(
+            "malformed-index", lambda ocu: (ocu / "index.json").write_bytes(b"{not json\n"))
         self.assertNotEqual(restored.returncode, 0)
-        self.assertIn("JSONDecodeError", restored.stderr)
+        self.assertNotIn("Traceback", restored.stderr)
+        refusals = [line for line in restored.stderr.splitlines() if line.startswith("recovery: chat")]
+        self.assertEqual(len(refusals), 1, restored.stderr)
+        self.assertIn(f"chat {CHAT_ID} index is unreadable (JSONDecodeError", refusals[0])
         self.assertFalse((dest / ".restored").exists())
 
     def test_index_rejected_by_selected_broker_refuses_with_its_cause(self):
@@ -3530,6 +3695,31 @@ class IndexSnapshotTests(unittest.TestCase):
                     if kind == "os.open":
                         self.assertTrue(flags & os.O_NOFOLLOW, (kind, path))
                     self.assertFalse(os.path.realpath(path).startswith(decoy), (kind, path))
+
+    def test_unreadable_index_is_a_refusal_naming_the_chat(self):
+        index = self.root / "chat" / CHAT_ID / ".ocu" / "index.json"
+        index.parent.mkdir(parents=True)
+        for case, body in (
+            ("not-json", b"{not json"), ("not-utf8", b'{"counter": 1, "x": "\xff"}'),
+            ("no-counter", b'{"active": {}}'), ("not-object", b"[3]"),
+            ("text-counter", b'{"counter": "three"}'), ("infinite-counter", b'{"counter": Infinity}'),
+            ("directory", None),
+        ):
+            with self.subTest(case=case):
+                if body is None:
+                    index.mkdir()
+                else:
+                    index.write_bytes(body)
+                try:
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        self.resources._index_snapshot(self.root / "chat", CHAT_ID)
+                finally:
+                    if body is None:
+                        index.rmdir()
+                    else:
+                        index.unlink()
+                self.assertTrue(str(raised.exception).startswith(f"chat {CHAT_ID} index is unreadable ("))
+                self.assertNotIn("\n", str(raised.exception))
 
     def test_missing_and_regular_index_read_as_before(self):
         chat_dir = self.root / "chat"

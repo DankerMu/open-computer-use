@@ -894,4 +894,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Dispatch through the imported module so the commands catch the RecoveryError class
+    # that recovery_resources and recovery_db raise, not a second __main__ copy of it.
+    import recovery as entry
+
+    raise SystemExit(entry.main())
