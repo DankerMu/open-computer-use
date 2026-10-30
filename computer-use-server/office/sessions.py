@@ -671,6 +671,10 @@ def _signed_editor_config(chat_id, file_id, relative_path, document_type, docume
             "editorConfig": {
                 "callbackUrl": f"{self_url}/office/callback/{quote(chat_id, safe='')}/{quote(session_id, safe='')}",
                 "mode": "edit",
+                # One fixed interface language for every user: "zh" is the exact
+                # DocumentServer locale file name; region sets date/number formats.
+                "lang": "zh",
+                "region": "zh-CN",
                 "customization": {"forcesave": False},
             },
         }

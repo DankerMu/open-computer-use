@@ -78,6 +78,8 @@ def _verify_config(payload, file_id, number):
     assert config["editorConfig"]["callbackUrl"] == f"{SELF_URL}/office/callback/{CHAT}/{payload['session_id']}"
     assert config["editorConfig"]["customization"]["forcesave"] is False
     assert signed["editorConfig"]["customization"]["forcesave"] is False
+    assert (config["editorConfig"]["lang"], config["editorConfig"]["region"]) == ("zh", "zh-CN")
+    assert (signed["editorConfig"]["lang"], signed["editorConfig"]["region"]) == ("zh", "zh-CN")
     expected = {"chat_id": CHAT, "file_id": file_id, "version": number, "session_id": payload["session_id"]}
     assert tokens.verify_source_ticket(_ticket(payload)) == expected
     claims = _oracle_verify(_ticket(payload), _ticket_key(INTERNAL))
