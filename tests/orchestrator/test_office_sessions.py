@@ -523,6 +523,8 @@ def test_editor_config_and_ticket_verify_independently(office_world):
     document = editor_config["document"]
     editor = editor_config["editorConfig"]
     assert editor["customization"]["forcesave"] is False
+    assert (editor["lang"], editor["region"]) == ("zh", "zh-CN")
+    assert (config_payload["editorConfig"]["lang"], config_payload["editorConfig"]["region"]) == ("zh", "zh-CN")
     assert document["key"] == payload["document_key"]
     assert document["fileType"] == "docx"
     source = urlsplit(document["url"])

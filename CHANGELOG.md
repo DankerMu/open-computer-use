@@ -57,6 +57,13 @@
   separate from orchestrator collection. A failure in either module fails the
   invocation and job; existing verification selections remain unchanged.
 
+### Changed
+- **Office editor opens in Simplified Chinese.** The signed editor
+  configuration returned on session create and join sets
+  `editorConfig.lang` to `zh` and `editorConfig.region` to `zh-CN` for every
+  user, so DocumentServer shows Chinese menus and Chinese date and number
+  formats. The returned configuration still equals the signed token payload.
+
 ## Unreleased — `next/v1` branch
 
 ### Fixed
