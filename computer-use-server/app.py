@@ -1145,6 +1145,10 @@ TERMINAL_STOP_COMMAND = (
     "pgrep -x ttyd >/dev/null 2>&1 || exit 0; pkill -KILL -x ttyd 2>/dev/null; "
     "SECONDS=0; while pgrep -x ttyd >/dev/null 2>&1; do [ $SECONDS -gt 1 ] && exit 1; sleep 0.1; done"
 )
+# Prefixes the first exec of every start (#680). One symlinkat: fails on any existing entry,
+# a dangling symlink included; -T keeps it from linking inside a directory. Both streams go to
+# /dev/null because `_execute_bash` folds stderr into the output the probes are compared on.
+TERMINAL_FILES_LINK = "ln -sT /mnt/user-data/files /home/assistant/files >/dev/null 2>&1; "
 # Bash /dev/tcp: no connect tool is added to the sandbox image.
 TERMINAL_LISTENER_TEST = "(exec 3<>/dev/tcp/127.0.0.1/7681) 2>/dev/null"
 # Exec timeouts cover the worst cases, about 6 s for the stop and 6 s for readiness; a timeout is a failure.
@@ -1170,9 +1174,12 @@ def _terminal_fingerprint_probe(fingerprint: str) -> str:
 
 
 def _terminal_reuse_probe(fingerprint: str) -> str:
-    """Print MATCH when the fingerprint probe says MATCH and 7681 accepts a connection, else OTHER or NONE."""
+    """Print MATCH when the fingerprint probe says MATCH and 7681 accepts a connection, else OTHER or NONE.
+
+    Runs the files link first; its result never reaches the output.
+    """
     return (
-        f'state=$({_terminal_fingerprint_probe(fingerprint)}); '
+        f'{TERMINAL_FILES_LINK}state=$({_terminal_fingerprint_probe(fingerprint)}); '
         f'if [ "$state" = MATCH ] && ! {TERMINAL_LISTENER_TEST}; then state=OTHER; fi; echo "$state"'
     )
 
@@ -1237,7 +1244,7 @@ async def start_ttyd(chat_id: str, request: Request, body: StartTtydRequest = Bo
     # Check if already running
     check = await asyncio.to_thread(
         _execute_bash, container,
-        "pgrep -x ttyd > /dev/null 2>&1 && echo RUNNING || echo STOPPED", 5)
+        TERMINAL_FILES_LINK + "pgrep -x ttyd > /dev/null 2>&1 && echo RUNNING || echo STOPPED", 5)
     if "RUNNING" in check.get("output", ""):
         return {"started": False, "already_running": True}
     # Start ttyd + tmux in background (-A = attach if session exists, create if not)
