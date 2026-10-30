@@ -6,10 +6,12 @@ Seams: the real FastAPI app over TestClient, the real per-chat lifecycle lock an
 real `_execute_bash`, against a fake container whose `exec_run` runs the probe, stop and
 readiness scripts in a local bash with stub `pgrep`, `pkill` and `tmux`, a fake `/proc`,
 and a fake listening file in place of the `/dev/tcp` listener test, so nothing on the host
-is signalled or connected to. Startup refusal runs the real lifespan in a subprocess.
-Expected values are the ocu-terminal-claude-gateway, ocu-terminal-start-race and
-ocu-review-followups fixture literals (design evidence a-h, a-g and a-d), not recomputed
-from the implementation.
+is signalled or connected to. `/home/assistant/` and `/mnt/user-data/files` map to temporary
+directories and a stub `ln` makes one symlink call, so nothing on the host is written.
+Startup refusal runs the real lifespan in a subprocess.
+Expected values are the ocu-terminal-claude-gateway, ocu-terminal-start-race,
+ocu-review-followups and ocu-terminal-files-link fixture literals (design evidence a-h, a-g,
+a-d and a-b), not recomputed from the implementation.
 """
 from __future__ import annotations
 
@@ -47,6 +49,7 @@ MODEL = "m-1"
 START_TTYD = f"/terminal/{CHAT}/start-ttyd"
 LISTENER = "(exec 3<>/dev/tcp/127.0.0.1/7681)"
 LEGACY_CHECK = "pgrep -x ttyd > /dev/null 2>&1 && echo RUNNING || echo STOPPED"
+FILES_LINK = "ln -sT /mnt/user-data/files /home/assistant/files >/dev/null 2>&1; "
 LEGACY_START = (
     "cd /home/assistant && echo 'set -g mouse on' > ~/.tmux.conf && LANG=C.UTF-8 "
     "{prefix}nohup ttyd -W -p 7681 tmux -u new-session -A -s main bash > /dev/null 2>&1 &"
@@ -90,7 +93,8 @@ class FakeSandbox:
     A plain `pkill` (SIGTERM) arms a countdown of `linger` `pgrep` polls after which ttyd's
     pid is gone; `pkill -KILL` removes it at once unless `survives_kill` is set. Every `pkill`
     argument list is logged. `tmux` does nothing. The listener test reads a file that exists
-    while ttyd listens.
+    while ttyd listens. `ln` accepts only `-sT TARGET LINK` and makes one `os.symlink`, which
+    fails on any existing entry with the error on stderr (macOS `/bin/ln` has no `-T`).
     """
 
     def __init__(self, root: Path, docker_manager, server):
@@ -111,7 +115,11 @@ class FakeSandbox:
         self._linger = root / "ttyd.linger"
         self._survives = root / "ttyd.survives-kill"
         self._signals = root / "pkill.log"
+        self.home = root / "home" / "assistant"
+        self.files = root / "user-data" / "files"
         self._bin.mkdir(parents=True, exist_ok=True)
+        self.home.mkdir(parents=True, exist_ok=True)
+        self.files.mkdir(parents=True, exist_ok=True)
         stubs = {
             "pgrep": textwrap.dedent(f"""\
                 #!/bin/sh
@@ -138,6 +146,16 @@ class FakeSandbox:
                 exit 0
                 """),
             "tmux": "#!/bin/sh\nexit 0\n",
+            "ln": textwrap.dedent(f"""\
+                #!{sys.executable}
+                import os, sys
+                if len(sys.argv) != 4 or sys.argv[1] != "-sT":
+                    sys.exit(f"ln stub: unsupported arguments {{sys.argv[1:]}}")
+                try:
+                    os.symlink(sys.argv[2], sys.argv[3])
+                except OSError as error:
+                    sys.exit(f"ln: {{error}}")
+                """),
         }
         for name, text in stubs.items():
             (self._bin / name).write_text(text)
@@ -179,8 +197,9 @@ class FakeSandbox:
 
     def _bash(self, script: str):
         local = script.replace("/proc/", f"{self._proc}/").replace(LISTENER, f'[ -f "{self._listening}" ]')
+        local = local.replace("/home/assistant/", f"{self.home}/").replace("/mnt/user-data/files", str(self.files))
         assert "/dev/tcp" not in local, local
-        assert all((self._bin / name).is_file() for name in ("pgrep", "pkill", "tmux"))
+        assert all((self._bin / name).is_file() for name in ("pgrep", "pkill", "tmux", "ln"))
         self._linger.write_text(f"{self.linger}\n")
         if self.survives_kill:
             self._survives.write_text("")
@@ -513,7 +532,7 @@ def test_gateway_off_runs_todays_commands_without_environment(world, monkeypatch
     assert response.status_code == 200
     assert response.json() == {"started": True}
     prefix = "NO_AUTOSTART=1 " if dangerous else ""
-    expected = [LEGACY_CHECK, LEGACY_START.format(prefix=prefix)]
+    expected = [FILES_LINK + LEGACY_CHECK, LEGACY_START.format(prefix=prefix)]
     assert [call["script"] for call in sandbox.calls] == expected
     for call, script in zip(sandbox.calls, expected):
         assert call["cmd"] == ["bash", "-c", f"timeout 5 bash -c {shlex.quote(script)}"]
@@ -804,3 +823,93 @@ def test_stop_escalates_to_sigkill_for_a_ttyd_ignoring_sigterm(world):
     assert result["exit_code"] == 0
     assert sandbox.signals() == ["-x ttyd", "-KILL -x ttyd"]
     assert not sandbox._pidfile.exists()
+
+
+# --- files link (ocu-terminal-files-link) ----------------------------------
+
+
+def _start_twice(world, monkeypatch, mode):
+    """Run the mode's start then a reopen; return both answers."""
+    if mode != "gateway-off":
+        _gateway_on(monkeypatch)
+    if mode == "gateway-reuse":
+        world["sandbox"].run_ttyd(gateway_environment(MODEL, CANARY))
+    first = _post(world, {"dangerous_mode": False, "model": MODEL})
+    second = _post(world, {"dangerous_mode": False, "model": MODEL})
+    assert first.status_code == 200 and second.status_code == 200, (first.text, second.text)
+    return first.json(), second.json()
+
+
+@pytest.mark.parametrize(
+    "mode, answer, events",
+    [
+        ("gateway-fresh", {"started": True, "already_running": False, "restarted": False},
+         ["probe", "stop", "start", "ready"]),
+        ("gateway-reuse", {"started": False, "already_running": True}, ["probe"]),
+        ("gateway-off", {"started": True}, ["probe", "start"]),
+    ],
+)
+def test_first_exec_alone_carries_the_files_link_and_answers_are_unchanged(world, monkeypatch, mode, answer, events):
+    sandbox = world["sandbox"]
+    first, second = _start_twice(world, monkeypatch, mode)
+    assert first == answer
+    assert second == {"started": False, "already_running": True}
+    assert sandbox.events == events + ["probe"]
+    probes = [call["script"] for call, event in zip(sandbox.calls, sandbox.events) if event == "probe"]
+    assert all(script.startswith(FILES_LINK) for script in probes)
+    assert [script.count("ln ") for script in probes] == [1, 1]
+    others = [call["script"] for call, event in zip(sandbox.calls, sandbox.events) if event != "probe"]
+    assert not any("ln " in script for script in others)
+    if mode == "gateway-off":
+        assert probes == [FILES_LINK + LEGACY_CHECK] * 2
+    else:
+        assert all("pgrep -o -x ttyd" in script for script in probes)
+    starts = [script for script in others if "nohup ttyd" in script]
+    assert starts == ([] if mode == "gateway-reuse" else [LEGACY_START.format(prefix="")])
+    assert sandbox.probe_answers[-1] == ("RUNNING" if mode == "gateway-off" else "MATCH")
+    assert os.readlink(sandbox.home / "files") == str(sandbox.files)
+
+
+def _tree(*roots):
+    """lstat identity of every entry under the roots, symlinks not followed."""
+    seen = {}
+    for root in roots:
+        for directory, names, files in os.walk(root):
+            for name in [".", *names, *files]:
+                path = Path(directory, name)
+                info = path.lstat()
+                link = os.readlink(path) if path.is_symlink() else None
+                seen[str(path)] = (info.st_mode, info.st_ino, info.st_size, info.st_mtime_ns, link)
+    return seen
+
+
+@pytest.mark.parametrize("mode", ["gateway-fresh", "gateway-reuse", "gateway-off"])
+@pytest.mark.parametrize("kind", ["directory", "file", "symlink-elsewhere", "symlink-to-directory", "dangling"])
+def test_existing_files_entry_is_left_unchanged(world, monkeypatch, mode, kind):
+    sandbox = world["sandbox"]
+    outside = world["tmp"] / "outside"
+    (outside / "dir").mkdir(parents=True)
+    (outside / "dir" / "keep.txt").write_text("outside dir\n")
+    (outside / "elsewhere.txt").write_text("elsewhere\n")
+    (sandbox.files / "report.txt").write_text("chat file\n")
+    entry = sandbox.home / "files"
+    if kind == "directory":
+        entry.mkdir()
+        (entry / "mine.txt").write_text("user dir\n")
+    elif kind == "file":
+        entry.write_text("user file\n")
+    elif kind == "symlink-elsewhere":
+        entry.symlink_to(outside / "elsewhere.txt")
+    elif kind == "symlink-to-directory":
+        entry.symlink_to(outside / "dir")
+    else:
+        entry.symlink_to(outside / "missing")
+    before = _tree(sandbox.home, sandbox.files, outside)
+    first, second = _start_twice(world, monkeypatch, mode)
+    assert second == {"started": False, "already_running": True}
+    assert first == {
+        "gateway-fresh": {"started": True, "already_running": False, "restarted": False},
+        "gateway-reuse": {"started": False, "already_running": True},
+        "gateway-off": {"started": True},
+    }[mode]
+    assert _tree(sandbox.home, sandbox.files, outside) == before
