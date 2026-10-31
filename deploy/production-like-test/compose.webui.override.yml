@@ -33,12 +33,14 @@ services:
       RAG_EMBEDDING_ENGINE: openai
       RAG_OPENAI_API_BASE_URL: ${DMXAPI_BASE_URL}
       RAG_OPENAI_API_KEY: ${DMXAPI_API_KEY}
-      RAG_EMBEDDING_MODEL: qwen3-embedding-8b
+      # Model names come from runtime.env (#686). An empty name stays empty; it
+      # does not fall back to Open WebUI's default, so set it in the admin UI.
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-}
       RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
       ENABLE_RAG_HYBRID_SEARCH: "true"
       RAG_TOP_K: "8"
       RAG_RERANKING_ENGINE: external
-      RAG_RERANKING_MODEL: qwen3-rerank
+      RAG_RERANKING_MODEL: ${RAG_RERANKING_MODEL:-}
       RAG_EXTERNAL_RERANKER_URL: ${DMXAPI_BASE_URL}/rerank
       RAG_EXTERNAL_RERANKER_API_KEY: ${DMXAPI_API_KEY}
       RAG_EXTERNAL_RERANKER_TIMEOUT: "30"
@@ -89,9 +91,10 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       ADMIN_NAME: AI Workbench Test Admin
-      # WebUI's default model. The initializer validates it against
-      # /api/models and refuses to finish when the provider does not offer it.
-      PRIMARY_CHAT_MODEL: qwen3.8-27b
+      # WebUI's default model, from runtime.env. When set, the initializer
+      # validates it against /api/models and refuses to finish when the
+      # provider does not offer it; when empty, the admin UI chooses it.
+      PRIMARY_CHAT_MODEL: ${PRIMARY_CHAT_MODEL:-}
       ORCHESTRATOR_URL: http://computer-use-server:8081
       MCP_API_KEY: ${MCP_API_KEY}
     volumes:

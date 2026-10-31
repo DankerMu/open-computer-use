@@ -73,6 +73,9 @@ PUBLIC_COPY_SOURCES = (
     "entrypoint.sh",
     "messages-ingress.conf",
 )
+# Operator-chosen model names (#686): interpolated from runtime.env, never fixed.
+WEBUI_MODEL_NAMES = ("RAG_EMBEDDING_MODEL", "RAG_RERANKING_MODEL")
+INIT_MODEL_NAME = "PRIMARY_CHAT_MODEL"
 MESSAGES_CONFIG = "/opt/ocu-proxy/messages-ingress.conf"
 MESSAGES_ENTRYPOINT = ["nginx", "-e", "stderr", "-p", "/var/lib/nginx/", "-c", MESSAGES_CONFIG]
 
@@ -112,7 +115,8 @@ def interpolated_present(value: str, name: str) -> bool:
     return isinstance(value, str) and value.startswith(f"${{{name}?")
 
 
-def resolved_stacks(directory: Path, flag: str, source: Path | None = None) -> dict:
+def resolved_stacks(directory: Path, flag: str, source: Path | None = None,
+                    extra: dict[str, str] | None = None) -> dict:
     source = source or ROOT
     directory.mkdir(parents=True, exist_ok=True)
     empty = directory / "empty.env"
@@ -145,6 +149,7 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None) -> d
         environment[name] = "native-fixture-" + name.lower()
     environment.update({name: DEFAULT_RELEASE_IMAGES[role]
                         for role, name in RUNTIME_IMAGE_VARS.items()})
+    environment.update(extra or {})
     standalone = shutil.which("docker-compose")
     command = [standalone] if standalone else ["docker", "compose"]
     overlay = source / "deploy/production-like-test"
@@ -164,6 +169,9 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None) -> d
         )
         if result.returncode:
             raise AssertionError(f"native Compose v2 resolution failed: {result.stderr}")
+        # An interpolated name a runtime.env may lack must not warn on every command.
+        if "is not set" in result.stderr:
+            raise AssertionError(f"native Compose v2 resolution warned: {result.stderr}")
         document = json.loads(result.stdout)
         if any(service.get("env_file") for service in document["services"].values()):
             raise AssertionError("native resolver must not omit service env_file inputs")
@@ -330,6 +338,55 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertIs(proxy["networks"]["sandbox"]["external"], True)
         self.assertNotIn("OCU_INTERNAL_TOKEN", json.dumps(ingress))
         self.assertNotIn("OCU_WEBUI_ORIGIN", json.dumps(ingress))
+
+    def test_webui_overlay_names_no_model_or_provider_literal(self):
+        text = WEBUI_OVERRIDE.read_text(encoding="utf-8")
+        # ${DMXAPI_BASE_URL} and ${DMXAPI_API_KEY} stay; the provider host must not.
+        offending = [line for line in text.splitlines()
+                     if "qwen" in line.lower() or "dmxapi.cn" in line.lower()]
+        self.assertEqual(offending, [])
+        webui = parsed(WEBUI_OVERRIDE)
+        webui_env = override_value(webui["services"]["open-webui"]["environment"])
+        init_env = webui["services"]["open-webui-init"]["environment"]
+        placeholders = {name: webui_env[name] for name in WEBUI_MODEL_NAMES}
+        placeholders[INIT_MODEL_NAME] = init_env[INIT_MODEL_NAME]
+        for name, value in placeholders.items():
+            with self.subTest(name=name):
+                # `:-` resolves a missing name silently; bare ${NAME} warns, ${NAME:?} refuses.
+                self.assertEqual(value, f"${{{name}:-}}")
+                self.assertEqual(interpolate_value(value, {name: "model-a"}), "model-a")
+                self.assertEqual(interpolate_value(value, {name: ""}), "")
+                self.assertEqual(interpolate_value(value, {}), "")
+        provider = {"DMXAPI_BASE_URL": "http://lan-model:8000/v1"}
+        for setting in ("OPENAI_API_BASE_URL", "RAG_OPENAI_API_BASE_URL"):
+            self.assertEqual(webui_env[setting], "${DMXAPI_BASE_URL}")
+        self.assertEqual(interpolate_value(webui_env["RAG_EXTERNAL_RERANKER_URL"], provider),
+                         "http://lan-model:8000/v1/rerank")
+
+    def test_native_compose_resolves_operator_models(self):
+        cases = (
+            ("absent", {}, {name: "" for name in (*WEBUI_MODEL_NAMES, INIT_MODEL_NAME)}),
+            ("empty", {name: "" for name in (*WEBUI_MODEL_NAMES, INIT_MODEL_NAME)},
+             {name: "" for name in (*WEBUI_MODEL_NAMES, INIT_MODEL_NAME)}),
+            ("given", {"RAG_EMBEDDING_MODEL": "embed-a", "RAG_RERANKING_MODEL": "rerank-a",
+                       "PRIMARY_CHAT_MODEL": "chat-a", "DMXAPI_BASE_URL": "http://lan-model:8000/v1"},
+             {"RAG_EMBEDDING_MODEL": "embed-a", "RAG_RERANKING_MODEL": "rerank-a",
+              "PRIMARY_CHAT_MODEL": "chat-a"}),
+        )
+        with tempfile.TemporaryDirectory(prefix="ocu-native-models-") as raw:
+            for label, extra, expected in cases:
+                with self.subTest(case=label):
+                    # resolved_stacks refuses a non-zero exit and any "is not set" warning.
+                    webui = resolved_stacks(Path(raw) / label, "false", extra=extra)["webui.json"]
+                    webui_env = webui["services"]["open-webui"]["environment"]
+                    init_env = webui["services"]["open-webui-init"]["environment"]
+                    for name in WEBUI_MODEL_NAMES:
+                        self.assertEqual(webui_env.get(name), expected[name], name)
+                    self.assertEqual(init_env.get(INIT_MODEL_NAME), expected[INIT_MODEL_NAME])
+                    base = extra.get("DMXAPI_BASE_URL", "http://provider.fixture/v1")
+                    self.assertEqual(webui_env["OPENAI_API_BASE_URL"], base)
+                    self.assertEqual(webui_env["RAG_OPENAI_API_BASE_URL"], base)
+                    self.assertEqual(webui_env["RAG_EXTERNAL_RERANKER_URL"], base + "/rerank")
 
     def test_adopted_local_dependencies_exist(self):
         for path in ADOPTED:

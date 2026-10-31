@@ -27,6 +27,25 @@ SOURCE = ROOT / "openwebui"
 SENTINEL = "sentinel-admin-password-9f3c"
 PRIMARY_MODEL = "qwen3.8-27b"
 MARKER_NAME = ".computer-use-initialized"
+DEFAULT_MODELS_LINE = "cfg.setdefault('DEFAULT_MODELS', cfg.get('DEFAULT_MODELS') or '')"
+MARKER_SECTION = "\n\n# Mark as initialized — only if every required step succeeded."
+UNSET_MODEL_LOG = "[init] PRIMARY_CHAT_MODEL is not set; leaving the default model to the admin UI"
+# What the wrapper at OCU 3c68b93 inserts before the marker section for a set
+# model; fixed text, so a generated initializer drifting from it fails (#686).
+PRIMARY_MODEL_CHECK = r'''
+# Refuse to finish unless the approved deployment model is offered by the provider.
+curl -sf "$WEBUI_URL/api/models" -H "$AUTH" 2>/dev/null | \
+    PRIMARY_CHAT_MODEL="$PRIMARY_CHAT_MODEL" python3 -c "
+import json, os, sys
+target = os.environ['PRIMARY_CHAT_MODEL']
+data = json.load(sys.stdin).get('data', [])
+if not any(model.get('id') == target for model in data):
+    raise SystemExit(f'requested PRIMARY_CHAT_MODEL is unavailable: {target}')
+" 2>/dev/null || {
+    echo "[init] ERROR: PRIMARY_CHAT_MODEL is unavailable: $PRIMARY_CHAT_MODEL" >&2
+    exit 1
+}
+'''
 PUBLIC_GRANTS = [
     {"principal_type": "group", "principal_id": "*", "permission": "read"},
     {"principal_type": "user", "principal_id": "*", "permission": "read"},
@@ -323,7 +342,7 @@ class InitWrapperTests(unittest.TestCase):
         self.webui.start()
 
 
-    def run_wrapper(self, extra_env=None, timeout=20):
+    def wrapper_env(self, extra_env=None):
         env = os.environ.copy()
         env.update({
             "OCU_INIT_SOURCE_ROOT": str(self.source),
@@ -341,15 +360,46 @@ class InitWrapperTests(unittest.TestCase):
         })
         if extra_env:
             env.update(extra_env)
+        return env
+
+    def run_wrapper(self, extra_env=None, timeout=20):
         return subprocess.run(
             ["bash", str(WRAPPER)],
             cwd=str(self.root),
             capture_output=True,
             text=True,
-            env=env,
+            env=self.wrapper_env(extra_env),
             timeout=timeout,
             check=False,
         )
+
+    def generated_init(self, extra_env=None) -> tuple[str, subprocess.CompletedProcess]:
+        """Read the initializer the wrapper runs, held at its first request."""
+        self.webui.mode = "success"
+        hold = self.root / "http-hold"
+        hold.write_text("1", encoding="utf-8")
+        self.webui.hold_path = str(hold)
+        process = subprocess.Popen(
+            ["bash", str(WRAPPER)],
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.wrapper_env(extra_env),
+            start_new_session=True,
+        )
+        try:
+            self.assertTrue(self.webui.entered.wait(5), "wrapper never reached its first request")
+            owned = leftover_init(self.root)
+            self.assertEqual(len(owned), 1)
+            generated = (owned[0] / "init.sh").read_text(encoding="utf-8")
+        finally:
+            hold.unlink(missing_ok=True)
+            self.webui.hold_path = ""
+            if process.poll() is None and not wait_for(lambda: process.poll() is not None, timeout=15):
+                process.send_signal(signal.SIGKILL)
+            stdout, stderr = process.communicate(timeout=10)
+        return generated, subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
     def combined(self, result) -> str:
         return result.stdout + result.stderr
@@ -492,19 +542,58 @@ class InitWrapperTests(unittest.TestCase):
         self.assertTrue((self.data / MARKER_NAME).is_file())
         self.assert_required_setup()
 
-    def test_missing_primary_model_refuses_before_any_request(self):
-        result = self.run_wrapper({"PRIMARY_CHAT_MODEL": " "})
-        self.assertNotEqual(result.returncode, 0, self.combined(result))
-        self.assertIn("PRIMARY_CHAT_MODEL is required", result.stderr)
-        self.assertFalse((self.data / MARKER_NAME).exists())
-        self.assertEqual(self.webui.calls, [])
+    def test_unset_primary_model_leaves_default_model_to_admin(self):
+        for value in ("", " \t "):
+            with self.subTest(value=repr(value)):
+                (self.data / MARKER_NAME).unlink(missing_ok=True)
+                self.webui.calls.clear()
+                self.webui.posted_config = None
+                self.webui.existing_config["DEFAULT_MODELS"] = "admin-chosen-model"
+                self.webui.mode = "primary-model-unavailable"
+                result = self.run_wrapper({"PRIMARY_CHAT_MODEL": value})
+                self.assertEqual(result.returncode, 0, self.combined(result))
+                self.assertIn(UNSET_MODEL_LOG, result.stdout.splitlines())
+                self.assertTrue((self.data / MARKER_NAME).is_file())
+                self.assert_no_secret(result)
+                self.assertEqual(self.webui.unexpected, [])
+                self.assertEqual(self.webui.posted_config["DEFAULT_MODELS"], "admin-chosen-model")
+                self.assertEqual(
+                    self.webui.posted_config["DEFAULT_MODEL_PARAMS"],
+                    {"temperature": 0.2, "keep_nested": True, "function_calling": "native", "stream_response": True},
+                )
+                self.assertNotIn("GET /api/models", self.webui.calls)
+                self.assertIn("POST /api/v1/tools/id/ai_computer_use/valves/update", self.webui.calls)
+                self.assertIn("POST /api/v1/functions/id/computer_use_filter/valves/update", self.webui.calls)
+                self.assertEqual(self.webui.tool_access["access_grants"], PUBLIC_GRANTS)
+                function = self.webui.functions["computer_use_filter"]
+                self.assertTrue(function["is_active"])
+                self.assertTrue(function["is_global"])
 
-    def _refuses_changed_anchor(self, anchor: str, expected: str):
+    def test_set_primary_model_generates_the_pinned_initializer(self):
+        upstream = (self.source / "init.sh").read_text(encoding="utf-8")
+        expected = upstream.replace(
+            DEFAULT_MODELS_LINE, f"cfg['DEFAULT_MODELS'] = '{PRIMARY_MODEL}'"
+        ).replace(MARKER_SECTION, PRIMARY_MODEL_CHECK + MARKER_SECTION)
+        self.assertNotEqual(expected, upstream)
+        generated, result = self.generated_init()
+        self.assertEqual(result.returncode, 0, self.combined(result))
+        self.assertEqual(generated, expected)
+        self.assertNotIn(UNSET_MODEL_LOG, result.stdout)
+        self.assert_required_setup()
+
+    def test_unset_primary_model_runs_upstream_initializer_unchanged(self):
+        upstream = (self.source / "init.sh").read_text(encoding="utf-8")
+        generated, result = self.generated_init({"PRIMARY_CHAT_MODEL": ""})
+        self.assertEqual(result.returncode, 0, self.combined(result))
+        self.assertEqual(generated, upstream)
+        self.assertTrue((self.data / MARKER_NAME).is_file())
+
+    def _refuses_changed_anchor(self, anchor: str, expected: str, extra_env=None):
         init = self.source / "init.sh"
         text = init.read_text(encoding="utf-8")
         self.assertEqual(text.count(anchor), 1, anchor)
         init.write_text(text.replace(anchor, anchor.replace(" ", "  ", 1)), encoding="utf-8")
-        result = self.run_wrapper()
+        result = self.run_wrapper(extra_env)
         self.assertNotEqual(result.returncode, 0, self.combined(result))
         self.assertIn(expected, result.stderr)
         self.assertFalse((self.data / MARKER_NAME).exists())
@@ -521,6 +610,18 @@ class InitWrapperTests(unittest.TestCase):
             "# Mark as initialized — only if every required step succeeded.",
             "could not locate initialization marker section",
         )
+
+    def test_changed_anchors_refuse_with_primary_model_unset(self):
+        anchors = (
+            (DEFAULT_MODELS_LINE, "expected DEFAULT_MODELS config line changed upstream"),
+            ("# Mark as initialized — only if every required step succeeded.",
+             "could not locate initialization marker section"),
+        )
+        pristine = (self.source / "init.sh").read_text(encoding="utf-8")
+        for anchor, expected in anchors:
+            with self.subTest(anchor=anchor):
+                (self.source / "init.sh").write_text(pristine, encoding="utf-8")
+                self._refuses_changed_anchor(anchor, expected, {"PRIMARY_CHAT_MODEL": ""})
 
     def test_installed_tool_is_the_shipped_tool_with_sub_agent(self):
         self.webui.mode = "success"

@@ -18,6 +18,9 @@
 #   OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
 #   OCU_SANDBOX_MESSAGES_ADDRESS — Messages ingress IPv4, default 172.31.0.254
 #   OCU_OFFICE_PROXY_PORT OCU_OFFICE_FONTS_DIR — port and operator-font directory
+#   DMXAPI_BASE_URL — OpenAI-compatible provider base URL for chat, embedding, rerank
+#   PRIMARY_CHAT_MODEL RAG_EMBEDDING_MODEL RAG_RERANKING_MODEL — model names
+#     Each is written as given, or empty when absent; empty leaves it to the admin UI.
 
 
 set -euo pipefail
@@ -260,6 +263,10 @@ office_proxy_port=${OCU_OFFICE_PROXY_PORT-8083}
 office_fonts_dir=${OCU_OFFICE_FONTS_DIR-"$deploy_root/data/office-fonts"}
 office_docserver_url='http://documentserver'
 office_self_url='http://computer-use-server:8081'
+dmxapi_base_url=${DMXAPI_BASE_URL-}
+primary_chat_model=${PRIMARY_CHAT_MODEL-}
+rag_embedding_model=${RAG_EMBEDDING_MODEL-}
+rag_reranking_model=${RAG_RERANKING_MODEL-}
 if [ -z "$office_fonts_dir" ]; then
     fail 'OCU_OFFICE_FONTS_DIR must name a directory'
 fi
@@ -286,7 +293,11 @@ for pair in \
     PUBLIC_BASE_URL:"$public_base_url" \
     OCU_WEBUI_AUTH_URL:"$internal_auth_url" \
     OCU_CHAT_DATA_DIR:"$chat_data_dir" \
-    OCU_SKILLS_CACHE_DIR:"$skills_cache_dir"
+    OCU_SKILLS_CACHE_DIR:"$skills_cache_dir" \
+    DMXAPI_BASE_URL:"$dmxapi_base_url" \
+    PRIMARY_CHAT_MODEL:"$primary_chat_model" \
+    RAG_EMBEDDING_MODEL:"$rag_embedding_model" \
+    RAG_RERANKING_MODEL:"$rag_reranking_model"
 do
     name=${pair%%:*}
     value=${pair#*:}
@@ -354,7 +365,10 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' 'OCU_SANDBOX_NO_AUTOSTART=1'
     # One generated token is consumed by WebUI, OCU, and proxy.
     printf '%s\n' "OCU_INTERNAL_TOKEN=$internal_token"
-    printf '%s\n' 'DMXAPI_BASE_URL=https://www.dmxapi.cn/v1'
+    printf '%s\n' "DMXAPI_BASE_URL=$dmxapi_base_url"
+    printf '%s\n' "PRIMARY_CHAT_MODEL=$primary_chat_model"
+    printf '%s\n' "RAG_EMBEDDING_MODEL=$rag_embedding_model"
+    printf '%s\n' "RAG_RERANKING_MODEL=$rag_reranking_model"
     printf '%s\n' "OCU_CHAT_DATA_DIR=$chat_data_dir"
     printf '%s\n' "OCU_SKILLS_CACHE_DIR=$skills_cache_dir"
     printf '%s\n' "OCU_OFFICE_JWT_SECRET=$office_jwt_secret"

@@ -58,6 +58,13 @@ IMAGES = {
     "DOCUMENTSERVER_IMAGE": DEFAULT_RELEASE_IMAGES["documentserver"],
 }
 
+# Optional operator inputs (#686); each is published as given or empty.
+OPERATOR_MODEL_INPUTS = (
+    "DMXAPI_BASE_URL",
+    "PRIMARY_CHAT_MODEL",
+    "RAG_EMBEDDING_MODEL",
+    "RAG_RERANKING_MODEL",
+)
 GENERATED_SECRETS = (
     "OCU_INTERNAL_TOKEN",
     "ADMIN_PASSWORD",
@@ -157,6 +164,8 @@ class BootstrapRuntimeTests(unittest.TestCase):
         # Ambient operator paths must never escape this fixture's owned root.
         self.env.pop("OCU_OFFICE_PROXY_PORT", None)
         self.env.pop("OCU_OFFICE_FONTS_DIR", None)
+        for name in OPERATOR_MODEL_INPUTS:
+            self.env.pop(name, None)
         self.env["PATH"] = str(FAKE_DOCKER.parent) + os.pathsep + self.env.get("PATH", "")
         self.env["FAKE_DOCKER_STATE"] = str(self.state)
         self.env["DOCKER_HOST"] = "unix://" + str(self.state / "docker.sock")
@@ -664,6 +673,51 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
                 self.assertNotEqual(result.returncode, 0)
                 self.assert_unpublished()
                 self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
+
+    def test_operator_model_inputs_are_published_as_given(self):
+        given = {
+            "DMXAPI_BASE_URL": "http://lan-model:8000/v1",
+            "PRIMARY_CHAT_MODEL": "chat-a",
+            "RAG_EMBEDDING_MODEL": "embed-a",
+            "RAG_RERANKING_MODEL": "rerank-a",
+        }
+        result = self.run_bootstrap(given)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        for name, value in given.items():
+            self.assertEqual(runtime.get(name), value, name)
+        self.assert_generated_secrets_hidden(runtime, result)
+        self.assert_no_temp_residue()
+
+    def test_absent_model_inputs_publish_empty_lines(self):
+        result = self.run_bootstrap(unset=list(OPERATOR_MODEL_INPUTS))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.runtime_path().read_text(encoding="utf-8")
+        lines = text.splitlines()
+        for name in OPERATOR_MODEL_INPUTS:
+            self.assertEqual(lines.count(f"{name}="), 1, name)
+            self.assertEqual([line for line in lines if line.startswith(f"{name}=")], [f"{name}="])
+        self.assertNotIn("dmxapi.cn", text)
+        self.assertNotIn("qwen", text.lower())
+        self.assert_no_temp_residue()
+
+    def test_unsafe_model_input_refuses_before_publish(self):
+        unsafe = {
+            "space": "model a",
+            "double-quote": 'model"a',
+            "single-quote": "model'a",
+            "dollar": "model$a",
+            "equals": "model=a",
+            "newline": "model-a\nOCU_INTERNAL_TOKEN=injected",
+        }
+        for name in OPERATOR_MODEL_INPUTS:
+            for label, value in unsafe.items():
+                with self.subTest(name=name, value=label):
+                    result = self.run_bootstrap({name: value})
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(name, result.stderr)
+                    self.assert_unpublished()
+                    self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 
     def test_post_temp_failure_removes_temporary_files(self):
         result = self.run_bootstrap(
