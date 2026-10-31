@@ -58,6 +58,17 @@
   invocation and job; existing verification selections remain unchanged.
 
 ### Changed
+- **Deployment models come from the operator (#686).** The production-like
+  test overlay reads `RAG_EMBEDDING_MODEL`, `RAG_RERANKING_MODEL` and the
+  initializer's `PRIMARY_CHAT_MODEL` from `runtime.env` as `${NAME:-}`, with no
+  model default. `bootstrap-test.sh` accepts these three and `DMXAPI_BASE_URL`
+  as optional inputs, checks each before publishing, and writes it as given or
+  empty; it no longer writes a fixed provider URL. With an empty
+  `PRIMARY_CHAT_MODEL` the initializer keeps the stored default model and
+  checks no model; with a set one its output is unchanged. Existing
+  deployments add the three model names to `runtime.env` before `up.sh`
+  (NETWORK-HARDENING.md, upgrade step 5); without them RAG runs with no
+  embedding or reranking model.
 - **Office editor opens in Simplified Chinese.** The signed editor
   configuration returned on session create and join sets
   `editorConfig.lang` to `zh` and `editorConfig.region` to `zh-CN` for every

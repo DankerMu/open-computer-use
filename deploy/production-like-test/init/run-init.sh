@@ -87,8 +87,6 @@ import sys
 source_root = Path(sys.argv[1])
 work_root = Path(sys.argv[2])
 primary_model = os.environ.get("PRIMARY_CHAT_MODEL", "").strip()
-if not primary_model:
-    raise SystemExit("refusing to bootstrap: PRIMARY_CHAT_MODEL is required")
 
 (work_root / "tools" / "computer_use_tools.py").write_bytes(
     (source_root / "tools" / "computer_use_tools.py").read_bytes()
@@ -96,23 +94,20 @@ if not primary_model:
 
 init_source = (source_root / "init.sh").read_text(encoding="utf-8")
 
-# WebUI's default model is the explicitly approved deployment model. The
+# WebUI's default model is the deployment model the operator configured. The
 # Computer Use tool reaches every model through the global filter, so no model
-# is created or selected here.
+# is created here. Both anchors are checked whether or not a model is set, so
+# upstream drift fails loud in either mode.
 default_models_line = "cfg.setdefault('DEFAULT_MODELS', cfg.get('DEFAULT_MODELS') or '')"
 if init_source.count(default_models_line) != 1:
     raise SystemExit("refusing to bootstrap: expected DEFAULT_MODELS config line changed upstream")
-safe_init = init_source.replace(
-    default_models_line,
-    f"cfg['DEFAULT_MODELS'] = {primary_model!r}",
-)
+marker_section = "\n\n# Mark as initialized — only if every required step succeeded."
+if init_source.count(marker_section) != 1:
+    raise SystemExit("refusing to bootstrap: could not locate initialization marker section")
 
-# Validate the approved model against /api/models after DEFAULT_MODELS is
+# Validate the configured model against /api/models after DEFAULT_MODELS is
 # posted and before the marker is written, so a bad value fails loud and init
 # stays re-runnable.
-marker_section = "\n\n# Mark as initialized — only if every required step succeeded."
-if safe_init.count(marker_section) != 1:
-    raise SystemExit("refusing to bootstrap: could not locate initialization marker section")
 primary_model_check = '''
 # Refuse to finish unless the approved deployment model is offered by the provider.
 curl -sf "$WEBUI_URL/api/models" -H "$AUTH" 2>/dev/null | \\
@@ -127,7 +122,15 @@ if not any(model.get('id') == target for model in data):
     exit 1
 }
 '''
-safe_init = safe_init.replace(marker_section, primary_model_check + marker_section)
+if primary_model:
+    safe_init = init_source.replace(
+        default_models_line,
+        f"cfg['DEFAULT_MODELS'] = {primary_model!r}",
+    ).replace(marker_section, primary_model_check + marker_section)
+else:
+    # Upstream keeps the stored DEFAULT_MODELS, so an admin's choice survives.
+    print("[init] PRIMARY_CHAT_MODEL is not set; leaving the default model to the admin UI")
+    safe_init = init_source
 (work_root / "init.sh").write_text(safe_init, encoding="utf-8")
 (work_root / "functions" / "computer_link_filter.py").write_bytes(
     (source_root / "functions" / "computer_link_filter.py").read_bytes()

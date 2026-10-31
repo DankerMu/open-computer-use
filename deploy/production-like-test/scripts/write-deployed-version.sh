@@ -83,7 +83,7 @@ PY
     printf -- '- LAN OpenAI/RAG endpoints remain the configured provider URLs; local Draw.io and Pyodide materials stay enabled\n'
     printf '\n## Deployment-local modifications\n\n'
     printf -- '- `%s`\n' 'Sandbox terminals use the OCU_SANDBOX_NO_AUTOSTART=1 environment policy; no historical source patch is applied'
-    printf -- '- `%s`\n' 'Open WebUI bootstrap wrapper: explicit Qwen model selection, public internal-model access, direct tools only, no credential log'
+    printf -- '- `%s`\n' 'Open WebUI bootstrap wrapper: default model taken from the runtime configuration (left to the admin UI when empty), public internal-model access, direct tools only, no credential log'
     printf -- '- `%s`\n' 'Ollama disabled; only the configured OpenAI-compatible provider is enabled'
     printf '\n## Upgrade and offline-production notes\n\n'
     printf -- '- Import a verified `release.json` before bootstrap or startup. Do not rebuild or pull images during `deploy/up.sh`.\n'
