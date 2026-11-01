@@ -160,6 +160,14 @@ const files = [
     url: `/ocu/files/${CHAT}/guides/many.md` },
   { file_id: 'markdown-over-limit', path: 'over-limit.md', type: 'markdown', mime: 'text/markdown' },
   { file_id: 'markdown-at-limit', path: 'at-limit.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'markdown-at-cap', path: 'at-cap.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'markdown-over-cap', path: 'over-cap.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'wide-csv', path: 'wide.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'wide-tsv', path: 'wide.tsv', type: 'spreadsheet', mime: 'text/tab-separated-values' },
+  { file_id: 'wide-body-csv', path: 'wide-body.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'columns-at-limit', path: 'columns-at-limit.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'columns-over-limit', path: 'columns-over-limit.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'columns-unshown-row', path: 'columns-unshown-row.csv', type: 'spreadsheet', mime: 'text/csv' },
   { file_id: 'code-over-limit', path: 'over-limit.py', type: 'code', mime: 'text/x-python' },
   { file_id: 'code-at-limit', path: 'at-limit.py', type: 'code', mime: 'text/x-python' },
   { file_id: 'too-large-markdown', path: 'too-large.md', type: 'markdown', mime: 'text/markdown', too_large: true },
@@ -1316,6 +1324,7 @@ async function main() {
       `$$\\href{javascript:${canary}}{Display math}$$`,
       'Inline math $x^2$ stays text.',
       '```javascript\nconst answer = 42;\n```',
+      '```python\nprint("known label")\n```',
       `![Inline raster](${rasters.png})`, '![Relative raster](pixel.png)', '![Token root](/pixel.png)',
       '![Remote HTTP](http://images.example.test/pixel.png)',
       '![Remote HTTPS](https://images.example.test/pixel.png)',
@@ -1334,6 +1343,8 @@ async function main() {
       '<img alt="Double slash path" src="/.//">', '![Double slash relative](../../..//)',
       '![Double slash from the root](../../../..//)',
       '```\nconst unlabelled = 1;\n```',
+      '```---\nconst hyphens = 1;\n```',
+      '```nosuchlanguage\nconst unknown = 1;\n```',
       '[HTTP link](http://links.example.test/x)', '[HTTPS link](https://links.example.test/x)',
       '[Mail link](mailto:reader@example.test)', '[Relative link](pixel.png)', '[Workspace file link](../notes.txt)',
       ...Array.from({ length: 40 }, (_, index) => `Filler paragraph ${index}`),
@@ -1363,6 +1374,16 @@ async function main() {
     bytes['past-limit.md'] = sized('**Parsed past the limit**\n\n', 'word ', 30001);
     bytes['over-limit.py'] = sized('', 'print("hello")\n', 20001);
     bytes['at-limit.py'] = sized('', 'print("hello")\n', 20000);
+    bytes['at-cap.md'] = sized('', 'word ', 200000);
+    bytes['over-cap.md'] = sized('', 'word ', 200001);
+    const csvRow = columns => Array.from({ length: columns }, (_, index) => `c${index}`).join(',');
+    bytes['wide.csv'] = Buffer.from(','.repeat(500000));
+    bytes['wide.tsv'] = Buffer.from('\t'.repeat(500000));
+    bytes['wide-body.csv'] = Buffer.from('Left,Right\n' + ','.repeat(500000));
+    bytes['columns-at-limit.csv'] = Buffer.from(`${csvRow(200)}\n${csvRow(200)}\n`);
+    bytes['columns-over-limit.csv'] = Buffer.from(`${csvRow(201)}\n${csvRow(201)}\n`);
+    bytes['columns-unshown-row.csv'] = Buffer.from(`${'a,b\n'.repeat(1000)}${csvRow(201)}\n`);
+    bytes['columns-standalone.csv'] = Buffer.from(`${csvRow(300)}\n${csvRow(300)}\n`);
     bytes['too-large.md'] = Buffer.from('Too large body');
     bytes['unsupported-name.py'] = Buffer.from('Unsupported name body');
     bytes[MARKUP_NAME] = Buffer.from('Markup name body');
@@ -1925,11 +1946,13 @@ async function main() {
       assert(text.length < bytes['long.txt'].length, 'long text kept every character');
       assert.equal(await fileStage().locator('[class*="hljs"]').count(), 0, 'long text was highlighted');
     });
+    const markdownTruncatedNotice =
+      'This file is too long to format here, so it is shown as plain text and truncated to the first 200000 characters.';
     await fileCase('Markdown over 500k characters truncates with ready', async () => {
       await showFile('long-markdown', 'ready', 30000);
-      const text = await fileStage().locator('.markdown-body').textContent();
-      assert(text.includes('... (truncated)'), 'long Markdown was not truncated');
-      assert(text.length < bytes['long.md'].length, 'long Markdown kept every character');
+      const body = fileStage().locator('.markdown-body');
+      assert.equal(await body.locator('pre').textContent(), bytes['long.md'].toString().slice(0, 200000));
+      assert.equal(await body.locator('.truncation-notice').textContent(), markdownTruncatedNotice);
     });
     const spyOnParsers = () => frame().locator('#app').evaluate(() => {
       window.__parserCalls = { marked: 0, hljs: 0 };
@@ -1962,6 +1985,23 @@ async function main() {
       assert.equal(await frame().locator('#app').evaluate(() =>
         document.documentElement.getAttribute('data-static-canary')), null);
     });
+    await fileCase('Markdown over 200,000 characters stops there with a truncation notice', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      await showFile('markdown-over-cap', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      assert.equal(await body.locator('pre').textContent(), bytes['over-cap.md'].toString().slice(0, 200000));
+      assert.equal(await body.locator('.truncation-notice').textContent(), markdownTruncatedNotice);
+      assert.deepEqual(await parserCalls(), { marked: 0, hljs: 0 });
+    });
+    await fileCase('Markdown of exactly 200,000 characters keeps the plain-text notice', async () => {
+      await remountFiles();
+      await showFile('markdown-at-cap', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      assert.equal(await body.locator('pre').textContent(), bytes['at-cap.md'].toString());
+      assert.equal(await body.locator('.truncation-notice').textContent(),
+        'This file is too long to format here, so it is shown as plain text.');
+    });
     await fileCase('Markdown at the parse limit renders', async () => {
       await remountFiles();
       await spyOnParsers();
@@ -1970,6 +2010,68 @@ async function main() {
       await body.locator('strong').getByText('Parsed at the limit', { exact: true }).waitFor();
       assert.equal(await body.locator('.truncation-notice').count(), 0);
       assert.equal((await parserCalls()).marked, 1);
+    });
+    const columnNotice = 'Showing the first 200 columns of each row.';
+    const tableShape = () => fileStage().locator('.data-table-wrap').evaluate((wrap) => {
+      // Reading a size forces the layout that a table of every cell would stall in.
+      void wrap.scrollWidth;
+      return {
+        header: wrap.querySelectorAll('th').length,
+        lastHeader: wrap.querySelector('thead th:last-child')?.textContent,
+        body: Array.from(wrap.querySelectorAll('tbody tr'), row => row.cells.length),
+        notices: Array.from(wrap.querySelectorAll('.truncation-notice'), node => node.textContent),
+      };
+    });
+    const wideTableBound = 5000;
+    for (const [id, expected] of [
+      ['wide-csv', { header: 200, lastHeader: '', body: [], notices: [columnNotice] }],
+      ['wide-tsv', { header: 200, lastHeader: '', body: [], notices: [columnNotice] }],
+      ['wide-body-csv', { header: 2, lastHeader: 'Right', body: [200], notices: [columnNotice] }],
+    ]) {
+      await fileCase(`${id} reports ready within the bound at 200 columns with a notice`, async () => {
+        await remountFiles();
+        const started = Date.now();
+        await showFile(id, 'ready', wideTableBound);
+        const shape = await tableShape();
+        const elapsed = Date.now() - started;
+        assert.deepEqual(shape, expected);
+        assert(elapsed < wideTableBound, `the table took ${elapsed} ms to lay out`);
+      });
+    }
+    await fileCase('a spreadsheet of exactly 200 columns shows no column notice', async () => {
+      await remountFiles();
+      await showFile('columns-at-limit', 'ready');
+      assert.deepEqual(await tableShape(), { header: 200, lastHeader: 'c199', body: [200], notices: [] });
+    });
+    await fileCase('a spreadsheet of 201 columns shows 200 with a notice', async () => {
+      await remountFiles();
+      await showFile('columns-over-limit', 'ready');
+      assert.deepEqual(await tableShape(), { header: 200, lastHeader: 'c199', body: [200], notices: [columnNotice] });
+    });
+    await fileCase('a wide row past the shown rows adds no column notice', async () => {
+      await remountFiles();
+      await showFile('columns-unshown-row', 'ready');
+      const shape = await tableShape();
+      assert.equal(shape.body.length, 999);
+      assert.deepEqual(shape.notices, ['Showing 1000 of 1001 rows']);
+    });
+    await fileCase('standalone spreadsheets keep every column with no notice', async () => {
+      await remountFiles();
+      const shape = await frame().locator('#app').evaluate(async (root, url) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const host = document.createElement('div');
+        root.appendChild(host);
+        await renderPreviewContent(host,
+          { name: 'columns-standalone.csv', path: 'columns-standalone.csv', type: 'spreadsheet', url }, [], () => {}, false);
+        const seen = {
+          header: host.querySelectorAll('th').length,
+          body: Array.from(host.querySelectorAll('tbody tr'), row => row.cells.length),
+          notices: host.querySelectorAll('.truncation-notice').length,
+        };
+        host.remove();
+        return seen;
+      }, `/ocu/files/${CHAT}/columns-standalone.csv`);
+      assert.deepEqual(shape, { header: 300, body: [300], notices: 0 });
     });
     await fileCase('code over the highlight limit reports ready without highlighting', async () => {
       await remountFiles();
@@ -2104,13 +2206,15 @@ async function main() {
       assert.equal(await body.locator('img[alt="Relative raster"]').evaluate(node => node.naturalWidth), pixelWidth);
       assert.equal(await body.locator('img[onerror]').count(), 0);
       assert.equal(await body.locator('.mermaid, .katex').count(), 0, 'a post-sanitize renderer ran');
-      assert((await body.locator('code.language-mermaid').textContent()).includes('graph TD'));
-      assert.equal(await body.locator('code.language-mermaid *').count(), 0);
       assert((await body.textContent()).includes('Inline math $x^2$ stays text.'));
       assert.equal(await body.locator('code.language-javascript .hljs-keyword').first().textContent(), 'const');
-      const unlabelled = body.locator('pre code').filter({ hasText: 'const unlabelled = 1;' });
-      assert.equal(await unlabelled.getAttribute('class'), 'no-highlight', 'an unlabelled fence auto-detected');
-      assert.equal(await unlabelled.locator('*').count(), 0, 'an unlabelled fence was highlighted');
+      assert.equal(await body.locator('code.language-python .hljs-string').first().textContent(), '"known label"');
+      for (const [fence, hasText] of [['unlabelled', 'const unlabelled = 1;'], ['hyphen-only', 'const hyphens = 1;'],
+        ['unknown', 'const unknown = 1;'], ['Mermaid', 'graph TD']]) {
+        const code = body.locator('pre code').filter({ hasText });
+        assert.equal(await code.getAttribute('class'), 'no-highlight', `the ${fence} fence kept its class`);
+        assert.equal(await code.locator('*').count(), 0, `the ${fence} fence was highlighted`);
+      }
       const requested = requests.slice(before).map(row => row.path);
       assert.deepEqual(requested.filter(item => decodeURIComponent(item) === `/ocu/files/${CHAT}/archive`), [],
         'an image requested the archive route');

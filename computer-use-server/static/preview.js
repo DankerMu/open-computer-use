@@ -372,9 +372,12 @@ async function renderPdfPreview(container, file) {
   }
 }
 
+const TEXT_DISPLAY_LIMIT = 200000;
 // marked and hljs run on the thread shared with WebUI, so embedded input is bounded.
 const EMBEDDED_MARKDOWN_PARSE_LIMIT = 30000;
 const EMBEDDED_CODE_HIGHLIGHT_LIMIT = 20000;
+// Table layout also runs on that thread, and a 500,000-character row is 500,000 cells.
+const EMBEDDED_SPREADSHEET_COLUMN_LIMIT = 200;
 // Each kept image is a request from the employee's browser.
 const EMBEDDED_IMAGE_LIMIT = 100;
 
@@ -385,7 +388,9 @@ async function renderMarkdownPreview(container, file, files, onSelectFile, embed
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000) + '\n\n... (truncated)';
     if (embedded && text.length > EMBEDDED_MARKDOWN_PARSE_LIMIT) {
-      container.innerHTML = `<div class="markdown-body"><p class="truncation-notice">${t('markdown_plain_notice')}</p><pre>${escapeHtml(text)}</pre></div>`;
+      const notice = text.length > TEXT_DISPLAY_LIMIT
+        ? t('markdown_truncated_notice', { n: TEXT_DISPLAY_LIMIT }) : t('markdown_plain_notice');
+      container.innerHTML = `<div class="markdown-body"><p class="truncation-notice">${notice}</p><pre>${escapeHtml(text.substring(0, TEXT_DISPLAY_LIMIT))}</pre></div>`;
       return true;
     }
     const rasterImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/i;
@@ -475,8 +480,11 @@ async function renderMarkdownPreview(container, file, files, onSelectFile, embed
       else node.removeAttribute('class');
     }
     if (embedded) {
-      // hljs would auto-detect across every language.
-      for (const code of fragment.querySelectorAll('pre code:not([class])')) code.className = 'no-highlight';
+      // hljs would auto-detect across every language for a class it cannot resolve.
+      for (const code of fragment.querySelectorAll('pre code')) {
+        code.className = Array.from(code.classList)
+          .find(name => hljs.getLanguage(name.slice('language-'.length))) ?? 'no-highlight';
+      }
     }
     for (const link of fragment.querySelectorAll('a[href]')) {
       const href = safeUrl(link.getAttribute('href'), false);
@@ -559,7 +567,7 @@ async function renderCodePreview(container, file, embedded = false) {
     const resp = await fetchOutput(file.url);
     if (embedded && !resp.ok) throw new Error('Text response failed');
     let text = await resp.text();
-    if (text.length > 200000) text = text.substring(0, 200000) + '\n... (truncated)';
+    if (text.length > TEXT_DISPLAY_LIMIT) text = text.substring(0, TEXT_DISPLAY_LIMIT) + '\n... (truncated)';
     if (embedded && text.length > EMBEDDED_CODE_HIGHLIGHT_LIMIT) {
       container.innerHTML = `<pre><code class="no-highlight">${escapeHtml(text)}</code></pre>`;
       return true;
@@ -587,18 +595,22 @@ async function renderSpreadsheetPreview(container, file, embedded = false) {
     const ext = file.name.split('.').pop().toLowerCase();
     const delimiter = ext === 'tsv' ? '\t' : ',';
     const rows = parseCSV(text, delimiter);
+    const columnLimit = embedded ? EMBEDDED_SPREADSHEET_COLUMN_LIMIT : Infinity;
     let tableHtml = '<table><thead><tr>';
     if (rows.length > 0) {
-      rows[0].forEach(cell => { tableHtml += `<th>${escapeHtml(cell)}</th>`; });
+      rows[0].slice(0, columnLimit).forEach(cell => { tableHtml += `<th>${escapeHtml(cell)}</th>`; });
       tableHtml += '</tr></thead><tbody>';
       for (let i = 1; i < Math.min(rows.length, 1000); i++) {
         tableHtml += '<tr>';
-        rows[i].forEach(cell => { tableHtml += `<td>${escapeHtml(cell)}</td>`; });
+        rows[i].slice(0, columnLimit).forEach(cell => { tableHtml += `<td>${escapeHtml(cell)}</td>`; });
         tableHtml += '</tr>';
       }
       tableHtml += '</tbody></table>';
       if (rows.length > 1000) {
         tableHtml += `<p class="truncation-notice">${t('showing_rows', { n: rows.length })}</p>`;
+      }
+      if (rows.slice(0, 1000).some(row => row.length > columnLimit)) {
+        tableHtml += `<p class="truncation-notice">${t('showing_columns', { n: columnLimit })}</p>`;
       }
     }
     container.innerHTML = `<div class="data-table-wrap">${tableHtml}</div>`;

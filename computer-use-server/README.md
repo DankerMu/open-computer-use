@@ -507,12 +507,16 @@ and any past the first 100. Only same-document fragment links stay active; every
 other link keeps its text and has no `href`. Standalone preview keeps Mermaid,
 KaTeX, remote images and external links.
 
-Parsing and highlighting run on the thread the frame shares with the parent, so
-this view limits them. Markdown over 30,000 characters shows as escaped plain
-text with a notice and reports `ready` without being parsed. Code and text over
-20,000 characters show without highlighting or line numbers. A Markdown fence
-with no language is not auto-detected. Standalone preview has none of these
-limits.
+Parsing, highlighting and layout run on the thread the frame shares with the
+parent, so this view limits them. Markdown over 30,000 characters shows as
+escaped plain text with a notice and reports `ready` without being parsed; it
+stops at 200,000 characters and the notice then says the view is truncated. Code
+and text over 20,000 characters show without highlighting or line numbers. A CSV
+or TSV shows at most 200 columns per row, header and body, with a notice when a
+shown row had more. A Markdown fence keeps its language class only if
+highlight.js recognises the language; any other fence, including one with no
+language, stays plain and is not auto-detected. Standalone preview has none of
+these limits.
 
 DOCX and SheetJS-converted HTML pass through locally pinned DOMPurify before
 insertion into the trusted DOM in both embedded and standalone previews.
