@@ -483,7 +483,8 @@ Broker types DOCX/XLSX/PPTX, Markdown, code, text, spreadsheet (CSV/TSV), audio
 and video are eligible, and HTML, SVG, XHTML, XML and `+xml` MIME essences are
 refused regardless of type. `drawio`, `html`, `pdf`, `image` and `other` report
 `unsupported`: PDF is not rendered in this view, because the parent displays PDF
-in its own viewer and raster images in an `<img>` element.
+in its own viewer and raster images in an `<img>` element. Entries marked
+`too_large` or `unsupported_name` also report `unsupported`, without a fetch.
 `ready` follows successful rendering. Corrupt Office content, and a fetch error,
 non-OK response or sanitizer failure for Markdown, code, text or a spreadsheet,
 report `error` visibly, so the parent can offer its own authorized download.
@@ -500,9 +501,18 @@ has no CSP. Mermaid and KaTeX do not run: those blocks stay as escaped code or
 text, and only syntax highlighting writes to the DOM after sanitizing. An image
 stays only if it is inline raster data or its resolved URL has the page origin
 and a path under this chat's files path; any other image is removed before
-insertion. Only same-document fragment links stay active; every other link keeps
-its text and has no `href`. Standalone preview keeps Mermaid, KaTeX, remote
-images and external links.
+insertion. So is an image with a query string, one on this chat's `archive`
+route, whose response is a zip of the workspace, one whose URL does not parse,
+and any past the first 100. Only same-document fragment links stay active; every
+other link keeps its text and has no `href`. Standalone preview keeps Mermaid,
+KaTeX, remote images and external links.
+
+Parsing and highlighting run on the thread the frame shares with the parent, so
+this view limits them. Markdown over 30,000 characters shows as escaped plain
+text with a notice and reports `ready` without being parsed. Code and text over
+20,000 characters show without highlighting or line numbers. A Markdown fence
+with no language is not auto-detected. Standalone preview has none of these
+limits.
 
 DOCX and SheetJS-converted HTML pass through locally pinned DOMPurify before
 insertion into the trusted DOM in both embedded and standalone previews.

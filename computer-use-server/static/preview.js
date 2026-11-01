@@ -372,12 +372,22 @@ async function renderPdfPreview(container, file) {
   }
 }
 
+// marked and hljs run on the thread shared with WebUI, so embedded input is bounded.
+const EMBEDDED_MARKDOWN_PARSE_LIMIT = 30000;
+const EMBEDDED_CODE_HIGHLIGHT_LIMIT = 20000;
+// Each kept image is a request from the employee's browser.
+const EMBEDDED_IMAGE_LIMIT = 100;
+
 async function renderMarkdownPreview(container, file, files, onSelectFile, embedded = false) {
   try {
     const resp = await fetchOutput(file.url);
     if (embedded && !resp.ok) throw new Error('Markdown response failed');
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000) + '\n\n... (truncated)';
+    if (embedded && text.length > EMBEDDED_MARKDOWN_PARSE_LIMIT) {
+      container.innerHTML = `<div class="markdown-body"><p class="truncation-notice">${t('markdown_plain_notice')}</p><pre>${escapeHtml(text)}</pre></div>`;
+      return true;
+    }
     const rasterImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/i;
     const fileDir = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/') + 1) : '';
     const base = new URL(FILES_BASE + '/' + fileDir, location.origin);
@@ -443,14 +453,20 @@ async function renderMarkdownPreview(container, file, files, onSelectFile, embed
         return url.pathname + url.search + url.hash;
       } catch { return null; }
     }
-    // FILES_BASE is only a path, so the resolved origin is compared as well.
+    // FILES_BASE is only a path, so the resolved origin is compared as well. The
+    // server routes the decoded path, so an encoded archive path is still the zip.
     function isWorkspaceImage(src) {
       if (rasterImage.test(src)) return true;
-      const root = new URL(FILES_BASE + '/', location.origin);
-      const url = new URL(src, location.origin);
-      return root.origin === location.origin && url.origin === location.origin
-        && !url.username && !url.password
-        && url.pathname.startsWith(root.pathname) && !/%2f|%5c/i.test(url.pathname);
+      try {
+        const root = new URL(FILES_BASE + '/', location.origin);
+        const url = new URL(src, location.origin);
+        return root.origin === location.origin && url.origin === location.origin
+          && !url.username && !url.password && !url.search
+          && url.pathname.startsWith(root.pathname) && !/%2f|%5c/i.test(url.pathname)
+          && decodeURIComponent(url.pathname.slice(root.pathname.length)) !== 'archive';
+      } catch {
+        return false;
+      }
     }
     for (const node of fragment.querySelectorAll('[class]')) {
       const languages = node.tagName === 'CODE'
@@ -458,15 +474,24 @@ async function renderMarkdownPreview(container, file, files, onSelectFile, embed
       if (languages.length) node.className = languages.join(' ');
       else node.removeAttribute('class');
     }
+    if (embedded) {
+      // hljs would auto-detect across every language.
+      for (const code of fragment.querySelectorAll('pre code:not([class])')) code.className = 'no-highlight';
+    }
     for (const link of fragment.querySelectorAll('a[href]')) {
       const href = safeUrl(link.getAttribute('href'), false);
       if (href === null || (embedded && !href.startsWith('#'))) link.removeAttribute('href');
       else link.setAttribute('href', href);
     }
+    let keptImages = 0;
     for (const image of fragment.querySelectorAll('img')) {
       const src = image.hasAttribute('src') ? safeUrl(image.getAttribute('src'), true) : null;
-      if (src === null || (embedded && !isWorkspaceImage(src))) image.remove();
-      else image.setAttribute('src', src);
+      if (src === null || (embedded && (keptImages >= EMBEDDED_IMAGE_LIMIT || !isWorkspaceImage(src)))) {
+        image.remove();
+      } else {
+        keptImages += 1;
+        image.setAttribute('src', src);
+      }
     }
     const mdBody = document.createElement('div');
     mdBody.className = 'markdown-body';
@@ -535,6 +560,10 @@ async function renderCodePreview(container, file, embedded = false) {
     if (embedded && !resp.ok) throw new Error('Text response failed');
     let text = await resp.text();
     if (text.length > 200000) text = text.substring(0, 200000) + '\n... (truncated)';
+    if (embedded && text.length > EMBEDDED_CODE_HIGHLIGHT_LIMIT) {
+      container.innerHTML = `<pre><code class="no-highlight">${escapeHtml(text)}</code></pre>`;
+      return true;
+    }
     const ext = file.name.split('.').pop().toLowerCase();
     // no-highlight, not an empty class: hljs would auto-detect across every language.
     const highlight = /^[a-z0-9]+$/.test(ext) ? `language-${ext}` : 'no-highlight';
@@ -2444,8 +2473,9 @@ function validEmbedSelection(data) {
 }
 
 function embeddedFileDisposition(file) {
-  if (!file || !['docx', 'xlsx', 'pptx', 'markdown', 'code', 'text', 'spreadsheet',
-    'audio', 'video'].includes(file.type) || typeof file.mime !== 'string') return 'unsupported';
+  if (!file || file.too_large === true || file.unsupported_name === true
+    || !['docx', 'xlsx', 'pptx', 'markdown', 'code', 'text', 'spreadsheet',
+      'audio', 'video'].includes(file.type) || typeof file.mime !== 'string') return 'unsupported';
   const mime = file.mime.split(';', 1)[0].trim().toLowerCase();
   if (!mime || ['text/html', 'image/svg+xml', 'application/xhtml+xml',
     'application/xml', 'text/xml'].includes(mime) || mime.endsWith('+xml')) return 'unsupported';

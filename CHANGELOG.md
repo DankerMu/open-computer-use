@@ -68,7 +68,13 @@
   SVG, XHTML, XML and `+xml` MIME essences stay refused whatever the broker type;
   `drawio`, `html`, `pdf`, `image` and `other` report `unsupported`. Embedded
   Markdown is static: no Mermaid or KaTeX, images only from inline raster data or
-  this chat's files path, and only same-document fragment links stay active.
+  this chat's files path, and only same-document fragment links stay active. It
+  keeps at most 100 images and removes any with a query string or on the chat's
+  archive route. Rendering shares a thread with the parent, so Markdown over
+  30,000 characters shows as plain text with a notice, code and text over 20,000
+  characters show without highlighting, and unlabelled fences are not
+  auto-detected. Entries marked `too_large` or `unsupported_name` report
+  `unsupported` without a fetch.
   Markdown, code and spreadsheet report `error` on a fetch error, a non-OK
   response or a sanitizer failure. Audio and video report `ready` on
   `loadedmetadata` and `error` on the element's `error` event, offer no download

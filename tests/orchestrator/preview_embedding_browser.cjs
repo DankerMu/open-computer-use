@@ -156,6 +156,15 @@ const files = [
   { file_id: 'reset-csv', path: 'reset.csv', type: 'spreadsheet', mime: 'text/csv' },
   { file_id: 'long-text', path: 'long.txt', type: 'text', mime: 'text/plain' },
   { file_id: 'long-markdown', path: 'long.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'many-images', path: 'guides/many.md', type: 'markdown', mime: 'text/markdown',
+    url: `/ocu/files/${CHAT}/guides/many.md` },
+  { file_id: 'markdown-over-limit', path: 'over-limit.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'markdown-at-limit', path: 'at-limit.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'code-over-limit', path: 'over-limit.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'code-at-limit', path: 'at-limit.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'too-large-markdown', path: 'too-large.md', type: 'markdown', mime: 'text/markdown', too_large: true },
+  { file_id: 'unsupported-name-code', path: 'unsupported-name.py', type: 'code', mime: 'text/x-python',
+    unsupported_name: true, url: null },
   { file_id: 'markup-name', path: MARKUP_NAME, type: 'code', mime: 'text/plain',
     url: `/ocu/files/${CHAT}/${MARKUP_NAME.split('/').map(encodeURIComponent).join('/')}` },
   { file_id: 'refused-html', path: 'page.html', type: 'html', mime: 'text/html' },
@@ -1317,6 +1326,14 @@ async function main() {
       '![Traversal](../../../api/x.png)',
       '<img alt="Encoded traversal" src="..%2f..%2f..%2fapi%2fx.png">',
       '<img alt="Backslash traversal" src="..\\..\\..\\api\\x.png">',
+      `<img alt="Archive route" src="/ocu/files/${CHAT}/archive">`,
+      `<img alt="Archive through dot segments" src="/ocu/files/${CHAT}/guides/../archive">`,
+      '![Archive relative](../archive)', '![Archive query](../archive?download=1)',
+      '![Archive encoded](../%61rchive)', '![Nested archive name](archive)',
+      '![Query string](queried.png?v=1)',
+      '<img alt="Double slash path" src="/.//">', '![Double slash relative](../../..//)',
+      '![Double slash from the root](../../../..//)',
+      '```\nconst unlabelled = 1;\n```',
       '[HTTP link](http://links.example.test/x)', '[HTTPS link](https://links.example.test/x)',
       '[Mail link](mailto:reader@example.test)', '[Relative link](pixel.png)', '[Workspace file link](../notes.txt)',
       ...Array.from({ length: 40 }, (_, index) => `Filler paragraph ${index}`),
@@ -1330,6 +1347,24 @@ async function main() {
     bytes['SCRIPT.PY'] = bytes['script.py'];
     bytes['long.txt'] = Buffer.from('a line of text\n'.repeat(15000));
     bytes['long.md'] = Buffer.from('word '.repeat(110000));
+    bytes['guides/archive'] = bytes['guides/pixel.png'];
+    bytes['guides/queried.png'] = bytes['guides/pixel.png'];
+    const imageCount = 101;
+    for (let index = 0; index < imageCount; index += 1)
+      bytes[`guides/many-${index}.png`] = bytes['guides/pixel.png'];
+    bytes['guides/many.md'] = Buffer.from([
+      '![Removed first](queried.png?v=1)',
+      ...Array.from({ length: imageCount }, (_, index) => `![Image ${index}](many-${index}.png)`),
+      '**After the images**',
+    ].join('\n\n'));
+    const sized = (prefix, unit, length) => Buffer.from((prefix + unit.repeat(length)).slice(0, length));
+    bytes['over-limit.md'] = sized(`<img id="plain-canary" src=x onerror="${canary}">\n\n`, '*a ', 30001);
+    bytes['at-limit.md'] = sized('**Parsed at the limit**\n\n', 'word ', 30000);
+    bytes['past-limit.md'] = sized('**Parsed past the limit**\n\n', 'word ', 30001);
+    bytes['over-limit.py'] = sized('', 'print("hello")\n', 20001);
+    bytes['at-limit.py'] = sized('', 'print("hello")\n', 20000);
+    bytes['too-large.md'] = Buffer.from('Too large body');
+    bytes['unsupported-name.py'] = Buffer.from('Unsupported name body');
     bytes[MARKUP_NAME] = Buffer.from('Markup name body');
     bytes[QUOTED_IMAGE] = bytes['guides/pixel.png'];
     const pixelWidth = bytes['guides/pixel.png'].readUInt32BE(16);
@@ -1888,12 +1923,118 @@ async function main() {
       const text = await fileStage().locator('pre code').textContent();
       assert(text.includes('... (truncated)'), 'long text was not truncated');
       assert(text.length < bytes['long.txt'].length, 'long text kept every character');
+      assert.equal(await fileStage().locator('[class*="hljs"]').count(), 0, 'long text was highlighted');
     });
     await fileCase('Markdown over 500k characters truncates with ready', async () => {
       await showFile('long-markdown', 'ready', 30000);
       const text = await fileStage().locator('.markdown-body').textContent();
       assert(text.includes('... (truncated)'), 'long Markdown was not truncated');
       assert(text.length < bytes['long.md'].length, 'long Markdown kept every character');
+    });
+    const spyOnParsers = () => frame().locator('#app').evaluate(() => {
+      window.__parserCalls = { marked: 0, hljs: 0 };
+      const { parse } = marked;
+      marked.parse = function (...args) {
+        window.__parserCalls.marked += 1;
+        return parse.apply(this, args);
+      };
+      const { highlightElement } = hljs;
+      hljs.highlightElement = function (...args) {
+        window.__parserCalls.hljs += 1;
+        return highlightElement.apply(this, args);
+      };
+    });
+    const parserCalls = () => frame().locator('#app').evaluate(() => window.__parserCalls);
+    await fileCase('Markdown over the parse limit reports ready as plain text with a notice', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      const before = requests.length;
+      await showFile('markdown-over-limit', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      assert.equal(await body.locator('pre').textContent(), bytes['over-limit.md'].toString(),
+        'the document was not shown as its source text');
+      assert.equal(await body.locator('.truncation-notice').textContent(),
+        'This file is too long to format here, so it is shown as plain text.');
+      assert.equal(await body.locator('img, em, strong').count(), 0, 'the document was parsed');
+      assert.deepEqual(await parserCalls(), { marked: 0, hljs: 0 });
+      assert.deepEqual(requests.slice(before).map(row => row.path)
+        .filter(item => item.endsWith('/purify.min.js')), [], 'the sanitizer was loaded');
+      assert.equal(await frame().locator('#app').evaluate(() =>
+        document.documentElement.getAttribute('data-static-canary')), null);
+    });
+    await fileCase('Markdown at the parse limit renders', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      await showFile('markdown-at-limit', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      await body.locator('strong').getByText('Parsed at the limit', { exact: true }).waitFor();
+      assert.equal(await body.locator('.truncation-notice').count(), 0);
+      assert.equal((await parserCalls()).marked, 1);
+    });
+    await fileCase('code over the highlight limit reports ready without highlighting', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      await showFile('code-over-limit', 'ready');
+      const code = fileStage().locator('pre code');
+      assert.equal(await code.textContent(), bytes['over-limit.py'].toString());
+      assert.equal(await fileStage().locator('[class*="hljs"]').count(), 0, 'code was highlighted');
+      assert.equal((await parserCalls()).hljs, 0);
+    });
+    await fileCase('code at the highlight limit highlights', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      await showFile('code-at-limit', 'ready');
+      assert.equal(await fileStage().locator('pre code.hljs').count(), 1);
+      assert((await fileStage().locator('.hljs-built_in').count()) > 0, 'keywords were not highlighted');
+      assert.equal((await parserCalls()).hljs, 1);
+    });
+    await fileCase('a Markdown document keeps its first 100 images', async () => {
+      await remountFiles();
+      const before = requests.length;
+      await showFile('many-images', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      await body.locator('strong').getByText('After the images', { exact: true }).waitFor();
+      const child = page.frames().find(item => item.url().includes('/ocu/preview/'));
+      await child.waitForFunction(() => Array.from(document.images).every(image => image.complete));
+      assert.deepEqual(await body.locator('img').evaluateAll(nodes => nodes.map(node => node.alt)),
+        Array.from({ length: 100 }, (_, index) => `Image ${index}`));
+      assert.deepEqual(requests.slice(before).map(row => row.path)
+        .filter(item => /\/guides\/many-\d+\.png$/.test(item)).sort(),
+      Array.from({ length: 100 }, (_, index) => `/ocu/files/${CHAT}/guides/many-${index}.png`).sort());
+    });
+    await fileCase('standalone rendering keeps formatting and images past the embedded limits', async () => {
+      await remountFiles();
+      const filesRoot = `/ocu/files/${CHAT}`;
+      const result = await frame().locator('#app').evaluate(async (root, targets) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const render = async (file) => {
+          const host = document.createElement('div');
+          root.appendChild(host);
+          await renderPreviewContent(host, { ...file, name: file.path }, [], () => {}, false);
+          const seen = {
+            strong: host.querySelector('.markdown-body strong')?.textContent,
+            notices: host.querySelectorAll('.truncation-notice').length,
+            images: host.querySelectorAll('img').length,
+            highlighted: host.querySelectorAll('pre code.hljs').length,
+          };
+          host.remove();
+          return seen;
+        };
+        return {
+          markdown: await render(targets.markdown),
+          images: await render(targets.images),
+          code: await render(targets.code),
+        };
+      }, {
+        markdown: { path: 'past-limit.md', type: 'markdown', url: `${filesRoot}/past-limit.md` },
+        images: { path: 'guides/many.md', type: 'markdown', url: `${filesRoot}/guides/many.md` },
+        code: { path: 'over-limit.py', type: 'code', url: `${filesRoot}/over-limit.py` },
+      });
+      assert.deepEqual(result.markdown,
+        { strong: 'Parsed past the limit', notices: 0, images: 0, highlighted: 0 });
+      assert.deepEqual(result.images,
+        { strong: 'After the images', notices: 0, images: imageCount + 1, highlighted: 0 });
+      assert.equal(result.code.highlighted, 1, 'standalone code lost highlighting');
     });
     for (const id of ['absent-markdown', 'absent-code', 'absent-csv']) {
       await fileCase(`${id} reports error for a 404`, async () => {
@@ -1914,7 +2055,8 @@ async function main() {
       });
     }
     for (const id of ['refused-html', 'refused-pdf', 'refused-image', 'refused-other',
-      'refused-html-markdown', 'refused-xml-text', 'refused-svg-code', 'refused-atom', 'refused-xml-audio']) {
+      'refused-html-markdown', 'refused-xml-text', 'refused-svg-code', 'refused-atom', 'refused-xml-audio',
+      'too-large-markdown', 'unsupported-name-code']) {
       await fileCase(`${id} reports unsupported without a fetch`, async () => {
         const before = requests.length;
         await showFile(id, 'unsupported');
@@ -1957,7 +2099,8 @@ async function main() {
       const child = page.frames().find(item => item.url().includes('/ocu/preview/'));
       await child.waitForFunction(() => Array.from(document.images).every(image => image.complete));
       assert.deepEqual((await body.locator('img').evaluateAll(nodes => nodes.map(node => node.alt))).sort(),
-        ['Inline event', 'Inline raster', 'Relative raster', 'Token root'], 'an unsafe image stayed');
+        ['Inline event', 'Inline raster', 'Nested archive name', 'Relative raster', 'Token root'],
+        'an unsafe image stayed');
       assert.equal(await body.locator('img[alt="Relative raster"]').evaluate(node => node.naturalWidth), pixelWidth);
       assert.equal(await body.locator('img[onerror]').count(), 0);
       assert.equal(await body.locator('.mermaid, .katex').count(), 0, 'a post-sanitize renderer ran');
@@ -1965,7 +2108,14 @@ async function main() {
       assert.equal(await body.locator('code.language-mermaid *').count(), 0);
       assert((await body.textContent()).includes('Inline math $x^2$ stays text.'));
       assert.equal(await body.locator('code.language-javascript .hljs-keyword').first().textContent(), 'const');
+      const unlabelled = body.locator('pre code').filter({ hasText: 'const unlabelled = 1;' });
+      assert.equal(await unlabelled.getAttribute('class'), 'no-highlight', 'an unlabelled fence auto-detected');
+      assert.equal(await unlabelled.locator('*').count(), 0, 'an unlabelled fence was highlighted');
       const requested = requests.slice(before).map(row => row.path);
+      assert.deepEqual(requested.filter(item => decodeURIComponent(item) === `/ocu/files/${CHAT}/archive`), [],
+        'an image requested the archive route');
+      assert.deepEqual(requested.filter(item => item.endsWith('/queried.png')), [], 'an image kept its query string');
+      assert(requested.includes(`/ocu/files/${CHAT}/guides/archive`), 'a file named archive was not requested');
       assert.deepEqual(requested.filter(item => /mermaid|katex/.test(item)), [], 'a diagram or math script loaded');
       assert.deepEqual(requested.filter(item => !item.startsWith(`/ocu/files/${CHAT}/`) &&
         !item.startsWith('/ocu/static/') && item !== `/ocu/api/outputs/${CHAT}`), [], 'request left the files base');
