@@ -58,6 +58,19 @@
   invocation and job; existing verification selections remain unchanged.
 
 ### Changed
+- **Embedding and reranking endpoints are separately configurable (#688).** The
+  production-like test overlay reads `RAG_OPENAI_API_BASE_URL`,
+  `RAG_OPENAI_API_KEY`, `RAG_EXTERNAL_RERANKER_URL` (a complete endpoint URL)
+  and `RAG_EXTERNAL_RERANKER_API_KEY`. Each falls back to its `DMXAPI_*` value
+  when unset or empty, the reranker URL to `${DMXAPI_BASE_URL}/rerank`; chat
+  stays on `DMXAPI_*`. `bootstrap-test.sh` accepts the two URLs as optional
+  inputs under the existing check. The two keys live in the provider file,
+  never in `runtime.env`; recovery carries both into activation, and its
+  persistent-provider notice now checks every provider key, once. Existing
+  `runtime.env` and provider files resolve as before. The environment sets
+  these values only on a first boot with an empty database, so a running
+  deployment changes them in the admin UI. NETWORK-HARDENING.md also documents
+  image generation for an OpenAI-compatible image service through the admin UI.
 - **Deployment models come from the operator (#686).** The production-like
   test overlay reads `RAG_EMBEDDING_MODEL`, `RAG_RERANKING_MODEL` and the
   initializer's `PRIMARY_CHAT_MODEL` from `runtime.env` as `${NAME:-}`, with no

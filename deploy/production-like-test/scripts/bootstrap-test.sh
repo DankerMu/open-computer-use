@@ -1,7 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Generates a root-owned, non-provider runtime configuration for the test
-# deployment. The DMXAPI token remains in the separately supplied 0600 file.
+# deployment. Provider keys remain in the separately supplied 0600 file:
+# DMXAPI_API_KEY, and optionally RAG_OPENAI_API_KEY and RAG_EXTERNAL_RERANKER_API_KEY.
 #
 # Required operator inputs (no historical source, image, or publication defaults):
 #   OCU_RELEASE_MANIFEST — imported release.json
@@ -18,7 +19,12 @@
 #   OPENWEBUI_VERSION OCU_PROXY_PORT OCU_PRIVATE_* OCU_SANDBOX_*
 #   OCU_SANDBOX_MESSAGES_ADDRESS — Messages ingress IPv4, default 172.31.0.254
 #   OCU_OFFICE_PROXY_PORT OCU_OFFICE_FONTS_DIR — port and operator-font directory
-#   DMXAPI_BASE_URL — OpenAI-compatible provider base URL for chat, embedding, rerank
+#   DMXAPI_BASE_URL — OpenAI-compatible provider base URL for chat, and for embedding
+#     and rerank unless the two URLs below are given
+#   RAG_OPENAI_API_BASE_URL — embedding base URL, for example http://host:port/v1
+#   RAG_EXTERNAL_RERANKER_URL — complete rerank endpoint, for example http://host:port/v1/rerank
+#     Each is written as given, or empty when absent; empty falls back to DMXAPI_BASE_URL,
+#     the rerank endpoint to its /rerank path.
 #   PRIMARY_CHAT_MODEL RAG_EMBEDDING_MODEL RAG_RERANKING_MODEL — model names
 #     Each is written as given, or empty when absent; empty leaves it to the admin UI.
 
@@ -264,6 +270,8 @@ office_fonts_dir=${OCU_OFFICE_FONTS_DIR-"$deploy_root/data/office-fonts"}
 office_docserver_url='http://documentserver'
 office_self_url='http://computer-use-server:8081'
 dmxapi_base_url=${DMXAPI_BASE_URL-}
+rag_openai_api_base_url=${RAG_OPENAI_API_BASE_URL-}
+rag_external_reranker_url=${RAG_EXTERNAL_RERANKER_URL-}
 primary_chat_model=${PRIMARY_CHAT_MODEL-}
 rag_embedding_model=${RAG_EMBEDDING_MODEL-}
 rag_reranking_model=${RAG_RERANKING_MODEL-}
@@ -295,6 +303,8 @@ for pair in \
     OCU_CHAT_DATA_DIR:"$chat_data_dir" \
     OCU_SKILLS_CACHE_DIR:"$skills_cache_dir" \
     DMXAPI_BASE_URL:"$dmxapi_base_url" \
+    RAG_OPENAI_API_BASE_URL:"$rag_openai_api_base_url" \
+    RAG_EXTERNAL_RERANKER_URL:"$rag_external_reranker_url" \
     PRIMARY_CHAT_MODEL:"$primary_chat_model" \
     RAG_EMBEDDING_MODEL:"$rag_embedding_model" \
     RAG_RERANKING_MODEL:"$rag_reranking_model"
@@ -366,6 +376,8 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     # One generated token is consumed by WebUI, OCU, and proxy.
     printf '%s\n' "OCU_INTERNAL_TOKEN=$internal_token"
     printf '%s\n' "DMXAPI_BASE_URL=$dmxapi_base_url"
+    printf '%s\n' "RAG_OPENAI_API_BASE_URL=$rag_openai_api_base_url"
+    printf '%s\n' "RAG_EXTERNAL_RERANKER_URL=$rag_external_reranker_url"
     printf '%s\n' "PRIMARY_CHAT_MODEL=$primary_chat_model"
     printf '%s\n' "RAG_EMBEDDING_MODEL=$rag_embedding_model"
     printf '%s\n' "RAG_RERANKING_MODEL=$rag_reranking_model"

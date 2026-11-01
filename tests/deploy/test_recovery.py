@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import errno
 import hashlib
 import io
@@ -31,6 +32,7 @@ from support import (
     ROLE_ORDER,
     ROOT,
     UP_FIXTURE_PATHS,
+    WEBUI_SERVICE,
     WEBUI_SYNTHETIC_SHA,
     config_payload,
     copy_tracked,
@@ -62,6 +64,9 @@ ORPHAN_ID = "chat-orphan"
 UNSUPPORTED_RAW_NAME = b"bad\xff.txt"
 PROVIDER_A = "credential-A"
 PROVIDER_B = "credential-B"
+EMBEDDING_KEY = "credential-embedding"
+RERANKER_KEY = "credential-reranker"
+PRECEDENCE_NOTICE = "recovery: restored persistent provider settings remain in effect"
 MODEL_LINKS = {
     "bin/python3": "/usr/bin/python3",
     ".claude/agents/x.md": "/opt/skills-external/a/x.md",
@@ -2522,6 +2527,81 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         loads = [line for line in ops(target_state) if line.startswith("docker load ")]
         self.assertEqual([Path(line.split()[-1]).name for line in loads], ["proxy.tar"])
 
+    def _restore_with_separate_keys(self, name):
+        self._edit_db(lambda db: db["config"].append(
+            {"key": "rag.openai.api_key", "value": EMBEDDING_KEY, "updated_at": 1700000000}
+        ))
+        backup = self.root / f"{name}-backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / f"{name}-provider.env"
+        provider.write_text(
+            f"DMXAPI_API_KEY={PROVIDER_B}\n"
+            f"RAG_OPENAI_API_KEY={EMBEDDING_KEY}\n"
+            f"RAG_EXTERNAL_RERANKER_API_KEY={RERANKER_KEY}\n",
+            encoding="utf-8",
+        )
+        os.chmod(provider, 0o600)
+        target_state = self._seed_restore_target(f"{name}-state")
+        docs = font_mount_docs()
+        docs["webui.json"]["__unresolved__"] = True
+        docs["webui.json"]["services"][WEBUI_SERVICE]["environment"] = {
+            name: f"${{{name}}}"
+            for name in ("DMXAPI_API_KEY", "RAG_OPENAI_API_KEY", "RAG_EXTERNAL_RERANKER_API_KEY")
+        }
+        write_fake_configs(target_state, docs)
+        dest = self.root / f"{name}-root"
+        extra = {"FAKE_DOCKER_STATE": str(target_state)}
+        restored = self.run_cli(
+            ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+             "--provider-file", str(provider)],
+            extra=extra,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(restored.stderr.splitlines().count(PRECEDENCE_NOTICE), 1, restored.stderr)
+        self._assert_no_provider_key(restored)
+        return dest, extra, target_state
+
+    def _assert_no_provider_key(self, result):
+        report = result.stdout + result.stderr
+        for key in (PROVIDER_B, EMBEDDING_KEY, RERANKER_KEY):
+            self.assertNotIn(key, report)
+
+    def _assert_up_received_separate_keys(self, target_state):
+        runs = [json.loads(line) for line in
+                (target_state / "executed.json").read_text(encoding="utf-8").splitlines()]
+        environment = next(run for run in runs if run["stack"] == "webui")[
+            "document"]["services"][WEBUI_SERVICE]["environment"]
+        self.assertEqual(environment, {
+            "DMXAPI_API_KEY": PROVIDER_B,
+            "RAG_OPENAI_API_KEY": EMBEDDING_KEY,
+            "RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY,
+        })
+
+    def test_recovery_carries_separate_keys_and_prints_neither(self):
+        dest, extra, target_state = self._restore_with_separate_keys("separate-keys")
+        delivery, _payload, _source = self._write_retained_delivery()
+        activated = self.run_cli(
+            ["activate", "--destination-root", str(dest), "--retained-delivery", str(delivery)],
+            extra=extra,
+        )
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        self._assert_up_received_separate_keys(target_state)
+        self._assert_no_provider_key(activated)
+
+    def test_failed_startup_prints_no_provider_key(self):
+        dest, extra, target_state = self._restore_with_separate_keys("failed-up")
+        (target_state / "up-fail-webui").write_text("1", encoding="utf-8")
+        delivery, _payload, _source = self._write_retained_delivery()
+        activated = self.run_cli(
+            ["activate", "--destination-root", str(dest), "--retained-delivery", str(delivery)],
+            extra=extra,
+        )
+        self.assertNotEqual(activated.returncode, 0)
+        self.assertIn("selected release startup failed", activated.stderr)
+        self._assert_up_received_separate_keys(target_state)
+        self._assert_no_provider_key(activated)
+
     def test_activation_of_backup_without_messages_address_fails_before_any_stack(self):
         # A recovery set captured before #655: no ingress address, no /32 for it.
         lines = [
@@ -3576,6 +3656,60 @@ recovery_resources.scan_volume = scan_volume_while_a_chat_is_created
         self.assertEqual(sorted(os.listdir(restored_workspace)), sorted([b"README.md", name]))
         with open(os.path.join(restored_workspace, name), "rb") as stream:
             self.assertEqual(stream.read(), b"gbk\n")
+
+
+class ProviderKeyTests(unittest.TestCase):
+    def setUp(self):
+        import recovery_resources
+
+        self.resources = recovery_resources
+
+    def notices(self, persisted, provider):
+        rows = [{"key": f"config.{index}", "value": value, "updated_at": 1700000000}
+                for index, value in enumerate(persisted)]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.resources._require_provider_precedence(rows, provider)
+        return stderr.getvalue().splitlines().count(PRECEDENCE_NOTICE)
+
+    def test_later_key_alone_persisted_reports_once(self):
+        for later in ("OPENAI_API_KEY", "RAG_OPENAI_API_KEY", "RAG_EXTERNAL_RERANKER_API_KEY"):
+            with self.subTest(later=later):
+                provider = {"DMXAPI_API_KEY": PROVIDER_B, later: "persisted-value"}
+                self.assertEqual(self.notices(["persisted-value"], provider), 1)
+
+    def test_report_does_not_depend_on_file_order(self):
+        provider = {"RAG_EXTERNAL_RERANKER_API_KEY": "persisted-value", "DMXAPI_API_KEY": PROVIDER_B}
+        self.assertEqual(self.notices(["persisted-value"], provider), 1)
+        provider = {"RAG_EXTERNAL_RERANKER_API_KEY": PROVIDER_B, "DMXAPI_API_KEY": "persisted-value"}
+        self.assertEqual(self.notices(["persisted-value"], provider), 1)
+
+    def test_two_persisted_keys_report_once(self):
+        provider = {"DMXAPI_API_KEY": PROVIDER_A, "RAG_OPENAI_API_KEY": PROVIDER_B}
+        self.assertEqual(self.notices([PROVIDER_A, PROVIDER_B], provider), 1)
+
+    def test_no_persisted_key_stays_silent(self):
+        provider = {"DMXAPI_API_KEY": PROVIDER_A, "RAG_OPENAI_API_KEY": PROVIDER_B,
+                    "RAG_EXTERNAL_RERANKER_API_KEY": "", "UNRELATED": "persisted-value"}
+        self.assertEqual(self.notices(["persisted-value"], provider), 0)
+
+    def test_activation_env_carries_each_provider_key_unchanged(self):
+        provider = {"DMXAPI_API_KEY": PROVIDER_A, "OPENAI_API_KEY": PROVIDER_B,
+                    "RAG_OPENAI_API_KEY": EMBEDDING_KEY,
+                    "RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY, "UNRELATED": "not-carried"}
+        inventory = synthetic_inventory(ocu_sha="a" * 40, webui_sha=WEBUI_SYNTHETIC_SHA)
+        ambient = {"DOCKER_HOST": recovery.SUPPORTED_DOCKER_HOST}
+        with patch.dict(os.environ, ambient), patch.object(
+            recovery.release, "_PINNED_DOCKER_HOST", None
+        ):
+            for name in ("RAG_OPENAI_API_KEY", "RAG_EXTERNAL_RERANKER_API_KEY", "UNRELATED"):
+                os.environ.pop(name, None)
+            env = self.resources.activation_env({}, inventory, Path("/nonexistent-root"), provider)
+        for name, value in provider.items():
+            if name == "UNRELATED":
+                self.assertNotIn(name, env)
+            else:
+                self.assertEqual(env.get(name), value, name)
 
 
 class VolumeHelperFailureTests(unittest.TestCase):
