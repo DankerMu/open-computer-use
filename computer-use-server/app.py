@@ -556,6 +556,10 @@ BASE_DATA_DIR = Path(os.getenv("BASE_DATA_DIR", "/data"))
 # File Classification for Preview
 # =============================================================================
 
+# The Python 3.12 image has no /etc/mime.types and its strict map lacks .webp,
+# which would otherwise serve as application/octet-stream.
+mimetypes.add_type("image/webp", ".webp")
+
 _CODE_EXTENSIONS = {
     '.py', '.js', '.ts', '.jsx', '.tsx', '.css', '.json', '.yaml', '.yml',
     '.toml', '.sh', '.bash', '.sql', '.go', '.rs', '.java', '.c', '.cpp',

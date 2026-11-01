@@ -81,6 +81,9 @@ async function captureProductionPreviews(docserverOrigin) {
     await fs.rm(directory, { recursive: true, force: true });
   }
 }
+// The final dot-separated segment of this name contains a quote and markup.
+const MARKUP_NAME = 'data:text/plain,a."><img src=x onerror=__nameCanary=1>';
+const QUOTED_IMAGE = `it's quote" data-injected="yes.png`;
 const OFFICE_MIME = {
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -132,6 +135,38 @@ const files = [
   { file_id: 'foreign', path: 'foreign.docx', type: 'docx', mime: OFFICE_MIME.docx, url: 'https://example.invalid/foreign.docx' },
   { file_id: 'cross-chat', path: 'cross-chat.docx', type: 'docx', mime: OFFICE_MIME.docx, url: '/ocu/files/another-chat/cross-chat.docx' },
   { file_id: 'hostile-markdown', path: 'hostile.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'static-markdown', path: 'guides/static.md', type: 'markdown', mime: 'text/markdown',
+    url: `/ocu/files/${CHAT}/guides/static.md` },
+  { file_id: 'notes', path: 'notes.txt', type: 'text', mime: 'text/plain' },
+  { file_id: 'table', path: 'table.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'tabbed', path: 'tabbed.tsv', type: 'spreadsheet', mime: 'text/tab-separated-values' },
+  { file_id: 'data-json', path: 'data.json', type: 'code', mime: 'application/json' },
+  { file_id: 'script', path: 'script.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'upper-script', path: 'SCRIPT.PY', type: 'code', mime: 'text/x-python' },
+  { file_id: 'tone', path: 'tone.wav', type: 'audio', mime: 'audio/x-wav' },
+  { file_id: 'clip', path: 'clip.webm', type: 'video', mime: 'video/webm' },
+  { file_id: 'held-clip', path: 'held.webm', type: 'video', mime: 'video/webm' },
+  { file_id: 'corrupt-mp3', path: 'corrupt.mp3', type: 'audio', mime: 'audio/mpeg' },
+  { file_id: 'corrupt-mp4', path: 'corrupt.mp4', type: 'video', mime: 'video/mp4' },
+  { file_id: 'absent-markdown', path: 'absent.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'absent-code', path: 'absent.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'absent-csv', path: 'absent.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'reset-markdown', path: 'reset.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'reset-code', path: 'reset.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'reset-csv', path: 'reset.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'long-text', path: 'long.txt', type: 'text', mime: 'text/plain' },
+  { file_id: 'long-markdown', path: 'long.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'markup-name', path: MARKUP_NAME, type: 'code', mime: 'text/plain',
+    url: `/ocu/files/${CHAT}/${MARKUP_NAME.split('/').map(encodeURIComponent).join('/')}` },
+  { file_id: 'refused-html', path: 'page.html', type: 'html', mime: 'text/html' },
+  { file_id: 'refused-pdf', path: 'manual.pdf', type: 'pdf', mime: 'application/pdf' },
+  { file_id: 'refused-image', path: 'chart.png', type: 'image', mime: 'image/png' },
+  { file_id: 'refused-other', path: 'blob.bin', type: 'other', mime: 'application/octet-stream' },
+  { file_id: 'refused-html-markdown', path: 'spoof.md', type: 'markdown', mime: 'text/html; charset=utf-8' },
+  { file_id: 'refused-xml-text', path: 'spoof.txt', type: 'text', mime: 'text/xml' },
+  { file_id: 'refused-svg-code', path: 'spoof.py', type: 'code', mime: 'image/svg+xml' },
+  { file_id: 'refused-atom', path: 'feed.atom', type: 'code', mime: 'application/atom+xml' },
+  { file_id: 'refused-xml-audio', path: 'spoof.mp3', type: 'audio', mime: 'application/xhtml+xml' },
 ];
 const requests = [];
 let slowRequested;
@@ -197,7 +232,12 @@ const heldViewer = [];
 const heldImages = [];
 const htmlFixtures = new Map();
 const heldHtml = [];
+const heldMedia = [];
+let heldMediaRequested = () => {};
 const bytes = {};
+const fileMediaTypes = {
+  '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.mp4': 'video/mp4', '.webm': 'video/webm',
+};
 const contentTypes = {
   '.js': 'text/javascript',
   '.mjs': 'text/javascript',
@@ -346,13 +386,14 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname.endsWith('/slow.docx')) { held.push(res); slowRequested(); return; }
       if (url.pathname.endsWith('/slow.xlsx')) { heldSheets.push(res); sheetRequested(); return; }
       if (drawioHeldDocument && url.pathname.endsWith('/diagram.drawio')) { heldDrawio.push(res); return; }
+      if (url.pathname.endsWith('/held.webm')) { heldMedia.push(res); heldMediaRequested(res); return; }
       const name = decodeURIComponent(url.pathname.slice(filesRoot.length)).replace(/\/{2,}/g, '/');
       if (!(name in bytes)) {
         requests[requests.length - 1].status = 404;
         return respond(res, 404, 'Not found', 'text/plain');
       }
       requests[requests.length - 1].status = 200;
-      return respond(res, 200, bytes[name], 'application/octet-stream');
+      return respond(res, 200, bytes[name], fileMediaTypes[path.extname(name)] || 'application/octet-stream');
     }
     if (url.pathname === `${prefix}/browser/${CHAT}/status`) {
       if (browserFixture === 'held') { heldBrowserStatuses.push(res); return; }
@@ -842,6 +883,10 @@ async function main() {
     let retiringFrame = null;
     const expectedRuntimeFailures = [];
     const unexpectedNetworkFailures = [];
+    // Deliberate file faults and media a newer selection cancels: their requests fail by design.
+    const expectedFileFailureUrls = new Set(['absent.md', 'absent.py', 'absent.csv', 'reset.md', 'reset.py',
+      'reset.csv', 'tone.wav', 'clip.webm', 'held.webm', 'corrupt.mp3', 'corrupt.mp4']
+      .map(name => `${origin}/ocu/files/${CHAT}/${name}`).concat(`${origin}/ocu/static/purify.min.js`));
     page.on('request', request => {
       const address = new URL(request.url());
       if (address.origin !== origin ||
@@ -865,6 +910,7 @@ async function main() {
     page.on('requestfailed', request => {
       const failure = request.failure()?.errorText || '';
       const url = request.url();
+      if (expectedFileFailureUrls.has(url)) return;
       const uploadFault = uploadFaults.find(fault => fault.request === request && fault.kind === 'network');
       if (uploadFault && failure === 'net::ERR_CONNECTION_RESET') {
         uploadFault.failure = failure;
@@ -899,6 +945,7 @@ async function main() {
       if (message.type() !== 'error') return;
       const text = message.text();
       const url = message.location().url;
+      if (expectedFileFailureUrls.has(url)) return;
       const expectedBrokerUrl = `${origin}/ocu/api/outputs/${CHAT}`;
       if (injectedListingFailure && accepted503 === 0 && text.includes('503')
           && (url.startsWith(expectedBrokerUrl) || text.includes(expectedBrokerUrl))) {
@@ -964,6 +1011,17 @@ async function main() {
       assert.equal(result.chat_id, CHAT);
       assert.equal(result.file_id, await page.evaluate(g => window.expectedSelections[g], generation));
       return result;
+    };
+    // Each case reports on its own, so one run names every failing case.
+    const fileCaseFailures = [];
+    const fileCase = async (name, work) => {
+      try {
+        await work();
+        console.log(JSON.stringify({ fileCase: name, result: 'pass' }));
+      } catch (error) {
+        fileCaseFailures.push(name);
+        console.error(JSON.stringify({ fileCase: name, result: 'fail', error: String(error?.message ?? error) }));
+      }
     };
     await page.goto(origin + '/parent');
     const extendedFrame = await within(page.evaluate(async socketUrl => {
@@ -1237,6 +1295,71 @@ async function main() {
       '<img alt="Markdown event canary" ' +
       'src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=" ' +
       'onload="document.documentElement.dataset.markdownEventCanary = \'executed\'">\n');
+    const canary = 'document.documentElement.dataset.staticCanary=1';
+    bytes['guides/static.md'] = Buffer.from([
+      '[Jump to section](#target-section)',
+      '<p><strong>Static Markdown neighbor</strong></p>',
+      `<script>${canary}</script>`,
+      `<img alt="Inline event" src="data:image/png;base64,AAAA" onerror="${canary}">`,
+      `<a href="javascript:${canary}">Script link</a>`,
+      `[Token script link](javascript:${canary})`,
+      `\`\`\`mermaid\ngraph TD\n  A["<img src=x onerror=${canary}>"]\n\`\`\``,
+      `$$\\href{javascript:${canary}}{Display math}$$`,
+      'Inline math $x^2$ stays text.',
+      '```javascript\nconst answer = 42;\n```',
+      `![Inline raster](${rasters.png})`, '![Relative raster](pixel.png)', '![Token root](/pixel.png)',
+      '![Remote HTTP](http://images.example.test/pixel.png)',
+      '![Remote HTTPS](https://images.example.test/pixel.png)',
+      `![Protocol relative](//evil.example/ocu/files/${CHAT}/x.png)`,
+      `![Other origin](https://evil.example/ocu/files/${CHAT}/x.png)`,
+      '<img alt="Root absolute" src="/api/x">',
+      `<img alt="Sibling chat" src="/ocu/files/${CHAT}-other/x.png">`,
+      '![Traversal](../../../api/x.png)',
+      '<img alt="Encoded traversal" src="..%2f..%2f..%2fapi%2fx.png">',
+      '<img alt="Backslash traversal" src="..\\..\\..\\api\\x.png">',
+      '[HTTP link](http://links.example.test/x)', '[HTTPS link](https://links.example.test/x)',
+      '[Mail link](mailto:reader@example.test)', '[Relative link](pixel.png)', '[Workspace file link](../notes.txt)',
+      ...Array.from({ length: 40 }, (_, index) => `Filler paragraph ${index}`),
+      '# Target section',
+    ].join('\n\n'));
+    bytes['notes.txt'] = Buffer.from(`Plain "double" and 'single' <b>marks</b> &amp; text`);
+    bytes['table.csv'] = Buffer.from(`Name,Note\n"He said ""hi""",it's <i>fine</i>\n`);
+    bytes['tabbed.tsv'] = Buffer.from('Left\tRight\nOne\tTwo\n');
+    bytes['data.json'] = Buffer.from('{"answer": 42}');
+    bytes['script.py'] = Buffer.from('print("hello")\n');
+    bytes['SCRIPT.PY'] = bytes['script.py'];
+    bytes['long.txt'] = Buffer.from('a line of text\n'.repeat(15000));
+    bytes['long.md'] = Buffer.from('word '.repeat(110000));
+    bytes[MARKUP_NAME] = Buffer.from('Markup name body');
+    bytes[QUOTED_IMAGE] = bytes['guides/pixel.png'];
+    const pixelWidth = bytes['guides/pixel.png'].readUInt32BE(16);
+    // One second of 8-bit silence at 8 kHz; WAV needs no encoder and every Chromium decodes it.
+    const toneSamples = Buffer.alloc(8000, 0x80);
+    const toneHeader = Buffer.alloc(44);
+    toneHeader.write('RIFF', 0);
+    toneHeader.writeUInt32LE(36 + toneSamples.length, 4);
+    toneHeader.write('WAVEfmt ', 8);
+    toneHeader.writeUInt32LE(16, 16);
+    toneHeader.writeUInt16LE(1, 20);
+    toneHeader.writeUInt16LE(1, 22);
+    toneHeader.writeUInt32LE(8000, 24);
+    toneHeader.writeUInt32LE(8000, 28);
+    toneHeader.writeUInt16LE(1, 32);
+    toneHeader.writeUInt16LE(8, 34);
+    toneHeader.write('data', 36);
+    toneHeader.writeUInt32LE(toneSamples.length, 40);
+    bytes['tone.wav'] = Buffer.concat([toneHeader, toneSamples]);
+    // 16x16 VP8 from `ffmpeg -f lavfi -i color=c=red:s=16x16:d=0.2:r=5 -c:v libvpx -b:v 10k -g 1 -an`;
+    // Playwright's Chromium has no H.264, and CI has no encoder.
+    bytes['clip.webm'] = Buffer.from(
+      'GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAHUEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHGTbuMU6uEElTDZ1OsggEiTbuMU6uEHFO7a1OsggG+7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmoCrXsYMPQkBNgIRMYXZmV0GETGF2ZkSJiEBpAAAAAAAAFlSua9euAQAAAAAAAE7XgQFzxYgAAAAAAAAAAZyBACK1nIN1bmSIgQCGhVZfVlA4g4EBI+ODhAvrwgDgkLCBELqBEJqBAlWwhFW5gQFV7oEA7AEAAAAAAAACAAASVMNn0HNzzWPAi2PFiAAAAAAAAAABZ8iYRaOHRU5DT0RFUkSHi0xhdmMgbGlidnB4Z8ihRaOIRFVSQVRJT05Eh5MwMDowMDowMC4yMDAwMDAwMDAAH0O2dcLngQCjvYEAAIDwAgCdASoQABAAAEcIhYWIhYSIAgICdaoD+AP6Ag1NGAD+/W7z/+OZNzDE/45t//FhPA4oyP/xUQAcU7trkbuPs4EAt4r3gQHxggF38IED', 'base64');
+    bytes['corrupt.mp3'] = Buffer.from('not an audio stream '.repeat(64));
+    bytes['corrupt.mp4'] = Buffer.from('not a video stream '.repeat(64));
+    bytes['valid.pdf'] = Buffer.from(['%PDF-1.4', '1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj',
+      '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj',
+      '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 72 72]/Contents 4 0 R>>endobj',
+      '4 0 obj<</Length 23>>stream', '1 0 0 rg 0 0 72 72 re f', 'endstream endobj',
+      'trailer<</Root 1 0 R>>', ''].join('\n'));
 
     await page.evaluate(() => window.mount());
     await page.waitForFunction(() => window.states.some(row => row.type === 'ocu:preview-ready'), null, { timeout: 10000 });
@@ -1630,12 +1753,23 @@ async function main() {
       await waitState(generation, 'error');
       await frame().locator('.preview-stage .empty-state').waitFor();
     }
-    await page.evaluate(() => window.select('hostile-markdown', 37));
-    await waitState(37, 'unsupported');
-    assert.equal(requests.filter(row => row.path.endsWith('/hostile.md')).length, 0,
-      'Office-only embedding fetched Markdown bytes');
-    assert.equal(await frame().locator('.preview-stage .markdown-body').count(), 0,
-      'Office-only embedding rendered Markdown');
+    await fileCase('Markdown with unsafe content reports ready sanitized', async () => {
+      const fetched = requests.filter(row => row.path.endsWith('/hostile.md')).length;
+      await page.evaluate(() => window.select('hostile-markdown', 37));
+      await waitState(37, 'ready');
+      assert.equal(requests.filter(row => row.path.endsWith('/hostile.md')).length, fetched + 1,
+        'embedded Markdown did not fetch its bytes');
+      const body = frame().locator('.preview-stage .markdown-body');
+      await body.locator('strong').getByText('Safe Markdown neighbor', { exact: true }).waitFor();
+      const image = body.locator('img[alt="Markdown event canary"]');
+      assert.equal(await image.getAttribute('onload'), null, 'event attribute reached the trusted DOM');
+      assert.deepEqual(await image.evaluate(async (node) => {
+        await node.decode();
+        return [node.naturalWidth, node.naturalHeight];
+      }), [1, 1], 'inline raster did not decode');
+      assert.equal(await frame().locator('#app').evaluate(() =>
+        document.documentElement.getAttribute('data-markdown-event-canary')), null);
+    });
     assert.equal(await page.locator('#preview').getAttribute('sandbox'),
       'allow-scripts allow-same-origin allow-forms');
     const secondSlow = new Promise(resolve => { slowRequested = resolve; });
@@ -1663,6 +1797,239 @@ async function main() {
     await page.locator('#preview').evaluate(element => element.remove());
     await page.evaluate(() => window.mount());
     await page.waitForFunction(() => window.states.filter(row => row.type === 'ocu:preview-ready').length === 2);
+    let fileGeneration = 200;
+    const selectFile = async (id) => {
+      const generation = ++fileGeneration;
+      await page.evaluate(([file, value]) => window.select(file, value), [id, generation]);
+      return generation;
+    };
+    const showFile = async (id, state, timeout) => {
+      const generation = await selectFile(id);
+      await waitState(generation, state, timeout);
+      return generation;
+    };
+    const remountFiles = async () => {
+      const mounted = await page.evaluate(() =>
+        window.states.filter(row => row.type === 'ocu:preview-ready').length);
+      await retireFrame();
+      await page.evaluate(() => window.mount());
+      await page.waitForFunction(count =>
+        window.states.filter(row => row.type === 'ocu:preview-ready').length === count + 1, mounted);
+    };
+    const nextFrames = () => page.evaluate(() =>
+      new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const fileStage = () => frame().locator('.preview-stage');
+    for (const [label, response] of [
+      ['unusable', { status: 200, contentType: 'text/javascript', body: 'window.DOMPurify = {};' }],
+      ['unavailable', { status: 404, contentType: 'text/plain', body: 'Not found' }],
+    ]) {
+      await fileCase(`Markdown reports error when the sanitizer is ${label}`, async () => {
+        await remountFiles();
+        await page.route('**/ocu/static/purify.min.js', route => route.fulfill(response));
+        try {
+          await showFile('hostile-markdown', 'error');
+          await fileStage().locator('.empty-state').waitFor();
+          assert.equal(await fileStage().locator('.markdown-body, img').count(), 0);
+        } finally {
+          await page.unroute('**/ocu/static/purify.min.js');
+        }
+      });
+    }
+    await remountFiles();
+    // The harness default of 150px collapses the audio control, which a sidebar never does.
+    await page.locator('#preview').evaluate((node) => { node.style.height = '480px'; });
+    for (const [id, text] of [['notes', bytes['notes.txt'].toString()], ['data-json', '{"answer": 42}'],
+      ['script', 'print("hello")']]) {
+      await fileCase(`${id} shows its text unchanged with ready`, async () => {
+        await showFile(id, 'ready');
+        const code = fileStage().locator('pre code');
+        await code.waitFor();
+        assert(await code.isVisible());
+        assert((await code.textContent()).includes(text), 'text display changed');
+      });
+    }
+    await fileCase('an uppercase extension keeps its language class', async () => {
+      await showFile('upper-script', 'ready');
+      assert.equal(await fileStage().locator('pre code.language-py .hljs-built_in').first().textContent(), 'print');
+    });
+    await fileCase('CSV shows its cells unchanged with ready', async () => {
+      await showFile('table', 'ready');
+      assert.deepEqual(await fileStage().locator('th').allTextContents(), ['Name', 'Note']);
+      assert.deepEqual(await fileStage().locator('td').allTextContents(),
+        ['He said "hi"', `it's <i>fine</i>`]);
+      assert(await fileStage().locator('td').first().isVisible());
+    });
+    await fileCase('TSV shows its cells with ready', async () => {
+      await showFile('tabbed', 'ready');
+      assert.deepEqual(await fileStage().locator('td').allTextContents(), ['One', 'Two']);
+    });
+    for (const [id, selector] of [['tone', 'audio'], ['clip', 'video']]) {
+      await fileCase(`${id} reports ready on loadedmetadata with no download link`, async () => {
+        await showFile(id, 'ready');
+        const media = fileStage().locator(`.media-container ${selector}`);
+        await media.waitFor();
+        assert(await media.isVisible());
+        assert(await media.evaluate(node => node.readyState >= 1 && node.duration > 0),
+          'ready arrived before the media metadata');
+        if (selector === 'video')
+          assert.equal(await media.evaluate(node => node.videoWidth), 16);
+        assert.equal(await fileStage().locator('a').count(), 0, 'embedded media offered a link');
+      });
+    }
+    for (const id of ['corrupt-mp3', 'corrupt-mp4']) {
+      await fileCase(`${id} reports error with a visible failure`, async () => {
+        await showFile(id, 'error');
+        await fileStage().locator('.empty-state').waitFor();
+        assert.equal(await fileStage().locator('audio, video').count(), 0);
+      });
+    }
+    await fileCase('text over 200k characters truncates with ready', async () => {
+      await showFile('long-text', 'ready');
+      const text = await fileStage().locator('pre code').textContent();
+      assert(text.includes('... (truncated)'), 'long text was not truncated');
+      assert(text.length < bytes['long.txt'].length, 'long text kept every character');
+    });
+    await fileCase('Markdown over 500k characters truncates with ready', async () => {
+      await showFile('long-markdown', 'ready', 30000);
+      const text = await fileStage().locator('.markdown-body').textContent();
+      assert(text.includes('... (truncated)'), 'long Markdown was not truncated');
+      assert(text.length < bytes['long.md'].length, 'long Markdown kept every character');
+    });
+    for (const id of ['absent-markdown', 'absent-code', 'absent-csv']) {
+      await fileCase(`${id} reports error for a 404`, async () => {
+        await showFile(id, 'error');
+        await fileStage().locator('.empty-state').waitFor();
+        assert((await fileStage().textContent()).includes('Not found') === false, 'error body was rendered');
+      });
+    }
+    for (const id of ['reset-markdown', 'reset-code', 'reset-csv']) {
+      await fileCase(`${id} reports error for a network failure`, async () => {
+        await page.route('**/ocu/files/**/reset.*', route => route.abort('connectionreset'));
+        try {
+          await showFile(id, 'error');
+          await fileStage().locator('.empty-state').waitFor();
+        } finally {
+          await page.unroute('**/ocu/files/**/reset.*');
+        }
+      });
+    }
+    for (const id of ['refused-html', 'refused-pdf', 'refused-image', 'refused-other',
+      'refused-html-markdown', 'refused-xml-text', 'refused-svg-code', 'refused-atom', 'refused-xml-audio']) {
+      await fileCase(`${id} reports unsupported without a fetch`, async () => {
+        const before = requests.length;
+        await showFile(id, 'unsupported');
+        assert.deepEqual(requests.slice(before).map(row => row.path)
+          .filter(requested => requested.startsWith(`/ocu/files/${CHAT}/`)), [], 'refused file was fetched');
+        assert.equal(await fileStage().count(), 0, 'refused file reached a renderer');
+      });
+    }
+    await fileCase('a file name with markup stays text in the embedded code view', async () => {
+      await showFile('markup-name', 'ready');
+      const code = fileStage().locator('pre code');
+      await code.waitFor();
+      assert((await code.textContent()).includes('Markup name body'));
+      assert((await code.getAttribute('class')).split(/\s+/).includes('no-highlight'),
+        'a rejected extension must not fall through to auto-detection');
+      assert.equal(await fileStage().locator('img').count(), 0, 'file name injected an element');
+      assert.equal(await frame().locator('#app').evaluate(() => window.__nameCanary), undefined);
+    });
+    await fileCase('a quote in a file name stays inside alt with the embedded renderer', async () => {
+      // embed=files refuses images, so this drives the shared image branch directly.
+      const image = await frame().locator('#app').evaluate(async (root, { name, url }) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const host = document.createElement('div');
+        root.appendChild(host);
+        renderPreviewContent(host, { name, type: 'image', url }, [], () => {}, true);
+        const node = host.querySelector('img');
+        const result = { alt: node.getAttribute('alt'), attributes: node.getAttributeNames().sort() };
+        host.remove();
+        return result;
+      }, { name: QUOTED_IMAGE, url: rasters.png });
+      assert.deepEqual(image, { alt: QUOTED_IMAGE, attributes: ['alt', 'src'] });
+    });
+    await fileCase('embedded Markdown is static', async () => {
+      await remountFiles();
+      const before = requests.length;
+      const externalBefore = externalRequests.length;
+      await showFile('static-markdown', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      await body.locator('strong').getByText('Static Markdown neighbor', { exact: true }).waitFor();
+      const child = page.frames().find(item => item.url().includes('/ocu/preview/'));
+      await child.waitForFunction(() => Array.from(document.images).every(image => image.complete));
+      assert.deepEqual((await body.locator('img').evaluateAll(nodes => nodes.map(node => node.alt))).sort(),
+        ['Inline event', 'Inline raster', 'Relative raster', 'Token root'], 'an unsafe image stayed');
+      assert.equal(await body.locator('img[alt="Relative raster"]').evaluate(node => node.naturalWidth), pixelWidth);
+      assert.equal(await body.locator('img[onerror]').count(), 0);
+      assert.equal(await body.locator('.mermaid, .katex').count(), 0, 'a post-sanitize renderer ran');
+      assert((await body.locator('code.language-mermaid').textContent()).includes('graph TD'));
+      assert.equal(await body.locator('code.language-mermaid *').count(), 0);
+      assert((await body.textContent()).includes('Inline math $x^2$ stays text.'));
+      assert.equal(await body.locator('code.language-javascript .hljs-keyword').first().textContent(), 'const');
+      const requested = requests.slice(before).map(row => row.path);
+      assert.deepEqual(requested.filter(item => /mermaid|katex/.test(item)), [], 'a diagram or math script loaded');
+      assert.deepEqual(requested.filter(item => !item.startsWith(`/ocu/files/${CHAT}/`) &&
+        !item.startsWith('/ocu/static/') && item !== `/ocu/api/outputs/${CHAT}`), [], 'request left the files base');
+      assert(requested.includes(`/ocu/files/${CHAT}/guides/pixel.png`), 'relative image was not requested');
+      assert.equal(externalRequests.length, externalBefore, 'embedded Markdown reached another origin');
+      await frame().locator('#app').evaluate(() => {
+        window.__opened = [];
+        window.open = (...args) => { window.__opened.push(args); return null; };
+      });
+      const frameUrl = child.url();
+      const stateCount = await page.evaluate(() => window.states.length);
+      const clicked = requests.length;
+      for (const label of ['HTTP link', 'HTTPS link', 'Mail link', 'Relative link', 'Workspace file link',
+        'Script link', 'Token script link']) {
+        const link = body.locator('a').getByText(label, { exact: true });
+        assert.equal(await link.getAttribute('href'), null, `${label} stayed active`);
+        await link.click();
+      }
+      assert.equal(child.url(), frameUrl, 'a link navigated the frame');
+      assert.deepEqual(await frame().locator('#app').evaluate(() => window.__opened), [], 'a link opened a window');
+      assert.equal(await frame().locator('#__ext_link_dialog').count(), 0, 'a link opened a dialog');
+      assert.equal(await page.evaluate(() => window.states.length), stateCount, 'a link selected a file');
+      assert.deepEqual(requests.slice(clicked), [], 'a link caused a request');
+      assert.equal(await frame().locator('#app').evaluate(() =>
+        document.documentElement.getAttribute('data-static-canary')), null);
+      const jump = body.locator('a').getByText('Jump to section', { exact: true });
+      assert.equal(await jump.getAttribute('href'), '#user-content-target-section');
+      const inView = () => {
+        const { top } = document.getElementById('user-content-target-section').getBoundingClientRect();
+        return top >= 0 && top < window.innerHeight;
+      };
+      await jump.evaluate(node => node.scrollIntoView());
+      assert.equal(await child.evaluate(inView), false, 'fragment target started in view');
+      await jump.click();
+      await child.waitForFunction(inView);
+      assert.equal(child.url(), frameUrl, 'a fragment link changed the frame URL');
+      await page.screenshot({ path: path.join(artifacts, 'static-markdown.png') });
+    });
+    await fileCase('a superseded media element reports nothing and releases its request', async () => {
+      await remountFiles();
+      const arrived = new Promise(resolve => { heldMediaRequested = resolve; });
+      const superseded = await selectFile('held-clip');
+      const response = await within(arrived, 'held media request');
+      await frame().locator('.preview-stage video').waitFor();
+      await frame().locator('#app').evaluate(() => {
+        window.__supersededMedia = document.querySelector('.preview-stage video');
+      });
+      const released = new Promise(resolve => {
+        if (response.destroyed) resolve();
+        else response.once('close', resolve);
+      });
+      const newest = await showFile('notes', 'ready');
+      await within(released, 'superseded media release');
+      await frame().locator('#app').evaluate(() => {
+        window.__supersededMedia.dispatchEvent(new Event('loadedmetadata'));
+        window.__supersededMedia.dispatchEvent(new Event('error'));
+      });
+      await nextFrames();
+      assert.deepEqual(await page.evaluate(generation => window.states
+        .filter(row => row.generation === generation).map(row => row.state), superseded), ['loading']);
+      assert.deepEqual(await page.evaluate(generation => window.states
+        .filter(row => row.generation === generation).map(row => row.state), newest), ['loading', 'ready']);
+      await fileStage().locator('pre code').waitFor();
+    });
     const transcript = await page.evaluate(() => ({
       states: window.states, expected: window.expectedSelections,
     }));
@@ -1685,6 +2052,8 @@ async function main() {
       || /\/api\/runtime\//.test(row.path) || /\/api\/v1\//.test(row.path)).length, 0);
     assert(requests.filter(row => row.path.includes('/api/outputs/')).every(row => row.header === 'ocu-workspace'));
     assert(requests.filter(row => row.path.endsWith('.docx') || row.path.endsWith('.xlsx') || row.path.endsWith('.pptx'))
+      .every(row => row.header === 'ocu-workspace'));
+    assert(requests.filter(row => /\/files\/.*\.(?:md|txt|csv|tsv|json|py)$/.test(row.path))
       .every(row => row.header === 'ocu-workspace'));
     await retireFrame();
     const listingBeforeRuntime = requests.filter(row => row.path === `/ocu/api/outputs/${CHAT}`).length;
@@ -2519,6 +2888,7 @@ async function main() {
       const isolated = await browser.newContext();
       isolated.setDefaultTimeout(10000);
       await isolated.addInitScript(freezePollingClock);
+      if (options.initScript) await isolated.addInitScript(options.initScript);
       await isolated.route('**/*', route => {
         const url = route.request().url();
         if (options.images && /^https?:\/\/images\.example\.test\/pixel\.png$/.test(url))
@@ -5332,6 +5702,70 @@ async function main() {
       await closeStandalone(nestedSession);
     }
 
+    standaloneListing = [
+      { file_id: 'markup-name', path: MARKUP_NAME, type: 'code', mime: 'text/plain' },
+      { file_id: 'quoted-image', path: QUOTED_IMAGE, type: 'image', mime: 'image/png' },
+      { file_id: 'tone', path: 'tone.wav', type: 'audio', mime: 'audio/x-wav' },
+      { file_id: 'clip', path: 'clip.webm', type: 'video', mime: 'video/webm' },
+      { file_id: 'manual', path: 'valid.pdf', type: 'pdf', mime: 'application/pdf' },
+    ];
+    // The vendored library exposes getDocument as a getter, so a Proxy records its options.
+    const recordPdfOptions = () => {
+      let library;
+      window.__pdfOptions = [];
+      Object.defineProperty(window, 'pdfjsLib', {
+        configurable: true,
+        get: () => library,
+        set(value) {
+          library = new Proxy(value, {
+            get: (target, key) => key !== 'getDocument' ? target[key] : (options) => {
+              window.__pdfOptions.push({ url: options.url, isEvalSupported: options.isEvalSupported });
+              return target.getDocument(options);
+            },
+          });
+        },
+      });
+    };
+    const fileSession = await openStandalone('/ocu', { initScript: recordPdfOptions });
+    try {
+      const stage = fileSession.page.locator('.preview-stage');
+      await fileCase('a file name with markup stays text in the standalone code view', async () => {
+        await selectStandaloneFile(fileSession.page, MARKUP_NAME);
+        await stage.locator('pre code').getByText('Markup name body').waitFor();
+        assert.equal(await stage.locator('img').count(), 0, 'file name injected an element');
+        assert.equal(await fileSession.page.evaluate(() => window.__nameCanary), undefined);
+      });
+      await fileCase('a quote in a file name stays inside alt in standalone', async () => {
+        await selectStandaloneFile(fileSession.page, QUOTED_IMAGE);
+        const image = stage.locator('img');
+        await image.waitFor();
+        assert.deepEqual(await image.evaluate(async (node) => {
+          await node.decode();
+          return { alt: node.getAttribute('alt'), attributes: node.getAttributeNames().sort(), width: node.naturalWidth };
+        }), { alt: QUOTED_IMAGE, attributes: ['alt', 'src'], width: pixelWidth });
+      });
+      for (const [name, selector] of [['tone.wav', 'audio'], ['clip.webm', 'video']]) {
+        await fileCase(`standalone ${selector} keeps its download link`, async () => {
+          await selectStandaloneFile(fileSession.page, name);
+          await stage.locator(`.media-container ${selector}`).waitFor();
+          assert.equal(await stage.locator('.media-container a[download]').count(), 1);
+        });
+      }
+      await fileCase('the PDF loader disables eval and still renders', async () => {
+        await selectStandaloneFile(fileSession.page, 'valid.pdf');
+        const canvas = stage.locator('#pdfContainer canvas');
+        await canvas.waitFor();
+        assert.deepEqual(await fileSession.page.evaluate(() => window.__pdfOptions),
+          [{ url: `/ocu/files/${CHAT}/valid.pdf`, isEvalSupported: false }]);
+        assert.deepEqual(await canvas.evaluate(node => Array.from(node.getContext('2d')
+          .getImageData(node.width / 2, node.height / 2, 1, 1).data)), [255, 0, 0, 255], 'PDF page did not render');
+      });
+    } finally {
+      standaloneListing = null;
+      await closeStandalone(fileSession);
+    }
+    assert.deepEqual(fileCaseFailures, [], 'file preview cases failed');
+
     listMode = 'normal';
     assert.deepEqual(externalRequests, [], 'Office content requested an external resource');
     const abortLogs = consoleErrors.filter(error => error.text.includes('net::ERR_ABORTED'));
@@ -5353,6 +5787,7 @@ main().catch(error => { console.error(error); process.exitCode = 1; }).finally(a
   for (const response of heldListings.splice(0)) response.destroy();
   for (const response of heldSheets.splice(0)) response.destroy();
   for (const response of heldDrawio.splice(0)) response.destroy();
+  for (const response of heldMedia.splice(0)) response.destroy();
   for (const pending of heldViewer.splice(0)) pending.res.destroy();
   for (const pending of heldImages.splice(0)) pending.res.destroy();
   for (const response of heldBrowserStatuses.splice(0)) response.destroy();

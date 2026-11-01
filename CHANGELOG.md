@@ -3,6 +3,11 @@
 ## Unreleased — `main` branch
 
 ### Fixed
+- **`.webp` resolves to `image/webp` (#689).** The server registers the type at
+  import, because the Python 3.12 image has no `/etc/mime.types` and its strict
+  map lacks `.webp`. `classify_file` and the file route otherwise reported
+  `application/octet-stream`.
+
 - **Office callback version-blob close reason.** A close-only failure while
   publishing a version blob now reaches the callback as HTTP500
   `state_close_failed` instead of `state_corrupt`, and the refusal is logged.
@@ -58,6 +63,23 @@
   invocation and job; existing verification selections remain unchanged.
 
 ### Changed
+- **Files-only preview admits text and media (#689).** `embed=files` now renders
+  Markdown, code, text, CSV/TSV, audio and video as well as Office files. HTML,
+  SVG, XHTML, XML and `+xml` MIME essences stay refused whatever the broker type;
+  `drawio`, `html`, `pdf`, `image` and `other` report `unsupported`. Embedded
+  Markdown is static: no Mermaid or KaTeX, images only from inline raster data or
+  this chat's files path, and only same-document fragment links stay active.
+  Markdown, code and spreadsheet report `error` on a fetch error, a non-OK
+  response or a sanitizer failure. Audio and video report `ready` on
+  `loadedmetadata` and `error` on the element's `error` event, offer no download
+  link in this view, and release their request when a newer selection replaces
+  them. Standalone preview keeps its features.
+
+- **Preview hardening (#689).** The code view places only a `[a-z0-9]+` file
+  extension in its `language-` class, in standalone and embedded modes.
+  `escapeHtml` also escapes quotes, so it is safe in attribute values; displayed
+  text is unchanged. The PDF loader passes `isEvalSupported: false`.
+
 - **Embedding and reranking endpoints are separately configurable (#688).** The
   production-like test overlay reads `RAG_OPENAI_API_BASE_URL`,
   `RAG_OPENAI_API_KEY`, `RAG_EXTERNAL_RERANKER_URL` (a complete endpoint URL)

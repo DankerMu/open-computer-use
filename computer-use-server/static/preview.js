@@ -50,10 +50,10 @@ const DISCOVERY_REASONS = new Set([
 // Utilities
 // =============================================================================
 
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
 function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
+  return String(text ?? '').replace(/[&<>"']/g, (char) => HTML_ESCAPES[char]);
 }
 
 function formatSize(bytes) {
@@ -346,6 +346,7 @@ async function renderPdfPreview(container, file) {
     const pdf = await pdfjsLib.getDocument({
       url: file.url,
       httpHeaders: workspaceHttpHeaders(),
+      isEvalSupported: false,
     }).promise;
     const pdfContainer = container.querySelector('#pdfContainer');
     pdfContainer.innerHTML = '';
@@ -371,9 +372,10 @@ async function renderPdfPreview(container, file) {
   }
 }
 
-async function renderMarkdownPreview(container, file, files, onSelectFile) {
+async function renderMarkdownPreview(container, file, files, onSelectFile, embedded = false) {
   try {
     const resp = await fetchOutput(file.url);
+    if (embedded && !resp.ok) throw new Error('Markdown response failed');
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000) + '\n\n... (truncated)';
     const rasterImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/i;
@@ -441,6 +443,15 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
         return url.pathname + url.search + url.hash;
       } catch { return null; }
     }
+    // FILES_BASE is only a path, so the resolved origin is compared as well.
+    function isWorkspaceImage(src) {
+      if (rasterImage.test(src)) return true;
+      const root = new URL(FILES_BASE + '/', location.origin);
+      const url = new URL(src, location.origin);
+      return root.origin === location.origin && url.origin === location.origin
+        && !url.username && !url.password
+        && url.pathname.startsWith(root.pathname) && !/%2f|%5c/i.test(url.pathname);
+    }
     for (const node of fragment.querySelectorAll('[class]')) {
       const languages = node.tagName === 'CODE'
         ? Array.from(node.classList).filter(name => /^language-[\w-]+$/.test(name)) : [];
@@ -449,12 +460,12 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
     }
     for (const link of fragment.querySelectorAll('a[href]')) {
       const href = safeUrl(link.getAttribute('href'), false);
-      if (href === null) link.removeAttribute('href');
+      if (href === null || (embedded && !href.startsWith('#'))) link.removeAttribute('href');
       else link.setAttribute('href', href);
     }
     for (const image of fragment.querySelectorAll('img')) {
       const src = image.hasAttribute('src') ? safeUrl(image.getAttribute('src'), true) : null;
-      if (src === null) image.remove();
+      if (src === null || (embedded && !isWorkspaceImage(src))) image.remove();
       else image.setAttribute('src', src);
     }
     const mdBody = document.createElement('div');
@@ -474,6 +485,10 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
     mdBody.querySelectorAll('pre code').forEach(el => {
       if (!el.classList.contains('language-mermaid')) hljs.highlightElement(el);
     });
+
+    // The embedded frame shares the parent's origin and has no CSP: nothing but
+    // hljs writes to its DOM after sanitizing.
+    if (embedded) return true;
 
     // Mermaid
     const mermaidBlocks = mdBody.querySelectorAll('pre code.language-mermaid');
@@ -508,30 +523,36 @@ async function renderMarkdownPreview(container, file, files, onSelectFile) {
     } catch (e) { console.warn('KaTeX:', e); }
   } catch (err) {
     if (!container.isConnected) return;
-    console.error('Markdown render error:', err);
+    if (!embedded) console.error('Markdown render error:', err);
     container.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
+    return false;
   }
 }
 
-async function renderCodePreview(container, file) {
+async function renderCodePreview(container, file, embedded = false) {
   try {
     const resp = await fetchOutput(file.url);
+    if (embedded && !resp.ok) throw new Error('Text response failed');
     let text = await resp.text();
     if (text.length > 200000) text = text.substring(0, 200000) + '\n... (truncated)';
-    const ext = file.name.split('.').pop() || '';
-    container.innerHTML = `<pre><code class="language-${ext}">${escapeHtml(text)}</code></pre>`;
+    const ext = file.name.split('.').pop().toLowerCase();
+    // no-highlight, not an empty class: hljs would auto-detect across every language.
+    const highlight = /^[a-z0-9]+$/.test(ext) ? `language-${ext}` : 'no-highlight';
+    container.innerHTML = `<pre><code class="${highlight}">${escapeHtml(text)}</code></pre>`;
     container.querySelectorAll('pre code').forEach(el => {
       hljs.highlightElement(el);
       if (typeof hljs.lineNumbersBlock === 'function') hljs.lineNumbersBlock(el);
     });
   } catch {
     container.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
+    return false;
   }
 }
 
-async function renderSpreadsheetPreview(container, file) {
+async function renderSpreadsheetPreview(container, file, embedded = false) {
   try {
     const resp = await fetchOutput(file.url);
+    if (embedded && !resp.ok) throw new Error('Spreadsheet response failed');
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000);
     const ext = file.name.split('.').pop().toLowerCase();
@@ -554,6 +575,7 @@ async function renderSpreadsheetPreview(container, file) {
     container.innerHTML = `<div class="data-table-wrap">${tableHtml}</div>`;
   } catch {
     container.innerHTML = `<div class="empty-state"><p>${t('load_fail')}</p></div>`;
+    return false;
   }
 }
 
@@ -1069,6 +1091,15 @@ function createDrawioLifetime(preview, parent) {
   return lifetime;
 }
 
+// A detached media element keeps its connection until collected; the file
+// route has no Range support, so each one would hold a socket open.
+function releaseStageMedia(stage) {
+  stage?.querySelectorAll('audio, video').forEach((media) => {
+    media.removeAttribute('src');
+    media.load();
+  });
+}
+
 function disposeDrawioStage(stage) {
   const lifetime = stage?.__ocuDrawioLifetime;
   if (lifetime) {
@@ -1400,6 +1431,20 @@ function renderDownloadFallback(container, file, iconType, errorMsg) {
   </div>`;
 }
 
+// The frame has no allow-downloads and the parent owns download.
+function mediaDownloadLink(file, embedded) {
+  if (embedded) return '';
+  return `<a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>`;
+}
+
+function mediaLoaded(container) {
+  const media = container.querySelector('audio, video');
+  return new Promise((resolve, reject) => {
+    media.addEventListener('loadedmetadata', () => resolve(true), { once: true });
+    media.addEventListener('error', () => reject(new Error('Media failed to load')), { once: true });
+  });
+}
+
 export function renderPreviewContent(container, file, files, onSelectFile, embedded = false) {
   // Over the listing's per-file limit or an unsupported name: never fetch the bytes.
   if (file.too_large === true || file.unsupported_name === true) return renderDownloadFallback(container, file);
@@ -1409,10 +1454,10 @@ export function renderPreviewContent(container, file, files, onSelectFile, embed
       container.innerHTML = `<img src="${escapeHtml(file.url)}" alt="${escapeHtml(file.name)}">`;
       return;
     case 'pdf': return renderPdfPreview(container, file);
-    case 'markdown': return renderMarkdownPreview(container, file, files, onSelectFile);
+    case 'markdown': return renderMarkdownPreview(container, file, files, onSelectFile, embedded);
     case 'code':
-    case 'text': return renderCodePreview(container, file);
-    case 'spreadsheet': return renderSpreadsheetPreview(container, file);
+    case 'text': return renderCodePreview(container, file, embedded);
+    case 'spreadsheet': return renderSpreadsheetPreview(container, file, embedded);
     case 'docx': return renderDocxPreview(container, file, embedded);
     case 'xlsx': return renderXlsxPreview(container, file, embedded);
     case 'pptx': return renderPptxPreview(container, file, embedded);
@@ -1423,15 +1468,15 @@ export function renderPreviewContent(container, file, files, onSelectFile, embed
         <div class="media-name">${escapeHtml(file.name)}</div>
         <div class="media-size">${formatSize(file.size)}</div>
         <audio controls preload="metadata" src="${escapeHtml(file.url)}">${t('audio_unsupported')}</audio>
-        <a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>
+        ${mediaDownloadLink(file, embedded)}
       </div>`;
-      return;
+      return embedded ? mediaLoaded(container) : undefined;
     case 'video':
       container.innerHTML = `<div class="media-container">
         <video controls preload="metadata" src="${escapeHtml(file.url)}">${t('video_unsupported')}</video>
-        <a class="btn" href="${escapeHtml(file.url)}" download>${icon('download')} ${t('download')}</a>
+        ${mediaDownloadLink(file, embedded)}
       </div>`;
-      return;
+      return embedded ? mediaLoaded(container) : undefined;
     default:
       renderDownloadFallback(container, file);
   }
@@ -1540,6 +1585,7 @@ function FilesView({ files, selectedFile, onSelectFile, selectionKey, onRenderSt
   const dropOwnedStage = (stage) => {
     disposeDrawioStage(stage);
     disconnectPreviewObserver(stage);
+    releaseStageMedia(stage);
     if (stage && stage !== containerRef.current) stage.remove();
     if (ownedStageRef.current === stage) ownedStageRef.current = null;
   };
@@ -1576,6 +1622,7 @@ function FilesView({ files, selectedFile, onSelectFile, selectionKey, onRenderSt
     host.querySelectorAll('.preview-stage').forEach((node) => {
       disposeDrawioStage(node);
       disconnectPreviewObserver(node);
+      releaseStageMedia(node);
       if (node !== host) node.remove();
     });
     disconnectPreviewObserver(host);
@@ -2397,8 +2444,8 @@ function validEmbedSelection(data) {
 }
 
 function embeddedFileDisposition(file) {
-  if (!file || !['docx', 'xlsx', 'pptx'].includes(file.type)
-      || typeof file.mime !== 'string') return 'unsupported';
+  if (!file || !['docx', 'xlsx', 'pptx', 'markdown', 'code', 'text', 'spreadsheet',
+    'audio', 'video'].includes(file.type) || typeof file.mime !== 'string') return 'unsupported';
   const mime = file.mime.split(';', 1)[0].trim().toLowerCase();
   if (!mime || ['text/html', 'image/svg+xml', 'application/xhtml+xml',
     'application/xml', 'text/xml'].includes(mime) || mime.endsWith('+xml')) return 'unsupported';
