@@ -76,6 +76,15 @@ PUBLIC_COPY_SOURCES = (
 # Operator-chosen model names (#686): interpolated from runtime.env, never fixed.
 WEBUI_MODEL_NAMES = ("RAG_EMBEDDING_MODEL", "RAG_RERANKING_MODEL")
 INIT_MODEL_NAME = "PRIMARY_CHAT_MODEL"
+# Separate embedding and reranking endpoints (#688); chat stays on DMXAPI_*.
+SHARED_URL = "http://shared.fixture/v1"
+SHARED_KEY = "shared-key-fixture"
+SHARED_EMBEDDING = (SHARED_URL, SHARED_KEY)
+SHARED_RERANKING = (SHARED_URL + "/rerank", SHARED_KEY)
+EMBEDDING_URL = "http://embedding.fixture/v1"
+EMBEDDING_KEY = "embedding-key-fixture"
+RERANKER_URL = "http://reranker.fixture/v1/rerank"
+RERANKER_KEY = "reranker-key-fixture"
 MESSAGES_CONFIG = "/opt/ocu-proxy/messages-ingress.conf"
 MESSAGES_ENTRYPOINT = ["nginx", "-e", "stderr", "-p", "/var/lib/nginx/", "-c", MESSAGES_CONFIG]
 
@@ -358,8 +367,15 @@ class OverlayStructureTests(unittest.TestCase):
                 self.assertEqual(interpolate_value(value, {name: ""}), "")
                 self.assertEqual(interpolate_value(value, {}), "")
         provider = {"DMXAPI_BASE_URL": "http://lan-model:8000/v1"}
-        for setting in ("OPENAI_API_BASE_URL", "RAG_OPENAI_API_BASE_URL"):
-            self.assertEqual(webui_env[setting], "${DMXAPI_BASE_URL}")
+        self.assertEqual(webui_env["OPENAI_API_BASE_URL"], "${DMXAPI_BASE_URL}")
+        self.assertEqual(webui_env["OPENAI_API_KEY"], "${DMXAPI_API_KEY}")
+        for setting, expression in (
+            ("RAG_OPENAI_API_BASE_URL", "${RAG_OPENAI_API_BASE_URL:-${DMXAPI_BASE_URL}}"),
+            ("RAG_OPENAI_API_KEY", "${RAG_OPENAI_API_KEY:-${DMXAPI_API_KEY}}"),
+            ("RAG_EXTERNAL_RERANKER_URL", "${RAG_EXTERNAL_RERANKER_URL:-${DMXAPI_BASE_URL}/rerank}"),
+            ("RAG_EXTERNAL_RERANKER_API_KEY", "${RAG_EXTERNAL_RERANKER_API_KEY:-${DMXAPI_API_KEY}}"),
+        ):
+            self.assertEqual(webui_env[setting], expression)
         self.assertEqual(interpolate_value(webui_env["RAG_EXTERNAL_RERANKER_URL"], provider),
                          "http://lan-model:8000/v1/rerank")
 
@@ -387,6 +403,56 @@ class OverlayStructureTests(unittest.TestCase):
                     self.assertEqual(webui_env["OPENAI_API_BASE_URL"], base)
                     self.assertEqual(webui_env["RAG_OPENAI_API_BASE_URL"], base)
                     self.assertEqual(webui_env["RAG_EXTERNAL_RERANKER_URL"], base + "/rerank")
+
+    def assert_model_endpoints(self, cases):
+        overlay = override_value(parsed(WEBUI_OVERRIDE)["services"]["open-webui"]["environment"])
+        with tempfile.TemporaryDirectory(prefix="ocu-native-endpoints-") as raw:
+            for label, given, embedding, reranking in cases:
+                with self.subTest(case=label):
+                    env = {"DMXAPI_BASE_URL": SHARED_URL, "DMXAPI_API_KEY": SHARED_KEY, **given}
+                    # resolved_stacks refuses a non-zero exit and any "is not set" warning.
+                    webui = resolved_stacks(Path(raw) / label, "false", extra=env)["webui.json"]
+                    resolved = webui["services"]["open-webui"]["environment"]
+                    expected = {
+                        "OPENAI_API_BASE_URL": SHARED_URL,
+                        "OPENAI_API_KEY": SHARED_KEY,
+                        "RAG_OPENAI_API_BASE_URL": embedding[0],
+                        "RAG_OPENAI_API_KEY": embedding[1],
+                        "RAG_EXTERNAL_RERANKER_URL": reranking[0],
+                        "RAG_EXTERNAL_RERANKER_API_KEY": reranking[1],
+                    }
+                    for name, value in expected.items():
+                        self.assertEqual(resolved.get(name), value, name)
+                        # The fake's resolver must agree with real Compose on the same text.
+                        self.assertEqual(interpolate_value(overlay[name], env), value, name)
+
+    def test_native_compose_keeps_the_shared_provider_when_endpoints_are_not_given(self):
+        empty = {"RAG_OPENAI_API_BASE_URL": "", "RAG_OPENAI_API_KEY": "",
+                 "RAG_EXTERNAL_RERANKER_URL": "", "RAG_EXTERNAL_RERANKER_API_KEY": ""}
+        self.assert_model_endpoints((
+            ("absent", {}, SHARED_EMBEDDING, SHARED_RERANKING),
+            ("empty", empty, SHARED_EMBEDDING, SHARED_RERANKING),
+        ))
+
+    def test_native_compose_gives_each_model_its_own_endpoint(self):
+        embedding_pair = {"RAG_OPENAI_API_BASE_URL": EMBEDDING_URL,
+                          "RAG_OPENAI_API_KEY": EMBEDDING_KEY}
+        reranker_pair = {"RAG_EXTERNAL_RERANKER_URL": RERANKER_URL,
+                         "RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY}
+        self.assert_model_endpoints((
+            ("all-four", {**embedding_pair, **reranker_pair},
+             (EMBEDDING_URL, EMBEDDING_KEY), (RERANKER_URL, RERANKER_KEY)),
+            ("embedding-pair", embedding_pair, (EMBEDDING_URL, EMBEDDING_KEY), SHARED_RERANKING),
+            ("reranker-pair", reranker_pair, SHARED_EMBEDDING, (RERANKER_URL, RERANKER_KEY)),
+            ("embedding-url", {"RAG_OPENAI_API_BASE_URL": EMBEDDING_URL},
+             (EMBEDDING_URL, SHARED_KEY), SHARED_RERANKING),
+            ("embedding-key", {"RAG_OPENAI_API_KEY": EMBEDDING_KEY},
+             (SHARED_URL, EMBEDDING_KEY), SHARED_RERANKING),
+            ("reranker-url", {"RAG_EXTERNAL_RERANKER_URL": RERANKER_URL},
+             SHARED_EMBEDDING, (RERANKER_URL, SHARED_KEY)),
+            ("reranker-key", {"RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY},
+             SHARED_EMBEDDING, (SHARED_URL + "/rerank", RERANKER_KEY)),
+        ))
 
     def test_adopted_local_dependencies_exist(self):
         for path in ADOPTED:
@@ -446,6 +512,27 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertEqual(interpolate_value("$$TOKEN", env), "$TOKEN")
         self.assertEqual(interpolate_value("${TOKEN}", env), "HOST_VALUE")
         self.assertEqual(interpolate_value("$TOKEN", env), "HOST_VALUE")
+
+    def test_nested_default_interpolation(self):
+        # Expected values observed from docker-compose v2.40 on the same expressions.
+        self.assertEqual(interpolate_value("${A:-${B}}", {"B": "b"}), "b")
+        self.assertEqual(interpolate_value("${A:-${B}}", {"A": "", "B": "b"}), "b")
+        self.assertEqual(interpolate_value("${A:-${B}}", {"A": "a", "B": "b"}), "a")
+        self.assertEqual(interpolate_value("${A-${B}}", {"A": "", "B": "b"}), "")
+        self.assertEqual(interpolate_value("${A:-${B}/rerank}", {"B": "b"}), "b/rerank")
+        self.assertEqual(interpolate_value("${A:-${B}/x${C:-z}}", {"B": "b"}), "b/xz")
+        self.assertEqual(interpolate_value("${A:-${C:-${B}}}", {"B": "b"}), "b")
+        self.assertEqual(interpolate_value("${A:-$${B}}", {"B": "b"}), "${B}")
+        self.assertEqual(interpolate_value("x${A:-${B}}y${A:-${B}}z", {"B": "b"}), "xbybz")
+
+    def test_nested_default_is_evaluated_even_when_the_outer_name_is_set(self):
+        # Compose substitutes the default first, so a required inner name still refuses.
+        with self.assertRaises(UnsupportedInterpolation):
+            interpolate_value("${A:-${B:?required}}", {"A": "a"})
+        with self.assertRaises(UnsupportedInterpolation):
+            interpolate_value("${A:-${B/foo/bar}}", {"A": "a"})
+        with self.assertRaises(UnsupportedInterpolation):
+            interpolate_value("${A:-${B}", {"B": "b"})
 
 
 if __name__ == "__main__":

@@ -31,8 +31,10 @@ services:
       BYPASS_EMBEDDING_AND_RETRIEVAL: "false"
       BYPASS_RETRIEVAL_ACCESS_CONTROL: "false"
       RAG_EMBEDDING_ENGINE: openai
-      RAG_OPENAI_API_BASE_URL: ${DMXAPI_BASE_URL}
-      RAG_OPENAI_API_KEY: ${DMXAPI_API_KEY}
+      # Embedding and reranking each take their own URL and key (#688). An unset
+      # or empty name, as bootstrap writes it, falls back to the shared provider.
+      RAG_OPENAI_API_BASE_URL: ${RAG_OPENAI_API_BASE_URL:-${DMXAPI_BASE_URL}}
+      RAG_OPENAI_API_KEY: ${RAG_OPENAI_API_KEY:-${DMXAPI_API_KEY}}
       # Model names come from runtime.env (#686). An empty name stays empty; it
       # does not fall back to Open WebUI's default, so set it in the admin UI.
       RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-}
@@ -41,8 +43,8 @@ services:
       RAG_TOP_K: "8"
       RAG_RERANKING_ENGINE: external
       RAG_RERANKING_MODEL: ${RAG_RERANKING_MODEL:-}
-      RAG_EXTERNAL_RERANKER_URL: ${DMXAPI_BASE_URL}/rerank
-      RAG_EXTERNAL_RERANKER_API_KEY: ${DMXAPI_API_KEY}
+      RAG_EXTERNAL_RERANKER_URL: ${RAG_EXTERNAL_RERANKER_URL:-${DMXAPI_BASE_URL}/rerank}
+      RAG_EXTERNAL_RERANKER_API_KEY: ${RAG_EXTERNAL_RERANKER_API_KEY:-${DMXAPI_API_KEY}}
       RAG_EXTERNAL_RERANKER_TIMEOUT: "30"
       RAG_TOP_K_RERANKER: "3"
       RAG_RERANKING_MODEL_AUTO_UPDATE: "false"

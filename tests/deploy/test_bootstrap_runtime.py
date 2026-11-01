@@ -46,6 +46,8 @@ from support import (
 BOOTSTRAP = ROOT / "deploy" / "production-like-test" / "scripts" / "bootstrap-test.sh"
 WRITE_VERSION = ROOT / "deploy" / "production-like-test" / "scripts" / "write-deployed-version.sh"
 PROVIDER_SENTINEL = "provider-secret-not-for-logs"
+EMBEDDING_KEY_SENTINEL = "embedding-secret-not-for-logs"
+RERANKER_KEY_SENTINEL = "reranker-secret-not-for-logs"
 ORIGIN = "https://workbench.example.test"
 PUBLIC_BASE = ORIGIN + "/ocu"
 INTERNAL_AUTH = "http://open-webui:8080/api/v1/ocu/auth"
@@ -58,9 +60,11 @@ IMAGES = {
     "DOCUMENTSERVER_IMAGE": DEFAULT_RELEASE_IMAGES["documentserver"],
 }
 
-# Optional operator inputs (#686); each is published as given or empty.
+# Optional operator inputs (#686, #688); each is published as given or empty.
 OPERATOR_MODEL_INPUTS = (
     "DMXAPI_BASE_URL",
+    "RAG_OPENAI_API_BASE_URL",
+    "RAG_EXTERNAL_RERANKER_URL",
     "PRIMARY_CHAT_MODEL",
     "RAG_EMBEDDING_MODEL",
     "RAG_RERANKING_MODEL",
@@ -677,6 +681,8 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
     def test_operator_model_inputs_are_published_as_given(self):
         given = {
             "DMXAPI_BASE_URL": "http://lan-model:8000/v1",
+            "RAG_OPENAI_API_BASE_URL": "http://lan-embedding:8001/v1",
+            "RAG_EXTERNAL_RERANKER_URL": "http://lan-reranker:8002/v1/rerank",
             "PRIMARY_CHAT_MODEL": "chat-a",
             "RAG_EMBEDDING_MODEL": "embed-a",
             "RAG_RERANKING_MODEL": "rerank-a",
@@ -718,6 +724,26 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
                     self.assertIn(name, result.stderr)
                     self.assert_unpublished()
                     self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
+
+    def test_model_endpoint_keys_reach_neither_runtime_nor_output(self):
+        keys = {
+            "RAG_OPENAI_API_KEY": EMBEDDING_KEY_SENTINEL,
+            "RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY_SENTINEL,
+        }
+        self.provider.write_text(
+            f"DMXAPI_API_KEY={PROVIDER_SENTINEL}\n"
+            + "".join(f"{name}={value}\n" for name, value in keys.items()),
+            encoding="utf-8",
+        )
+        result = self.run_bootstrap(keys)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.runtime_path().read_text(encoding="utf-8")
+        for name, value in keys.items():
+            self.assertNotIn(name, text)
+            self.assertNotIn(value, text)
+            self.assertNotIn(value, self.combined(result))
+        self.assertNotIn(PROVIDER_SENTINEL, text)
+        self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 
     def test_post_temp_failure_removes_temporary_files(self):
         result = self.run_bootstrap(

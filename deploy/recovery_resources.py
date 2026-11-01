@@ -1590,11 +1590,9 @@ def _require_cursor_lag(restored: dict, chat_dir: Path, image: str) -> None:
 
 def _require_provider_precedence(rows: list[dict], provider: dict[str, str]) -> None:
     persisted = json.dumps(rows, separators=(",", ":"))
-    for name, value in provider.items():
-        if name in recovery.PROVIDER_KEYS and value:
-            if value in persisted:
-                recovery.report("restored persistent provider settings remain in effect")
-            return
+    values = [provider[name] for name in recovery.PROVIDER_KEYS if provider.get(name)]
+    if any(value in persisted for value in values):
+        recovery.report("restored persistent provider settings remain in effect")
 
 
 
