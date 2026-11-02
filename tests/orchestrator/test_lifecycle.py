@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Per-chat lifecycle: explicit launch, shared locks, credentials, host idle.
+"""Per-chat lifecycle: launch and wake on use, shared locks, credentials, host idle.
 
 Docker is a MagicMock. Nothing in this module opens a socket or imports a live
 engine client. Expected statuses and error literals come from the ocu-lifecycle
@@ -32,7 +32,6 @@ INTERNAL = "ocu-test-internal-token"
 MCP_KEY = "ocu-test-mcp-api-key"
 CHAT = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 CHAT_B = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
-STOPPED_MESSAGE = "workspace is stopped and needs an explicit launch"
 NEVER_CREATED = "never_created"
 MIGRATION_REQUIRED = "migration_required"
 
@@ -428,34 +427,199 @@ def test_recreated_sandbox_keeps_the_same_files_mount_set(world, monkeypatch):
 
 
 
-def test_stopped_tool_call_does_not_start_or_recreate(world):
-    docker_manager, client, _clock, _tmp = world
-    container = _put(client, f"owui-chat-{CHAT}", "exited")
-    with pytest.raises(docker_manager.SandboxStopped, match=STOPPED_MESSAGE):
-        docker_manager._get_or_create_container(CHAT)
-    assert container.status == "exited"
-    container.start.assert_not_called()
-    assert client._created == []
+def _running_after_reloads(container, reloads):
+    """Report restarting until the given reload call, then running."""
+    calls = {"n": 0}
+
+    def reload():
+        calls["n"] += 1
+        if calls["n"] >= reloads:
+            container.status = "running"
+        container.attrs["State"]["Status"] = container.status
+
+    container.reload.side_effect = reload
+    return calls
 
 
-@pytest.mark.parametrize("status", ["paused", "created", "restarting", "dead"])
-def test_non_running_tool_call_leaves_state_unchanged(world, status):
-    docker_manager, client, _clock, _tmp = world
-    container = _put(client, f"owui-chat-{CHAT}", status)
-    with pytest.raises(docker_manager.SandboxStopped):
-        docker_manager._get_or_create_container(CHAT)
-    assert container.status == status
-    container.start.assert_not_called()
-    container.unpause.assert_not_called()
-
-
-def test_absent_valid_metadata_does_not_create_on_tool_path(world):
-    docker_manager, client, _clock, _tmp = world
+@pytest.mark.parametrize("status", ["exited", "created", "paused", "restarting", "absent"])
+def test_tool_call_wakes_recoverable_sandbox_and_runs_command(world, status):
+    docker_manager, client, clock, _tmp = world
     _meta(docker_manager, CHAT)
-    with pytest.raises(docker_manager.SandboxStopped):
-        docker_manager._get_or_create_container(CHAT)
-    assert client._created == []
+    existing = None
+    reloads = None
+    if status != "absent":
+        existing = _put(client, f"owui-chat-{CHAT}", status, container_id=f"wake-{status}")
+        if status == "paused":
+            docker_manager.mark_sleeper_retired(CHAT, existing, now=clock.time())
+        if status == "restarting":
+            # Reload 1 is the tool lookup and reload 2 the launch lookup, so
+            # running first appears inside the bounded readiness wait.
+            reloads = _running_after_reloads(existing, 3)
+
+    container = docker_manager._get_or_create_container(CHAT)
+
+    assert container.status == "running"
+    if existing is None:
+        assert client._created == [container]
+    else:
+        assert container is existing
+        assert client._created == []
+        existing.remove.assert_not_called()
+    if reloads is not None:
+        assert reloads["n"] >= 3
+    result = docker_manager._execute_bash(container, "echo woke")
+    assert result["exit_code"] == 0
+    assert any(
+        isinstance(item["cmd"], list) and "echo woke" in item["cmd"][-1]
+        for item in container._execs
+    )
     assert docker_manager.load_container_meta(CHAT)["user_email"] == "owner@example"
+
+
+def _conflict_with_exited_winner(client, container_id="loser"):
+    winner = _container(f"owui-chat-{CHAT}", "exited", container_id=container_id)
+
+    def conflict(**config):
+        client._store[config["name"]] = winner
+        raise APIError("name already in use", response=type("R", (), {"status_code": 409})())
+
+    client.containers.create.side_effect = conflict
+    return winner
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "status_code"),
+    [
+        ("dead", "LaunchFailed", 500),
+        ("refused", "LaunchFailed", 500),
+        ("restart_timeout", "LaunchFailed", 504),
+        ("legacy_paused", "MigrationRequired", 409),
+        ("conflict_loser", "LaunchFailed", 409),
+        ("corrupt_meta", "MetadataCorrupt", 500),
+    ],
+)
+def test_unrecoverable_tool_call_fails_explicitly_without_delete_or_recreate(
+    world, case, error, status_code
+):
+    docker_manager, client, _clock, _tmp = world
+    meta_path = _meta(docker_manager, CHAT)
+    if case == "corrupt_meta":
+        meta_path.write_text("{not-json")
+    meta_before = meta_path.read_bytes()
+    container = None
+    if case == "conflict_loser":
+        winner = _conflict_with_exited_winner(client)
+    else:
+        status = {
+            "dead": "dead",
+            "refused": "exited",
+            "restart_timeout": "restarting",
+            "legacy_paused": "paused",
+            "corrupt_meta": "exited",
+        }[case]
+        container = _put(client, f"owui-chat-{CHAT}", status, container_id=f"keep-{case}")
+        if case == "refused":
+            container.start.side_effect = APIError(
+                "engine refused start",
+                response=MagicMock(status_code=500, url="http://docker.test", reason="error"),
+                explanation=b"refused",
+            )
+
+    with pytest.raises(getattr(docker_manager, error)) as caught:
+        docker_manager._get_or_create_container(CHAT)
+
+    assert type(caught.value) is getattr(docker_manager, error)
+    assert caught.value.status_code == status_code
+    assert meta_path.read_bytes() == meta_before
+    assert client._created == []
+    kept = winner if case == "conflict_loser" else container
+    kept.remove.assert_not_called()
+    kept.unpause.assert_not_called()
+    assert client._store[f"owui-chat-{CHAT}"] is kept
+    if case == "conflict_loser":
+        assert str(caught.value) == "create conflict winner is not running"
+        winner.start.assert_not_called()
+        assert winner.status == "exited"
+    elif case != "refused":
+        container.start.assert_not_called()
+        assert container.status == status
+
+
+def test_tool_path_recreation_ignores_request_credentials(world, monkeypatch):
+    docker_manager, client, _clock, _tmp = world
+    _meta(docker_manager, CHAT, user_email="saved@example", user_name="Saved")
+    monkeypatch.setattr(docker_manager, "ANTHROPIC_AUTH_TOKEN", "server-fallback-token")
+    monkeypatch.setattr(docker_manager, "MCP_TOKENS_URL", "http://tokens.example")
+    monkeypatch.setattr(docker_manager, "MCP_TOKENS_API_KEY", "wrapper-key")
+    looked_up = []
+
+    async def fetch(email, url, key):
+        looked_up.append(email)
+        return "server-gitlab-token"
+
+    monkeypatch.setattr(docker_manager, "_fetch_gitlab_token", fetch)
+    tokens = [
+        (docker_manager.current_gitlab_token, docker_manager.current_gitlab_token.set("request-gitlab-token")),
+        (
+            docker_manager.current_anthropic_auth_token,
+            docker_manager.current_anthropic_auth_token.set("request-anthropic-token"),
+        ),
+        (docker_manager.current_user_email, docker_manager.current_user_email.set("requester@example")),
+        (docker_manager.current_user_name, docker_manager.current_user_name.set("Requester")),
+    ]
+    try:
+        container = docker_manager._get_or_create_container(CHAT)
+        assert docker_manager.current_credential_source.get() == "request"
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+    assert container.status == "running"
+    env = _env_of(client._created[0])
+    assert env["GITLAB_TOKEN"] == "server-gitlab-token"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "server-fallback-token"
+    assert env["GIT_AUTHOR_EMAIL"] == "saved@example"
+    assert env["GIT_AUTHOR_NAME"] == "Saved"
+    for request_value in ("request-gitlab-token", "request-anthropic-token", "requester@example", "Requester"):
+        assert request_value not in env.values()
+    assert looked_up == ["saved@example"]
+
+
+@pytest.mark.parametrize("path", ["tool", "launch"])
+def test_wake_after_idle_stop_keeps_a_fresh_idle_window(world, monkeypatch, path):
+    docker_manager, client, clock, _tmp = world
+    timeout = 259200
+    poll = docker_manager.IDLE_POLL_SECONDS
+    monkeypatch.setattr(docker_manager, "CONTAINER_IDLE_TIMEOUT", timeout)
+    _meta(docker_manager, CHAT)
+    container = _put(client, f"owui-chat-{CHAT}", "running", container_id="idle-woken")
+    started = clock.time()
+    docker_manager.mark_sleeper_retired(CHAT, container, now=started)
+    clock.advance(timeout - poll)
+    docker_manager.reap_idle(CHAT, now=clock.time())
+    assert container.status == "running"
+    clock.advance(poll)
+    docker_manager.reap_idle(CHAT, now=clock.time())
+    assert container.status == "exited"
+    assert docker_manager.read_idle_state(CHAT) == {
+        "container_id": "idle-woken",
+        "status": "running",
+        "observed_at": started + timeout - poll,
+        "idle_expiry": started + timeout,
+        "sleeper_retired_for": "idle-woken",
+    }
+
+    clock.advance(3600)
+    if path == "tool":
+        assert docker_manager._get_or_create_container(CHAT) is container
+    else:
+        assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
+    assert container.status == "running"
+    clock.advance(poll)
+    docker_manager.reap_idle(CHAT, now=clock.time())
+
+    assert container.status == "running"
+    assert container.stop.call_count == 1
+    assert client._created == []
 
 
 def test_corrupt_metadata_fails_closed_on_tool_path(world):
@@ -489,18 +653,24 @@ def test_create_conflict_adopts_running_winner_without_delete(world):
     assert winner._removed["value"] is False
 
 
-def test_create_conflict_non_running_winner_is_not_deleted(world):
+@pytest.mark.parametrize("initiator", ["tool-first", "tool-recreate", "launch"])
+def test_create_conflict_non_running_winner_is_not_deleted(world, initiator):
     docker_manager, client, _clock, _tmp = world
-    winner = _put(client, f"owui-chat-{CHAT}", "exited", container_id="loser")
-
-    def conflict(**config):
-        raise APIError("name already in use", response=type("R", (), {"status_code": 409})())
-
-    client.containers.create.side_effect = conflict
-    with pytest.raises(docker_manager.SandboxStopped):
-        docker_manager._get_or_create_container(CHAT)
+    if initiator != "tool-first":
+        _meta(docker_manager, CHAT)
+    winner = _conflict_with_exited_winner(client)
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
+        if initiator == "launch":
+            docker_manager.launch_sandbox(CHAT)
+        else:
+            docker_manager._get_or_create_container(CHAT)
+    assert caught.value.status_code == 409
+    assert caught.value.reason == "launch_failed"
+    assert str(caught.value) == "create conflict winner is not running"
     winner.remove.assert_not_called()
+    winner.start.assert_not_called()
     assert winner.status == "exited"
+    assert client._created == []
 
 
 def test_launch_never_created_is_409_and_creates_nothing(world):
@@ -1282,23 +1452,38 @@ def test_launch_route_never_created_and_failure_statuses(app_module, monkeypatch
 
 
 @pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("dead", "sandbox is dead"),
+        ("legacy_paused", MIGRATION_REQUIRED),
+        ("conflict_loser", "create conflict winner is not running"),
+    ],
+)
+@pytest.mark.parametrize(
     "tool_name",
     ["view", "bash_tool", "str_replace", "create_file", "sub_agent"],
 )
-def test_mcp_stopped_error_is_workspace_stopped(monkeypatch, tool_name):
+def test_mcp_tools_surface_unrecoverable_wake_errors(app_module, world, monkeypatch, tool_name, case, message):
     import mcp_tools
 
+    docker_manager, client, _clock, _tmp = world
+    assert mcp_tools._get_or_create_container is docker_manager._get_or_create_container
+    _meta(docker_manager, CHAT)
+    if case == "conflict_loser":
+        kept = _conflict_with_exited_winner(client)
+    else:
+        kept = _put(client, f"owui-chat-{CHAT}", "dead" if case == "dead" else "paused", container_id=f"mcp-{case}")
     monkeypatch.setattr(mcp_tools, "_validate_chat_id", lambda: (CHAT, None))
     monkeypatch.setattr(mcp_tools, "_ensure_gitlab_token", lambda: _async_none())
-    monkeypatch.setattr(
-        mcp_tools,
-        "_get_or_create_container",
-        lambda chat_id: (_ for _ in ()).throw(mcp_tools.SandboxStopped(STOPPED_MESSAGE)),
-    )
+
     result = _run(_mcp_tool(mcp_tools, tool_name))
-    assert result.startswith("Error:")
-    assert "workspace is stopped" in result
-    assert "explicit launch" in result
+
+    assert result == f"Error: {message}"
+    assert client._created == []
+    assert client._store[f"owui-chat-{CHAT}"] is kept
+    kept.remove.assert_not_called()
+    kept.start.assert_not_called()
+    kept.unpause.assert_not_called()
 
 
 def _async_none():
@@ -2569,18 +2754,17 @@ def test_unpause_failure_is_structured(world):
     "tool_name",
     ["view", "bash_tool", "str_replace", "create_file", "sub_agent"],
 )
-def test_mcp_tools_surface_stopped_and_corrupt_meta(monkeypatch, tool_name):
+def test_mcp_tools_surface_wake_failure_and_corrupt_meta(monkeypatch, tool_name):
     import mcp_tools
 
     monkeypatch.setattr(mcp_tools, "_validate_chat_id", lambda: (CHAT, None))
     monkeypatch.setattr(mcp_tools, "_ensure_gitlab_token", lambda: _async_none())
-    monkeypatch.setattr(
-        mcp_tools,
-        "_get_or_create_container",
-        lambda chat_id: (_ for _ in ()).throw(mcp_tools.SandboxStopped(STOPPED_MESSAGE)),
-    )
-    stopped = _run(_mcp_tool(mcp_tools, tool_name))
-    assert "workspace is stopped" in stopped
+
+    def wake_failed(chat_id):
+        raise mcp_tools.LifecycleError("restart readiness timed out", status_code=504, reason="launch_failed")
+
+    monkeypatch.setattr(mcp_tools, "_get_or_create_container", wake_failed)
+    assert _run(_mcp_tool(mcp_tools, tool_name)) == "Error: restart readiness timed out"
 
     def corrupt(chat_id):
         raise mcp_tools.LifecycleError("sandbox metadata is corrupt")
@@ -2592,12 +2776,15 @@ def test_mcp_tools_surface_stopped_and_corrupt_meta(monkeypatch, tool_name):
     assert "corrupt" in result.lower()
 
 
-def test_stopped_tool_path_stays_sandbox_stopped_with_incompatible_dns(world, monkeypatch):
+def test_stopped_tool_path_refuses_wake_with_incompatible_dns(world, monkeypatch):
     docker_manager, client, _clock, _tmp = world
     monkeypatch.setenv("OCU_SANDBOX_DNS", "8.8.8.8")
     container = _put(client, f"owui-chat-{CHAT}", "exited", dns=["1.1.1.1"])
-    with pytest.raises(docker_manager.SandboxStopped, match=STOPPED_MESSAGE):
+    with pytest.raises(docker_manager.LaunchFailed) as caught:
         docker_manager._get_or_create_container(CHAT)
+    assert caught.value.status_code == 409
+    assert "DNS" in str(caught.value)
+    container.remove.assert_not_called()
     assert container.status == "exited"
     container.start.assert_not_called()
     assert client._created == []

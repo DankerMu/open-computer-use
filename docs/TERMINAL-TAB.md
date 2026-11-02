@@ -40,15 +40,15 @@ Browser (xterm.js)  ←WebSocket→  Computer Use Server  ←WebSocket→  Conta
 6. While the page is open, `/terminal/{chat_id}/heartbeat` extends the host-owned idle window.
 7. OCU stops a continuously observed running sandbox after `CONTAINER_IDLE_TIMEOUT` (default: 10 min). External Docker pause time does not count, and no idle stop runs while OCU is down.
 
-A stopped, paused, created, restarting, dead, or removed-but-metadata sandbox is not started by a tool call. Resume is explicit `POST /internal/launch/{chat_id}` or its `/terminal/{chat_id}/restart-container` and `resurrect-container` aliases. Launch answers `{"state":"running"}` only after observing running. `GET /internal/describe/{chat_id}` reads state and does not change it. Both require the internal bearer token.
+A tool call for an exited, created, paused, restarting, or removed-but-metadata sandbox wakes it with the launch transition before it runs: exited and created start, paused unpauses, restarting waits within a bounded deadline, and a removed container is recreated from server-side credentials only. A dead sandbox, an engine refusal, a readiness timeout, a legacy paused sandbox without migration evidence, a create-conflict winner that is not running, and corrupt metadata return their explicit lifecycle error; nothing is deleted or recreated. Every launch that reaches running starts a fresh idle window. The same transition is available as `POST /internal/launch/{chat_id}` or its `/terminal/{chat_id}/restart-container` and `resurrect-container` aliases. Launch answers `{"state":"running"}` only after observing running. `GET /internal/describe/{chat_id}` reads state and does not change it. Both require the internal bearer token.
 
 ## Existing sleeper cutover
 
 Containers created before this change may contain a detached `sleep && kill 1` timer. Quiesce the old orchestrator before deploying this one.
 
 1. Running sandboxes: the first explicit launch or host reap retires that sleeper under its in-container flock, verifies it is gone, and records the container id. Heartbeats, tool activity, and startup sweeps preserve existing evidence and never invent it. A failed retirement is an explicit migration error; the sandbox is not adopted silently.
-2. Exited or created sandboxes have no live sleeper. Explicit launch starts the same container and does not exec a retirement command first.
-3. Paused pre-upgrade sandboxes cannot run retirement code. Stop that container with Docker yourself, preserve the container and mounts, verify it is stopped, then deploy. Launch reports `migration-required` and does not unpause, delete, or recreate it until that operator stop is done. After the stop, explicit launch starts the same container.
+2. Exited or created sandboxes have no live sleeper. Launch, or a tool call that wakes the sandbox, starts the same container and does not exec a retirement command first.
+3. Paused pre-upgrade sandboxes cannot run retirement code. Stop that container with Docker yourself, preserve the container and mounts, verify it is stopped, then deploy. Launch reports `migration-required` and does not unpause, delete, or recreate it until that operator stop is done. After the stop, launch or the next tool call starts the same container.
 
 The pause-aware idle guarantee applies after this cutover. An upgrade is incomplete while a legacy paused sandbox remains. Real Docker evidence for this cutover is deferred to epic task 19.0.
 

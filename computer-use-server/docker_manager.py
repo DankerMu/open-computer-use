@@ -89,7 +89,6 @@ except (TypeError, ValueError):
     IDLE_POLL_SECONDS = -1
 RESTART_WAIT_SECONDS = 5
 RESTART_POLL_SECONDS = 0.05
-STOPPED_MESSAGE = "workspace is stopped and needs an explicit launch"
 
 
 class LifecycleError(Exception):
@@ -100,11 +99,6 @@ class LifecycleError(Exception):
         self.status_code = self.status_code if status_code is None else status_code
         self.reason = self.reason if reason is None else reason
         super().__init__(message or self.reason)
-
-
-class SandboxStopped(LifecycleError):
-    def __init__(self, message=STOPPED_MESSAGE):
-        super().__init__(message, status_code=409, reason="sandbox_stopped")
 
 
 class NeverCreated(LifecycleError):
@@ -1080,23 +1074,23 @@ def _lifecycle_docker_step(context, step, *args, **kwargs):
 
 
 def _get_or_create_container(chat_id: str) -> docker.models.containers.Container:
-    """Return a running sandbox, or create one only when nothing exists.
+    """Return a running sandbox for a tool call.
 
-    Stopped, paused, created, restarting, dead, and absent-with-metadata
-    raise SandboxStopped. Corrupt metadata fails closed.
+    Running is reused. Any other existing state, or an absent container with
+    valid metadata, takes the launch transition within this lock acquisition.
+    Only a chat with neither container nor metadata creates from request
+    credentials. Corrupt metadata and unrecoverable states fail explicitly.
     """
     chat_id = canonical_lock_chat_id(chat_id)
     with _combined_lock(chat_id):
         container = _lifecycle_docker_step("engine lookup", _lookup_container, chat_id)
         meta = load_container_meta(chat_id)
-        if container is not None:
-            if container.status != "running":
-                raise SandboxStopped()
+        if container is not None and container.status == "running":
             _require_dns_compatibility(container)
             note_running_activity(chat_id, container)
             return container
-        if meta is not None:
-            raise SandboxStopped()
+        if container is not None or meta is not None:
+            return _launch_locked(chat_id)
         print(f"[MCP] Creating new container: {_container_name(chat_id)}")
         container = _create_container(chat_id, _container_name(chat_id))
         note_running_activity(chat_id, container)
@@ -1275,7 +1269,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
                 _prepare_existing_container(winner, mutate=False)
                 print(f"[MCP] Adopting running container after name conflict: {container_name}")
                 return winner
-            raise SandboxStopped()
+            raise LaunchFailed(409, "create conflict winner is not running") from e
         elif "host UTS namespace" in str(e):
             print("[MCP] Engine refuses a per-container hostname; creating without one")
             config.pop("hostname", None)
@@ -1842,24 +1836,39 @@ def launch_sandbox(chat_id: str, credential_source: str = "server") -> dict:
     token = current_credential_source.set(credential_source)
     try:
         with _combined_lock(chat_id):
-            return _launch_locked(chat_id, credential_source)
+            _launch_locked(chat_id)
+            return {"state": "running"}
     finally:
         current_credential_source.reset(token)
 
 
-def _launch_locked(chat_id: str, credential_source: str) -> dict:
-    try:
-        meta = load_container_meta(chat_id)
-    except MetadataCorrupt:
-        raise
+def _note_launched(chat_id: str, container) -> None:
+    """Bind retirement evidence, then grant a fresh idle window.
+
+    An idle stop leaves an expired state naming the same container, which
+    retirement alone does not refresh.
+    """
+    mark_sleeper_retired(chat_id, container)
+    note_running_activity(chat_id, container)
+
+
+def _launch_locked(chat_id: str):
+    """Bring the chat's sandbox to running under the held lifecycle lock."""
+    meta = load_container_meta(chat_id)
     container = _lifecycle_docker_step("engine lookup", _lookup_container, chat_id)
     if container is None and meta is None:
         raise NeverCreated()
     if container is None:
-        created = _create_container(chat_id, _container_name(chat_id))
+        # Recreation never uses request credentials, on the launch and the tool path.
+        source = current_credential_source.set("server")
+        try:
+            created = _create_container(chat_id, _container_name(chat_id))
+        finally:
+            current_credential_source.reset(source)
         if _reload_container(created) != "running":
             raise LaunchFailed(500, "recreated sandbox is not running")
-        return {"state": "running"}
+        note_running_activity(chat_id, created)
+        return created
 
     status = container.status
     state = read_idle_state(chat_id)
@@ -1869,9 +1878,8 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
         _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
         if not _migration_verified(state, container):
             retire_legacy_sleeper(chat_id, container)
-        else:
-            note_running_activity(chat_id, container)
-        return {"state": "running"}
+        _note_launched(chat_id, container)
+        return container
     if status == "paused":
         _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
         note_running_activity(chat_id, container)
@@ -1881,7 +1889,8 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
             raise LaunchFailed(500, f"engine refused unpause: {exc}") from exc
         if _reload_container(container) != "running":
             raise LaunchFailed(500, "unpause did not reach running")
-        return {"state": "running"}
+        _note_launched(chat_id, container)
+        return container
     if status in {"exited", "created"}:
         _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=True)
         try:
@@ -1889,14 +1898,15 @@ def _launch_locked(chat_id: str, credential_source: str) -> dict:
         except docker.errors.APIError as exc:
             raise LaunchFailed(500, f"engine refused start: {exc}") from exc
         _verify_started_container(container)
-        mark_sleeper_retired(chat_id, container)
-        return {"state": "running"}
+        _note_launched(chat_id, container)
+        return container
     if status == "restarting":
         _lifecycle_docker_step("network preparation", _prepare_existing_container, container, mutate=False)
         if not _lifecycle_docker_step("restart readiness", _wait_until_running, container):
             raise LaunchFailed(504, "restart readiness timed out")
         retire_legacy_sleeper(chat_id, container)
-        return {"state": "running"}
+        _note_launched(chat_id, container)
+        return container
     if status == "dead":
         raise LaunchFailed(500, "sandbox is dead")
     raise LaunchFailed(500, f"unsupported sandbox state: {status}")
