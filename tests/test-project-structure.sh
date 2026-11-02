@@ -182,6 +182,22 @@ else
     fail "test-list-subagent-models.sh exits non-zero — see /tmp/list-subagent.log"
 fi
 
+# 15. Offline Remotion template and skill (content pins: tests/test_remotion_image.py)
+echo ""
+echo "[15/15] Remotion template and skill"
+for f in remotion-template/package.json remotion-template/package-lock.json \
+         remotion-template/remotion.config.ts remotion-template/tsconfig.json \
+         remotion-template/src/index.ts remotion-template/src/Root.tsx \
+         skills/public/remotion/SKILL.md \
+         skills/public/remotion/remotion-best-practices/SKILL.md \
+         skills/public/remotion/remotion-best-practices/SOURCE.md; do
+    if [ -f "$ROOT/$f" ]; then
+        pass "$f"
+    else
+        fail "$f missing"
+    fi
+done
+
 # Summary
 echo ""
 echo "==============================="

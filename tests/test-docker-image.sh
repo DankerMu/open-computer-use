@@ -847,6 +847,28 @@ else
     fail "entrypoint missing escape-hint line (NO_AUTOSTART=1 bash / touch /tmp/.no_autostart): $ENTRYPOINT_OUT"
 fi
 
+# 15. Offline Remotion template, started the way skills/public/remotion/SKILL.md
+# says: copy without node_modules, symlink the root-owned node_modules, no network.
+echo ""
+echo "[15/15] Offline Remotion template"
+if REMOTION_OUT=$(run_in_container_verbose '
+[ "$(stat -c %U /opt/remotion-template/node_modules)" = root ] && echo "owner=OK"
+[ ! -w /opt/remotion-template/node_modules ] && echo "readonly=OK"
+mkdir -p /home/assistant/videos/smoke && cd /home/assistant/videos/smoke
+tar -C /opt/remotion-template --exclude=node_modules -cf - . | tar -xf -
+ln -s /opt/remotion-template/node_modules node_modules
+npx --no-install remotion browser ensure
+npx --no-install remotion still src/index.ts Main /tmp/remotion-smoke.png --frame=30
+[ -s /tmp/remotion-smoke.png ] && echo "still=OK"
+'); then
+    pass "offline Remotion still exits 0"
+else
+    fail "offline Remotion still failed: $REMOTION_OUT"
+fi
+echo "$REMOTION_OUT" | grep -q "owner=OK" && pass "template node_modules owned by root" || fail "template node_modules not owned by root"
+echo "$REMOTION_OUT" | grep -q "readonly=OK" && pass "template node_modules read-only for assistant" || fail "template node_modules writable by assistant"
+echo "$REMOTION_OUT" | grep -q "still=OK" && pass "Remotion still written without network" || fail "Remotion still missing: $REMOTION_OUT"
+
 test_browser_cli_config
 test_browser_relay
 

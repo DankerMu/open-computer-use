@@ -618,6 +618,31 @@ RUN chmod -R a+r /opt/cli-defaults
 COPY --chown=root:root computer-use-server/bin/list-subagent-models /usr/local/bin/list-subagent-models
 RUN chmod +x /usr/local/bin/list-subagent-models
 
+# Remotion template for skills/public/remotion: projects copy it and symlink its
+# node_modules, so rendering needs no network. `remotion browser ensure` fetches
+# Chrome Headless Shell 157.0.8080.0 (Remotion 4.0.537's tested version) into
+# node_modules/.remotion; the build fails unless the installed files match the
+# pinned sha256 list exactly. Root-owned, readable by assistant.
+COPY --chown=root:root remotion-template/ /opt/remotion-template/
+RUN cd /opt/remotion-template && \
+    npm ci --no-audit --no-fund && \
+    npx --no-install remotion browser ensure && \
+    test "$(cat node_modules/.remotion/chrome-headless-shell/VERSION)" = "157.0.8080.0-remotion-v3" && \
+    printf '%s\n' \
+        '6499ae333be19f27484c73a61da262754a02ab3d82bbba856f44bef785ec3e62  chrome-headless-shell' \
+        '63c23d1cb8444e28b61db90c5867aca54272c0f2acdca3fb5fb0e50c7d5a280a  libEGL.so' \
+        '3fab23c6e868449d3a04274ff45ea2a432fa1d7f1811b1b49eb2403299a4255f  libGLESv2.so' \
+        '9b27ad17f1c92e941f2929661e0f8a03933f565abbf5f2e16848ce65150eb5b9  libvk_swiftshader.so' \
+        '4fbaaab71a65d9393b3f38e72dfcee707620beacc532ac354b0360934cdf5f0c  libvulkan.so.1' \
+        'c9eef28b6b984fec220ef0abfecc40b502d46946706e47bfe97707027cb818bd  vk_swiftshader_icd.json' \
+        > /tmp/headless-shell.sha256 && \
+    cd node_modules/.remotion/chrome-headless-shell/linux64/chrome-headless-shell-linux64 && \
+    sha256sum -c /tmp/headless-shell.sha256 && \
+    test "$(find . -type f | wc -l)" = "6" && \
+    rm -f /tmp/headless-shell.sha256 && \
+    npm cache clean --force && \
+    chmod -R a+rX /opt/remotion-template
+
 # Copy skills into image (available in all containers)
 # Placed late in Dockerfile so skill file changes don't invalidate heavy layers above
 COPY --chown=root:root ./skills /mnt/skills/
