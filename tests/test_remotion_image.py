@@ -232,6 +232,7 @@ def test_skill_md_states_the_sandbox_rules() -> None:
         "npx --no-install remotion still",
         "nohup npx --no-install remotion render",
         "> render.log 2>&1 &",
+        'pgrep -f "[r]emotion render"',
         "COMMAND_TIMEOUT",
         "--concurrency=2",
         "--gl=swangle",

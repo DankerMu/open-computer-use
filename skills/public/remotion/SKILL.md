@@ -57,8 +57,10 @@ nohup npx --no-install remotion render src/index.ts Main /mnt/user-data/files/<n
 **3. Poll until it finishes.** The sandbox stops after about 10 minutes without a tool call, which kills the render, so keep polling:
 
 ```bash
-sleep 60; tail -n 3 /home/assistant/videos/<name>/render.log; pgrep -f "remotion render" >/dev/null && echo running || echo finished
+sleep 60; tail -n 3 /home/assistant/videos/<name>/render.log; pgrep -f "[r]emotion render" >/dev/null && echo running || echo finished
 ```
+
+The brackets in `[r]emotion` stop `pgrep` from matching this polling command itself.
 
 **4. Verify and hand over.** When it has finished, check the log for errors and the file with `ffprobe`, then tell the user the file `/mnt/user-data/files/<name>.mp4` is in the Files tab:
 
