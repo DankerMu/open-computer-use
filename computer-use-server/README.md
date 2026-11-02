@@ -479,13 +479,49 @@ Selection resolves the id against the authorized broker's coherent listing,
 up to 100 pages/10 seconds (including a stale-cursor retry). Only a completed
 same-revision enumeration can prove `missing`; failures or limits are `error`.
 Resolved URLs must be canonical same-origin URLs under this chat's files path.
-Only broker types DOCX/XLSX/PPTX are eligible, and HTML, SVG, XHTML, XML and
-`+xml` MIME essences are refused regardless of type. `ready` follows successful
-Office rendering; corrupt Office reports `error` visibly, so the parent can
-offer its own authorized download. The child does not poll, autoselect, handle
-generated-content link selection, or mount Browser/Terminal/CLI clients. A
-newer request clears the old render and supersedes its result; tearing down
-the iframe releases owned effects.
+Broker types DOCX/XLSX/PPTX, Markdown, code, text, spreadsheet (CSV/TSV), audio
+and video are eligible, and HTML, SVG, XHTML, XML and `+xml` MIME essences are
+refused regardless of type. `drawio`, `html`, `pdf`, `image` and `other` report
+`unsupported`: PDF is not rendered in this view, because the parent displays PDF
+in its own viewer and raster images in an `<img>` element. Entries marked
+`too_large` or `unsupported_name` also report `unsupported`, without a fetch.
+`ready` follows successful rendering. Corrupt Office content, and a fetch error,
+non-OK response or sanitizer failure for Markdown, code, text or a spreadsheet,
+report `error` visibly, so the parent can offer its own authorized download.
+Audio and video report `ready` on `loadedmetadata` and `error` on the element's
+`error` event, which covers formats the browser cannot decode; they offer no
+download link here, since the frame has no `allow-downloads`. The child does not
+poll, autoselect, handle generated-content link selection, or mount
+Browser/Terminal/CLI clients. A newer request clears the old render, releases
+its media request and supersedes its result; tearing down the iframe releases
+owned effects.
+
+Embedded Markdown is static, because the frame shares the parent's origin and
+has no CSP. Mermaid and KaTeX do not run: those blocks stay as escaped code or
+text, and only syntax highlighting writes to the DOM after sanitizing. An image
+stays only if it is inline raster data or its resolved URL has the page origin
+and a path under this chat's files path; any other image is removed before
+insertion. So is an image with a query string, one on this chat's `archive`
+route, whose response is a zip of the workspace, one whose URL does not parse,
+and any past the first 100. Only same-document fragment links stay active; every
+other link keeps its text and has no `href`. Standalone preview keeps Mermaid,
+KaTeX, remote images and external links.
+
+Parsing, highlighting and layout run on the thread the frame shares with the
+parent, so this view limits them. Markdown over 30,000 characters shows as
+escaped plain text with a notice and reports `ready` without being parsed; it
+stops at 200,000 characters and the notice then says the view is truncated.
+Markdown whose estimated table size is over 200,000 cells uses the same
+plain-text view and notice, also without being parsed; the estimate comes from
+the text alone, as the columns of the line with the most `|` characters times
+the number of lines. Markdown with a line of more than 16 `>` characters uses
+the same view. Code and text over 20,000 characters show without
+highlighting or line numbers. A CSV or TSV shows at most 200 columns per row,
+header and body, with a notice when a shown row had more, and at most 1,000
+characters per cell, with no notice. A Markdown fence keeps its language class
+only if highlight.js recognises the language; any other fence, including one
+with no language, stays plain and is not auto-detected. Standalone preview has
+none of these limits.
 
 DOCX and SheetJS-converted HTML pass through locally pinned DOMPurify before
 insertion into the trusted DOM in both embedded and standalone previews.

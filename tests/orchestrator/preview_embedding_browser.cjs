@@ -81,6 +81,9 @@ async function captureProductionPreviews(docserverOrigin) {
     await fs.rm(directory, { recursive: true, force: true });
   }
 }
+// The final dot-separated segment of this name contains a quote and markup.
+const MARKUP_NAME = 'data:text/plain,a."><img src=x onerror=__nameCanary=1>';
+const QUOTED_IMAGE = `it's quote" data-injected="yes.png`;
 const OFFICE_MIME = {
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -132,6 +135,66 @@ const files = [
   { file_id: 'foreign', path: 'foreign.docx', type: 'docx', mime: OFFICE_MIME.docx, url: 'https://example.invalid/foreign.docx' },
   { file_id: 'cross-chat', path: 'cross-chat.docx', type: 'docx', mime: OFFICE_MIME.docx, url: '/ocu/files/another-chat/cross-chat.docx' },
   { file_id: 'hostile-markdown', path: 'hostile.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'static-markdown', path: 'guides/static.md', type: 'markdown', mime: 'text/markdown',
+    url: `/ocu/files/${CHAT}/guides/static.md` },
+  { file_id: 'notes', path: 'notes.txt', type: 'text', mime: 'text/plain' },
+  { file_id: 'table', path: 'table.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'tabbed', path: 'tabbed.tsv', type: 'spreadsheet', mime: 'text/tab-separated-values' },
+  { file_id: 'data-json', path: 'data.json', type: 'code', mime: 'application/json' },
+  { file_id: 'script', path: 'script.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'upper-script', path: 'SCRIPT.PY', type: 'code', mime: 'text/x-python' },
+  { file_id: 'tone', path: 'tone.wav', type: 'audio', mime: 'audio/x-wav' },
+  { file_id: 'clip', path: 'clip.webm', type: 'video', mime: 'video/webm' },
+  { file_id: 'held-clip', path: 'held.webm', type: 'video', mime: 'video/webm' },
+  { file_id: 'corrupt-mp3', path: 'corrupt.mp3', type: 'audio', mime: 'audio/mpeg' },
+  { file_id: 'corrupt-mp4', path: 'corrupt.mp4', type: 'video', mime: 'video/mp4' },
+  { file_id: 'absent-markdown', path: 'absent.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'absent-code', path: 'absent.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'absent-csv', path: 'absent.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'reset-markdown', path: 'reset.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'reset-code', path: 'reset.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'reset-csv', path: 'reset.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'long-text', path: 'long.txt', type: 'text', mime: 'text/plain' },
+  { file_id: 'long-markdown', path: 'long.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'many-images', path: 'guides/many.md', type: 'markdown', mime: 'text/markdown',
+    url: `/ocu/files/${CHAT}/guides/many.md` },
+  { file_id: 'markdown-over-limit', path: 'over-limit.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'markdown-at-limit', path: 'at-limit.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'markdown-at-cap', path: 'at-cap.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'markdown-over-cap', path: 'over-cap.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-wide-rows', path: 'table-wide-rows.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-past-budget', path: 'table-past-budget.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-at-budget', path: 'table-at-budget.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-in-quote', path: 'table-in-quote.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-cr-lines', path: 'table-cr-lines.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-ordinary', path: 'table-ordinary.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'quote-deep-table', path: 'quote-deep-table.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'quote-deep-list', path: 'quote-deep-list.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'wide-csv', path: 'wide.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'wide-tsv', path: 'wide.tsv', type: 'spreadsheet', mime: 'text/tab-separated-values' },
+  { file_id: 'wide-body-csv', path: 'wide-body.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'columns-at-limit', path: 'columns-at-limit.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'columns-over-limit', path: 'columns-over-limit.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'columns-unshown-row', path: 'columns-unshown-row.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'long-cell-csv', path: 'long-cell.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'long-cell-tsv', path: 'long-cell.tsv', type: 'spreadsheet', mime: 'text/tab-separated-values' },
+  { file_id: 'cell-at-limit', path: 'cell-at-limit.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'code-over-limit', path: 'over-limit.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'code-at-limit', path: 'at-limit.py', type: 'code', mime: 'text/x-python' },
+  { file_id: 'too-large-markdown', path: 'too-large.md', type: 'markdown', mime: 'text/markdown', too_large: true },
+  { file_id: 'unsupported-name-code', path: 'unsupported-name.py', type: 'code', mime: 'text/x-python',
+    unsupported_name: true, url: null },
+  { file_id: 'markup-name', path: MARKUP_NAME, type: 'code', mime: 'text/plain',
+    url: `/ocu/files/${CHAT}/${MARKUP_NAME.split('/').map(encodeURIComponent).join('/')}` },
+  { file_id: 'refused-html', path: 'page.html', type: 'html', mime: 'text/html' },
+  { file_id: 'refused-pdf', path: 'manual.pdf', type: 'pdf', mime: 'application/pdf' },
+  { file_id: 'refused-image', path: 'chart.png', type: 'image', mime: 'image/png' },
+  { file_id: 'refused-other', path: 'blob.bin', type: 'other', mime: 'application/octet-stream' },
+  { file_id: 'refused-html-markdown', path: 'spoof.md', type: 'markdown', mime: 'text/html; charset=utf-8' },
+  { file_id: 'refused-xml-text', path: 'spoof.txt', type: 'text', mime: 'text/xml' },
+  { file_id: 'refused-svg-code', path: 'spoof.py', type: 'code', mime: 'image/svg+xml' },
+  { file_id: 'refused-atom', path: 'feed.atom', type: 'code', mime: 'application/atom+xml' },
+  { file_id: 'refused-xml-audio', path: 'spoof.mp3', type: 'audio', mime: 'application/xhtml+xml' },
 ];
 const requests = [];
 let slowRequested;
@@ -197,7 +260,12 @@ const heldViewer = [];
 const heldImages = [];
 const htmlFixtures = new Map();
 const heldHtml = [];
+const heldMedia = [];
+let heldMediaRequested = () => {};
 const bytes = {};
+const fileMediaTypes = {
+  '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.mp4': 'video/mp4', '.webm': 'video/webm',
+};
 const contentTypes = {
   '.js': 'text/javascript',
   '.mjs': 'text/javascript',
@@ -346,13 +414,14 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname.endsWith('/slow.docx')) { held.push(res); slowRequested(); return; }
       if (url.pathname.endsWith('/slow.xlsx')) { heldSheets.push(res); sheetRequested(); return; }
       if (drawioHeldDocument && url.pathname.endsWith('/diagram.drawio')) { heldDrawio.push(res); return; }
+      if (url.pathname.endsWith('/held.webm')) { heldMedia.push(res); heldMediaRequested(res); return; }
       const name = decodeURIComponent(url.pathname.slice(filesRoot.length)).replace(/\/{2,}/g, '/');
       if (!(name in bytes)) {
         requests[requests.length - 1].status = 404;
         return respond(res, 404, 'Not found', 'text/plain');
       }
       requests[requests.length - 1].status = 200;
-      return respond(res, 200, bytes[name], 'application/octet-stream');
+      return respond(res, 200, bytes[name], fileMediaTypes[path.extname(name)] || 'application/octet-stream');
     }
     if (url.pathname === `${prefix}/browser/${CHAT}/status`) {
       if (browserFixture === 'held') { heldBrowserStatuses.push(res); return; }
@@ -842,6 +911,10 @@ async function main() {
     let retiringFrame = null;
     const expectedRuntimeFailures = [];
     const unexpectedNetworkFailures = [];
+    // Deliberate file faults and media a newer selection cancels: their requests fail by design.
+    const expectedFileFailureUrls = new Set(['absent.md', 'absent.py', 'absent.csv', 'reset.md', 'reset.py',
+      'reset.csv', 'tone.wav', 'clip.webm', 'held.webm', 'corrupt.mp3', 'corrupt.mp4']
+      .map(name => `${origin}/ocu/files/${CHAT}/${name}`).concat(`${origin}/ocu/static/purify.min.js`));
     page.on('request', request => {
       const address = new URL(request.url());
       if (address.origin !== origin ||
@@ -865,6 +938,7 @@ async function main() {
     page.on('requestfailed', request => {
       const failure = request.failure()?.errorText || '';
       const url = request.url();
+      if (expectedFileFailureUrls.has(url)) return;
       const uploadFault = uploadFaults.find(fault => fault.request === request && fault.kind === 'network');
       if (uploadFault && failure === 'net::ERR_CONNECTION_RESET') {
         uploadFault.failure = failure;
@@ -899,6 +973,7 @@ async function main() {
       if (message.type() !== 'error') return;
       const text = message.text();
       const url = message.location().url;
+      if (expectedFileFailureUrls.has(url)) return;
       const expectedBrokerUrl = `${origin}/ocu/api/outputs/${CHAT}`;
       if (injectedListingFailure && accepted503 === 0 && text.includes('503')
           && (url.startsWith(expectedBrokerUrl) || text.includes(expectedBrokerUrl))) {
@@ -964,6 +1039,17 @@ async function main() {
       assert.equal(result.chat_id, CHAT);
       assert.equal(result.file_id, await page.evaluate(g => window.expectedSelections[g], generation));
       return result;
+    };
+    // Each case reports on its own, so one run names every failing case.
+    const fileCaseFailures = [];
+    const fileCase = async (name, work) => {
+      try {
+        await work();
+        console.log(JSON.stringify({ fileCase: name, result: 'pass' }));
+      } catch (error) {
+        fileCaseFailures.push(name);
+        console.error(JSON.stringify({ fileCase: name, result: 'fail', error: String(error?.message ?? error) }));
+      }
     };
     await page.goto(origin + '/parent');
     const extendedFrame = await within(page.evaluate(async socketUrl => {
@@ -1237,6 +1323,136 @@ async function main() {
       '<img alt="Markdown event canary" ' +
       'src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=" ' +
       'onload="document.documentElement.dataset.markdownEventCanary = \'executed\'">\n');
+    const canary = 'document.documentElement.dataset.staticCanary=1';
+    bytes['guides/static.md'] = Buffer.from([
+      '[Jump to section](#target-section)',
+      '<p><strong>Static Markdown neighbor</strong></p>',
+      `<script>${canary}</script>`,
+      `<img alt="Inline event" src="data:image/png;base64,AAAA" onerror="${canary}">`,
+      `<a href="javascript:${canary}">Script link</a>`,
+      `[Token script link](javascript:${canary})`,
+      `\`\`\`mermaid\ngraph TD\n  A["<img src=x onerror=${canary}>"]\n\`\`\``,
+      `$$\\href{javascript:${canary}}{Display math}$$`,
+      'Inline math $x^2$ stays text.',
+      '```javascript\nconst answer = 42;\n```',
+      '```python\nprint("known label")\n```',
+      `![Inline raster](${rasters.png})`, '![Relative raster](pixel.png)', '![Token root](/pixel.png)',
+      '![Remote HTTP](http://images.example.test/pixel.png)',
+      '![Remote HTTPS](https://images.example.test/pixel.png)',
+      `![Protocol relative](//evil.example/ocu/files/${CHAT}/x.png)`,
+      `![Other origin](https://evil.example/ocu/files/${CHAT}/x.png)`,
+      '<img alt="Root absolute" src="/api/x">',
+      `<img alt="Sibling chat" src="/ocu/files/${CHAT}-other/x.png">`,
+      '![Traversal](../../../api/x.png)',
+      '<img alt="Encoded traversal" src="..%2f..%2f..%2fapi%2fx.png">',
+      '<img alt="Backslash traversal" src="..\\..\\..\\api\\x.png">',
+      `<img alt="Archive route" src="/ocu/files/${CHAT}/archive">`,
+      `<img alt="Archive through dot segments" src="/ocu/files/${CHAT}/guides/../archive">`,
+      '![Archive relative](../archive)', '![Archive query](../archive?download=1)',
+      '![Archive encoded](../%61rchive)', '![Nested archive name](archive)',
+      '![Query string](queried.png?v=1)',
+      '<img alt="Double slash path" src="/.//">', '![Double slash relative](../../..//)',
+      '![Double slash from the root](../../../..//)',
+      '```\nconst unlabelled = 1;\n```',
+      '```---\nconst hyphens = 1;\n```',
+      '```nosuchlanguage\nconst unknown = 1;\n```',
+      '[HTTP link](http://links.example.test/x)', '[HTTPS link](https://links.example.test/x)',
+      '[Mail link](mailto:reader@example.test)', '[Relative link](pixel.png)', '[Workspace file link](../notes.txt)',
+      ...Array.from({ length: 40 }, (_, index) => `Filler paragraph ${index}`),
+      '# Target section',
+    ].join('\n\n'));
+    bytes['notes.txt'] = Buffer.from(`Plain "double" and 'single' <b>marks</b> &amp; text`);
+    bytes['table.csv'] = Buffer.from(`Name,Note\n"He said ""hi""",it's <i>fine</i>\n`);
+    bytes['tabbed.tsv'] = Buffer.from('Left\tRight\nOne\tTwo\n');
+    bytes['data.json'] = Buffer.from('{"answer": 42}');
+    bytes['script.py'] = Buffer.from('print("hello")\n');
+    bytes['SCRIPT.PY'] = bytes['script.py'];
+    bytes['long.txt'] = Buffer.from('a line of text\n'.repeat(15000));
+    bytes['long.md'] = Buffer.from('word '.repeat(110000));
+    bytes['guides/archive'] = bytes['guides/pixel.png'];
+    bytes['guides/queried.png'] = bytes['guides/pixel.png'];
+    const imageCount = 101;
+    for (let index = 0; index < imageCount; index += 1)
+      bytes[`guides/many-${index}.png`] = bytes['guides/pixel.png'];
+    bytes['guides/many.md'] = Buffer.from([
+      '![Removed first](queried.png?v=1)',
+      ...Array.from({ length: imageCount }, (_, index) => `![Image ${index}](many-${index}.png)`),
+      '**After the images**',
+    ].join('\n\n'));
+    const sized = (prefix, unit, length) => Buffer.from((prefix + unit.repeat(length)).slice(0, length));
+    bytes['over-limit.md'] = sized(`<img id="plain-canary" src=x onerror="${canary}">\n\n`, '*a ', 30001);
+    bytes['at-limit.md'] = sized('**Parsed at the limit**\n\n', 'word ', 30000);
+    bytes['past-limit.md'] = sized('**Parsed past the limit**\n\n', 'word ', 30001);
+    bytes['over-limit.py'] = sized('', 'print("hello")\n', 20001);
+    bytes['at-limit.py'] = sized('', 'print("hello")\n', 20000);
+    bytes['at-cap.md'] = sized('', 'word ', 200000);
+    bytes['over-cap.md'] = sized('', 'word ', 200001);
+    const csvRow = columns => Array.from({ length: columns }, (_, index) => `c${index}`).join(',');
+    bytes['wide.csv'] = Buffer.from(','.repeat(500000));
+    bytes['wide.tsv'] = Buffer.from('\t'.repeat(500000));
+    bytes['wide-body.csv'] = Buffer.from('Left,Right\n' + ','.repeat(500000));
+    bytes['columns-at-limit.csv'] = Buffer.from(`${csvRow(200)}\n${csvRow(200)}\n`);
+    bytes['columns-over-limit.csv'] = Buffer.from(`${csvRow(201)}\n${csvRow(201)}\n`);
+    bytes['columns-unshown-row.csv'] = Buffer.from(`${'a,b\n'.repeat(1000)}${csvRow(201)}\n`);
+    bytes['columns-standalone.csv'] = Buffer.from(`${csvRow(300)}\n${csvRow(300)}\n`);
+    const longCell = 'a\u05d0'.repeat(100001).slice(0, 200001);
+    bytes['long-cell.csv'] = Buffer.from(`${longCell},b\n${longCell},d\n`);
+    bytes['long-cell.tsv'] = Buffer.from(`${longCell}\tb\n${longCell}\td\n`);
+    bytes['cell-at-limit.csv'] = Buffer.from(`${'h'.repeat(1000)},b\n${'c'.repeat(1000)},d\n`);
+    bytes['cell-standalone.csv'] = Buffer.from(`${'h'.repeat(2000)},b\n${'c'.repeat(2000)},d\n`);
+    // marked pads each short row to the header, so a cell costs nothing in the source.
+    const paddedTable = (columns, rows, lead = '', rest = lead) => {
+      const row = cell => Array.from({ length: columns }, () => cell).join('|');
+      return [`${lead}${row('h')}`, `${rest}${row('-')}`, ...Array.from({ length: rows }, () => `${rest}x`)].join('\n');
+    };
+    bytes['table-wide-rows.md'] = Buffer.from(paddedTable(200, 10000));
+    // 20 columns over 10,000 lines is exactly the limit by the bound, and one line more passes it.
+    bytes['table-at-budget.md'] = Buffer.from(paddedTable(20, 9998));
+    bytes['table-past-budget.md'] = Buffer.from(paddedTable(20, 9999));
+    bytes['table-in-quote.md'] = Buffer.from(paddedTable(100, 2000, '> '));
+    bytes['table-cr-lines.md'] = Buffer.from(paddedTable(200, 10000).replaceAll('\n', '\r'));
+    const ordinaryRow = cell => `| ${Array.from({ length: 12 }, (_, index) => `${cell} ${index}`).join(' | ')} |`;
+    bytes['table-ordinary.md'] = Buffer.from(['# Quarterly figures', '', ordinaryRow('Column'),
+      `|${'---|'.repeat(12)}`, ...Array.from({ length: 200 }, (_, index) => ordinaryRow(`row ${index}`))].join('\n'));
+    // 17 quote markers is one past the depth limit; the unquoted last line ends every level at once.
+    bytes['quote-deep-table.md'] = Buffer.from(`${paddedTable(10, 100, '> '.repeat(17))}\nAfter the quote`);
+    bytes['quote-deep-list.md'] = Buffer.from([...Array.from({ length: 100 },
+      (_, index) => `${'> - '.repeat(8)}>${'> '.repeat(8)}line ${index}`), 'After the quote'].join('\n'));
+    bytes['quote-at-depth.md'] = Buffer.from(`${'> '.repeat(16)}**At the depth limit**\n\nAfter the quote`);
+    bytes['quote-ordinary.md'] = Buffer.from(['# Review notes', '', '> The outer remark.', '>',
+      '> > The **inner** remark.', '', 'After the quote'].join('\n'));
+    bytes['too-large.md'] = Buffer.from('Too large body');
+    bytes['unsupported-name.py'] = Buffer.from('Unsupported name body');
+    bytes[MARKUP_NAME] = Buffer.from('Markup name body');
+    bytes[QUOTED_IMAGE] = bytes['guides/pixel.png'];
+    const pixelWidth = bytes['guides/pixel.png'].readUInt32BE(16);
+    // One second of 8-bit silence at 8 kHz; WAV needs no encoder and every Chromium decodes it.
+    const toneSamples = Buffer.alloc(8000, 0x80);
+    const toneHeader = Buffer.alloc(44);
+    toneHeader.write('RIFF', 0);
+    toneHeader.writeUInt32LE(36 + toneSamples.length, 4);
+    toneHeader.write('WAVEfmt ', 8);
+    toneHeader.writeUInt32LE(16, 16);
+    toneHeader.writeUInt16LE(1, 20);
+    toneHeader.writeUInt16LE(1, 22);
+    toneHeader.writeUInt32LE(8000, 24);
+    toneHeader.writeUInt32LE(8000, 28);
+    toneHeader.writeUInt16LE(1, 32);
+    toneHeader.writeUInt16LE(8, 34);
+    toneHeader.write('data', 36);
+    toneHeader.writeUInt32LE(toneSamples.length, 40);
+    bytes['tone.wav'] = Buffer.concat([toneHeader, toneSamples]);
+    // 16x16 VP8 from `ffmpeg -f lavfi -i color=c=red:s=16x16:d=0.2:r=5 -c:v libvpx -b:v 10k -g 1 -an`;
+    // Playwright's Chromium has no H.264, and CI has no encoder.
+    bytes['clip.webm'] = Buffer.from(
+      'GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAHUEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHGTbuMU6uEElTDZ1OsggEiTbuMU6uEHFO7a1OsggG+7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmoCrXsYMPQkBNgIRMYXZmV0GETGF2ZkSJiEBpAAAAAAAAFlSua9euAQAAAAAAAE7XgQFzxYgAAAAAAAAAAZyBACK1nIN1bmSIgQCGhVZfVlA4g4EBI+ODhAvrwgDgkLCBELqBEJqBAlWwhFW5gQFV7oEA7AEAAAAAAAACAAASVMNn0HNzzWPAi2PFiAAAAAAAAAABZ8iYRaOHRU5DT0RFUkSHi0xhdmMgbGlidnB4Z8ihRaOIRFVSQVRJT05Eh5MwMDowMDowMC4yMDAwMDAwMDAAH0O2dcLngQCjvYEAAIDwAgCdASoQABAAAEcIhYWIhYSIAgICdaoD+AP6Ag1NGAD+/W7z/+OZNzDE/45t//FhPA4oyP/xUQAcU7trkbuPs4EAt4r3gQHxggF38IED', 'base64');
+    bytes['corrupt.mp3'] = Buffer.from('not an audio stream '.repeat(64));
+    bytes['corrupt.mp4'] = Buffer.from('not a video stream '.repeat(64));
+    bytes['valid.pdf'] = Buffer.from(['%PDF-1.4', '1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj',
+      '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj',
+      '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 72 72]/Contents 4 0 R>>endobj',
+      '4 0 obj<</Length 23>>stream', '1 0 0 rg 0 0 72 72 re f', 'endstream endobj',
+      'trailer<</Root 1 0 R>>', ''].join('\n'));
 
     await page.evaluate(() => window.mount());
     await page.waitForFunction(() => window.states.some(row => row.type === 'ocu:preview-ready'), null, { timeout: 10000 });
@@ -1630,12 +1846,23 @@ async function main() {
       await waitState(generation, 'error');
       await frame().locator('.preview-stage .empty-state').waitFor();
     }
-    await page.evaluate(() => window.select('hostile-markdown', 37));
-    await waitState(37, 'unsupported');
-    assert.equal(requests.filter(row => row.path.endsWith('/hostile.md')).length, 0,
-      'Office-only embedding fetched Markdown bytes');
-    assert.equal(await frame().locator('.preview-stage .markdown-body').count(), 0,
-      'Office-only embedding rendered Markdown');
+    await fileCase('Markdown with unsafe content reports ready sanitized', async () => {
+      const fetched = requests.filter(row => row.path.endsWith('/hostile.md')).length;
+      await page.evaluate(() => window.select('hostile-markdown', 37));
+      await waitState(37, 'ready');
+      assert.equal(requests.filter(row => row.path.endsWith('/hostile.md')).length, fetched + 1,
+        'embedded Markdown did not fetch its bytes');
+      const body = frame().locator('.preview-stage .markdown-body');
+      await body.locator('strong').getByText('Safe Markdown neighbor', { exact: true }).waitFor();
+      const image = body.locator('img[alt="Markdown event canary"]');
+      assert.equal(await image.getAttribute('onload'), null, 'event attribute reached the trusted DOM');
+      assert.deepEqual(await image.evaluate(async (node) => {
+        await node.decode();
+        return [node.naturalWidth, node.naturalHeight];
+      }), [1, 1], 'inline raster did not decode');
+      assert.equal(await frame().locator('#app').evaluate(() =>
+        document.documentElement.getAttribute('data-markdown-event-canary')), null);
+    });
     assert.equal(await page.locator('#preview').getAttribute('sandbox'),
       'allow-scripts allow-same-origin allow-forms');
     const secondSlow = new Promise(resolve => { slowRequested = resolve; });
@@ -1663,6 +1890,565 @@ async function main() {
     await page.locator('#preview').evaluate(element => element.remove());
     await page.evaluate(() => window.mount());
     await page.waitForFunction(() => window.states.filter(row => row.type === 'ocu:preview-ready').length === 2);
+    let fileGeneration = 200;
+    const selectFile = async (id) => {
+      const generation = ++fileGeneration;
+      await page.evaluate(([file, value]) => window.select(file, value), [id, generation]);
+      return generation;
+    };
+    const showFile = async (id, state, timeout) => {
+      const generation = await selectFile(id);
+      await waitState(generation, state, timeout);
+      return generation;
+    };
+    const remountFiles = async () => {
+      const mounted = await page.evaluate(() =>
+        window.states.filter(row => row.type === 'ocu:preview-ready').length);
+      await retireFrame();
+      await page.evaluate(() => window.mount());
+      await page.waitForFunction(count =>
+        window.states.filter(row => row.type === 'ocu:preview-ready').length === count + 1, mounted);
+    };
+    const nextFrames = () => page.evaluate(() =>
+      new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const fileStage = () => frame().locator('.preview-stage');
+    for (const [label, response] of [
+      ['unusable', { status: 200, contentType: 'text/javascript', body: 'window.DOMPurify = {};' }],
+      ['unavailable', { status: 404, contentType: 'text/plain', body: 'Not found' }],
+    ]) {
+      await fileCase(`Markdown reports error when the sanitizer is ${label}`, async () => {
+        await remountFiles();
+        await page.route('**/ocu/static/purify.min.js', route => route.fulfill(response));
+        try {
+          await showFile('hostile-markdown', 'error');
+          await fileStage().locator('.empty-state').waitFor();
+          assert.equal(await fileStage().locator('.markdown-body, img').count(), 0);
+        } finally {
+          await page.unroute('**/ocu/static/purify.min.js');
+        }
+      });
+    }
+    await remountFiles();
+    // The harness default of 150px collapses the audio control, which a sidebar never does.
+    await page.locator('#preview').evaluate((node) => { node.style.height = '480px'; });
+    for (const [id, text] of [['notes', bytes['notes.txt'].toString()], ['data-json', '{"answer": 42}'],
+      ['script', 'print("hello")']]) {
+      await fileCase(`${id} shows its text unchanged with ready`, async () => {
+        await showFile(id, 'ready');
+        const code = fileStage().locator('pre code');
+        await code.waitFor();
+        assert(await code.isVisible());
+        assert((await code.textContent()).includes(text), 'text display changed');
+      });
+    }
+    await fileCase('an uppercase extension keeps its language class', async () => {
+      await showFile('upper-script', 'ready');
+      assert.equal(await fileStage().locator('pre code.language-py .hljs-built_in').first().textContent(), 'print');
+    });
+    await fileCase('CSV shows its cells unchanged with ready', async () => {
+      await showFile('table', 'ready');
+      assert.deepEqual(await fileStage().locator('th').allTextContents(), ['Name', 'Note']);
+      assert.deepEqual(await fileStage().locator('td').allTextContents(),
+        ['He said "hi"', `it's <i>fine</i>`]);
+      assert(await fileStage().locator('td').first().isVisible());
+    });
+    await fileCase('TSV shows its cells with ready', async () => {
+      await showFile('tabbed', 'ready');
+      assert.deepEqual(await fileStage().locator('td').allTextContents(), ['One', 'Two']);
+    });
+    for (const [id, selector] of [['tone', 'audio'], ['clip', 'video']]) {
+      await fileCase(`${id} reports ready on loadedmetadata with no download link`, async () => {
+        await showFile(id, 'ready');
+        const media = fileStage().locator(`.media-container ${selector}`);
+        await media.waitFor();
+        assert(await media.isVisible());
+        assert(await media.evaluate(node => node.readyState >= 1 && node.duration > 0),
+          'ready arrived before the media metadata');
+        if (selector === 'video')
+          assert.equal(await media.evaluate(node => node.videoWidth), 16);
+        assert.equal(await fileStage().locator('a').count(), 0, 'embedded media offered a link');
+      });
+    }
+    for (const id of ['corrupt-mp3', 'corrupt-mp4']) {
+      await fileCase(`${id} reports error with a visible failure`, async () => {
+        await showFile(id, 'error');
+        await fileStage().locator('.empty-state').waitFor();
+        assert.equal(await fileStage().locator('audio, video').count(), 0);
+      });
+    }
+    await fileCase('text over 200k characters truncates with ready', async () => {
+      await showFile('long-text', 'ready');
+      const text = await fileStage().locator('pre code').textContent();
+      assert(text.includes('... (truncated)'), 'long text was not truncated');
+      assert(text.length < bytes['long.txt'].length, 'long text kept every character');
+      assert.equal(await fileStage().locator('[class*="hljs"]').count(), 0, 'long text was highlighted');
+    });
+    const markdownTruncatedNotice =
+      'This file is too long to format here, so it is shown as plain text and truncated to the first 200000 characters.';
+    await fileCase('Markdown over 500k characters truncates with ready', async () => {
+      await showFile('long-markdown', 'ready', 30000);
+      const body = fileStage().locator('.markdown-body');
+      assert.equal(await body.locator('pre').textContent(), bytes['long.md'].toString().slice(0, 200000));
+      assert.equal(await body.locator('.truncation-notice').textContent(), markdownTruncatedNotice);
+    });
+    const spyOnParsers = () => frame().locator('#app').evaluate(() => {
+      window.__parserCalls = { marked: 0, hljs: 0 };
+      const { parse } = marked;
+      marked.parse = function (...args) {
+        window.__parserCalls.marked += 1;
+        return parse.apply(this, args);
+      };
+      const { highlightElement } = hljs;
+      hljs.highlightElement = function (...args) {
+        window.__parserCalls.hljs += 1;
+        return highlightElement.apply(this, args);
+      };
+    });
+    const parserCalls = () => frame().locator('#app').evaluate(() => window.__parserCalls);
+    await fileCase('Markdown over the parse limit reports ready as plain text with a notice', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      const before = requests.length;
+      await showFile('markdown-over-limit', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      assert.equal(await body.locator('pre').textContent(), bytes['over-limit.md'].toString(),
+        'the document was not shown as its source text');
+      assert.equal(await body.locator('.truncation-notice').textContent(),
+        'This file is too long to format here, so it is shown as plain text.');
+      assert.equal(await body.locator('img, em, strong').count(), 0, 'the document was parsed');
+      assert.deepEqual(await parserCalls(), { marked: 0, hljs: 0 });
+      assert.deepEqual(requests.slice(before).map(row => row.path)
+        .filter(item => item.endsWith('/purify.min.js')), [], 'the sanitizer was loaded');
+      assert.equal(await frame().locator('#app').evaluate(() =>
+        document.documentElement.getAttribute('data-static-canary')), null);
+    });
+    await fileCase('Markdown over 200,000 characters stops there with a truncation notice', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      await showFile('markdown-over-cap', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      assert.equal(await body.locator('pre').textContent(), bytes['over-cap.md'].toString().slice(0, 200000));
+      assert.equal(await body.locator('.truncation-notice').textContent(), markdownTruncatedNotice);
+      assert.deepEqual(await parserCalls(), { marked: 0, hljs: 0 });
+    });
+    await fileCase('Markdown of exactly 200,000 characters keeps the plain-text notice', async () => {
+      await remountFiles();
+      await showFile('markdown-at-cap', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      assert.equal(await body.locator('pre').textContent(), bytes['at-cap.md'].toString());
+      assert.equal(await body.locator('.truncation-notice').textContent(),
+        'This file is too long to format here, so it is shown as plain text.');
+    });
+    await fileCase('Markdown at the parse limit renders', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      await showFile('markdown-at-limit', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      await body.locator('strong').getByText('Parsed at the limit', { exact: true }).waitFor();
+      assert.equal(await body.locator('.truncation-notice').count(), 0);
+      assert.equal((await parserCalls()).marked, 1);
+    });
+    const columnNotice = 'Showing the first 200 columns of each row.';
+    const tableShape = () => fileStage().locator('.data-table-wrap').evaluate((wrap) => {
+      // Reading a size forces the layout that a table of every cell would stall in.
+      void wrap.scrollWidth;
+      return {
+        header: wrap.querySelectorAll('th').length,
+        lastHeader: wrap.querySelector('thead th:last-child')?.textContent,
+        body: Array.from(wrap.querySelectorAll('tbody tr'), row => row.cells.length),
+        notices: Array.from(wrap.querySelectorAll('.truncation-notice'), node => node.textContent),
+      };
+    });
+    const wideTableBound = 5000;
+    for (const [id, expected] of [
+      ['wide-csv', { header: 200, lastHeader: '', body: [], notices: [columnNotice] }],
+      ['wide-tsv', { header: 200, lastHeader: '', body: [], notices: [columnNotice] }],
+      ['wide-body-csv', { header: 2, lastHeader: 'Right', body: [200], notices: [columnNotice] }],
+    ]) {
+      await fileCase(`${id} reports ready within the bound at 200 columns with a notice`, async () => {
+        await remountFiles();
+        const started = Date.now();
+        await showFile(id, 'ready', wideTableBound);
+        const shape = await tableShape();
+        const elapsed = Date.now() - started;
+        assert.deepEqual(shape, expected);
+        assert(elapsed < wideTableBound, `the table took ${elapsed} ms to lay out`);
+      });
+    }
+    await fileCase('a spreadsheet of exactly 200 columns shows no column notice', async () => {
+      await remountFiles();
+      await showFile('columns-at-limit', 'ready');
+      assert.deepEqual(await tableShape(), { header: 200, lastHeader: 'c199', body: [200], notices: [] });
+    });
+    await fileCase('a spreadsheet of 201 columns shows 200 with a notice', async () => {
+      await remountFiles();
+      await showFile('columns-over-limit', 'ready');
+      assert.deepEqual(await tableShape(), { header: 200, lastHeader: 'c199', body: [200], notices: [columnNotice] });
+    });
+    await fileCase('a wide row past the shown rows adds no column notice', async () => {
+      await remountFiles();
+      await showFile('columns-unshown-row', 'ready');
+      const shape = await tableShape();
+      assert.equal(shape.body.length, 999);
+      assert.deepEqual(shape.notices, ['Showing 1000 of 1001 rows']);
+    });
+    await fileCase('standalone spreadsheets keep every column with no notice', async () => {
+      await remountFiles();
+      const shape = await frame().locator('#app').evaluate(async (root, url) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const host = document.createElement('div');
+        root.appendChild(host);
+        await renderPreviewContent(host,
+          { name: 'columns-standalone.csv', path: 'columns-standalone.csv', type: 'spreadsheet', url }, [], () => {}, false);
+        const seen = {
+          header: host.querySelectorAll('th').length,
+          body: Array.from(host.querySelectorAll('tbody tr'), row => row.cells.length),
+          notices: host.querySelectorAll('.truncation-notice').length,
+        };
+        host.remove();
+        return seen;
+      }, `/ocu/files/${CHAT}/columns-standalone.csv`);
+      assert.deepEqual(shape, { header: 300, body: [300], notices: 0 });
+    });
+    const cellsShown = () => fileStage().locator('.data-table-wrap').evaluate((wrap) => {
+      void wrap.scrollWidth;
+      return {
+        header: wrap.querySelector('th').textContent,
+        body: wrap.querySelector('td').textContent,
+        neighbours: [wrap.querySelectorAll('th')[1].textContent, wrap.querySelectorAll('td')[1].textContent],
+        notices: wrap.querySelectorAll('.truncation-notice').length,
+      };
+    });
+    for (const [id, neighbours] of [['long-cell-csv', ['b', 'd']], ['long-cell-tsv', ['b', 'd']]]) {
+      await fileCase(`${id} shows 1,000 characters of a 200,001-character cell within the bound`, async () => {
+        await remountFiles();
+        const started = Date.now();
+        await showFile(id, 'ready', wideTableBound);
+        const shown = await cellsShown();
+        const elapsed = Date.now() - started;
+        const clipped = longCell.slice(0, 1000);
+        assert.deepEqual(shown, { header: clipped, body: clipped, neighbours, notices: 0 });
+        assert(elapsed < wideTableBound, `the cell took ${elapsed} ms to lay out`);
+      });
+    }
+    await fileCase('a cell of exactly 1,000 characters is shown whole', async () => {
+      await remountFiles();
+      await showFile('cell-at-limit', 'ready');
+      assert.deepEqual(await cellsShown(),
+        { header: 'h'.repeat(1000), body: 'c'.repeat(1000), neighbours: ['b', 'd'], notices: 0 });
+    });
+    await fileCase('standalone spreadsheets keep the full cell', async () => {
+      await remountFiles();
+      const lengths = await frame().locator('#app').evaluate(async (root, url) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const host = document.createElement('div');
+        root.appendChild(host);
+        await renderPreviewContent(host,
+          { name: 'cell-standalone.csv', path: 'cell-standalone.csv', type: 'spreadsheet', url }, [], () => {}, false);
+        const seen = [host.querySelector('th').textContent.length, host.querySelector('td').textContent.length];
+        host.remove();
+        return seen;
+      }, `/ocu/files/${CHAT}/cell-standalone.csv`);
+      assert.deepEqual(lengths, [2000, 2000]);
+    });
+    const markdownPlainNotice = 'This file is too long to format here, so it is shown as plain text.';
+    for (const [id, file, label] of [
+      ['table-wide-rows', 'table-wide-rows.md', 'a wide header over thousands of short rows'],
+      ['table-past-budget', 'table-past-budget.md', 'one line past the cell bound'],
+      ['table-in-quote', 'table-in-quote.md', 'a table nested in a blockquote'],
+      ['table-cr-lines', 'table-cr-lines.md', 'a table whose lines end in a bare carriage return'],
+      ['quote-deep-table', 'quote-deep-table.md', 'a padded table in quotes nested past the depth limit'],
+      ['quote-deep-list', 'quote-deep-list.md', 'quotes and lists nested past the depth limit, with no table'],
+    ]) {
+      await fileCase(`Markdown with ${label} reports ready as plain text within the bound`, async () => {
+        assert(bytes[file].length < 30000, `${file} no longer tests the bound`);
+        await remountFiles();
+        await spyOnParsers();
+        const before = requests.length;
+        const started = Date.now();
+        await showFile(id, 'ready', wideTableBound);
+        const shown = await fileStage().locator('.markdown-body').evaluate((body) => {
+          void body.scrollWidth;
+          return {
+            source: body.querySelector('pre')?.textContent,
+            notice: body.querySelector('.truncation-notice')?.textContent,
+            cells: body.querySelectorAll('td, th').length,
+          };
+        });
+        const elapsed = Date.now() - started;
+        // The HTML parser turns a carriage return into a line feed.
+        const source = bytes[file].toString().replaceAll('\r', '\n');
+        assert.deepEqual(shown, { source, notice: markdownPlainNotice, cells: 0 });
+        assert(elapsed < wideTableBound, `the document took ${elapsed} ms to lay out`);
+        assert.deepEqual(await parserCalls(), { marked: 0, hljs: 0 });
+        assert.deepEqual(requests.slice(before).map(row => row.path)
+          .filter(item => item.endsWith('/purify.min.js')), [], 'the sanitizer was loaded');
+      });
+    }
+    for (const [id, label, columns, rows, timeout] of [
+      ['table-at-budget', 'exactly at the cell bound', 20, 9998, 30000],
+      ['table-ordinary', 'an ordinary table of 12 columns and 200 rows', 12, 200, undefined],
+    ]) {
+      await fileCase(`Markdown with ${label} renders as a table`, async () => {
+        await remountFiles();
+        await spyOnParsers();
+        await showFile(id, 'ready', timeout);
+        const shown = await fileStage().locator('.markdown-body').evaluate((body) => {
+          void body.scrollWidth;
+          return {
+            header: body.querySelectorAll('th').length,
+            cells: body.querySelectorAll('td').length,
+            notices: body.querySelectorAll('.truncation-notice').length,
+          };
+        });
+        assert.deepEqual(shown, { header: columns, cells: columns * rows, notices: 0 });
+        assert.deepEqual(await parserCalls(), { marked: 1, hljs: 0 });
+      });
+    }
+    // Rendered directly in embedded mode: the stub lists at most 100 fixtures on its last page.
+    for (const [file, label, depth, emphasis] of [
+      ['quote-at-depth.md', 'a quote nested exactly at the depth limit', 16, 'At the depth limit'],
+      ['quote-ordinary.md', 'an ordinary two-level quote', 2, 'inner'],
+    ]) {
+      await fileCase(`embedded Markdown with ${label} renders as quotes`, async () => {
+        await remountFiles();
+        await spyOnParsers();
+        const shown = await frame().locator('#app').evaluate(async (root, [path, url]) => {
+          const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+          const host = document.createElement('div');
+          root.appendChild(host);
+          const rendered = await renderPreviewContent(host,
+            { name: path, path, type: 'markdown', url }, [], () => {}, true);
+          const body = host.querySelector('.markdown-body');
+          let depth = 0;
+          for (let node = body.querySelector('strong'); node && node !== body; node = node.parentElement) {
+            if (node.tagName === 'BLOCKQUOTE') depth += 1;
+          }
+          const seen = {
+            rendered,
+            emphasis: body.querySelector('strong')?.textContent,
+            depth,
+            after: body.lastElementChild?.textContent,
+            notices: body.querySelectorAll('.truncation-notice').length,
+          };
+          host.remove();
+          return seen;
+        }, [file, `/ocu/files/${CHAT}/${file}`]);
+        assert.deepEqual(shown, { rendered: true, emphasis, depth, after: 'After the quote', notices: 0 });
+        assert.deepEqual(await parserCalls(), { marked: 1, hljs: 0 });
+      });
+    }
+    await fileCase('code over the highlight limit reports ready without highlighting', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      await showFile('code-over-limit', 'ready');
+      const code = fileStage().locator('pre code');
+      assert.equal(await code.textContent(), bytes['over-limit.py'].toString());
+      assert.equal(await fileStage().locator('[class*="hljs"]').count(), 0, 'code was highlighted');
+      assert.equal((await parserCalls()).hljs, 0);
+    });
+    await fileCase('code at the highlight limit highlights', async () => {
+      await remountFiles();
+      await spyOnParsers();
+      await showFile('code-at-limit', 'ready');
+      assert.equal(await fileStage().locator('pre code.hljs').count(), 1);
+      assert((await fileStage().locator('.hljs-built_in').count()) > 0, 'keywords were not highlighted');
+      assert.equal((await parserCalls()).hljs, 1);
+    });
+    await fileCase('a Markdown document keeps its first 100 images', async () => {
+      await remountFiles();
+      const before = requests.length;
+      await showFile('many-images', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      await body.locator('strong').getByText('After the images', { exact: true }).waitFor();
+      const child = page.frames().find(item => item.url().includes('/ocu/preview/'));
+      await child.waitForFunction(() => Array.from(document.images).every(image => image.complete));
+      assert.deepEqual(await body.locator('img').evaluateAll(nodes => nodes.map(node => node.alt)),
+        Array.from({ length: 100 }, (_, index) => `Image ${index}`));
+      assert.deepEqual(requests.slice(before).map(row => row.path)
+        .filter(item => /\/guides\/many-\d+\.png$/.test(item)).sort(),
+      Array.from({ length: 100 }, (_, index) => `/ocu/files/${CHAT}/guides/many-${index}.png`).sort());
+    });
+    await fileCase('standalone rendering keeps formatting and images past the embedded limits', async () => {
+      await remountFiles();
+      const filesRoot = `/ocu/files/${CHAT}`;
+      const result = await frame().locator('#app').evaluate(async (root, targets) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const render = async (file) => {
+          const host = document.createElement('div');
+          root.appendChild(host);
+          await renderPreviewContent(host, { ...file, name: file.path }, [], () => {}, false);
+          const seen = {
+            strong: host.querySelector('.markdown-body strong')?.textContent,
+            notices: host.querySelectorAll('.truncation-notice').length,
+            images: host.querySelectorAll('img').length,
+            highlighted: host.querySelectorAll('pre code.hljs').length,
+          };
+          host.remove();
+          return seen;
+        };
+        return {
+          markdown: await render(targets.markdown),
+          images: await render(targets.images),
+          code: await render(targets.code),
+        };
+      }, {
+        markdown: { path: 'past-limit.md', type: 'markdown', url: `${filesRoot}/past-limit.md` },
+        images: { path: 'guides/many.md', type: 'markdown', url: `${filesRoot}/guides/many.md` },
+        code: { path: 'over-limit.py', type: 'code', url: `${filesRoot}/over-limit.py` },
+      });
+      assert.deepEqual(result.markdown,
+        { strong: 'Parsed past the limit', notices: 0, images: 0, highlighted: 0 });
+      assert.deepEqual(result.images,
+        { strong: 'After the images', notices: 0, images: imageCount + 1, highlighted: 0 });
+      assert.equal(result.code.highlighted, 1, 'standalone code lost highlighting');
+    });
+    for (const id of ['absent-markdown', 'absent-code', 'absent-csv']) {
+      await fileCase(`${id} reports error for a 404`, async () => {
+        await showFile(id, 'error');
+        await fileStage().locator('.empty-state').waitFor();
+        assert((await fileStage().textContent()).includes('Not found') === false, 'error body was rendered');
+      });
+    }
+    for (const id of ['reset-markdown', 'reset-code', 'reset-csv']) {
+      await fileCase(`${id} reports error for a network failure`, async () => {
+        await page.route('**/ocu/files/**/reset.*', route => route.abort('connectionreset'));
+        try {
+          await showFile(id, 'error');
+          await fileStage().locator('.empty-state').waitFor();
+        } finally {
+          await page.unroute('**/ocu/files/**/reset.*');
+        }
+      });
+    }
+    for (const id of ['refused-html', 'refused-pdf', 'refused-image', 'refused-other',
+      'refused-html-markdown', 'refused-xml-text', 'refused-svg-code', 'refused-atom', 'refused-xml-audio',
+      'too-large-markdown', 'unsupported-name-code']) {
+      await fileCase(`${id} reports unsupported without a fetch`, async () => {
+        const before = requests.length;
+        await showFile(id, 'unsupported');
+        assert.deepEqual(requests.slice(before).map(row => row.path)
+          .filter(requested => requested.startsWith(`/ocu/files/${CHAT}/`)), [], 'refused file was fetched');
+        assert.equal(await fileStage().count(), 0, 'refused file reached a renderer');
+      });
+    }
+    await fileCase('a file name with markup stays text in the embedded code view', async () => {
+      await showFile('markup-name', 'ready');
+      const code = fileStage().locator('pre code');
+      await code.waitFor();
+      assert((await code.textContent()).includes('Markup name body'));
+      assert((await code.getAttribute('class')).split(/\s+/).includes('no-highlight'),
+        'a rejected extension must not fall through to auto-detection');
+      assert.equal(await fileStage().locator('img').count(), 0, 'file name injected an element');
+      assert.equal(await frame().locator('#app').evaluate(() => window.__nameCanary), undefined);
+    });
+    await fileCase('a quote in a file name stays inside alt with the embedded renderer', async () => {
+      // embed=files refuses images, so this drives the shared image branch directly.
+      const image = await frame().locator('#app').evaluate(async (root, { name, url }) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const host = document.createElement('div');
+        root.appendChild(host);
+        renderPreviewContent(host, { name, type: 'image', url }, [], () => {}, true);
+        const node = host.querySelector('img');
+        const result = { alt: node.getAttribute('alt'), attributes: node.getAttributeNames().sort() };
+        host.remove();
+        return result;
+      }, { name: QUOTED_IMAGE, url: rasters.png });
+      assert.deepEqual(image, { alt: QUOTED_IMAGE, attributes: ['alt', 'src'] });
+    });
+    await fileCase('embedded Markdown is static', async () => {
+      await remountFiles();
+      const before = requests.length;
+      const externalBefore = externalRequests.length;
+      await showFile('static-markdown', 'ready');
+      const body = fileStage().locator('.markdown-body');
+      await body.locator('strong').getByText('Static Markdown neighbor', { exact: true }).waitFor();
+      const child = page.frames().find(item => item.url().includes('/ocu/preview/'));
+      await child.waitForFunction(() => Array.from(document.images).every(image => image.complete));
+      assert.deepEqual((await body.locator('img').evaluateAll(nodes => nodes.map(node => node.alt))).sort(),
+        ['Inline event', 'Inline raster', 'Nested archive name', 'Relative raster', 'Token root'],
+        'an unsafe image stayed');
+      assert.equal(await body.locator('img[alt="Relative raster"]').evaluate(node => node.naturalWidth), pixelWidth);
+      assert.equal(await body.locator('img[onerror]').count(), 0);
+      assert.equal(await body.locator('.mermaid, .katex').count(), 0, 'a post-sanitize renderer ran');
+      assert((await body.textContent()).includes('Inline math $x^2$ stays text.'));
+      assert.equal(await body.locator('code.language-javascript .hljs-keyword').first().textContent(), 'const');
+      assert.equal(await body.locator('code.language-python .hljs-string').first().textContent(), '"known label"');
+      for (const [fence, hasText] of [['unlabelled', 'const unlabelled = 1;'], ['hyphen-only', 'const hyphens = 1;'],
+        ['unknown', 'const unknown = 1;'], ['Mermaid', 'graph TD']]) {
+        const code = body.locator('pre code').filter({ hasText });
+        assert.equal(await code.getAttribute('class'), 'no-highlight', `the ${fence} fence kept its class`);
+        assert.equal(await code.locator('*').count(), 0, `the ${fence} fence was highlighted`);
+      }
+      const requested = requests.slice(before).map(row => row.path);
+      assert.deepEqual(requested.filter(item => decodeURIComponent(item) === `/ocu/files/${CHAT}/archive`), [],
+        'an image requested the archive route');
+      assert.deepEqual(requested.filter(item => item.endsWith('/queried.png')), [], 'an image kept its query string');
+      assert(requested.includes(`/ocu/files/${CHAT}/guides/archive`), 'a file named archive was not requested');
+      assert.deepEqual(requested.filter(item => /mermaid|katex/.test(item)), [], 'a diagram or math script loaded');
+      assert.deepEqual(requested.filter(item => !item.startsWith(`/ocu/files/${CHAT}/`) &&
+        !item.startsWith('/ocu/static/') && item !== `/ocu/api/outputs/${CHAT}`), [], 'request left the files base');
+      assert(requested.includes(`/ocu/files/${CHAT}/guides/pixel.png`), 'relative image was not requested');
+      assert.equal(externalRequests.length, externalBefore, 'embedded Markdown reached another origin');
+      await frame().locator('#app').evaluate(() => {
+        window.__opened = [];
+        window.open = (...args) => { window.__opened.push(args); return null; };
+      });
+      const frameUrl = child.url();
+      const stateCount = await page.evaluate(() => window.states.length);
+      const clicked = requests.length;
+      for (const label of ['HTTP link', 'HTTPS link', 'Mail link', 'Relative link', 'Workspace file link',
+        'Script link', 'Token script link']) {
+        const link = body.locator('a').getByText(label, { exact: true });
+        assert.equal(await link.getAttribute('href'), null, `${label} stayed active`);
+        await link.click();
+      }
+      assert.equal(child.url(), frameUrl, 'a link navigated the frame');
+      assert.deepEqual(await frame().locator('#app').evaluate(() => window.__opened), [], 'a link opened a window');
+      assert.equal(await frame().locator('#__ext_link_dialog').count(), 0, 'a link opened a dialog');
+      assert.equal(await page.evaluate(() => window.states.length), stateCount, 'a link selected a file');
+      assert.deepEqual(requests.slice(clicked), [], 'a link caused a request');
+      assert.equal(await frame().locator('#app').evaluate(() =>
+        document.documentElement.getAttribute('data-static-canary')), null);
+      const jump = body.locator('a').getByText('Jump to section', { exact: true });
+      assert.equal(await jump.getAttribute('href'), '#user-content-target-section');
+      const inView = () => {
+        const { top } = document.getElementById('user-content-target-section').getBoundingClientRect();
+        return top >= 0 && top < window.innerHeight;
+      };
+      await jump.evaluate(node => node.scrollIntoView());
+      assert.equal(await child.evaluate(inView), false, 'fragment target started in view');
+      await jump.click();
+      await child.waitForFunction(inView);
+      assert.equal(child.url(), frameUrl, 'a fragment link changed the frame URL');
+      await page.screenshot({ path: path.join(artifacts, 'static-markdown.png') });
+    });
+    await fileCase('a superseded media element reports nothing and releases its request', async () => {
+      await remountFiles();
+      const arrived = new Promise(resolve => { heldMediaRequested = resolve; });
+      const superseded = await selectFile('held-clip');
+      const response = await within(arrived, 'held media request');
+      await frame().locator('.preview-stage video').waitFor();
+      await frame().locator('#app').evaluate(() => {
+        window.__supersededMedia = document.querySelector('.preview-stage video');
+      });
+      const released = new Promise(resolve => {
+        if (response.destroyed) resolve();
+        else response.once('close', resolve);
+      });
+      const newest = await showFile('notes', 'ready');
+      await within(released, 'superseded media release');
+      await frame().locator('#app').evaluate(() => {
+        window.__supersededMedia.dispatchEvent(new Event('loadedmetadata'));
+        window.__supersededMedia.dispatchEvent(new Event('error'));
+      });
+      await nextFrames();
+      assert.deepEqual(await page.evaluate(generation => window.states
+        .filter(row => row.generation === generation).map(row => row.state), superseded), ['loading']);
+      assert.deepEqual(await page.evaluate(generation => window.states
+        .filter(row => row.generation === generation).map(row => row.state), newest), ['loading', 'ready']);
+      await fileStage().locator('pre code').waitFor();
+    });
     const transcript = await page.evaluate(() => ({
       states: window.states, expected: window.expectedSelections,
     }));
@@ -1685,6 +2471,8 @@ async function main() {
       || /\/api\/runtime\//.test(row.path) || /\/api\/v1\//.test(row.path)).length, 0);
     assert(requests.filter(row => row.path.includes('/api/outputs/')).every(row => row.header === 'ocu-workspace'));
     assert(requests.filter(row => row.path.endsWith('.docx') || row.path.endsWith('.xlsx') || row.path.endsWith('.pptx'))
+      .every(row => row.header === 'ocu-workspace'));
+    assert(requests.filter(row => /\/files\/.*\.(?:md|txt|csv|tsv|json|py)$/.test(row.path))
       .every(row => row.header === 'ocu-workspace'));
     await retireFrame();
     const listingBeforeRuntime = requests.filter(row => row.path === `/ocu/api/outputs/${CHAT}`).length;
@@ -2519,6 +3307,7 @@ async function main() {
       const isolated = await browser.newContext();
       isolated.setDefaultTimeout(10000);
       await isolated.addInitScript(freezePollingClock);
+      if (options.initScript) await isolated.addInitScript(options.initScript);
       await isolated.route('**/*', route => {
         const url = route.request().url();
         if (options.images && /^https?:\/\/images\.example\.test\/pixel\.png$/.test(url))
@@ -5332,6 +6121,70 @@ async function main() {
       await closeStandalone(nestedSession);
     }
 
+    standaloneListing = [
+      { file_id: 'markup-name', path: MARKUP_NAME, type: 'code', mime: 'text/plain' },
+      { file_id: 'quoted-image', path: QUOTED_IMAGE, type: 'image', mime: 'image/png' },
+      { file_id: 'tone', path: 'tone.wav', type: 'audio', mime: 'audio/x-wav' },
+      { file_id: 'clip', path: 'clip.webm', type: 'video', mime: 'video/webm' },
+      { file_id: 'manual', path: 'valid.pdf', type: 'pdf', mime: 'application/pdf' },
+    ];
+    // The vendored library exposes getDocument as a getter, so a Proxy records its options.
+    const recordPdfOptions = () => {
+      let library;
+      window.__pdfOptions = [];
+      Object.defineProperty(window, 'pdfjsLib', {
+        configurable: true,
+        get: () => library,
+        set(value) {
+          library = new Proxy(value, {
+            get: (target, key) => key !== 'getDocument' ? target[key] : (options) => {
+              window.__pdfOptions.push({ url: options.url, isEvalSupported: options.isEvalSupported });
+              return target.getDocument(options);
+            },
+          });
+        },
+      });
+    };
+    const fileSession = await openStandalone('/ocu', { initScript: recordPdfOptions });
+    try {
+      const stage = fileSession.page.locator('.preview-stage');
+      await fileCase('a file name with markup stays text in the standalone code view', async () => {
+        await selectStandaloneFile(fileSession.page, MARKUP_NAME);
+        await stage.locator('pre code').getByText('Markup name body').waitFor();
+        assert.equal(await stage.locator('img').count(), 0, 'file name injected an element');
+        assert.equal(await fileSession.page.evaluate(() => window.__nameCanary), undefined);
+      });
+      await fileCase('a quote in a file name stays inside alt in standalone', async () => {
+        await selectStandaloneFile(fileSession.page, QUOTED_IMAGE);
+        const image = stage.locator('img');
+        await image.waitFor();
+        assert.deepEqual(await image.evaluate(async (node) => {
+          await node.decode();
+          return { alt: node.getAttribute('alt'), attributes: node.getAttributeNames().sort(), width: node.naturalWidth };
+        }), { alt: QUOTED_IMAGE, attributes: ['alt', 'src'], width: pixelWidth });
+      });
+      for (const [name, selector] of [['tone.wav', 'audio'], ['clip.webm', 'video']]) {
+        await fileCase(`standalone ${selector} keeps its download link`, async () => {
+          await selectStandaloneFile(fileSession.page, name);
+          await stage.locator(`.media-container ${selector}`).waitFor();
+          assert.equal(await stage.locator('.media-container a[download]').count(), 1);
+        });
+      }
+      await fileCase('the PDF loader disables eval and still renders', async () => {
+        await selectStandaloneFile(fileSession.page, 'valid.pdf');
+        const canvas = stage.locator('#pdfContainer canvas');
+        await canvas.waitFor();
+        assert.deepEqual(await fileSession.page.evaluate(() => window.__pdfOptions),
+          [{ url: `/ocu/files/${CHAT}/valid.pdf`, isEvalSupported: false }]);
+        assert.deepEqual(await canvas.evaluate(node => Array.from(node.getContext('2d')
+          .getImageData(node.width / 2, node.height / 2, 1, 1).data)), [255, 0, 0, 255], 'PDF page did not render');
+      });
+    } finally {
+      standaloneListing = null;
+      await closeStandalone(fileSession);
+    }
+    assert.deepEqual(fileCaseFailures, [], 'file preview cases failed');
+
     listMode = 'normal';
     assert.deepEqual(externalRequests, [], 'Office content requested an external resource');
     const abortLogs = consoleErrors.filter(error => error.text.includes('net::ERR_ABORTED'));
@@ -5353,6 +6206,7 @@ main().catch(error => { console.error(error); process.exitCode = 1; }).finally(a
   for (const response of heldListings.splice(0)) response.destroy();
   for (const response of heldSheets.splice(0)) response.destroy();
   for (const response of heldDrawio.splice(0)) response.destroy();
+  for (const response of heldMedia.splice(0)) response.destroy();
   for (const pending of heldViewer.splice(0)) pending.res.destroy();
   for (const pending of heldImages.splice(0)) pending.res.destroy();
   for (const response of heldBrowserStatuses.splice(0)) response.destroy();

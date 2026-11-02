@@ -11,6 +11,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import mimetypes
 import os
 import sys
 from contextlib import contextmanager
@@ -1058,3 +1059,19 @@ def test_listing_committed_index_close_failure_reports_resource_and_replays_with
         assert replay.json()["total"] == 1
         assert _index(data).read_bytes() == successor_bytes
         assert output.read_bytes() == b"bb"
+
+
+def test_webp_resolves_to_image_webp_without_a_host_mime_database(tmp_path, monkeypatch):
+    # Built from defaults alone, so neither the host's mime.types nor the interpreter's map can answer.
+    database = mimetypes.MimeTypes()
+    for by_extension in database.types_map:
+        by_extension.pop(".webp", None)
+    monkeypatch.setattr(mimetypes, "_db", database)
+    assert mimetypes.guess_type("b.webp") == (None, None)
+
+    with _isolated_app(tmp_path) as (loaded, _docker_manager, _broker, data):
+        assert loaded.classify_file("b.webp") == ("image", "image/webp")
+        _put(data, "b.webp", b"RIFF\x04\x00\x00\x00WEBP")
+        served = _client(loaded).get(f"/files/{CHAT}/b.webp", headers=_auth())
+        assert served.status_code == 200
+        assert served.headers["content-type"] == "image/webp"
