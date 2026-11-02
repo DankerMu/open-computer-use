@@ -2083,14 +2083,17 @@ def delete_sandbox(chat_id: str) -> dict:
                 removed_data = _clear_chat_entries(chat_fd)
             finally:
                 os.close(chat_fd)
+            step = "workspace resource cleanup"
             try:
                 # outputs/ is gone, so discovery publishes an empty set for this chat.
                 sync_chat_resources_sync(chat_id)
             except DiscoveryError as exc:
-                # The data is gone and the registry is in-process only; uploads
-                # tolerate a failed discovery the same way.
-                print(f"[DELETE] chat {chat_id}: resource cleanup skipped: {exc.reason}")
-    except (docker.errors.DockerException, OSError) as exc:
+                if exc.reason != "busy":
+                    raise
+                # Another discovery holds admission. The data is gone and the
+                # registry is in-process only, so the delete stands.
+                print(f"[DELETE] chat {chat_id}: resource cleanup skipped: busy")
+    except (docker.errors.DockerException, OSError, DiscoveryError) as exc:
         raise DeleteFailed(f"sandbox delete failed during {step}: {exc}") from exc
     print(f"[DELETE] chat {chat_id}: container={removed_container} "
           f"volume={removed_volume} data={removed_data}")
@@ -2185,11 +2188,19 @@ def _retain(chat_id: str, container, now: float) -> None:
     print(f"[RETENTION] removing {reloaded.name} and its workspace volume")
     try:
         reloaded.remove()
-    except Exception:
-        # The container may still exist (e.g. started after the recheck). Without
-        # the marker, a later manual removal cannot make the reaper drop its volume.
-        _clear_retention_marker(chat_id)
-        raise
+    except Exception as exc:
+        # NotFound, or a client timeout after which the engine finished, leaves no
+        # container: keep the marker and finish with the volume. If the container
+        # still exists (e.g. started after the recheck), or the engine cannot say,
+        # clear the marker so a later manual removal never drops the volume.
+        try:
+            gone = isinstance(exc, docker.errors.NotFound) or _lookup_container(chat_id) is None
+        except Exception:
+            gone = False
+        if not gone:
+            _clear_retention_marker(chat_id)
+            raise
+        print(f"[RETENTION] {reloaded.name} is already gone ({type(exc).__name__})")
     _finish_retention(chat_id)
 
 

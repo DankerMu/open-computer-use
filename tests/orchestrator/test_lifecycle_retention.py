@@ -329,6 +329,30 @@ def test_offset_and_whole_second_timestamps_are_aged_exactly(world, form, age, r
     assert container._removed["value"] is removed
 
 
+@pytest.mark.parametrize("failure", ("not_found", "timeout_after_engine_removed"))
+def test_remove_failure_with_container_gone_still_removes_the_volume(world, failure):
+    import requests
+
+    docker_manager, client, clock, _tmp = world
+    _meta(docker_manager, CHAT)
+    container = _sandbox(client, "exited", finished=_iso(clock.now - RETENTION - 1))
+    _volume(client)
+
+    def remove(force=False):
+        client._store.pop(container.name, None)
+        if failure == "not_found":
+            raise NotFound("removed elsewhere")
+        raise requests.exceptions.ReadTimeout("engine answered after the client timeout")
+
+    container.remove.side_effect = remove
+
+    docker_manager.reap_idle(CHAT, now=clock.now)
+    docker_manager.reap_idle(CHAT, now=clock.advance(30))
+
+    assert client._volumes == {}
+    assert "retained_at" not in docker_manager.read_idle_state(CHAT)
+
+
 def test_absent_container_without_retention_marker_keeps_its_volume(world):
     docker_manager, client, clock, _tmp = world
     _meta(docker_manager, CHAT)
@@ -669,6 +693,39 @@ def test_busy_resource_discovery_does_not_fail_a_completed_delete(http, world):
 
     assert response.status_code == 200, response.text
     assert response.json() == {"container": True, "volume": True, "data": True}
+    assert _entries(docker_manager) == [".deleted", ".lifecycle.lock"]
+
+
+def test_non_busy_discovery_failure_is_delete_failed_and_retry_completes(http, world, monkeypatch):
+    import mcp_resources
+    from uploads import DiscoveryError
+
+    docker_manager, client, _clock, _tmp = world
+    _populated_running_chat(docker_manager, client)
+    assert mcp_resources.sync_chat_resources_sync(CHAT) == 1
+    real_list = mcp_resources.list_chat_uploads
+    attempts = {"n": 0}
+
+    def flaky_list(chat_id):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise DiscoveryError("io_error")
+        return real_list(chat_id)
+
+    monkeypatch.setattr(mcp_resources, "list_chat_uploads", flaky_list)
+
+    failed = http.delete(f"/internal/sandbox/{CHAT}", headers=HEADERS)
+
+    assert failed.status_code == 500
+    assert failed.json()["detail"]["reason"] == DELETE_FAILED
+    assert "workspace resource cleanup" in failed.json()["detail"]["detail"]
+    assert CHAT in mcp_resources._chat_uris
+
+    retried = http.delete(f"/internal/sandbox/{CHAT}", headers=HEADERS)
+
+    assert retried.status_code == 200
+    assert retried.json() == {"container": False, "volume": False, "data": False}
+    assert CHAT not in mcp_resources._chat_uris
     assert _entries(docker_manager) == [".deleted", ".lifecycle.lock"]
 
 

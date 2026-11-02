@@ -28,8 +28,12 @@
   `Error: chat was deleted`. Uploads and the outputs listing now map lifecycle
   errors to their status instead of 500; Office writes, upload imports and the
   terminal heartbeat still answer 500. A retention whose `container.remove()`
-  fails clears its `retained_at` marker, so a later manual removal never lets
-  the reaper delete the volume.
+  fails while the container still exists clears its `retained_at` marker, so a
+  later manual removal never lets the reaper delete the volume; if the container
+  is gone anyway (`NotFound`, or a client timeout after the engine finished),
+  the marker stays and the volume is still removed. A busy MCP resource
+  discovery at the end of a delete is logged; any other discovery failure is
+  `delete_failed`.
 
 ### Changed
 - **Tool calls wake a stopped sandbox (#697).** A tool or MCP request for an
