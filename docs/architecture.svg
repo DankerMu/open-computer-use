@@ -103,7 +103,7 @@
 
   <!-- Row 3: Features -->
   <text x="80" y="445" font-size="9" font-weight="600" fill="rgba(255,255,255,0.9)">Limits:</text>
-  <text x="125" y="445" font-size="9" fill="rgba(255,255,255,0.65)">2 GB RAM · 1 CPU · idle timeout auto-shutdown · network access enabled</text>
+  <text x="125" y="445" font-size="9" fill="rgba(255,255,255,0.65)">4 GB RAM · 2 CPU · idle timeout auto-shutdown · network access enabled</text>
 
   <!-- Row 4 -->
   <text x="80" y="465" font-size="9" font-weight="600" fill="rgba(255,255,255,0.9)">Skills:</text>

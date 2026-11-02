@@ -468,6 +468,8 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         self.assertEqual(runtime["POSTGRES_IMAGE"], "postgres:17-alpine")
         self.assertEqual(runtime["CONTAINER_IDLE_TIMEOUT"], "259200")
         self.assertEqual(runtime["SANDBOX_RETENTION_DAYS"], "30")
+        self.assertEqual(runtime["CONTAINER_MEM_LIMIT"], "4g")
+        self.assertEqual(runtime["CONTAINER_CPU_LIMIT"], "2.0")
 
         self.assert_generated_secrets_hidden(runtime, result)
         self.assertNotIn("MCP_PORT=8081", self.runtime_path().read_text(encoding="utf-8"))

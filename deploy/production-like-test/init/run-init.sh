@@ -132,9 +132,10 @@ else:
     print("[init] PRIMARY_CHAT_MODEL is not set; leaving the default model to the admin UI")
     safe_init = init_source
 (work_root / "init.sh").write_text(safe_init, encoding="utf-8")
-(work_root / "functions" / "computer_link_filter.py").write_bytes(
-    (source_root / "functions" / "computer_link_filter.py").read_bytes()
-)
+for function_file in ("computer_link_filter.py", "video_production_filter.py"):
+    (work_root / "functions" / function_file).write_bytes(
+        (source_root / "functions" / function_file).read_bytes()
+    )
 PY
 OWNED_PID=$!
 wait_owned "$OWNED_PID"

@@ -72,7 +72,7 @@ def _prime_cache(
     outlet() never invents a public URL — it pulls from cache populated by inlet().
     Tests that exercise outlet() in isolation must prime the cache first.
     """
-    f._prompt_cache[(chat_id, user_email)] = (time.time(), (public_url, prompt))
+    f._prompt_cache[(chat_id, user_email, "")] = (time.time(), (public_url, prompt))
 
 
 def _active_body() -> dict:
@@ -132,11 +132,14 @@ def _prompt_app(
     guarded: bool = False,
     status: int = 200,
 ):
-    async def system_prompt(_request):
+    async def system_prompt(request):
         headers = {}
         if public_base_url is not None:
             headers["X-Public-Base-URL"] = public_base_url
-        return PlainTextResponse(prompt, headers=headers, status_code=status)
+        # Like OCU, a feature request renders a different prompt.
+        features = request.headers.get("x-ocu-features")
+        text = f"{prompt} [features: {features}]" if features else prompt
+        return PlainTextResponse(text, headers=headers, status_code=status)
 
     application = Starlette(routes=[Route("/system-prompt", system_prompt)])
     if guarded:
@@ -242,7 +245,7 @@ def test_guard_rejection_does_not_reuse_a_stale_prompt(monkeypatch, capsys):
         )
     ) as origin:
         filter_ = _make_filter(origin)
-        filter_._prompt_cache[(CHAT_ID, "")] = (
+        filter_._prompt_cache[(CHAT_ID, "", "")] = (
             time.time() - 9999,
             ("https://webui.example/ocu", "stale prompt"),
         )
@@ -268,7 +271,7 @@ def test_forbidden_response_does_not_reuse_a_stale_prompt(monkeypatch):
         )
     ) as origin:
         filter_ = _make_filter(origin)
-        filter_._prompt_cache[(CHAT_ID, "")] = (
+        filter_._prompt_cache[(CHAT_ID, "", "")] = (
             time.time() - 9999,
             ("https://webui.example/ocu", "stale prompt"),
         )
@@ -282,7 +285,7 @@ def test_forbidden_response_does_not_reuse_a_stale_prompt(monkeypatch):
 def test_missing_filter_credential_does_not_use_a_warm_prompt(monkeypatch):
     monkeypatch.delenv("OCU_INTERNAL_TOKEN", raising=False)
     filter_ = _make_filter()
-    filter_._prompt_cache[(CHAT_ID, "")] = (
+    filter_._prompt_cache[(CHAT_ID, "", "")] = (
         time.time(),
         ("https://webui.example/ocu", "warm prompt"),
     )
@@ -311,7 +314,7 @@ def test_missing_public_base_header_does_not_reuse_stale_prompt_or_link_metadata
     original = f"see {file_url}"
     with _live_asgi(_prompt_app(records, "headerless prompt", None)) as origin:
         filter_ = _make_filter(origin)
-        filter_._prompt_cache[(CHAT_ID, "")] = (
+        filter_._prompt_cache[(CHAT_ID, "", "")] = (
             time.time() - computer_link_filter._PROMPT_TTL_SECONDS - 1,
             (public_base, "stale prompt"),
         )
@@ -596,6 +599,116 @@ def test_outlet_preserves_trailing_punctuation_in_explicit_file_url_destinations
 
     assert f"[🖥️ Open preview]({literal_file})" in result["messages"][0]["content"]
 
+VIDEO_MODEL = {
+    "id": "qwen3.8-27b",
+    "filters": [
+        {"id": "computer_use_filter_toggle_unrelated", "name": "Other"},
+        {"id": "video_production_filter", "name": "video"},
+    ],
+}
+PLAIN_MODEL = {"id": "qwen3.8-27b", "filters": [{"id": "other_toggle", "name": "Other"}]}
+
+
+def test_video_filter_id_is_the_installed_toggle_id():
+    assert computer_link_filter.VIDEO_FILTER_ID == "video_production_filter"
+
+
+@pytest.mark.parametrize(
+    ("filter_ids", "model", "expected"),
+    [
+        (["video_production_filter"], VIDEO_MODEL, "video"),
+        (["other_toggle", "video_production_filter"], VIDEO_MODEL, "video"),
+        # Selected by the client, but the admin deactivated the filter, so
+        # the model no longer lists it among its toggle filters.
+        (["video_production_filter"], PLAIN_MODEL, None),
+        (["video_production_filter"], {"id": "qwen3.8-27b"}, None),
+        (["video_production_filter"], {"id": "qwen3.8-27b", "filters": None}, None),
+        (["video_production_filter"], None, None),
+        # Listed by the model, but the user did not turn the switch on.
+        ([], VIDEO_MODEL, None),
+        (None, VIDEO_MODEL, None),
+        (["other_toggle"], VIDEO_MODEL, None),
+        # A string is not a list of ids, even if it contains the id.
+        ("video_production_filter", VIDEO_MODEL, None),
+    ],
+)
+def test_video_header_requires_the_switch_and_the_active_model_filter(
+    monkeypatch, filter_ids, model, expected
+):
+    _disable_proxy_env(monkeypatch)
+    records = []
+    metadata = {"chat_id": CHAT_ID}
+    if filter_ids is not None:
+        metadata["filter_ids"] = filter_ids
+    with _live_asgi(_prompt_app(records, "server prompt", "https://webui.example/ocu")) as origin:
+        result = _make_filter(origin).inlet(
+            _active_body(),
+            __user__={"email": "person@example.test"},
+            __metadata__=metadata,
+            __model__=model,
+        )
+
+    assert len(records) == 1
+    assert records[0]["headers"].get("x-ocu-features") == expected
+    suffix = f" [features: {expected}]" if expected else ""
+    assert _system_content(result) == "server prompt" + suffix
+
+
+def test_video_and_plain_requests_in_one_chat_use_separate_cache_entries(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    records = []
+    user = {"email": "person@example.test"}
+    video_metadata = {"chat_id": CHAT_ID, "filter_ids": ["video_production_filter"]}
+    plain_metadata = {"chat_id": CHAT_ID, "filter_ids": []}
+    with _live_asgi(_prompt_app(records, "server prompt", "https://webui.example/ocu")) as origin:
+        filter_ = _make_filter(origin)
+        contents = [
+            _system_content(
+                filter_.inlet(_active_body(), __user__=user, __metadata__=metadata, __model__=VIDEO_MODEL)
+            )
+            for metadata in (video_metadata, plain_metadata, video_metadata, plain_metadata)
+        ]
+
+    assert contents == [
+        "server prompt [features: video]",
+        "server prompt",
+        "server prompt [features: video]",
+        "server prompt",
+    ]
+    assert [record["headers"].get("x-ocu-features") for record in records] == ["video", None]
+    assert set(filter_._prompt_cache) == {
+        (CHAT_ID, "person@example.test", "video"),
+        (CHAT_ID, "person@example.test", ""),
+    }
+
+
+def test_video_inlet_fetch_then_outlet_decorates_from_the_cache(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    records = []
+    public_base = "https://webui.example/ocu"
+    file_url = f"{public_base}/files/{CHAT_ID}/intro.mp4"
+    metadata = {"chat_id": CHAT_ID, "filter_ids": ["video_production_filter"]}
+    user = {"email": "person@example.test"}
+    with _live_asgi(_prompt_app(records, "server prompt", public_base)) as origin:
+        filter_ = _make_filter(origin)
+        inlet_result = filter_.inlet(
+            _active_body(), __user__=user, __metadata__=metadata, __model__=VIDEO_MODEL
+        )
+        outlet_result = filter_.outlet(
+            {"messages": [{"role": "assistant", "content": f"rendered {file_url}"}]},
+            __user__=user,
+            __metadata__=metadata,
+        )
+
+    assert _system_content(inlet_result) == "server prompt [features: video]"
+    assert outlet_result["messages"][0]["content"] == (
+        f"rendered {file_url}\n\n"
+        f"[🖥️ Open preview]({file_url})\n"
+        f"[📦 Download all files as archive]({public_base}/files/{CHAT_ID}/archive)"
+    )
+    assert len(records) == 1
+
+
 class OrchestratorUrlNormalisation(unittest.TestCase):
     """ORCHESTRATOR_URL remains trailing-slash tolerant."""
 
@@ -808,13 +921,13 @@ class SystemPromptFetchCache(unittest.TestCase):
         ):
             result = f._fetch_system_prompt("chat-a", "")
         self.assertEqual(result, ("http://pub:8081", "PROMPT_V1"))
-        self.assertIn(("chat-a", ""), f._prompt_cache)
-        self.assertEqual(f._prompt_cache[("chat-a", "")][1], ("http://pub:8081", "PROMPT_V1"))
+        self.assertIn(("chat-a", "", ""), f._prompt_cache)
+        self.assertEqual(f._prompt_cache[("chat-a", "", "")][1], ("http://pub:8081", "PROMPT_V1"))
 
 
     def test_cache_hit_within_ttl_skips_http(self):
         f = _make_filter()
-        f._prompt_cache[("chat-a", "")] = (time.time(), ("http://pub:8081", "CACHED"))
+        f._prompt_cache[("chat-a", "", "")] = (time.time(), ("http://pub:8081", "CACHED"))
         with patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("open must not be called")) as m:
             result = f._fetch_system_prompt("chat-a", "")
         self.assertEqual(result, ("http://pub:8081", "CACHED"))
@@ -822,11 +935,11 @@ class SystemPromptFetchCache(unittest.TestCase):
 
     def test_ttl_expiry_triggers_refetch(self):
         f = _make_filter()
-        f._prompt_cache[("chat-a", "")] = (time.time() - 301, ("http://pub:8081", "OLD"))
+        f._prompt_cache[("chat-a", "", "")] = (time.time() - 301, ("http://pub:8081", "OLD"))
         with patch("urllib.request.OpenerDirector.open", return_value=_urlopen_mock("FRESH")):
             result = f._fetch_system_prompt("chat-a", "")
         self.assertEqual(result[1], "FRESH")
-        self.assertGreater(f._prompt_cache[("chat-a", "")][0], time.time() - 5)
+        self.assertGreater(f._prompt_cache[("chat-a", "", "")][0], time.time() - 5)
 
     def test_lru_eviction_at_max_size(self):
         f = _make_filter()
@@ -834,12 +947,12 @@ class SystemPromptFetchCache(unittest.TestCase):
             for i in range(1, 102):  # 101 distinct chat ids
                 f._fetch_system_prompt(f"chat-{i}", "")
         self.assertEqual(len(f._prompt_cache), 100)
-        self.assertNotIn(("chat-1", ""), f._prompt_cache)
-        self.assertIn(("chat-101", ""), f._prompt_cache)
+        self.assertNotIn(("chat-1", "", ""), f._prompt_cache)
+        self.assertIn(("chat-101", "", ""), f._prompt_cache)
 
     def test_stale_cache_fallback_on_server_down(self):
         f = _make_filter()
-        f._prompt_cache[("chat-a", "")] = (
+        f._prompt_cache[("chat-a", "", "")] = (
             time.time() - 9999,
             ("http://pub:8081", "STALE"),
         )
@@ -884,7 +997,7 @@ class SystemPromptFetchCache(unittest.TestCase):
 
     def test_rejects_non_http_scheme_without_stale_cache_fallback(self):
         f = _make_filter("ftp://example.com")
-        f._prompt_cache[("chat-a", "")] = (
+        f._prompt_cache[("chat-a", "", "")] = (
             time.time() - 9999,
             ("http://pub:8081", "STALE"),
         )
@@ -910,15 +1023,15 @@ class SystemPromptFetchCache(unittest.TestCase):
             return _urlopen_mock(next(prompts))
 
         with patch("urllib.request.OpenerDirector.open", side_effect=_serve_next):
-            a = f._fetch_system_prompt("chat-shared", "alice@example.com")
-            b = f._fetch_system_prompt("chat-shared", "bob@example.com")
+            a = f._fetch_system_prompt("chat-shared", "alice@example.com", "")
+            b = f._fetch_system_prompt("chat-shared", "bob@example.com", "")
         self.assertEqual(a[1], "PROMPT_FOR_ALICE")
         self.assertEqual(b[1], "PROMPT_FOR_BOB")
-        self.assertIn(("chat-shared", "alice@example.com"), f._prompt_cache)
-        self.assertIn(("chat-shared", "bob@example.com"), f._prompt_cache)
+        self.assertIn(("chat-shared", "alice@example.com", ""), f._prompt_cache)
+        self.assertIn(("chat-shared", "bob@example.com", ""), f._prompt_cache)
         # No cross-contamination: Alice's cached entry still holds Alice's prompt
         self.assertEqual(
-            f._prompt_cache[("chat-shared", "alice@example.com")][1][1],
+            f._prompt_cache[("chat-shared", "alice@example.com", "")][1][1],
             "PROMPT_FOR_ALICE",
         )
 

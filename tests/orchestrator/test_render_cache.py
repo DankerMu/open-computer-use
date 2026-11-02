@@ -25,7 +25,7 @@ class RenderCacheContract(unittest.TestCase):
     def test_same_key_hits_cache(self):
         calls = []
 
-        async def _fake_uncached(chat_id, user_email):
+        async def _fake_uncached(chat_id, user_email, features=frozenset()):
             calls.append((chat_id, user_email))
             return f"rendered:{chat_id}:{user_email}"
 
@@ -37,7 +37,7 @@ class RenderCacheContract(unittest.TestCase):
         self.assertEqual(len(calls), 1, "second call should hit cache")
 
     def test_different_key_misses_cache(self):
-        async def _fake_uncached(chat_id, user_email):
+        async def _fake_uncached(chat_id, user_email, features=frozenset()):
             return f"rendered:{chat_id}:{user_email}"
 
         with patch.object(system_prompt, "_render_uncached", side_effect=_fake_uncached) as m:
@@ -49,7 +49,7 @@ class RenderCacheContract(unittest.TestCase):
     def test_invalidate_drops_entry(self):
         calls = []
 
-        async def _fake_uncached(chat_id, user_email):
+        async def _fake_uncached(chat_id, user_email, features=frozenset()):
             calls.append(1)
             return "x"
 
@@ -63,7 +63,7 @@ class RenderCacheContract(unittest.TestCase):
     def test_ttl_expires(self):
         calls = []
 
-        async def _fake_uncached(chat_id, user_email):
+        async def _fake_uncached(chat_id, user_email, features=frozenset()):
             calls.append(1)
             return "y"
 

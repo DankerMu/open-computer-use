@@ -38,6 +38,9 @@ MCP_API_KEY="${MCP_API_KEY:-}"
 MARKER_FILE="${MARKER_FILE:-/app/backend/data/.computer-use-initialized}"
 export TOOL_SOURCE="${SCRIPT_DIR}/tools/computer_use_tools.py"
 export FILTER_SOURCE="${SCRIPT_DIR}/functions/computer_link_filter.py"
+# The video switch. Its id is VIDEO_FILTER_ID in computer_link_filter.py.
+VIDEO_FILTER_ID="video_production_filter"
+VIDEO_FILTER_SOURCE="${SCRIPT_DIR}/functions/video_production_filter.py"
 
 # Sanity checks — run EVERY start (before marker-gate), so stale-default
 # warnings resurface on each restart until the user fixes them.
@@ -97,6 +100,78 @@ fi
 
 AUTH="Authorization: Bearer $TOKEN"
 
+# install_function ID NAME SOURCE DESCRIPTION: create the Open WebUI function,
+# or update it when it exists, from a shipped source file. A failed write stops
+# init before the marker is written.
+install_function() {
+    local id=$1 name=$2 source=$3 description=$4 payload existing action url
+    payload=$(FUNCTION_ID="$id" FUNCTION_NAME="$name" FUNCTION_SOURCE="$source" \
+        FUNCTION_DESCRIPTION="$description" python3 -c "
+import json, os
+with open(os.environ['FUNCTION_SOURCE'], encoding='utf-8') as source:
+    code = source.read()
+print(json.dumps({
+    'id': os.environ['FUNCTION_ID'],
+    'name': os.environ['FUNCTION_NAME'],
+    'content': code,
+    'meta': {'description': os.environ['FUNCTION_DESCRIPTION']},
+}))
+")
+    existing=$(curl -sf "$WEBUI_URL/api/v1/functions/id/$id" -H "$AUTH" 2>/dev/null || echo "")
+    if [ -n "$existing" ] && echo "$existing" | python3 -c "import sys,json; json.load(sys.stdin)['id']" 2>/dev/null; then
+        action=updated
+        url="$WEBUI_URL/api/v1/functions/id/$id/update"
+    else
+        action=created
+        url="$WEBUI_URL/api/v1/functions/create"
+    fi
+    if ! curl -sf -X POST "$url" -H "$AUTH" -H "Content-Type: application/json" \
+        -d "$payload" >/dev/null; then
+        echo "[init] ERROR: Could not install function $id. Init will retry on next restart." >&2
+        exit 1
+    fi
+    echo "[init] Function $action: $id"
+}
+
+# enable_global_function ID: make the function active (is_active) and global
+# (is_global). Open WebUI has TWO flip endpoints, /toggle and /toggle/global;
+# active-but-not-global is silently inert — the filter loads but is never
+# applied to chats. Read the state first and flip only what is off, so re-runs
+# are idempotent. A failure sets INIT_FAILED, so the marker is not written.
+enable_global_function() {
+    local id=$1 state flags
+    if ! state=$(curl -sf "$WEBUI_URL/api/v1/functions/id/$id" -H "$AUTH" 2>/dev/null) ||
+        ! flags=$(printf '%s' "$state" | python3 -c "
+import json, sys
+function = json.load(sys.stdin)
+print(function.get('is_active') is True, function.get('is_global') is True)
+" 2>/dev/null); then
+        echo "[init] ERROR: Could not read the state of function $id. Init will retry on next restart." >&2
+        INIT_FAILED=1
+        return 0
+    fi
+    if [ "${flags% *}" != "True" ]; then
+        if curl -sf -X POST "$WEBUI_URL/api/v1/functions/id/$id/toggle" -H "$AUTH" >/dev/null 2>&1; then
+            echo "[init] Function activated: $id"
+        else
+            echo "[init] ERROR: Could not activate function $id — it stays disabled. Init will retry on next restart." >&2
+            INIT_FAILED=1
+        fi
+    else
+        echo "[init] Function already active: $id"
+    fi
+    if [ "${flags#* }" != "True" ]; then
+        if curl -sf -X POST "$WEBUI_URL/api/v1/functions/id/$id/toggle/global" -H "$AUTH" >/dev/null 2>&1; then
+            echo "[init] Function marked global (applies to all chats): $id"
+        else
+            echo "[init] ERROR: Could not mark function $id global — it won't apply to chats. Init will retry on next restart." >&2
+            INIT_FAILED=1
+        fi
+    else
+        echo "[init] Function already global: $id"
+    fi
+}
+
 # Install tool: computer_use_tools.py
 echo "[init] Installing Computer Use tool..."
 TOOL_PAYLOAD=$(python3 -c "
@@ -153,29 +228,8 @@ fi
 
 # Install function: computer_link_filter.py
 echo "[init] Installing Computer Use filter..."
-FUNC_PAYLOAD=$(python3 -c "
-import json, os
-code = open(os.environ['FILTER_SOURCE']).read()
-print(json.dumps({
-    'id': 'computer_use_filter',
-    'name': 'Computer Use Filter',
-    'content': code,
-    'meta': {'description': 'Injects system prompt with file URLs and adds archive download button.'}
-}))
-")
-
-EXISTING_F=$(curl -sf "$WEBUI_URL/api/v1/functions/id/computer_use_filter" -H "$AUTH" 2>/dev/null || echo "")
-if [ -n "$EXISTING_F" ] && echo "$EXISTING_F" | python3 -c "import sys,json; json.load(sys.stdin)['id']" 2>/dev/null; then
-    curl -sf -X POST "$WEBUI_URL/api/v1/functions/id/computer_use_filter/update" \
-        -H "$AUTH" -H "Content-Type: application/json" \
-        -d "$FUNC_PAYLOAD" >/dev/null
-    echo "[init] Function updated: computer_use_filter"
-else
-    curl -sf -X POST "$WEBUI_URL/api/v1/functions/create" \
-        -H "$AUTH" -H "Content-Type: application/json" \
-        -d "$FUNC_PAYLOAD" >/dev/null
-    echo "[init] Function created: computer_use_filter"
-fi
+install_function computer_use_filter "Computer Use Filter" "$FILTER_SOURCE" \
+    "Injects system prompt with file URLs and adds archive download button."
 
 # Configure filter valves. ORCHESTRATOR_URL is the internal URL used for
 # server→server fetch of /system-prompt. The public URL (for browser-facing
@@ -192,38 +246,15 @@ else
     INIT_FAILED=1
 fi
 
-# Enable filter (is_active=True) and mark it global (is_global=True).
-# Open WebUI v0.8.12 has TWO separate endpoints: /toggle flips is_active,
-# /toggle/global flips is_global. Active-but-not-global is silently inert —
-# the filter loads but is never applied to chats. Query state first and only
-# flip when needed so the script stays idempotent on re-runs.
-FILTER_STATE=$(curl -sf "$WEBUI_URL/api/v1/functions/id/computer_use_filter" -H "$AUTH" 2>/dev/null || echo "{}")
-IS_ACTIVE=$(echo "$FILTER_STATE" | python3 -c "import sys,json;print(json.load(sys.stdin).get('is_active',False))" 2>/dev/null || echo "False")
-IS_GLOBAL=$(echo "$FILTER_STATE" | python3 -c "import sys,json;print(json.load(sys.stdin).get('is_global',False))" 2>/dev/null || echo "False")
+enable_global_function computer_use_filter
 
-if [ "$IS_ACTIVE" != "True" ]; then
-    if curl -sf -X POST "$WEBUI_URL/api/v1/functions/id/computer_use_filter/toggle" \
-        -H "$AUTH" >/dev/null 2>&1; then
-        echo "[init] Filter activated."
-    else
-        echo "[init] ERROR: Could not activate filter — it will stay disabled until the next successful init. Init will retry on next restart."
-        INIT_FAILED=1
-    fi
-else
-    echo "[init] Filter already active."
-fi
-
-if [ "$IS_GLOBAL" != "True" ]; then
-    if curl -sf -X POST "$WEBUI_URL/api/v1/functions/id/computer_use_filter/toggle/global" \
-        -H "$AUTH" >/dev/null 2>&1; then
-        echo "[init] Filter marked global (applies to all chats)."
-    else
-        echo "[init] ERROR: Could not mark filter global — it is active but won't apply to chats. Init will retry on next restart."
-        INIT_FAILED=1
-    fi
-else
-    echo "[init] Filter already global."
-fi
+# Install the video switch: an active, global toggle filter appears in every
+# model's integrations menu, off by default. The Computer Use filter reads the
+# switch from the request and asks for the remotion skill.
+echo "[init] Installing video switch filter..."
+install_function "$VIDEO_FILTER_ID" "视频制作" "$VIDEO_FILTER_SOURCE" \
+    "Offers the remotion video skill for the next message."
+enable_global_function "$VIDEO_FILTER_ID"
 
 # Set global DEFAULT_MODEL_PARAMS so every model uses Native Function Calling + streaming
 # without per-model Advanced Params clicks. The old /api/v1/configs/models/default/update
@@ -279,7 +310,7 @@ fi
 
 # Mark as initialized — only if every required step succeeded. If INIT_FAILED=1,
 # leave the marker off so the next container start retries the failed steps
-# (public-access grant, filter toggle, filter global, models configuration).
+# (public-access grant, filter valves, filter states, models configuration).
 # Without this guard a transient failure would be baked in forever.
 if [ "$INIT_FAILED" = "0" ]; then
     touch "$MARKER_FILE"

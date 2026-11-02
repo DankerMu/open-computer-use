@@ -642,8 +642,12 @@ def build_system_prompt(
 # Cache rationale: render hits skill_manager.get_user_skills() which may do
 # an HTTP call to mcp-settings-wrapper. We cannot pay that on every MCP
 # request (middleware pre-renders for Tier 4 dynamic instructions on EVERY
-# request, not just initialize). Per-(chat_id, user_email) cache with 60s
-# TTL — matches skill_manager's own in-memory cache TTL.
+# request, not just initialize). Per-(chat_id, user_email, features) cache
+# with 60s TTL — matches skill_manager's own in-memory cache TTL.
+#
+# Features are opt-in prompt extensions requested by the Open WebUI filter
+# through the X-OCU-Features header. Callers that pass none (MCP initialize,
+# the sandbox README, sub_agent) get the prompt without any of them.
 
 import asyncio
 import time
@@ -652,7 +656,9 @@ from typing import Optional
 import skill_manager
 
 _RENDER_TTL_SECONDS = 60.0
-_RenderKey = tuple[Optional[str], Optional[str]]
+# The only feature: "video" lists the remotion skill (the video switch).
+PROMPT_FEATURES = frozenset({"video"})
+_RenderKey = tuple[Optional[str], Optional[str], frozenset[str]]
 _render_cache: dict[_RenderKey, tuple[float, str]] = {}
 
 # Per-key render locks. A single global lock would serialize cold renders
@@ -663,9 +669,29 @@ _render_locks: dict[_RenderKey, asyncio.Lock] = {}
 _locks_dict_lock = asyncio.Lock()
 
 
-async def _render_uncached(chat_id: Optional[str], user_email: Optional[str]) -> str:
+def parse_prompt_features(header: Optional[str]) -> frozenset[str]:
     """
-    Build the full system prompt for (chat_id, user_email). No cache.
+    Parse an X-OCU-Features value: comma-separated names from PROMPT_FEATURES.
+
+    Absent or blank means no features. Any other item, including an empty one,
+    raises ValueError so a misconfigured caller fails loud.
+    """
+    if header is None or not header.strip():
+        return frozenset()
+    names = [name.strip() for name in header.split(",")]
+    unknown = [name for name in names if name not in PROMPT_FEATURES]
+    if unknown:
+        raise ValueError(f"unknown prompt feature: {unknown[0]!r}")
+    return frozenset(names)
+
+
+async def _render_uncached(
+    chat_id: Optional[str],
+    user_email: Optional[str],
+    features: frozenset[str] = frozenset(),
+) -> str:
+    """
+    Build the full system prompt for (chat_id, user_email, features). No cache.
 
     chat_id=None is the legacy diagnostic path: external integrators
     (n8n, custom HTTP callers) hit /system-prompt with no params and do
@@ -679,6 +705,8 @@ async def _render_uncached(chat_id: Optional[str], user_email: Optional[str]) ->
 
     if user_email:
         skills = await skill_manager.get_user_skills(user_email)
+        if "video" in features:
+            skills = skill_manager.video_skills(skills)
         for s in skills:
             if s.category == "user":
                 await skill_manager.ensure_skill_cached(s)
@@ -710,15 +738,19 @@ async def _get_render_lock(key: _RenderKey) -> asyncio.Lock:
         return lock
 
 
-async def render_system_prompt(chat_id: Optional[str], user_email: Optional[str]) -> str:
+async def render_system_prompt(
+    chat_id: Optional[str],
+    user_email: Optional[str],
+    features: frozenset[str] = frozenset(),
+) -> str:
     """
-    Cached per-(chat_id, user_email) async renderer. 60s TTL.
+    Cached per-(chat_id, user_email, features) async renderer. 60s TTL.
     Hot path is ~μs; cold path is one skill-manager HTTP call + substitution.
 
     chat_id=None is the legacy /system-prompt no-params path — see
     _render_uncached docstring.
     """
-    key: _RenderKey = (chat_id, user_email)
+    key: _RenderKey = (chat_id, user_email, features)
     now = time.monotonic()
     hit = _render_cache.get(key)
     if hit is not None and (now - hit[0]) < _RENDER_TTL_SECONDS:
@@ -728,7 +760,7 @@ async def render_system_prompt(chat_id: Optional[str], user_email: Optional[str]
         hit = _render_cache.get(key)  # double-check after awaiting the lock
         if hit is not None and (now - hit[0]) < _RENDER_TTL_SECONDS:
             return hit[1]
-        text = await _render_uncached(chat_id, user_email)
+        text = await _render_uncached(chat_id, user_email, features)
         _render_cache[key] = (time.monotonic(), text)
         return text
 

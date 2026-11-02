@@ -10,14 +10,15 @@ Everything needed to connect [Open WebUI](https://github.com/open-webui/open-web
 |---|-----------|------|----------|-------------|
 | 1 | [**tools/computer_use_tools.py**](tools/) | Tool | Yes | MCP client proxy — forwards `bash`, `create_file`, `str_replace`, `view`, `sub_agent` calls to the Computer Use Server |
 | 2 | [**functions/computer_link_filter.py**](functions/) | Filter | Yes | Fetches the server-generated system prompt (skills list + file base URL embedded server-side) and the `X-Public-Base-URL` response header; decorates responses with preview/archive links |
+| 3 | [**functions/video_production_filter.py**](functions/) | Toggle filter | Yes | The 视频制作 switch; when on, the system prompt lists the `remotion` video skill. `remove-wrapper-model.py` refuses until it is installed |
 
-**Tool + Filter is the whole integration.** Both work against a stock upstream Open WebUI.
+**The tool and the two filters are the whole integration.** All three work against a stock upstream Open WebUI.
 
 ## Quick Start
 
-**Automatic** (recommended): `docker-compose.webui.yml` runs upstream Open WebUI and `init.sh` on first startup to install the tool + filter, configure valves, mark the **tool public-read** (`group:*` + `user:*` grants) and the **filter both active AND global** (two separate Open WebUI toggles), plus set `DEFAULT_MODEL_PARAMS = {function_calling: "native", stream_response: true}`.
+**Automatic** (recommended): `docker-compose.webui.yml` runs upstream Open WebUI and `init.sh` on first startup to install the tool and both filters, configure valves, mark the **tool public-read** (`group:*` + `user:*` grants) and **both filters active AND global** (two separate Open WebUI toggles), plus set `DEFAULT_MODEL_PARAMS = {function_calling: "native", stream_response: true}`.
 
-**Manual**: Install tool and filter through Workspace UI, set Tool ID to `ai_computer_use`, toggle **Active** and **Global** on the filter (both switches), set tool access to **Public** (Share → Public). See [setup guide](../README.md#required-setup-when-embedding-open-webui-into-your-own-stack) for the full checklist and common silent-fail traps.
+**Manual**: Install the tool and both filters through Workspace UI, set Tool ID to `ai_computer_use`, set the video filter's id to `video_production_filter`, toggle **Active** and **Global** on both filters (both switches), set tool access to **Public** (Share → Public). See [setup guide](../README.md#required-setup-when-embedding-open-webui-into-your-own-stack) for the full checklist and common silent-fail traps.
 
 ## There are no patches here any more
 

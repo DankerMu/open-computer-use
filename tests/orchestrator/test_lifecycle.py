@@ -412,6 +412,15 @@ def test_created_sandbox_has_one_read_write_files_bind(world, monkeypatch):
     assert not (tmp_path / "user-data" / CHAT / "uploads").exists()
 
 
+def test_created_sandbox_gets_the_default_two_cpus_and_four_gigabytes(world):
+    # CONTAINER_MEM_LIMIT and CONTAINER_CPU_LIMIT are unset in this process.
+    docker_manager, client, _clock, _tmp_path = world
+    docker_manager._get_or_create_container(CHAT)
+    config = client._created[0]._create_config
+    assert config["mem_limit"] == "4g"
+    assert config["nano_cpus"] == 2_000_000_000
+
+
 def test_recreated_sandbox_keeps_the_same_files_mount_set(world, monkeypatch):
     docker_manager, client, _clock, tmp_path = world
     monkeypatch.setattr(docker_manager, "DOCKER_IMAGE", "open-computer-use:test")

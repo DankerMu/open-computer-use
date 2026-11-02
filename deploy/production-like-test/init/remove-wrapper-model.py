@@ -5,10 +5,11 @@
 
 The Computer Use tool now reaches every model through the global filter, so the
 "<model> (Computer Use)" row that older initializers created is obsolete. Run
-this once, after open-webui-init has stored the shipped filter. It refuses to
-delete anything until the stored computer_use_filter equals the shipped file
-byte for byte, then deletes only rows whose name ends with " (Computer Use)"
-and whose meta.toolIds contains ai_computer_use. A second run removes nothing.
+this once, after open-webui-init has stored the shipped sources. It refuses to
+delete anything until the stored computer_use_filter, video_production_filter
+and ai_computer_use tool each equal their shipped file byte for byte, then
+deletes only rows whose name ends with " (Computer Use)" and whose
+meta.toolIds contains ai_computer_use. A second run removes nothing.
 
 Rows come from two admin endpoints. The old initializer gave the wrapper the
 raw provider model's id, so Open WebUI stored it as a base-model override
@@ -30,8 +31,15 @@ import sys
 import urllib.error
 import urllib.request
 
-FILTER_ID = "computer_use_filter"
 TOOL_ID = "ai_computer_use"
+# (stored id, admin endpoint, shipped file under OCU_INIT_SOURCE_ROOT)
+STORED_SOURCES = (
+    ("computer_use_filter", "/api/v1/functions/id/computer_use_filter",
+     "functions/computer_link_filter.py"),
+    ("video_production_filter", "/api/v1/functions/id/video_production_filter",
+     "functions/video_production_filter.py"),
+    (TOOL_ID, f"/api/v1/tools/id/{TOOL_ID}", "tools/computer_use_tools.py"),
+)
 WRAPPER_SUFFIX = " (Computer Use)"
 
 
@@ -87,7 +95,8 @@ def _is_wrapper(row: object) -> bool:
     )
 
 
-def remove_wrappers(base: str, email: str, password: str, shipped: bytes) -> None:
+def remove_wrappers(base: str, email: str, password: str, shipped: dict[str, bytes]) -> None:
+    """`shipped` maps each STORED_SOURCES id to its shipped file's bytes."""
     try:
         session = _call(
             base, "POST", "/api/v1/auths/signin", payload={"email": email, "password": password}
@@ -104,19 +113,20 @@ def remove_wrappers(base: str, email: str, password: str, shipped: bytes) -> Non
     if not isinstance(token, str) or not token:
         raise Refusal("admin sign-in failed (no session token returned)")
 
-    try:
-        stored = _call(base, "GET", f"/api/v1/functions/id/{FILTER_ID}", token)
-    except Refusal as refusal:
-        stored = None
-        reason = str(refusal)
-    else:
-        reason = "its content differs from the shipped filter"
-    content = stored.get("content") if isinstance(stored, dict) else None
-    if not isinstance(content, str) or content.encode("utf-8") != shipped:
-        raise Refusal(
-            f"the stored {FILTER_ID} is not the shipped filter ({reason}); "
-            "delete the init marker and re-run open-webui-init first"
-        )
+    for stored_id, path, relative in STORED_SOURCES:
+        try:
+            stored = _call(base, "GET", path, token)
+        except Refusal as refusal:
+            stored = None
+            reason = str(refusal)
+        else:
+            reason = f"its content differs from {relative}"
+        content = stored.get("content") if isinstance(stored, dict) else None
+        if not isinstance(content, str) or content.encode("utf-8") != shipped[stored_id]:
+            raise Refusal(
+                f"the stored {stored_id} is not the shipped source ({reason}); "
+                "delete the init marker and re-run open-webui-init first"
+            )
 
     rows: dict[str, dict] = {}
     for path in ("/api/v1/models/base", "/api/v1/models/export"):
@@ -141,18 +151,16 @@ def main() -> int:
     base = os.environ.get("WEBUI_URL", "http://open-webui:8080").rstrip("/")
     email = os.environ.get("ADMIN_EMAIL", "")
     password = os.environ.get("ADMIN_PASSWORD", "")
-    filter_path = (
-        Path(os.environ.get("OCU_INIT_SOURCE_ROOT", "/app/source"))
-        / "functions"
-        / "computer_link_filter.py"
-    )
+    source_root = Path(os.environ.get("OCU_INIT_SOURCE_ROOT", "/app/source"))
     try:
         if not email or not password:
             raise Refusal("ADMIN_EMAIL and ADMIN_PASSWORD are required")
-        try:
-            shipped = filter_path.read_bytes()
-        except OSError:
-            raise Refusal(f"cannot read the shipped filter at {filter_path}") from None
+        shipped = {}
+        for stored_id, _path, relative in STORED_SOURCES:
+            try:
+                shipped[stored_id] = (source_root / relative).read_bytes()
+            except OSError:
+                raise Refusal(f"cannot read the shipped source at {source_root / relative}") from None
         remove_wrappers(base, email, password, shipped)
     except Refusal as refusal:
         print(f"remove-wrapper-model: ERROR: {refusal}", file=sys.stderr)

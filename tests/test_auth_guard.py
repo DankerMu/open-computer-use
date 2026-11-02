@@ -1374,6 +1374,39 @@ class TestMountedMcp:
         assert response.status_code == 400
         assert calls == []
 
+    def test_initialize_never_lists_the_video_skill(self, client, monkeypatch):
+        import skill_manager
+
+        async def _no_provider(_email):
+            return None
+
+        monkeypatch.setattr(skill_manager, "_fetch_user_config", _no_provider)
+        monkeypatch.setattr(skill_manager, "_load_user_config_cache", lambda _email: None)
+        email = "person@example.test"
+        video = client.get(
+            "/system-prompt",
+            params={"chat_id": CHAT, "user_email": email},
+            headers={**_bearer(), "X-OCU-Features": "video"},
+        )
+        assert video.status_code == 200
+        assert "<name>\nremotion\n</name>" in video.text
+        response = client.post(
+            "/mcp", headers=_mcp_headers(extra={"X-User-Email": email}), json=INIT_BODY
+        )
+        assert response.status_code == 200, response.text[:300]
+        instructions = _instructions(response)
+        assert "<available_skills>" in instructions
+        assert "remotion" not in instructions
+
+    def test_feature_header_without_internal_token_is_401(self, client):
+        response = client.get(
+            "/system-prompt",
+            params={"chat_id": CHAT, "user_email": "person@example.test"},
+            headers={"X-OCU-Features": "video"},
+        )
+        assert response.status_code == 401
+        assert "remotion" not in response.text
+
     def test_authenticated_initialize_trusts_only_this_request(self, client):
         first = client.post("/mcp", headers=_mcp_headers(chat=CHAT), json=INIT_BODY)
         second = client.post("/mcp", headers=_mcp_headers(chat=CHAT_B), json=INIT_BODY)

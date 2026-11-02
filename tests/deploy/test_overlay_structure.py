@@ -65,6 +65,7 @@ ADOPTED = (
     ROOT / "openwebui" / "init.sh",
     ROOT / "openwebui" / "tools" / "computer_use_tools.py",
     ROOT / "openwebui" / "functions" / "computer_link_filter.py",
+    ROOT / "openwebui" / "functions" / "video_production_filter.py",
 )
 PUBLIC_COPY_SOURCES = (
     "render.py",
@@ -147,7 +148,7 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None,
         "OCU_SKILLS_CACHE_DIR": str(directory / "skills"),
         "OCU_RELEASE_FONTS_DIR": str(directory.parent / "release-fonts"),
         "OCU_OFFICE_FONTS_DIR": str(directory.parent / "operator-fonts"),
-        "CONTAINER_MEM_LIMIT": "2g", "CONTAINER_CPU_LIMIT": "1.0",
+        "CONTAINER_MEM_LIMIT": "4g", "CONTAINER_CPU_LIMIT": "2.0",
         "CONTAINER_IDLE_TIMEOUT": "259200", "COMMAND_TIMEOUT": "120",
         "SUB_AGENT_TIMEOUT": "3600", "RETENTION_CHECK_INTERVAL_SECONDS": "3600",
         "ADMIN_EMAIL": "admin@fixture.test", "DMXAPI_BASE_URL": "http://provider.fixture/v1",
