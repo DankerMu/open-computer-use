@@ -25,9 +25,10 @@ FUNCTIONALITY:
   credentials, authorization failures, redirects, and missing public metadata skip
   injection.
 - outlet(): Decorates assistant messages only when they contain a concrete file URL for
-  the current chat under the public base cached for any entry of that chat. PREVIEW_MODE="button" appends one
-  markdown link to the first matching file URL; ARCHIVE_BUTTON="on" appends the
-  current-chat archive link. Both decorations are idempotent.
+  the current chat under the public base cached for any entry of that chat.
+  PREVIEW_MODE="button" appends one markdown link to the first matching file URL;
+  ARCHIVE_BUTTON="on" appends the current-chat archive link. Both decorations are
+  idempotent.
 
 Security:
 - OCU_INTERNAL_TOKEN is read from the Open WebUI process environment at request time.
