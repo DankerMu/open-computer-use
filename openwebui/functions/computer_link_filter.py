@@ -3,7 +3,7 @@
 """
 title: Computer Use Filter
 author: Open Computer Use Contributors
-version: 5.0.0
+version: 5.1.0
 required_open_webui_version: 0.5.17
 description: Attaches the Computer Use tool to every saved chat and authenticated HTTP-fetches the Computer Use system prompt from the internal orchestrator, with an LRU cache for transient failures. outlet() decorates assistant messages with a concrete-file preview link and optional archive link.
 
@@ -16,12 +16,16 @@ FUNCTIONALITY:
   fully-baked system prompt from the orchestrator's /system-prompt endpoint using the
   process OCU_INTERNAL_TOKEN as Bearer authentication. It derives user_email only from
   injected __user__, requires the X-Public-Base-URL response header, and caches that
-  header with the prompt per chat/user and current credential/orchestrator authority.
+  header with the prompt per chat/user/feature set and current credential/orchestrator
+  authority. A request is video-enabled when its __metadata__["filter_ids"] selects
+  the video_production_filter switch and that id is among __model__["filters"], which
+  Open WebUI fills only from active toggle filters; such a request asks for the
+  remotion skill with the X-OCU-Features: video header.
   Transient transport failures may use a stale same-authority cache entry; missing
   credentials, authorization failures, redirects, and missing public metadata skip
   injection.
 - outlet(): Decorates assistant messages only when they contain a concrete file URL for
-  the current chat under the cached public base. PREVIEW_MODE="button" appends one
+  the current chat under the public base cached for any entry of that chat. PREVIEW_MODE="button" appends one
   markdown link to the first matching file URL; ARCHIVE_BUTTON="on" appends the
   current-chat archive link. Both decorations are idempotent.
 
@@ -87,6 +91,10 @@ TEMPLATE_PATTERN = r"^.*\{\{\s*(?:" + "|".join(OPENWEBUI_TEMPLATE_VARS) + r")\s*
 _PROMPT_TTL_SECONDS = 300
 _PROMPT_CACHE_MAX_SIZE = 100
 
+# Id of the video switch (video_production_filter.py) as the init scripts install
+# it. Open WebUI loads each function on its own, so this file cannot import it.
+VIDEO_FILTER_ID = "video_production_filter"
+
 # Saved Open WebUI chats have UUID ids. Channel replies ("channel:<id>") and
 # temporary or local chats ("temporary:<id>", "local:<id>") have no workspace.
 _SAVED_CHAT_ID_RE = re.compile(
@@ -97,6 +105,25 @@ _SAVED_CHAT_ID_RE = re.compile(
 def _saved_chat_id(chat_id: object) -> bool:
     """True only for a saved chat's id, the only kind with a Computer Use workspace."""
     return isinstance(chat_id, str) and _SAVED_CHAT_ID_RE.fullmatch(chat_id) is not None
+
+
+def _prompt_features(metadata: Optional[dict], model: Optional[dict]) -> str:
+    """Return the X-OCU-Features value for this request ("" for none).
+
+    The switch counts only when the user selected it and the model lists it among
+    its toggle filters, so an admin who deactivates the filter turns video off even
+    for a client that keeps sending the id.
+    """
+    selected = metadata.get("filter_ids") if isinstance(metadata, dict) else None
+    if not isinstance(selected, (list, tuple)) or VIDEO_FILTER_ID not in selected:
+        return ""
+    filters = model.get("filters") if isinstance(model, dict) else None
+    if not isinstance(filters, (list, tuple)):
+        return ""
+    active = any(
+        isinstance(item, dict) and item.get("id") == VIDEO_FILTER_ID for item in filters
+    )
+    return "video" if active else ""
 
 
 def _find_block_start(content: str, pos: int) -> int:
@@ -239,11 +266,12 @@ class Filter:
     def __init__(self):
         self.valves = self.Valves()
         self._no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
-        # Per-(chat, user) LRU cache: (chat_id, user_email) ->
-        # (fetched_at, (public_url, prompt)). Its authority records the normalized
-        # internal origin and current process credential that produced every entry.
+        # Per-(chat, user, features) LRU cache: (chat_id, user_email, features) ->
+        # (fetched_at, (public_url, prompt)), where features is the X-OCU-Features
+        # value ("" for none). Its authority records the normalized internal origin
+        # and current process credential that produced every entry.
         self._prompt_cache: OrderedDict[
-            tuple[str, str], tuple[float, tuple[str, str]]
+            tuple[str, str, str], tuple[float, tuple[str, str]]
         ] = OrderedDict()
         self._cache_authority: Optional[tuple[str, str]] = None
 
@@ -275,7 +303,7 @@ class Filter:
         return authority
 
     def _fetch_system_prompt(
-        self, chat_id: str, user_email: str = ""
+        self, chat_id: str, user_email: str = "", features: str = ""
     ) -> Optional[tuple[str, str]]:
         """Fetch an authorized prompt, retaining stale data only for transport failures."""
         authority = self._configured_authority()
@@ -283,7 +311,7 @@ class Filter:
             return None
         orchestrator, token = authority
         now = time.time()
-        cache_key = (chat_id, user_email)
+        cache_key = (chat_id, user_email, features)
         cached = self._prompt_cache.get(cache_key)
 
         if cached and (now - cached[0]) < _PROMPT_TTL_SECONDS:
@@ -303,6 +331,8 @@ class Filter:
             req = urllib.request.Request(url, method="GET")
             req.add_header("Accept", "text/plain")
             req.add_header("Authorization", f"Bearer {token}")
+            if features:
+                req.add_header("X-OCU-Features", features)
             with self._no_redirect_opener.open(req, timeout=10) as resp:  # noqa: S310
                 prompt = resp.read().decode("utf-8")
                 public_url = resp.headers.get("X-Public-Base-URL")
@@ -346,6 +376,7 @@ class Filter:
         body: dict,
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
+        __model__: Optional[dict] = None,
     ) -> dict:
         """Attach the Computer Use tool and inject its system prompt BEFORE LLM processing."""
         chat_id = __metadata__.get("chat_id") if __metadata__ else None
@@ -363,7 +394,8 @@ class Filter:
 
         user_email = __user__.get("email", "") if __user__ else ""
 
-        fetched = self._fetch_system_prompt(chat_id, user_email)
+        features = _prompt_features(__metadata__, __model__)
+        fetched = self._fetch_system_prompt(chat_id, user_email, features)
         if not fetched:
             # Unavailable, unauthorized, or incomplete prompt metadata leaves the body unchanged.
             return body
@@ -433,22 +465,22 @@ class Filter:
         if not chat_id or self._configured_authority() is None:
             return body
 
-        user_email = __user__.get("email", "") if __user__ else ""
-        cached = self._prompt_cache.get((chat_id, user_email)) or self._prompt_cache.get(
-            (chat_id, "")
+        # Only the public base is needed, and it depends on neither the user nor
+        # the feature set: use the most recent entry for this chat.
+        public_url = next(
+            (
+                entry[1][0]
+                for key, entry in reversed(self._prompt_cache.items())
+                if key[0] == chat_id
+            ),
+            None,
         )
-        if not cached:
-            for (cached_chat_id, _), entry in self._prompt_cache.items():
-                if cached_chat_id == chat_id:
-                    cached = entry
-                    break
-        if not cached:
-            cached_pair = self._fetch_system_prompt(chat_id, user_email)
-            if not cached_pair:
+        if public_url is None:
+            user_email = __user__.get("email", "") if __user__ else ""
+            fetched = self._fetch_system_prompt(chat_id, user_email)
+            if not fetched:
                 return body
-            public_url, _prompt = cached_pair
-        else:
-            public_url, _prompt = cached[1]
+            public_url = fetched[0]
 
         archive_url = f"{public_url}/files/{chat_id}/archive"
         for message in body.get("messages", []):
