@@ -76,11 +76,13 @@ X-Chat-Id | X-OpenWebUI-Chat-Id   > ?chat_id=           > "default"
 X-User-Email | X-OpenWebUI-User-Email > ?user_email=   > None
 ```
 
+`X-OCU-Features` is a comma-separated list of prompt extensions. The only one is `video`, which adds a `remotion` entry to `<available_skills>` when a user email is present; the filter sends it for the video switch. Absent or blank means none, and the prompt is byte-identical to a request without the header. Any other value is 400 and nothing is rendered. No other tier passes features, so MCP `initialize`, the sandbox README and `sub_agent` never list `remotion`.
+
 Header-priority rule consistent with the rest of the server (MCP middleware reads the same headers and aliases). Response header `X-Public-Base-URL` is still emitted so the filter's `outlet()` can build browser-facing concrete-file and archive links from the server-owned `PUBLIC_BASE_URL`.
 
 ## Render cache
 
-`render_system_prompt(chat_id, user_email)` is cache-backed with a 60-second TTL (`_RENDER_TTL_SECONDS` in `system_prompt.py`). Matches `skill_manager`'s own memory-cache TTL. Middleware runs the render on **every** MCP request to pre-fill the ContextVar for Tier 4, so the cache is load-bearing — without it, every `tools/call` would re-hit the skills provider. The second request for the same `(chat_id, user_email)` is a dict lookup.
+`render_system_prompt(chat_id, user_email, features=frozenset())` is cache-backed with a 60-second TTL (`_RENDER_TTL_SECONDS` in `system_prompt.py`). Matches `skill_manager`'s own memory-cache TTL. Middleware runs the render on **every** MCP request to pre-fill the ContextVar for Tier 4, so the cache is load-bearing — without it, every `tools/call` would re-hit the skills provider. The second request for the same `(chat_id, user_email, features)` is a dict lookup. A `video` render builds a new skills list with `remotion` appended; the list `skill_manager` caches for the user is never modified.
 
 Invalidation: `invalidate_render_cache()` (no arg → clear all; `chat_id` arg → clear that chat). Used in tests; also callable when skills change upstream.
 

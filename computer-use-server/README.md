@@ -568,7 +568,7 @@ before retrying native preparation.
 ### System
 - `GET /health` — Health check
 - `DELETE /internal/sandbox/{chat_id}` — internal-token deletion of the chat's container and `chat-{chat_id}-workspace` volume under the lifecycle lock. It then writes a `.deleted` tombstone, even for a chat OCU has never seen, and only after that removes every chat file except `.lifecycle.lock` and `.deleted`, so a failure there still refuses every creator. A busy MCP resource-discovery admission at the end is logged, not a failure; any other discovery failure is 500 `delete_failed`. It answers `{"container": bool, "volume": bool, "data": bool}`; a repeated call reports all `false`. A non-canonical id (`default`, a transient prefix, `..`) is 400 before any engine or file access. An engine or file failure is 500 `delete_failed`, and a retry completes the remaining steps. After deletion every create-capable lifecycle acquisition for that chat is refused and creates nothing. Launch, describe, uploads and the outputs listing answer HTTP 410 `chat_deleted`; MCP tool calls return the text `Error: chat was deleted`. Office write routes, `GET /api/uploads/{chat_id}/imports` and `GET /terminal/{chat_id}/heartbeat` do not map lifecycle errors and answer 500. The check runs after the cross-process lock is held, so a creator already waiting on the lock is refused too.
-- `GET /system-prompt` — Get system prompt (with dynamic skills)
+- `GET /system-prompt` — Get system prompt (with dynamic skills; the `X-OCU-Features: video` header adds the `remotion` skill)
 - `GET /skill-list` — List available skills
 
 ## Configuration

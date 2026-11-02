@@ -11,6 +11,10 @@
 
 Without this filter, the model won't know about skills or how to generate file download links.
 
+## Video switch
+
+**File**: `video_production_filter.py` — optional. A toggle filter, installed as `video_production_filter` (named 视频制作) and active and global, that shows a switch in the chat integrations menu. Its inlet changes nothing; when the switch is on, `computer_link_filter.py` asks for the prompt with the `remotion` skill. See [`docs/openwebui-filter.md`](../../docs/openwebui-filter.md#video-switch).
+
 ## Valves
 
 | Valve | Default | Description |

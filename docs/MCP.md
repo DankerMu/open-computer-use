@@ -276,6 +276,7 @@ curl "http://localhost:8081/system-prompt?chat_id=my-session&user_email=user@exa
 |-----------|-------------|----------|
 | `chat_id` | Session ID — server constructs file download URLs from this | Recommended |
 | `user_email` | Returns prompt with user-specific skills | No |
+| `X-OCU-Features` header | `video` adds the `remotion` skill; any other value is 400 | No |
 
 ### GET /skill-list
 

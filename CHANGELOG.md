@@ -3,6 +3,21 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **Video switch (#702).** `openwebui/functions/video_production_filter.py` is
+  a toggle filter that both init scripts install as `video_production_filter`,
+  named 视频制作, active and global, idempotently; an API error fails init
+  without the marker. The Computer Use filter treats a request as video-enabled
+  only when `filter_ids` selects the switch and the model lists it among its
+  active toggle filters, then fetches `/system-prompt` with
+  `X-OCU-Features: video`. Its prompt cache keys on
+  `(chat_id, user_email, features)`, and `outlet()` takes the public base from
+  any entry for the chat.
+- **`X-OCU-Features` on `/system-prompt` (#702).** The only accepted value is
+  `video`, which adds a `remotion` entry to `<available_skills>` for a request
+  with a user email. Any other value is 400 and renders nothing; an absent or
+  blank header gives the prompt byte-identical to before. The render cache keys
+  on the feature set, and the skills list cached per user is never modified.
+  MCP `initialize`, the sandbox README and `sub_agent` never list `remotion`.
 - **Stopped sandboxes are removed after `SANDBOX_RETENTION_DAYS` (#698).** The
   idle reaper removes a sandbox that has been exited or created for the
   retention period (default 30 days), measured from the engine's
@@ -36,6 +51,13 @@
   `delete_failed`.
 
 ### Changed
+- **New sandboxes get 2 CPUs and 4 GB (#702).** The `docker_manager`
+  defaults and `bootstrap-test.sh` give `CONTAINER_CPU_LIMIT=2.0` and
+  `CONTAINER_MEM_LIMIT=4g`. Limits apply at container creation, and an existing
+  `runtime.env` keeps its values.
+- **`remove-wrapper-model.py` checks every stored source (#702).** It refuses
+  until the stored `computer_use_filter`, `video_production_filter` and
+  `ai_computer_use` tool each equal their shipped file byte for byte.
 - **Tool calls wake a stopped sandbox (#697).** A tool or MCP request for an
   exited, created, paused or restarting sandbox, or for an absent container with
   valid metadata, now takes the launch transition within the same lifecycle lock
