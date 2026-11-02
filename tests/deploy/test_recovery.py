@@ -66,6 +66,7 @@ PROVIDER_A = "credential-A"
 PROVIDER_B = "credential-B"
 EMBEDDING_KEY = "credential-embedding"
 RERANKER_KEY = "credential-reranker"
+TTS_KEY = "credential-tts"
 PRECEDENCE_NOTICE = "recovery: restored persistent provider settings remain in effect"
 MODEL_LINKS = {
     "bin/python3": "/usr/bin/python3",
@@ -3696,13 +3697,15 @@ class ProviderKeyTests(unittest.TestCase):
     def test_activation_env_carries_each_provider_key_unchanged(self):
         provider = {"DMXAPI_API_KEY": PROVIDER_A, "OPENAI_API_KEY": PROVIDER_B,
                     "RAG_OPENAI_API_KEY": EMBEDDING_KEY,
-                    "RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY, "UNRELATED": "not-carried"}
+                    "RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY, "TTS_API_KEY": TTS_KEY,
+                    "UNRELATED": "not-carried"}
         inventory = synthetic_inventory(ocu_sha="a" * 40, webui_sha=WEBUI_SYNTHETIC_SHA)
         ambient = {"DOCKER_HOST": recovery.SUPPORTED_DOCKER_HOST}
         with patch.dict(os.environ, ambient), patch.object(
             recovery.release, "_PINNED_DOCKER_HOST", None
         ):
-            for name in ("RAG_OPENAI_API_KEY", "RAG_EXTERNAL_RERANKER_API_KEY", "UNRELATED"):
+            for name in ("RAG_OPENAI_API_KEY", "RAG_EXTERNAL_RERANKER_API_KEY", "TTS_API_KEY",
+                         "UNRELATED"):
                 os.environ.pop(name, None)
             env = self.resources.activation_env({}, inventory, Path("/nonexistent-root"), provider)
         for name, value in provider.items():

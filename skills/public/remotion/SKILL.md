@@ -121,14 +121,17 @@ Also pass `--gl=swangle` on every `still` and `render` command of such a project
 
 ## Voiceover
 
-When available, call the `generate_speech` tool for each narration line. It writes the audio to `/mnt/user-data/files/` and returns its path.
+When available, call the `generate_speech` tool for each narration line: `text` (up to 2000 characters), a plain `filename` ending in `.mp3` or `.wav`, and `instructions` describing the voice, for example "a calm female narrator, Mandarin". It writes the audio to `/mnt/user-data/files/` and returns its path; an existing name gets a numbered suffix, so use the returned path.
 
-1. Measure each file: `ffprobe -v error -show_entries format=duration -of csv=p=0 <file>`.
-2. Copy it into `public/` and play it with `<Audio src={staticFile("<file>")} />` from `@remotion/media`.
+1. Copy each returned file into `public/` under a plain name, quoting the returned path because it can contain spaces and parentheses, for example `line1 (2).mp3`:
+   ```bash
+   cd /home/assistant/videos/<name> && cp "<returned path>" public/line1.mp3
+   ```
+2. Measure it: `cd /home/assistant/videos/<name> && ffprobe -v error -show_entries format=duration -of csv=p=0 public/line1.mp3`. Play it with `<Audio src={staticFile("line1.mp3")} />` from `@remotion/media`.
 3. Size each scene and the composition's `durationInFrames` from the measured lengths.
 4. For captions, use the text you sent to `generate_speech` and place each line over its measured duration.
 
-Without the tool, make the video without narration and say so.
+Without the tool, or when it returns `speech synthesis is not configured`, make the video without narration and say so.
 
 ## Installed packages
 

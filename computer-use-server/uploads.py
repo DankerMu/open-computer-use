@@ -4,7 +4,8 @@
 Shared helpers for publishing, listing and reading chat workspace files.
 
 Used by:
-  - POST /api/uploads/{chat_id}/{path} (publication via claim_file_no_replace).
+  - POST /api/uploads/{chat_id}/{path} and the generate_speech MCP tool
+    (publication via store_upload and claim_file_no_replace).
   - sync_chat_resources / the @mcp.resource handler in mcp_resources.py
     (native MCP surface over workspace files).
 
@@ -16,6 +17,7 @@ skipped from MCP discovery. Upload staging lives in the server-private
 
 import errno
 import datetime
+import hashlib
 import json
 import mimetypes
 import os
@@ -669,3 +671,75 @@ def _validate_receipts(loaded: Any) -> dict[str, dict[str, Any]]:
             "stored_name": stored_name,
         }
     return validated
+
+
+def check_upload_name(filename: str) -> Path:
+    """Return ``filename`` as a relative path, or raise 403 for an unsafe one."""
+    relative = Path(filename)
+    if (not filename or relative.is_absolute() or ".." in relative.parts
+            or relative.name in {"", ".", ".."} or "\x00" in filename):
+        raise HTTPException(status_code=403, detail="Invalid upload path")
+    return relative
+
+
+def store_upload(
+    chat_id: str, filename: str, content: bytes, attachment_id: str | None = None,
+) -> tuple[str, str, int]:
+    """Publish bytes under ``outputs/`` with the collision suffix; return name, md5, size.
+
+    Shared by the upload route and the generate_speech tool. Keeps blocking
+    lock and file operations on one worker thread under the chat's
+    create-capable lifecycle lock, which refuses a tombstoned chat.
+
+    Ancestors stay pinned by directory fds from the chat root. Staging is a
+    private ``.ocu`` file; publication hard-links from that directory into
+    the destination directory fd. Every owned fd and the staging name are
+    released on success and on error.
+    """
+    # docker_manager imports this module lazily; importing it here keeps that one-way.
+    from docker_manager import _combined_lock
+
+    with _combined_lock(chat_id):
+        relative = check_upload_name(filename)
+        chat_dir = BASE_DATA_DIR / chat_id
+        receipts = read_import_receipts(chat_dir) if attachment_id else None
+        if attachment_id and attachment_id in receipts:
+            record = receipts[attachment_id]
+            return record["stored_name"], record["md5"], record["size"]
+        parent_parts = () if relative.parent == Path(".") else relative.parent.parts
+        if any(part in {"", ".", ".."} for part in parent_parts):
+            raise HTTPException(status_code=403, detail="Invalid upload path")
+        os.makedirs(chat_dir, exist_ok=True)
+        chat_fd = None
+        outputs_fd = None
+        dest_fd = None
+        control_fd = None
+        staging_fd = None
+        staging_name = None
+        try:
+            chat_fd = open_directory_path(chat_dir)
+            outputs_fd = ensure_workspace_directories(chat_fd, ("outputs",))
+            dest_fd = ensure_workspace_directories(outputs_fd, parent_parts)
+            control_fd = open_control_directory(chat_fd)
+            staging_fd, staging_name = stage_upload_bytes(control_fd, content)
+            stored_basename = claim_file_no_replace(
+                staging_name,
+                src_dir_fd=control_fd,
+                dst_dir_fd=dest_fd,
+                requested_name=relative.name,
+            )
+            stored_name = "/".join((*parent_parts, stored_basename))
+            md5_hash = hashlib.md5(content).hexdigest()
+            if attachment_id:
+                receipts[attachment_id] = import_receipt(
+                    stored_name, len(content), md5_hash)
+                write_import_receipts(chat_dir, receipts)
+            return stored_name, md5_hash, len(content)
+        finally:
+            close_fd(staging_fd)
+            if staging_name is not None and control_fd is not None:
+                unlink_relative(staging_name, control_fd)
+            close_fd(control_fd)
+            close_fd(dest_fd)
+            close_fd(outputs_fd)
+            close_fd(chat_fd)

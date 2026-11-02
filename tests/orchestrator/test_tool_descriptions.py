@@ -42,10 +42,13 @@ class ToolDescriptionsContract(unittest.TestCase):
         self.assertIn("resources/list", static)
         self.assertNotIn("prompts/get", static)
 
-    def test_total_tool_count_unchanged_at_five(self):
-        """We promised the user: 5 tools before, 5 tools after."""
+    def test_tool_set_is_the_five_tools_plus_generate_speech(self):
+        """The five sandbox tools plus generate_speech (#703); any other drift fails."""
         tools = asyncio.run(mcp_tools.mcp.list_tools())
-        self.assertEqual(len(tools), 5, f"tool count drifted: {[t.name for t in tools]}")
+        self.assertEqual(
+            {t.name for t in tools},
+            {"bash_tool", "str_replace", "create_file", "view", "sub_agent", "generate_speech"},
+        )
 
 
 if __name__ == "__main__":

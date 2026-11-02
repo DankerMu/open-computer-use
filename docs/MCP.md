@@ -78,10 +78,11 @@ Leave `MCP_API_KEY` empty for development (no auth required).
 | `create_file` | Create new files |
 | `str_replace` | Edit files via text replacement |
 | `sub_agent` | Delegate tasks to autonomous Claude Code agent |
+| `generate_speech` | Synthesize speech into `/mnt/user-data/files/` through the server's `TTS_*` endpoint |
 
 ## Native MCP primitives beyond tools
 
-Beyond the five tools, the server exposes three more native primitives of the Streamable-HTTP MCP protocol — all scoped by `X-Chat-Id`:
+Beyond the six tools, the server exposes three more native primitives of the Streamable-HTTP MCP protocol — all scoped by `X-Chat-Id`:
 
 | Primitive | What you get | How |
 |---|---|---|

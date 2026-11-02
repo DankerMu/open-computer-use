@@ -31,6 +31,27 @@ retention_days() {
     fi
 }
 
+# A runtime.env written before #703 lacks the TTS keys; Compose then passes
+# empty values and a 120-second timeout. The key is never read here.
+tts_value() {
+    if grep -q "^$1=" "$runtime_file"; then
+        env_value "$1"
+    else
+        printf '%s' "$2"
+    fi
+}
+
+tts_policy() {
+    local configured=no model voice
+    if [ -n "$(tts_value TTS_BASE_URL '')" ]; then
+        configured=yes
+    fi
+    model=$(tts_value TTS_MODEL '')
+    voice=$(tts_value TTS_VOICE '')
+    printf -- '- Speech synthesis (TTS): configured `%s`, model `%s`, voice `%s`, timeout `%s` seconds; the endpoint URL and API key are not recorded\n' \
+        "$configured" "${model:-none}" "${voice:-none}" "$(tts_value TTS_TIMEOUT_SECONDS 120)"
+}
+
 manifest=${OCU_RELEASE_MANIFEST:-$(env_value OCU_RELEASE_MANIFEST)}
 if [ -z "$manifest" ]; then
     printf '%s\n' 'OCU_RELEASE_MANIFEST is required' >&2
@@ -88,6 +109,7 @@ PY
     printf -- '- Host publications: proxy only (`OCU_PROXY_PORT:8082`, `OCU_OFFICE_PROXY_PORT:8083`)\n'
     printf -- '- Sandbox CDP/ttyd published ports: dedicated sandbox bridge gateway (`%s`)\n' "$(env_value OCU_SANDBOX_GATEWAY)"
     printf -- '- Stopped sandbox retention: container and workspace volume removed after `SANDBOX_RETENTION_DAYS=%s` days stopped; chat files kept until the chat is deleted\n' "$(retention_days)"
+    tts_policy
     printf -- '- Offline mode: `OFFLINE_MODE=true`; version update checks disabled; embedding/rerank auto-update disabled\n'
     printf -- '- LAN OpenAI/RAG endpoints remain the configured provider URLs; local Draw.io and Pyodide materials stay enabled\n'
     printf '\n## Deployment-local modifications\n\n'

@@ -16,7 +16,7 @@ from ._mcp import call_mcp
 # Snapshot of tools registered in mcp_tools.py. Update intentionally when the
 # tool surface changes; a drift here means somebody renamed/added/removed a tool
 # and the team should agree before shipping.
-EXPECTED_TOOL_NAMES = {"bash_tool", "str_replace", "create_file", "view", "sub_agent"}
+EXPECTED_TOOL_NAMES = {"bash_tool", "str_replace", "create_file", "view", "sub_agent", "generate_speech"}
 
 
 def _initialize(client, chat_id) -> None:

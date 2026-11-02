@@ -30,6 +30,7 @@ from urllib.parse import quote, urlsplit
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
 import claude_gateway
+import speech
 from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
 from office.router import OfficeAvailabilityMiddleware, create_office_router
 from office import config as office_config
@@ -83,17 +84,10 @@ from uploads import (
     CorruptReceiptsError,
     DiscoveryError,
     NameCapacityError,
-    claim_file_no_replace,
     close_fd,
-    ensure_workspace_directories,
-    import_receipt,
     open_chat_upload,
-    open_control_directory,
-    open_directory_path,
     read_import_receipts,
-    stage_upload_bytes,
-    unlink_relative,
-    write_import_receipts,
+    store_upload,
 )
 from outputs_broker import (
     CursorError,
@@ -483,6 +477,7 @@ async def lifespan(app):
     configured_retention_days()
     validate_sandbox_dns_configuration()
     claude_gateway.gateway_base_url()
+    speech.configuration()
     warn_if_public_base_url_is_default()
     warn_if_mcp_api_key_missing()
     warn_subagent_cli()
@@ -639,65 +634,6 @@ async def root():
     return get_root_html()
 
 
-def _store_upload(
-    chat_id: str, filename: str, content: bytes, attachment_id: str | None = None,
-) -> tuple[str, str, int]:
-    """Keep blocking lock and file operations on one worker thread.
-
-    Ancestors stay pinned by directory fds from the chat root. Staging is a
-    private ``.ocu`` file; publication hard-links from that directory into
-    the destination directory fd. Every owned fd and the staging name are
-    released on success and on error.
-    """
-    with _combined_lock(chat_id):
-        relative = Path(filename)
-        if (not filename or relative.is_absolute() or ".." in relative.parts
-                or relative.name in {"", ".", ".."} or "\x00" in filename):
-            raise HTTPException(status_code=403, detail="Invalid upload path")
-        chat_dir = BASE_DATA_DIR / chat_id
-        receipts = read_import_receipts(chat_dir) if attachment_id else None
-        if attachment_id and attachment_id in receipts:
-            record = receipts[attachment_id]
-            return record["stored_name"], record["md5"], record["size"]
-        parent_parts = () if relative.parent == Path(".") else relative.parent.parts
-        if any(part in {"", ".", ".."} for part in parent_parts):
-            raise HTTPException(status_code=403, detail="Invalid upload path")
-        os.makedirs(chat_dir, exist_ok=True)
-        chat_fd = None
-        outputs_fd = None
-        dest_fd = None
-        control_fd = None
-        staging_fd = None
-        staging_name = None
-        try:
-            chat_fd = open_directory_path(chat_dir)
-            outputs_fd = ensure_workspace_directories(chat_fd, ("outputs",))
-            dest_fd = ensure_workspace_directories(outputs_fd, parent_parts)
-            control_fd = open_control_directory(chat_fd)
-            staging_fd, staging_name = stage_upload_bytes(control_fd, content)
-            stored_basename = claim_file_no_replace(
-                staging_name,
-                src_dir_fd=control_fd,
-                dst_dir_fd=dest_fd,
-                requested_name=relative.name,
-            )
-            stored_name = "/".join((*parent_parts, stored_basename))
-            md5_hash = hashlib.md5(content).hexdigest()
-            if attachment_id:
-                receipts[attachment_id] = import_receipt(
-                    stored_name, len(content), md5_hash)
-                write_import_receipts(chat_dir, receipts)
-            return stored_name, md5_hash, len(content)
-        finally:
-            close_fd(staging_fd)
-            if staging_name is not None and control_fd is not None:
-                unlink_relative(staging_name, control_fd)
-            close_fd(control_fd)
-            close_fd(dest_fd)
-            close_fd(outputs_fd)
-            close_fd(chat_fd)
-
-
 def _list_import_ids(chat_id: str) -> dict[str, list[str]]:
     chat_dir = safe_path(BASE_DATA_DIR, chat_id)
     if not chat_dir.is_dir():
@@ -742,7 +678,7 @@ async def upload_file(
     try:
         content = await file.read()
         stored_name, md5_hash, size = await asyncio.to_thread(
-            _store_upload, chat_id, filename, content, attachment_id
+            store_upload, chat_id, filename, content, attachment_id
         )
 
         # Publication is already committed. Discovery reports a separate outcome,
