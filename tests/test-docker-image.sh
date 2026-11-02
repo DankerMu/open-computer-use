@@ -878,6 +878,8 @@ const Scene = () => {
 };
 registerRoot(() => <Composition id="Smoke3D" component={Scene} durationInFrames={1} fps={30} width={640} height={360} />);
 TSX
+printf "\nConfig.setChromiumOpenGlRenderer(\047swangle\047);\n" >> remotion.config.ts
+grep -qF "Config.setChromiumOpenGlRenderer($(printf "\047")swangle$(printf "\047"));" remotion.config.ts && echo "config3d=OK"
 npx --no-install remotion still src/Smoke3D.tsx Smoke3D /tmp/remotion-3d.png --gl=swangle
 python3 - <<PY
 from PIL import Image, ImageStat
@@ -894,6 +896,7 @@ fi
 echo "$REMOTION_OUT" | grep -q "owner=OK" && pass "template node_modules owned by root" || fail "template node_modules not owned by root"
 echo "$REMOTION_OUT" | grep -q "readonly=OK" && pass "template node_modules read-only for assistant" || fail "template node_modules writable by assistant"
 echo "$REMOTION_OUT" | grep -q "still=OK" && pass "Remotion still written without network" || fail "Remotion still missing: $REMOTION_OUT"
+echo "$REMOTION_OUT" | grep -q "config3d=OK" && pass "ThreeCanvas smoke sets swangle in remotion.config.ts" || fail "swangle config line missing: $REMOTION_OUT"
 echo "$REMOTION_OUT" | grep -q "still3d=OK" && pass "ThreeCanvas still with --gl=swangle is not uniform" || fail "ThreeCanvas still blank or missing: $REMOTION_OUT"
 
 test_browser_cli_config

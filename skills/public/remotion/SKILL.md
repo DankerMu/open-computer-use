@@ -50,10 +50,11 @@ Every tool call starts in `/home/assistant`, so begin each command with `cd /hom
 
 ```bash
 cd /home/assistant/videos/<name>
+rm -rf out/frames
 npx --no-install remotion render src/index.ts Main out/frames --sequence --frames=0,45,90,149 --image-format=png --concurrency=2
 ```
 
-Fix what looks wrong and repeat. Copy a frame to `/mnt/user-data/files/` only if the user should see it.
+Every listed frame must exist: the last frame is `durationInFrames - 1`, so `0,45,90,149` fits only the template's 150-frame `Main`; pick frames from your own composition's length. `rm -rf out/frames` comes first because the sequence output does not delete PNGs from an earlier run. Fix what looks wrong and repeat. Copy a frame to `/mnt/user-data/files/` only if the user should see it.
 
 **2. Launch the MP4 render in the background.** Tool commands are killed after `COMMAND_TIMEOUT` (120 seconds), and most renders take longer:
 
@@ -61,14 +62,15 @@ Fix what looks wrong and repeat. Copy a frame to `/mnt/user-data/files/` only if
 cd /home/assistant/videos/<name>
 rm -f /mnt/user-data/files/<name>.mp4
 setsid nohup bash -c 'npx --no-install remotion render src/index.ts Main /mnt/user-data/files/<name>.mp4 --concurrency=2 --codec=h264 --pixel-format=yuv420p; echo "remotion exit $?"' > render.log 2>&1 < /dev/null &
+echo $! > render.pid
 ```
 
 Do not sleep in the same call that launches the render; let that call return at once.
 
-**3. Poll until the log reports the exit code.** Repeat this call until it prints `remotion exit …`:
+**3. Poll until the log reports the exit code.** Repeat this call while it prints `running`:
 
 ```bash
-cd /home/assistant/videos/<name>; sleep 100; tail -n 3 render.log; grep "remotion exit" render.log || echo running
+cd /home/assistant/videos/<name>; sleep 100; tail -n 3 render.log; grep "remotion exit" render.log || { kill -0 "$(cat render.pid)" 2>/dev/null && echo running || echo "render died without exit"; }
 ```
 
 The default idle stop is about 10 minutes; deployments may set it longer. A sandbox stopped for idleness kills the render, so keep polling without long pauses.
@@ -86,10 +88,10 @@ Flags:
 
 ## When a render fails
 
-Any `remotion exit` other than 0, or an `ffprobe` error, is a failure:
+Any `remotion exit` other than 0, or an `ffprobe` error, is a failure. `render died without exit` means the render was killed, for example by an idle stop; relaunch it from step 2 of "Run Remotion". Otherwise:
 
 1. Read the error: `cd /home/assistant/videos/<name>; tail -n 50 render.log`.
-2. Render the failing frame alone, for example `npx --no-install remotion still src/index.ts Main out/fail.png --frame=<n>`, and look at it with the `view` tool.
+2. Render the failing frame alone, for example `cd /home/assistant/videos/<name> && npx --no-install remotion still src/index.ts Main out/fail.png --frame=<n>`, and look at it with the `view` tool.
 3. Check the usual offline causes:
    - a remote URL, or a `delayRender` timeout while waiting for one: move the asset into `public/`;
    - a missing `staticFile()` asset: check the file name in `public/`;

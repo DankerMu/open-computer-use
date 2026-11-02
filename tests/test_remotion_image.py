@@ -293,6 +293,8 @@ def test_skill_md_check_frames_go_to_project_out() -> None:
     )
     assert "--image-format=png" in skill
     assert "`view` tool" in skill
+    assert "rm -rf out/frames" in skill
+    assert "durationInFrames - 1" in skill
 
 
 def test_skill_md_background_render_reports_its_exit() -> None:
@@ -301,7 +303,10 @@ def test_skill_md_background_render_reports_its_exit() -> None:
         "rm -f /mnt/user-data/files/<name>.mp4",
         "setsid nohup bash -c 'npx --no-install remotion render src/index.ts Main",
         "; echo \"remotion exit $?\"' > render.log 2>&1 < /dev/null &",
-        'sleep 100; tail -n 3 render.log; grep "remotion exit" render.log || echo running',
+        "echo $! > render.pid",
+        'sleep 100; tail -n 3 render.log; grep "remotion exit" render.log || '
+        '{ kill -0 "$(cat render.pid)" 2>/dev/null && echo running || echo "render died without exit"; }',
+        "cd /home/assistant/videos/<name> && npx --no-install remotion still",
         "Do not sleep in the same call that launches the render",
         "tail -n 50 render.log",
         "delayRender",
