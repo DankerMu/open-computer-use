@@ -480,7 +480,12 @@ def test_failed_acquisition_preserves_error_and_retires_resources(world, monkeyp
             ["fstat", stage.removeprefix("fstat-")] if stage.startswith("fstat-") else [stage]
         )
         assert admitted == []
-        assert observed.flocked == []
+        # A create-capable acquisition keeps the chat directory fd past LOCK_EX for
+        # the tombstone check, so its close failure surfaces after the flock (#698).
+        root_after_flock = stage == "root-close" and create
+        assert observed.flocked == (
+            [(manager.fcntl.LOCK_EX, identities["leaf"])] if root_after_flock else []
+        )
         assert CHAT not in manager._FLOCK_DEPTH
         _assert_retired(observed)
     assert leaf.read_bytes() == b"KEEP-LOCK-BYTES"
@@ -522,7 +527,10 @@ def test_directory_close_error_inside_handled_exception_still_refuses_admission(
         assert failure.value is error
         assert faults == [directory]
         assert admitted == []
-        assert observed.flock_attempts == []
+        # The chat directory fd closes after LOCK_EX on this create-capable path (#698).
+        assert [operation for operation, _inode in observed.flock_attempts] == (
+            [manager.fcntl.LOCK_EX] if directory == "root" else []
+        )
         assert CHAT not in manager._FLOCK_DEPTH
         _assert_retired(observed)
     _assert_another_thread_acquires(manager)

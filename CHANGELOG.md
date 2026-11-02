@@ -2,6 +2,31 @@
 
 ## Unreleased — `main` branch
 
+### Added
+- **Stopped sandboxes are removed after `SANDBOX_RETENTION_DAYS` (#698).** The
+  idle reaper removes a sandbox that has been exited or created for the
+  retention period (default 30 days), measured from the engine's
+  `State.FinishedAt`, or `Created` when FinishedAt is the zero time. It removes
+  the `chat-<id>-workspace` volume with it and keeps `BASE_DATA_DIR/<chat_id>`,
+  so the chat's next tool call creates a new sandbox over the same files.
+  Identity, status and age are revalidated under the lifecycle lock before
+  removal, and `retained_at` is recorded in `.idle.json` first, so a volume
+  left by an interrupted removal is retried on a later tick. Running, paused,
+  restarting and dead sandboxes, and unparsable timestamps, are never removed.
+  An empty, zero, negative or non-integer value refuses startup. The
+  production-like overlay passes `${SANDBOX_RETENTION_DAYS-30}`, `bootstrap-test.sh`
+  writes `SANDBOX_RETENTION_DAYS=30`, and the deployment record reports it.
+- **`DELETE /internal/sandbox/{chat_id}` (#698).** An internal-token route
+  removes the chat's container, workspace volume and every chat file except
+  `.lifecycle.lock`, then writes a `.deleted` tombstone, also for a chat OCU has
+  never seen. It answers `{"container", "volume", "data"}` booleans and is
+  idempotent. A non-canonical id is 400 before any engine or file access, and a
+  failure is 500 `delete_failed` that a retry completes. Every later
+  create-capable lifecycle acquisition for the chat, including describe and a
+  creator already waiting on the lock in another worker, returns 410
+  `chat_deleted`. Uploads and the outputs listing now map lifecycle errors to
+  their status instead of 500.
+
 ### Changed
 - **Tool calls wake a stopped sandbox (#697).** A tool or MCP request for an
   exited, created, paused or restarting sandbox, or for an absent container with

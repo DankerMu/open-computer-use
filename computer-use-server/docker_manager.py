@@ -20,6 +20,7 @@ import sys
 import re
 import json
 import shlex
+import shutil
 import time
 import datetime
 import fcntl
@@ -89,6 +90,10 @@ except (TypeError, ValueError):
     IDLE_POLL_SECONDS = -1
 RESTART_WAIT_SECONDS = 5
 RESTART_POLL_SECONDS = 0.05
+SANDBOX_RETENTION_DEFAULT_DAYS = 30
+_RETAINABLE_STATUSES = frozenset({"exited", "created"})
+_TOMBSTONE = ".deleted"
+_LIFECYCLE_LOCK = ".lifecycle.lock"
 
 
 class LifecycleError(Exception):
@@ -145,6 +150,16 @@ class LifecycleConfigError(LifecycleError):
         super().__init__(message, status_code=500, reason="invalid_idle_configuration")
 
 
+class ChatDeleted(LifecycleError):
+    def __init__(self):
+        super().__init__("chat was deleted", status_code=410, reason="chat_deleted")
+
+
+class DeleteFailed(LifecycleError):
+    def __init__(self, message):
+        super().__init__(message, status_code=500, reason="delete_failed")
+
+
 class SandboxDnsConfigError(LifecycleError):
     def __init__(self, message):
         super().__init__(message, status_code=500, reason="invalid_dns_configuration")
@@ -165,6 +180,22 @@ def validate_idle_configuration(idle_timeout=None, poll_seconds=None):
             f"CONTAINER_IDLE_TIMEOUT ({timeout})"
         )
     return timeout, poll
+
+
+def configured_retention_days() -> int:
+    """Parse SANDBOX_RETENTION_DAYS at call time. Only an absent variable means 30.
+
+    Compose passes ``${SANDBOX_RETENTION_DAYS-30}``, so an explicitly empty
+    value reaches the server and must refuse startup rather than default.
+    """
+    raw = os.environ.get("SANDBOX_RETENTION_DAYS")
+    if raw is None:
+        return SANDBOX_RETENTION_DEFAULT_DAYS
+    if not re.fullmatch(r"[0-9]+", raw) or int(raw) <= 0:
+        raise LifecycleConfigError(
+            f"SANDBOX_RETENTION_DAYS ({raw!r}) must be a positive integer"
+        )
+    return int(raw)
 
 
 def canonical_lock_chat_id(chat_id: str) -> str:
@@ -195,13 +226,22 @@ class _CombinedLock:
     mutated only while that RLock is held, so two threads cannot interleave it.
     create=False returns None when the chat directory is absent and never
     creates it.
+
+    A create-capable acquisition refuses a chat holding the ``.deleted``
+    tombstone with ChatDeleted. The check runs after the flock, against the
+    chat directory fd held since the lock file was opened, so a creator that
+    opened the lock file before the tombstone existed and then waited on the
+    flock is still refused. Only the delete transaction passes
+    admit_deleted=True.
     """
 
-    def __init__(self, chat_id: str, *, create: bool = True):
+    def __init__(self, chat_id: str, *, create: bool = True, admit_deleted: bool = False):
         self.chat_id = canonical_lock_chat_id(chat_id)
         self._thread_lock = get_chat_lock(self.chat_id)
         self._file = None
         self._create = create
+        self._check_tombstone = create and not admit_deleted
+        self._root_fd = None
         self._acquired = False
 
     def _open_file(self):
@@ -250,14 +290,14 @@ class _CombinedLock:
             )
             try:
                 try:
-                    lock_fd = os.open(".lifecycle.lock", flags, dir_fd=root_fd)
+                    lock_fd = os.open(_LIFECYCLE_LOCK, flags, dir_fd=root_fd)
                 except FileNotFoundError:
                     try:
                         lock_fd = os.open(
-                            ".lifecycle.lock", flags | os.O_CREAT | os.O_EXCL,
+                            _LIFECYCLE_LOCK, flags | os.O_CREAT | os.O_EXCL,
                             0o666, dir_fd=root_fd)
                     except FileExistsError:
-                        lock_fd = os.open(".lifecycle.lock", flags, dir_fd=root_fd)
+                        lock_fd = os.open(_LIFECYCLE_LOCK, flags, dir_fd=root_fd)
             except FileNotFoundError:
                 if not self._create:
                     return missing()
@@ -265,10 +305,15 @@ class _CombinedLock:
             owned.append(lock_fd)
             if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
                 raise OSError(errno.EINVAL, "lifecycle lock is not a regular file")
-            close_fd(root_fd)
+            if not self._check_tombstone:
+                close_fd(root_fd)
             close_fd(parent_fd)
             handle = os.fdopen(lock_fd, "r+")
             owned.remove(lock_fd)
+            if self._check_tombstone:
+                # __enter__ owns it from here and closes it after the tombstone check.
+                owned.remove(root_fd)
+                self._root_fd = root_fd
             return handle
         except BaseException:
             # Only a failure in this acquisition permits best-effort retirement.
@@ -292,8 +337,15 @@ class _CombinedLock:
             handle = self._open_file()
             if handle is None:
                 return None
+            root_fd, self._root_fd = self._root_fd, None
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    if root_fd is not None:
+                        _refuse_tombstoned(root_fd)
+                finally:
+                    if root_fd is not None:
+                        os.close(root_fd)
             except BaseException:
                 handle.close()
                 raise
@@ -324,8 +376,16 @@ class _CombinedLock:
         return False
 
 
-def _combined_lock(chat_id: str, *, create: bool = True) -> _CombinedLock:
-    return _CombinedLock(chat_id, create=create)
+def _refuse_tombstoned(root_fd: int) -> None:
+    try:
+        os.stat(_TOMBSTONE, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise ChatDeleted()
+
+
+def _combined_lock(chat_id: str, *, create: bool = True, admit_deleted: bool = False) -> _CombinedLock:
+    return _CombinedLock(chat_id, create=create, admit_deleted=admit_deleted)
 
 
 OCU_SANDBOX_NETWORK = os.getenv("OCU_SANDBOX_NETWORK", "ocu-sandbox").strip() or "ocu-sandbox"
@@ -1052,6 +1112,21 @@ def _container_name(chat_id: str) -> str:
     return f"owui-chat-{sanitized_id}"
 
 
+def _workspace_volume_name(chat_id: str) -> str:
+    """The chat's home volume, mounted by _create_container and removed by retention or delete."""
+    return f"chat-{canonical_lock_chat_id(chat_id)}-workspace"
+
+
+def _remove_workspace_volume(chat_id: str, *, force: bool = False) -> bool:
+    """Remove the chat's workspace volume. NotFound counts as done and returns False."""
+    try:
+        volume = get_docker_client().volumes.get(_workspace_volume_name(chat_id))
+        volume.remove(force=force)
+    except docker.errors.NotFound:
+        return False
+    return True
+
+
 def _reload_container(container):
     container.reload()
     return (container.status or "").lower()
@@ -1157,8 +1232,7 @@ def _create_container(chat_id: str, container_name: str) -> docker.models.contai
         extra_env["NO_AUTOSTART"] = "1"
     extra_env.pop("OCU_INTERNAL_TOKEN", None)
     extra_env.pop("MCP_API_KEY", None)
-    # Workspace volume for this chat
-    workspace_volume = f"chat-{chat_id}-workspace"
+    workspace_volume = _workspace_volume_name(chat_id)
 
     # Host path for the single workspace files directory. BASE_DATA_DIR is both
     # the server IO root and the Docker bind source; the configured path must be
@@ -1944,6 +2018,73 @@ def describe_sandbox(chat_id: str) -> dict:
         }
 
 
+def _clear_chat_directory(chat_id: str) -> bool:
+    """Remove every chat entry except the lock and tombstone; write the tombstone.
+
+    The lock file is never unlinked: a waiter on the old inode and a new
+    acquirer on a fresh one would otherwise run concurrently.
+    """
+    removed = False
+    chat_fd = os.open(_control_dir(chat_id), descriptor_io.DIRECTORY_FLAGS)
+    try:
+        with os.scandir(chat_fd) as listing:
+            entries = list(listing)
+        for entry in entries:
+            if entry.name in {_LIFECYCLE_LOCK, _TOMBSTONE}:
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.name, dir_fd=chat_fd)
+            else:
+                os.unlink(entry.name, dir_fd=chat_fd)
+            removed = True
+        tombstone = os.open(
+            _TOMBSTONE,
+            os.O_WRONLY | os.O_CREAT | descriptor_io.NO_FOLLOW | descriptor_io.CLOSE_ON_EXEC,
+            0o644, dir_fd=chat_fd)
+        os.close(tombstone)
+        os.fsync(chat_fd)
+    finally:
+        os.close(chat_fd)
+    return removed
+
+
+def delete_sandbox(chat_id: str) -> dict:
+    """Remove the chat's container, workspace volume and files; leave a tombstone.
+
+    Idempotent: a repeated call runs every step again and reports nothing
+    removed. Any engine or filesystem failure is DeleteFailed, and a retry
+    completes the remaining steps.
+    """
+    from mcp_resources import sync_chat_resources_sync
+    from uploads import DiscoveryError
+
+    chat_id = canonical_lock_chat_id(chat_id)
+    step = "lifecycle lock"
+    try:
+        with _combined_lock(chat_id, admit_deleted=True):
+            step = "container removal"
+            container = _lookup_container(chat_id)
+            removed_container = False
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                    removed_container = True
+                except docker.errors.NotFound:
+                    pass
+            step = "volume removal"
+            removed_volume = _remove_workspace_volume(chat_id, force=True)
+            step = "chat file removal"
+            removed_data = _clear_chat_directory(chat_id)
+            step = "workspace resource cleanup"
+            # outputs/ is gone, so discovery publishes an empty set for this chat.
+            sync_chat_resources_sync(chat_id)
+    except (docker.errors.DockerException, OSError, DiscoveryError) as exc:
+        raise DeleteFailed(f"sandbox delete failed during {step}: {exc}") from exc
+    print(f"[DELETE] chat {chat_id}: container={removed_container} "
+          f"volume={removed_volume} data={removed_data}")
+    return {"container": removed_container, "volume": removed_volume, "data": removed_data}
+
+
 def _idle_uncertain(state, container, now: float) -> bool:
     timeout, poll = validate_idle_configuration()
     identity = _container_identity(container)
@@ -1959,13 +2100,90 @@ def _idle_uncertain(state, container, now: float) -> bool:
     return now - observed > max(poll, timeout)
 
 
+_ENGINE_TIME = re.compile(
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})")
+
+
+def _engine_time(raw):
+    """Parse an engine RFC 3339 timestamp, nanoseconds included; None if unparsable."""
+    if not isinstance(raw, str):
+        return None
+    match = _ENGINE_TIME.fullmatch(raw)
+    if match is None:
+        return None
+    base, fraction, zone = match.groups()
+    fraction = f".{fraction[:6]:0<6}" if fraction else ""
+    zone = "+00:00" if zone == "Z" else zone
+    try:
+        return datetime.datetime.fromisoformat(base + fraction + zone)
+    except ValueError:
+        return None
+
+
+def _stopped_since(container):
+    """Engine stop time, or creation time when the stop time is the zero time."""
+    attrs = getattr(container, "attrs", None) or {}
+    stamp = _engine_time((attrs.get("State") or {}).get("FinishedAt"))
+    if stamp is not None and stamp.year == 1:
+        stamp = _engine_time(attrs.get("Created"))
+    if stamp is None or stamp.year == 1:
+        return None
+    return stamp.timestamp()
+
+
+def _retention_due(container, now: float) -> bool:
+    """Only an exited or created sandbox with a parsable stop time past the period."""
+    if (container.status or "") not in _RETAINABLE_STATUSES:
+        return False
+    since = _stopped_since(container)
+    if since is None:
+        print(f"[RETENTION] keeping {container.name}: engine timestamps do not parse")
+        return False
+    return now - since >= configured_retention_days() * 86400
+
+
+def _finish_retention(chat_id: str) -> None:
+    """Remove the workspace volume of a retained sandbox, then clear the marker."""
+    state = read_idle_state(chat_id)
+    if not isinstance(state, dict) or "retained_at" not in state:
+        return
+    _remove_workspace_volume(chat_id)
+    state = dict(state)
+    state.pop("retained_at")
+    write_idle_state(chat_id, state)
+
+
+def _retain(chat_id: str, container, now: float) -> None:
+    """Remove a stopped sandbox past retention; keep the chat directory."""
+    reloaded = _lookup_container(chat_id)
+    if (
+        reloaded is None
+        or _container_identity(reloaded) != _container_identity(container)
+        or not _retention_due(reloaded, now)
+    ):
+        return
+    state = read_idle_state(chat_id) or {}
+    write_idle_state(chat_id, {**state, "retained_at": now})
+    print(f"[RETENTION] removing {reloaded.name} and its workspace volume")
+    reloaded.remove()
+    _finish_retention(chat_id)
+
+
 def reap_idle(chat_id: str, now=None) -> None:
-    """Stop one continuously observed running sandbox, or grant a fresh window."""
+    """Stop one continuously observed running sandbox, or grant a fresh window.
+
+    A sandbox exited or created for SANDBOX_RETENTION_DAYS is removed with its
+    workspace volume; a volume left by an interrupted removal is retried here.
+    """
     chat_id = canonical_lock_chat_id(chat_id)
     current = time.time() if now is None else now
     with _combined_lock(chat_id):
         container = _lookup_container(chat_id)
         if container is None:
+            _finish_retention(chat_id)
+            return
+        if _retention_due(container, current):
+            _retain(chat_id, container, current)
             return
         if container.status == "paused":
             state = read_idle_state(chat_id)

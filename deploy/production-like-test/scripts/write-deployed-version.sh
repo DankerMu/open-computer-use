@@ -22,6 +22,15 @@ env_value() {
     sed -n "s/^$1=//p" "$runtime_file"
 }
 
+# A runtime.env written before #698 lacks the key; Compose then passes 30.
+retention_days() {
+    if grep -q '^SANDBOX_RETENTION_DAYS=' "$runtime_file"; then
+        env_value SANDBOX_RETENTION_DAYS
+    else
+        printf '%s' 30
+    fi
+}
+
 manifest=${OCU_RELEASE_MANIFEST:-$(env_value OCU_RELEASE_MANIFEST)}
 if [ -z "$manifest" ]; then
     printf '%s\n' 'OCU_RELEASE_MANIFEST is required' >&2
@@ -78,7 +87,7 @@ PY
     printf -- '- Sandbox idle/maximum continuous runtime: `%s` seconds / `%s` hours\n' "$(env_value CONTAINER_IDLE_TIMEOUT)" "$(env_value CONTAINER_MAX_AGE_HOURS)"
     printf -- '- Host publications: proxy only (`OCU_PROXY_PORT:8082`, `OCU_OFFICE_PROXY_PORT:8083`)\n'
     printf -- '- Sandbox CDP/ttyd published ports: dedicated sandbox bridge gateway (`%s`)\n' "$(env_value OCU_SANDBOX_GATEWAY)"
-    printf -- '- Chat/workspace data retention: no automatic deletion\n'
+    printf -- '- Stopped sandbox retention: container and workspace volume removed after `SANDBOX_RETENTION_DAYS=%s` days stopped; chat files kept until the chat is deleted\n' "$(retention_days)"
     printf -- '- Offline mode: `OFFLINE_MODE=true`; version update checks disabled; embedding/rerank auto-update disabled\n'
     printf -- '- LAN OpenAI/RAG endpoints remain the configured provider URLs; local Draw.io and Pyodide materials stay enabled\n'
     printf '\n## Deployment-local modifications\n\n'

@@ -43,6 +43,10 @@ services:
       CONTAINER_MEM_LIMIT: ${CONTAINER_MEM_LIMIT}
       CONTAINER_CPU_LIMIT: ${CONTAINER_CPU_LIMIT}
       CONTAINER_IDLE_TIMEOUT: ${CONTAINER_IDLE_TIMEOUT}
+      # A sandbox stopped this many days loses its container and workspace
+      # volume; chat files stay. Unset means 30; an explicitly empty or
+      # non-positive value refuses server startup.
+      SANDBOX_RETENTION_DAYS: ${SANDBOX_RETENTION_DAYS-30}
       OCU_SANDBOX_NETWORK: ${OCU_SANDBOX_NETWORK:?OCU_SANDBOX_NETWORK is required}
       OCU_SANDBOX_SUBNET: ${OCU_SANDBOX_SUBNET:?OCU_SANDBOX_SUBNET is required}
       SANDBOX_HOST_BIND_IP: ${OCU_SANDBOX_GATEWAY:?OCU_SANDBOX_GATEWAY is required}

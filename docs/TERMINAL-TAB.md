@@ -39,8 +39,11 @@ Browser (xterm.js)  ←WebSocket→  Computer Use Server  ←WebSocket→  Conta
 5. tmux session is persistent — reconnectable on disconnect.
 6. While the page is open, `/terminal/{chat_id}/heartbeat` extends the host-owned idle window.
 7. OCU stops a continuously observed running sandbox after `CONTAINER_IDLE_TIMEOUT` (default: 10 min). External Docker pause time does not count, and no idle stop runs while OCU is down.
+8. A sandbox that stays exited or created for `SANDBOX_RETENTION_DAYS` (default: 30) is removed with its workspace volume by the same reaper. The chat's files and metadata stay, so the next tool call creates a new sandbox that sees them; the home directory starts fresh.
 
 A tool call for an exited, created, paused, restarting, or removed-but-metadata sandbox wakes it with the launch transition before it runs: exited and created start, paused unpauses, restarting waits within a bounded deadline, and a removed container is recreated from server-side credentials only. A dead sandbox, an engine refusal, a readiness timeout, a legacy paused sandbox without migration evidence, a create-conflict winner that is not running, and corrupt metadata return their explicit lifecycle error; nothing is deleted or recreated. Every launch that reaches running starts a fresh idle window. The same transition is available as `POST /internal/launch/{chat_id}` or its `/terminal/{chat_id}/restart-container` and `resurrect-container` aliases. Launch answers `{"state":"running"}` only after observing running. `GET /internal/describe/{chat_id}` reads state and does not change it. Both require the internal bearer token.
+
+`DELETE /internal/sandbox/{chat_id}` removes the chat's container, workspace volume and files and leaves a `.deleted` tombstone. Afterwards launch, describe and tool calls for that chat return 410 `chat_deleted` and create nothing.
 
 ## Existing sleeper cutover
 

@@ -567,6 +567,7 @@ before retrying native preparation.
 
 ### System
 - `GET /health` — Health check
+- `DELETE /internal/sandbox/{chat_id}` — internal-token deletion of the chat's container, `chat-{chat_id}-workspace` volume and every chat file except `.lifecycle.lock`, under the lifecycle lock. It writes a `.deleted` tombstone, even for a chat OCU has never seen, and answers `{"container": bool, "volume": bool, "data": bool}`; a repeated call reports all `false`. A non-canonical id (`default`, a transient prefix, `..`) is 400 before any engine or file access. An engine or file failure is 500 `delete_failed`, and a retry completes the remaining steps. After deletion every create-capable lifecycle acquisition for that chat is refused and creates nothing: tool calls, launch, describe, uploads and the outputs listing answer 410 `chat_deleted` (Office routes do not map lifecycle errors and answer 500). The check runs after the cross-process lock is held, so a creator already waiting on the lock is refused too.
 - `GET /system-prompt` — Get system prompt (with dynamic skills)
 - `GET /skill-list` — List available skills
 
@@ -593,6 +594,7 @@ All via environment variables:
 | `CONTAINER_MEM_LIMIT` | `2g` | Container memory limit |
 | `CONTAINER_CPU_LIMIT` | `1.0` | Container CPU limit |
 | `CONTAINER_IDLE_TIMEOUT` | `600` | Host-owned idle stop for a continuously observed running sandbox (seconds). Paused time and OCU downtime do not count. The next tool call or launch wakes a stopped sandbox and starts a fresh window. |
+| `SANDBOX_RETENTION_DAYS` | `30` | Days an exited or created sandbox is kept, measured from the engine's `State.FinishedAt` (its `Created` time when FinishedAt is the zero time). The idle reaper then removes the container and its `chat-{chat_id}-workspace` volume and keeps `BASE_DATA_DIR/{chat_id}`; the chat's next tool call creates a new sandbox over the same files. Running, paused, restarting and dead sandboxes, and unparsable timestamps, are never removed. Must be a positive integer; an empty or other value refuses startup. |
 | `OCU_IDLE_POLL_SECONDS` | `30` | Idle observation cadence. Must be a positive integer shorter than `CONTAINER_IDLE_TIMEOUT`. |
 | `OCU_SANDBOX_NO_AUTOSTART` | unset | When exactly `1`, created sandboxes receive `NO_AUTOSTART=1`. |
 | `MCP_TOKENS_URL` | _(empty)_ | Settings wrapper URL (optional) |
