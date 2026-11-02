@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import os
 import subprocess
@@ -19,15 +20,17 @@ from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHan
 
 SCRIPT = ROOT / "deploy" / "production-like-test" / "init" / "remove-wrapper-model.py"
 SOURCE_ROOT = ROOT / "openwebui"
-SHIPPED_FILTER = SOURCE_ROOT / "functions" / "computer_link_filter.py"
+
+def _stored_sources():
+    """The script's own STORED_SOURCES: (stored id, endpoint, shipped file)."""
+    spec = importlib.util.spec_from_file_location("remove_wrapper_model", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.STORED_SOURCES
+
+
 # Every source open-webui-init stores, by the endpoint that returns it.
-SHIPPED_SOURCES = {
-    "/api/v1/functions/id/computer_use_filter": SHIPPED_FILTER,
-    "/api/v1/functions/id/video_production_filter": (
-        SOURCE_ROOT / "functions" / "video_production_filter.py"
-    ),
-    "/api/v1/tools/id/ai_computer_use": SOURCE_ROOT / "tools" / "computer_use_tools.py",
-}
+SHIPPED_SOURCES = {path: SOURCE_ROOT / relative for _id, path, relative in _stored_sources()}
 SENTINEL = "sentinel-admin-password-5b1e"
 TOKEN = "sentinel-session-token-77ad"
 ADMIN_EMAIL = "admin@example.test"
@@ -250,13 +253,23 @@ class RemoveWrapperModelTests(unittest.TestCase):
         self.assertEqual(self.webui.calls, ["POST /api/v1/auths/signin"])
         self.assertEqual(self.webui.models, self.rows)
 
-    def test_shipped_sources_survive_the_webui_import_rewrite(self):
-        # Open WebUI rewrites these substrings in every stored function and
-        # tool, which would make the byte-for-byte refresh check impossible.
-        for path, shipped in self.shipped_sources.items():
+    def test_every_stored_source_survives_the_webui_import_rewrite(self):
+        sources = _stored_sources()
+        self.assertEqual(
+            {stored_id for stored_id, _path, _relative in sources},
+            {"computer_use_filter", "video_production_filter", "ai_computer_use"},
+        )
+        for stored_id, _path, relative in sources:
+            shipped = (SOURCE_ROOT / relative).read_bytes()
+            # Open WebUI rewrites these substrings in every stored function and
+            # tool, which would make the byte-for-byte refresh check impossible.
             for rewritten in ("from utils", "from apps", "from main", "from config"):
-                with self.subTest(path=path, rewritten=rewritten):
-                    self.assertNotIn(rewritten, shipped)
+                with self.subTest(source=stored_id, rewritten=rewritten):
+                    self.assertNotIn(rewritten.encode(), shipped)
+            # A carriage return would not survive the JSON text round trip intact
+            # on every client, so the shipped files stay LF-only.
+            with self.subTest(source=stored_id, check="no CR"):
+                self.assertNotIn(b"\r", shipped)
 
 
 if __name__ == "__main__":

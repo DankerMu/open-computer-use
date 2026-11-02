@@ -54,7 +54,8 @@
 - **New sandboxes get 2 CPUs and 4 GB (#702).** The `docker_manager`
   defaults and `bootstrap-test.sh` give `CONTAINER_CPU_LIMIT=2.0` and
   `CONTAINER_MEM_LIMIT=4g`. Limits apply at container creation, and an existing
-  `runtime.env` keeps its values.
+  `runtime.env` keeps its values. The helm chart keeps 2g / 1.0, because its
+  sandboxes share one podman sidecar capped at 2 CPU / 4Gi.
 - **`remove-wrapper-model.py` checks every stored source (#702).** It refuses
   until the stored `computer_use_filter`, `video_production_filter` and
   `ai_computer_use` tool each equal their shipped file byte for byte.

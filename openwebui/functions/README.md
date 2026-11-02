@@ -13,7 +13,7 @@ Without this filter, the model won't know about skills or how to generate file d
 
 ## Video switch
 
-**File**: `video_production_filter.py` — optional. A toggle filter, installed as `video_production_filter` (named 视频制作) and active and global, that shows a switch in the chat integrations menu. Its inlet changes nothing; when the switch is on, `computer_link_filter.py` asks for the prompt with the `remotion` skill. See [`docs/openwebui-filter.md`](../../docs/openwebui-filter.md#video-switch).
+**File**: `video_production_filter.py` — required: `remove-wrapper-model.py` refuses until the stored copy equals this file. A toggle filter, installed as `video_production_filter` (named 视频制作) and active and global, that shows a switch in the chat integrations menu. Its inlet changes nothing; when the switch is on, `computer_link_filter.py` asks for the prompt with the `remotion` skill. See [`docs/openwebui-filter.md`](../../docs/openwebui-filter.md#video-switch).
 
 ## Valves
 
@@ -31,6 +31,7 @@ See [`docs/openwebui-filter.md`](../../docs/openwebui-filter.md#valves-reference
 1. **Workspace > Functions** → Create → paste `computer_link_filter.py`
 2. Enable globally (toggle in Functions list).
 3. Configure the filter `ORCHESTRATOR_URL` to the internal server address and provide `OCU_INTERNAL_TOKEN` through the Open WebUI process environment.
+4. Create a second function from `video_production_filter.py` with the id `video_production_filter`, and turn on both **Active** and **Global** for it. The switch has no effect with a Computer Use filter older than 5.1.0, which does not read it.
 
 ## How File Links Work
 

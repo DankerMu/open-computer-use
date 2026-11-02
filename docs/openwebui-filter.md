@@ -34,7 +34,7 @@ The server response must include `X-Public-Base-URL`; the filter does not substi
 
 `openwebui/functions/video_production_filter.py` is a toggle filter (`toggle = True`) installed as `video_production_filter`, named 视频制作, active and global. Open WebUI shows it as a switch in every model's integrations menu, off by default and reset when the user changes chats, and its own inlet changes nothing.
 
-The Computer Use filter treats a request as video-enabled when `__metadata__["filter_ids"]` contains `video_production_filter` and that id is among `__model__["filters"]`, which Open WebUI fills only from active toggle filters. Deactivating the filter therefore turns the feature off even for a client that keeps sending the id. A video-enabled request fetches `/system-prompt` with `X-OCU-Features: video`, and the prompt lists the `remotion` skill. `outlet()` needs only the public base, so it uses any cached entry for the chat.
+The Computer Use filter treats a request as video-enabled when `__metadata__["filter_ids"]` contains `video_production_filter` and that id is among `__model__["filters"]`, which Open WebUI fills only from active toggle filters. For a regular model, deactivating the filter turns the feature off even for a client that keeps sending the id; a client using a direct connection supplies its own model item, `filters` included. The switch is a user-interface control, not a security boundary: it only adds an installed skill to the prompt. A video-enabled request fetches `/system-prompt` with `X-OCU-Features: video`, and the prompt lists the `remotion` skill. `outlet()` needs only the public base, so it uses any cached entry for the chat.
 
 ## Concrete file links
 

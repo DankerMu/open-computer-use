@@ -80,8 +80,11 @@ orchestrator:
 
     COMMAND_TIMEOUT: "120"
     SUB_AGENT_TIMEOUT: "3600"
-    CONTAINER_MEM_LIMIT: "4g"
-    CONTAINER_CPU_LIMIT: "2.0"
+    # Below the 4g / 2.0 code default: every sandbox runs inside the podman sidecar
+    # (podman.resources.limits, 2 CPU / 4Gi), so a 4g sandbox could OOM the whole
+    # sidecar and every other sandbox with it.
+    CONTAINER_MEM_LIMIT: "2g"
+    CONTAINER_CPU_LIMIT: "1.0"
     CONTAINER_IDLE_TIMEOUT: "600"
     SINGLE_USER_MODE: "false"
 

@@ -135,7 +135,8 @@ NATIVE_PROMPT_DESCRIPTIONS: dict[str, str] = {
         "Make videos with Remotion (React) in the sandbox, including voiceover "
         "and 3D scenes, rendered offline to MP4 in /mnt/user-data/files/. "
         "Read this SKILL.md first, before writing any composition or running "
-        "any Remotion command."
+        "any Remotion command. Use when the user asks for a video, animation "
+        "or motion graphics."
     ),
     # Example skills
     "algorithmic-art": (
