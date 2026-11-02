@@ -49,8 +49,10 @@ import sandbox_dns
 
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "unix:///var/run/docker.sock")
 DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", "open-computer-use:latest")
-CONTAINER_MEM_LIMIT = os.getenv("CONTAINER_MEM_LIMIT", "2g")
-CONTAINER_CPU_LIMIT = float(os.getenv("CONTAINER_CPU_LIMIT", "1.0"))
+# 2 CPUs / 4 GB: a Remotion render (Chrome Headless Shell plus webpack) at
+# --concurrency=2 does not fit the former 1 CPU / 2 GB.
+CONTAINER_MEM_LIMIT = os.getenv("CONTAINER_MEM_LIMIT", "4g")
+CONTAINER_CPU_LIMIT = float(os.getenv("CONTAINER_CPU_LIMIT", "2.0"))
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "120"))
 ENABLE_NETWORK = os.getenv("ENABLE_NETWORK", "true").lower() == "true"
 # Public URL of the orchestrator — the single source of truth for browser-facing

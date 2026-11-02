@@ -591,8 +591,8 @@ All via environment variables:
 | `COMMAND_TIMEOUT` | `120` | Bash command timeout (seconds) |
 | `SUB_AGENT_TIMEOUT` | `3600` | Sub-agent timeout (seconds) |
 | `BASE_DATA_DIR` | `/data` | Server IO root and Docker bind source for chat data. The configured path must be identical inside the server and at the Docker daemon. |
-| `CONTAINER_MEM_LIMIT` | `2g` | Container memory limit |
-| `CONTAINER_CPU_LIMIT` | `1.0` | Container CPU limit |
+| `CONTAINER_MEM_LIMIT` | `4g` | Container memory limit, applied when a sandbox is created |
+| `CONTAINER_CPU_LIMIT` | `2.0` | Container CPU limit, applied when a sandbox is created |
 | `CONTAINER_IDLE_TIMEOUT` | `600` | Host-owned idle stop for a continuously observed running sandbox (seconds). Paused time and OCU downtime do not count. The next tool call or launch wakes a stopped sandbox and starts a fresh window. |
 | `SANDBOX_RETENTION_DAYS` | `30` | Days an exited or created sandbox is kept, measured from the engine's `State.FinishedAt` (its `Created` time when FinishedAt is the zero time). The idle reaper then removes the container and its `chat-{chat_id}-workspace` volume and keeps `BASE_DATA_DIR/{chat_id}`; the chat's next tool call creates a new sandbox over the same files. Running, paused, restarting and dead sandboxes, and unparsable timestamps, are never removed. Must be a positive integer; an empty or other value refuses startup. |
 | `OCU_IDLE_POLL_SECONDS` | `30` | Idle observation cadence. Must be a positive integer shorter than `CONTAINER_IDLE_TIMEOUT`. |

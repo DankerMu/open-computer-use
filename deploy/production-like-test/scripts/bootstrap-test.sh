@@ -396,8 +396,9 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' "MCP_API_KEY=$mcp_api_key"
     printf '%s\n' "POSTGRES_PASSWORD=$postgres_password"
     printf '%s\n' 'SINGLE_USER_MODE=false'
-    printf '%s\n' 'CONTAINER_MEM_LIMIT=2g'
-    printf '%s\n' 'CONTAINER_CPU_LIMIT=1.0'
+    # 2 CPUs / 4 GB per sandbox, for Remotion video renders.
+    printf '%s\n' 'CONTAINER_MEM_LIMIT=4g'
+    printf '%s\n' 'CONTAINER_CPU_LIMIT=2.0'
     # An idle chat sandbox stops after 3 days. The retention guard's 168-hour
     # ceiling still caps continuous runtime. A stopped sandbox wakes on the
     # chat's next tool call.

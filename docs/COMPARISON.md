@@ -33,13 +33,13 @@ Claude.ai and OpenAI Operator are cloud-only, not self-hosted — we drew inspir
 
 ## Architecture and Isolation
 
-**Open Computer Use** creates a new Docker container for every chat session. If the AI breaks something (installs wrong packages, corrupts files, fills disk), only that chat is affected. Next chat starts fresh. Containers are cleaned up automatically after idle timeout. Resource limits (2 GB RAM, 1 CPU) are enforced per container.
+**Open Computer Use** creates a new Docker container for every chat session. If the AI breaks something (installs wrong packages, corrupts files, fills disk), only that chat is affected. Next chat starts fresh. Containers are cleaned up automatically after idle timeout. Resource limits (4 GB RAM, 2 CPUs) are enforced per container.
 
 **open-terminal** runs a single container (or bare metal process) shared across sessions. Multi-user mode creates OS-level user accounts with isolated home directories (`chmod 2770` + group membership), file ownership enforcement via `sudo chown`, and path validation to prevent cross-user access. For container-per-user isolation, the separate [Terminals](https://github.com/open-webui/terminals) project manages dedicated open-terminal containers per user.
 
 **Why this matters:** Non-technical users + AI agent executing arbitrary code is the worst case for a shared environment. The user doesn't control what the agent does, and the agent can do anything — install packages, fill disk, corrupt files, spawn processes. Container-per-chat means each session is disposable: if something breaks, only that chat is affected, and the next one starts clean.
 
-**Trade-off:** Each container has a 2 GB RAM limit (configurable via `CONTAINER_MEM_LIMIT`). This is a ceiling, not an allocation — an idle container or one running simple commands uses very little memory. Heavy tasks like Chromium or LibreOffice consume more, up to the limit. open-terminal is lighter but shares kernel, network, and system resources between users. open-terminal's own documentation [notes](https://github.com/open-webui/open-terminal#built-in-multi-user-isolation) that single-container multi-user mode is not designed for production multi-user deployments.
+**Trade-off:** Each container has a 4 GB RAM limit (configurable via `CONTAINER_MEM_LIMIT`). This is a ceiling, not an allocation — an idle container or one running simple commands uses very little memory. Heavy tasks like Chromium or LibreOffice consume more, up to the limit. open-terminal is lighter but shares kernel, network, and system resources between users. open-terminal's own documentation [notes](https://github.com/open-webui/open-terminal#built-in-multi-user-isolation) that single-container multi-user mode is not designed for production multi-user deployments.
 
 ---
 
@@ -75,7 +75,7 @@ The two projects take opposite approaches to tool design.
 |--------|-------------------|---------------|
 | **Isolation** | Docker containers (kernel namespaces) | OS user accounts (chmod 2770 + group membership) |
 | **Privilege escalation** | Non-root user with passwordless sudo; `no-new-privileges` flag | Non-root user with passwordless sudo (full image); no sudo in slim/alpine |
-| **Resource limits** | Per-container (2 GB RAM, 1 CPU default) | OS-level only |
+| **Resource limits** | Per-container (4 GB RAM, 2 CPUs default) | OS-level only |
 | **Egress firewall** | Configurable (Docker network policies) | Built-in DNS whitelist (dnsmasq + iptables + ipset), CAP_NET_ADMIN dropped after setup |
 | **API key auth** | Bearer token (MCP_API_KEY) | Bearer token, constant-time comparison (hmac.compare_digest) |
 | **Path traversal** | Sanitized chat_id + safe_path validation | resolve_path + is_path_allowed validation |
