@@ -32,6 +32,7 @@ COPY ./auth_guard.py .
 COPY ./ws_recheck.py .
 COPY ./cli_runtime.py .
 COPY ./claude_gateway.py .
+COPY ./speech.py .
 COPY ./cli_adapters/ ./cli_adapters/
 COPY ./office/ ./office/
 COPY ./drawio/ ./drawio/

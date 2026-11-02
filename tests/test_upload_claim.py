@@ -366,12 +366,12 @@ def test_receipts_live_outside_uploads_and_record_original_metadata(upload_serve
 
 def test_published_upload_is_writable_at_claim_and_preserves_no_overwrite(
         upload_server, monkeypatch):
-    import app
+    import uploads as upload_store
 
     client, uploads = upload_server
     previous_umask = os.umask(0o077)
     try:
-        original_claim = app.claim_file_no_replace
+        original_claim = upload_store.claim_file_no_replace
         claims = []
         staging_modes = []
         opened = os.open
@@ -403,7 +403,7 @@ def test_published_upload_is_writable_at_claim_and_preserves_no_overwrite(
                 staging_modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
             return fd
 
-        monkeypatch.setattr(app, "claim_file_no_replace", recording_claim)
+        monkeypatch.setattr(upload_store, "claim_file_no_replace", recording_claim)
         monkeypatch.setattr(os, "open", observing_open)
 
         payloads = (b"first", b"second")
@@ -896,24 +896,24 @@ def test_symlink_receipt_path_fails_explicitly_without_following_or_recreating(
 
 def test_failed_receipt_write_leaves_prior_receipts_and_retries_without_overwrite(
         upload_server, monkeypatch):
-    import app
+    import uploads as upload_store
 
     client, uploads = upload_server
     first = _upload(client, "brief.docx", b"one", attachment_id="F1")
     assert first.status_code == 200
     prior = _receipts(uploads)
-    original = app.write_import_receipts
+    original = upload_store.write_import_receipts
 
     def fail_once(chat_dir, receipts):
         raise OSError("injected receipt write failure")
 
-    monkeypatch.setattr(app, "write_import_receipts", fail_once)
+    monkeypatch.setattr(upload_store, "write_import_receipts", fail_once)
     failed = _upload(client, "notes.txt", b"two", attachment_id="F2")
     assert failed.status_code == 500
     assert _receipts(uploads) == prior
     stored = sorted(path.name for path in uploads.iterdir())
     assert stored == ["brief.docx", "notes.txt"]
-    monkeypatch.setattr(app, "write_import_receipts", original)
+    monkeypatch.setattr(upload_store, "write_import_receipts", original)
     retry = _upload(client, "notes.txt", b"two", attachment_id="F2")
     assert retry.status_code == 200
     assert retry.json()["filename"] == "notes (2).txt"

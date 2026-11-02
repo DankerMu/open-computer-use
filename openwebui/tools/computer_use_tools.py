@@ -3,7 +3,7 @@
 """
 title: Computer Use Tools
 author: OpenWebUI Implementation
-version: 4.0.0
+version: 4.1.0
 
 Thin MCP client proxy to computer-use-orchestrator. All tool configuration is server-side.
 ORCHESTRATOR_URL and optional MCP_API_KEY are Valves; OCU_INTERNAL_TOKEN is read from the process environment per call.
@@ -748,7 +748,7 @@ class Tools:
     ) -> str:
         """One transport-aware MCP call with consistent SSE status events.
 
-        Every per-tool wrapper (bash_tool/str_replace/create_file/view/sub_agent)
+        Every per-tool wrapper (bash_tool/str_replace/create_file/view/sub_agent/generate_speech)
         funnels through here. Without this helper each wrapper duplicated:
           - the in_progress emit before the call
           - the try/except + final emit
@@ -930,6 +930,40 @@ class Tools:
             chat_id, __event_emitter__, __request__, __user__,
             in_progress_desc=description or f"Reading {path}...",
             ok_desc="Read complete", err_desc="Read failed",
+            sync_warning=sync_warning,
+        )
+
+    async def generate_speech(
+        self,
+        text: str,
+        filename: str,
+        instructions: str = "",
+        voice: str = "",
+        __event_emitter__: Callable[[dict], Awaitable[None]] = None,
+        __metadata__: dict = None,
+        __user__: dict = None,
+        __files__: Optional[List[dict]] = None,
+        __request__=None,
+    ) -> str:
+        """
+        Synthesize speech, such as a video voiceover line, into /mnt/user-data/files/
+
+        :param text: The words to speak, 1 to 2000 characters
+        :param filename: Plain file name ending in .mp3 or .wav, e.g. line1.mp3
+        :param instructions: Free-text voice description, e.g. "a calm female narrator, Mandarin"
+        :param voice: Optional voice id; empty uses the server's default voice
+        :return: The sandbox path of the audio file and its size, or an error
+        """
+        chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
+        if error:
+            return error
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        return await self._run_tool(
+            "generate_speech",
+            {"text": text, "filename": filename, "instructions": instructions, "voice": voice},
+            chat_id, __event_emitter__, __request__, __user__,
+            in_progress_desc=f"Generating speech {filename}...",
+            ok_desc="Speech generated", err_desc="Speech generation failed",
             sync_warning=sync_warning,
         )
 

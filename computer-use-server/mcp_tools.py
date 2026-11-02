@@ -3,7 +3,7 @@
 """
 MCP Server Tools for Computer Use
 
-Provides MCP tools (bash, str_replace, create_file, view, sub_agent) via Streamable HTTP.
+Provides MCP tools (bash, str_replace, create_file, view, sub_agent, generate_speech) via Streamable HTTP.
 Works with local Docker socket for container management.
 
 ARCHITECTURE:
@@ -48,6 +48,7 @@ Environment Variables (computer-use-orchestrator defaults):
 - CODEX_SUB_AGENT_DEFAULT_MODEL: Default model for sub_agent when SUBAGENT_CLI=codex (no default — required)
 - SUB_AGENT_MAX_TURNS: Default max turns for sub_agent (default: 25)
 - SUB_AGENT_TIMEOUT: Timeout for sub_agent execution in seconds (default: 3600)
+- TTS_BASE_URL, TTS_MODEL, TTS_VOICE, TTS_API_KEY, TTS_TIMEOUT_SECONDS: generate_speech (speech.py)
 
 LiteLLM Integration:
   mcp_servers:
@@ -84,9 +85,13 @@ import asyncio
 import urllib.parse
 from typing import Optional, List, Annotated
 
+from fastapi import HTTPException
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import Field
 import skill_manager
+import speech
+import uploads
+from security import sanitize_chat_id
 from context_vars import (
     current_chat_id, current_user_email, current_user_name,
     current_gitlab_token, current_gitlab_host,
@@ -826,6 +831,74 @@ fi
 
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+MAX_SPEECH_TEXT_CHARS = 2000
+
+
+@mcp.tool()
+async def generate_speech(
+    text: str,
+    filename: str,
+    instructions: str = "",
+    voice: str = "",
+    ctx: Context = None,  # injected by FastMCP; None when called directly
+) -> str:
+    """
+    Synthesize speech (for example a video voiceover line) into the workspace files.
+
+    The audio is written to /mnt/user-data/files/ and the stored path is
+    returned; an existing name gets a numbered suffix, so use the returned path.
+    Measure the duration with ffprobe before timing scenes to it.
+
+    Args:
+        text: The words to speak, 1 to 2000 characters
+        filename: Plain file name ending in .mp3 or .wav, e.g. `line1.mp3`
+        instructions: Free-text voice description, e.g. "a calm female narrator, Mandarin"
+        voice: Optional voice id; empty uses the server's default voice
+
+    Returns:
+        The sandbox path of the audio file and its size, or an error
+    """
+    chat_id, error = _validate_chat_id()
+    if error:
+        return error
+    config = speech.configuration()
+    if config is None:
+        return "Error: speech synthesis is not configured"
+    if not 1 <= len(text) <= MAX_SPEECH_TEXT_CHARS:
+        return f"Error: text must be 1 to {MAX_SPEECH_TEXT_CHARS} characters"
+    try:
+        chat = sanitize_chat_id(chat_id)
+        uploads.check_upload_name(filename)
+    except HTTPException as refused:
+        return f"Error: {refused.detail}"
+    fmt = speech.response_format(filename)
+    if "/" in filename or fmt is None:
+        return "Error: filename must be a plain name ending in .mp3 or .wav"
+    try:
+        audio = await speech.synthesize(config, text, fmt, instructions, voice)
+    except speech.SpeechError as failed:
+        return f"Error: {failed}"
+    try:
+        stored, _md5, size = await asyncio.to_thread(uploads.store_upload, chat, filename, audio)
+    except HTTPException as refused:
+        return f"Error: {refused.detail}"
+    except LifecycleError as stopped:
+        return f"Error: {stopped}"
+    except Exception as exc:
+        return f"Error: speech audio was not saved ({type(exc).__name__})"
+    note = ""
+    try:
+        # mcp_resources imports this module at load time.
+        from mcp_resources import sync_chat_resources
+        await sync_chat_resources(chat)
+    except Exception:
+        note = "\nThe file is saved, but workspace file discovery failed; do not generate it again."
+    return (
+        f"Saved speech to /mnt/user-data/files/{stored} ({size} bytes){note}"
+        + _get_default_chat_warning()
+    )
 
 
 # ---------------------------------------------------------------------------

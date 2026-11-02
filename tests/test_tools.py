@@ -91,6 +91,9 @@ def _hint(chat_id):
     }
 
 
+PUBLIC_TOOLS = ("bash_tool", "str_replace", "create_file", "view", "sub_agent", "generate_speech")
+
+
 class _RecordingEmitter:
     def __init__(self, fail_hint=False):
         self.events = []
@@ -137,6 +140,8 @@ def _call_with_empty_chat(tools, method, metadata, emitter):
         return tools.create_file("create", "contents", "/home/assistant/a.txt", **kwargs)
     if method == "view":
         return tools.view("read", "/mnt/user-data/files/input.txt", **kwargs)
+    if method == "generate_speech":
+        return tools.generate_speech("narration", "line1.mp3", **kwargs)
     return tools.sub_agent("inspect upload", "delegate", **kwargs)
 
 
@@ -146,7 +151,7 @@ def _call_with_empty_chat(tools, method, metadata, emitter):
     ids=("absent", "none", "empty", "whitespace"),
 )
 @pytest.mark.parametrize(
-    "method", ("bash_tool", "str_replace", "create_file", "view", "sub_agent")
+    "method", PUBLIC_TOOLS
 )
 def test_empty_chat_rejects_every_public_tool_before_work(monkeypatch, method, metadata):
     calls, events = [], []
@@ -256,6 +261,7 @@ class _GuardedOCU:
         self.bash_gate = None
         self.commands = []
         self.calls = []
+        self.speech_calls = []
         self.imports_mode = imports_mode
         self.server = None
         self.thread = None
@@ -322,6 +328,16 @@ class _GuardedOCU:
         ) -> str:
             self.calls.append(("sub_agent", task))
             return f"delegated:{task}"
+
+        @self.mcp.tool()
+        async def generate_speech(
+            text: str, filename: str, instructions: str = "", voice: str = ""
+        ) -> str:
+            self.calls.append(("generate_speech", filename))
+            self.speech_calls.append(
+                {"text": text, "filename": filename, "instructions": instructions, "voice": voice}
+            )
+            return f"spoken:{filename}"
 
 
 
@@ -492,6 +508,10 @@ def _invoke_public_tool(tools, method, chat_id, files, command="echo ready"):
             "read", "/home/assistant/notes.txt",
             __metadata__=metadata, __files__=files,
         )
+    if method == "generate_speech":
+        return tools.generate_speech(
+            "narration", "line1.mp3", __metadata__=metadata, __files__=files,
+        )
     return tools.sub_agent(
         "inspect attachment", "delegate",
         __metadata__=metadata, __files__=files,
@@ -657,7 +677,7 @@ def test_bash_imports_attachment_before_command_without_uploads_path(monkeypatch
 
 
 @pytest.mark.parametrize(
-    "method", ("bash_tool", "str_replace", "create_file", "view", "sub_agent")
+    "method", PUBLIC_TOOLS
 )
 def test_public_tools_sync_new_attachment_before_command(monkeypatch, tmp_path, method):
     source = tmp_path / "brief.tmp"
@@ -706,7 +726,7 @@ def _fail_directory_enumeration(monkeypatch, root):
 
 
 @pytest.mark.parametrize(
-    "method", ("bash_tool", "str_replace", "create_file", "view", "sub_agent")
+    "method", PUBLIC_TOOLS
 )
 def test_public_tools_report_committed_upload_discovery_warning_without_retry(
     monkeypatch, tmp_path, method
@@ -742,6 +762,7 @@ def test_public_tools_report_committed_upload_discovery_warning_without_retry(
             "create_file": ("/home/assistant/a.txt", "created:/home/assistant/a.txt"),
             "view": ("/home/assistant/notes.txt", "viewed:/home/assistant/notes.txt"),
             "sub_agent": ("inspect attachment", "delegated:inspect attachment"),
+            "generate_speech": ("line1.mp3", "spoken:line1.mp3"),
         }
         argument, output = expected_calls[method]
         assert ocu.calls == [(method, argument)] * 2
@@ -1653,7 +1674,7 @@ def test_sub_agent_without_request_sends_no_gateway_token(monkeypatch):
     assert calls == []
 
 
-@pytest.mark.parametrize("method", ("bash_tool", "str_replace", "create_file", "view"))
+@pytest.mark.parametrize("method", ("bash_tool", "str_replace", "create_file", "view", "generate_speech"))
 def test_other_tools_never_send_gateway_headers(monkeypatch, method):
     sent = _capture_call_headers(monkeypatch)
     tools = _tools_with_token(monkeypatch)
@@ -1663,10 +1684,50 @@ def test_other_tools_never_send_gateway_headers(monkeypatch, method):
         "str_replace": lambda: tools.str_replace("edit", "a", "/home/assistant/a.txt", "b", **common),
         "create_file": lambda: tools.create_file("create", "x", "/home/assistant/a.txt", **common),
         "view": lambda: tools.view("read", "/home/assistant/a.txt", **common),
+        "generate_speech": lambda: tools.generate_speech("hi", "a.mp3", **common),
     }
     asyncio.run(calls[method]())
     [call] = sent
     assert set(call["headers"]) == {"X-Chat-Id", "X-OCU-Internal-Token", "Authorization"}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "forwarded"),
+    (
+        (("第一句", "line1.mp3"), {"text": "第一句", "filename": "line1.mp3", "instructions": "", "voice": ""}),
+        (("hi", "intro.wav", "calm narrator", "v-2"),
+         {"text": "hi", "filename": "intro.wav", "instructions": "calm narrator", "voice": "v-2"}),
+    ),
+    ids=("defaults", "all-arguments"),
+)
+def test_generate_speech_forwards_to_the_mcp_tool(monkeypatch, arguments, forwarded):
+    sent = _capture_call_headers(monkeypatch)
+    tools = _tools_with_token(monkeypatch)
+    events = []
+    result = asyncio.run(tools.generate_speech(
+        *arguments, __metadata__={"chat_id": "chat-speech"},
+        __event_emitter__=lambda e: _collect(events, e),
+    ))
+    assert result == "sandbox output"
+    [call] = sent
+    assert call["tool"] == "generate_speech"
+    assert call["args"] == forwarded
+    assert call["headers"]["X-Chat-Id"] == "chat-speech"
+    statuses = [e["data"]["status"] for e in events if e.get("type") == "status"]
+    assert statuses == ["in_progress", "complete"]
+
+
+def test_generate_speech_error_result_marks_the_status_as_error(monkeypatch):
+    _stub_call_tool(monkeypatch, "Error: speech synthesis is not configured")
+    tools = _tools_with_token(monkeypatch)
+    events = []
+    result = asyncio.run(tools.generate_speech(
+        "hi", "a.mp3", __metadata__={"chat_id": "chat-speech"},
+        __event_emitter__=lambda e: _collect(events, e),
+    ))
+    assert result == "Error: speech synthesis is not configured"
+    statuses = [e["data"]["status"] for e in events if e.get("type") == "status"]
+    assert statuses[-1] == "error"
 
 
 def test_sub_agent_docstring_says_the_chat_model_is_used_in_gateway_deployments():

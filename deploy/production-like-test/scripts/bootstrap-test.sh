@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Generates a root-owned, non-provider runtime configuration for the test
 # deployment. Provider keys remain in the separately supplied 0600 file:
-# DMXAPI_API_KEY, and optionally RAG_OPENAI_API_KEY and RAG_EXTERNAL_RERANKER_API_KEY.
+# DMXAPI_API_KEY, and optionally RAG_OPENAI_API_KEY, RAG_EXTERNAL_RERANKER_API_KEY
+# and TTS_API_KEY.
 #
 # Required operator inputs (no historical source, image, or publication defaults):
 #   OCU_RELEASE_MANIFEST — imported release.json
@@ -409,6 +410,12 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' 'COMMAND_TIMEOUT=120'
     printf '%s\n' 'SUB_AGENT_TIMEOUT=3600'
     printf '%s\n' 'CONTAINER_MAX_AGE_HOURS=168'
+    # generate_speech (#703): empty TTS_BASE_URL leaves speech unconfigured; set
+    # the URL and model here to enable it. TTS_API_KEY belongs in the provider file.
+    printf '%s\n' 'TTS_BASE_URL='
+    printf '%s\n' 'TTS_MODEL='
+    printf '%s\n' 'TTS_VOICE='
+    printf '%s\n' 'TTS_TIMEOUT_SECONDS=120'
     printf '%s\n' 'RETENTION_CHECK_INTERVAL_SECONDS=3600'
 } > "$runtime_tmp"
 

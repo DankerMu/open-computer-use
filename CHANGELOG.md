@@ -3,6 +3,25 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **`generate_speech` MCP tool (#703).** `generate_speech(text, filename,
+  instructions, voice)` calls an OpenAI-compatible
+  `POST {TTS_BASE_URL}/audio/speech` from the orchestrator with
+  `{model, input, response_format}`, adding `voice` (falling back to
+  `TTS_VOICE`) and `instructions` only when set, and a Bearer header only when
+  `TTS_API_KEY` is set. Redirects are refused; only a 2xx response of at most
+  50 MB, enforced while streaming, with `audio/mpeg` for `.mp3` or
+  `audio/wav` / `audio/x-wav` for `.wav` is accepted. Errors carry the status
+  and at most 200 characters of body with the key removed, never the URL. The
+  audio is written through the upload store (`uploads.store_upload`, moved from
+  `app.py`) under the lifecycle lock with the collision suffix, followed by the
+  upload resource sync; a tombstoned chat returns `Error: chat was deleted`.
+  The Open WebUI tool (4.1.0) forwards it. Empty `TTS_BASE_URL` returns
+  `speech synthesis is not configured`; an invalid URL, a URL without
+  `TTS_MODEL`, or an empty or non-positive `TTS_TIMEOUT_SECONDS` refuses
+  startup. The production-like overlay passes `${TTS_TIMEOUT_SECONDS-120}` and
+  `TTS_API_KEY` to `computer-use-server` only, `bootstrap-test.sh` writes the
+  non-secret values, and the deployment record reports configured yes/no,
+  model, voice and timeout, never the key or URL.
 - **Video switch (#702).** `openwebui/functions/video_production_filter.py` is
   a toggle filter that both init scripts install as `video_production_filter`,
   named 视频制作, active and global, idempotently; an API error fails init

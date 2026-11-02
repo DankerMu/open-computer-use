@@ -140,7 +140,7 @@ def test_file_route_fixture_restores_caller_modules(
     assert sys.modules["docker_manager"].descriptor_io is active_descriptor
     assert sys.modules["outputs_broker"].descriptor_io is active_descriptor
     assert sys.modules["file_response"].open_chat_upload is active_uploads.open_chat_upload
-    assert loaded.write_import_receipts is active_uploads.write_import_receipts
+    assert loaded.store_upload is active_uploads.store_upload
 
 
 @pytest.mark.parametrize("owner", APP_OWNERS)

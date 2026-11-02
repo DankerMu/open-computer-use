@@ -597,6 +597,11 @@ All via environment variables:
 | `SANDBOX_RETENTION_DAYS` | `30` | Days an exited or created sandbox is kept, measured from the engine's `State.FinishedAt` (its `Created` time when FinishedAt is the zero time). The idle reaper then removes the container and its `chat-{chat_id}-workspace` volume and keeps `BASE_DATA_DIR/{chat_id}`; the chat's next tool call creates a new sandbox over the same files. Running, paused, restarting and dead sandboxes, and unparsable timestamps, are never removed. Must be a positive integer; an empty or other value refuses startup. |
 | `OCU_IDLE_POLL_SECONDS` | `30` | Idle observation cadence. Must be a positive integer shorter than `CONTAINER_IDLE_TIMEOUT`. |
 | `OCU_SANDBOX_NO_AUTOSTART` | unset | When exactly `1`, created sandboxes receive `NO_AUTOSTART=1`. |
+| `TTS_BASE_URL` | _(empty)_ | OpenAI-compatible base for `generate_speech`; the orchestrator posts to `{TTS_BASE_URL}/audio/speech`. Empty leaves the tool unconfigured (`speech synthesis is not configured`). A set value must be an `http(s)://` URL, otherwise startup is refused. |
+| `TTS_MODEL` | _(empty)_ | Sent as `model`. Required when `TTS_BASE_URL` is set, otherwise startup is refused. |
+| `TTS_VOICE` | _(empty)_ | Default `voice` when the call gives none; empty sends no `voice`. |
+| `TTS_API_KEY` | _(empty)_ | Sent as `Authorization: Bearer`; empty sends no header. Read by this server only: never passed to sandboxes, returned, logged or recorded, and removed from upstream error text. |
+| `TTS_TIMEOUT_SECONDS` | `120` | Speech request timeout. Must be a positive integer; an explicitly empty or other value refuses startup. Keep it below the Open WebUI tool's 660-second client timeout. |
 | `MCP_TOKENS_URL` | _(empty)_ | Settings wrapper URL (optional) |
 | `MCP_TOKENS_API_KEY` | _(empty)_ | Settings wrapper auth key |
 

@@ -460,6 +460,58 @@ class OverlayStructureTests(unittest.TestCase):
              SHARED_EMBEDDING, (SHARED_URL + "/rerank", RERANKER_KEY)),
         ))
 
+    def test_tts_settings_reach_only_the_computer_use_server(self):
+        core = parsed(CORE_OVERRIDE)
+        core_env = override_value(core["services"]["computer-use-server"]["environment"])
+        for name in ("TTS_BASE_URL", "TTS_MODEL", "TTS_VOICE", "TTS_API_KEY"):
+            with self.subTest(name=name):
+                # `:-` resolves a missing name silently; bare ${NAME} warns on every command.
+                self.assertEqual(core_env[name], f"${{{name}:-}}")
+                self.assertEqual(interpolate_value(core_env[name], {}), "")
+                self.assertEqual(interpolate_value(core_env[name], {name: "given"}), "given")
+        # Unset defaults to 120; an explicit empty value reaches the server, which refuses it.
+        timeout = core_env["TTS_TIMEOUT_SECONDS"]
+        self.assertEqual(timeout, "${TTS_TIMEOUT_SECONDS-120}")
+        self.assertEqual(interpolate_value(timeout, {}), "120")
+        self.assertEqual(interpolate_value(timeout, {"TTS_TIMEOUT_SECONDS": ""}), "")
+        self.assertEqual(interpolate_value(timeout, {"TTS_TIMEOUT_SECONDS": "300"}), "300")
+        webui = parsed(WEBUI_OVERRIDE)
+        proxy = parsed(PROXY_COMPOSE)
+        others = {f"core:{name}": service for name, service in core["services"].items()
+                  if name != "computer-use-server"}
+        others.update({f"webui:{name}": service for name, service in webui["services"].items()})
+        others.update({f"proxy:{name}": service for name, service in proxy["services"].items()})
+        for label, service in others.items():
+            with self.subTest(service=label):
+                self.assertNotIn("TTS_", json.dumps(service))
+                self.assertNotIn("env_file", service)
+
+    def test_native_compose_resolves_tts_settings(self):
+        key = "tts-key-fixture-not-for-other-services"
+        cases = (
+            ("unset", {}, {"TTS_TIMEOUT_SECONDS": "120", "TTS_BASE_URL": "", "TTS_API_KEY": ""}),
+            ("empty", {"TTS_TIMEOUT_SECONDS": ""}, {"TTS_TIMEOUT_SECONDS": ""}),
+            ("set", {"TTS_TIMEOUT_SECONDS": "300", "TTS_BASE_URL": "http://tts.lan/v1",
+                     "TTS_MODEL": "breeze-tts-2", "TTS_VOICE": "v", "TTS_API_KEY": key},
+             {"TTS_TIMEOUT_SECONDS": "300", "TTS_BASE_URL": "http://tts.lan/v1",
+              "TTS_MODEL": "breeze-tts-2", "TTS_VOICE": "v", "TTS_API_KEY": key}),
+        )
+        with tempfile.TemporaryDirectory(prefix="ocu-native-tts-") as raw:
+            for label, extra, expected in cases:
+                with self.subTest(case=label):
+                    # resolved_stacks refuses a non-zero exit and any "is not set" warning.
+                    stacks = resolved_stacks(Path(raw) / label, "false", extra=extra)
+                    server = stacks["core.json"]["services"]["computer-use-server"]["environment"]
+                    for name, value in expected.items():
+                        self.assertEqual(server.get(name), value, name)
+                    for document, body in stacks.items():
+                        for service, definition in body["services"].items():
+                            if (document, service) == ("core.json", "computer-use-server"):
+                                continue
+                            text = json.dumps(definition)
+                            self.assertNotIn("TTS_", text, f"{document}:{service}")
+                            self.assertNotIn(key, text, f"{document}:{service}")
+
     def test_adopted_local_dependencies_exist(self):
         for path in ADOPTED:
             self.assertTrue(path.is_file(), path)
