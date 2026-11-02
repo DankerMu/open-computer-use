@@ -2018,42 +2018,44 @@ def describe_sandbox(chat_id: str) -> dict:
         }
 
 
-def _clear_chat_directory(chat_id: str) -> bool:
-    """Remove every chat entry except the lock and tombstone; write the tombstone.
+def _write_tombstone(chat_fd: int) -> None:
+    """Create .deleted durably; from here on no creator is admitted."""
+    tombstone = os.open(
+        _TOMBSTONE,
+        os.O_WRONLY | os.O_CREAT | descriptor_io.NO_FOLLOW | descriptor_io.CLOSE_ON_EXEC,
+        0o644, dir_fd=chat_fd)
+    os.close(tombstone)
+    os.fsync(chat_fd)
+
+
+def _clear_chat_entries(chat_fd: int) -> bool:
+    """Remove every chat entry except the lock and tombstone; True if any was removed.
 
     The lock file is never unlinked: a waiter on the old inode and a new
     acquirer on a fresh one would otherwise run concurrently.
     """
     removed = False
-    chat_fd = os.open(_control_dir(chat_id), descriptor_io.DIRECTORY_FLAGS)
-    try:
-        with os.scandir(chat_fd) as listing:
-            entries = list(listing)
-        for entry in entries:
-            if entry.name in {_LIFECYCLE_LOCK, _TOMBSTONE}:
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                shutil.rmtree(entry.name, dir_fd=chat_fd)
-            else:
-                os.unlink(entry.name, dir_fd=chat_fd)
-            removed = True
-        tombstone = os.open(
-            _TOMBSTONE,
-            os.O_WRONLY | os.O_CREAT | descriptor_io.NO_FOLLOW | descriptor_io.CLOSE_ON_EXEC,
-            0o644, dir_fd=chat_fd)
-        os.close(tombstone)
-        os.fsync(chat_fd)
-    finally:
-        os.close(chat_fd)
+    with os.scandir(chat_fd) as listing:
+        entries = list(listing)
+    for entry in entries:
+        if entry.name in {_LIFECYCLE_LOCK, _TOMBSTONE}:
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            shutil.rmtree(entry.name, dir_fd=chat_fd)
+        else:
+            os.unlink(entry.name, dir_fd=chat_fd)
+        removed = True
     return removed
 
 
 def delete_sandbox(chat_id: str) -> dict:
     """Remove the chat's container, workspace volume and files; leave a tombstone.
 
-    Idempotent: a repeated call runs every step again and reports nothing
-    removed. Any engine or filesystem failure is DeleteFailed, and a retry
-    completes the remaining steps.
+    The tombstone is written before the chat files are removed, so a failure
+    in a later step still refuses every creator. Idempotent: a repeated call
+    runs every step again and reports nothing removed. Any engine or
+    filesystem failure is DeleteFailed, and a retry completes the remaining
+    steps.
     """
     from mcp_resources import sync_chat_resources_sync
     from uploads import DiscoveryError
@@ -2073,12 +2075,22 @@ def delete_sandbox(chat_id: str) -> dict:
                     pass
             step = "volume removal"
             removed_volume = _remove_workspace_volume(chat_id, force=True)
-            step = "chat file removal"
-            removed_data = _clear_chat_directory(chat_id)
-            step = "workspace resource cleanup"
-            # outputs/ is gone, so discovery publishes an empty set for this chat.
-            sync_chat_resources_sync(chat_id)
-    except (docker.errors.DockerException, OSError, DiscoveryError) as exc:
+            step = "tombstone write"
+            chat_fd = os.open(_control_dir(chat_id), descriptor_io.DIRECTORY_FLAGS)
+            try:
+                _write_tombstone(chat_fd)
+                step = "chat file removal"
+                removed_data = _clear_chat_entries(chat_fd)
+            finally:
+                os.close(chat_fd)
+            try:
+                # outputs/ is gone, so discovery publishes an empty set for this chat.
+                sync_chat_resources_sync(chat_id)
+            except DiscoveryError as exc:
+                # The data is gone and the registry is in-process only; uploads
+                # tolerate a failed discovery the same way.
+                print(f"[DELETE] chat {chat_id}: resource cleanup skipped: {exc.reason}")
+    except (docker.errors.DockerException, OSError) as exc:
         raise DeleteFailed(f"sandbox delete failed during {step}: {exc}") from exc
     print(f"[DELETE] chat {chat_id}: container={removed_container} "
           f"volume={removed_volume} data={removed_data}")
@@ -2148,9 +2160,15 @@ def _finish_retention(chat_id: str) -> None:
     if not isinstance(state, dict) or "retained_at" not in state:
         return
     _remove_workspace_volume(chat_id)
-    state = dict(state)
-    state.pop("retained_at")
-    write_idle_state(chat_id, state)
+    _clear_retention_marker(chat_id)
+
+
+def _clear_retention_marker(chat_id: str) -> None:
+    state = read_idle_state(chat_id)
+    if isinstance(state, dict) and "retained_at" in state:
+        state = dict(state)
+        state.pop("retained_at")
+        write_idle_state(chat_id, state)
 
 
 def _retain(chat_id: str, container, now: float) -> None:
@@ -2165,7 +2183,13 @@ def _retain(chat_id: str, container, now: float) -> None:
     state = read_idle_state(chat_id) or {}
     write_idle_state(chat_id, {**state, "retained_at": now})
     print(f"[RETENTION] removing {reloaded.name} and its workspace volume")
-    reloaded.remove()
+    try:
+        reloaded.remove()
+    except Exception:
+        # The container may still exist (e.g. started after the recheck). Without
+        # the marker, a later manual removal cannot make the reaper drop its volume.
+        _clear_retention_marker(chat_id)
+        raise
     _finish_retention(chat_id)
 
 

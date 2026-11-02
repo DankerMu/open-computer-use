@@ -17,15 +17,19 @@
   production-like overlay passes `${SANDBOX_RETENTION_DAYS-30}`, `bootstrap-test.sh`
   writes `SANDBOX_RETENTION_DAYS=30`, and the deployment record reports it.
 - **`DELETE /internal/sandbox/{chat_id}` (#698).** An internal-token route
-  removes the chat's container, workspace volume and every chat file except
-  `.lifecycle.lock`, then writes a `.deleted` tombstone, also for a chat OCU has
-  never seen. It answers `{"container", "volume", "data"}` booleans and is
+  removes the chat's container and workspace volume, writes a `.deleted`
+  tombstone (also for a chat OCU has never seen), then removes every chat file
+  except `.lifecycle.lock` and `.deleted`. It answers `{"container", "volume", "data"}` booleans and is
   idempotent. A non-canonical id is 400 before any engine or file access, and a
   failure is 500 `delete_failed` that a retry completes. Every later
   create-capable lifecycle acquisition for the chat, including describe and a
-  creator already waiting on the lock in another worker, returns 410
-  `chat_deleted`. Uploads and the outputs listing now map lifecycle errors to
-  their status instead of 500.
+  creator already waiting on the lock in another worker, is refused: HTTP
+  routes answer 410 `chat_deleted` and MCP tool calls return
+  `Error: chat was deleted`. Uploads and the outputs listing now map lifecycle
+  errors to their status instead of 500; Office writes, upload imports and the
+  terminal heartbeat still answer 500. A retention whose `container.remove()`
+  fails clears its `retained_at` marker, so a later manual removal never lets
+  the reaper delete the volume.
 
 ### Changed
 - **Tool calls wake a stopped sandbox (#697).** A tool or MCP request for an

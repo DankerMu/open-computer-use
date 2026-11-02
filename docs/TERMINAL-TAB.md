@@ -43,7 +43,7 @@ Browser (xterm.js)  ←WebSocket→  Computer Use Server  ←WebSocket→  Conta
 
 A tool call for an exited, created, paused, restarting, or removed-but-metadata sandbox wakes it with the launch transition before it runs: exited and created start, paused unpauses, restarting waits within a bounded deadline, and a removed container is recreated from server-side credentials only. A dead sandbox, an engine refusal, a readiness timeout, a legacy paused sandbox without migration evidence, a create-conflict winner that is not running, and corrupt metadata return their explicit lifecycle error; nothing is deleted or recreated. Every launch that reaches running starts a fresh idle window. The same transition is available as `POST /internal/launch/{chat_id}` or its `/terminal/{chat_id}/restart-container` and `resurrect-container` aliases. Launch answers `{"state":"running"}` only after observing running. `GET /internal/describe/{chat_id}` reads state and does not change it. Both require the internal bearer token.
 
-`DELETE /internal/sandbox/{chat_id}` removes the chat's container, workspace volume and files and leaves a `.deleted` tombstone. Afterwards launch, describe and tool calls for that chat return 410 `chat_deleted` and create nothing.
+`DELETE /internal/sandbox/{chat_id}` removes the chat's container, workspace volume and files and leaves a `.deleted` tombstone. Afterwards launch and describe for that chat return HTTP 410 `chat_deleted`, MCP tool calls return the text `Error: chat was deleted`, and none of them create anything. The terminal heartbeat answers 500 for a deleted chat.
 
 ## Existing sleeper cutover
 

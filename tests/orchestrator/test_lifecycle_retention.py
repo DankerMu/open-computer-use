@@ -289,6 +289,46 @@ def test_volume_removal_is_completed_on_a_later_tick(world, failure):
     assert "retained_at" not in docker_manager.read_idle_state(CHAT)
 
 
+def test_failed_container_remove_clears_the_retention_marker(world):
+    docker_manager, client, clock, _tmp = world
+    _meta(docker_manager, CHAT)
+    container = _sandbox(client, "exited", finished=_iso(clock.now - RETENTION - 1))
+    volume = _volume(client)
+    response = MagicMock(status_code=409, url="http://docker.test", reason="conflict")
+    container.remove.side_effect = APIError(
+        "cannot remove a running container", response=response, explanation=b"running")
+
+    with pytest.raises(APIError):
+        docker_manager.reap_idle(CHAT, now=clock.now)
+
+    assert "retained_at" not in (docker_manager.read_idle_state(CHAT) or {})
+    assert client._store[container.name] is container
+    # An operator's later `docker rm` must not let the reaper take the volume.
+    client._store.pop(container.name)
+    docker_manager.reap_idle(CHAT, now=clock.advance(30))
+    volume.remove.assert_not_called()
+    assert client._volumes == {volume.name: volume}
+
+
+@pytest.mark.parametrize("form", ("offset", "whole_seconds"))
+@pytest.mark.parametrize(("age", "removed"), ((RETENTION + 1, True), (RETENTION - 1, False)))
+def test_offset_and_whole_second_timestamps_are_aged_exactly(world, form, age, removed):
+    docker_manager, client, clock, _tmp = world
+    _meta(docker_manager, CHAT)
+    finished_utc = datetime.datetime.fromtimestamp(int(clock.now - age), datetime.timezone.utc)
+    if form == "offset":
+        zone = datetime.timezone(datetime.timedelta(hours=8))
+        finished = finished_utc.astimezone(zone).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    else:
+        finished = finished_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    container = _sandbox(client, "exited", finished=finished)
+    _volume(client)
+
+    docker_manager.reap_idle(CHAT, now=clock.now)
+
+    assert container._removed["value"] is removed
+
+
 def test_absent_container_without_retention_marker_keeps_its_volume(world):
     docker_manager, client, clock, _tmp = world
     _meta(docker_manager, CHAT)
@@ -576,6 +616,59 @@ def test_delete_engine_failure_is_delete_failed_and_retry_completes(http, world)
     assert retried.status_code == 200
     assert retried.json() == {"container": False, "volume": True, "data": True}
     assert client._volumes == {}
+    assert _entries(docker_manager) == [".deleted", ".lifecycle.lock"]
+
+
+def test_failed_file_removal_leaves_tombstone_and_retry_completes(http, world, monkeypatch):
+    docker_manager, client, _clock, _tmp = world
+    _populated_running_chat(docker_manager, client)
+    real_rmtree = docker_manager.shutil.rmtree
+    attempts = {"n": 0}
+
+    def flaky_rmtree(path, *args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise OSError(5, "chat file removal failed")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(docker_manager.shutil, "rmtree", flaky_rmtree)
+
+    failed = http.delete(f"/internal/sandbox/{CHAT}", headers=HEADERS)
+
+    assert failed.status_code == 500
+    assert failed.json()["detail"]["reason"] == DELETE_FAILED
+    assert "chat file removal" in failed.json()["detail"]["detail"]
+    assert ".deleted" in _entries(docker_manager)
+    launch = http.post(f"/internal/launch/{CHAT}", headers=HEADERS)
+    assert launch.status_code == 410
+    assert launch.json()["detail"]["reason"] == CHAT_DELETED
+    with pytest.raises(docker_manager.LifecycleError) as refused:
+        docker_manager._get_or_create_container(CHAT)
+    assert refused.value.reason == CHAT_DELETED
+    assert client._created == []
+
+    retried = http.delete(f"/internal/sandbox/{CHAT}", headers=HEADERS)
+
+    assert retried.status_code == 200
+    assert retried.json() == {"container": False, "volume": False, "data": True}
+    assert _entries(docker_manager) == [".deleted", ".lifecycle.lock"]
+    clean = http.delete(f"/internal/sandbox/{CHAT}", headers=HEADERS)
+    assert clean.json() == {"container": False, "volume": False, "data": False}
+
+
+def test_busy_resource_discovery_does_not_fail_a_completed_delete(http, world):
+    import mcp_resources
+
+    docker_manager, client, _clock, _tmp = world
+    _populated_running_chat(docker_manager, client)
+    assert mcp_resources._discovery_admission.acquire(blocking=False)
+    try:
+        response = http.delete(f"/internal/sandbox/{CHAT}", headers=HEADERS)
+    finally:
+        mcp_resources._discovery_admission.release()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"container": True, "volume": True, "data": True}
     assert _entries(docker_manager) == [".deleted", ".lifecycle.lock"]
 
 
