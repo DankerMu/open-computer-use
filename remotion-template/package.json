@@ -1,0 +1,31 @@
+{
+  "name": "remotion-template",
+  "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@react-three/fiber": "9.8.2",
+    "@remotion/captions": "4.0.537",
+    "@remotion/cli": "4.0.537",
+    "@remotion/effects": "4.0.537",
+    "@remotion/fonts": "4.0.537",
+    "@remotion/gif": "4.0.537",
+    "@remotion/layout-utils": "4.0.537",
+    "@remotion/lottie": "4.0.537",
+    "@remotion/media": "4.0.537",
+    "@remotion/media-utils": "4.0.537",
+    "@remotion/motion-blur": "4.0.537",
+    "@remotion/paths": "4.0.537",
+    "@remotion/rough-notation": "4.0.537",
+    "@remotion/shapes": "4.0.537",
+    "@remotion/three": "4.0.537",
+    "@remotion/transitions": "4.0.537",
+    "@remotion/zod-types": "4.0.537",
+    "lottie-web": "5.13.0",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "remotion": "4.0.537",
+    "three": "0.186.1",
+    "zod": "4.5.4"
+  }
+}

@@ -4,13 +4,14 @@ This directory bundles AI skills that ship inside the sandbox image at `/mnt/ski
 
 ## Licensing
 
-Skills here come from three different sources, each with its own license:
+Skills here come from four different sources, each with its own license:
 
 | Source | Where | License | Notes |
 | --- | --- | --- | --- |
 | Project-original | `public/describe-image/`, `public/sub-agent/` | MIT (SPDX header) | Authored for this project. |
 | Apache 2.0 forks | `public/frontend-design/`, `public/webapp-testing/`, `examples/*/` | Apache 2.0 (`LICENSE.txt`) | Imported under their original Apache license; safe to redistribute. |
 | Anthropic-authored | `public/docx/`, `public/pdf/`, `public/pptx/`, `public/xlsx/`, `public/file-reading/`, `public/pdf-reading/` (any directory containing a proprietary `LICENSE.txt` starting with `© 2025 Anthropic, PBC`) | Anthropic Skill License (proprietary) | See disclaimer below. |
+| Remotion | `public/remotion/` | `public/remotion/SKILL.md`: MIT (project-original). `public/remotion/remotion-best-practices/`: Remotion License | The official Remotion skill 4.0.537, vendored unchanged (see its `SOURCE.md`). Remotion is free for individuals, for-profit organizations with up to 3 employees, non-profit organizations, and anyone evaluating it who does not yet use it commercially; others need a Company License: https://www.remotion.dev/license. |
 
 ### Anthropic Skill disclaimer
 

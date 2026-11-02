@@ -18,7 +18,8 @@ This product uses a multi-license model:
    within your organization is explicitly permitted and is not considered
    competition.
 
-2. OUR SKILLS (skills/public/describe-image/, skills/public/sub-agent/):
+2. OUR SKILLS (skills/public/describe-image/, skills/public/sub-agent/,
+   skills/public/remotion/SKILL.md):
    Licensed under the MIT License (LICENSE-MIT).
 
 3. THIRD-PARTY SKILLS (other directories under skills/):
@@ -29,6 +30,23 @@ This product uses a multi-license model:
    generated computer-use-server/static/drawio/):
    Licensed under their own terms. See THIRD-PARTY-LICENSES.md and the
    original packages for details.
+
+5. REMOTION (skills/public/remotion/remotion-best-practices/, and the
+   Remotion 4.0.537 packages with Chrome Headless Shell 157.0.8080.0 that the
+   sandbox image installs into /opt/remotion-template/ from
+   remotion-template/package-lock.json):
+   Remotion and its official agent skills are licensed under the Remotion
+   License, not under this repository's licenses, and are not relicensed
+   here. The vendored skills come unchanged from remotion-dev/remotion,
+   packages/skills, tag v4.0.537; see their SOURCE.md. Chrome Headless Shell
+   is a Chromium build under Chromium's BSD-3-Clause license and the licenses
+   of its bundled components.
+
+   Remotion is free for individuals, for-profit organizations with up to 3
+   employees, non-profit organizations, and anyone evaluating it who does not
+   yet use it commercially. Any other organization needs a
+   Remotion Company License before using Remotion, including through an
+   image built from this repository. Terms: https://www.remotion.dev/license
 
 Attribution required: include "Open Computer Use" and a link to
 https://github.com/Wide-Moat/open-computer-use in any copies or

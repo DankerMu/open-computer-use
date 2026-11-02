@@ -23,7 +23,7 @@ All code, comments, commit messages, PR titles, PR descriptions, documentation, 
 
 All new source files MUST include an SPDX license header as the first comment:
 
-- Files in `skills/public/describe-image/` or `skills/public/sub-agent/`: `# SPDX-License-Identifier: MIT`
+- Files in `skills/public/describe-image/` or `skills/public/sub-agent/`, and `skills/public/remotion/SKILL.md`: `# SPDX-License-Identifier: MIT`
 - Files in other `skills/` directories with their own LICENSE.txt: DO NOT add headers
 - All other new files: `# SPDX-License-Identifier: FSL-1.1-Apache-2.0`
 
