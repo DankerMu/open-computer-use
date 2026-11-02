@@ -162,12 +162,21 @@ const files = [
   { file_id: 'markdown-at-limit', path: 'at-limit.md', type: 'markdown', mime: 'text/markdown' },
   { file_id: 'markdown-at-cap', path: 'at-cap.md', type: 'markdown', mime: 'text/markdown' },
   { file_id: 'markdown-over-cap', path: 'over-cap.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-wide-rows', path: 'table-wide-rows.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-past-budget', path: 'table-past-budget.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-at-budget', path: 'table-at-budget.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-in-quote', path: 'table-in-quote.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-cr-lines', path: 'table-cr-lines.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'table-ordinary', path: 'table-ordinary.md', type: 'markdown', mime: 'text/markdown' },
   { file_id: 'wide-csv', path: 'wide.csv', type: 'spreadsheet', mime: 'text/csv' },
   { file_id: 'wide-tsv', path: 'wide.tsv', type: 'spreadsheet', mime: 'text/tab-separated-values' },
   { file_id: 'wide-body-csv', path: 'wide-body.csv', type: 'spreadsheet', mime: 'text/csv' },
   { file_id: 'columns-at-limit', path: 'columns-at-limit.csv', type: 'spreadsheet', mime: 'text/csv' },
   { file_id: 'columns-over-limit', path: 'columns-over-limit.csv', type: 'spreadsheet', mime: 'text/csv' },
   { file_id: 'columns-unshown-row', path: 'columns-unshown-row.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'long-cell-csv', path: 'long-cell.csv', type: 'spreadsheet', mime: 'text/csv' },
+  { file_id: 'long-cell-tsv', path: 'long-cell.tsv', type: 'spreadsheet', mime: 'text/tab-separated-values' },
+  { file_id: 'cell-at-limit', path: 'cell-at-limit.csv', type: 'spreadsheet', mime: 'text/csv' },
   { file_id: 'code-over-limit', path: 'over-limit.py', type: 'code', mime: 'text/x-python' },
   { file_id: 'code-at-limit', path: 'at-limit.py', type: 'code', mime: 'text/x-python' },
   { file_id: 'too-large-markdown', path: 'too-large.md', type: 'markdown', mime: 'text/markdown', too_large: true },
@@ -1384,6 +1393,25 @@ async function main() {
     bytes['columns-over-limit.csv'] = Buffer.from(`${csvRow(201)}\n${csvRow(201)}\n`);
     bytes['columns-unshown-row.csv'] = Buffer.from(`${'a,b\n'.repeat(1000)}${csvRow(201)}\n`);
     bytes['columns-standalone.csv'] = Buffer.from(`${csvRow(300)}\n${csvRow(300)}\n`);
+    const longCell = 'a\u05d0'.repeat(100001).slice(0, 200001);
+    bytes['long-cell.csv'] = Buffer.from(`${longCell},b\n${longCell},d\n`);
+    bytes['long-cell.tsv'] = Buffer.from(`${longCell}\tb\n${longCell}\td\n`);
+    bytes['cell-at-limit.csv'] = Buffer.from(`${'h'.repeat(1000)},b\n${'c'.repeat(1000)},d\n`);
+    bytes['cell-standalone.csv'] = Buffer.from(`${'h'.repeat(2000)},b\n${'c'.repeat(2000)},d\n`);
+    // marked pads each short row to the header, so a cell costs nothing in the source.
+    const paddedTable = (columns, rows, lead = '', rest = lead) => {
+      const row = cell => Array.from({ length: columns }, () => cell).join('|');
+      return [`${lead}${row('h')}`, `${rest}${row('-')}`, ...Array.from({ length: rows }, () => `${rest}x`)].join('\n');
+    };
+    bytes['table-wide-rows.md'] = Buffer.from(paddedTable(200, 10000));
+    // 20 columns over 10,000 lines is exactly the limit by the bound, and one line more passes it.
+    bytes['table-at-budget.md'] = Buffer.from(paddedTable(20, 9998));
+    bytes['table-past-budget.md'] = Buffer.from(paddedTable(20, 9999));
+    bytes['table-in-quote.md'] = Buffer.from(paddedTable(100, 2000, '> '));
+    bytes['table-cr-lines.md'] = Buffer.from(paddedTable(200, 10000).replaceAll('\n', '\r'));
+    const ordinaryRow = cell => `| ${Array.from({ length: 12 }, (_, index) => `${cell} ${index}`).join(' | ')} |`;
+    bytes['table-ordinary.md'] = Buffer.from(['# Quarterly figures', '', ordinaryRow('Column'),
+      `|${'---|'.repeat(12)}`, ...Array.from({ length: 200 }, (_, index) => ordinaryRow(`row ${index}`))].join('\n'));
     bytes['too-large.md'] = Buffer.from('Too large body');
     bytes['unsupported-name.py'] = Buffer.from('Unsupported name body');
     bytes[MARKUP_NAME] = Buffer.from('Markup name body');
@@ -2073,6 +2101,99 @@ async function main() {
       }, `/ocu/files/${CHAT}/columns-standalone.csv`);
       assert.deepEqual(shape, { header: 300, body: [300], notices: 0 });
     });
+    const cellsShown = () => fileStage().locator('.data-table-wrap').evaluate((wrap) => {
+      void wrap.scrollWidth;
+      return {
+        header: wrap.querySelector('th').textContent,
+        body: wrap.querySelector('td').textContent,
+        neighbours: [wrap.querySelectorAll('th')[1].textContent, wrap.querySelectorAll('td')[1].textContent],
+        notices: wrap.querySelectorAll('.truncation-notice').length,
+      };
+    });
+    for (const [id, neighbours] of [['long-cell-csv', ['b', 'd']], ['long-cell-tsv', ['b', 'd']]]) {
+      await fileCase(`${id} shows 1,000 characters of a 200,001-character cell within the bound`, async () => {
+        await remountFiles();
+        const started = Date.now();
+        await showFile(id, 'ready', wideTableBound);
+        const shown = await cellsShown();
+        const elapsed = Date.now() - started;
+        const clipped = longCell.slice(0, 1000);
+        assert.deepEqual(shown, { header: clipped, body: clipped, neighbours, notices: 0 });
+        assert(elapsed < wideTableBound, `the cell took ${elapsed} ms to lay out`);
+      });
+    }
+    await fileCase('a cell of exactly 1,000 characters is shown whole', async () => {
+      await remountFiles();
+      await showFile('cell-at-limit', 'ready');
+      assert.deepEqual(await cellsShown(),
+        { header: 'h'.repeat(1000), body: 'c'.repeat(1000), neighbours: ['b', 'd'], notices: 0 });
+    });
+    await fileCase('standalone spreadsheets keep the full cell', async () => {
+      await remountFiles();
+      const lengths = await frame().locator('#app').evaluate(async (root, url) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const host = document.createElement('div');
+        root.appendChild(host);
+        await renderPreviewContent(host,
+          { name: 'cell-standalone.csv', path: 'cell-standalone.csv', type: 'spreadsheet', url }, [], () => {}, false);
+        const seen = [host.querySelector('th').textContent.length, host.querySelector('td').textContent.length];
+        host.remove();
+        return seen;
+      }, `/ocu/files/${CHAT}/cell-standalone.csv`);
+      assert.deepEqual(lengths, [2000, 2000]);
+    });
+    const markdownPlainNotice = 'This file is too long to format here, so it is shown as plain text.';
+    for (const [id, file, label] of [
+      ['table-wide-rows', 'table-wide-rows.md', 'a wide header over thousands of short rows'],
+      ['table-past-budget', 'table-past-budget.md', 'one line past the cell bound'],
+      ['table-in-quote', 'table-in-quote.md', 'a table nested in a blockquote'],
+      ['table-cr-lines', 'table-cr-lines.md', 'a table whose lines end in a bare carriage return'],
+    ]) {
+      await fileCase(`Markdown with ${label} reports ready as plain text within the bound`, async () => {
+        assert(bytes[file].length < 30000, `${file} no longer tests the bound`);
+        await remountFiles();
+        await spyOnParsers();
+        const before = requests.length;
+        const started = Date.now();
+        await showFile(id, 'ready', wideTableBound);
+        const shown = await fileStage().locator('.markdown-body').evaluate((body) => {
+          void body.scrollWidth;
+          return {
+            source: body.querySelector('pre')?.textContent,
+            notice: body.querySelector('.truncation-notice')?.textContent,
+            cells: body.querySelectorAll('td, th').length,
+          };
+        });
+        const elapsed = Date.now() - started;
+        // The HTML parser turns a carriage return into a line feed.
+        const source = bytes[file].toString().replaceAll('\r', '\n');
+        assert.deepEqual(shown, { source, notice: markdownPlainNotice, cells: 0 });
+        assert(elapsed < wideTableBound, `the document took ${elapsed} ms to lay out`);
+        assert.deepEqual(await parserCalls(), { marked: 0, hljs: 0 });
+        assert.deepEqual(requests.slice(before).map(row => row.path)
+          .filter(item => item.endsWith('/purify.min.js')), [], 'the sanitizer was loaded');
+      });
+    }
+    for (const [id, label, columns, rows, timeout] of [
+      ['table-at-budget', 'exactly at the cell bound', 20, 9998, 30000],
+      ['table-ordinary', 'an ordinary table of 12 columns and 200 rows', 12, 200, undefined],
+    ]) {
+      await fileCase(`Markdown with ${label} renders as a table`, async () => {
+        await remountFiles();
+        await spyOnParsers();
+        await showFile(id, 'ready', timeout);
+        const shown = await fileStage().locator('.markdown-body').evaluate((body) => {
+          void body.scrollWidth;
+          return {
+            header: body.querySelectorAll('th').length,
+            cells: body.querySelectorAll('td').length,
+            notices: body.querySelectorAll('.truncation-notice').length,
+          };
+        });
+        assert.deepEqual(shown, { header: columns, cells: columns * rows, notices: 0 });
+        assert.deepEqual(await parserCalls(), { marked: 1, hljs: 0 });
+      });
+    }
     await fileCase('code over the highlight limit reports ready without highlighting', async () => {
       await remountFiles();
       await spyOnParsers();

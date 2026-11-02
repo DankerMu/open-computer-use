@@ -72,10 +72,12 @@
   keeps at most 100 images and removes any with a query string or on the chat's
   archive route. Rendering shares a thread with the parent, so Markdown over
   30,000 characters shows as plain text with a notice and stops at 200,000
-  characters, code and text over 20,000 characters show without highlighting, a
-  spreadsheet shows at most 200 columns per row with a notice, and a fence whose
-  language highlight.js does not recognise is not auto-detected. Entries marked
-  `too_large` or `unsupported_name` report `unsupported` without a fetch.
+  characters, Markdown whose table size, estimated from the text, is over 200,000
+  cells uses the same view, code and text over 20,000 characters show without
+  highlighting, a spreadsheet shows at most 200 columns per row with a notice and
+  1,000 characters per cell, and a fence whose language highlight.js does not
+  recognise is not auto-detected. Entries marked `too_large` or
+  `unsupported_name` report `unsupported` without a fetch.
   Markdown, code and spreadsheet report `error` on a fetch error, a non-OK
   response or a sanitizer failure. Audio and video report `ready` on
   `loadedmetadata` and `error` on the element's `error` event, offer no download

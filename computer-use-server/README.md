@@ -510,13 +510,17 @@ KaTeX, remote images and external links.
 Parsing, highlighting and layout run on the thread the frame shares with the
 parent, so this view limits them. Markdown over 30,000 characters shows as
 escaped plain text with a notice and reports `ready` without being parsed; it
-stops at 200,000 characters and the notice then says the view is truncated. Code
-and text over 20,000 characters show without highlighting or line numbers. A CSV
-or TSV shows at most 200 columns per row, header and body, with a notice when a
-shown row had more. A Markdown fence keeps its language class only if
-highlight.js recognises the language; any other fence, including one with no
-language, stays plain and is not auto-detected. Standalone preview has none of
-these limits.
+stops at 200,000 characters and the notice then says the view is truncated.
+Markdown whose estimated table size is over 200,000 cells uses the same
+plain-text view and notice, also without being parsed; the estimate comes from
+the text alone, as the columns of the line with the most `|` characters times
+the number of lines. Code and text over 20,000 characters show without
+highlighting or line numbers. A CSV or TSV shows at most 200 columns per row,
+header and body, with a notice when a shown row had more, and at most 1,000
+characters per cell, with no notice. A Markdown fence keeps its language class
+only if highlight.js recognises the language; any other fence, including one
+with no language, stays plain and is not auto-detected. Standalone preview has
+none of these limits.
 
 DOCX and SheetJS-converted HTML pass through locally pinned DOMPurify before
 insertion into the trusted DOM in both embedded and standalone previews.

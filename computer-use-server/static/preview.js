@@ -378,8 +378,25 @@ const EMBEDDED_MARKDOWN_PARSE_LIMIT = 30000;
 const EMBEDDED_CODE_HIGHLIGHT_LIMIT = 20000;
 // Table layout also runs on that thread, and a 500,000-character row is 500,000 cells.
 const EMBEDDED_SPREADSHEET_COLUMN_LIMIT = 200;
+// marked pads a short row to the header, so a two-character row can cost thousands of cells.
+const EMBEDDED_TABLE_CELL_LIMIT = 200000;
+// Laying out one long cell of mixed-direction text stalls that thread as well.
+const EMBEDDED_SPREADSHEET_CELL_LIMIT = 1000;
 // Each kept image is a request from the employee's browser.
 const EMBEDDED_IMAGE_LIMIT = 100;
+
+// Counted before lexing, because marked materialises every padded cell.
+// Lines end as marked ends them: a bare \r is a line break there too.
+function tableCellBound(text) {
+  const lines = text.split(/\r\n?|\n/);
+  return lines.length * Math.max(...lines.map(line => line.split('|').length));
+}
+
+function renderMarkdownPlainText(container, text) {
+  const notice = text.length > TEXT_DISPLAY_LIMIT
+    ? t('markdown_truncated_notice', { n: TEXT_DISPLAY_LIMIT }) : t('markdown_plain_notice');
+  container.innerHTML = `<div class="markdown-body"><p class="truncation-notice">${notice}</p><pre>${escapeHtml(text.substring(0, TEXT_DISPLAY_LIMIT))}</pre></div>`;
+}
 
 async function renderMarkdownPreview(container, file, files, onSelectFile, embedded = false) {
   try {
@@ -387,10 +404,9 @@ async function renderMarkdownPreview(container, file, files, onSelectFile, embed
     if (embedded && !resp.ok) throw new Error('Markdown response failed');
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000) + '\n\n... (truncated)';
-    if (embedded && text.length > EMBEDDED_MARKDOWN_PARSE_LIMIT) {
-      const notice = text.length > TEXT_DISPLAY_LIMIT
-        ? t('markdown_truncated_notice', { n: TEXT_DISPLAY_LIMIT }) : t('markdown_plain_notice');
-      container.innerHTML = `<div class="markdown-body"><p class="truncation-notice">${notice}</p><pre>${escapeHtml(text.substring(0, TEXT_DISPLAY_LIMIT))}</pre></div>`;
+    if (embedded && (text.length > EMBEDDED_MARKDOWN_PARSE_LIMIT
+      || tableCellBound(text) > EMBEDDED_TABLE_CELL_LIMIT)) {
+      renderMarkdownPlainText(container, text);
       return true;
     }
     const rasterImage = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/i;
@@ -596,13 +612,14 @@ async function renderSpreadsheetPreview(container, file, embedded = false) {
     const delimiter = ext === 'tsv' ? '\t' : ',';
     const rows = parseCSV(text, delimiter);
     const columnLimit = embedded ? EMBEDDED_SPREADSHEET_COLUMN_LIMIT : Infinity;
+    const cellLimit = embedded ? EMBEDDED_SPREADSHEET_CELL_LIMIT : Infinity;
     let tableHtml = '<table><thead><tr>';
     if (rows.length > 0) {
-      rows[0].slice(0, columnLimit).forEach(cell => { tableHtml += `<th>${escapeHtml(cell)}</th>`; });
+      rows[0].slice(0, columnLimit).forEach(cell => { tableHtml += `<th>${escapeHtml(cell.slice(0, cellLimit))}</th>`; });
       tableHtml += '</tr></thead><tbody>';
       for (let i = 1; i < Math.min(rows.length, 1000); i++) {
         tableHtml += '<tr>';
-        rows[i].slice(0, columnLimit).forEach(cell => { tableHtml += `<td>${escapeHtml(cell)}</td>`; });
+        rows[i].slice(0, columnLimit).forEach(cell => { tableHtml += `<td>${escapeHtml(cell.slice(0, cellLimit))}</td>`; });
         tableHtml += '</tr>';
       }
       tableHtml += '</tbody></table>';
