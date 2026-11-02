@@ -158,7 +158,7 @@ class SystemPromptEndpointContract(unittest.TestCase):
         # broke and the query value won.
         captured: dict = {}
 
-        async def _capture(chat_id, user_email):
+        async def _capture(chat_id, user_email, features=frozenset()):
             captured["chat_id"] = chat_id
             captured["user_email"] = user_email
             return "stub-prompt-body"

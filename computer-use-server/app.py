@@ -49,7 +49,12 @@ from fastapi.responses import StreamingResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from system_prompt import SYSTEM_PROMPT_TEMPLATE, build_system_prompt, render_system_prompt
+from system_prompt import (
+    SYSTEM_PROMPT_TEMPLATE,
+    build_system_prompt,
+    parse_prompt_features,
+    render_system_prompt,
+)
 from docker_manager import (
     get_container_service_address,
     CDP_PORT,
@@ -1571,6 +1576,11 @@ async def system_prompt(
            (kept for backwards compat with pre-v4.0.0 integrations; see below)
         4. "default"
 
+    `X-OCU-Features` (comma-separated) requests prompt extensions; the only
+    one is `video`, which lists the remotion skill. Absent or blank means none;
+    any other value is 400 and nothing is rendered. The route is
+    internal-token guarded, so only the Open WebUI filter can set it.
+
     `file_base_url` / `archive_url` are deprecated query params from pre-v4.0.0:
     before the server owned `PUBLIC_BASE_URL`, clients passed their own
     browser-facing URLs here. Now the server always emits PUBLIC_BASE_URL/files/
@@ -1606,6 +1616,10 @@ async def system_prompt(
     effective_user_email = (
         _header("x-user-email", "x-openwebui-user-email") or user_email
     )
+    try:
+        features = parse_prompt_features(request.headers.get("x-ocu-features"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Single rendering path — shared cache with Tiers 2, 4, 5.
     # chat_id=None preserves the legacy diagnostic path: external callers
@@ -1614,6 +1628,7 @@ async def system_prompt(
     result = await render_system_prompt(
         effective_chat_id,
         effective_user_email,
+        features,
     )
 
     # Public URL is owned by the server. Expose via response header so the

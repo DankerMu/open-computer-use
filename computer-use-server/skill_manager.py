@@ -130,6 +130,13 @@ NATIVE_PROMPT_DESCRIPTIONS: dict[str, str] = {
         "with web pages, fill forms, take screenshots, test web applications, "
         "or extract information from web pages."
     ),
+    # Listed only for requests with the video feature (see video_skills()).
+    "remotion": (
+        "Make videos with Remotion (React) in the sandbox, including voiceover "
+        "and 3D scenes, rendered offline to MP4 in /mnt/user-data/files/. "
+        "Read this SKILL.md first, before writing any composition or running "
+        "any Remotion command."
+    ),
     # Example skills
     "algorithmic-art": (
         "Create algorithmic art with p5.js using generative randomness and "
@@ -554,6 +561,26 @@ async def get_user_skills(email: Optional[str]) -> list[SkillInfo]:
         skills = _build_default_skills()
         _memory_cache[email] = (time.time(), skills)
         return skills
+
+
+def video_skills(skills: list[SkillInfo]) -> list[SkillInfo]:
+    """
+    Skills for a request with the video feature: `skills` plus `remotion`.
+
+    Always a new list. `skills` may be the in-memory cache entry that every
+    other request for the user reads, so it is never appended to.
+    """
+    if any(skill.name == "remotion" for skill in skills):
+        return list(skills)
+    return [
+        *skills,
+        SkillInfo(
+            name="remotion",
+            description=NATIVE_PROMPT_DESCRIPTIONS["remotion"],
+            category="public",
+            skill_path="public/remotion",
+        ),
+    ]
 
 
 def get_user_skills_sync(email: Optional[str]) -> list[SkillInfo]:
