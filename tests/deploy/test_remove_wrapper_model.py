@@ -266,8 +266,9 @@ class RemoveWrapperModelTests(unittest.TestCase):
             for rewritten in ("from utils", "from apps", "from main", "from config"):
                 with self.subTest(source=stored_id, rewritten=rewritten):
                     self.assertNotIn(rewritten.encode(), shipped)
-            # A carriage return would not survive the JSON text round trip intact
-            # on every client, so the shipped files stay LF-only.
+            # The fixtures read these files in text mode, which folds CRLF to LF,
+            # while the script compares bytes; a CR would let the fixtures hide a
+            # real mismatch, so the shipped files stay LF-only.
             with self.subTest(source=stored_id, check="no CR"):
                 self.assertNotIn(b"\r", shipped)
 
