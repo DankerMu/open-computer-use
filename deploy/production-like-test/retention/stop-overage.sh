@@ -1,8 +1,8 @@
 #!/bin/sh
 # Stop only sandbox containers that exceed the permitted continuous runtime.
 # Deliberately never removes containers, named volumes, chat data, images, or
-# build cache. Stopped workspaces require the existing explicit launch
-# operation; this guard never restarts a sandbox.
+# build cache. This guard never restarts a sandbox; a stopped sandbox wakes on
+# the chat's next tool call.
 
 set -eu
 

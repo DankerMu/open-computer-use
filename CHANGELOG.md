@@ -2,7 +2,28 @@
 
 ## Unreleased — `main` branch
 
+### Changed
+- **Tool calls wake a stopped sandbox (#697).** A tool or MCP request for an
+  exited, created, paused or restarting sandbox, or for an absent container with
+  valid metadata, now takes the launch transition within the same lifecycle lock
+  and runs once the sandbox is observed running. It no longer returns
+  `workspace is stopped and needs an explicit launch`. Recreation from metadata
+  uses server-side credentials only, on the tool path as on launch. Dead, engine
+  refusal, readiness timeout, legacy paused without migration evidence, a
+  create-conflict winner that is not running (now `launch_failed` 409) and
+  corrupt metadata still return their explicit lifecycle error without deleting
+  or recreating anything. `SandboxStopped` is removed.
+- **Production-like idle default is 3 days (#697).** `bootstrap-test.sh` writes
+  `CONTAINER_IDLE_TIMEOUT=259200` for a new `runtime.env`; an existing file keeps
+  its value. The retention guard's 168-hour ceiling is unchanged.
+
 ### Fixed
+- **A launched sandbox keeps a fresh idle window (#697).** Every launch branch
+  that reaches running refreshes the host idle state. A sandbox launched within
+  `CONTAINER_IDLE_TIMEOUT` of an idle stop was previously stopped again on the
+  next reaper tick, because the idle stop leaves an expired state naming the same
+  container.
+
 - **`.webp` resolves to `image/webp` (#689).** The server registers the type at
   import, because the Python 3.12 image has no `/etc/mime.types` and its strict
   map lacks `.webp`. `classify_file` and the file route otherwise reported

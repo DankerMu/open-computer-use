@@ -592,7 +592,7 @@ All via environment variables:
 | `BASE_DATA_DIR` | `/data` | Server IO root and Docker bind source for chat data. The configured path must be identical inside the server and at the Docker daemon. |
 | `CONTAINER_MEM_LIMIT` | `2g` | Container memory limit |
 | `CONTAINER_CPU_LIMIT` | `1.0` | Container CPU limit |
-| `CONTAINER_IDLE_TIMEOUT` | `600` | Host-owned idle stop for a continuously observed running sandbox (seconds). Paused time and OCU downtime do not count. |
+| `CONTAINER_IDLE_TIMEOUT` | `600` | Host-owned idle stop for a continuously observed running sandbox (seconds). Paused time and OCU downtime do not count. The next tool call or launch wakes a stopped sandbox and starts a fresh window. |
 | `OCU_IDLE_POLL_SECONDS` | `30` | Idle observation cadence. Must be a positive integer shorter than `CONTAINER_IDLE_TIMEOUT`. |
 | `OCU_SANDBOX_NO_AUTOSTART` | unset | When exactly `1`, created sandboxes receive `NO_AUTOSTART=1`. |
 | `MCP_TOKENS_URL` | _(empty)_ | Settings wrapper URL (optional) |

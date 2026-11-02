@@ -162,7 +162,7 @@ from docker_manager import (
     _reset_shutdown_timer,
     build_mcp_config, build_mcp_config_write_script,
     _fetch_gitlab_token, _ensure_gitlab_token,
-    SandboxStopped, LifecycleError,
+    LifecycleError,
     DOCKER_SOCKET, DOCKER_IMAGE, CONTAINER_MEM_LIMIT, CONTAINER_CPU_LIMIT,
     COMMAND_TIMEOUT, ENABLE_NETWORK, PUBLIC_BASE_URL,
     MCP_TOKENS_URL, MCP_TOKENS_API_KEY,

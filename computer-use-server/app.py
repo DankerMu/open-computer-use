@@ -1290,7 +1290,7 @@ def _lifecycle_http_error(exc: LifecycleError) -> HTTPException:
 
 async def _launch_response(chat_id: str):
     try:
-        return await asyncio.to_thread(launch_sandbox, canonical_chat_id(chat_id), "server")
+        return await asyncio.to_thread(launch_sandbox, canonical_chat_id(chat_id))
     except LifecycleError as exc:
         raise _lifecycle_http_error(exc) from exc
 
