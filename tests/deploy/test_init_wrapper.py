@@ -46,6 +46,8 @@ if not any(model.get('id') == target for model in data):
     exit 1
 }
 '''
+VIDEO_FILTER = "video_production_filter"
+VIDEO_FILTER_NAME = "视频制作"
 PUBLIC_GRANTS = [
     {"principal_type": "group", "principal_id": "*", "permission": "read"},
     {"principal_type": "user", "principal_id": "*", "permission": "read"},
@@ -55,6 +57,7 @@ ALLOWED_GET = {
     "/api/models",
     "/api/v1/tools/id/ai_computer_use",
     "/api/v1/functions/id/computer_use_filter",
+    f"/api/v1/functions/id/{VIDEO_FILTER}",
     "/api/v1/configs/models",
 }
 ALLOWED_POST = {
@@ -69,6 +72,9 @@ ALLOWED_POST = {
     "/api/v1/functions/id/computer_use_filter/valves/update",
     "/api/v1/functions/id/computer_use_filter/toggle",
     "/api/v1/functions/id/computer_use_filter/toggle/global",
+    f"/api/v1/functions/id/{VIDEO_FILTER}/update",
+    f"/api/v1/functions/id/{VIDEO_FILTER}/toggle",
+    f"/api/v1/functions/id/{VIDEO_FILTER}/toggle/global",
     "/api/v1/configs/models",
 }
 
@@ -211,8 +217,12 @@ class FakeWebUI:
                         self.send_error(404)
                         return
                     return self._json(200, tool)
-                if path == "/api/v1/functions/id/computer_use_filter":
-                    function = owner.functions.get("computer_use_filter")
+                if path.startswith("/api/v1/functions/id/"):
+                    function_id = path.rsplit("/", 1)[1]
+                    if owner.mode == "video-state-failure" and function_id == VIDEO_FILTER:
+                        self.send_error(503)
+                        return
+                    function = owner.functions.get(function_id)
                     if function is None:
                         self.send_error(404)
                         return
@@ -266,34 +276,36 @@ class FakeWebUI:
                     owner.tool_access = payload
                     return self._json(200, payload)
                 if path == "/api/v1/functions/create":
-                    owner.functions["computer_use_filter"] = {
-                        "id": "computer_use_filter",
+                    function_id = (payload or {}).get("id")
+                    if owner.mode == "video-create-failure" and function_id == VIDEO_FILTER:
+                        self.send_error(500)
+                        return
+                    owner.functions[function_id] = {
                         "is_active": False,
                         "is_global": False,
                         **(payload or {}),
                     }
-                    return self._json(200, owner.functions["computer_use_filter"])
-                if path == "/api/v1/functions/id/computer_use_filter/update":
-                    current = owner.functions.get("computer_use_filter", {})
-                    current.update(payload or {})
-                    owner.functions["computer_use_filter"] = current
-                    return self._json(200, current)
+                    return self._json(200, owner.functions[function_id])
                 if path == "/api/v1/functions/id/computer_use_filter/valves/update":
                     owner.filter_valves = payload
                     return self._json(200, payload)
-                if path.endswith("/toggle/global"):
+                if path.startswith("/api/v1/functions/id/"):
+                    function_id = path.split("/")[5]
+                    if path.endswith("/update"):
+                        current = owner.functions.get(function_id, {})
+                        current.update(payload or {})
+                        owner.functions[function_id] = current
+                        return self._json(200, current)
+                    if owner.mode == "video-toggle-failure" and function_id == VIDEO_FILTER:
+                        self.send_error(500)
+                        return
+                    # Like Open WebUI, both toggle endpoints flip the flag.
+                    flag = "is_global" if path.endswith("/toggle/global") else "is_active"
                     current = owner.functions.setdefault(
-                        "computer_use_filter",
-                        {"id": "computer_use_filter", "is_active": False, "is_global": False},
+                        function_id,
+                        {"id": function_id, "is_active": False, "is_global": False},
                     )
-                    current["is_global"] = True
-                    return self._json(200, current)
-                if path.endswith("/toggle"):
-                    current = owner.functions.setdefault(
-                        "computer_use_filter",
-                        {"id": "computer_use_filter", "is_active": False, "is_global": False},
-                    )
-                    current["is_active"] = True
+                    current[flag] = not current[flag]
                     return self._json(200, current)
                 if path == "/api/v1/configs/models":
                     if owner.mode == "config-post-failure":
@@ -434,6 +446,7 @@ class InitWrapperTests(unittest.TestCase):
         function = self.webui.functions["computer_use_filter"]
         self.assertTrue(function["is_active"])
         self.assertTrue(function["is_global"])
+        self.assert_video_filter_installed()
         self.assertEqual(self.webui.posted_config["DEFAULT_MODELS"], PRIMARY_MODEL)
         self.assertEqual(
             self.webui.posted_config["DEFAULT_MODEL_PARAMS"],
@@ -443,6 +456,16 @@ class InitWrapperTests(unittest.TestCase):
         self.assertEqual(self.webui.posted_config["MODEL_ORDER_LIST"], ["keep-order"])
         self.assertEqual(self.webui.posted_config["DEFAULT_MODEL_METADATA"], {"keep": True})
         self.assert_no_wrapper_model()
+
+    def assert_video_filter_installed(self):
+        video = self.webui.functions[VIDEO_FILTER]
+        shipped = (SOURCE / "functions" / f"{VIDEO_FILTER}.py").read_text(encoding="utf-8")
+        self.assertEqual(video["id"], VIDEO_FILTER)
+        self.assertEqual(video["name"], VIDEO_FILTER_NAME)
+        self.assertEqual(video["content"], shipped)
+        self.assertTrue(video["is_active"])
+        self.assertTrue(video["is_global"])
+        self.assertNotIn(f"POST /api/v1/functions/id/{VIDEO_FILTER}/valves/update", self.webui.calls)
 
     def assert_no_wrapper_model(self):
         # The tool reaches every model through the global filter (#590); no
@@ -634,6 +657,67 @@ class InitWrapperTests(unittest.TestCase):
         wrapper = WRAPPER.read_text(encoding="utf-8")
         self.assertNotIn("sub_agent method", wrapper)
         self.assertNotIn("method_start", wrapper)
+
+    def test_video_filter_install_is_idempotent_across_reruns(self):
+        self.webui.mode = "success"
+        first = self.run_wrapper()
+        self.assertEqual(first.returncode, 0, self.combined(first))
+        self.assert_video_filter_installed()
+        (self.data / MARKER_NAME).unlink()
+        second = self.run_wrapper()
+        self.assertEqual(second.returncode, 0, self.combined(second))
+        self.assertTrue((self.data / MARKER_NAME).is_file())
+        self.assert_video_filter_installed()
+        calls = self.webui.calls
+        self.assertEqual(calls.count("POST /api/v1/functions/create"), 2)  # one per filter
+        self.assertEqual(calls.count(f"POST /api/v1/functions/id/{VIDEO_FILTER}/update"), 1)
+        self.assertEqual(calls.count(f"POST /api/v1/functions/id/{VIDEO_FILTER}/toggle"), 1)
+        self.assertEqual(calls.count(f"POST /api/v1/functions/id/{VIDEO_FILTER}/toggle/global"), 1)
+        self.assertEqual(self.webui.unexpected, [])
+
+    def test_video_filter_api_errors_fail_without_marker_then_retry(self):
+        for mode in ("video-create-failure", "video-state-failure", "video-toggle-failure"):
+            with self.subTest(mode=mode):
+                self.webui.functions.clear()
+                self.webui.mode = mode
+                failed = self.run_wrapper()
+                self.assertNotEqual(failed.returncode, 0, self.combined(failed))
+                self.assertIn("ERROR", failed.stderr)
+                self.assertIn(VIDEO_FILTER, failed.stderr)
+                self.assertFalse((self.data / MARKER_NAME).exists())
+                self.assert_no_secret(failed)
+                self.webui.mode = "success"
+                succeeded = self.run_wrapper()
+                self.assertEqual(succeeded.returncode, 0, self.combined(succeeded))
+                self.assertTrue((self.data / MARKER_NAME).is_file())
+                self.assert_video_filter_installed()
+                (self.data / MARKER_NAME).unlink()
+
+    def test_wrapper_copies_the_shipped_video_filter(self):
+        hold = self.root / "http-hold"
+        self.webui.mode = "success"
+        hold.write_text("1", encoding="utf-8")
+        self.webui.hold_path = str(hold)
+        process = subprocess.Popen(
+            ["bash", str(WRAPPER)],
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.wrapper_env(),
+            start_new_session=True,
+        )
+        try:
+            self.assertTrue(self.webui.entered.wait(5), "wrapper never reached its first request")
+            owned = leftover_init(self.root)
+            self.assertEqual(len(owned), 1)
+            copied = (owned[0] / "functions" / f"{VIDEO_FILTER}.py").read_bytes()
+        finally:
+            hold.unlink(missing_ok=True)
+            self.webui.hold_path = ""
+            process.communicate(timeout=20)
+        self.assertEqual(copied, (SOURCE / "functions" / f"{VIDEO_FILTER}.py").read_bytes())
+        self.assertEqual(process.returncode, 0)
 
     def test_success_after_failure_writes_marker_without_secret(self):
         self.webui.mode = "auth-failure"

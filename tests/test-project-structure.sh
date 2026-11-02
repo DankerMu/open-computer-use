@@ -67,11 +67,13 @@ fi
 # 5. openwebui/functions/
 echo ""
 echo "[5/12] openwebui/functions/"
-if [ -f "$ROOT/openwebui/functions/computer_link_filter.py" ]; then
-    pass "openwebui/functions/computer_link_filter.py"
-else
-    fail "openwebui/functions/computer_link_filter.py missing"
-fi
+for function_file in computer_link_filter.py video_production_filter.py; do
+    if [ -f "$ROOT/openwebui/functions/$function_file" ]; then
+        pass "openwebui/functions/$function_file"
+    else
+        fail "openwebui/functions/$function_file missing"
+    fi
+done
 
 # 6. openwebui/patches/ must NOT come back
 #

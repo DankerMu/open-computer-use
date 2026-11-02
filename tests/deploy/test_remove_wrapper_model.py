@@ -20,6 +20,14 @@ from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHan
 SCRIPT = ROOT / "deploy" / "production-like-test" / "init" / "remove-wrapper-model.py"
 SOURCE_ROOT = ROOT / "openwebui"
 SHIPPED_FILTER = SOURCE_ROOT / "functions" / "computer_link_filter.py"
+# Every source open-webui-init stores, by the endpoint that returns it.
+SHIPPED_SOURCES = {
+    "/api/v1/functions/id/computer_use_filter": SHIPPED_FILTER,
+    "/api/v1/functions/id/video_production_filter": (
+        SOURCE_ROOT / "functions" / "video_production_filter.py"
+    ),
+    "/api/v1/tools/id/ai_computer_use": SOURCE_ROOT / "tools" / "computer_use_tools.py",
+}
 SENTINEL = "sentinel-admin-password-5b1e"
 TOKEN = "sentinel-session-token-77ad"
 ADMIN_EMAIL = "admin@example.test"
@@ -66,7 +74,7 @@ UNRELATED = {
 
 class FakeWebUI:
     def __init__(self):
-        self.stored_filter: str | None = None
+        self.stored: dict[str, str | None] = {path: None for path in SHIPPED_SOURCES}
         self.models: list[dict] = []
         self.calls: list[str] = []
         self.deleted: list[object] = []
@@ -100,11 +108,12 @@ class FakeWebUI:
                     owner.calls.append(f"GET {self.path}")
                 if not self._authorized():
                     return self._json(401, {"detail": "unauthorized"})
-                if self.path == "/api/v1/functions/id/computer_use_filter":
-                    if owner.stored_filter is None:
+                if self.path in owner.stored:
+                    content = owner.stored[self.path]
+                    if content is None:
                         return self._json(401, {"detail": "not found"})
                     return self._json(
-                        200, {"id": "computer_use_filter", "content": owner.stored_filter}
+                        200, {"id": self.path.rsplit("/", 1)[1], "content": content}
                     )
                 # Mirrors the fork: export lists derived rows only
                 # (base_model_id set), base lists base-model rows only.
@@ -159,7 +168,9 @@ class RemoveWrapperModelTests(unittest.TestCase):
         self.webui = FakeWebUI()
         self.addCleanup(self.webui.stop)
         self.webui.start()
-        self.shipped = SHIPPED_FILTER.read_text(encoding="utf-8")
+        self.shipped_sources = {
+            path: source.read_text(encoding="utf-8") for path, source in SHIPPED_SOURCES.items()
+        }
         self.rows = [WRAPPER, DERIVED_WRAPPER, SUFFIX_ONLY, TOOL_ONLY, UNRELATED]
         self.webui.models = copy.deepcopy(self.rows)
 
@@ -190,26 +201,29 @@ class RemoveWrapperModelTests(unittest.TestCase):
         self.assertNotIn(TOKEN, output)
         return result
 
-    def test_refuses_until_the_stored_filter_is_the_shipped_file(self):
-        for stored in (
-            None,
-            "old filter that still requires a per-model tool binding\n",
-            self.shipped + "\n",
-            self.shipped.replace("from ", "from open_webui.", 1),
-        ):
-            with self.subTest(stored=None if stored is None else stored[:40]):
-                self.webui.calls.clear()
-                self.webui.stored_filter = stored
-                result = self.run_script()
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("re-run open-webui-init", result.stderr)
-                self.assertNotIn("GET /api/v1/models/export", self.webui.calls)
-                self.assertNotIn("GET /api/v1/models/base", self.webui.calls)
-                self.assertEqual(self.webui.deleted, [])
-                self.assertEqual(self.webui.models, self.rows)
+    def test_refuses_until_every_stored_source_is_the_shipped_file(self):
+        for path, shipped in self.shipped_sources.items():
+            for stored in (
+                None,
+                "old source that still requires a per-model tool binding\n",
+                shipped + "\n",
+                shipped.replace("from ", "from open_webui.", 1),
+            ):
+                with self.subTest(path=path, stored=None if stored is None else stored[:40]):
+                    self.webui.calls.clear()
+                    self.webui.stored = dict(self.shipped_sources)
+                    self.webui.stored[path] = stored
+                    result = self.run_script()
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("re-run open-webui-init", result.stderr)
+                    self.assertIn(f"the stored {path.rsplit('/', 1)[1]} ", result.stderr)
+                    self.assertNotIn("GET /api/v1/models/export", self.webui.calls)
+                    self.assertNotIn("GET /api/v1/models/base", self.webui.calls)
+                    self.assertEqual(self.webui.deleted, [])
+                    self.assertEqual(self.webui.models, self.rows)
 
     def test_removes_base_and_derived_wrappers_then_reports_nothing_to_remove(self):
-        self.webui.stored_filter = self.shipped
+        self.webui.stored = dict(self.shipped_sources)
         first = self.run_script()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         removed = [{"id": WRAPPER["id"]}, {"id": DERIVED_WRAPPER["id"]}]
@@ -229,18 +243,20 @@ class RemoveWrapperModelTests(unittest.TestCase):
         self.assertEqual(self.webui.models, [SUFFIX_ONLY, TOOL_ONLY, UNRELATED])
 
     def test_failed_admin_sign_in_refuses_before_reading_anything(self):
-        self.webui.stored_filter = self.shipped
+        self.webui.stored = dict(self.shipped_sources)
         result = self.run_script(password="not-the-admin-password")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("admin sign-in failed", result.stderr)
         self.assertEqual(self.webui.calls, ["POST /api/v1/auths/signin"])
         self.assertEqual(self.webui.models, self.rows)
 
-    def test_shipped_filter_survives_the_webui_import_rewrite(self):
-        # Open WebUI rewrites these substrings in every stored function, which
-        # would make the byte-for-byte refresh check impossible to satisfy.
-        for rewritten in ("from utils", "from apps", "from main", "from config"):
-            self.assertNotIn(rewritten, self.shipped)
+    def test_shipped_sources_survive_the_webui_import_rewrite(self):
+        # Open WebUI rewrites these substrings in every stored function and
+        # tool, which would make the byte-for-byte refresh check impossible.
+        for path, shipped in self.shipped_sources.items():
+            for rewritten in ("from utils", "from apps", "from main", "from config"):
+                with self.subTest(path=path, rewritten=rewritten):
+                    self.assertNotIn(rewritten, shipped)
 
 
 if __name__ == "__main__":

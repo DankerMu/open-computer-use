@@ -65,6 +65,7 @@ ADOPTED = (
     ROOT / "openwebui" / "init.sh",
     ROOT / "openwebui" / "tools" / "computer_use_tools.py",
     ROOT / "openwebui" / "functions" / "computer_link_filter.py",
+    ROOT / "openwebui" / "functions" / "video_production_filter.py",
 )
 PUBLIC_COPY_SOURCES = (
     "render.py",
