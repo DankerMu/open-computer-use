@@ -402,6 +402,9 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     # ceiling still caps continuous runtime. A stopped sandbox wakes on the
     # chat's next tool call.
     printf '%s\n' 'CONTAINER_IDLE_TIMEOUT=259200'
+    # A sandbox stopped for 30 days loses its container and workspace volume;
+    # the chat's files stay, and its next tool call creates a new sandbox.
+    printf '%s\n' 'SANDBOX_RETENTION_DAYS=30'
     printf '%s\n' 'COMMAND_TIMEOUT=120'
     printf '%s\n' 'SUB_AGENT_TIMEOUT=3600'
     printf '%s\n' 'CONTAINER_MAX_AGE_HOURS=168'

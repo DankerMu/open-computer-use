@@ -291,6 +291,11 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertEqual(interpolate_value(core_env["OCU_SANDBOX_DNS"], {"OCU_SANDBOX_DNS": ""}), "")
         with self.assertRaises(UnsupportedInterpolation):
             interpolate_value(core_env["OCU_SANDBOX_DNS"], {})
+        # Unset defaults to 30; an explicit empty value reaches the server, which refuses it.
+        retention = core_env["SANDBOX_RETENTION_DAYS"]
+        self.assertEqual(interpolate_value(retention, {}), "30")
+        self.assertEqual(interpolate_value(retention, {"SANDBOX_RETENTION_DAYS": ""}), "")
+        self.assertEqual(interpolate_value(retention, {"SANDBOX_RETENTION_DAYS": "45"}), "45")
         self.assertTrue(interpolated(webui_env["OCU_INTERNAL_TOKEN"], "OCU_INTERNAL_TOKEN"))
         self.assertEqual(webui_env["ENABLE_OCU_WORKSPACE"], "true")
         # Every provider model is visible to ordinary users without per-model rows (#590).

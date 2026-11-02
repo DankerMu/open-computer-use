@@ -60,10 +60,12 @@ from docker_manager import (
     warn_subagent_cli,
     launch_sandbox,
     describe_sandbox,
+    delete_sandbox,
     record_heartbeat,
     startup_idle_sweep,
     reap_known_sandboxes,
     validate_idle_configuration,
+    configured_retention_days,
     validate_sandbox_dns_configuration,
     LifecycleError,
     GatewayPublicationUnassigned,
@@ -473,6 +475,7 @@ async def lifespan(app):
     if startup_preflight():
         raise RuntimeError("OCU authorization startup preflight failed")
     validate_idle_configuration()
+    configured_retention_days()
     validate_sandbox_dns_configuration()
     claude_gateway.gateway_base_url()
     warn_if_public_base_url_is_default()
@@ -759,6 +762,8 @@ async def upload_file(
         return result
     except HTTPException:
         raise
+    except LifecycleError as exc:
+        raise _lifecycle_http_error(exc) from exc
     except CommittedCloseError as exc:
         raise HTTPException(status_code=500, detail=exc.public_detail()) from exc
     except CorruptReceiptsError:
@@ -956,6 +961,8 @@ async def list_outputs(
         raise HTTPException(status_code=422, detail=_GENERIC_OUTPUTS_FAILURE)
     try:
         listing = await asyncio.to_thread(_reconcile_outputs, chat_id, cursor, limit)
+    except LifecycleError as exc:
+        raise _lifecycle_http_error(exc) from exc
     except (RecoveryRequiredError, SandboxStateError, docker.errors.DockerException) as exc:
         raise _outputs_http_error(UnstableReadError(str(exc))) from exc
     except (CommittedCloseError, StateCorruptError, StateDurabilityError) as extra:
@@ -1310,6 +1317,19 @@ async def internal_describe(chat_id: str):
         raise _lifecycle_http_error(exc) from exc
     except (OutputsBrokerError, OSError) as exc:
         raise _outputs_http_error(exc) from exc
+
+
+@app.delete("/internal/sandbox/{chat_id}", tags=["System"])
+async def internal_delete_sandbox(chat_id: str):
+    """Token-protected deletion of a chat's container, workspace volume and files.
+
+    Leaves a tombstone that refuses every later creator with 410 chat_deleted.
+    Idempotent; reports which of the three were removed by this call.
+    """
+    try:
+        return await asyncio.to_thread(delete_sandbox, canonical_chat_id(chat_id))
+    except LifecycleError as exc:
+        raise _lifecycle_http_error(exc) from exc
 
 
 @app.get("/terminal/{chat_id}/sessions", tags=["Terminal"])

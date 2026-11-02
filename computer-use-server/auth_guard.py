@@ -213,7 +213,7 @@ def _chat_id_from_path(path: str) -> str | None:
         return None
     if parts[0] in {"files", "browser", "terminal", "preview"}:
         return parts[1]
-    if parts[0] == "internal" and len(parts) >= 3 and parts[1] in {"launch", "describe"}:
+    if parts[0] == "internal" and len(parts) >= 3 and parts[1] in {"launch", "describe", "sandbox"}:
         return parts[2]
     if parts[0] == "api" and len(parts) >= 3 and parts[1] in {"uploads", "outputs"}:
         return parts[2]

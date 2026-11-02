@@ -2,6 +2,39 @@
 
 ## Unreleased — `main` branch
 
+### Added
+- **Stopped sandboxes are removed after `SANDBOX_RETENTION_DAYS` (#698).** The
+  idle reaper removes a sandbox that has been exited or created for the
+  retention period (default 30 days), measured from the engine's
+  `State.FinishedAt`, or `Created` when FinishedAt is the zero time. It removes
+  the `chat-<id>-workspace` volume with it and keeps `BASE_DATA_DIR/<chat_id>`,
+  so the chat's next tool call creates a new sandbox over the same files.
+  Identity, status and age are revalidated under the lifecycle lock before
+  removal, and `retained_at` is recorded in `.idle.json` first, so a volume
+  left by an interrupted removal is retried on a later tick. Running, paused,
+  restarting and dead sandboxes, and unparsable timestamps, are never removed.
+  An empty, zero, negative or non-integer value refuses startup. The
+  production-like overlay passes `${SANDBOX_RETENTION_DAYS-30}`, `bootstrap-test.sh`
+  writes `SANDBOX_RETENTION_DAYS=30`, and the deployment record reports it.
+- **`DELETE /internal/sandbox/{chat_id}` (#698).** An internal-token route
+  removes the chat's container and workspace volume, writes a `.deleted`
+  tombstone (also for a chat OCU has never seen), then removes every chat file
+  except `.lifecycle.lock` and `.deleted`. It answers `{"container", "volume", "data"}` booleans and is
+  idempotent. A non-canonical id is 400 before any engine or file access, and a
+  failure is 500 `delete_failed` that a retry completes. Every later
+  create-capable lifecycle acquisition for the chat, including describe and a
+  creator already waiting on the lock in another worker, is refused: HTTP
+  routes answer 410 `chat_deleted` and MCP tool calls return
+  `Error: chat was deleted`. Uploads and the outputs listing now map lifecycle
+  errors to their status instead of 500; Office writes, upload imports and the
+  terminal heartbeat still answer 500. A retention whose `container.remove()`
+  fails while the container still exists clears its `retained_at` marker, so a
+  later manual removal never lets the reaper delete the volume; if the container
+  is gone anyway (`NotFound`, or a client timeout after the engine finished),
+  the marker stays and the volume is still removed. A busy MCP resource
+  discovery at the end of a delete is logged; any other discovery failure is
+  `delete_failed`.
+
 ### Changed
 - **Tool calls wake a stopped sandbox (#697).** A tool or MCP request for an
   exited, created, paused or restarting sandbox, or for an absent container with

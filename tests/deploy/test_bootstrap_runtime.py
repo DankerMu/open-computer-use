@@ -466,6 +466,8 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         for name, value in IMAGES.items():
             self.assertEqual(runtime[name], value, name)
         self.assertEqual(runtime["POSTGRES_IMAGE"], "postgres:17-alpine")
+        self.assertEqual(runtime["CONTAINER_IDLE_TIMEOUT"], "259200")
+        self.assertEqual(runtime["SANDBOX_RETENTION_DAYS"], "30")
 
         self.assert_generated_secrets_hidden(runtime, result)
         self.assertNotIn("MCP_PORT=8081", self.runtime_path().read_text(encoding="utf-8"))
@@ -816,18 +818,25 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         (self.state / "now-epoch").write_text("1800000000", encoding="utf-8")
         env = dict(self.env)
         env["OCU_RELEASE_MANIFEST"] = runtime["OCU_RELEASE_MANIFEST"]
-        result = subprocess.run(
-            ["bash", str(WRITE_VERSION)],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-            timeout=20,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        record = (self.deploy_root / "DEPLOYED_VERSION.md").read_text(encoding="utf-8")
+
+        def write_version():
+            result = subprocess.run(
+                ["bash", str(WRITE_VERSION)],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return (self.deploy_root / "DEPLOYED_VERSION.md").read_text(encoding="utf-8")
+
+        record = write_version()
         self.assertIn("OCU_SANDBOX_NO_AUTOSTART=1", record)
+        self.assertIn("Sandbox idle/maximum continuous runtime: `259200` seconds / `168` hours", record)
+        self.assertIn("removed after `SANDBOX_RETENTION_DAYS=30` days stopped", record)
+        self.assertNotIn("no automatic deletion", record)
         for name in GENERATED_SECRETS:
             self.assertNotIn(runtime[name], record, name)
         self.assertNotIn(PROVIDER_SENTINEL, record)
@@ -846,6 +855,14 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
         self.assertIn(self.webui_sha, record)
         self.assertNotIn(runtime["WEBUI_SECRET_KEY"], record)
         self.assertEqual(stat.S_IMODE((self.deploy_root / "DEPLOYED_VERSION.md").stat().st_mode), 0o644)
+
+        # A runtime.env written before #698 has no key; Compose then passes 30.
+        lines = self.runtime_path().read_text(encoding="utf-8").splitlines()
+        self.runtime_path().write_text(
+            "".join(line + "\n" for line in lines if not line.startswith("SANDBOX_RETENTION_DAYS=")),
+            encoding="utf-8",
+        )
+        self.assertIn("removed after `SANDBOX_RETENTION_DAYS=30` days stopped", write_version())
 
     def test_descriptor_engine_identity_bootstraps_and_records_distinct_configuration(self):
         images_path = self.state / "images.json"
