@@ -887,6 +887,8 @@ async def generate_speech(
     except LifecycleError as stopped:
         return f"Error: {stopped}"
     except Exception as exc:
+        # The audio holds no credential; log the cause so a disk or store fault is visible.
+        print(f"[MCP] generate_speech: storing audio for chat {chat} failed: {type(exc).__name__}: {exc}")
         return f"Error: speech audio was not saved ({type(exc).__name__})"
     note = ""
     try:
