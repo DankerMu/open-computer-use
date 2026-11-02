@@ -532,7 +532,7 @@ def test_delete_of_never_seen_chat_writes_tombstone_that_refuses_first_tool_call
     assert _entries(docker_manager, CHAT_B) == [".deleted", ".lifecycle.lock"]
 
 
-def test_tombstoned_chat_refuses_launch_describe_and_outputs_write(http, world):
+def test_tombstoned_chat_refuses_launch_describe_outputs_write_and_listing(http, world):
     docker_manager, client, _clock, _tmp = world
     _populated_running_chat(docker_manager, client)
     assert http.delete(f"/internal/sandbox/{CHAT}", headers=HEADERS).status_code == 200
@@ -541,8 +541,9 @@ def test_tombstoned_chat_refuses_launch_describe_and_outputs_write(http, world):
     describe = http.get(f"/internal/describe/{CHAT}", headers=HEADERS)
     upload = http.post(
         f"/api/uploads/{CHAT}/note.txt", headers=HEADERS, files={"file": ("note.txt", b"x")})
+    listing = http.get(f"/api/outputs/{CHAT}", headers=HEADERS)
 
-    for response in (launch, describe, upload):
+    for response in (launch, describe, upload, listing):
         assert response.status_code == 410, response.text
         assert response.json()["detail"]["reason"] == CHAT_DELETED
     assert client._created == []
