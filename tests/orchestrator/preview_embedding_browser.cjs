@@ -168,6 +168,8 @@ const files = [
   { file_id: 'table-in-quote', path: 'table-in-quote.md', type: 'markdown', mime: 'text/markdown' },
   { file_id: 'table-cr-lines', path: 'table-cr-lines.md', type: 'markdown', mime: 'text/markdown' },
   { file_id: 'table-ordinary', path: 'table-ordinary.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'quote-deep-table', path: 'quote-deep-table.md', type: 'markdown', mime: 'text/markdown' },
+  { file_id: 'quote-deep-list', path: 'quote-deep-list.md', type: 'markdown', mime: 'text/markdown' },
   { file_id: 'wide-csv', path: 'wide.csv', type: 'spreadsheet', mime: 'text/csv' },
   { file_id: 'wide-tsv', path: 'wide.tsv', type: 'spreadsheet', mime: 'text/tab-separated-values' },
   { file_id: 'wide-body-csv', path: 'wide-body.csv', type: 'spreadsheet', mime: 'text/csv' },
@@ -1412,6 +1414,13 @@ async function main() {
     const ordinaryRow = cell => `| ${Array.from({ length: 12 }, (_, index) => `${cell} ${index}`).join(' | ')} |`;
     bytes['table-ordinary.md'] = Buffer.from(['# Quarterly figures', '', ordinaryRow('Column'),
       `|${'---|'.repeat(12)}`, ...Array.from({ length: 200 }, (_, index) => ordinaryRow(`row ${index}`))].join('\n'));
+    // 17 quote markers is one past the depth limit; the unquoted last line ends every level at once.
+    bytes['quote-deep-table.md'] = Buffer.from(`${paddedTable(10, 100, '> '.repeat(17))}\nAfter the quote`);
+    bytes['quote-deep-list.md'] = Buffer.from([...Array.from({ length: 100 },
+      (_, index) => `${'> - '.repeat(8)}>${'> '.repeat(8)}line ${index}`), 'After the quote'].join('\n'));
+    bytes['quote-at-depth.md'] = Buffer.from(`${'> '.repeat(16)}**At the depth limit**\n\nAfter the quote`);
+    bytes['quote-ordinary.md'] = Buffer.from(['# Review notes', '', '> The outer remark.', '>',
+      '> > The **inner** remark.', '', 'After the quote'].join('\n'));
     bytes['too-large.md'] = Buffer.from('Too large body');
     bytes['unsupported-name.py'] = Buffer.from('Unsupported name body');
     bytes[MARKUP_NAME] = Buffer.from('Markup name body');
@@ -2148,6 +2157,8 @@ async function main() {
       ['table-past-budget', 'table-past-budget.md', 'one line past the cell bound'],
       ['table-in-quote', 'table-in-quote.md', 'a table nested in a blockquote'],
       ['table-cr-lines', 'table-cr-lines.md', 'a table whose lines end in a bare carriage return'],
+      ['quote-deep-table', 'quote-deep-table.md', 'a padded table in quotes nested past the depth limit'],
+      ['quote-deep-list', 'quote-deep-list.md', 'quotes and lists nested past the depth limit, with no table'],
     ]) {
       await fileCase(`Markdown with ${label} reports ready as plain text within the bound`, async () => {
         assert(bytes[file].length < 30000, `${file} no longer tests the bound`);
@@ -2191,6 +2202,39 @@ async function main() {
           };
         });
         assert.deepEqual(shown, { header: columns, cells: columns * rows, notices: 0 });
+        assert.deepEqual(await parserCalls(), { marked: 1, hljs: 0 });
+      });
+    }
+    // Rendered directly in embedded mode: the stub lists at most 100 fixtures on its last page.
+    for (const [file, label, depth, emphasis] of [
+      ['quote-at-depth.md', 'a quote nested exactly at the depth limit', 16, 'At the depth limit'],
+      ['quote-ordinary.md', 'an ordinary two-level quote', 2, 'inner'],
+    ]) {
+      await fileCase(`embedded Markdown with ${label} renders as quotes`, async () => {
+        await remountFiles();
+        await spyOnParsers();
+        const shown = await frame().locator('#app').evaluate(async (root, [path, url]) => {
+          const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+          const host = document.createElement('div');
+          root.appendChild(host);
+          const rendered = await renderPreviewContent(host,
+            { name: path, path, type: 'markdown', url }, [], () => {}, true);
+          const body = host.querySelector('.markdown-body');
+          let depth = 0;
+          for (let node = body.querySelector('strong'); node && node !== body; node = node.parentElement) {
+            if (node.tagName === 'BLOCKQUOTE') depth += 1;
+          }
+          const seen = {
+            rendered,
+            emphasis: body.querySelector('strong')?.textContent,
+            depth,
+            after: body.lastElementChild?.textContent,
+            notices: body.querySelectorAll('.truncation-notice').length,
+          };
+          host.remove();
+          return seen;
+        }, [file, `/ocu/files/${CHAT}/${file}`]);
+        assert.deepEqual(shown, { rendered: true, emphasis, depth, after: 'After the quote', notices: 0 });
         assert.deepEqual(await parserCalls(), { marked: 1, hljs: 0 });
       });
     }

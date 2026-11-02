@@ -380,6 +380,8 @@ const EMBEDDED_CODE_HIGHLIGHT_LIMIT = 20000;
 const EMBEDDED_SPREADSHEET_COLUMN_LIMIT = 200;
 // marked pads a short row to the header, so a two-character row can cost thousands of cells.
 const EMBEDDED_TABLE_CELL_LIMIT = 200000;
+// Each nested quote level makes marked lex the rest of the quote again.
+const EMBEDDED_QUOTE_DEPTH_LIMIT = 16;
 // Laying out one long cell of mixed-direction text stalls that thread as well.
 const EMBEDDED_SPREADSHEET_CELL_LIMIT = 1000;
 // Each kept image is a request from the employee's browser.
@@ -387,9 +389,14 @@ const EMBEDDED_IMAGE_LIMIT = 100;
 
 // Counted before lexing, because marked materialises every padded cell.
 // Lines end as marked ends them: a bare \r is a line break there too.
-function tableCellBound(text) {
+function markdownTooCostly(text) {
   const lines = text.split(/\r\n?|\n/);
-  return lines.length * Math.max(...lines.map(line => line.split('|').length));
+  let columns = 0;
+  for (const line of lines) {
+    if (line.split('>').length - 1 > EMBEDDED_QUOTE_DEPTH_LIMIT) return true;
+    columns = Math.max(columns, line.split('|').length);
+  }
+  return lines.length * columns > EMBEDDED_TABLE_CELL_LIMIT;
 }
 
 function renderMarkdownPlainText(container, text) {
@@ -404,8 +411,7 @@ async function renderMarkdownPreview(container, file, files, onSelectFile, embed
     if (embedded && !resp.ok) throw new Error('Markdown response failed');
     let text = await resp.text();
     if (text.length > 500000) text = text.substring(0, 500000) + '\n\n... (truncated)';
-    if (embedded && (text.length > EMBEDDED_MARKDOWN_PARSE_LIMIT
-      || tableCellBound(text) > EMBEDDED_TABLE_CELL_LIMIT)) {
+    if (embedded && (text.length > EMBEDDED_MARKDOWN_PARSE_LIMIT || markdownTooCostly(text))) {
       renderMarkdownPlainText(container, text);
       return true;
     }

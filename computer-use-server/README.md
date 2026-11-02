@@ -514,7 +514,8 @@ stops at 200,000 characters and the notice then says the view is truncated.
 Markdown whose estimated table size is over 200,000 cells uses the same
 plain-text view and notice, also without being parsed; the estimate comes from
 the text alone, as the columns of the line with the most `|` characters times
-the number of lines. Code and text over 20,000 characters show without
+the number of lines. Markdown with a line of more than 16 `>` characters uses
+the same view. Code and text over 20,000 characters show without
 highlighting or line numbers. A CSV or TSV shows at most 200 columns per row,
 header and body, with a notice when a shown row had more, and at most 1,000
 characters per cell, with no notice. A Markdown fence keeps its language class

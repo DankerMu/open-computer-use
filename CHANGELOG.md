@@ -73,7 +73,8 @@
   archive route. Rendering shares a thread with the parent, so Markdown over
   30,000 characters shows as plain text with a notice and stops at 200,000
   characters, Markdown whose table size, estimated from the text, is over 200,000
-  cells uses the same view, code and text over 20,000 characters show without
+  cells or with a line of more than 16 `>` characters uses the same view, code
+  and text over 20,000 characters show without
   highlighting, a spreadsheet shows at most 200 columns per row with a notice and
   1,000 characters per cell, and a fence whose language highlight.js does not
   recognise is not auto-detected. Entries marked `too_large` or
