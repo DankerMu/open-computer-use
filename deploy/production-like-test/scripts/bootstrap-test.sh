@@ -400,7 +400,7 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' 'CONTAINER_CPU_LIMIT=1.0'
     # An idle chat sandbox stops after 3 days. The retention guard's 168-hour
     # ceiling still caps continuous runtime. A stopped sandbox wakes on the
-    # chat's next message.
+    # chat's next tool call.
     printf '%s\n' 'CONTAINER_IDLE_TIMEOUT=259200'
     printf '%s\n' 'COMMAND_TIMEOUT=120'
     printf '%s\n' 'SUB_AGENT_TIMEOUT=3600'

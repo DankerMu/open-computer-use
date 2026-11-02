@@ -90,7 +90,7 @@ services:
 
   # Stops only sandboxes that have exceeded their maximum continuous runtime.
   # It never removes sandbox containers, chat data, volumes, images, or cache.
-  # A stopped sandbox wakes on the chat's next message.
+  # A stopped sandbox wakes on the chat's next tool call.
   retention-guard:
     build:
       context: ./deploy/production-like-test/retention

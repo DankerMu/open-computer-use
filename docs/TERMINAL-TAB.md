@@ -32,7 +32,7 @@ Browser (xterm.js)  ←WebSocket→  Computer Use Server  ←WebSocket→  Conta
 
 ## Lifecycle
 
-1. AI calls `sub_agent` → sandbox container is created only when neither a container nor valid metadata exists.
+1. AI calls any workspace tool → a sandbox is created on the chat's first call, woken if it is stopped, or recreated from metadata if its container is gone.
 2. Filter injects preview link → Artifacts panel opens.
 3. User sees dashboard with processes and sessions.
 4. Click **"Open terminal"** → ttyd starts, Claude Code launches.

@@ -2,7 +2,7 @@
 # Stop only sandbox containers that exceed the permitted continuous runtime.
 # Deliberately never removes containers, named volumes, chat data, images, or
 # build cache. This guard never restarts a sandbox; a stopped sandbox wakes on
-# the chat's next message.
+# the chat's next tool call.
 
 set -eu
 

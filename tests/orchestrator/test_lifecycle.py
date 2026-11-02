@@ -416,7 +416,7 @@ def test_recreated_sandbox_keeps_the_same_files_mount_set(world, monkeypatch):
     docker_manager, client, _clock, tmp_path = world
     monkeypatch.setattr(docker_manager, "DOCKER_IMAGE", "open-computer-use:test")
     _meta(docker_manager, CHAT, user_email="saved@example", user_name="Saved")
-    assert docker_manager.launch_sandbox(CHAT, credential_source="server") == {"state": "running"}
+    assert docker_manager.launch_sandbox(CHAT) == {"state": "running"}
     created = client._created[0]
     _assert_unified_workspace_mounts(docker_manager, created)
     chat_root = tmp_path / "data" / CHAT
@@ -838,7 +838,7 @@ def test_launch_recreates_absent_container_from_server_fallbacks_only(world, mon
     gitlab_tok = docker_manager.current_gitlab_token.set("request-token-must-not-enter")
     anth_tok = docker_manager.current_anthropic_auth_token.set("request-anthropic-must-not-enter")
     try:
-        body = docker_manager.launch_sandbox(CHAT, credential_source="server")
+        body = docker_manager.launch_sandbox(CHAT)
         assert body == {"state": "running"}
         env = _env_of(client._created[0])
         assert env["ANTHROPIC_AUTH_TOKEN"] == "server-fallback-token"
@@ -1337,8 +1337,8 @@ def test_internal_launch_and_aliases_share_boundary(app_module, monkeypatch, tmp
     _apply_env(monkeypatch, tmp_path)
     seen = []
 
-    def launch(chat_id, credential_source="server"):
-        seen.append((chat_id, credential_source))
+    def launch(chat_id):
+        seen.append(chat_id)
         return {"state": "running"}
 
     monkeypatch.setattr(app_module, "launch_sandbox", launch)
@@ -1353,7 +1353,7 @@ def test_internal_launch_and_aliases_share_boundary(app_module, monkeypatch, tmp
     assert restart.status_code == 200
     assert resurrect.status_code == 200
     assert missing.status_code == 401
-    assert seen == [(CHAT, "server"), (CHAT, "server"), (CHAT, "server")]
+    assert seen == [CHAT, CHAT, CHAT]
 
 def test_restart_alias_launches_compatible_stopped_sandbox(app_module, monkeypatch, tmp_path):
     _apply_env(monkeypatch, tmp_path)
@@ -1432,7 +1432,7 @@ def test_launch_route_never_created_and_failure_statuses(app_module, monkeypatch
     import docker_manager
     from fastapi.testclient import TestClient
 
-    def absent(chat_id, credential_source="server"):
+    def absent(chat_id):
         raise docker_manager.NeverCreated()
 
     monkeypatch.setattr(app_module, "launch_sandbox", absent)
@@ -1442,7 +1442,7 @@ def test_launch_route_never_created_and_failure_statuses(app_module, monkeypatch
     assert response.status_code == 409
     assert response.json()["detail"]["reason"] == NEVER_CREATED
 
-    def failed(chat_id, credential_source="server"):
+    def failed(chat_id):
         raise docker_manager.LaunchFailed(500, "engine refused")
 
     monkeypatch.setattr(app_module, "launch_sandbox", failed)
@@ -2413,7 +2413,7 @@ def test_server_recreate_uses_metadata_skills_and_trusted_token_lookup(world, mo
     monkeypatch.setattr(docker_manager, "_fetch_gitlab_token", fetch)
     docker_manager.current_user_email.set("attacker@example")
     docker_manager.current_gitlab_token.set("poison-request-token")
-    body = docker_manager.launch_sandbox(CHAT, credential_source="server")
+    body = docker_manager.launch_sandbox(CHAT)
     assert body == {"state": "running"}
     assert emails == ["saved@example"]
     env = _env_of(client._created[0])

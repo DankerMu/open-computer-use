@@ -1830,16 +1830,12 @@ def _wait_until_running(container) -> bool:
         time.sleep(min(RESTART_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     return _reload_container(container) == "running"
 
-def launch_sandbox(chat_id: str, credential_source: str = "server") -> dict:
+def launch_sandbox(chat_id: str) -> dict:
     """Observe running, or return an explicit failure without deleting anything."""
     chat_id = canonical_lock_chat_id(chat_id)
-    token = current_credential_source.set(credential_source)
-    try:
-        with _combined_lock(chat_id):
-            _launch_locked(chat_id)
-            return {"state": "running"}
-    finally:
-        current_credential_source.reset(token)
+    with _combined_lock(chat_id):
+        _launch_locked(chat_id)
+        return {"state": "running"}
 
 
 def _note_launched(chat_id: str, container) -> None:
