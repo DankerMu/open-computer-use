@@ -75,8 +75,10 @@ LICENSE_TIERS = (
     "individuals",
     "up to 3 employees",
     "non-profit",
+    "evaluating",
     "Company License",
 )
+SKILL_ROUTE = "/mnt/skills/public/remotion/remotion-best-practices/SKILL.md"
 
 
 def _read(path: Path) -> str:
@@ -120,6 +122,14 @@ def test_template_dependencies_are_exact_pins() -> None:
     assert "devDependencies" not in package
     for name in EXCLUDED_PACKAGES:
         assert name not in package["dependencies"]
+
+
+def test_template_runs_no_install_scripts_but_esbuild() -> None:
+    package = json.loads(_read(TEMPLATE / "package.json"))
+    assert "scripts" not in package
+    packages = json.loads(_read(TEMPLATE / "package-lock.json"))["packages"]
+    scripted = sorted(key for key, entry in packages.items() if entry.get("hasInstallScript"))
+    assert scripted == ["node_modules/esbuild"]
 
 
 def test_template_lockfile_matches_the_pins() -> None:
@@ -205,8 +215,17 @@ def test_source_md_names_origin_and_license() -> None:
         "Remotion License",
         LICENSE_URL,
         "REFERENCE.md",
+        "remotion-markup/remotion-maps/",
     ):
         assert needle in source, needle
+
+
+def test_claude_md_lists_skill_md_as_mit() -> None:
+    rule = next(
+        line for line in _read(ROOT / "CLAUDE.md").splitlines()
+        if "SPDX-License-Identifier: MIT" in line
+    )
+    assert "`skills/public/remotion/SKILL.md`" in rule
 
 
 def test_skill_md_is_ours_and_mit() -> None:
@@ -227,12 +246,10 @@ def test_skill_md_states_the_sandbox_rules() -> None:
         "npm install",
         "remotion add",
         "--license-key",
-        "Studio",
+        "--public-license-key",
+        "Config.setPublicLicenseKey",
+        "Never start Studio.",
         "Google Fonts",
-        "npx --no-install remotion still",
-        "nohup npx --no-install remotion render",
-        "> render.log 2>&1 &",
-        'pgrep -f "[r]emotion render"',
         "COMMAND_TIMEOUT",
         "--concurrency=2",
         "--gl=swangle",
@@ -242,12 +259,56 @@ def test_skill_md_states_the_sandbox_rules() -> None:
         "generate_speech",
         "when available",
         "staticFile(",
-        "remotion-best-practices/SKILL.md",
+        SKILL_ROUTE,
         "these rules win",
+        "default idle stop is about 10 minutes; deployments may set it longer",
     ):
         assert needle in skill, needle
     for name in (*EXPECTED_DEPENDENCIES, *EXCLUDED_PACKAGES):
         assert f"`{name}`" in skill, name
+
+
+def test_skill_md_overrides_vendored_conflicts() -> None:
+    skill = _read(SKILL_DIR / "SKILL.md")
+    for needle in (
+        "--gl=angle",
+        "Config.setChromiumOpenGlRenderer('swangle')",
+        "`cylinder()`",
+        "`sphere()`",
+        "`pageTurn()`",
+        "remotion-docs/REFERENCE.md",
+        "node_modules/<pkg>/dist/*.d.ts",
+        "remotion-captions/transcribe-captions.md",
+        "remotion-markup/voiceover.md",
+        "ElevenLabs",
+    ):
+        assert needle in skill, needle
+
+
+def test_skill_md_check_frames_go_to_project_out() -> None:
+    skill = _read(SKILL_DIR / "SKILL.md")
+    assert (
+        "npx --no-install remotion render src/index.ts Main out/frames --sequence"
+        in skill
+    )
+    assert "--image-format=png" in skill
+    assert "`view` tool" in skill
+
+
+def test_skill_md_background_render_reports_its_exit() -> None:
+    skill = _read(SKILL_DIR / "SKILL.md")
+    for needle in (
+        "rm -f /mnt/user-data/files/<name>.mp4",
+        "setsid nohup bash -c 'npx --no-install remotion render src/index.ts Main",
+        "; echo \"remotion exit $?\"' > render.log 2>&1 < /dev/null &",
+        'sleep 100; tail -n 3 render.log; grep "remotion exit" render.log || echo running',
+        "Do not sleep in the same call that launches the render",
+        "tail -n 50 render.log",
+        "delayRender",
+        "--concurrency=1",
+    ):
+        assert needle in skill, needle
+    assert "pgrep" not in skill
 
 
 # --- notices ----------------------------------------------------------------

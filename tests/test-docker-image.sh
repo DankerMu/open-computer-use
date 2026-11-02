@@ -860,6 +860,32 @@ ln -s /opt/remotion-template/node_modules node_modules
 npx --no-install remotion browser ensure
 npx --no-install remotion still src/index.ts Main /tmp/remotion-smoke.png --frame=30
 [ -s /tmp/remotion-smoke.png ] && echo "still=OK"
+cat > src/Smoke3D.tsx <<TSX
+import {Composition, registerRoot, useVideoConfig} from "remotion";
+import {ThreeCanvas} from "@remotion/three";
+const Scene = () => {
+  const {width, height} = useVideoConfig();
+  return (
+    <ThreeCanvas width={width} height={height}>
+      <ambientLight intensity={0.4} />
+      <directionalLight position={[5, 5, 5]} intensity={1} />
+      <mesh rotation={[0.5, 0.7, 0]}>
+        <boxGeometry args={[2, 2, 2]} />
+        <meshStandardMaterial color="#4a9eff" />
+      </mesh>
+    </ThreeCanvas>
+  );
+};
+registerRoot(() => <Composition id="Smoke3D" component={Scene} durationInFrames={1} fps={30} width={640} height={360} />);
+TSX
+npx --no-install remotion still src/Smoke3D.tsx Smoke3D /tmp/remotion-3d.png --gl=swangle
+python3 - <<PY
+from PIL import Image, ImageStat
+spread = max(ImageStat.Stat(Image.open("/tmp/remotion-3d.png").convert("RGBA")).stddev)
+print("3d-stddev=%.1f" % spread)
+if spread > 10:
+    print("still3d=OK")
+PY
 '); then
     pass "offline Remotion still exits 0"
 else
@@ -868,6 +894,7 @@ fi
 echo "$REMOTION_OUT" | grep -q "owner=OK" && pass "template node_modules owned by root" || fail "template node_modules not owned by root"
 echo "$REMOTION_OUT" | grep -q "readonly=OK" && pass "template node_modules read-only for assistant" || fail "template node_modules writable by assistant"
 echo "$REMOTION_OUT" | grep -q "still=OK" && pass "Remotion still written without network" || fail "Remotion still missing: $REMOTION_OUT"
+echo "$REMOTION_OUT" | grep -q "still3d=OK" && pass "ThreeCanvas still with --gl=swangle is not uniform" || fail "ThreeCanvas still blank or missing: $REMOTION_OUT"
 
 test_browser_cli_config
 test_browser_relay
