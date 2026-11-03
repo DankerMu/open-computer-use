@@ -2097,7 +2097,7 @@ def test_view_of_an_image_keeps_the_data_uri_bare_when_images_sync(monkeypatch, 
 
 # --- Attachment and chat-image sync resolve files by id and check read access ---
 
-SECRET = b"server-side bytes"
+SECRET = b"bytes outside the row"
 
 
 def _sync_from(source, file_id, filename="pic.png"):
@@ -2166,12 +2166,12 @@ def test_the_requesters_own_file_syncs_without_an_access_lookup(monkeypatch, tmp
 
 def test_attachment_sync_reads_only_the_db_path(monkeypatch, tmp_path):
     _image_env(monkeypatch)
-    canary = tmp_path / "server-only.db"
+    canary = tmp_path / "elsewhere.bin"
     canary.write_bytes(SECRET)
     webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment")})
     files = [
         {"id": "F1", "name": "brief.docx", "path": str(canary), "file": {"path": str(canary)}},
-        {"id": "F-unknown", "name": "webui.db", "path": str(canary), "file": {"path": str(canary)}},
+        {"id": "F-unknown", "name": "other.bin", "path": str(canary), "file": {"path": str(canary)}},
     ]
     with _with_guard(monkeypatch, tmp_path) as ocu:
         result = asyncio.run(_invoke_public_tool(
