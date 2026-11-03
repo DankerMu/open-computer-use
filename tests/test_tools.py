@@ -23,6 +23,7 @@ import pytest
 import requests
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ImageContent, TextContent
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
@@ -70,6 +71,7 @@ def test_browser_valve_payload_excludes_internal_token(monkeypatch):
 
 INTERNAL_TOKEN = "test-internal-token"
 MCP_API_KEY = "test-mcp-key"
+VIEW_IMAGE_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAs="
 
 
 async def _collect(events, event):
@@ -310,11 +312,17 @@ class _GuardedOCU:
             self.calls.append(("create_file", path))
             return f"created:{path}"
 
-        @self.mcp.tool()
+        @self.mcp.tool(structured_output=False)
         async def view(
             description: str, path: str, view_range: list | None = None
-        ) -> str:
+        ) -> str | list:
             self.calls.append(("view", path))
+            if path.endswith(".png"):
+                # The shape of the real MCP view for an image (mcp_tools.view, #706).
+                return [
+                    f"Image: {path}",
+                    ImageContent(type="image", data=VIEW_IMAGE_B64, mimeType="image/jpeg"),
+                ]
             return f"viewed:{path}"
 
         @self.mcp.tool()
@@ -1735,6 +1743,333 @@ def test_sub_agent_docstring_says_the_chat_model_is_used_in_gateway_deployments(
     assert "gateway" in doc
     assert "chat's model" in doc
     assert '"sonnet"' in doc and '"opus"' in doc
+
+
+# ============================================================================
+# Workspace images: view returns images, chat-generated images sync (#706, #707)
+# ============================================================================
+
+GEN_SUNSET = "0a1b2c3d-0000-4000-8000-000000000001"
+GEN_LOGO = "0a1b2c3d-0000-4000-8000-000000000002"
+GEN_MISSING = "0a1b2c3d-0000-4000-8000-0000000000ff"
+DOC_BRIEF = "0a1b2c3d-0000-4000-8000-0000000000d0"
+VISION_OFF = {"id": "text-only", "info": {"meta": {"capabilities": {"vision": False}}}}
+VISION_ON = {"id": "seeing", "info": {"meta": {"capabilities": {"vision": True}}}}
+
+
+def _image_ref(file_id):
+    """A message file entry as upstream generate_image records it (tools/builtin.py)."""
+    return {"type": "image", "url": f"/api/v1/files/{file_id}/content"}
+
+
+def _message(timestamp, *files):
+    return {"role": "assistant", "content": "", "timestamp": timestamp, "files": list(files)}
+
+
+def _install_chat_images(monkeypatch, tmp_path, chat_id, messages, files, chat_error=None):
+    """Fake Open WebUI storage + models.chats + models.files for one chat.
+
+    `files` maps a WebUI file id to (filename, bytes); each gets a Storage key.
+    Returns the list of file ids looked up through Files.get_file_by_id.
+    """
+    sources = {}
+    rows = {}
+    for file_id, (filename, content) in files.items():
+        source = tmp_path / f"webui-{file_id}"
+        source.write_bytes(content)
+        sources[f"storage-{file_id}"] = source
+        rows[file_id] = types.SimpleNamespace(
+            id=file_id, filename=filename, path=f"storage-{file_id}"
+        )
+    _install_storage(monkeypatch, sources)
+    lookups = []
+
+    class Chats:
+        @staticmethod
+        async def get_chat_by_id(requested):
+            if chat_error is not None:
+                raise chat_error
+            if requested != chat_id:
+                return None
+            return types.SimpleNamespace(id=chat_id, chat={"history": {"messages": messages}})
+
+    class Files:
+        @staticmethod
+        async def get_file_by_id(file_id):
+            lookups.append(file_id)
+            return rows.get(file_id)
+
+    models = types.ModuleType("open_webui.models")
+    models.__path__ = []
+    chats = types.ModuleType("open_webui.models.chats")
+    chats.Chats = Chats
+    files_module = types.ModuleType("open_webui.models.files")
+    files_module.Files = Files
+    monkeypatch.setitem(sys.modules, "open_webui.models", models)
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats)
+    monkeypatch.setitem(sys.modules, "open_webui.models.files", files_module)
+    return lookups
+
+
+def _guarded_tools(monkeypatch, ocu):
+    tools = _tools_with_token(monkeypatch)
+    tools.valves.ORCHESTRATOR_URL = ocu.url
+    return tools
+
+
+def _image_env(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+
+
+@pytest.mark.parametrize(
+    "metadata_model",
+    (None, {"id": "base-model"}, {"id": "m", "info": {"meta": {}}}, VISION_ON),
+    ids=("no-model", "no-info", "no-capabilities", "vision-true"),
+)
+def test_view_of_an_image_returns_a_data_uri_for_the_model(monkeypatch, tmp_path, metadata_model):
+    _image_env(monkeypatch)
+    metadata = {"chat_id": "chat-view-image"}
+    if metadata_model is not None:
+        metadata["model"] = metadata_model
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        events = []
+        result = asyncio.run(_guarded_tools(monkeypatch, ocu).view(
+            "check frame", "/home/assistant/videos/intro/out/frames/element-045.png",
+            __metadata__=metadata, __event_emitter__=lambda e: _collect(events, e),
+        ))
+
+    # Upstream routes a result starting with data:image/ to the model as input_image
+    # only when the whole string is the data URI (middleware.py 1124-1129).
+    assert result == f"data:image/jpeg;base64,{VIEW_IMAGE_B64}"
+    assert ocu.calls == [("view", "/home/assistant/videos/intro/out/frames/element-045.png")]
+    assert _status_events(events)[-1]["data"]["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ("/a/f.png", "/a/f.jpg", "/a/f.jpeg", "/a/f.gif", "/a/f.webp", "/a/F.PNG"),
+)
+def test_view_of_an_image_by_a_non_vision_model_errors_before_any_call(monkeypatch, path):
+    calls, events = [], []
+
+    def blocked(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise OSError("network must not run")
+
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setattr(requests, "get", blocked)
+    monkeypatch.setattr(requests, "post", blocked)
+    monkeypatch.setattr(computer_use_tools.urllib.request.OpenerDirector, "open", blocked)
+    monkeypatch.setattr(computer_use_tools._MCPClient, "call_tool", blocked)
+    result = asyncio.run(computer_use_tools.Tools().view(
+        "look", path,
+        __metadata__={"chat_id": "chat-text-only", "model": VISION_OFF},
+        __files__=[_attachment("F1", "brief.docx", "attachment-source")],
+        __event_emitter__=lambda e: _collect(events, e),
+    ))
+
+    assert result.startswith("Error: this model cannot view images")
+    assert calls == []
+    assert _status_events(events)[-1]["data"]["status"] == "error"
+    assert _workspace_hints(events) == []
+
+
+def test_vision_guard_reads_the_chat_model_not_the_injected_task_model(monkeypatch):
+    """Open WebUI offers the task model as __model__ (middleware.py:2916-2925); the image
+    goes to the chat model in __metadata__["model"] (main.py:1261)."""
+    sent = _capture_call_headers(monkeypatch)
+    tools = _tools_with_token(monkeypatch)
+
+    def view_with(chat_model, task_model):
+        offered = {
+            "__metadata__": {"chat_id": "chat-models", "model": chat_model},
+            "__model__": task_model,
+        }
+        accepted = inspect.signature(tools.view).parameters
+        injected = {name: value for name, value in offered.items() if name in accepted}
+        return asyncio.run(tools.view("look", "/a/frame.png", **injected))
+
+    refused = view_with(VISION_OFF, VISION_ON)
+    assert refused.startswith("Error: this model cannot view images")
+    assert sent == []
+    assert view_with(VISION_ON, VISION_OFF) == "sandbox output"
+    assert [call["tool"] for call in sent] == ["view"]
+
+
+@pytest.mark.parametrize("path", ("/home/assistant/notes.txt", "/home/assistant"))
+@pytest.mark.parametrize("model", (VISION_OFF, VISION_ON), ids=("vision-off", "vision-on"))
+def test_view_of_text_and_directories_is_unchanged(monkeypatch, tmp_path, path, model):
+    _image_env(monkeypatch)
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_guarded_tools(monkeypatch, ocu).view(
+            "read", path, __metadata__={"chat_id": "chat-view-text", "model": model},
+        ))
+
+    assert result == f"viewed:{path}"
+    assert ocu.calls == [("view", path)]
+
+
+def test_text_extraction_for_other_tools_ignores_image_blocks():
+    result = types.SimpleNamespace(isError=False, content=[
+        TextContent(type="text", text="Image: /a/f.png"),
+        ImageContent(type="image", data=VIEW_IMAGE_B64, mimeType="image/jpeg"),
+    ])
+    assert computer_use_tools._MCPClient._extract_text(result) == "Image: /a/f.png"
+
+
+@pytest.mark.parametrize("method", PUBLIC_TOOLS)
+def test_chat_generated_images_sync_once_and_are_listed(monkeypatch, tmp_path, method):
+    _image_env(monkeypatch)
+    chat_id = f"gen-{method.replace('_', '-')}"
+    messages = {
+        "m1": _message(100, _image_ref(GEN_SUNSET)),
+        "m2": _message(
+            200,
+            _image_ref(GEN_LOGO),
+            {"type": "file", "id": DOC_BRIEF, "url": f"/api/v1/files/{DOC_BRIEF}/content"},
+        ),
+        "m3": _message(300),
+    }
+    lookups = _install_chat_images(monkeypatch, tmp_path, chat_id, messages, {
+        GEN_SUNSET: ("sunset.png", b"sunset bytes"),
+        GEN_LOGO: ("logo.png", b"logo bytes"),
+        DOC_BRIEF: ("brief.pdf", b"document bytes"),
+    })
+
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        root = ocu.chat_uploads(chat_id)
+        root.mkdir(parents=True)
+        (root / "sunset.png").write_bytes(b"the user's own sunset")
+        tools = _guarded_tools(monkeypatch, ocu)
+        first = asyncio.run(_invoke_public_tool(tools, method, chat_id, []))
+
+        fetches = []
+        monkeypatch.setattr(
+            sys.modules["open_webui.storage.provider"].Storage,
+            "get_file",
+            staticmethod(lambda key: fetches.append(key) or str(tmp_path / "unused")),
+        )
+        second = asyncio.run(_invoke_public_tool(tools, "bash_tool", chat_id, [], "echo second"))
+
+        assert ocu.uploads == [
+            {"filename": "logo.png", "attachment_id": GEN_LOGO},
+            {"filename": "sunset.png", "attachment_id": GEN_SUNSET},
+        ]
+        assert ocu.stored_files(chat_id) == {
+            "sunset.png": b"the user's own sunset",
+            "logo.png": b"logo bytes",
+            "sunset (2).png": b"sunset bytes",
+        }
+        assert "Synced generated image: /mnt/user-data/files/logo.png" in first
+        assert "Synced generated image: /mnt/user-data/files/sunset (2).png" in first
+        assert first.count("Synced generated image:") == 2
+        assert DOC_BRIEF not in lookups
+        # The second call skips both receipted ids before any Storage fetch or upload.
+        assert second == "ran:echo second"
+        assert fetches == []
+        assert len(_records(ocu, f"/api/uploads/{chat_id}/logo.png")) == 1
+        assert len(_records(ocu, f"/api/uploads/{chat_id}/sunset.png")) == 1
+        assert ocu.calls[-1] == ("bash_tool", "echo second")
+
+
+def test_generated_images_merge_with_attachments_and_only_images_are_listed(
+    monkeypatch, tmp_path
+):
+    _image_env(monkeypatch)
+    chat_id = "gen-merge"
+    _install_chat_images(
+        monkeypatch, tmp_path, chat_id,
+        {"m1": _message(1, _image_ref(GEN_LOGO))},
+        {GEN_LOGO: ("logo.png", b"logo bytes"), "F1": ("brief.docx", b"attachment")},
+    )
+    attachment = _attachment("F1", "brief.docx", "storage-F1")
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, [attachment]
+        ))
+
+    assert ocu.stored_files(chat_id) == {"brief.docx": b"attachment", "logo.png": b"logo bytes"}
+    assert result == "ran:echo ready\n\nSynced generated image: /mnt/user-data/files/logo.png"
+
+
+def test_missing_generated_file_is_skipped(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "gen-missing"
+    lookups = _install_chat_images(
+        monkeypatch, tmp_path, chat_id,
+        {"m1": _message(1, _image_ref(GEN_LOGO)), "m2": _message(2, _image_ref(GEN_MISSING))},
+        {GEN_LOGO: ("logo.png", b"logo bytes")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
+        ))
+
+    assert GEN_MISSING in lookups
+    assert ocu.uploads == [{"filename": "logo.png", "attachment_id": GEN_LOGO}]
+    assert result == "ran:echo ready\n\nSynced generated image: /mnt/user-data/files/logo.png"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (RuntimeError("database unavailable"), None),
+    ids=("chat-read-raises", "open-webui-not-importable"),
+)
+def test_chat_read_failure_does_not_fail_the_call(monkeypatch, tmp_path, fault):
+    _image_env(monkeypatch)
+    chat_id = "gen-broken"
+    _install_chat_images(
+        monkeypatch, tmp_path, chat_id, {"m1": _message(1, _image_ref(GEN_LOGO))},
+        {GEN_LOGO: ("logo.png", b"logo bytes")}, chat_error=fault,
+    )
+    if fault is None:
+        monkeypatch.setitem(sys.modules, "open_webui.models.chats", None)
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
+        ))
+
+    assert result == "ran:echo ready"
+    assert ocu.uploads == []
+    assert not _records(ocu, f"/api/uploads/{chat_id}/imports")
+
+
+def test_generated_image_sync_takes_the_20_newest(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "gen-cap"
+    ids = [f"0a1b2c3d-0000-4000-8000-{n:012x}" for n in range(1, 26)]
+    messages = {f"m{n}": _message(n, _image_ref(ids[n - 1])) for n in range(1, 26)}
+    # The newest image also appears in an older message; it still counts once.
+    messages["m0"] = _message(0, _image_ref(ids[-1]))
+    lookups = _install_chat_images(
+        monkeypatch, tmp_path, chat_id, messages,
+        {file_id: (f"img{n}.png", b"x%d" % n) for n, file_id in enumerate(ids, 1)},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
+        ))
+
+    assert lookups == list(reversed(ids[5:]))
+    assert sorted(ocu.stored_files(chat_id)) == sorted(f"img{n}.png" for n in range(6, 26))
+    assert result.count("Synced generated image:") == 20
+
+
+def test_view_of_an_image_keeps_the_data_uri_bare_when_images_sync(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "gen-view"
+    _install_chat_images(
+        monkeypatch, tmp_path, chat_id, {"m1": _message(1, _image_ref(GEN_LOGO))},
+        {GEN_LOGO: ("logo.png", b"logo bytes")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_guarded_tools(monkeypatch, ocu).view(
+            "check", "/home/assistant/out/frame.png", __metadata__={"chat_id": chat_id},
+        ))
+
+    assert result == f"data:image/jpeg;base64,{VIEW_IMAGE_B64}"
+    assert ocu.stored_files(chat_id) == {"logo.png": b"logo bytes"}
 
 
 if __name__ == "__main__":

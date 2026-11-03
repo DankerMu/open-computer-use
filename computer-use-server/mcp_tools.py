@@ -82,11 +82,14 @@ import json
 import shlex
 import time
 import asyncio
+import base64
+import binascii
 import urllib.parse
 from typing import Optional, List, Annotated
 
 from fastapi import HTTPException
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.types import ImageContent
 from pydantic import Field
 import skill_manager
 import speech
@@ -694,15 +697,17 @@ except Exception as e:
         return f"Error: {str(e)}"
 
 
-@mcp.tool()
+# structured_output=False: an image result is a text block plus an MCP image block,
+# which a `-> str` output schema rejects ("validation error for viewOutput", #706).
+@mcp.tool(structured_output=False)
 async def view(
     description: str,
     path: str,
     view_range: Optional[List[int]] = None,
     ctx: Context = None,
-) -> str:
+) -> str | list[str | ImageContent]:
     """
-    View text files or directory listings.
+    View text files, directory listings, or images.
     Binary files are detected and rejected with instructions to read SKILL documentation.
 
     If you've lost track of your environment (chat_id, file URLs, available
@@ -711,6 +716,7 @@ async def view(
     Supported path types:
     - Directories: Lists files and directories with details
     - Text files: Displays numbered lines. You can optionally specify a view_range.
+    - Images (.png, .jpg, .jpeg, .gif, .webp): Returned as an image you can see (JPEG, longest side at most 1280 px)
     - Binary files (.xlsx, .docx, .pptx, .pdf, etc.): Returns error with SKILL.md instructions
 
     Args:
@@ -719,7 +725,7 @@ async def view(
         view_range: Optional line range [start_line, end_line]. Use [start, -1] to view from start to end.
 
     Returns:
-        File contents, directory listing, or error message
+        File contents, directory listing, the image, or error message
     """
     chat_id, error = _validate_chat_id()
     if error:
@@ -776,9 +782,13 @@ async def view(
                 if b64_result["exit_code"] != 0:
                     return f"Error viewing image {path}: {b64_result['output']}"
                 image_b64 = b64_result["output"].strip()
+                try:
+                    base64.b64decode(image_b64, validate=True)
+                except binascii.Error:
+                    return f"Error viewing image {path}: the resize step returned no valid image data"
                 return [
-                    {"type": "text", "text": f"Image: {path}"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+                    f"Image: {path}",
+                    ImageContent(type="image", data=image_b64, mimeType="image/jpeg"),
                 ]
             except Exception as e:
                 return f"Error processing image {path}: {e}"
