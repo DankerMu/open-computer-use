@@ -87,8 +87,8 @@
   resolves the host's IANA zone name on every run, from the `/etc/localtime`
   link into `/usr/share/zoneinfo/` or else the first line of `/etc/timezone`
   (`settings.host_time_zone`), and exports it as `OCU_HOST_TZ`; it refuses to
-  start, before any Compose command, when the name is invalid or has no zone
-  file. An inherited `OCU_HOST_TZ` is replaced, and `runtime.env` has no zone
+  start, before any Compose command, when the name is invalid, is a `right/`
+  leap-second zone, or has no zone file; a `posix/` prefix is dropped. An inherited `OCU_HOST_TZ` is replaced, and `runtime.env` has no zone
   setting. Every service in the production-like overlay gets
   `TZ: ${OCU_HOST_TZ:?…}`, postgres also starts with `-c timezone` and
   `-c log_timezone`, and the retention-guard image installs `tzdata`.

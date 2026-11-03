@@ -73,6 +73,11 @@ def host_time_zone(root=None) -> str:
         name = lines[0].strip() if lines else ""
     if not ZONE_NAME.fullmatch(name):
         raise ValueError(f"{source} gives {name!r}, which is not a zone name")
+    # Container images ship only the plain names: posix/ holds the same data,
+    # right/ (leap seconds) has no counterpart there and postgres refuses it.
+    if name.startswith("right/"):
+        raise ValueError(f"{source} gives {name}, a leap-second zone the containers do not have")
+    name = name.removeprefix("posix/")
     if not os.path.isfile(os.path.join(zoneinfo, name)):
         raise ValueError(f"{source} gives {name}, which has no zone file in /usr/share/zoneinfo")
     return name

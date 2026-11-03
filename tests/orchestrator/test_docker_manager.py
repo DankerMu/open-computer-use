@@ -305,7 +305,8 @@ class TestDockerManagerEnvInjection(_RuntimeEnvironmentCase):
                 client = _build_mock_docker_client()
                 with patch("docker_manager.get_docker_client", return_value=client):
                     docker_manager._create_container("test-chat", "owui-chat-test")
-                return client.containers.create.call_args.kwargs["environment"]
+                self._last_create = client.containers.create.call_args.kwargs
+                return self._last_create["environment"]
         return self._run_isolated(body)
 
     def test_server_time_zone_reaches_every_new_sandbox(self):
@@ -313,6 +314,16 @@ class TestDockerManagerEnvInjection(_RuntimeEnvironmentCase):
         for zone in ("Asia/Shanghai", "Etc/UTC"):
             with self.subTest(zone=zone):
                 self.assertEqual(self._sandbox_environment(zone)["TZ"], zone)
+
+    def test_sandbox_never_binds_a_localtime_file(self):
+        """#708: a bound /etc/localtime makes TZ=UTC in the sandbox return local time."""
+        self._sandbox_environment("Asia/Shanghai")
+        create = self._last_create
+        binds = [spec.get("bind") for spec in (create.get("volumes") or {}).values()]
+        # docker.types.Mount is a dict keyed by "Target".
+        binds += [mount["Target"] for mount in create.get("mounts") or []]
+        self.assertFalse([target for target in binds
+                          if target and str(target).startswith("/etc/localtime")])
 
     def test_unset_or_empty_server_time_zone_adds_nothing(self):
         """Development compose sets no TZ; sandboxes are created as before."""

@@ -549,6 +549,10 @@ class OverlayStructureTests(unittest.TestCase):
                     })
                     for label, body in started.items():
                         self.assertEqual(body["environment"].get("TZ"), zone, label)
+                        # A bound /etc/localtime makes TZ=UTC return local time (#708 design).
+                        targets = [mount.get("target") for mount in body.get("volumes") or []]
+                        self.assertFalse([target for target in targets
+                                          if target and target.startswith("/etc/localtime")], label)
                     # An initialized cluster keeps the zone initdb wrote; the command overrides it.
                     self.assertEqual(stacks["webui.json"]["services"]["postgres"]["command"], [
                         "postgres", "-c", f"timezone={zone}", "-c", f"log_timezone={zone}",

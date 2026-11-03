@@ -474,7 +474,12 @@ raise SystemExit(smoke_deployment.main(['smoke']))
     def test_inventory_resolves_the_host_zone_like_up(self):
         # The overlay requires OCU_HOST_TZ, so Compose refuses inventory queries without it.
         self.seed_inventory()
-        self.run_smoke_on_host(FIXTURE_HOST_ROOT, {"OCU_HOST_TZ": "America/Los_Angeles"})
+        result = self.run_smoke_on_host(FIXTURE_HOST_ROOT, {"OCU_HOST_TZ": "America/Los_Angeles"})
+        # Without the control listeners the run stops at the first later probe,
+        # after inventory, publication, sandbox and endpoint checks succeeded.
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("former OCU publication timed out rather than refusing", result.stderr)
+        self.assertNotIn("time zone", result.stderr)
         rows = [json.loads(line) for line in
                 (self.state / "ps-environment.jsonl").read_text().splitlines()]
         self.assertEqual([row["stack"] for row in rows], ["core", "webui", "proxy"])

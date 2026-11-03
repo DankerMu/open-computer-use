@@ -64,6 +64,13 @@ class HostTimeZoneTests(unittest.TestCase):
         write_host_root(self.root, localtime="Asia/Shanghai", zones=("Asia/Shanghai",))
         self.assertEqual(host_time_zone(self.root), "Asia/Shanghai")
         self.assertEqual(host_time_zone(FIXTURE_HOST_ROOT), FIXTURE_HOST_ZONE)
+        # posix/ holds the same data as the plain name; container images ship only the plain one.
+        write_host_root(self.root, localtime="posix/Asia/Shanghai",
+                        zones=("Asia/Shanghai", "posix/Asia/Shanghai"))
+        self.assertEqual(host_time_zone(self.root), "Asia/Shanghai")
+        write_host_root(self.root, localtime=b"TZif-copy", timezone="posix/Europe/Berlin\n",
+                        zones=("Europe/Berlin", "posix/Europe/Berlin"))
+        self.assertEqual(host_time_zone(self.root), "Europe/Berlin")
 
     def test_relative_and_chained_links_resolve_to_the_final_zone(self):
         write_host_root(self.root, zones=("Asia/Shanghai",))
@@ -110,13 +117,22 @@ class HostTimeZoneTests(unittest.TestCase):
             "link to a zone directory": dict(localtime="Asia", timezone=None),
             "stored name of a zone directory": dict(localtime=None, timezone="Asia\n"),
             "dangling link, unusable fallback": dict(localtime="Mars/Olympus", timezone="Mars/Olympus\n"),
+            "posix/ link without the plain zone": dict(localtime="posix/Europe/Paris", timezone=None),
         }
-        for label, layout in cases.items():
+        right = {
+            "right/ link": dict(localtime="right/Asia/Shanghai", timezone=None),
+            "right/ stored name": dict(localtime=None, timezone="right/Asia/Shanghai\n"),
+        }
+        zones = ("Asia/Shanghai", "Europe/Berlin", "posix/Europe/Paris", "right/Asia/Shanghai")
+        for label, layout in {**cases, **right}.items():
             with self.subTest(case=label):
-                write_host_root(self.root, zones=("Asia/Shanghai", "Europe/Berlin"), **layout)
+                write_host_root(self.root, zones=zones, **layout)
                 with self.assertRaises(ValueError) as raised:
                     host_time_zone(self.root)
                 self.assertTrue(str(raised.exception))
+                if label in right:
+                    # Leap-second zones are absent from container images (#708).
+                    self.assertIn("right/", str(raised.exception))
 
     def test_link_into_zoneinfo_is_not_overridden_by_etc_timezone(self):
         write_host_root(self.root, localtime="Asia/Shanghai", timezone="Europe/Berlin\n",
