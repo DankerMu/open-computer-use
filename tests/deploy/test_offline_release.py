@@ -210,6 +210,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/init.sh",
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
+            "openwebui/functions/video_production_filter.py",
             "deploy/release.py",
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
@@ -378,6 +379,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/init.sh",
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
+            "openwebui/functions/video_production_filter.py",
             "deploy/release.py",
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
@@ -442,6 +444,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/init.sh",
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
+            "openwebui/functions/video_production_filter.py",
             "deploy/up.sh",
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
@@ -550,6 +553,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/init.sh",
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
+            "openwebui/functions/video_production_filter.py",
             "deploy/release.py",
             "deploy/up.sh",
             "deploy/settings.py",
@@ -3790,3 +3794,16 @@ class OfflineReleaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BindPathCoverageTests(unittest.TestCase):
+    def test_every_shipped_open_webui_function_and_tool_is_a_verified_bind_file(self):
+        # Init installs every function and tool file from the bind-mounted openwebui/;
+        # a file left out of SOURCE_BIND_PATHS would reach the database unverified.
+        shipped = {
+            path.relative_to(ROOT).as_posix()
+            for folder in ("openwebui/functions", "openwebui/tools")
+            for path in (ROOT / folder).glob("*.py")
+        }
+        self.assertTrue(shipped)
+        self.assertLessEqual(shipped, set(release.SOURCE_BIND_PATHS))
