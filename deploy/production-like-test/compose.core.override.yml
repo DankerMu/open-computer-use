@@ -3,12 +3,15 @@
 # project name as the WebUI stack: docker compose -p ocu-test -f
 # docker-compose.yml -f deploy/production-like-test/compose.core.override.yml …
 # Manual Compose calls also need OCU_RELEASE_FONTS_DIR derived from the selected
-# inventory; up.sh and smoke.sh supply it (see NETWORK-HARDENING.md).
+# inventory and OCU_HOST_TZ derived from the host; up.sh and smoke.sh supply
+# both (see NETWORK-HARDENING.md).
 # Host publications are removed; the proxy stack is the only publisher.
 
 services:
   workspace:
     image: ${DOCKER_IMAGE}
+    environment:
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
 
   computer-use-server:
     image: ${COMPUTER_USE_SERVER_IMAGE}
@@ -22,6 +25,8 @@ services:
       - ${OCU_CHAT_DATA_DIR}:${OCU_CHAT_DATA_DIR}:rw
       - ${OCU_SKILLS_CACHE_DIR}:${OCU_SKILLS_CACHE_DIR}:rw
     environment: !override
+      # The host's zone, derived by up.sh on every run (#708). Sandboxes inherit it.
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
       MCP_API_KEY: ${MCP_API_KEY}
       OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
       OCU_WEBUI_ORIGIN: ${OCU_WEBUI_ORIGIN:?OCU_WEBUI_ORIGIN is required}
@@ -73,6 +78,7 @@ services:
   documentserver:
     image: ${DOCUMENTSERVER_IMAGE:?DOCUMENTSERVER_IMAGE is required}
     environment:
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
       JWT_ENABLED: "true"
       JWT_SECRET: ${OCU_OFFICE_JWT_SECRET:?OCU_OFFICE_JWT_SECRET is required}
     ports: []
@@ -101,6 +107,8 @@ services:
   cleanup:
     profiles: ["manual-maintenance"]
     restart: "no"
+    environment:
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
 
   # Stops only sandboxes that have exceeded their maximum continuous runtime.
   # It never removes sandbox containers, chat data, volumes, images, or cache.
@@ -114,6 +122,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
       CONTAINER_MAX_AGE_HOURS: ${CONTAINER_MAX_AGE_HOURS-168}
       RETENTION_CHECK_INTERVAL_SECONDS: ${RETENTION_CHECK_INTERVAL_SECONDS}
     security_opt:

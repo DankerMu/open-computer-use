@@ -136,6 +136,21 @@ if [[ ! -d "$OCU_OFFICE_FONTS_DIR" ]]; then
 fi
 CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ocu-deploy-config.XXXXXX")"
 : >"$CONFIG_DIR/empty.env"
+# Every service and sandbox follows the host's zone (#708). It is derived on
+# each run and replaces any inherited OCU_HOST_TZ.
+if ! run_owned python3 - >"$CONFIG_DIR/host-time-zone" <<'PY'
+from settings import host_time_zone
+
+try:
+    print(host_time_zone(), end="")
+except ValueError as exc:
+    raise SystemExit(f"deploy: cannot resolve the host time zone: {exc}")
+PY
+then
+    exit 1
+fi
+OCU_HOST_TZ="$(<"$CONFIG_DIR/host-time-zone")"
+export OCU_HOST_TZ
 if ! run_owned python3 - "$ROOT" "$OCU_RELEASE_MANIFEST" >"$CONFIG_DIR/release-fonts" <<'PY'
 from __future__ import annotations
 

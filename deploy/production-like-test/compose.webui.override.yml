@@ -6,6 +6,8 @@ services:
     image: ${OPENWEBUI_IMAGE}
     ports: !override []
     environment: !override
+      # The host's zone, derived by up.sh on every run (#708).
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
       DATABASE_URL: postgresql://openwebui:${POSTGRES_PASSWORD}@postgres:5432/openwebui
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
       WEBUI_AUTH: "true"
@@ -69,7 +71,11 @@ services:
 
   postgres:
     image: ${POSTGRES_IMAGE}
+    # An initialized cluster keeps the zone initdb wrote into postgresql.conf;
+    # these flags override it. Stored timestamptz values are UTC instants.
+    command: ["postgres", "-c", "timezone=${OCU_HOST_TZ}", "-c", "log_timezone=${OCU_HOST_TZ}"]
     environment: !override
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
       POSTGRES_USER: openwebui
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: openwebui
@@ -89,6 +95,7 @@ services:
       open-webui:
         condition: service_started
     environment:
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
       WEBUI_URL: http://open-webui:8080
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}

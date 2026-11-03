@@ -1,6 +1,6 @@
 FROM docker:27-cli
 
-RUN apk add --no-cache coreutils
+RUN apk add --no-cache coreutils tzdata
 
 COPY stop-overage.sh /usr/local/bin/stop-overage.sh
 RUN chmod 0555 /usr/local/bin/stop-overage.sh

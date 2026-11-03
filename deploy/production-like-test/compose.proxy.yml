@@ -17,6 +17,7 @@ services:
       - "${OCU_PROXY_PORT:?OCU_PROXY_PORT is required}:8082"
       - "${OCU_OFFICE_PROXY_PORT:?OCU_OFFICE_PROXY_PORT is required}:8083"
     environment:
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
       OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
       OCU_WEBUI_ORIGIN: ${OCU_WEBUI_ORIGIN:?OCU_WEBUI_ORIGIN is required}
       OCU_WEBUI_UPSTREAM: http://open-webui:8080
@@ -34,6 +35,8 @@ services:
     entrypoint: ["nginx", "-e", "stderr", "-p", "/var/lib/nginx/", "-c", "/opt/ocu-proxy/messages-ingress.conf"]
     labels:
       ocu.role: messages-ingress
+    environment:
+      TZ: ${OCU_HOST_TZ:?OCU_HOST_TZ is required}
     networks:
       default: {}
       sandbox:
