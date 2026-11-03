@@ -138,6 +138,7 @@ UP_FIXTURE_PATHS = (
     "openwebui/init.sh",
     "openwebui/tools/computer_use_tools.py",
     "openwebui/functions/computer_link_filter.py",
+    "openwebui/functions/video_production_filter.py",
     "computer-use-server/sandbox_dns.py",
     "docker-compose.yml",
     "docker-compose.webui.yml",
