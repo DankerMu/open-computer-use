@@ -330,17 +330,9 @@ This release wakes stopped sandboxes on use, removes sandboxes stopped for `SAND
    - `CONTAINER_MEM_LIMIT=4g` and `CONTAINER_CPU_LIMIT=2.0`.
    - `CONTAINER_IDLE_TIMEOUT=259200` (3 days), unless the site chose another value.
    - Optional: `SANDBOX_RETENTION_DAYS=<positive integer>`. Absent means 30.
-   - Optional, to enable speech: `TTS_BASE_URL` and `TTS_MODEL`, plus `TTS_VOICE` and `TTS_TIMEOUT_SECONDS` if needed. Absent or empty `TTS_BASE_URL` leaves speech unconfigured. `computer-use-server` refuses to start, so `up.sh` fails, when `TTS_BASE_URL` is set without `TTS_MODEL`, is not an `http(s)://` URL with a host, or when `TTS_TIMEOUT_SECONDS` is set but empty or not a positive integer. The service must expose an OpenAI-compatible `POST {TTS_BASE_URL}/audio/speech` returning `audio/mpeg` or `audio/wav`. Keep `TTS_TIMEOUT_SECONDS` below 660, the tool wrapper's client timeout. Put `TTS_API_KEY`, if the service needs one, in the provider env file next to `DMXAPI_API_KEY`, never in `runtime.env`; the deploy shell must source that file before `up.sh`, as in the #590 preamble.
+   - Optional, to enable speech: `TTS_BASE_URL` and `TTS_MODEL`, plus `TTS_VOICE` and `TTS_TIMEOUT_SECONDS` if needed. Absent or empty `TTS_BASE_URL` leaves speech unconfigured. `computer-use-server` refuses to start when `TTS_BASE_URL` is set without `TTS_MODEL`, is not an `http(s)://` URL with a host, or contains whitespace, or when `TTS_TIMEOUT_SECONDS` is set but empty or not a positive integer. `up.sh` does not wait for the server, so it still exits 0; step 7's `docker ps` then shows `ocu-test-computer-use-server` restarting. The service must expose an OpenAI-compatible `POST {TTS_BASE_URL}/audio/speech` returning `audio/mpeg` or `audio/wav`. Keep `TTS_TIMEOUT_SECONDS` below 660, the tool wrapper's client timeout. Put `TTS_API_KEY`, if the service needs one, in the provider env file next to `DMXAPI_API_KEY`, never in `runtime.env`; the deploy shell must source that file before `up.sh`, as in the #590 preamble. The `TTS_*` values are read at every server start, so they can be changed later the same way, followed by `up.sh`.
 2. **After step 7**, re-run the initializer as in [step 2 of the #590 section](#re-running-the-initializer-and-removing-the-wrapper-model-590). It installs `video_production_filter` as 视频制作, active and global, and replaces the Computer Use filter and the tool with this release's sources, which add the feature header and `generate_speech`. Then run step 3's removal script once as a check: it exits 0 only when both filters and the tool equal the shipped files byte for byte. Re-running init reactivates the 视频制作 switch if an admin had turned it off.
-3. **Existing sandboxes** keep the previous workspace image, without `/opt/remotion-template` and the `remotion` skill, and keep 1 CPU / 2 GB. OCU never recreates a container whose image changed, and with wake on use a chat in regular use never reaches retention, so these sandboxes stay old until removed. After step 7, remove them without `-v`; this interrupts any task still running in them, so do it in the maintenance window:
-
-   ```bash
-   docker ps -aq --filter label=managed-by=mcp-computer-use-orchestrator | xargs -r docker rm -f
-   ```
-
-   The `chat-<id>-workspace` volumes and `/data/<chat_id>` stay. The chat's next tool call recreates its sandbox from this release's image and limits and remounts the same home volume. This also clears paused containers left from before #697, which would otherwise fail with a migration error and which retention never removes. `docker update --cpus 2 --memory 4g --memory-swap 8g` would change only the limits, not the image.
-4. **Chat deletion** cleans up only when both WebUI and OCU run this release. WebUI calls OCU's internal `DELETE /internal/sandbox/{chat_id}` for each chat that was actually deleted; a failure is logged in `open-webui` and the chat is still deleted.
-5. **Orphan workspace volumes.** Volumes left by earlier rebuilds have no container and no retention record, so retention never removes them. List them, then delete only volumes whose chat no longer exists in WebUI:
+3. **Orphan workspace volumes.** List them before step 4, while every existing sandbox still has its container. Volumes left by earlier rebuilds have no container and no retention record, so retention never removes them. Delete only volumes whose chat no longer exists in WebUI:
 
    ```bash
    comm -23 \
@@ -348,6 +340,18 @@ This release wakes stopped sandboxes on use, removes sandboxes stopped for `SAND
        <(docker ps -a --no-trunc --filter label=managed-by=mcp-computer-use-orchestrator \
              --format '{{.Mounts}}' | tr ',' '\n' | grep -o 'chat-[^ ]*-workspace' | sort -u)
    ```
+
+4. **Existing sandboxes** keep the previous workspace image, without `/opt/remotion-template` and the `remotion` skill, and keep 1 CPU / 2 GB. OCU never recreates a container whose image changed, and with wake on use a chat in regular use never reaches retention, so these sandboxes stay old until removed. After step 7, remove them without `-v`; this interrupts any task still running in them, so do it in the maintenance window:
+
+   ```bash
+   docker ps -aq --filter label=managed-by=mcp-computer-use-orchestrator | xargs -r docker rm -f
+   ```
+
+   - The `chat-<id>-workspace` volumes and `${OCU_CHAT_DATA_DIR}/<chat_id>` stay. The chat's next tool call recreates its sandbox from this release's image and limits and remounts the same home volume. From then on, retention manages it again.
+   - A chat that is never used again keeps its volume outside retention, because retention removes a volume only together with a container it retained. Deleting the chat in WebUI still removes the volume and files. After this step, step 3's listing no longer separates orphans from these chats.
+   - This also clears legacy paused containers without migration evidence, which would otherwise fail with a migration error and which retention never removes.
+   - `docker update --cpus 2 --memory 4g --memory-swap 8g` would change only the limits, not the image.
+5. **Chat deletion** cleans up only when both WebUI and OCU run this release. WebUI calls OCU's internal `DELETE /internal/sandbox/{chat_id}` for each chat that was actually deleted; a failure is logged in `open-webui` and the chat is still deleted.
 
 ## Re-running the initializer and removing the wrapper model (#590)
 
