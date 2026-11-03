@@ -353,6 +353,34 @@ This release wakes stopped sandboxes on use, removes sandboxes stopped for `SAND
    - `docker update --cpus 2 --memory 4g --memory-swap 8g` would change only the limits, not the image.
 5. **Chat deletion** cleans up only when both WebUI and OCU run this release. WebUI calls OCU's internal `DELETE /internal/sandbox/{chat_id}` for each chat that was actually deleted; a failure is logged in `open-webui` and the chat is still deleted.
 
+## Upgrading to the host time zone release (#708)
+
+Every service in the three overlay files now runs with `TZ` set to the host's IANA zone name, and computer-use-server passes its own `TZ` to each sandbox it creates. postgres also starts with `-c timezone=<zone> -c log_timezone=<zone>`, because an initialized cluster keeps the zone initdb wrote into `postgresql.conf`. Stored `timestamptz` values are instants and do not change; Open WebUI stores epoch integers. `date`, file times and log lines change from UTC to local time. A process that sets `TZ=UTC`, or code that writes explicit UTC, still gets UTC. The retention-guard image now installs `tzdata`; without it musl ignores the zone name and stays on UTC.
+
+`deploy/up.sh` resolves the zone on every run and exports it as `OCU_HOST_TZ`. It takes the target of `/etc/localtime` with the `/usr/share/zoneinfo/` prefix removed, or else the first line of `/etc/timezone`. It refuses to start with `deploy: cannot resolve the host time zone: …`, before any Compose command, when neither gives a name made of letters, digits, `_`, `+`, `-` and `/` that is a regular file under `/usr/share/zoneinfo/`. A UTC host resolves to `Etc/UTC` like any other zone. The zone is never read from `runtime.env`, and a value inherited from the deploy shell is replaced. `deploy/smoke.sh` resolves it the same way for its Compose inventory query.
+
+Upgrade as in [Upgrading an existing deployment](#upgrading-an-existing-deployment), with these additions. `runtime.env` needs no edit, and the initializer does not need to run again.
+
+1. Step 5's `up.sh` recreates every service, because each one's environment changes. postgres and documentserver restart with the rest.
+2. **After step 7**, remove the existing sandboxes once. They keep the `TZ` they were created with, which is none. Do it in the maintenance window, because it interrupts any task still running in them:
+
+   ```bash
+   docker ps -aq --filter label=managed-by=mcp-computer-use-orchestrator | xargs -r docker rm -f
+   ```
+
+   The `chat-<id>-workspace` volumes and `${OCU_CHAT_DATA_DIR}/<chat_id>` stay. The chat's next tool call recreates its sandbox with the zone and remounts the same home volume.
+3. Check: `docker exec ocu-test-computer-use-server date` prints the host's zone abbreviation, for example `CST` on an `Asia/Shanghai` host, and so does `date` in a sandbox created afterwards. `docker exec ocu-test-postgres-1 psql -U openwebui -d openwebui -c 'show timezone'` and `-c 'show log_timezone'` print the zone name.
+
+A later change of the host's zone takes effect only when `deploy/up.sh` runs again, which recreates the services, and existing sandboxes are removed as in step 2.
+
+Manual `docker compose` commands against the overlay files, such as the `restart proxy messages-ingress` in [部署入口与端口边界](#部署入口与端口边界) and the `open-webui-init` recreation in the #590 section, now refuse with `required variable OCU_HOST_TZ is missing a value` unless the shell exports it. From the source checkout root, set it to the zone `up.sh` derives:
+
+```bash
+export OCU_HOST_TZ="$(PYTHONPATH=deploy python3 -c 'from settings import host_time_zone; print(host_time_zone())')"
+```
+
+Rollback: an older release's overlay sets no `TZ`, so its `up.sh` recreates every service in UTC. Sandboxes created in the meantime keep the zone until removed as in step 2.
+
 ## Re-running the initializer and removing the wrapper model (#590)
 
 The Computer Use tool reaches every model through the global `computer_use_filter`; no model carries it any more, and `BYPASS_MODEL_ACCESS_CONTROL=true` on `open-webui` makes every provider model visible to every user. A deployment initialized before #590 still has the old filter, which acts only when the request already names the tool, and a wrapper row `<PRIMARY_CHAT_MODEL> (Computer Use)` that names it. The filter source lives in the WebUI database. Only the one-shot `open-webui-init` service writes it, and `init.sh` exits without changes while the `.computer-use-initialized` marker exists in the `open-webui-data` volume. Upgrade in this order, as root, from the selected release's source checkout (`DEPLOY_ROOT` defaults to `/opt/ai-workbench-test/open-computer-use`):

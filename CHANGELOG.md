@@ -83,6 +83,20 @@
   `delete_failed`.
 
 ### Changed
+- **Containers and sandboxes follow the host's time zone (#708).** `deploy/up.sh`
+  resolves the host's IANA zone name on every run, from the `/etc/localtime`
+  link into `/usr/share/zoneinfo/` or else the first line of `/etc/timezone`
+  (`settings.host_time_zone`), and exports it as `OCU_HOST_TZ`; it refuses to
+  start, before any Compose command, when the name is invalid or has no zone
+  file. An inherited `OCU_HOST_TZ` is replaced, and `runtime.env` has no zone
+  setting. Every service in the production-like overlay gets
+  `TZ: ${OCU_HOST_TZ:?…}`, postgres also starts with `-c timezone` and
+  `-c log_timezone`, and the retention-guard image installs `tzdata`.
+  `computer-use-server` passes its own non-empty `TZ` to each new sandbox;
+  without one (the plain `docker-compose.yml` path) sandboxes get none, as
+  before. `deploy/smoke.sh` resolves the zone the same way for its Compose
+  inventory query. Existing sandboxes keep no `TZ` until removed
+  (NETWORK-HARDENING).
 - **New sandboxes get 2 CPUs and 4 GB (#702).** The `docker_manager`
   defaults and `bootstrap-test.sh` give `CONTAINER_CPU_LIMIT=2.0` and
   `CONTAINER_MEM_LIMIT=4g`. Limits apply at container creation, and an existing
