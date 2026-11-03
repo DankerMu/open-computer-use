@@ -7,6 +7,7 @@ Uses mock Docker to test tool logic without real containers.
 Run: python -m pytest tests/orchestrator/test_mcp_tools.py -v
 """
 
+import base64
 import os
 import sys
 import unittest
@@ -169,6 +170,70 @@ class TestViewTruncation(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, normal_output)
         self.assertNotIn("truncated", result.lower())
+
+
+class TestViewOverMcp(unittest.IsolatedAsyncioTestCase):
+    """view through the real FastMCP app and an in-memory MCP client session (#706)."""
+
+    IMAGE_B64 = base64.b64encode(b"\xff\xd8\xff\xe0 check frame jpeg bytes").decode()
+
+    async def _call(self, path, output):
+        from mcp.shared.memory import create_connected_server_and_client_session
+        from mcp_tools import mcp
+        current_chat_id.set("test-chat")
+        with patch("mcp_tools._ensure_gitlab_token", new_callable=AsyncMock), \
+                patch("mcp_tools._get_or_create_container", return_value=_mock_container()), \
+                patch("mcp_tools._execute_bash",
+                      return_value={"output": output, "exit_code": 0}) as bash:
+            async with create_connected_server_and_client_session(mcp) as session:
+                result = await session.call_tool(
+                    "view", {"description": "check", "path": path})
+        return result, bash
+
+    async def test_png_returns_path_text_and_jpeg_image_block(self):
+        result, bash = await self._call("/home/assistant/out/frame-045.png", self.IMAGE_B64 + "\n")
+
+        # Viewed images stay in the chat history and are re-sent with every later
+        # request, so view shrinks them to a longest side of 768 at JPEG quality 70.
+        command = bash.call_args.args[1]
+        self.assertIn("mx=768", command)
+        self.assertIn("quality=70", command)
+
+        self.assertFalse(result.isError, result.content)
+        self.assertEqual(
+            [(item.type, getattr(item, "text", None)) for item in result.content],
+            [("text", "Image: /home/assistant/out/frame-045.png"), ("image", None)],
+        )
+        image = result.content[1]
+        self.assertEqual(image.mimeType, "image/jpeg")
+        self.assertEqual(image.data, self.IMAGE_B64)
+
+    async def test_corrupt_image_output_is_an_error_text(self):
+        result, _ = await self._call("/home/assistant/out/frame.png", "not base64!")
+
+        self.assertFalse(result.isError, result.content)
+        self.assertEqual([item.type for item in result.content], ["text"])
+        self.assertTrue(
+            result.content[0].text.startswith("Error: viewing image /home/assistant/out/frame.png"),
+            result.content[0].text,
+        )
+
+    async def test_text_file_returns_one_text_block(self):
+        result, bash = await self._call("/home/assistant/notes.py", "     1\tprint('hi')\n")
+
+        self.assertFalse(result.isError)
+        self.assertEqual(
+            [(item.type, item.text) for item in result.content],
+            [("text", "     1\tprint('hi')\n")],
+        )
+        self.assertIn("/home/assistant/notes.py", bash.call_args.args[1])
+
+    async def test_directory_returns_one_text_block(self):
+        listing = "total 8\ndrwxr-xr-x 2 assistant assistant 4096 out\n"
+        result, _ = await self._call("/home/assistant/videos/intro", listing)
+
+        self.assertFalse(result.isError)
+        self.assertEqual([(item.type, item.text) for item in result.content], [("text", listing)])
 
 
 class TestStrReplaceUniqueness(unittest.IsolatedAsyncioTestCase):

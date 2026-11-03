@@ -3,6 +3,19 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **Images in the chat reach the sandbox (#707).** Before each tool call the
+  Open WebUI tool (4.2.0) reads the messages of the chat, when the requesting
+  user owns it, and takes the files of type `image` whose URL is
+  `/api/v1/files/<id>/content` (what upstream `generate_image` records), newest
+  first. Ids the sandbox already imported (its upload receipts) are dropped
+  first, then at most 20 are taken, so older images follow on later calls; when
+  the receipts cannot be read, the 20 newest are posted and the server answers
+  receipted ids from its record. Each newly synced image is named in the tool
+  result as `Synced image: /mnt/user-data/files/<stored name>`, using the name
+  the upload returned (collisions get a numbered suffix). A chat or file that
+  cannot be read is logged and skipped; the tool call still runs. The Remotion
+  skill explains how to copy these images into `public/`, and how to judge
+  check frames from one `view` of a 2x2 contact sheet.
 - **`generate_speech` MCP tool (#703).** `generate_speech(text, filename,
   instructions, voice)` calls an OpenAI-compatible
   `POST {TTS_BASE_URL}/audio/speech` from the orchestrator with
@@ -93,6 +106,38 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **`view` shows images to the model (#706).** MCP `view` on a `.png`, `.jpg`,
+  `.jpeg`, `.gif` or `.webp` file failed with `validation error for
+  viewOutput`, because it returned a list from a tool with a `str` output
+  schema. It is now registered without structured output and returns the
+  `Image: <path>` text plus an MCP image block, a JPEG with its longest side at
+  most 768 px at quality 70 (previously 1280 px at 80); text files and
+  directories still return one text block, now without `structuredContent`.
+  Invalid base64 from the resize step returns an `Error: viewing image` text.
+  The Open WebUI tool's `view` returns the image block as a bare
+  `data:image/jpeg;base64,…` string, which Open WebUI passes to the model as an
+  input image; sync notes are logged instead of appended to it. Cost: Open WebUI
+  stores each viewed image in the chat history and sends it to the model again
+  with every later request in that chat, which is why the image is small and
+  the Remotion skill limits check frames to one contact sheet per render. A
+  1920x1080 frame now costs about 12 KB of base64 for the plain template frame
+  and about 46 KB for a detailed one (previously 28 KB and 161 KB). When the
+  chat model (`__metadata__["model"]`, not the injected task model) has
+  `info.meta.capabilities.vision` set to false, `view` of an image returns an
+  `Error:` text without calling the server; a missing value counts as
+  vision-capable.
+- **Attachment sync resolves files by id and checks read access.** The Open
+  WebUI tool takes only the id of each attachment and of each chat image, loads
+  the file row, and syncs it only when the requesting user owns it or has read
+  access to it (`has_access_to_file`, as Open WebUI's file content route
+  decides, without an administrator exception). The file is read from the row's
+  own storage path; other fields of the request's file entries are ignored.
+  Without a requesting user nothing is synced. Chat images additionally need an
+  `image/` content type.
+- **Upgrade for #706 and #707.** Rebuild both the `computer-use-server` image
+  and the `open-computer-use` workspace image (skills are copied into it at
+  build time), then re-run init so the stored Open WebUI tool source is
+  replaced.
 - **A launched sandbox keeps a fresh idle window (#697).** Every launch branch
   that reaches running refreshes the host idle state. A sandbox launched within
   `CONTAINER_IDLE_TIMEOUT` of an idle stop was previously stopped again on the

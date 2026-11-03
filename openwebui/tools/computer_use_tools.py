@@ -3,7 +3,7 @@
 """
 title: Computer Use Tools
 author: OpenWebUI Implementation
-version: 4.1.0
+version: 4.2.0
 
 Thin MCP client proxy to computer-use-orchestrator. All tool configuration is server-side.
 ORCHESTRATOR_URL and optional MCP_API_KEY are Valves; OCU_INTERNAL_TOKEN is read from the process environment per call.
@@ -18,6 +18,7 @@ REQUIRED SETUP:
 import asyncio
 import json
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -52,6 +53,28 @@ def _looks_like_error(s: str) -> bool:
     if not isinstance(s, str):
         return False
     return any(s.startswith(p) for p in _ERROR_PREFIXES)
+
+
+# The image extensions mcp_tools.view resizes and returns as an image.
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+
+def _is_image_data_uri(result: object) -> bool:
+    """Open WebUI routes a tool result starting with data:image/ to the model as an image."""
+    return isinstance(result, str) and result.startswith("data:image/")
+
+
+def _model_cannot_view_images(metadata: object) -> bool:
+    """True only when the chat model's metadata says vision is False; missing means capable.
+
+    The image goes to the chat model, metadata["model"]; Open WebUI injects the task
+    model as __model__, so __model__ is not consulted.
+    """
+    model = metadata.get("model") if isinstance(metadata, dict) else None
+    try:
+        return model["info"]["meta"]["capabilities"]["vision"] is False
+    except (KeyError, TypeError):
+        return False
 
 def _is_http_safe_credential(value: object) -> bool:
     """Match the service guard's credential format without exposing a value."""
@@ -371,8 +394,12 @@ class _MCPClient:
         timeout: int,
         event_emitter: Callable = None,
         operation_name: str = "",
+        image: bool = False,
     ) -> str:
         """Call MCP tool via Streamable HTTP with SSE progress.
+
+        With image=True an MCP image block in a successful result is returned as a
+        data:<mime>;base64,<data> string instead of the text.
 
         Failure-mode contract: on ANY failure path this method returns a
         string with one of the _ERROR_PREFIXES. Outer wrappers detect that
@@ -426,7 +453,7 @@ class _MCPClient:
                     progress_callback=on_progress,
                     read_timeout_seconds=timedelta(seconds=timeout + 30),
                 )
-                return self._extract_text(result)
+                return self._extract_text(result, image=image)
 
         try:
             try:
@@ -485,8 +512,8 @@ class _MCPClient:
             )
 
     @staticmethod
-    def _extract_text(result) -> str:
-        """Extract text from MCP tool result.
+    def _extract_text(result, image: bool = False) -> str:
+        """Extract text from MCP tool result, or with image=True its first image block.
 
         Distinguishes three cases the old version conflated under "[No output]":
           1. result is None or missing — session died before producing one.
@@ -520,6 +547,15 @@ class _MCPClient:
                 "not an error. If you expected output, the command may have "
                 "written to a file instead of stdout.]"
             )
+
+        if image and not is_error:
+            for item in content:
+                mime_type = getattr(item, "mimeType", None)
+                data = getattr(item, "data", None)
+                if (getattr(item, "type", None) == "image"
+                        and isinstance(mime_type, str) and mime_type.startswith("image/")
+                        and isinstance(data, str) and data):
+                    return f"data:{mime_type};base64,{data}"
 
         parts = []
         for item in content:
@@ -711,22 +747,57 @@ class Tools:
                 pass
         return headers
 
-    async def _sync_files_if_needed(self, chat_id: str, __files__: list = None) -> str:
-        """Sync attached files before the MCP command, independent of path text."""
-        if not __files__:
+    async def _sync_files_if_needed(
+        self, chat_id: str, __files__: list = None, __user__: dict = None
+    ) -> str:
+        """Sync attachments and the chat's message images before the MCP command.
+
+        Files are resolved by id and synced only when the requesting user may read
+        them. Ids the sandbox already imported are skipped before any lookup; the
+        chat-image cap applies after that, so older images follow on later calls.
+        Returns the discovery warnings and one line per newly synced chat image.
+        """
+        attached = _attachment_ids(__files__)
+        chat_images = [i for i in await _chat_image_ids(chat_id, __user__) if i not in attached]
+        if not attached and not chat_images:
+            return ""
+        orchestrator_url = self.valves.ORCHESTRATOR_URL
+        internal_token = os.environ.get("OCU_INTERNAL_TOKEN", "")
+        try:
+            imported = await asyncio.to_thread(
+                _imported_attachment_ids, orchestrator_url, chat_id,
+                {"Authorization": f"Bearer {internal_token}"},
+            )
+        except Exception:
+            # Unreadable receipts: post every id; the server answers a receipted id
+            # with its stored record instead of writing the file again.
+            imported = set()
+        attached = [i for i in attached if i not in imported]
+        chat_images = [i for i in chat_images if i not in imported][:_CHAT_IMAGE_LIMIT]
+        entries = await _readable_files(
+            [(i, False) for i in attached] + [(i, True) for i in chat_images], __user__
+        )
+        if not entries:
             return ""
         try:
             sync_result = await asyncio.to_thread(
                 _sync_uploaded_files,
-                self.valves.ORCHESTRATOR_URL,
+                orchestrator_url,
                 chat_id,
-                __files__,
-                os.environ.get("OCU_INTERNAL_TOKEN", ""),
+                entries,
+                internal_token,
                 debug=self.valves.DEBUG_LOGGING,
             )
             if sync_result.get("synced", 0) > 0:
                 print(f"Synced {sync_result['synced']} file(s)")
-            return "\n".join(sync_result.get("warnings", []))
+            chat_image_ids = set(chat_images)
+            notes = list(sync_result.get("warnings", []))
+            notes.extend(
+                f"Synced image: /mnt/user-data/files/{stored_name}"
+                for attachment_id, stored_name in sync_result.get("stored", [])
+                if attachment_id in chat_image_ids
+            )
+            return "\n".join(notes)
         except Exception as e:
             print(f"[SYNC] Error: {e}")
             return ""
@@ -745,6 +816,7 @@ class Tools:
         timeout: int = CLIENT_HTTP_TIMEOUT,
         sync_warning: str = "",
         extra_headers: Optional[dict] = None,
+        image: bool = False,
     ) -> str:
         """One transport-aware MCP call with consistent SSE status events.
 
@@ -789,7 +861,7 @@ class Tools:
             invoked = True
             result = await client.call_tool(
                 tool_name, args, headers=headers, timeout=timeout,
-                event_emitter=emitter,
+                event_emitter=emitter, image=image,
             )
             is_err = _looks_like_error(result)
             await emit(err_desc if is_err else ok_desc, "error" if is_err else "complete", True)
@@ -798,6 +870,11 @@ class Tools:
             result = f"[Error] {tool_name} wrapper crashed: {type(e).__name__}: {e}"
         if invoked:
             await self._emit_workspace_hint(emitter, chat_id)
+        if sync_warning and _is_image_data_uri(result):
+            # Open WebUI sends the whole string to the model as one image
+            # (middleware.py 1124-1129); appended text would corrupt it.
+            print(f"[SYNC] Not shown with the image result: {sync_warning}")
+            return result
         return f"{result}\n\n{sync_warning}" if sync_warning else result
 
     # =========================================================================
@@ -824,7 +901,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         return await self._run_tool(
             "bash_tool", {"command": command, "description": description},
             chat_id, __event_emitter__, __request__, __user__,
@@ -859,7 +936,7 @@ class Tools:
             return error
         if old_str == new_str:
             return "Error: old_str and new_str are identical."
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         return await self._run_tool(
             "str_replace", {"description": description, "old_str": old_str, "path": path, "new_str": new_str},
             chat_id, __event_emitter__, __request__, __user__,
@@ -890,7 +967,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         return await self._run_tool(
             "create_file", {"description": description, "file_text": file_text, "path": path},
             chat_id, __event_emitter__, __request__, __user__,
@@ -911,17 +988,25 @@ class Tools:
         __request__=None,
     ) -> str:
         """
-        View text files, directory listings, or binary file info.
+        View text files, directory listings, images (.png, .jpg, .jpeg, .gif, .webp), or binary file info.
 
         :param description: Why I need to view this
         :param path: Absolute path to file or directory
         :param view_range: Optional [start_line, end_line]. Use [start, -1] for to-end.
-        :return: File contents, directory listing, or error message
+        :return: File contents, directory listing, the image, or error message
         """
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        is_image = isinstance(path, str) and path.lower().endswith(_IMAGE_EXTENSIONS)
+        if is_image and _model_cannot_view_images(__metadata__):
+            await self._emit_terminal_error(__event_emitter__, "Model cannot view images")
+            return (
+                "Error: this model cannot view images; its capabilities mark vision "
+                "as off. Inspect the file with bash_tool instead, for example "
+                "`file` or `ffprobe` for its size and format."
+            )
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         args = {"description": description, "path": path}
         if view_range:
             args["view_range"] = view_range
@@ -931,6 +1016,7 @@ class Tools:
             in_progress_desc=description or f"Reading {path}...",
             ok_desc="Read complete", err_desc="Read failed",
             sync_warning=sync_warning,
+            image=is_image,
         )
 
     async def generate_speech(
@@ -957,7 +1043,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         return await self._run_tool(
             "generate_speech",
             {"text": text, "filename": filename, "instructions": instructions, "voice": voice},
@@ -997,7 +1083,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         args = {
             "task": task, "description": description, "model": model,
             "max_turns": max_turns, "working_directory": working_directory,
@@ -1019,18 +1105,99 @@ class Tools:
 # File sync helper (HTTP — no SSH needed)
 # ============================================================================
 
-def _attachment_source_path(file_info):
-    nested = file_info.get("file")
-    if isinstance(nested, dict) and nested.get("path"):
-        return nested.get("path")
-    return file_info.get("path")
+# Upstream generate_image records each image in the message's files as
+# {"type": "image", "url": "/api/v1/files/<id>/content"} (tools/builtin.py).
+_CHAT_IMAGE_URL = re.compile(r"^/api/v1/files/([0-9a-f-]+)/content$")
+# Bounds the per-call file lookups in a chat with many images.
+_CHAT_IMAGE_LIMIT = 20
 
 
-def _attachment_filename(file_info, source_path):
-    filename = file_info.get("name") or (
-        os.path.basename(source_path) if source_path else "unknown"
-    )
-    return os.path.basename(filename)
+def _message_timestamp(message):
+    timestamp = message.get("timestamp")
+    return timestamp if isinstance(timestamp, (int, float)) else 0
+
+
+def _attachment_ids(files) -> list:
+    """The ids of the request's attachments, in order; any other field is ignored."""
+    ids = []
+    for item in files or []:
+        file_id = item.get("id") if isinstance(item, dict) else None
+        if isinstance(file_id, str) and file_id and file_id not in ids:
+            ids.append(file_id)
+    return ids
+
+
+async def _chat_image_ids(chat_id: str, user) -> list:
+    """Ids of the images in this chat's messages, newest first.
+
+    Read only when the requesting user owns the chat. Any failure is logged and
+    yields no ids; it never fails the tool call.
+    """
+    try:
+        from open_webui.models.chats import Chats
+
+        chat = await Chats.get_chat_by_id(chat_id)
+        if chat is None or chat.user_id != user["id"]:
+            return []
+        history = (chat.chat or {}).get("history") or {}
+        messages = [m for m in (history.get("messages") or {}).values() if isinstance(m, dict)]
+    except Exception as e:
+        print(f"[SYNC] Chat images not read: {type(e).__name__}: {e}")
+        return []
+
+    file_ids = []
+    for message in sorted(messages, key=_message_timestamp, reverse=True):
+        for item in message.get("files") or []:
+            if not isinstance(item, dict) or item.get("type") != "image":
+                continue
+            match = _CHAT_IMAGE_URL.match(str(item.get("url", "")))
+            if match and match.group(1) not in file_ids:
+                file_ids.append(match.group(1))
+    return file_ids
+
+
+async def _readable_files(candidates: list, user) -> list:
+    """Sync entries for the (file_id, image_only) candidates the user may read.
+
+    The single resolver for attachments and chat images: each file is loaded by
+    id, kept when the user owns it or has read access (as Open WebUI's file
+    content route decides, without its admin clause: admin read access is not
+    execution authority in a user's sandbox), and synced from the row's own
+    storage path. Refusals are logged.
+    """
+    if not candidates:
+        return []
+    try:
+        from open_webui.models.files import Files
+        from open_webui.models.users import Users
+        from open_webui.utils.access_control.files import has_access_to_file
+
+        owner = await Users.get_user_by_id(user["id"])
+        if owner is None:
+            raise LookupError("requesting user not found")
+    except Exception as e:
+        print(f"[SYNC] Files not resolved: {type(e).__name__}: {e}")
+        return []
+
+    entries = []
+    for file_id, image_only in candidates:
+        try:
+            row = await Files.get_file_by_id(file_id)
+            meta = (row.meta or {}) if row is not None else {}
+            if row is None or not row.path:
+                reason = "no stored file"
+            elif image_only and not str(meta.get("content_type") or "").startswith("image/"):
+                reason = "not an image"
+            elif row.user_id != owner.id and not await has_access_to_file(file_id, "read", owner):
+                reason = "no read access for the requesting user"
+            else:
+                name = os.path.basename(meta.get("name") or row.filename or file_id)
+                entries.append({"id": row.id, "name": name, "path": row.path})
+                continue
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+        print(f"[SYNC] File {file_id} skipped: {reason}")
+    return entries
 
 
 def _imported_attachment_ids(orchestrator_url, chat_id, headers):
@@ -1063,47 +1230,24 @@ _DISCOVERY_REASONS = frozenset({
 def _sync_uploaded_files(
     orchestrator_url: str,
     chat_id: str,
-    files: list,
+    entries: list,
     internal_token: str,
     debug: bool = False,
 ) -> dict:
-    """Sync attached files by WebUI id; skip receipted ids before Storage fetch."""
+    """Upload resolved files ({"id", "name", "path"} from _readable_files) by WebUI id."""
     import requests
 
-    if not files:
-        return {"synced": 0, "skipped": 0, "errors": 0}
-
     headers = {"Authorization": f"Bearer {internal_token}"}
-    try:
-        imported_ids = _imported_attachment_ids(
-            orchestrator_url, chat_id, headers
-        )
-        imports_readable = True
-    except Exception:
-        imported_ids = set()
-        imports_readable = False
-
-    synced, skipped, errors = 0, 0, 0
+    synced, errors = 0, 0
     warnings = []
+    stored = []
 
-    for file_info in files:
+    for entry in entries:
         temp_file_path = None
         try:
-            attachment_id = file_info.get("id")
-            if not isinstance(attachment_id, str) or not attachment_id:
-                errors += 1
-                continue
-            if imports_readable and attachment_id in imported_ids:
-                skipped += 1
-                continue
-
-            source_path = _attachment_source_path(file_info)
-            filename = _attachment_filename(file_info, source_path)
-
-            if not source_path:
-                errors += 1
-                continue
-
+            attachment_id = entry["id"]
+            filename = entry["name"]
+            source_path = entry["path"]
             try:
                 from open_webui.storage.provider import Storage
                 local_file_path = Storage.get_file(source_path)
@@ -1145,12 +1289,15 @@ def _sync_uploaded_files(
                 payload = resp.json()
             except ValueError:
                 payload = {}
+            stored_filename = filename
+            if isinstance(payload, dict) and isinstance(payload.get("filename"), str):
+                stored_filename = payload["filename"]
+            stored.append((attachment_id, stored_filename))
             discovery = payload.get("discovery") if isinstance(payload, dict) else None
             if isinstance(discovery, dict) and discovery.get("status") == "failed":
                 reason = discovery.get("reason")
                 if not isinstance(reason, str) or reason not in _DISCOVERY_REASONS:
                     reason = "internal_error"
-                stored_filename = payload.get("filename", filename)
                 warnings.append(
                     f"[DISCOVERY WARNING] File {stored_filename!r} was stored, but workspace "
                     f"file discovery failed ({reason}). Do not upload it again."
@@ -1164,7 +1311,9 @@ def _sync_uploaded_files(
                 except Exception:
                     pass
 
-    result = {"synced": synced, "skipped": skipped, "errors": errors}
+    result = {"synced": synced, "errors": errors}
     if warnings:
         result["warnings"] = warnings
+    if stored:
+        result["stored"] = stored
     return result

@@ -46,7 +46,7 @@ mkdir -p public out
 
 Every tool call starts in `/home/assistant`, so begin each command with `cd /home/assistant/videos/<name>` and run Remotion only as `npx --no-install remotion …`. Remotion finds its bundled Chrome through the project's `node_modules`; from any other directory it tries to download Chrome and fails. `--no-install` makes a typo fail instead of reaching for the network.
 
-**1. Check frames.** Render the key frames (start, middle, end, every scene change) into the project's `out/` in one command, which bundles once, then look at each PNG with the `view` tool:
+**1. Check frames.** Render four key frames (start, end, and the most important scene changes between them) into the project's `out/` in one command, which bundles once, then look at them with the `view` tool:
 
 ```bash
 cd /home/assistant/videos/<name>
@@ -54,7 +54,15 @@ rm -rf out/frames
 npx --no-install remotion render src/index.ts Main out/frames --sequence --frames=0,45,90,149 --image-format=png --concurrency=2
 ```
 
-Every listed frame must exist: the last frame is `durationInFrames - 1`, so `0,45,90,149` fits only the template's 150-frame `Main`; pick frames from your own composition's length. `rm -rf out/frames` comes first because the sequence output does not delete PNGs from an earlier run. Fix what looks wrong and repeat. Copy a frame to `/mnt/user-data/files/` only if the user should see it.
+Every listed frame must exist: the last frame is `durationInFrames - 1`, so `0,45,90,149` fits only the template's 150-frame `Main`; pick frames from your own composition's length. `rm -rf out/frames` comes first because the sequence output does not delete PNGs from an earlier run.
+
+Look at the frames as one contact sheet: every image you `view` stays in the chat and is sent to the model again on every later turn, so `view` at most four frames per render, preferably as a single sheet. With exactly four frames rendered as above, tile them 2x2 and `view` the sheet by its absolute path:
+
+```bash
+cd /home/assistant/videos/<name> && montage out/frames/*.png -tile 2x2 -geometry 960x540+4+4 out/contact.png
+```
+
+Then `view` `/home/assistant/videos/<name>/out/contact.png`. The tiles run left to right, top to bottom, in frame order. Judge each one: the intended layout and colors, nothing cut off or overlapping, no blank or black frame. `view` a single frame (`out/frames/<file>.png`) only when you need to read small text. Fix what looks wrong and repeat. If `view` says the model cannot view images, check the render command output and the file sizes instead, and tell the user the frames were not inspected. Copy a frame to `/mnt/user-data/files/` only if the user should see it.
 
 **2. Launch the MP4 render in the background.** Tool commands are killed after `COMMAND_TIMEOUT` (120 seconds), and most renders take longer:
 
@@ -117,6 +125,11 @@ Also pass `--gl=swangle` on every `still` and `render` command of such a project
 ## Assets and fonts
 
 - Put images, audio, video and font files in the project's `public/` and reference them with `staticFile("name.ext")`. Copy uploads from `/mnt/user-data/files/` into `public/` first.
+- Images in this chat's messages, for example ones made with the image generation tool, are copied into `/mnt/user-data/files/` before your next tool call runs, and that tool's result names each new one as `Synced image: /mnt/user-data/files/<file>`. After generating an image, run any command, for example `ls /mnt/user-data/files`, to receive it. The name often carries a numbered suffix such as `generated-image (2).png`, so copy it by the reported path, quoted, under a plain name:
+  ```bash
+  cd /home/assistant/videos/<name> && cp "/mnt/user-data/files/generated-image (2).png" public/scene1.png
+  ```
+  Then show it with `<Img src={staticFile("scene1.png")} />` (`Img` and `staticFile` from `remotion`).
 - Installed system fonts work by CSS `font-family`: `Noto Sans CJK SC` (Chinese, Japanese, Korean), `DejaVu Sans`, `Liberation Sans`, `Liberation Serif`, `Noto Color Emoji`. For other fonts, load a local file from `public/` with `@remotion/fonts`.
 
 ## Voiceover
