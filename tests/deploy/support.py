@@ -43,6 +43,10 @@ PROXY_COMPOSE = ROOT / "deploy" / "production-like-test" / "compose.proxy.yml"
 PROXY_DOCKERFILE = ROOT / "deploy" / "proxy" / "Dockerfile"
 PROXY_ENTRYPOINT = ROOT / "deploy" / "proxy" / "entrypoint.sh"
 PROXY_DOCKERIGNORE = ROOT / "deploy" / "proxy" / ".dockerignore"
+# Every copied up.sh reads this host instead of the test machine's /etc (#708).
+FIXTURE_HOST_ROOT = ROOT / "tests" / "deploy" / "fixtures" / "host-zone"
+FIXTURE_HOST_ZONE = "Asia/Shanghai"
+HOST_ROOT_LITERAL = 'HOST_ROOT = Path("/")'
 
 CONTROL_NETWORK = "ocu-test-private"
 SANDBOX_NETWORK = "ocu-sandbox"
@@ -1007,9 +1011,47 @@ def copy_tracked(relative: str, dest_root: Path) -> None:
         shutil.copy2(source, target)
 
 
-def committed_up_fixture(dest_root: Path, *, lock_dir: Path | None = None) -> str:
+def write_host_root(root: Path, *, localtime=None, timezone=None, zones=()) -> Path:
+    """A host's zone files under root; localtime is a zone name to link or raw bytes."""
+    zoneinfo = root / "usr" / "share" / "zoneinfo"
+    zoneinfo.mkdir(parents=True, exist_ok=True)
+    (root / "etc").mkdir(parents=True, exist_ok=True)
+    for name in zones:
+        path = zoneinfo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture zone file\n")
+    link = root / "etc" / "localtime"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    if isinstance(localtime, str):
+        link.symlink_to(zoneinfo / localtime)
+    elif isinstance(localtime, bytes):
+        link.write_bytes(localtime)
+    stored = root / "etc" / "timezone"
+    if stored.exists():
+        stored.unlink()
+    if timezone is not None:
+        stored.write_text(timezone, encoding="utf-8")
+    return root
+
+
+def pin_host_root(source_root: Path, host_root: Path = FIXTURE_HOST_ROOT) -> None:
+    """Point a copied settings.py at a fixture host instead of this machine's /etc."""
+    path = source_root / "deploy" / "settings.py"
+    text = path.read_text(encoding="utf-8")
+    if HOST_ROOT_LITERAL not in text:
+        raise RuntimeError("settings fixture is missing HOST_ROOT")
+    path.write_text(
+        text.replace(HOST_ROOT_LITERAL, f"HOST_ROOT = Path({str(host_root)!r})", 1),
+        encoding="utf-8",
+    )
+
+
+def committed_up_fixture(dest_root: Path, *, lock_dir: Path | None = None,
+                         host_root: Path = FIXTURE_HOST_ROOT) -> str:
     for relative in UP_FIXTURE_PATHS:
         copy_tracked(relative, dest_root)
+    pin_host_root(dest_root, host_root)
     if lock_dir is not None:
         release_path = dest_root / "deploy" / "release.py"
         text = release_path.read_text(encoding="utf-8")
@@ -1049,14 +1091,14 @@ def seed_release_env(env: dict, state_dir: Path, source_root: Path, inventory: P
     return merged
 
 
-def prepare_up_context(state_dir: Path, extra=None):
+def prepare_up_context(state_dir: Path, extra=None, host_root: Path = FIXTURE_HOST_ROOT):
     source = state_dir / "committed-source"
     lock_dir = state_dir / "image-store-lock"
     lock_dir.mkdir(parents=True, exist_ok=True)
     if not (source / ".git").exists():
         (state_dir / "office-fonts").mkdir(exist_ok=True)
         source.mkdir(parents=True, exist_ok=True)
-        sha = committed_up_fixture(source, lock_dir=lock_dir)
+        sha = committed_up_fixture(source, lock_dir=lock_dir, host_root=host_root)
         inventory = write_release_for_sha(state_dir / "release.json", sha, WEBUI_SYNTHETIC_SHA)
         if not (state_dir / "images.json").exists():
             seed_images(state_dir)

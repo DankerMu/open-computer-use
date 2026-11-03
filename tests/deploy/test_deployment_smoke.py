@@ -18,6 +18,8 @@ import unittest
 
 from support import (
     CONTROL_NETWORK,
+    FIXTURE_HOST_ROOT,
+    FIXTURE_HOST_ZONE,
     MESSAGES_ADDRESS,
     ROOT,
     SANDBOX_NETWORK,
@@ -29,6 +31,7 @@ from support import (
     write_containers,
     write_curl,
     write_exec,
+    write_host_root,
     write_network,
     write_ps,
     write_sandbox_terminal,
@@ -452,6 +455,38 @@ class OverlaySmokeCliTests(unittest.TestCase):
                     self.assertEqual({Path(row["release_fonts"]).resolve() for row in rows},
                                      {expected.resolve()})
                     self.assert_no_secrets(result)
+
+    def run_smoke_on_host(self, host_root, extra=None):
+        program = """
+import sys
+from pathlib import Path
+import settings
+settings.HOST_ROOT = Path(sys.argv[1])
+import smoke_deployment
+raise SystemExit(smoke_deployment.main(['smoke']))
+"""
+        return subprocess.run(
+            [sys.executable, "-c", program, str(host_root)],
+            cwd=ROOT / "deploy", env={**self.env, **(extra or {})}, capture_output=True,
+            text=True, timeout=20,
+        )
+
+    def test_inventory_resolves_the_host_zone_like_up(self):
+        # The overlay requires OCU_HOST_TZ, so Compose refuses inventory queries without it.
+        self.seed_inventory()
+        self.run_smoke_on_host(FIXTURE_HOST_ROOT, {"OCU_HOST_TZ": "America/Los_Angeles"})
+        rows = [json.loads(line) for line in
+                (self.state / "ps-environment.jsonl").read_text().splitlines()]
+        self.assertEqual([row["stack"] for row in rows], ["core", "webui", "proxy"])
+        self.assertEqual({row["host_tz"] for row in rows}, {FIXTURE_HOST_ZONE})
+
+    def test_unresolvable_host_zone_is_prerequisite(self):
+        self.seed_inventory()
+        host = write_host_root(self.state / "host", localtime=b"TZif-copy")
+        result = self.run_smoke_on_host(host)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("cannot resolve the host time zone", result.stderr)
+        self.assertEqual(ops(self.state), [])
 
     def test_release_manifest_is_required_for_compose_inventory(self):
         for value in (None, ""):

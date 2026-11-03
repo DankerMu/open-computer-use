@@ -88,6 +88,9 @@ RERANKER_URL = "http://reranker.fixture/v1/rerank"
 RERANKER_KEY = "reranker-key-fixture"
 MESSAGES_CONFIG = "/opt/ocu-proxy/messages-ingress.conf"
 MESSAGES_ENTRYPOINT = ["nginx", "-e", "stderr", "-p", "/var/lib/nginx/", "-c", MESSAGES_CONFIG]
+# up.sh exports the host's zone name as OCU_HOST_TZ (#708).
+HOST_ZONE = "Asia/Shanghai"
+OVERLAYS = {"core": CORE_OVERRIDE, "webui": WEBUI_OVERRIDE, "proxy": PROXY_COMPOSE}
 
 
 class ComposeLoader(yaml.SafeLoader):
@@ -139,6 +142,7 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None,
         "OCU_PRIVATE_GATEWAY": "172.30.0.1", "OCU_SANDBOX_NETWORK": "ocu-sandbox",
         "OCU_SANDBOX_SUBNET": "172.31.0.0/24", "OCU_SANDBOX_GATEWAY": "172.31.0.1",
         "OCU_SANDBOX_DNS": "8.8.8.8", "OCU_PROXY_PORT": "8082",
+        "OCU_HOST_TZ": HOST_ZONE,
         "OCU_SANDBOX_MESSAGES_ADDRESS": "172.31.0.254",
         "OCU_OFFICE_PROXY_PORT": "8083",
         "OCU_WEBUI_ORIGIN": "http://workbench.test:8082",
@@ -262,7 +266,7 @@ class OverlayStructureTests(unittest.TestCase):
                 self.assertEqual(ingress["labels"], {"ocu.role": "messages-ingress"})
                 self.assertIn("http://127.0.0.1:8080/healthz", " ".join(ingress["healthcheck"]["test"]))
                 self.assertFalse(ingress.get("ports"))
-                self.assertFalse(ingress.get("environment"))
+                self.assertEqual(ingress.get("environment"), {"TZ": HOST_ZONE})
                 self.assertFalse(ingress.get("env_file"))
                 self.assertNotIn("build", ingress)
                 self.assertFalse(ingress.get("network_mode"))
@@ -511,6 +515,44 @@ class OverlayStructureTests(unittest.TestCase):
                             text = json.dumps(definition)
                             self.assertNotIn("TTS_", text, f"{document}:{service}")
                             self.assertNotIn(key, text, f"{document}:{service}")
+
+    def test_every_overlay_service_requires_the_host_zone(self):
+        services = {f"{stack}:{name}": body
+                    for stack, path in OVERLAYS.items()
+                    for name, body in parsed(path)["services"].items()}
+        self.assertIn("core:cleanup", services)
+        for label, body in services.items():
+            with self.subTest(service=label):
+                environment = body.get("environment")
+                if isinstance(environment, dict) and environment.get("__override__"):
+                    environment = override_value(environment)
+                self.assertIsInstance(environment, dict)
+                self.assertTrue(interpolated(environment.get("TZ"), "OCU_HOST_TZ"), environment.get("TZ"))
+                with self.assertRaises(UnsupportedInterpolation):
+                    interpolate_value(environment["TZ"], {})
+                self.assertEqual(interpolate_value(environment["TZ"], {"OCU_HOST_TZ": HOST_ZONE}), HOST_ZONE)
+
+    def test_native_compose_gives_every_service_the_host_zone(self):
+        with tempfile.TemporaryDirectory(prefix="ocu-native-zone-") as raw:
+            for zone in (HOST_ZONE, "Etc/UTC"):
+                with self.subTest(zone=zone):
+                    stacks = resolved_stacks(Path(raw) / zone.replace("/", "-"), "false",
+                                             extra={"OCU_HOST_TZ": zone})
+                    started = {f"{document}:{name}": body
+                               for document, stack in stacks.items()
+                               for name, body in stack["services"].items()}
+                    self.assertEqual(set(started), {
+                        "core.json:workspace", "core.json:computer-use-server",
+                        "core.json:documentserver", "core.json:retention-guard",
+                        "webui.json:open-webui", "webui.json:postgres", "webui.json:open-webui-init",
+                        "proxy.json:proxy", "proxy.json:messages-ingress",
+                    })
+                    for label, body in started.items():
+                        self.assertEqual(body["environment"].get("TZ"), zone, label)
+                    # An initialized cluster keeps the zone initdb wrote; the command overrides it.
+                    self.assertEqual(stacks["webui.json"]["services"]["postgres"]["command"], [
+                        "postgres", "-c", f"timezone={zone}", "-c", f"log_timezone={zone}",
+                    ])
 
     def test_adopted_local_dependencies_exist(self):
         for path in ADOPTED:
