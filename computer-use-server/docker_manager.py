@@ -769,6 +769,10 @@ def _build_container_env(extra_env: Optional[dict] = None) -> dict:
     env = {
         "NPM_CONFIG_PREFIX": "/usr/local/lib/node_modules_global",
     }
+    # Sandboxes follow the server's zone, which the deployment sets to the host's (#708).
+    server_tz = os.environ.get("TZ")
+    if server_tz:
+        env["TZ"] = server_tz
     if extra_env:
         env.update(extra_env)
     return env

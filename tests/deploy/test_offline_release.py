@@ -35,6 +35,7 @@ from support import (
     intended_docs,
     intended_docs_for_images,
     ops,
+    pin_host_root,
     prepare_up_context,
     run_script,
     seed_healthy_host,
@@ -230,6 +231,7 @@ class OfflineReleaseTests(unittest.TestCase):
             f"SOURCE_CONSUMER_CONTRACT = {contract}", 1,
         ))
         (ocu / "README").write_text("delivery source\n", encoding="utf-8")
+        pin_host_root(ocu)
         ocu_sha = git_init_commit(ocu, "delivery source")
         delivery = self.root / name
         images_dir = delivery / "images"
@@ -590,6 +592,7 @@ class OfflineReleaseTests(unittest.TestCase):
         # A wrong source pin must fail locally rather than fetch real fonts during tests.
         self.env.update(http_proxy="http://127.0.0.1:1", https_proxy="http://127.0.0.1:1",
                         no_proxy="127.0.0.1,localhost")
+        pin_host_root(ocu)
         ocu_sha = git_init_commit(ocu, "ocu sources")
         (webui / "Dockerfile").write_text(
             'FROM scratch\nARG BUILD_HASH=dev-build\nARG USE_TIKTOKEN_ENCODING_NAME="cl100k_base"\nARG USE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2\n',

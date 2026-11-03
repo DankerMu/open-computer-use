@@ -37,6 +37,7 @@ from support import (
     write_containers,
     write_fake_configs,
     write_installed_fonts,
+    write_host_root,
     write_network,
 )
 
@@ -319,6 +320,66 @@ class DeployEntryTests(unittest.TestCase):
                 if kind != "empty":
                     self.assertEqual((fonts / "operator.otf").read_bytes(), b"operator-owned-font")
                 self.assertEqual((decoy / "untouched").read_bytes(), b"wrong project-directory source")
+                self.assertEqual(leftover_tmp(self.state), [])
+
+    def zone_docs(self):
+        docs = intended_docs()
+        for document in docs.values():
+            document["__unresolved__"] = True
+            for body in document["services"].values():
+                body.setdefault("environment", {})["TZ"] = "${OCU_HOST_TZ:?OCU_HOST_TZ is required}"
+        return docs
+
+    def started_zones(self) -> dict:
+        zones = {}
+        for row in executed_rows(self.state):
+            for name, body in row["consumer_document"]["services"].items():
+                zones[f"{row['stack']}:{name}"] = body["environment"]["TZ"]
+        return zones
+
+    def test_host_time_zone_reaches_every_started_service(self):
+        host = write_host_root(self.state / "host", zones=("Asia/Shanghai", "Europe/Berlin"))
+        env, script, _source = prepare_up_context(self.state, extra=self.env, host_root=host)
+        write_fake_configs(self.state, self.zone_docs())
+        expected_services = {
+            f"{stack}:{name}"
+            for stack, document in (("core", "core.json"), ("webui", "webui.json"), ("proxy", "proxy.json"))
+            for name in intended_docs()[document]["services"]
+        }
+        cases = (
+            ("link", dict(localtime="Asia/Shanghai"), "Asia/Shanghai"),
+            ("etc/timezone", dict(localtime=b"TZif-copy", timezone="Europe/Berlin\n"), "Europe/Berlin"),
+        )
+        for label, layout, zone in cases:
+            with self.subTest(source=label):
+                write_host_root(host, **layout)
+                (self.state / "executed.json").unlink(missing_ok=True)
+                # A value inherited from runtime.env must not select the zone.
+                result = run_script(script, {**env, "OCU_HOST_TZ": "America/Los_Angeles"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                zones = self.started_zones()
+                self.assertEqual(set(zones), expected_services)
+                self.assertEqual(set(zones.values()), {zone})
+                self.assertEqual(leftover_tmp(self.state), [])
+
+    def test_unresolvable_host_time_zone_refuses_before_engine_contact(self):
+        host = write_host_root(self.state / "host", zones=("Asia/Shanghai",))
+        env, script, _source = prepare_up_context(self.state, extra=self.env, host_root=host)
+        write_fake_configs(self.state, self.zone_docs())
+        cases = {
+            "no link, no timezone file": dict(localtime=b"TZif-copy"),
+            "dot-dot in the stored name": dict(timezone="Asia/../Asia/Shanghai\n"),
+            "no zone file": dict(localtime="Mars/Olympus", timezone="Mars/Olympus\n"),
+        }
+        for label, layout in cases.items():
+            with self.subTest(case=label):
+                write_host_root(host, **layout)
+                result = run_script(script, {**env, "OCU_HOST_TZ": "Asia/Shanghai"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("deploy: cannot resolve the host time zone", result.stderr)
+                self.assertEqual(ops(self.state), [])
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual(executed_rows(self.state), [])
                 self.assertEqual(leftover_tmp(self.state), [])
 
     def test_missing_sandbox_bridge_is_created_then_reinspected(self):

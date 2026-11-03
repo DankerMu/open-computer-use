@@ -15,6 +15,7 @@ from support import FAKE_DOCKER, ROOT, ops, tmp_dir
 
 
 STOP_OVERAGE = ROOT / "deploy" / "production-like-test" / "retention" / "stop-overage.sh"
+RETENTION_DOCKERFILE = ROOT / "deploy" / "production-like-test" / "retention" / "Dockerfile"
 NOW = 1_800_000_000
 HOUR = 3600
 VOLUME_SENTINEL = b"volume-bytes-must-survive-stop\n"
@@ -78,6 +79,14 @@ class RetentionGuardTests(unittest.TestCase):
             check=False,
             timeout=20,
         )
+
+    def test_image_installs_the_zone_database(self):
+        installed = [package
+                     for line in RETENTION_DOCKERFILE.read_text(encoding="utf-8").splitlines()
+                     if line.startswith("RUN apk add --no-cache ")
+                     for package in line.split()[4:]]
+        # Without it musl ignores TZ=<zone name> and stays on UTC (#708).
+        self.assertIn("tzdata", installed)
 
     def assert_sentinels(self):
         self.assertEqual(self.volume.read_bytes(), VOLUME_SENTINEL)

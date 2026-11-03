@@ -293,6 +293,50 @@ class TestDockerManagerEnvInjection(_RuntimeEnvironmentCase):
                 client.containers.run.assert_not_called()
         self._run_isolated(body)
 
+    def _sandbox_environment(self, server_tz):
+        """Environment handed to Docker for a new sandbox when the server's TZ is server_tz."""
+        def body():
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("TZ", None)
+                if server_tz is not None:
+                    os.environ["TZ"] = server_tz
+                docker_manager = self._reload_docker_manager({})
+                _reset_context_vars()
+                client = _build_mock_docker_client()
+                with patch("docker_manager.get_docker_client", return_value=client):
+                    docker_manager._create_container("test-chat", "owui-chat-test")
+                self._last_create = client.containers.create.call_args.kwargs
+                return self._last_create["environment"]
+        return self._run_isolated(body)
+
+    def test_server_time_zone_reaches_every_new_sandbox(self):
+        """#708: the deployment sets TZ on computer-use-server; sandboxes inherit it."""
+        for zone in ("Asia/Shanghai", "Etc/UTC"):
+            with self.subTest(zone=zone):
+                self.assertEqual(self._sandbox_environment(zone)["TZ"], zone)
+
+    def test_sandbox_never_binds_a_localtime_file(self):
+        """#708: a bound /etc/localtime makes TZ=UTC in the sandbox return local time."""
+        self._sandbox_environment("Asia/Shanghai")
+        create = self._last_create
+        binds = [spec.get("bind") for spec in (create.get("volumes") or {}).values()]
+        # docker.types.Mount is a dict keyed by "Target".
+        binds += [mount["Target"] for mount in create.get("mounts") or []]
+        self.assertFalse([target for target in binds
+                          if target and str(target).startswith("/etc/localtime")])
+
+    def test_unset_or_empty_server_time_zone_adds_nothing(self):
+        """Development compose sets no TZ; sandboxes are created as before."""
+        for server_tz in (None, ""):
+            with self.subTest(server_tz=server_tz):
+                self.assertNotIn("TZ", self._sandbox_environment(server_tz))
+
+    def test_explicit_sandbox_time_zone_overrides_the_server_zone(self):
+        with patch.dict(os.environ, {"TZ": "Asia/Shanghai"}):
+            import docker_manager
+            self.assertEqual(docker_manager._build_container_env({"TZ": "UTC"})["TZ"], "UTC")
+            self.assertEqual(docker_manager._build_container_env()["TZ"], "Asia/Shanghai")
+
     def test_anthropic_custom_headers_injection_regression_guard(self):
         """current_user_email set -> ANTHROPIC_CUSTOM_HEADERS + GIT_* vars land unchanged."""
         def body():

@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 from firewall.policy import METADATA, parse_allowlist
 from release import release_fonts_directory
+from settings import host_time_zone
 from netinspect import (
     NetworkInspectError,
     container_identity,
@@ -706,7 +707,16 @@ def load_inputs() -> dict:
 
 def collect_inventory(root: str, project: str) -> dict[str, dict]:
     manifest = Path(require_nonempty("OCU_RELEASE_MANIFEST"))
-    env = {**os.environ, "OCU_RELEASE_FONTS_DIR": str(release_fonts_directory(manifest))}
+    # The overlay requires OCU_HOST_TZ; use the zone up.sh derives, never an inherited one.
+    try:
+        zone = host_time_zone()
+    except ValueError as exc:
+        fail(f"cannot resolve the host time zone: {exc}", 2)
+    env = {
+        **os.environ,
+        "OCU_RELEASE_FONTS_DIR": str(release_fonts_directory(manifest)),
+        "OCU_HOST_TZ": zone,
+    }
     stacks = []
     for name, args in compose_contexts(root, project):
         result = docker("compose", *args, "ps", "--all", "--format", "json", env=env)
