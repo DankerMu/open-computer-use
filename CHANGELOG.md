@@ -3,6 +3,18 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **Images generated in the chat reach the sandbox (#707).** Before each tool
+  call the Open WebUI tool (4.2.0) reads the chat's own messages
+  (`Chats.get_chat_by_id`), takes the files of type `image` whose URL is
+  `/api/v1/files/<id>/content` (what upstream `generate_image` records), at most
+  the 20 newest, resolves each with `Files.get_file_by_id`, and syncs them with
+  the attachments through the receipted upload path, so each file id is
+  imported once per chat. Each newly synced image is named in the tool result
+  as `Synced generated image: /mnt/user-data/files/<stored name>`, using the
+  name the upload returned (collisions get a numbered suffix). A chat or file
+  that cannot be read is logged and skipped; the tool call still runs. The
+  Remotion skill explains how to copy these images into `public/` and how to
+  judge check frames with `view`.
 - **`generate_speech` MCP tool (#703).** `generate_speech(text, filename,
   instructions, voice)` calls an OpenAI-compatible
   `POST {TTS_BASE_URL}/audio/speech` from the orchestrator with
@@ -93,6 +105,20 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **`view` shows images to the model (#706).** MCP `view` on a `.png`, `.jpg`,
+  `.jpeg`, `.gif` or `.webp` file failed with `validation error for
+  viewOutput`, because it returned a list from a tool with a `str` output
+  schema. It is now registered without structured output and returns the
+  `Image: <path>` text plus an MCP image block (JPEG, longest side at most
+  1280 px, as before); text files and directories still return one text block,
+  now without `structuredContent`. Invalid base64 from the resize step returns
+  an `Error viewing image` text. The Open WebUI tool's `view` returns the image
+  block as a bare `data:image/jpeg;base64,…` string, which Open WebUI passes to
+  the model as an input image; sync notes are logged instead of appended to it.
+  When the chat model (`__metadata__["model"]`, not the injected task model)
+  has `info.meta.capabilities.vision` set to false, `view` of an image returns
+  an `Error:` text without calling the server; a missing value counts as
+  vision-capable.
 - **A launched sandbox keeps a fresh idle window (#697).** Every launch branch
   that reaches running refreshes the host idle state. A sandbox launched within
   `CONTAINER_IDLE_TIMEOUT` of an idle stop was previously stopped again on the

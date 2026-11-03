@@ -54,7 +54,9 @@ rm -rf out/frames
 npx --no-install remotion render src/index.ts Main out/frames --sequence --frames=0,45,90,149 --image-format=png --concurrency=2
 ```
 
-Every listed frame must exist: the last frame is `durationInFrames - 1`, so `0,45,90,149` fits only the template's 150-frame `Main`; pick frames from your own composition's length. `rm -rf out/frames` comes first because the sequence output does not delete PNGs from an earlier run. Fix what looks wrong and repeat. Copy a frame to `/mnt/user-data/files/` only if the user should see it.
+Every listed frame must exist: the last frame is `durationInFrames - 1`, so `0,45,90,149` fits only the template's 150-frame `Main`; pick frames from your own composition's length. `rm -rf out/frames` comes first because the sequence output does not delete PNGs from an earlier run.
+
+List the PNGs with `cd /home/assistant/videos/<name> && ls out/frames`, then call `view` on each one by its absolute path, for example `/home/assistant/videos/<name>/out/frames/<file>.png`. `view` returns the frame as an image you can see. Judge it: text readable and inside the frame, nothing cut off or overlapping, the intended colors and layout, no blank or black frame. Fix what looks wrong and repeat. If `view` says the model cannot view images, check the render log and the file sizes instead, and tell the user the frames were not inspected. Copy a frame to `/mnt/user-data/files/` only if the user should see it.
 
 **2. Launch the MP4 render in the background.** Tool commands are killed after `COMMAND_TIMEOUT` (120 seconds), and most renders take longer:
 
@@ -117,6 +119,11 @@ Also pass `--gl=swangle` on every `still` and `render` command of such a project
 ## Assets and fonts
 
 - Put images, audio, video and font files in the project's `public/` and reference them with `staticFile("name.ext")`. Copy uploads from `/mnt/user-data/files/` into `public/` first.
+- Images generated in this chat, for example with the image generation tool, are copied into `/mnt/user-data/files/` before your next tool call runs, and that tool's result names each new one as `Synced generated image: /mnt/user-data/files/<file>`. After generating an image, run any command, for example `ls /mnt/user-data/files`, to receive it. The name often carries a numbered suffix such as `generated-image (2).png`, so copy it by the reported path, quoted, under a plain name:
+  ```bash
+  cd /home/assistant/videos/<name> && cp "/mnt/user-data/files/generated-image (2).png" public/scene1.png
+  ```
+  Then show it with `<Img src={staticFile("scene1.png")} />` (`Img` and `staticFile` from `remotion`).
 - Installed system fonts work by CSS `font-family`: `Noto Sans CJK SC` (Chinese, Japanese, Korean), `DejaVu Sans`, `Liberation Sans`, `Liberation Serif`, `Noto Color Emoji`. For other fonts, load a local file from `public/` with `@remotion/fonts`.
 
 ## Voiceover
