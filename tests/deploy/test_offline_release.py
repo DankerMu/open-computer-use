@@ -3791,11 +3791,6 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assert_published(install, delivery)
 
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BindPathCoverageTests(unittest.TestCase):
     def test_every_shipped_open_webui_function_and_tool_is_a_verified_bind_file(self):
         # Init installs every function and tool file from the bind-mounted openwebui/;
@@ -3807,3 +3802,8 @@ class BindPathCoverageTests(unittest.TestCase):
         }
         self.assertTrue(shipped)
         self.assertLessEqual(shipped, set(release.SOURCE_BIND_PATHS))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
