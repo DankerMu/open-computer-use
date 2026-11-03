@@ -747,37 +747,55 @@ class Tools:
                 pass
         return headers
 
-    async def _sync_files_if_needed(self, chat_id: str, __files__: list = None) -> str:
-        """Sync attachments and the chat's generated images before the MCP command.
+    async def _sync_files_if_needed(
+        self, chat_id: str, __files__: list = None, __user__: dict = None
+    ) -> str:
+        """Sync attachments and the chat's message images before the MCP command.
 
-        Returns the discovery warnings and one line per newly synced generated image.
+        Files are resolved by id and synced only when the requesting user may read
+        them. Ids the sandbox already imported are skipped before any lookup; the
+        chat-image cap applies after that, so older images follow on later calls.
+        Returns the discovery warnings and one line per newly synced chat image.
         """
-        files = list(__files__ or [])
-        attached_ids = {f.get("id") for f in files if isinstance(f, dict)}
-        generated = [
-            entry for entry in await _chat_generated_images(chat_id)
-            if entry["id"] not in attached_ids
-        ]
-        files.extend(generated)
-        if not files:
+        attached = _attachment_ids(__files__)
+        chat_images = [i for i in await _chat_image_ids(chat_id, __user__) if i not in attached]
+        if not attached and not chat_images:
+            return ""
+        orchestrator_url = self.valves.ORCHESTRATOR_URL
+        internal_token = os.environ.get("OCU_INTERNAL_TOKEN", "")
+        try:
+            imported = await asyncio.to_thread(
+                _imported_attachment_ids, orchestrator_url, chat_id,
+                {"Authorization": f"Bearer {internal_token}"},
+            )
+        except Exception:
+            # Unreadable receipts: post every id; the server answers a receipted id
+            # with its stored record instead of writing the file again.
+            imported = set()
+        attached = [i for i in attached if i not in imported]
+        chat_images = [i for i in chat_images if i not in imported][:_CHAT_IMAGE_LIMIT]
+        entries = await _readable_files(
+            [(i, False) for i in attached] + [(i, True) for i in chat_images], __user__
+        )
+        if not entries:
             return ""
         try:
             sync_result = await asyncio.to_thread(
                 _sync_uploaded_files,
-                self.valves.ORCHESTRATOR_URL,
+                orchestrator_url,
                 chat_id,
-                files,
-                os.environ.get("OCU_INTERNAL_TOKEN", ""),
+                entries,
+                internal_token,
                 debug=self.valves.DEBUG_LOGGING,
             )
             if sync_result.get("synced", 0) > 0:
                 print(f"Synced {sync_result['synced']} file(s)")
-            generated_ids = {entry["id"] for entry in generated}
+            chat_image_ids = set(chat_images)
             notes = list(sync_result.get("warnings", []))
             notes.extend(
-                f"Synced generated image: /mnt/user-data/files/{stored_name}"
+                f"Synced image: /mnt/user-data/files/{stored_name}"
                 for attachment_id, stored_name in sync_result.get("stored", [])
-                if attachment_id in generated_ids
+                if attachment_id in chat_image_ids
             )
             return "\n".join(notes)
         except Exception as e:
@@ -883,7 +901,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         return await self._run_tool(
             "bash_tool", {"command": command, "description": description},
             chat_id, __event_emitter__, __request__, __user__,
@@ -918,7 +936,7 @@ class Tools:
             return error
         if old_str == new_str:
             return "Error: old_str and new_str are identical."
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         return await self._run_tool(
             "str_replace", {"description": description, "old_str": old_str, "path": path, "new_str": new_str},
             chat_id, __event_emitter__, __request__, __user__,
@@ -949,7 +967,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         return await self._run_tool(
             "create_file", {"description": description, "file_text": file_text, "path": path},
             chat_id, __event_emitter__, __request__, __user__,
@@ -988,7 +1006,7 @@ class Tools:
                 "as off. Inspect the file with bash_tool instead, for example "
                 "`file` or `ffprobe` for its size and format."
             )
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         args = {"description": description, "path": path}
         if view_range:
             args["view_range"] = view_range
@@ -1025,7 +1043,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         return await self._run_tool(
             "generate_speech",
             {"text": text, "filename": filename, "instructions": instructions, "voice": voice},
@@ -1065,7 +1083,7 @@ class Tools:
         chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
         if error:
             return error
-        sync_warning = await self._sync_files_if_needed(chat_id, __files__)
+        sync_warning = await self._sync_files_if_needed(chat_id, __files__, __user__)
         args = {
             "task": task, "description": description, "model": model,
             "max_turns": max_turns, "working_directory": working_directory,
@@ -1089,9 +1107,9 @@ class Tools:
 
 # Upstream generate_image records each image in the message's files as
 # {"type": "image", "url": "/api/v1/files/<id>/content"} (tools/builtin.py).
-_GENERATED_IMAGE_URL = re.compile(r"^/api/v1/files/([0-9a-f-]+)/content$")
-# Bounds the per-call file lookups in a chat with many generated images.
-_GENERATED_IMAGE_LIMIT = 20
+_CHAT_IMAGE_URL = re.compile(r"^/api/v1/files/([0-9a-f-]+)/content$")
+# Bounds the per-call file lookups in a chat with many images.
+_CHAT_IMAGE_LIMIT = 20
 
 
 def _message_timestamp(message):
@@ -1099,18 +1117,29 @@ def _message_timestamp(message):
     return timestamp if isinstance(timestamp, (int, float)) else 0
 
 
-async def _chat_generated_images(chat_id: str) -> list:
-    """Sync entries for the newest images generated in this chat's own messages.
+def _attachment_ids(files) -> list:
+    """The ids of the request's attachments, in order; any other field is ignored."""
+    ids = []
+    for item in files or []:
+        file_id = item.get("id") if isinstance(item, dict) else None
+        if isinstance(file_id, str) and file_id and file_id not in ids:
+            ids.append(file_id)
+    return ids
 
-    Reads only the chat the tool call runs in. Any failure is logged and yields
-    fewer entries; it never fails the tool call.
+
+async def _chat_image_ids(chat_id: str, user) -> list:
+    """Ids of the images in this chat's messages, newest first.
+
+    Read only when the requesting user owns the chat. Any failure is logged and
+    yields no ids; it never fails the tool call.
     """
     try:
         from open_webui.models.chats import Chats
-        from open_webui.models.files import Files
 
         chat = await Chats.get_chat_by_id(chat_id)
-        history = (getattr(chat, "chat", None) or {}).get("history") or {}
+        if chat is None or chat.user_id != user["id"]:
+            return []
+        history = (chat.chat or {}).get("history") or {}
         messages = [m for m in (history.get("messages") or {}).values() if isinstance(m, dict)]
     except Exception as e:
         print(f"[SYNC] Chat images not read: {type(e).__name__}: {e}")
@@ -1121,35 +1150,54 @@ async def _chat_generated_images(chat_id: str) -> list:
         for item in message.get("files") or []:
             if not isinstance(item, dict) or item.get("type") != "image":
                 continue
-            match = _GENERATED_IMAGE_URL.match(str(item.get("url", "")))
+            match = _CHAT_IMAGE_URL.match(str(item.get("url", "")))
             if match and match.group(1) not in file_ids:
                 file_ids.append(match.group(1))
+    return file_ids
+
+
+async def _readable_files(candidates: list, user) -> list:
+    """Sync entries for the (file_id, image_only) candidates the user may read.
+
+    The single resolver for attachments and chat images: each file is loaded by
+    id, kept when the user owns it or has read access (as Open WebUI's file
+    content route decides, without its admin clause: admin read access is not
+    execution authority in a user's sandbox), and synced from the row's own
+    storage path. Refusals are logged.
+    """
+    if not candidates:
+        return []
+    try:
+        from open_webui.models.files import Files
+        from open_webui.models.users import Users
+        from open_webui.utils.access_control.files import has_access_to_file
+
+        owner = await Users.get_user_by_id(user["id"])
+        if owner is None:
+            raise LookupError("requesting user not found")
+    except Exception as e:
+        print(f"[SYNC] Files not resolved: {type(e).__name__}: {e}")
+        return []
+
     entries = []
-    for file_id in file_ids[:_GENERATED_IMAGE_LIMIT]:
+    for file_id, image_only in candidates:
         try:
             row = await Files.get_file_by_id(file_id)
+            meta = (row.meta or {}) if row is not None else {}
+            if row is None or not row.path:
+                reason = "no stored file"
+            elif image_only and not str(meta.get("content_type") or "").startswith("image/"):
+                reason = "not an image"
+            elif row.user_id != owner.id and not await has_access_to_file(file_id, "read", owner):
+                reason = "no read access for the requesting user"
+            else:
+                name = os.path.basename(meta.get("name") or row.filename or file_id)
+                entries.append({"id": row.id, "name": name, "path": row.path})
+                continue
         except Exception as e:
-            print(f"[SYNC] Generated image {file_id} not read: {type(e).__name__}: {e}")
-            continue
-        if row is None or not row.path:
-            print(f"[SYNC] Generated image {file_id} skipped: no stored file")
-            continue
-        entries.append({"id": row.id, "name": row.filename, "file": {"path": row.path}})
+            reason = f"{type(e).__name__}: {e}"
+        print(f"[SYNC] File {file_id} skipped: {reason}")
     return entries
-
-
-def _attachment_source_path(file_info):
-    nested = file_info.get("file")
-    if isinstance(nested, dict) and nested.get("path"):
-        return nested.get("path")
-    return file_info.get("path")
-
-
-def _attachment_filename(file_info, source_path):
-    filename = file_info.get("name") or (
-        os.path.basename(source_path) if source_path else "unknown"
-    )
-    return os.path.basename(filename)
 
 
 def _imported_attachment_ids(orchestrator_url, chat_id, headers):
@@ -1182,48 +1230,24 @@ _DISCOVERY_REASONS = frozenset({
 def _sync_uploaded_files(
     orchestrator_url: str,
     chat_id: str,
-    files: list,
+    entries: list,
     internal_token: str,
     debug: bool = False,
 ) -> dict:
-    """Sync attached files by WebUI id; skip receipted ids before Storage fetch."""
+    """Upload resolved files ({"id", "name", "path"} from _readable_files) by WebUI id."""
     import requests
 
-    if not files:
-        return {"synced": 0, "skipped": 0, "errors": 0}
-
     headers = {"Authorization": f"Bearer {internal_token}"}
-    try:
-        imported_ids = _imported_attachment_ids(
-            orchestrator_url, chat_id, headers
-        )
-        imports_readable = True
-    except Exception:
-        imported_ids = set()
-        imports_readable = False
-
-    synced, skipped, errors = 0, 0, 0
+    synced, errors = 0, 0
     warnings = []
     stored = []
 
-    for file_info in files:
+    for entry in entries:
         temp_file_path = None
         try:
-            attachment_id = file_info.get("id")
-            if not isinstance(attachment_id, str) or not attachment_id:
-                errors += 1
-                continue
-            if imports_readable and attachment_id in imported_ids:
-                skipped += 1
-                continue
-
-            source_path = _attachment_source_path(file_info)
-            filename = _attachment_filename(file_info, source_path)
-
-            if not source_path:
-                errors += 1
-                continue
-
+            attachment_id = entry["id"]
+            filename = entry["name"]
+            source_path = entry["path"]
             try:
                 from open_webui.storage.provider import Storage
                 local_file_path = Storage.get_file(source_path)
@@ -1287,7 +1311,7 @@ def _sync_uploaded_files(
                 except Exception:
                     pass
 
-    result = {"synced": synced, "skipped": skipped, "errors": errors}
+    result = {"synced": synced, "errors": errors}
     if warnings:
         result["warnings"] = warnings
     if stored:

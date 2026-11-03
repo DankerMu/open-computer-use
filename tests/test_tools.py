@@ -491,60 +491,126 @@ def _with_guard(monkeypatch, tmp_path, imports_mode="live"):
     return GuardContext()
 
 
-def _attachment(file_id, name, source):
-    return {"id": file_id, "name": name, "file": {"path": source}}
+OWNER = {"id": "user-owner", "email": "owner@example.test", "name": "Owner", "role": "user"}
+OTHER = {"id": "user-other", "email": "other@example.test", "name": "Other", "role": "user"}
+ADMIN = {"id": "user-admin", "email": "admin@example.test", "name": "Admin", "role": "admin"}
 
 
-def _invoke_public_tool(tools, method, chat_id, files, command="echo ready"):
+def _attachment(file_id, name):
+    """An attachment as the request body carries it; the path names the DB row's storage key."""
+    return {"id": file_id, "name": name, "file": {"path": f"webui/{file_id}"}}
+
+
+def _invoke_public_tool(tools, method, chat_id, files, command="echo ready", user=OWNER):
     metadata = {"chat_id": chat_id}
+    common = {"__metadata__": metadata, "__files__": files, "__user__": user}
     if method == "bash_tool":
-        return tools.bash_tool(
-            command, "start work", __metadata__=metadata, __files__=files
-        )
+        return tools.bash_tool(command, "start work", **common)
     if method == "str_replace":
-        return tools.str_replace(
-            "edit", "before", "/home/assistant/a.txt", "after",
-            __metadata__=metadata, __files__=files,
-        )
+        return tools.str_replace("edit", "before", "/home/assistant/a.txt", "after", **common)
     if method == "create_file":
-        return tools.create_file(
-            "create", "contents", "/home/assistant/a.txt",
-            __metadata__=metadata, __files__=files,
-        )
+        return tools.create_file("create", "contents", "/home/assistant/a.txt", **common)
     if method == "view":
-        return tools.view(
-            "read", "/home/assistant/notes.txt",
-            __metadata__=metadata, __files__=files,
-        )
+        return tools.view("read", "/home/assistant/notes.txt", **common)
     if method == "generate_speech":
-        return tools.generate_speech(
-            "narration", "line1.mp3", __metadata__=metadata, __files__=files,
-        )
-    return tools.sub_agent(
-        "inspect attachment", "delegate",
-        __metadata__=metadata, __files__=files,
-    )
+        return tools.generate_speech("narration", "line1.mp3", **common)
+    return tools.sub_agent("inspect attachment", "delegate", **common)
 
 
-def _install_storage(monkeypatch, paths):
-    snapshots = {key: Path(path).read_bytes() for key, path in paths.items()}
-    destinations = {key: Path(path) for key, path in paths.items()}
+def _row(filename, content, user_id=OWNER["id"], content_type="application/octet-stream"):
+    return {"filename": filename, "content": content, "user_id": user_id, "content_type": content_type}
 
-    def get_file(source):
-        destination = destinations[source]
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(snapshots[source])
-        return str(destination)
 
-    provider = types.ModuleType("open_webui.storage.provider")
-    provider.Storage = type("Storage", (), {"get_file": staticmethod(get_file)})
-    storage = types.ModuleType("open_webui.storage")
-    storage.__path__ = []
-    package = types.ModuleType("open_webui")
-    package.__path__ = []
-    monkeypatch.setitem(sys.modules, "open_webui", package)
-    monkeypatch.setitem(sys.modules, "open_webui.storage", storage)
-    monkeypatch.setitem(sys.modules, "open_webui.storage.provider", provider)
+class _FakeWebUI:
+    """The Open WebUI modules the tool imports: storage, files, users, chats, file access.
+
+    `files` maps a file id to a _row(); each row's storage key is webui/<id>.
+    `chats` maps a chat id to (owner id, history messages). `grants` holds
+    (file_id, user_id) pairs that has_access_to_file grants for read.
+    """
+
+    def __init__(self, monkeypatch, tmp_path, files=None, chats=None, grants=(), chat_error=None):
+        self.fetched_dir = tmp_path / "webui-fetched"
+        self.rows = {}
+        self.contents = {}
+        for file_id, spec in (files or {}).items():
+            row = types.SimpleNamespace(
+                id=file_id, user_id=spec["user_id"], filename=spec["filename"],
+                path=f"webui/{file_id}",
+                meta={"name": spec["filename"], "content_type": spec["content_type"]},
+            )
+            self.rows[file_id] = row
+            self.contents[row.path] = spec["content"]
+        self.chats = chats or {}
+        self.grants = set(grants)
+        self.chat_error = chat_error
+        self.get_file_calls, self.fetched, self.lookups, self.access_checks = [], [], [], []
+        self._install(monkeypatch)
+
+    def get_file(self, key):
+        self.get_file_calls.append(key)
+        if key not in self.contents:
+            raise FileNotFoundError(key)
+        self.fetched_dir.mkdir(parents=True, exist_ok=True)
+        fetched = self.fetched_dir / f"fetch-{len(self.fetched)}"
+        fetched.write_bytes(self.contents[key])
+        self.fetched.append(fetched)
+        return str(fetched)
+
+    def _install(self, monkeypatch):
+        webui = self
+
+        class Storage:
+            get_file = staticmethod(webui.get_file)
+
+        class Files:
+            @staticmethod
+            async def get_file_by_id(file_id, db=None):
+                webui.lookups.append(file_id)
+                return webui.rows.get(file_id)
+
+        class Users:
+            @staticmethod
+            async def get_user_by_id(user_id, db=None):
+                for user in (OWNER, OTHER, ADMIN):
+                    if user["id"] == user_id:
+                        return types.SimpleNamespace(id=user["id"], role=user["role"])
+                return None
+
+        class Chats:
+            @staticmethod
+            async def get_chat_by_id(chat_id, db=None):
+                if webui.chat_error is not None:
+                    raise webui.chat_error
+                if chat_id not in webui.chats:
+                    return None
+                owner_id, messages = webui.chats[chat_id]
+                return types.SimpleNamespace(
+                    id=chat_id, user_id=owner_id, chat={"history": {"messages": messages}}
+                )
+
+        async def has_access_to_file(file_id, access_type, user, db=None, user_group_ids=None):
+            webui.access_checks.append((file_id, access_type, user.id))
+            return access_type == "read" and (file_id, user.id) in webui.grants
+
+        modules = {}
+        for name in (
+            "open_webui", "open_webui.storage", "open_webui.models", "open_webui.utils",
+            "open_webui.utils.access_control",
+        ):
+            modules[name] = types.ModuleType(name)
+            modules[name].__path__ = []
+        for name, attribute, value in (
+            ("open_webui.storage.provider", "Storage", Storage),
+            ("open_webui.models.files", "Files", Files),
+            ("open_webui.models.users", "Users", Users),
+            ("open_webui.models.chats", "Chats", Chats),
+            ("open_webui.utils.access_control.files", "has_access_to_file", has_access_to_file),
+        ):
+            modules[name] = types.ModuleType(name)
+            setattr(modules[name], attribute, value)
+        for name, module in modules.items():
+            monkeypatch.setitem(sys.modules, name, module)
 
 
 def _records(server, path, **headers):
@@ -631,9 +697,7 @@ def _service_unavailable(request):
 
 
 def test_bash_imports_attachment_before_command_without_uploads_path(monkeypatch, tmp_path):
-    source = tmp_path / "attachment.tmp"
-    source.write_bytes(b"attachment original")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment original")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
@@ -646,9 +710,8 @@ def test_bash_imports_attachment_before_command_without_uploads_path(monkeypatch
                 "echo ready",
                 "start work",
                 __metadata__={"chat_id": "chat-attachment"},
-                __files__=[
-                    {"id": "F1", "name": "brief.docx", "file": {"path": "attachment-source"}}
-                ],
+                __user__=OWNER,
+                __files__=[_attachment("F1", "brief.docx")],
             )
         )
 
@@ -688,14 +751,12 @@ def test_bash_imports_attachment_before_command_without_uploads_path(monkeypatch
     "method", PUBLIC_TOOLS
 )
 def test_public_tools_sync_new_attachment_before_command(monkeypatch, tmp_path, method):
-    source = tmp_path / "brief.tmp"
-    source.write_bytes(b"attachment original")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment original")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
     chat_id = f"chat-{method.replace('_', '-')}"
-    files = [_attachment("F1", "brief.docx", "attachment-source")]
+    files = [_attachment("F1", "brief.docx")]
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
         tools = _tools_with_token(monkeypatch)
@@ -739,14 +800,12 @@ def _fail_directory_enumeration(monkeypatch, root):
 def test_public_tools_report_committed_upload_discovery_warning_without_retry(
     monkeypatch, tmp_path, method
 ):
-    source = tmp_path / "brief.tmp"
-    source.write_bytes(b"attachment original")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment original")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
     chat_id = f"discovery-{method.replace('_', '-')}"
-    files = [_attachment("F1", "brief.docx", "attachment-source")]
+    files = [_attachment("F1", "brief.docx")]
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
         root = ocu.chat_uploads(chat_id)
@@ -788,13 +847,11 @@ def test_public_tools_report_committed_upload_discovery_warning_without_retry(
 def test_tool_discovery_warning_identifies_collision_stored_filename(
     monkeypatch, tmp_path
 ):
-    source = tmp_path / "brief.tmp"
-    source.write_bytes(b"attachment original")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment original")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
-    files = [_attachment("F1", "brief.docx", "attachment-source")]
+    files = [_attachment("F1", "brief.docx")]
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
         root = ocu.chat_uploads("collision-warning")
@@ -830,9 +887,7 @@ def test_tool_discovery_warning_identifies_collision_stored_filename(
 def test_overlapping_tool_calls_keep_discovery_warning_on_its_own_result(
     monkeypatch, tmp_path
 ):
-    source = tmp_path / "brief.tmp"
-    source.write_bytes(b"attachment original")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment original")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
@@ -856,7 +911,7 @@ def test_overlapping_tool_calls_keep_discovery_warning_on_its_own_result(
         async def overlap():
             warning_call = asyncio.create_task(_invoke_public_tool(
                 tools, "bash_tool", "warning-chat",
-                [_attachment("F1", "brief.docx", "attachment-source")], "echo held"
+                [_attachment("F1", "brief.docx")], "echo held"
             ))
             try:
                 assert await asyncio.to_thread(reached.wait, 10), "warning call never reached MCP"
@@ -880,13 +935,11 @@ def test_overlapping_tool_calls_keep_discovery_warning_on_its_own_result(
 
 
 def test_imported_edited_attachment_is_not_posted_again(monkeypatch, tmp_path):
-    source = tmp_path / "brief.tmp"
-    source.write_bytes(b"attachment original")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment original")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
-    files = [_attachment("F1", "brief.docx", "attachment-source")]
+    files = [_attachment("F1", "brief.docx")]
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
         tools = _tools_with_token(monkeypatch)
@@ -897,21 +950,13 @@ def test_imported_edited_attachment_is_not_posted_again(monkeypatch, tmp_path):
                 "import",
                 __metadata__={"chat_id": "chat-skip"},
                 __files__=files,
+                __user__=OWNER,
             )
         )
         stored = ocu.chat_uploads("chat-skip") / "brief.docx"
         stored.write_bytes(b"user edited bytes")
-        fetches = []
-
-        def counting_get_file(key):
-            fetches.append(key)
-            return str(source)
-
-        monkeypatch.setattr(
-            sys.modules["open_webui.storage.provider"].Storage,
-            "get_file",
-            staticmethod(counting_get_file),
-        )
+        webui.get_file_calls.clear()
+        webui.lookups.clear()
         ocu.uploads.clear()
         second = asyncio.run(
             tools.bash_tool(
@@ -919,6 +964,7 @@ def test_imported_edited_attachment_is_not_posted_again(monkeypatch, tmp_path):
                 "skip imported",
                 __metadata__={"chat_id": "chat-skip"},
                 __files__=files,
+                __user__=OWNER,
             )
         )
 
@@ -927,19 +973,18 @@ def test_imported_edited_attachment_is_not_posted_again(monkeypatch, tmp_path):
         uploads = _records(ocu, "/api/uploads/chat-skip/brief.docx")
         assert len(uploads) == 1
         assert ocu.uploads == []
-        assert fetches == []
+        assert webui.get_file_calls == []
+        assert webui.lookups == [], "a receipted id is skipped before any DB lookup"
         assert stored.read_bytes() == b"user edited bytes"
         assert ocu.stored_files("chat-skip") == {"brief.docx": b"user edited bytes"}
 
 
 def test_two_consecutive_calls_store_one_file_for_the_same_id(monkeypatch, tmp_path):
-    source = tmp_path / "brief.tmp"
-    source.write_bytes(b"attachment original")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment original")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
-    files = [_attachment("F1", "brief.docx", "attachment-source")]
+    files = [_attachment("F1", "brief.docx")]
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
         tools = _tools_with_token(monkeypatch)
@@ -950,6 +995,7 @@ def test_two_consecutive_calls_store_one_file_for_the_same_id(monkeypatch, tmp_p
                 "import",
                 __metadata__={"chat_id": "chat-once"},
                 __files__=files,
+                __user__=OWNER,
             )
         )
         asyncio.run(
@@ -958,6 +1004,7 @@ def test_two_consecutive_calls_store_one_file_for_the_same_id(monkeypatch, tmp_p
                 "repeat",
                 __metadata__={"chat_id": "chat-once"},
                 __files__=files,
+                __user__=OWNER,
             )
         )
         assert ocu.stored_files("chat-once") == {"brief.docx": b"attachment original"}
@@ -968,13 +1015,11 @@ def test_two_consecutive_calls_store_one_file_for_the_same_id(monkeypatch, tmp_p
 def test_failed_imports_read_posts_all_ids_and_server_writes_nothing(
     monkeypatch, tmp_path, imports_mode
 ):
-    source = tmp_path / "brief.tmp"
-    source.write_bytes(b"attachment original")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment original")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
-    files = [_attachment("F1", "brief.docx", "attachment-source")]
+    files = [_attachment("F1", "brief.docx")]
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
         tools = _tools_with_token(monkeypatch)
@@ -985,6 +1030,7 @@ def test_failed_imports_read_posts_all_ids_and_server_writes_nothing(
                 "import once",
                 __metadata__={"chat_id": "chat-failed-read"},
                 __files__=files,
+                __user__=OWNER,
             )
         )
         stored = ocu.chat_uploads("chat-failed-read") / "brief.docx"
@@ -998,6 +1044,7 @@ def test_failed_imports_read_posts_all_ids_and_server_writes_nothing(
                 "failed read",
                 __metadata__={"chat_id": "chat-failed-read"},
                 __files__=files,
+                __user__=OWNER,
             )
         )
 
@@ -1017,14 +1064,12 @@ def test_failed_imports_read_posts_all_ids_and_server_writes_nothing(
 def test_reserved_filename_is_url_encoded_and_storage_temp_is_cleaned(
     monkeypatch, tmp_path
 ):
-    downloaded = tmp_path / "downloaded.tmp"
-    downloaded.write_bytes(b"reserved name")
-    _install_storage(monkeypatch, {"attachment-source": downloaded})
+    filename = "hash#query?percent%文件.txt"
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F-reserved": _row(filename, b"reserved name")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
-    filename = "hash#query?percent%文件.txt"
-    files = [_attachment("F-reserved", filename, "attachment-source")]
+    files = [_attachment("F-reserved", filename)]
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
         tools = _tools_with_token(monkeypatch)
@@ -1035,6 +1080,7 @@ def test_reserved_filename_is_url_encoded_and_storage_temp_is_cleaned(
                 "encode name",
                 __metadata__={"chat_id": "chat-reserved"},
                 __files__=files,
+                __user__=OWNER,
             )
         )
         upload = _records(ocu, f"/api/uploads/chat-reserved/{filename}")
@@ -1051,25 +1097,26 @@ def test_reserved_filename_is_url_encoded_and_storage_temp_is_cleaned(
         assert b"#" not in upload[0]["raw_path"]
         assert b"?" not in upload[0]["raw_path"]
         assert ocu.stored_files("chat-reserved") == {filename: b"reserved name"}
-        assert not downloaded.exists()
+        assert len(webui.fetched) == 1
+        assert not webui.fetched[0].exists(), "the Storage temp copy is removed"
 
 
 def test_missing_attachment_id_does_not_create_an_unstable_import(monkeypatch, tmp_path):
-    source = tmp_path / "brief.tmp"
-    source.write_bytes(b"no identity")
-    _install_storage(monkeypatch, {"attachment-source": source})
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"no identity")})
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
-        result = computer_use_tools._sync_uploaded_files(
-            ocu.url,
-            "chat-missing-id",
-            [{"name": "brief.docx", "file": {"path": "attachment-source"}}],
-            INTERNAL_TOKEN,
-        )
-        assert result == {"synced": 0, "skipped": 0, "errors": 1}
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu),
+            "bash_tool", "chat-missing-id",
+            [{"name": "brief.docx", "file": {"path": "webui/F1"}}, {"id": "", "name": "x"}],
+        ))
+        assert result == "ran:echo ready"
+        assert webui.lookups == []
+        assert webui.get_file_calls == []
+        assert not _records(ocu, "/api/uploads/chat-missing-id/imports")
         assert ocu.uploads == []
         assert ocu.stored_files("chat-missing-id") == {}
         assert not _records(ocu, "/api/uploads/chat-missing-id/brief.docx")
@@ -1077,13 +1124,10 @@ def test_missing_attachment_id_does_not_create_an_unstable_import(monkeypatch, t
 
 def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tmp_path):
     first_token, second_token = "test-internal-one", "test-internal-two"
-    existing = tmp_path / "existing.tmp"
-    uploaded = tmp_path / "uploaded.tmp"
-    existing.write_bytes(b"already uploaded")
-    uploaded.write_bytes(b"new upload")
-    _install_storage(
-        monkeypatch, {"existing-source": existing, "uploaded-source": uploaded}
-    )
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={
+        "existing-id": _row("existing.txt", b"already uploaded"),
+        "uploaded-id": _row("uploaded.txt", b"new upload"),
+    })
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", first_token)
     monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
@@ -1096,20 +1140,19 @@ def test_tool_authenticates_real_transports_and_rotates_identity(monkeypatch, tm
                 "cat /mnt/user-data/files/uploaded.txt",
                 "read upload",
                 __metadata__={"chat_id": "chat-one"},
-                __user__={"email": "first@example.test", "name": "First User"},
+                __user__={"id": OWNER["id"], "email": "first@example.test", "name": "First User"},
                 __request__=types.SimpleNamespace(
                     headers={"X-User-Email": "forged@example.test"}
                 ),
                 __files__=[
-                    _attachment("existing-id", "existing.txt", "existing-source"),
-                    {"id": "uploaded-id", "name": "uploaded.txt", "path": "uploaded-source"},
+                    _attachment("existing-id", "existing.txt"),
+                    {"id": "uploaded-id", "name": "uploaded.txt", "path": "webui/uploaded-id"},
                 ],
             )
         )
         first_records = list(ocu.requests)
         assert "ran:cat /mnt/user-data/files/uploaded.txt" in first
-        assert not existing.exists()
-        assert not uploaded.exists()
+        assert webui.fetched and not any(path.exists() for path in webui.fetched)
 
         health = _records(ocu, "/health")
         imports = _records(ocu, "/api/uploads/chat-one/imports")
@@ -1297,21 +1340,19 @@ def test_mcp_sdk_redirect_does_not_leave_the_configured_origin(monkeypatch, tmp_
 
 
 def test_upload_redirect_does_not_leave_the_configured_origin(monkeypatch, tmp_path):
-    source = tmp_path / "upload.txt"
-    source.write_text("redirect upload")
-    _install_storage(monkeypatch, {"upload-source": source})
+    _FakeWebUI(monkeypatch, tmp_path, files={"upload-id": _row("upload.txt", b"redirect upload")})
     _disable_proxy_env(monkeypatch)
     with _local_origin(_service_unavailable) as target:
         with _local_origin(_redirect_to(target)) as origin:
             result = computer_use_tools._sync_uploaded_files(
                 origin.url,
                 "chat-upload-redirect",
-                [_attachment("upload-id", "upload.txt", "upload-source")],
+                [{"id": "upload-id", "name": "upload.txt", "path": "webui/upload-id"}],
                 INTERNAL_TOKEN,
             )
 
     assert target.requests == []
-    assert result == {"synced": 0, "skipped": 0, "errors": 1}
+    assert result == {"synced": 0, "errors": 1}
 
 
 @pytest.mark.parametrize("status", (401, 403))
@@ -1766,49 +1807,14 @@ def _message(timestamp, *files):
     return {"role": "assistant", "content": "", "timestamp": timestamp, "files": list(files)}
 
 
-def _install_chat_images(monkeypatch, tmp_path, chat_id, messages, files, chat_error=None):
-    """Fake Open WebUI storage + models.chats + models.files for one chat.
+def _image_row(filename, content, user_id=OWNER["id"]):
+    return _row(filename, content, user_id, "image/png")
 
-    `files` maps a WebUI file id to (filename, bytes); each gets a Storage key.
-    Returns the list of file ids looked up through Files.get_file_by_id.
-    """
-    sources = {}
-    rows = {}
-    for file_id, (filename, content) in files.items():
-        source = tmp_path / f"webui-{file_id}"
-        source.write_bytes(content)
-        sources[f"storage-{file_id}"] = source
-        rows[file_id] = types.SimpleNamespace(
-            id=file_id, filename=filename, path=f"storage-{file_id}"
-        )
-    _install_storage(monkeypatch, sources)
-    lookups = []
 
-    class Chats:
-        @staticmethod
-        async def get_chat_by_id(requested):
-            if chat_error is not None:
-                raise chat_error
-            if requested != chat_id:
-                return None
-            return types.SimpleNamespace(id=chat_id, chat={"history": {"messages": messages}})
-
-    class Files:
-        @staticmethod
-        async def get_file_by_id(file_id):
-            lookups.append(file_id)
-            return rows.get(file_id)
-
-    models = types.ModuleType("open_webui.models")
-    models.__path__ = []
-    chats = types.ModuleType("open_webui.models.chats")
-    chats.Chats = Chats
-    files_module = types.ModuleType("open_webui.models.files")
-    files_module.Files = Files
-    monkeypatch.setitem(sys.modules, "open_webui.models", models)
-    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats)
-    monkeypatch.setitem(sys.modules, "open_webui.models.files", files_module)
-    return lookups
+def _chat_webui(monkeypatch, tmp_path, chat_id, messages, files, chat_owner=OWNER["id"], **kwargs):
+    return _FakeWebUI(
+        monkeypatch, tmp_path, files=files, chats={chat_id: (chat_owner, messages)}, **kwargs
+    )
 
 
 def _guarded_tools(monkeypatch, ocu):
@@ -1865,7 +1871,7 @@ def test_view_of_an_image_by_a_non_vision_model_errors_before_any_call(monkeypat
     result = asyncio.run(computer_use_tools.Tools().view(
         "look", path,
         __metadata__={"chat_id": "chat-text-only", "model": VISION_OFF},
-        __files__=[_attachment("F1", "brief.docx", "attachment-source")],
+        __files__=[_attachment("F1", "brief.docx")],
         __event_emitter__=lambda e: _collect(events, e),
     ))
 
@@ -1919,7 +1925,7 @@ def test_text_extraction_for_other_tools_ignores_image_blocks():
 
 
 @pytest.mark.parametrize("method", PUBLIC_TOOLS)
-def test_chat_generated_images_sync_once_and_are_listed(monkeypatch, tmp_path, method):
+def test_chat_images_sync_once_and_are_listed(monkeypatch, tmp_path, method):
     _image_env(monkeypatch)
     chat_id = f"gen-{method.replace('_', '-')}"
     messages = {
@@ -1931,10 +1937,10 @@ def test_chat_generated_images_sync_once_and_are_listed(monkeypatch, tmp_path, m
         ),
         "m3": _message(300),
     }
-    lookups = _install_chat_images(monkeypatch, tmp_path, chat_id, messages, {
-        GEN_SUNSET: ("sunset.png", b"sunset bytes"),
-        GEN_LOGO: ("logo.png", b"logo bytes"),
-        DOC_BRIEF: ("brief.pdf", b"document bytes"),
+    webui = _chat_webui(monkeypatch, tmp_path, chat_id, messages, {
+        GEN_SUNSET: _image_row("sunset.png", b"sunset bytes"),
+        GEN_LOGO: _image_row("logo.png", b"logo bytes"),
+        DOC_BRIEF: _row("brief.pdf", b"document bytes"),
     })
 
     with _with_guard(monkeypatch, tmp_path) as ocu:
@@ -1943,13 +1949,8 @@ def test_chat_generated_images_sync_once_and_are_listed(monkeypatch, tmp_path, m
         (root / "sunset.png").write_bytes(b"the user's own sunset")
         tools = _guarded_tools(monkeypatch, ocu)
         first = asyncio.run(_invoke_public_tool(tools, method, chat_id, []))
-
-        fetches = []
-        monkeypatch.setattr(
-            sys.modules["open_webui.storage.provider"].Storage,
-            "get_file",
-            staticmethod(lambda key: fetches.append(key) or str(tmp_path / "unused")),
-        )
+        webui.get_file_calls.clear()
+        webui.lookups.clear()
         second = asyncio.run(_invoke_public_tool(tools, "bash_tool", chat_id, [], "echo second"))
 
         assert ocu.uploads == [
@@ -1961,54 +1962,53 @@ def test_chat_generated_images_sync_once_and_are_listed(monkeypatch, tmp_path, m
             "logo.png": b"logo bytes",
             "sunset (2).png": b"sunset bytes",
         }
-        assert "Synced generated image: /mnt/user-data/files/logo.png" in first
-        assert "Synced generated image: /mnt/user-data/files/sunset (2).png" in first
-        assert first.count("Synced generated image:") == 2
-        assert DOC_BRIEF not in lookups
-        # The second call skips both receipted ids before any Storage fetch or upload.
+        assert "Synced image: /mnt/user-data/files/logo.png" in first
+        assert "Synced image: /mnt/user-data/files/sunset (2).png" in first
+        assert first.count("Synced image:") == 2
+        # The second call skips both receipted ids before any DB lookup, Storage fetch or upload.
         assert second == "ran:echo second"
-        assert fetches == []
+        assert webui.lookups == []
+        assert webui.get_file_calls == []
         assert len(_records(ocu, f"/api/uploads/{chat_id}/logo.png")) == 1
         assert len(_records(ocu, f"/api/uploads/{chat_id}/sunset.png")) == 1
         assert ocu.calls[-1] == ("bash_tool", "echo second")
 
 
-def test_generated_images_merge_with_attachments_and_only_images_are_listed(
+def test_chat_images_merge_with_attachments_and_only_chat_images_are_listed(
     monkeypatch, tmp_path
 ):
     _image_env(monkeypatch)
     chat_id = "gen-merge"
-    _install_chat_images(
+    _chat_webui(
         monkeypatch, tmp_path, chat_id,
         {"m1": _message(1, _image_ref(GEN_LOGO))},
-        {GEN_LOGO: ("logo.png", b"logo bytes"), "F1": ("brief.docx", b"attachment")},
+        {GEN_LOGO: _image_row("logo.png", b"logo bytes"), "F1": _row("brief.docx", b"attachment")},
     )
-    attachment = _attachment("F1", "brief.docx", "storage-F1")
     with _with_guard(monkeypatch, tmp_path) as ocu:
         result = asyncio.run(_invoke_public_tool(
-            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, [attachment]
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, [_attachment("F1", "brief.docx")]
         ))
 
     assert ocu.stored_files(chat_id) == {"brief.docx": b"attachment", "logo.png": b"logo bytes"}
-    assert result == "ran:echo ready\n\nSynced generated image: /mnt/user-data/files/logo.png"
+    assert result == "ran:echo ready\n\nSynced image: /mnt/user-data/files/logo.png"
 
 
-def test_missing_generated_file_is_skipped(monkeypatch, tmp_path):
+def test_missing_chat_image_file_is_skipped(monkeypatch, tmp_path):
     _image_env(monkeypatch)
     chat_id = "gen-missing"
-    lookups = _install_chat_images(
+    webui = _chat_webui(
         monkeypatch, tmp_path, chat_id,
         {"m1": _message(1, _image_ref(GEN_LOGO)), "m2": _message(2, _image_ref(GEN_MISSING))},
-        {GEN_LOGO: ("logo.png", b"logo bytes")},
+        {GEN_LOGO: _image_row("logo.png", b"logo bytes")},
     )
     with _with_guard(monkeypatch, tmp_path) as ocu:
         result = asyncio.run(_invoke_public_tool(
             _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
         ))
 
-    assert GEN_MISSING in lookups
+    assert GEN_MISSING in webui.lookups
     assert ocu.uploads == [{"filename": "logo.png", "attachment_id": GEN_LOGO}]
-    assert result == "ran:echo ready\n\nSynced generated image: /mnt/user-data/files/logo.png"
+    assert result == "ran:echo ready\n\nSynced image: /mnt/user-data/files/logo.png"
 
 
 @pytest.mark.parametrize(
@@ -2019,9 +2019,9 @@ def test_missing_generated_file_is_skipped(monkeypatch, tmp_path):
 def test_chat_read_failure_does_not_fail_the_call(monkeypatch, tmp_path, fault):
     _image_env(monkeypatch)
     chat_id = "gen-broken"
-    _install_chat_images(
+    _chat_webui(
         monkeypatch, tmp_path, chat_id, {"m1": _message(1, _image_ref(GEN_LOGO))},
-        {GEN_LOGO: ("logo.png", b"logo bytes")}, chat_error=fault,
+        {GEN_LOGO: _image_row("logo.png", b"logo bytes")}, chat_error=fault,
     )
     if fault is None:
         monkeypatch.setitem(sys.modules, "open_webui.models.chats", None)
@@ -2035,42 +2035,203 @@ def test_chat_read_failure_does_not_fail_the_call(monkeypatch, tmp_path, fault):
     assert not _records(ocu, f"/api/uploads/{chat_id}/imports")
 
 
-def test_generated_image_sync_takes_the_20_newest(monkeypatch, tmp_path):
+def test_chat_image_cap_applies_after_receipts_so_older_images_follow(monkeypatch, tmp_path):
     _image_env(monkeypatch)
     chat_id = "gen-cap"
     ids = [f"0a1b2c3d-0000-4000-8000-{n:012x}" for n in range(1, 26)]
     messages = {f"m{n}": _message(n, _image_ref(ids[n - 1])) for n in range(1, 26)}
     # The newest image also appears in an older message; it still counts once.
     messages["m0"] = _message(0, _image_ref(ids[-1]))
-    lookups = _install_chat_images(
+    webui = _chat_webui(
         monkeypatch, tmp_path, chat_id, messages,
-        {file_id: (f"img{n}.png", b"x%d" % n) for n, file_id in enumerate(ids, 1)},
+        {file_id: _image_row(f"img{n}.png", b"x%d" % n) for n, file_id in enumerate(ids, 1)},
     )
     with _with_guard(monkeypatch, tmp_path) as ocu:
-        result = asyncio.run(_invoke_public_tool(
-            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
-        ))
+        tools = _guarded_tools(monkeypatch, ocu)
+        first = asyncio.run(_invoke_public_tool(tools, "bash_tool", chat_id, []))
+        first_lookups = list(webui.lookups)
+        webui.lookups.clear()
+        second = asyncio.run(_invoke_public_tool(tools, "bash_tool", chat_id, [], "echo second"))
 
-    assert lookups == list(reversed(ids[5:]))
+        assert first_lookups == list(reversed(ids[5:]))
+        assert first.count("Synced image:") == 20
+        assert webui.lookups == list(reversed(ids[:5]))
+        assert second.count("Synced image:") == 5
+        assert sorted(ocu.stored_files(chat_id)) == sorted(f"img{n}.png" for n in range(1, 26))
+        assert len(ocu.uploads) == 25
+        assert len({upload["attachment_id"] for upload in ocu.uploads}) == 25
+
+
+def test_chat_image_cap_without_readable_receipts_takes_the_20_newest(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "gen-cap-blind"
+    ids = [f"0a1b2c3d-0000-4000-8000-{n:012x}" for n in range(1, 26)]
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id,
+        {f"m{n}": _message(n, _image_ref(ids[n - 1])) for n in range(1, 26)},
+        {file_id: _image_row(f"img{n}.png", b"x%d" % n) for n, file_id in enumerate(ids, 1)},
+    )
+    with _with_guard(monkeypatch, tmp_path, imports_mode="fail") as ocu:
+        asyncio.run(_invoke_public_tool(_guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []))
+
+    assert webui.lookups == list(reversed(ids[5:]))
     assert sorted(ocu.stored_files(chat_id)) == sorted(f"img{n}.png" for n in range(6, 26))
-    assert result.count("Synced generated image:") == 20
 
 
 def test_view_of_an_image_keeps_the_data_uri_bare_when_images_sync(monkeypatch, tmp_path):
     _image_env(monkeypatch)
     chat_id = "gen-view"
-    _install_chat_images(
+    _chat_webui(
         monkeypatch, tmp_path, chat_id, {"m1": _message(1, _image_ref(GEN_LOGO))},
-        {GEN_LOGO: ("logo.png", b"logo bytes")},
+        {GEN_LOGO: _image_row("logo.png", b"logo bytes")},
     )
     with _with_guard(monkeypatch, tmp_path) as ocu:
         result = asyncio.run(_guarded_tools(monkeypatch, ocu).view(
-            "check", "/home/assistant/out/frame.png", __metadata__={"chat_id": chat_id},
+            "check", "/home/assistant/out/frame.png",
+            __metadata__={"chat_id": chat_id}, __user__=OWNER,
         ))
 
     assert result == f"data:image/jpeg;base64,{VIEW_IMAGE_B64}"
     assert ocu.stored_files(chat_id) == {"logo.png": b"logo bytes"}
 
+
+# --- Attachment and chat-image sync resolve files by id and check read access ---
+
+SECRET = b"server-side bytes"
+
+
+def _sync_from(source, file_id, filename="pic.png"):
+    """(chat messages, __files__) referencing file_id through one sync source."""
+    if source == "attachment":
+        return {}, [_attachment(file_id, filename)]
+    return {"m1": _message(1, _image_ref(file_id))}, []
+
+
+@pytest.mark.parametrize("source", ("attachment", "chat-image"))
+@pytest.mark.parametrize("requester", (OWNER, ADMIN), ids=("user", "admin"))
+def test_a_file_the_requester_cannot_read_is_not_synced(monkeypatch, tmp_path, source, requester):
+    _image_env(monkeypatch)
+    chat_id = f"refuse-{source}-{requester['role']}"
+    messages, files = _sync_from(source, GEN_LOGO)
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id, messages,
+        {GEN_LOGO: _image_row("pic.png", SECRET, user_id=OTHER["id"])},
+        chat_owner=requester["id"],
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, files, user=requester
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.access_checks == [(GEN_LOGO, "read", requester["id"])]
+    assert webui.get_file_calls == []
+    assert ocu.uploads == []
+    assert ocu.stored_files(chat_id) == {}
+
+
+@pytest.mark.parametrize("source", ("attachment", "chat-image"))
+def test_a_file_shared_with_read_access_is_synced(monkeypatch, tmp_path, source):
+    _image_env(monkeypatch)
+    chat_id = f"shared-{source}"
+    messages, files = _sync_from(source, GEN_LOGO)
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id, messages,
+        {GEN_LOGO: _image_row("pic.png", b"shared picture", user_id=OTHER["id"])},
+        grants={(GEN_LOGO, OWNER["id"])},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        asyncio.run(_invoke_public_tool(_guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, files))
+
+    assert webui.access_checks == [(GEN_LOGO, "read", OWNER["id"])]
+    assert webui.get_file_calls == [f"webui/{GEN_LOGO}"]
+    assert ocu.stored_files(chat_id) == {"pic.png": b"shared picture"}
+
+
+@pytest.mark.parametrize("source", ("attachment", "chat-image"))
+def test_the_requesters_own_file_syncs_without_an_access_lookup(monkeypatch, tmp_path, source):
+    _image_env(monkeypatch)
+    chat_id = f"own-{source}"
+    messages, files = _sync_from(source, GEN_LOGO)
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id, messages, {GEN_LOGO: _image_row("pic.png", b"mine")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        asyncio.run(_invoke_public_tool(_guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, files))
+
+    assert webui.access_checks == []
+    assert webui.get_file_calls == [f"webui/{GEN_LOGO}"]
+    assert ocu.stored_files(chat_id) == {"pic.png": b"mine"}
+
+
+def test_attachment_sync_reads_only_the_db_path(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    canary = tmp_path / "server-only.db"
+    canary.write_bytes(SECRET)
+    webui = _FakeWebUI(monkeypatch, tmp_path, files={"F1": _row("brief.docx", b"attachment")})
+    files = [
+        {"id": "F1", "name": "brief.docx", "path": str(canary), "file": {"path": str(canary)}},
+        {"id": "F-unknown", "name": "webui.db", "path": str(canary), "file": {"path": str(canary)}},
+    ]
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", "forged-path", files
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.get_file_calls == ["webui/F1"]
+    assert ocu.stored_files("forged-path") == {"brief.docx": b"attachment"}
+    assert ocu.uploads == [{"filename": "brief.docx", "attachment_id": "F1"}]
+
+
+def test_without_a_requester_nothing_syncs(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    webui = _chat_webui(
+        monkeypatch, tmp_path, "no-user", {"m1": _message(1, _image_ref(GEN_LOGO))},
+        {GEN_LOGO: _image_row("logo.png", b"logo bytes"), "F1": _row("brief.docx", b"a")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", "no-user",
+            [_attachment("F1", "brief.docx")], user=None,
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.get_file_calls == []
+    assert ocu.uploads == []
+
+
+def test_chat_images_of_a_chat_the_requester_does_not_own_are_not_read(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    webui = _chat_webui(
+        monkeypatch, tmp_path, "owners-chat", {"m1": _message(1, _image_ref(GEN_LOGO))},
+        {GEN_LOGO: _image_row("logo.png", b"logo bytes")}, chat_owner=OWNER["id"],
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", "owners-chat", [], user=ADMIN
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.lookups == []
+    assert ocu.uploads == []
+
+
+def test_a_chat_image_entry_naming_a_non_image_file_is_not_synced(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    webui = _chat_webui(
+        monkeypatch, tmp_path, "not-an-image", {"m1": _message(1, _image_ref(DOC_BRIEF))},
+        {DOC_BRIEF: _row("brief.pdf", b"document", content_type="application/pdf")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", "not-an-image", []
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.lookups == [DOC_BRIEF]
+    assert webui.get_file_calls == []
+    assert ocu.uploads == []
 
 if __name__ == "__main__":
     unittest.main()
