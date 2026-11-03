@@ -191,7 +191,13 @@ class TestViewOverMcp(unittest.IsolatedAsyncioTestCase):
         return result, bash
 
     async def test_png_returns_path_text_and_jpeg_image_block(self):
-        result, _ = await self._call("/home/assistant/out/frame-045.png", self.IMAGE_B64 + "\n")
+        result, bash = await self._call("/home/assistant/out/frame-045.png", self.IMAGE_B64 + "\n")
+
+        # Viewed images stay in the chat history and are re-sent with every later
+        # request, so view shrinks them to a longest side of 768 at JPEG quality 70.
+        command = bash.call_args.args[1]
+        self.assertIn("mx=768", command)
+        self.assertIn("quality=70", command)
 
         self.assertFalse(result.isError, result.content)
         self.assertEqual(
@@ -208,7 +214,7 @@ class TestViewOverMcp(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.isError, result.content)
         self.assertEqual([item.type for item in result.content], ["text"])
         self.assertTrue(
-            result.content[0].text.startswith("Error viewing image /home/assistant/out/frame.png"),
+            result.content[0].text.startswith("Error: viewing image /home/assistant/out/frame.png"),
             result.content[0].text,
         )
 

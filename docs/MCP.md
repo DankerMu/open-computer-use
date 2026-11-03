@@ -74,7 +74,7 @@ Leave `MCP_API_KEY` empty for development (no auth required).
 | Tool | Description |
 |------|-------------|
 | `bash_tool` | Execute bash commands in isolated Docker container |
-| `view` | View files and directories; images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) come back as an MCP image block |
+| `view` | View files and directories; images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) come back as an MCP image block (JPEG, longest side 768 px). In Open WebUI each viewed image stays in the chat history and is sent to the model again with every later request |
 | `create_file` | Create new files |
 | `str_replace` | Edit files via text replacement |
 | `sub_agent` | Delegate tasks to autonomous Claude Code agent |

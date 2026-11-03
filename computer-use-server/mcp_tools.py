@@ -716,7 +716,7 @@ async def view(
     Supported path types:
     - Directories: Lists files and directories with details
     - Text files: Displays numbered lines. You can optionally specify a view_range.
-    - Images (.png, .jpg, .jpeg, .gif, .webp): Returned as an image you can see (JPEG, longest side at most 1280 px)
+    - Images (.png, .jpg, .jpeg, .gif, .webp): Returned as an image you can see (JPEG, longest side at most 768 px). Each viewed image stays in the chat and is sent to the model again on every later turn, so view only the frames you need
     - Binary files (.xlsx, .docx, .pptx, .pdf, etc.): Returns error with SKILL.md instructions
 
     Args:
@@ -766,15 +766,16 @@ async def view(
                 break
 
         if file_ext and file_ext in image_extensions:
-            # Image file — resize+compress in container, return as structured content
+            # Image file: resize+compress in the container (768 px, JPEG 70: a viewed image stays
+            # in the chat history and is re-sent to the model every turn), return an image block.
             try:
                 py_code = (
                     "from PIL import Image; from io import BytesIO; import base64,sys; "
                     f"img=Image.open({path!r}); "
-                    "mx=1280; "
+                    "mx=768; "
                     "img.thumbnail((mx,mx),Image.Resampling.LANCZOS) if max(img.size)>mx else None; "
                     "img=img.convert('RGB') if img.mode in ('RGBA','P') else img; "
-                    "b=BytesIO(); img.save(b,format='JPEG',quality=80); "
+                    "b=BytesIO(); img.save(b,format='JPEG',quality=70); "
                     "sys.stdout.write(base64.b64encode(b.getvalue()).decode())"
                 )
                 resize_cmd = f"python3 -c {shlex.quote(py_code)}"
@@ -785,7 +786,7 @@ async def view(
                 try:
                     base64.b64decode(image_b64, validate=True)
                 except binascii.Error:
-                    return f"Error viewing image {path}: the resize step returned no valid image data"
+                    return f"Error: viewing image {path}: the resize step returned no valid image data"
                 return [
                     f"Image: {path}",
                     ImageContent(type="image", data=image_b64, mimeType="image/jpeg"),
