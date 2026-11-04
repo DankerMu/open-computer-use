@@ -36,6 +36,7 @@ LINK_POLICY = {
 }
 # The company system prompt (#712): open-webui mounts its directory, OCU_PROMPTS_DIR.
 SYSTEM_PROMPT_NAME = "system-prompt.md"
+PROMPTS_MOUNT = "/etc/ocu/prompts"
 
 
 def _office_timeout() -> float:
@@ -446,6 +447,26 @@ def _stop_writer(name: str) -> None:
         _stop_container(name)
 
 
+def _require_prompts_mount(name: str, payload: dict, runtime: dict[str, str]) -> None:
+    """Refuse when open-webui reads a company prompt other than the one backup captures."""
+    mounts = [mount for mount in _mounts(payload) if mount.get("Destination") == PROMPTS_MOUNT]
+    declared = runtime.get("OCU_PROMPTS_DIR")
+    if not mounts:
+        return
+    if not declared:
+        raise RecoveryError(f"{name} mounts {PROMPTS_MOUNT} but runtime has no OCU_PROMPTS_DIR")
+    try:
+        matches = (
+            len(mounts) == 1
+            and mounts[0].get("Type") == "bind"
+            and Path(str(mounts[0].get("Source") or "")).resolve() == Path(declared).resolve()
+        )
+    except OSError as cop:
+        raise RecoveryError(f"OCU_PROMPTS_DIR cannot be resolved: {cop}") from cop
+    if not matches:
+        raise RecoveryError(f"{name} {PROMPTS_MOUNT} mount does not match OCU_PROMPTS_DIR")
+
+
 def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inventory: dict) -> None:
     expected_images = {
         identity["server_container"]: inventory["images"]["computer-use-server"],
@@ -508,6 +529,9 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
             required_mounts = {"/var/lib/postgresql/data": ("volume", identity["postgres_volume"])}
         elif name in (identity["webui_container"], identity["init_container"]):
             required_mounts = {"/app/backend/data": ("volume", identity["webui_volume"])}
+        if name == identity["webui_container"]:
+            # Read-only, so not one of the read-write data mounts below.
+            _require_prompts_mount(name, payload, runtime)
         for destination, (kind, expected_source) in required_mounts.items():
             matches = [mount for mount in _mounts(payload) if mount.get("Destination") == destination]
             if len(matches) != 1:

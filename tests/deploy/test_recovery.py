@@ -122,6 +122,11 @@ def stack_container(name: str, *, running=True, paused=False, extra=None, image=
     return body
 
 
+def prompts_mount(source: Path) -> dict:
+    # The overlay's read-only company prompt directory on open-webui (#712).
+    return {"Type": "bind", "Source": str(source), "Destination": "/etc/ocu/prompts", "RW": False}
+
+
 def sandbox(name: str, chat_id: str, *, running=True, paused=False, chat_dir: Path | None = None):
     chat_root = str(chat_dir / chat_id) if chat_dir is not None else chat_id
     return stack_container(
@@ -430,6 +435,8 @@ recovery_resources.time = SimpleNamespace(
                     "Name": "ocu-test_postgres-data" if is_pg else "ocu-test_open-webui-data",
                     "Destination": "/var/lib/postgresql/data" if is_pg else "/app/backend/data",
                 }]
+                if service == "open-webui":
+                    item["Mounts"].append(prompts_mount(self.prompts_dir))
         if extra_containers:
             containers.extend(extra_containers)
         (self.state / "containers.json").write_text(json.dumps(containers), encoding="utf-8")
@@ -1388,6 +1395,53 @@ else:
         self.assertNotEqual(retry.returncode, 0)
 
 
+    def _set_webui_prompts_mount(self, source):
+        path = self.state / "containers.json"
+        containers = json.loads(path.read_text(encoding="utf-8"))
+        webui = next(row for row in containers if row["Name"] == "ocu-test-open-webui-1")
+        webui["Mounts"] = [m for m in webui["Mounts"] if m.get("Destination") != "/etc/ocu/prompts"]
+        if source is not None:
+            webui["Mounts"].append(prompts_mount(source))
+        path.write_text(json.dumps(containers), encoding="utf-8")
+
+    def _runtime_without_prompts_key(self):
+        return "".join(
+            line for line in self.runtime.read_text(encoding="utf-8").splitlines(keepends=True)
+            if not line.startswith("OCU_PROMPTS_DIR=")
+        )
+
+    def test_backup_refuses_a_prompts_mount_the_runtime_does_not_name(self):
+        original_runtime = self.runtime.read_text(encoding="utf-8")
+        other = self.root / "other-prompts"
+        cases = (
+            ("mount-without-key", self._runtime_without_prompts_key(), self.prompts_dir,
+             "ocu-test-open-webui-1 mounts /etc/ocu/prompts but runtime has no OCU_PROMPTS_DIR"),
+            ("other-source", original_runtime, other,
+             "ocu-test-open-webui-1 /etc/ocu/prompts mount does not match OCU_PROMPTS_DIR"),
+        )
+        for label, runtime_text, source, message in cases:
+            with self.subTest(label):
+                self._seed_volumes_and_db()
+                (self.state / "stopped.log").unlink(missing_ok=True)
+                self.runtime.write_text(runtime_text, encoding="utf-8")
+                self._set_webui_prompts_mount(source)
+                try:
+                    dest = self.root / f"refused-{label}"
+                    result = self._backup(dest)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+                    self.assertFalse(dest.exists())
+                    self.assertFalse((self.state / "stopped.log").exists())
+                finally:
+                    self.runtime.write_text(original_runtime, encoding="utf-8")
+        # The fixture's own stack mounts the directory OCU_PROMPTS_DIR names.
+        self._seed_volumes_and_db()
+        containers = json.loads((self.state / "containers.json").read_text(encoding="utf-8"))
+        webui = next(row for row in containers if row["Name"] == "ocu-test-open-webui-1")
+        self.assertIn(prompts_mount(self.prompts_dir), webui["Mounts"])
+        created = self._backup(self.root / "matching-mount")
+        self.assertEqual(created.returncode, 0, created.stderr)
+
     def _assert_restored_prompt(self, dest, content):
         prompts = dest / "prompts"
         prompt = prompts / "system-prompt.md"
@@ -1468,11 +1522,8 @@ else:
                     self.runtime.write_text(original_runtime, encoding="utf-8")
 
     def test_set_without_company_prompt_restores_an_empty_prompt_and_says_so(self):
-        # Before #712: no prompts/ and no OCU_PROMPTS_DIR in the deployment's runtime.env.
-        without_key = "".join(
-            line for line in self.runtime.read_text(encoding="utf-8").splitlines(keepends=True)
-            if not line.startswith("OCU_PROMPTS_DIR=")
-        )
+        # Before #712: no prompts mount on open-webui and no OCU_PROMPTS_DIR in runtime.env.
+        without_key = self._runtime_without_prompts_key()
         for label in ("captured-before-712", "release-before-712"):
             with self.subTest(label):
                 self._seed_volumes_and_db()
@@ -1480,6 +1531,7 @@ else:
                 if label == "release-before-712":
                     # This checkout backs up a deployment that still runs a release before #712.
                     self.runtime.write_text(without_key, encoding="utf-8")
+                    self._set_webui_prompts_mount(None)
                 created = self._backup(backup)
                 self.assertEqual(created.returncode, 0, created.stderr)
                 manifest = json.loads((backup / "recovery.json").read_text(encoding="utf-8"))
