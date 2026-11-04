@@ -11,6 +11,7 @@ Everything needed to connect [Open WebUI](https://github.com/open-webui/open-web
 | 1 | [**tools/computer_use_tools.py**](tools/) | Tool | Yes | MCP client proxy — forwards `bash`, `create_file`, `str_replace`, `view`, `sub_agent` calls to the Computer Use Server |
 | 2 | [**functions/computer_link_filter.py**](functions/) | Filter | Yes | Fetches the server-generated system prompt (skills list + file base URL embedded server-side) and the `X-Public-Base-URL` response header; decorates responses with preview/archive links |
 | 3 | [**functions/video_production_filter.py**](functions/) | Toggle filter | Yes | The 视频制作 switch; when on, the system prompt lists the `remotion` video skill. `remove-wrapper-model.py` refuses until it is installed |
+| 4 | [**functions/org_prompt_filter.py**](functions/) | Filter | Production-like deployment | Puts the mounted `/etc/ocu/prompts/system-prompt.md` in front of every system message; fails chats when that file is missing, so deactivate it where it is not mounted |
 
 **The tool and the two filters are the whole integration.** All three work against a stock upstream Open WebUI.
 
