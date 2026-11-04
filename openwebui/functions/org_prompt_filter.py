@@ -18,12 +18,14 @@ prompt after it. Open WebUI applies the model's own system prompt after the
 filters and puts it first. Open WebUI prompt variables such as {{CURRENT_DATE}}
 are not substituted here: Open WebUI substitutes them before filters run.
 
-An empty or whitespace-only file injects nothing. A missing, oversized or
-non-UTF-8 file raises OrgPromptError, which Open WebUI shows as the chat's
-error. deploy/up.sh runs read_org_prompt on the host file before it starts the
-stack, so the two agree on what is a usable file.
+An empty or whitespace-only file injects nothing. A missing, symbolic-link,
+oversized or non-UTF-8 file raises OrgPromptError, which Open WebUI shows as
+the chat's error; the filter also logs it at WARNING, because Open WebUI logs
+inlet exceptions only at DEBUG. deploy/up.sh runs read_org_prompt on the host
+file before it starts the stack, so the two agree on what is a usable file.
 """
 
+import logging
 import os
 import stat
 from pathlib import Path
@@ -31,6 +33,8 @@ from typing import Optional
 
 PROMPT_FILE = Path("/etc/ocu/prompts/system-prompt.md")
 MAX_BYTES = 64 * 1024
+
+log = logging.getLogger(__name__)
 
 
 class OrgPromptError(Exception):
@@ -40,11 +44,16 @@ class OrgPromptError(Exception):
 def read_org_prompt(path: Path) -> str:
     """Return the file's text as written, or "" when it holds only whitespace."""
     try:
-        mode = os.stat(path).st_mode
+        mode = os.lstat(path).st_mode
     except FileNotFoundError:
         raise OrgPromptError(f"company system prompt {path} is missing") from None
     except OSError as exc:
         raise OrgPromptError(f"company system prompt {path} is unreadable: {exc.strerror}") from None
+    # Only the directory is mounted: a link's target outside it is missing in the container.
+    if stat.S_ISLNK(mode):
+        raise OrgPromptError(
+            f"company system prompt {path} is a symbolic link; replace it with the file itself"
+        )
     # Checked before opening: opening a FIFO would block the request.
     if not stat.S_ISREG(mode):
         raise OrgPromptError(f"company system prompt {path} is not a regular file")
@@ -65,7 +74,11 @@ def read_org_prompt(path: Path) -> str:
 class Filter:
     def inlet(self, body: dict, __metadata__: Optional[dict] = None) -> dict:
         """Prepend the company prompt to the system message of every chat request."""
-        prompt = read_org_prompt(PROMPT_FILE)
+        try:
+            prompt = read_org_prompt(PROMPT_FILE)
+        except OrgPromptError as exc:
+            log.warning("%s", exc)
+            raise
         messages = body.get("messages")
         if not prompt or not messages:
             return body

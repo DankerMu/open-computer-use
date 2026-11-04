@@ -362,15 +362,21 @@ class DeployEntryTests(unittest.TestCase):
             "directory": ("dir", "is not a regular file"),
             "over 64 KiB": (b"a" * (64 * 1024 + 1), "is larger than 65536 bytes"),
             "not UTF-8": ("公司".encode("gbk"), "is not valid UTF-8"),
+            # The container mounts only the directory, so a link out of it would be missing there.
+            "symbolic link": ("link", "is a symbolic link"),
         }
+        outside = self.state / "outside-prompt.md"
+        outside.write_text("valid text outside the mounted directory\n", encoding="utf-8")
         for label, (content, problem) in cases.items():
             with self.subTest(label):
-                if path.is_dir():
-                    path.rmdir()
-                elif path.exists():
+                if path.is_symlink() or path.is_file():
                     path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
                 if content == "dir":
                     path.mkdir()
+                elif content == "link":
+                    path.symlink_to(outside)
                 elif content is not None:
                     path.write_bytes(content)
                 result = run_script(script, {**env, "OCU_PROMPTS_DIR": str(prompts)})

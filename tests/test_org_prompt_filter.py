@@ -9,6 +9,7 @@ before the Computer Use prompt, whichever of the two filters runs first.
 """
 
 import copy
+import logging
 import os
 import sys
 from pathlib import Path
@@ -124,6 +125,30 @@ def test_directory_in_place_of_the_file_raises_naming_the_file(prompt_file):
         run(chat())
     assert str(prompt_file) in str(raised.value)
     assert "not a regular file" in str(raised.value)
+
+
+@pytest.mark.parametrize("target_exists", [True, False], ids=["link", "dangling-link"])
+def test_symbolic_link_raises_naming_the_file(prompt_file, tmp_path, target_exists):
+    # Only prompts/ is mounted, so a link to a file outside it is missing in the container.
+    target = tmp_path / "elsewhere.md"
+    if target_exists:
+        target.write_text(COMPANY, encoding="utf-8")
+    prompt_file.symlink_to(target)
+    with pytest.raises(org_prompt_filter.OrgPromptError) as raised:
+        run(chat(USER_PROMPT))
+    assert str(prompt_file) in str(raised.value)
+    assert "is a symbolic link" in str(raised.value)
+
+
+def test_a_rejected_file_is_logged_as_a_warning(prompt_file, caplog):
+    # Open WebUI logs inlet exceptions only at DEBUG; the filter's own line reaches docker logs.
+    prompt_file.write_bytes(b"\xff")
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(org_prompt_filter.OrgPromptError) as raised:
+            run(chat())
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert [r.getMessage() for r in warnings] == [str(raised.value)]
+    assert str(prompt_file) in warnings[0].getMessage()
 
 
 def test_file_at_the_limit_is_accepted(prompt_file):
