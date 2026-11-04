@@ -79,7 +79,7 @@ kubectl -n open-computer-use get pods
 
 - **`PUBLIC_BASE_URL`** is the **browser-facing** URL of the orchestrator. The orchestrator returns it in the `X-Public-Base-URL` header, and the Open WebUI filter uses it to rewrite preview links in chat. It must match the public hostname users actually hit. Set in `values-computer-use.yaml`.
 
-> Note: the `openwebui/init.sh` script from this repo expects to run as the Open WebUI container's entrypoint wrapper. The upstream Open WebUI chart does **not** invoke it. Either build your own image (using `openwebui/Dockerfile` from this repo) and point the upstream chart at it via `image.repository`, or seed the Valves manually through the Admin UI on first boot. Both paths work — the init.sh path is more reproducible.
+> Note: the `openwebui/init.sh` script from this repo expects to run as the Open WebUI container's entrypoint wrapper. The upstream Open WebUI chart does **not** invoke it. Either build your own image (using `openwebui/Dockerfile` from this repo) and point the upstream chart at it via `image.repository`, or seed the Valves manually through the Admin UI on first boot. Both paths work — the init.sh path is more reproducible. Leave `OCU_ORG_PROMPT_FILTER` unset for `init.sh`: `install` adds a filter that fails every chat unless the pod mounts `/etc/ocu/prompts/system-prompt.md`.
 
 ## Files in this directory
 

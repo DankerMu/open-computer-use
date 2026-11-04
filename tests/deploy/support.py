@@ -143,6 +143,7 @@ UP_FIXTURE_PATHS = (
     "openwebui/tools/computer_use_tools.py",
     "openwebui/functions/computer_link_filter.py",
     "openwebui/functions/video_production_filter.py",
+    "openwebui/functions/org_prompt_filter.py",
     "computer-use-server/sandbox_dns.py",
     "docker-compose.yml",
     "docker-compose.webui.yml",
@@ -388,6 +389,7 @@ def fake_env(state_dir: Path, extra=None):
         "OCU_OFFICE_SELF_URL": "http://computer-use-server:8081",
         "OCU_OFFICE_PROXY_PORT": "8083",
         "OCU_OFFICE_FONTS_DIR": str(state_dir / "office-fonts"),
+        "OCU_PROMPTS_DIR": str(state_dir / "prompts"),
         "ENABLE_OCU_OFFICE_EDIT": "false",
     })
     env["OCU_SANDBOX_EGRESS_LOCK"] = str(state_dir / "ocu-sandbox-egress.lock")
@@ -1097,6 +1099,8 @@ def prepare_up_context(state_dir: Path, extra=None, host_root: Path = FIXTURE_HO
     lock_dir.mkdir(parents=True, exist_ok=True)
     if not (source / ".git").exists():
         (state_dir / "office-fonts").mkdir(exist_ok=True)
+        (state_dir / "prompts").mkdir(exist_ok=True)
+        (state_dir / "prompts" / "system-prompt.md").touch()
         source.mkdir(parents=True, exist_ok=True)
         sha = committed_up_fixture(source, lock_dir=lock_dir, host_root=host_root)
         inventory = write_release_for_sha(state_dir / "release.json", sha, WEBUI_SYNTHETIC_SHA)

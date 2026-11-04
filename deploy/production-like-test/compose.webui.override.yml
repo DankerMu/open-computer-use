@@ -67,6 +67,16 @@ services:
       CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "200"
       TOOL_RESULT_MAX_CHARS: "50000"
       TOOL_RESULT_PREVIEW_CHARS: "2000"
+    volumes:
+      # The company system prompt, read by org_prompt_filter on every chat
+      # request (#712). A directory, because editors save by renaming a new file
+      # over the old one; never config/, which holds runtime.env.
+      - type: bind
+        source: ${OCU_PROMPTS_DIR:?OCU_PROMPTS_DIR is required}
+        target: /etc/ocu/prompts
+        read_only: true
+        bind:
+          create_host_path: false
     restart: unless-stopped
 
   postgres:
@@ -106,6 +116,9 @@ services:
       PRIMARY_CHAT_MODEL: ${PRIMARY_CHAT_MODEL:-}
       ORCHESTRATOR_URL: http://computer-use-server:8081
       MCP_API_KEY: ${MCP_API_KEY}
+      # open-webui mounts the company prompt directory, so init installs the
+      # filter that reads it (#712).
+      OCU_ORG_PROMPT_FILTER: install
     volumes:
       - ./openwebui:/app/source:ro
       - ./deploy/production-like-test/init/run-init.sh:/bootstrap/run-init.sh:ro

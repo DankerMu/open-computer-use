@@ -257,7 +257,7 @@ class RemoveWrapperModelTests(unittest.TestCase):
         sources = _stored_sources()
         self.assertEqual(
             {stored_id for stored_id, _path, _relative in sources},
-            {"computer_use_filter", "video_production_filter", "ai_computer_use"},
+            {"computer_use_filter", "video_production_filter", "org_prompt_filter", "ai_computer_use"},
         )
         for stored_id, _path, relative in sources:
             shipped = (SOURCE_ROOT / relative).read_bytes()

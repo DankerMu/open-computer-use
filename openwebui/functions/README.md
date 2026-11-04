@@ -15,6 +15,10 @@ Without this filter, the model won't know about skills or how to generate file d
 
 **File**: `video_production_filter.py` — required: `remove-wrapper-model.py` refuses until the stored copy equals this file. A toggle filter, installed as `video_production_filter` (named 视频制作) and active and global, that shows a switch in the chat integrations menu. Its inlet changes nothing; when the switch is on, `computer_link_filter.py` asks for the prompt with the `remotion` skill. See [`docs/openwebui-filter.md`](../../docs/openwebui-filter.md#video-switch).
 
+## Company system prompt
+
+**File**: `org_prompt_filter.py` — optional. `init.sh` installs it as `org_prompt_filter` (named Company System Prompt), active and global, only when `OCU_ORG_PROMPT_FILTER=install`; unset leaves an installed copy alone, and any other value stops init. The production-like overlay sets it next to its mount, and `remove-wrapper-model.py` checks the stored copy. Its inlet reads `/etc/ocu/prompts/system-prompt.md` on every chat request and puts the text in front of the system message. An empty file adds nothing; a missing, symbolic-link, oversized (> 64 KiB) or non-UTF-8 file fails the chat with an error naming the file, also logged at WARNING. Install it only where that file is mounted. See [NETWORK-HARDENING](../../deploy/production-like-test/NETWORK-HARDENING.md#company-system-prompt-712).
+
 ## Valves
 
 | Valve | Default | Description |

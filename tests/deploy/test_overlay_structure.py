@@ -66,6 +66,7 @@ ADOPTED = (
     ROOT / "openwebui" / "tools" / "computer_use_tools.py",
     ROOT / "openwebui" / "functions" / "computer_link_filter.py",
     ROOT / "openwebui" / "functions" / "video_production_filter.py",
+    ROOT / "openwebui" / "functions" / "org_prompt_filter.py",
 )
 PUBLIC_COPY_SOURCES = (
     "render.py",
@@ -152,6 +153,7 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None,
         "OCU_SKILLS_CACHE_DIR": str(directory / "skills"),
         "OCU_RELEASE_FONTS_DIR": str(directory.parent / "release-fonts"),
         "OCU_OFFICE_FONTS_DIR": str(directory.parent / "operator-fonts"),
+        "OCU_PROMPTS_DIR": str(directory.parent / "prompts"),
         "CONTAINER_MEM_LIMIT": "4g", "CONTAINER_CPU_LIMIT": "2.0",
         "CONTAINER_IDLE_TIMEOUT": "259200", "COMMAND_TIMEOUT": "120",
         "SUB_AGENT_TIMEOUT": "3600", "RETENTION_CHECK_INTERVAL_SECONDS": "3600",
@@ -557,6 +559,43 @@ class OverlayStructureTests(unittest.TestCase):
                     self.assertEqual(stacks["webui.json"]["services"]["postgres"]["command"], [
                         "postgres", "-c", f"timezone={zone}", "-c", f"log_timezone={zone}",
                     ])
+
+    def test_open_webui_requires_the_prompts_directory(self):
+        volumes = parsed(WEBUI_OVERRIDE)["services"]["open-webui"]["volumes"]
+        self.assertEqual(len(volumes), 1)
+        self.assertTrue(interpolated(volumes[0]["source"], "OCU_PROMPTS_DIR"), volumes[0])
+        with self.assertRaises(UnsupportedInterpolation):
+            interpolate_value(volumes[0]["source"], {})
+
+    def test_native_compose_mounts_the_prompts_directory_read_only_and_never_config(self):
+        with tempfile.TemporaryDirectory(prefix="ocu-native-prompts-") as raw:
+            deploy_root = Path(raw) / "deploy-root"
+            prompts = deploy_root / "prompts"
+            config = deploy_root / "config"
+            stacks = resolved_stacks(Path(raw) / "stack", "false",
+                                     extra={"OCU_PROMPTS_DIR": str(prompts)})
+            webui = stacks["webui.json"]["services"]["open-webui"]
+            mounts = [m for m in webui["volumes"] if m["target"] == "/etc/ocu/prompts"]
+            self.assertEqual([(m["type"], m["source"], m.get("read_only")) for m in mounts],
+                             [("bind", str(prompts), True)])
+            # Compose omits false bind options from normalized JSON.
+            self.assertIs(mounts[0]["bind"].get("create_host_path", False), False)
+            for document, stack in stacks.items():
+                for name, body in stack["services"].items():
+                    for mount in body.get("volumes") or []:
+                        if mount["type"] != "bind":
+                            continue
+                        source = Path(mount["source"])
+                        with self.subTest(service=f"{document}:{name}", source=str(source)):
+                            self.assertNotEqual(source, config)
+                            self.assertNotIn(config, source.parents)
+                            self.assertNotEqual(source.name, "runtime.env")
+                            if mount["target"] == "/etc/ocu/prompts":
+                                self.assertEqual(f"{document}:{name}", "webui.json:open-webui")
+            # Only the stack that mounts the file opts in to installing the filter.
+            init_env = stacks["webui.json"]["services"]["open-webui-init"]["environment"]
+            self.assertEqual(init_env.get("OCU_ORG_PROMPT_FILTER"), "install")
+            self.assertNotIn("OCU_ORG_PROMPT_FILTER", webui.get("environment") or {})
 
     def test_adopted_local_dependencies_exist(self):
         for path in ADOPTED:

@@ -67,7 +67,7 @@ fi
 # 5. openwebui/functions/
 echo ""
 echo "[5/12] openwebui/functions/"
-for function_file in computer_link_filter.py video_production_filter.py; do
+for function_file in computer_link_filter.py video_production_filter.py org_prompt_filter.py; do
     if [ -f "$ROOT/openwebui/functions/$function_file" ]; then
         pass "openwebui/functions/$function_file"
     else

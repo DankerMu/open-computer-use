@@ -3,6 +3,27 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **Company system prompt from a Markdown file (#712).**
+  `openwebui/functions/org_prompt_filter.py` reads
+  `/etc/ocu/prompts/system-prompt.md` on every chat request and puts its text,
+  as written, in front of the first system message, or inserts one; a list
+  content gets a leading text part. The Computer Use filter appends, so the
+  company prompt precedes it whichever runs first, and Open WebUI puts the
+  model's own system prompt in front of both. It applies to every chat,
+  including temporary ones, without computer-use-server. An empty or
+  whitespace-only file injects nothing; a missing, symbolic-link, non-regular,
+  larger than 64 KiB, or non-UTF-8 file raises an error naming the file, also
+  logged at WARNING. Open WebUI prompt variables are not substituted. `init.sh`
+  installs it as `org_prompt_filter`, active and global, only when
+  `OCU_ORG_PROMPT_FILTER=install` (unset leaves an installed copy alone; any
+  other value stops init), and `remove-wrapper-model.py` checks it. The
+  production-like overlay sets that on `open-webui-init` and mounts
+  `${OCU_PROMPTS_DIR:?…}` read-only at `/etc/ocu/prompts` on `open-webui`, a
+  directory so that rename-saving editors are seen. `bootstrap-test.sh` writes
+  `OCU_PROMPTS_DIR=$DEPLOY_ROOT/prompts` and an empty `system-prompt.md`
+  (mode 0644, kept when present); `deploy/up.sh` requires the key and runs the
+  filter's own check on the host file before any Compose command
+  (NETWORK-HARDENING; backup, restore and rollback in BACKUP-RESTORE).
 - **Images in the chat reach the sandbox (#707).** Before each tool call the
   Open WebUI tool (4.2.0) reads the messages of the chat, when the requesting
   user owns it, and takes the files of type `image` whose URL is

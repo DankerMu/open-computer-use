@@ -134,6 +134,27 @@ if [[ ! -d "$OCU_OFFICE_FONTS_DIR" ]]; then
     printf '%s\n' 'deploy: OCU_OFFICE_FONTS_DIR must be an existing directory' >&2
     exit 1
 fi
+# open-webui mounts this directory read-only and its company prompt filter reads
+# system-prompt.md on every chat request (#712). Refuse a file the filter would reject.
+require OCU_PROMPTS_DIR
+if [[ "$OCU_PROMPTS_DIR" != /* ]]; then
+    export OCU_PROMPTS_DIR="$PWD/$OCU_PROMPTS_DIR"
+fi
+if ! run_owned python3 - "$ROOT/openwebui/functions" "$OCU_PROMPTS_DIR/system-prompt.md" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from org_prompt_filter import OrgPromptError, read_org_prompt
+
+try:
+    read_org_prompt(Path(sys.argv[2]))
+except OrgPromptError as exc:
+    raise SystemExit(f"deploy: {exc}")
+PY
+then
+    exit 1
+fi
 CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ocu-deploy-config.XXXXXX")"
 : >"$CONFIG_DIR/empty.env"
 # Every service and sandbox follows the host's zone (#708). It is derived on

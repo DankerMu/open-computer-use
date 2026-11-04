@@ -531,6 +531,35 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
                 token,
             )
 
+    def test_new_deployment_gets_an_empty_company_prompt(self):
+        # The directory is fixed under the deployment root; an ambient value cannot move it.
+        result = self.run_bootstrap(extra={"OCU_PROMPTS_DIR": str(self.root / "ambient-prompts")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompts = self.deploy_root / "prompts"
+        runtime = parse_env_file(self.runtime_path())
+        self.assertEqual(runtime["OCU_PROMPTS_DIR"], str(prompts))
+        self.assertFalse((self.root / "ambient-prompts").exists())
+        self.assertEqual(sorted(path.name for path in prompts.iterdir()), ["system-prompt.md"])
+        self.assertEqual((prompts / "system-prompt.md").read_bytes(), b"")
+        # Read by the open-webui container user; never the 0700 config directory.
+        self.assertEqual(stat.S_IMODE(prompts.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((prompts / "system-prompt.md").stat().st_mode), 0o644)
+        self.assertNotEqual(prompts, self.runtime_path().parent)
+
+    def test_existing_company_prompt_is_kept(self):
+        prompts = self.deploy_root / "prompts"
+        prompts.mkdir(mode=0o750)
+        existing = prompts / "system-prompt.md"
+        existing.write_text("你是示例公司的助手。\n", encoding="utf-8")
+        existing.chmod(0o640)
+        before = (existing.stat().st_ino, existing.stat().st_mode, existing.stat().st_mtime_ns)
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "你是示例公司的助手。\n")
+        self.assertEqual((existing.stat().st_ino, existing.stat().st_mode, existing.stat().st_mtime_ns),
+                         before)
+        self.assertEqual(stat.S_IMODE(prompts.stat().st_mode), 0o750)
+
     def test_direct_startup_refuses_mismatched_reader_contract_before_resource_changes(self):
         created = self.run_bootstrap()
         self.assertEqual(created.returncode, 0, created.stderr)

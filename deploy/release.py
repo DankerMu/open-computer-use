@@ -88,6 +88,7 @@ SOURCE_BIND_PATHS = (
     "openwebui/tools/computer_use_tools.py",
     "openwebui/functions/computer_link_filter.py",
     "openwebui/functions/video_production_filter.py",
+    "openwebui/functions/org_prompt_filter.py",
 )
 SOURCE_CONSUMER_PATHS = (
     "deploy/release.py",
