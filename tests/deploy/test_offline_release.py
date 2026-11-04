@@ -3816,6 +3816,15 @@ class BindPathCoverageTests(unittest.TestCase):
         self.assertTrue(shipped)
         self.assertLessEqual(shipped, set(release.SOURCE_BIND_PATHS))
 
+    def test_every_listed_bind_file_is_tracked(self):
+        # verify_tracked_source skips a listed file its commit lacks (#715), so this
+        # checkout must track each one it lists.
+        listed = subprocess.run(
+            ["git", "ls-files", "--", *release.SOURCE_BIND_PATHS],
+            cwd=str(ROOT), capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(set(listed.stdout.splitlines()), set(release.SOURCE_BIND_PATHS))
+
 
 class OlderReleaseBindFileTests(unittest.TestCase):
     """This checkout verifies a retained release that predates some of its bind files (#715)."""
