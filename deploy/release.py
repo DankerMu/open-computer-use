@@ -2493,6 +2493,9 @@ def build_release(
         ocu_tree = snapshots / "ocu-tree"
         webui_tree = snapshots / "webui-tree"
         checkout_tracked_tree(ocu_snap, ocu_tree, ocu_sha)
+        # Verification later skips a bind file its commit lacks (#715): a new build ships each.
+        for relative in SOURCE_BIND_PATHS:
+            require_tracked_regular_file(ocu_tree, relative)
         checkout_tracked_tree(webui_snap, webui_tree, webui_sha)
         contract = require_supported_source_contract(ocu_tree)
         if contract != SOURCE_CONSUMER_CONTRACT:

@@ -1123,6 +1123,19 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertFalse(any(" image rm " in line for line in ops(self.state)))
         self.assertFalse(destination.exists())
 
+    def test_build_of_a_commit_without_a_listed_bind_file_fails_before_building(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        relative = "openwebui/functions/org_prompt_filter.py"
+        subprocess.run(["git", "rm", "-q", relative], cwd=str(ocu), check=True, capture_output=True)
+        subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "drop a bind file"],
+                       cwd=str(ocu), check=True, capture_output=True)
+        destination = self.root / "unlisted-bind-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{relative}: missing required build input", result.stderr)
+        self.assertEqual(self.recorded_builds(), [])
+        self.assertFalse(destination.exists())
+
     def test_stale_scratch_tag_with_the_same_pid_is_not_a_conflict_and_is_kept(self):
         ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
         stale = {"Id": "sha256:" + "5" * 64, "Os": "linux", "Architecture": "amd64"}
