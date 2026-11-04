@@ -141,6 +141,29 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **Backups carry the company system prompt (#715).** `recovery.py backup`
+  reads `system-prompt.md` in `OCU_PROMPTS_DIR` before anything stops and
+  stores it in the set as the `system-prompt` component with its checksum; a
+  missing file, a link or non-regular file, or a directory outside the
+  deployment root refuses the backup with the stack still running. So does an
+  `open-webui` mount of `/etc/ocu/prompts` from another directory, or one
+  while `runtime.env` has no `OCU_PROMPTS_DIR`; only with neither the mount nor
+  the key (a release before #712) does the backup go ahead without the file.
+  The bytes are kept as they are, so a file the filter refuses restores and
+  `up.sh` refuses it at activation.
+  `restore` writes it to `<new root>/prompts/system-prompt.md` (0755/0644) and
+  sets `OCU_PROMPTS_DIR` to that directory with the other data paths, where it
+  used to keep the old root. A set without the file restores an empty one,
+  sets the key and says so on stderr.
+- **A retained release older than #712 can be selected again (#715).**
+  `verify_tracked_source` required every bind file this checkout lists, so
+  `activate`, `restore --retained-delivery`, `retarget` and `release.py import`
+  refused a release without `org_prompt_filter.py` or
+  `video_production_filter.py` with `required bind asset is missing`. Bind files
+  are now checked against the selected commit: each one it holds must be
+  present and unchanged, and one it does not hold must be absent.
+  `release.py build` refuses a commit that does not track every bind file it
+  lists, before any image is built.
 - **`recovery.py retarget` accepts a WebUI-only release (#711).** The backup
   of the previous `runtime.env` was named after the target OCU commit alone
   (`runtime.env.before-<ocu12>`), so a second release with the same OCU commit

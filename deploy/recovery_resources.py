@@ -34,6 +34,9 @@ LINK_POLICY = {
     "chat-data": "verbatim",
     "workspaces": "verbatim",
 }
+# The company system prompt (#712): open-webui mounts its directory, OCU_PROMPTS_DIR.
+SYSTEM_PROMPT_NAME = "system-prompt.md"
+PROMPTS_MOUNT = "/etc/ocu/prompts"
 
 
 def _office_timeout() -> float:
@@ -269,6 +272,29 @@ def remap_declared_data_roots(
 
 
 
+def read_system_prompt(runtime: dict[str, str], deploy_root: Path) -> bytes | None:
+    """Return the company prompt's bytes, or None for a release before #712 (no key)."""
+    value = runtime.get("OCU_PROMPTS_DIR")
+    if not value:
+        return None
+    path = _require_root_scoped_path(value, deploy_root, "OCU_PROMPTS_DIR") / SYSTEM_PROMPT_NAME
+    name = f"company system prompt {path}"
+    try:
+        with ExitStack() as held:
+            fd = _open_regular_nofollow(held, (str(path),))
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                return stream.read()
+    except FileNotFoundError:
+        raise RecoveryError(f"{name} is missing") from None
+    # Only the directory is mounted: a link's target would be missing in open-webui.
+    except ValueError:
+        raise RecoveryError(f"{name} is not a regular file") from None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RecoveryError(f"{name} is a symbolic link") from None
+        raise RecoveryError(f"{name} is unreadable: {exc.strerror}") from None
+
+
 def deployment_identity(runtime: dict[str, str], deploy_root: Path) -> dict:
     project = runtime.get("COMPOSE_PROJECT_NAME") or "ocu-test"
     chat_raw = runtime.get("OCU_CHAT_DATA_DIR") or str(deploy_root / "data" / "chat")
@@ -421,6 +447,26 @@ def _stop_writer(name: str) -> None:
         _stop_container(name)
 
 
+def _require_prompts_mount(name: str, payload: dict, runtime: dict[str, str]) -> None:
+    """Refuse when open-webui reads a company prompt other than the one backup captures."""
+    mounts = [mount for mount in _mounts(payload) if mount.get("Destination") == PROMPTS_MOUNT]
+    declared = runtime.get("OCU_PROMPTS_DIR")
+    if not mounts:
+        return
+    if not declared:
+        raise RecoveryError(f"{name} mounts {PROMPTS_MOUNT} but runtime has no OCU_PROMPTS_DIR")
+    try:
+        matches = (
+            len(mounts) == 1
+            and mounts[0].get("Type") == "bind"
+            and Path(str(mounts[0].get("Source") or "")).resolve() == Path(declared).resolve()
+        )
+    except OSError as cop:
+        raise RecoveryError(f"OCU_PROMPTS_DIR cannot be resolved: {cop}") from cop
+    if not matches:
+        raise RecoveryError(f"{name} {PROMPTS_MOUNT} mount does not match OCU_PROMPTS_DIR")
+
+
 def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inventory: dict) -> None:
     expected_images = {
         identity["server_container"]: inventory["images"]["computer-use-server"],
@@ -483,6 +529,9 @@ def _require_stack_matches_runtime(identity: dict, runtime: dict[str, str], inve
             required_mounts = {"/var/lib/postgresql/data": ("volume", identity["postgres_volume"])}
         elif name in (identity["webui_container"], identity["init_container"]):
             required_mounts = {"/app/backend/data": ("volume", identity["webui_volume"])}
+        if name == identity["webui_container"]:
+            # Read-only, so not one of the read-write data mounts below.
+            _require_prompts_mount(name, payload, runtime)
         for destination, (kind, expected_source) in required_mounts.items():
             matches = [mount for mount in _mounts(payload) if mount.get("Destination") == destination]
             if len(matches) != 1:
@@ -756,6 +805,8 @@ def backup_deployment(*, deploy_root: Path, destination: Path, runtime_file: Pat
     try:
         session.acquire()
         with release.ImageStoreLock(recovery.recovery_lock_path(identity_name)):
+            # Before anything stops: an unusable file refuses with the stack running.
+            system_prompt = read_system_prompt(runtime, deploy_root)
             quiesced = establish_quiescence(identity, runtime, inventory)
             stage = session.allocate_stage()
             os.chmod(stage, 0o700)
@@ -787,6 +838,13 @@ def backup_deployment(*, deploy_root: Path, destination: Path, runtime_file: Pat
                 links=LINK_POLICY["skills-cache"],
             )
             components["skills-cache"]["path"] = "skills-cache.tar.gz"
+            components["system-prompt"] = {"path": None, "sha256": None}
+            if system_prompt is not None:
+                recovery.write_private_bytes(stage / SYSTEM_PROMPT_NAME, system_prompt)
+                components["system-prompt"] = {
+                    "path": SYSTEM_PROMPT_NAME,
+                    "sha256": recovery.sha256_bytes(system_prompt),
+                }
             workspaces = {}
             workspace_dir = stage / "workspaces"
             workspace_dir.mkdir()
@@ -904,16 +962,18 @@ def verify_recovery_set(root: Path, *, require_published: bool = True) -> dict:
         if _normalized_component_path(record["path"]) != expected:
             raise RecoveryError(f"{key} path is not the declared recovery component")
         claim_path(record["path"], record["sha256"])
-    admin = components.get("admin-config") or {}
-    if admin.get("path"):
-        if _normalized_component_path(admin["path"]) != "admin-credentials.txt":
-            raise RecoveryError("admin-config path is not the declared recovery component")
-        claim_path(admin["path"], admin["sha256"])
-    version = components.get("version-record") or {}
-    if version.get("path"):
-        if _normalized_component_path(version["path"]) != "DEPLOYED_VERSION.md":
-            raise RecoveryError("version-record path is not the declared recovery component")
-        claim_path(version["path"], version["sha256"])
+    # Optional files; a set captured before #715 has no system-prompt record at all.
+    optional_roles = {
+        "admin-config": "admin-credentials.txt",
+        "version-record": "DEPLOYED_VERSION.md",
+        "system-prompt": SYSTEM_PROMPT_NAME,
+    }
+    for key, expected in optional_roles.items():
+        record = components.get(key) or {}
+        if record.get("path"):
+            if _normalized_component_path(record["path"]) != expected:
+                raise RecoveryError(f"{key} path is not the declared recovery component")
+            claim_path(record["path"], record["sha256"])
     if not _archive_contains(
         recovery.confined_component_path(root, components["webui-data"]["path"]),
         recovery.MARKER_NAME,
@@ -991,6 +1051,7 @@ def bind_selected_runtime(captured: dict[str, str], inventory: dict, destination
         values.pop(key, None)
     values["OCU_CHAT_DATA_DIR"] = str(destination_root / "data" / "chat")
     values["OCU_SKILLS_CACHE_DIR"] = str(destination_root / "data" / "skills-cache")
+    values["OCU_PROMPTS_DIR"] = str(destination_root / "prompts")
     values["OCU_RELEASE_MANIFEST"] = str(destination_root / "release.json")
     values["SOURCE_SHA"] = inventory["ocu_source_sha"]
     values["WEBUI_SOURCE_SHA"] = inventory["webui_source_sha"]
@@ -1261,6 +1322,25 @@ def import_selected_release(delivery: Path, install_root: Path) -> dict:
 
 
 
+def _stage_system_prompt(recovery_set: Path, record: dict, stage: Path, destination_root: Path) -> None:
+    """Write the captured company prompt, or an empty one, where restored open-webui mounts it."""
+    data = b""
+    if record.get("path"):
+        data = recovery.confined_component_path(recovery_set, record["path"]).read_bytes()
+    else:
+        recovery.report(
+            "the recovery set has no company system prompt; "
+            f"{destination_root / 'prompts' / SYSTEM_PROMPT_NAME} is empty"
+        )
+    prompts = stage / "prompts"
+    prompts.mkdir()
+    os.chmod(prompts, 0o755)
+    fd = os.open(prompts / SYSTEM_PROMPT_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "wb") as stream:
+        os.fchmod(stream.fileno(), 0o644)
+        stream.write(data)
+
+
 def _own_created(owned: list[str], name: str) -> None:
     if name not in owned:
         owned.append(name)
@@ -1382,6 +1462,9 @@ def restore_deployment(
                 recovery_set / payload["components"]["skills-cache"]["path"],
                 stage / "data" / "skills-cache",
                 links=LINK_POLICY["skills-cache"],
+            )
+            _stage_system_prompt(
+                recovery_set, payload["components"].get("system-prompt") or {}, stage, destination_root
             )
             version = payload["components"]["version-record"]
             if version.get("path"):

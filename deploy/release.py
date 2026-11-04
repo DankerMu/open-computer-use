@@ -2493,6 +2493,9 @@ def build_release(
         ocu_tree = snapshots / "ocu-tree"
         webui_tree = snapshots / "webui-tree"
         checkout_tracked_tree(ocu_snap, ocu_tree, ocu_sha)
+        # Verification later skips a bind file its commit lacks (#715): a new build ships each.
+        for relative in SOURCE_BIND_PATHS:
+            require_tracked_regular_file(ocu_tree, relative)
         checkout_tracked_tree(webui_snap, webui_tree, webui_sha)
         contract = require_supported_source_contract(ocu_tree)
         if contract != SOURCE_CONSUMER_CONTRACT:
@@ -2585,8 +2588,17 @@ def verify_tracked_source(root: Path, commit: str) -> None:
         raise ReleaseError(
             "tracked deployment or initializer files differ from the bundled commit"
         )
+    # The commit decides which bind files exist: an older retained release ships fewer
+    # than this checkout lists, and its own Compose files bind only those (#715).
+    listed = git("ls-tree", "-z", "--name-only", commit, "--", *SOURCE_BIND_PATHS, cwd=root)
+    require_command(listed, "list the bind files of the bundled commit")
+    shipped = set(listed.stdout.split("\0"))
     for relative in SOURCE_BIND_PATHS:
         path = root / relative
+        if relative not in shipped:
+            if os.path.lexists(path):
+                raise ReleaseError(f"{relative} is not in the bundled commit")
+            continue
         if not path.is_file():
             raise ReleaseError(f"required bind asset is missing: {relative}")
         current = path.read_bytes()

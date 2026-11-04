@@ -29,6 +29,7 @@ from support import (
     DEFAULT_RELEASE_IMAGES,
     FAKE_DOCKER,
     FONT_FILES,
+    NEWER_BIND_FILES,
     ROLE_ORDER,
     ROOT,
     UP_FIXTURE_PATHS,
@@ -43,6 +44,7 @@ from support import (
     prepare_up_context,
     seed_healthy_host,
     seed_images,
+    strip_newer_bind_files,
     synthetic_inventory,
     tmp_dir,
     write_fake_configs,
@@ -68,6 +70,8 @@ EMBEDDING_KEY = "credential-embedding"
 RERANKER_KEY = "credential-reranker"
 TTS_KEY = "credential-tts"
 PRECEDENCE_NOTICE = "recovery: restored persistent provider settings remain in effect"
+COMPANY_PROMPT = "Company rules: answer in Chinese.\n公司规则：先确认需求。\n".encode("utf-8")
+NO_PROMPT_NOTICE = "recovery: the recovery set has no company system prompt; {} is empty"
 MODEL_LINKS = {
     "bin/python3": "/usr/bin/python3",
     ".claude/agents/x.md": "/opt/skills-external/a/x.md",
@@ -116,6 +120,11 @@ def stack_container(name: str, *, running=True, paused=False, extra=None, image=
             body["Config"] = config
             body["Image"] = image_id
     return body
+
+
+def prompts_mount(source: Path) -> dict:
+    # The overlay's read-only company prompt directory on open-webui (#712).
+    return {"Type": "bind", "Source": str(source), "Destination": "/etc/ocu/prompts", "RW": False}
 
 
 def sandbox(name: str, chat_id: str, *, running=True, paused=False, chat_dir: Path | None = None):
@@ -173,6 +182,9 @@ class RecoveryCliTests(unittest.TestCase):
         self.skills_dir = self.deploy_root / "data" / "skills-cache"
         self.chat_dir.mkdir(parents=True)
         self.skills_dir.mkdir(parents=True)
+        self.prompts_dir = self.deploy_root / "prompts"
+        self.prompts_dir.mkdir(mode=0o755)
+        (self.prompts_dir / "system-prompt.md").write_bytes(COMPANY_PROMPT)
         self.env, self.up, self.source = prepare_up_context(self.state)
         self.env["PATH"] = str(FAKE_DOCKER.parent) + os.pathsep + self.env.get("PATH", "")
         self.env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
@@ -193,6 +205,7 @@ class RecoveryCliTests(unittest.TestCase):
             "COMPOSE_PROJECT_NAME": "ocu-test",
             "OCU_CHAT_DATA_DIR": str(self.chat_dir),
             "OCU_SKILLS_CACHE_DIR": str(self.skills_dir),
+            "OCU_PROMPTS_DIR": str(self.prompts_dir),
             "OCU_RELEASE_MANIFEST": self.env["OCU_RELEASE_MANIFEST"],
             "SOURCE_SHA": self.env["SOURCE_SHA"],
             "WEBUI_SOURCE_SHA": WEBUI_SYNTHETIC_SHA,
@@ -422,6 +435,8 @@ recovery_resources.time = SimpleNamespace(
                     "Name": "ocu-test_postgres-data" if is_pg else "ocu-test_open-webui-data",
                     "Destination": "/var/lib/postgresql/data" if is_pg else "/app/backend/data",
                 }]
+                if service == "open-webui":
+                    item["Mounts"].append(prompts_mount(self.prompts_dir))
         if extra_containers:
             containers.extend(extra_containers)
         (self.state / "containers.json").write_text(json.dumps(containers), encoding="utf-8")
@@ -523,11 +538,13 @@ recovery_resources.time = SimpleNamespace(
         self.recovery_pkg = package
         return path
 
-    def _write_retained_delivery(self, name="retained-delivery", images=None):
+    def _write_retained_delivery(self, name="retained-delivery", images=None, older=False):
         source = self.root / f"{name}-source"
         source.mkdir()
         for relative in UP_FIXTURE_PATHS:
             copy_tracked(relative, source)
+        if older:
+            strip_newer_bind_files(source)
         write_font_pin(source)
         (source / "README").write_text(f"retained delivery source {name}\n", encoding="utf-8")
         (source / "IDENTITY").write_text(f"{name}\n", encoding="utf-8")
@@ -771,6 +788,7 @@ recovery_resources.time = SimpleNamespace(
         self.assertEqual(set(manifest["components"]), {
             "database", "webui-data", "chat-data", "skills-cache", "workspaces",
             "runtime-config", "admin-config", "release-inventory", "version-record",
+            "system-prompt",
         })
         self.assertNotIn("documentserver-data", json.dumps(manifest))
         self.assertFalse((self.chat_dir / CHAT_ID / "uploads").exists())
@@ -1376,6 +1394,198 @@ else:
         )
         self.assertNotEqual(retry.returncode, 0)
 
+
+    def _set_webui_prompts_mount(self, source):
+        path = self.state / "containers.json"
+        containers = json.loads(path.read_text(encoding="utf-8"))
+        webui = next(row for row in containers if row["Name"] == "ocu-test-open-webui-1")
+        webui["Mounts"] = [m for m in webui["Mounts"] if m.get("Destination") != "/etc/ocu/prompts"]
+        if source is not None:
+            webui["Mounts"].append(prompts_mount(source))
+        path.write_text(json.dumps(containers), encoding="utf-8")
+
+    def _runtime_without_prompts_key(self):
+        return "".join(
+            line for line in self.runtime.read_text(encoding="utf-8").splitlines(keepends=True)
+            if not line.startswith("OCU_PROMPTS_DIR=")
+        )
+
+    def test_backup_refuses_a_prompts_mount_the_runtime_does_not_name(self):
+        original_runtime = self.runtime.read_text(encoding="utf-8")
+        other = self.root / "other-prompts"
+        cases = (
+            ("mount-without-key", self._runtime_without_prompts_key(), self.prompts_dir,
+             "ocu-test-open-webui-1 mounts /etc/ocu/prompts but runtime has no OCU_PROMPTS_DIR"),
+            ("other-source", original_runtime, other,
+             "ocu-test-open-webui-1 /etc/ocu/prompts mount does not match OCU_PROMPTS_DIR"),
+        )
+        for label, runtime_text, source, message in cases:
+            with self.subTest(label):
+                self._seed_volumes_and_db()
+                (self.state / "stopped.log").unlink(missing_ok=True)
+                self.runtime.write_text(runtime_text, encoding="utf-8")
+                self._set_webui_prompts_mount(source)
+                try:
+                    dest = self.root / f"refused-{label}"
+                    result = self._backup(dest)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+                    self.assertFalse(dest.exists())
+                    self.assertFalse((self.state / "stopped.log").exists())
+                finally:
+                    self.runtime.write_text(original_runtime, encoding="utf-8")
+        # The fixture's own stack mounts the directory OCU_PROMPTS_DIR names.
+        self._seed_volumes_and_db()
+        containers = json.loads((self.state / "containers.json").read_text(encoding="utf-8"))
+        webui = next(row for row in containers if row["Name"] == "ocu-test-open-webui-1")
+        self.assertIn(prompts_mount(self.prompts_dir), webui["Mounts"])
+        created = self._backup(self.root / "matching-mount")
+        self.assertEqual(created.returncode, 0, created.stderr)
+
+    def _assert_restored_prompt(self, dest, content):
+        prompts = dest / "prompts"
+        prompt = prompts / "system-prompt.md"
+        self.assertEqual(prompt.read_bytes(), content)
+        self.assertEqual(sorted(path.name for path in prompts.iterdir()), ["system-prompt.md"])
+        self.assertEqual(stat.S_IMODE(prompts.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(prompt.stat().st_mode), 0o644)
+        runtime = recovery.parse_dotenv(dest / "config" / "runtime.env")
+        self.assertEqual(runtime["OCU_PROMPTS_DIR"], str(prompts))
+
+    def test_company_prompt_is_captured_and_restored_under_the_new_root(self):
+        for label, content in (("prompt", COMPANY_PROMPT), ("empty-prompt", b"")):
+            with self.subTest(label):
+                self._seed_volumes_and_db()
+                (self.prompts_dir / "system-prompt.md").write_bytes(content)
+                backup = self.root / f"{label}-backup"
+                created = self._backup(backup)
+                self.assertEqual(created.returncode, 0, created.stderr)
+                manifest = json.loads((backup / "recovery.json").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    manifest["components"]["system-prompt"],
+                    {"path": "system-prompt.md", "sha256": hashlib.sha256(content).hexdigest()},
+                )
+                self.assertEqual((backup / "system-prompt.md").read_bytes(), content)
+                captured = recovery.parse_dotenv(backup / "runtime.env")
+                self.assertEqual(captured["OCU_PROMPTS_DIR"], str(self.prompts_dir))
+                restored, dest = self._restore_set(backup, label)
+                self.assertEqual(restored.returncode, 0, restored.stderr)
+                self.assertNotIn("no company system prompt", restored.stderr)
+                self._assert_restored_prompt(dest, content)
+
+    def test_verify_refuses_a_changed_company_prompt(self):
+        backup = self.root / "backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        (backup / "system-prompt.md").write_bytes(b"changed after capture\n")
+        result = self.run_cli(["verify", "--recovery-set", str(backup)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("system-prompt.md checksum mismatch", result.stderr)
+
+    def test_unusable_company_prompt_refuses_backup_before_quiesce(self):
+        prompt = self.prompts_dir / "system-prompt.md"
+        elsewhere = self.deploy_root / "prompt-elsewhere.md"
+        elsewhere.write_bytes(COMPANY_PROMPT)
+        outside = self.root / "outside-prompts"
+        outside.mkdir()
+        (outside / "system-prompt.md").write_bytes(COMPANY_PROMPT)
+        original_runtime = self.runtime.read_text(encoding="utf-8")
+        cases = (
+            ("missing", lambda: prompt.unlink(), f"company system prompt {prompt} is missing"),
+            ("link", lambda: (prompt.unlink(), prompt.symlink_to(elsewhere)),
+             f"company system prompt {prompt} is a symbolic link"),
+            ("directory", lambda: (prompt.unlink(), prompt.mkdir()),
+             f"company system prompt {prompt} is not a regular file"),
+            ("outside", lambda: self.runtime.write_text(
+                original_runtime.replace(f"OCU_PROMPTS_DIR={self.prompts_dir}", f"OCU_PROMPTS_DIR={outside}"),
+                encoding="utf-8",
+            ), "OCU_PROMPTS_DIR is outside the selected deployment root"),
+        )
+        for label, damage, message in cases:
+            with self.subTest(label):
+                self._seed_volumes_and_db()
+                (self.state / "stopped.log").unlink(missing_ok=True)
+                damage()
+                try:
+                    dest = self.root / f"refused-{label}"
+                    result = self._backup(dest)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+                    self.assertFalse(dest.exists())
+                    self.assertFalse((self.state / "stopped.log").exists())
+                finally:
+                    if prompt.is_dir() and not prompt.is_symlink():
+                        prompt.rmdir()
+                    elif os.path.lexists(prompt):
+                        prompt.unlink()
+                    prompt.write_bytes(COMPANY_PROMPT)
+                    self.runtime.write_text(original_runtime, encoding="utf-8")
+
+    def test_set_without_company_prompt_restores_an_empty_prompt_and_says_so(self):
+        # Before #712: no prompts mount on open-webui and no OCU_PROMPTS_DIR in runtime.env.
+        without_key = self._runtime_without_prompts_key()
+        for label in ("captured-before-712", "release-before-712"):
+            with self.subTest(label):
+                self._seed_volumes_and_db()
+                backup = self.root / f"{label}-backup"
+                if label == "release-before-712":
+                    # This checkout backs up a deployment that still runs a release before #712.
+                    self.runtime.write_text(without_key, encoding="utf-8")
+                    self._set_webui_prompts_mount(None)
+                created = self._backup(backup)
+                self.assertEqual(created.returncode, 0, created.stderr)
+                manifest = json.loads((backup / "recovery.json").read_text(encoding="utf-8"))
+                if label == "captured-before-712":
+                    # Rewrite the set as recovery.py before #715 wrote it for a deployment before #712.
+                    del manifest["components"]["system-prompt"]
+                    (backup / "system-prompt.md").unlink()
+                    runtime = backup / "runtime.env"
+                    runtime.write_text(without_key, encoding="utf-8")
+                    manifest["components"]["runtime-config"]["sha256"] = hashlib.sha256(
+                        runtime.read_bytes()
+                    ).hexdigest()
+                    (backup / "recovery.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                else:
+                    self.assertEqual(manifest["components"]["system-prompt"], {"path": None, "sha256": None})
+                    self.assertFalse((backup / "system-prompt.md").exists())
+                self.assertNotIn("OCU_PROMPTS_DIR", (backup / "runtime.env").read_text(encoding="utf-8"))
+                restored, dest = self._restore_set(backup, label)
+                self.assertEqual(restored.returncode, 0, restored.stderr)
+                notice = NO_PROMPT_NOTICE.format(dest / "prompts" / "system-prompt.md")
+                self.assertEqual(restored.stderr.splitlines().count(notice), 1, restored.stderr)
+                self.assertNotIn("no company system prompt", restored.stdout)
+                self._assert_restored_prompt(dest, b"")
+
+    def test_activation_of_a_release_without_newer_bind_files(self):
+        backup = self.root / "backup"
+        created = self._backup(backup)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provider = self.root / "provider.env"
+        provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
+        os.chmod(provider, 0o600)
+        target_state = self._seed_restore_target("older-release-state")
+        write_fake_configs(target_state, font_mount_docs())
+        extra = {"FAKE_DOCKER_STATE": str(target_state)}
+        dest = self.root / "older-release-root"
+        restored = self.run_cli(
+            ["restore", "--recovery-set", str(backup), "--destination-root", str(dest),
+             "--provider-file", str(provider)],
+            extra=extra,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        delivery, payload, _source = self._write_retained_delivery("older-delivery", older=True)
+        activated = self.run_cli(
+            ["activate", "--destination-root", str(dest), "--retained-delivery", str(delivery)],
+            extra=extra,
+        )
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        installed = json.loads((dest / "release.json").read_text(encoding="utf-8"))
+        self.assertEqual(installed["ocu_source_sha"], payload["ocu_source_sha"])
+        for relative in NEWER_BIND_FILES:
+            self.assertFalse((dest / "source" / relative).exists())
+        self.assertEqual((target_state / "starts.log").read_text(encoding="utf-8").splitlines(),
+                         ["core", "webui", "proxy"])
+        self._assert_restored_prompt(dest, COMPANY_PROMPT)
 
     def test_mixed_component_membership_rejects_before_allocation(self):
         backup = self.root / "backup"
@@ -2204,6 +2414,9 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
             # Backup refuses a damaged source index, so damage the captured set instead.
             damage_captured(self.chat_dir / CHAT_ID / ".ocu")
             self._recapture_chat_data(backup)
+        return self._restore_set(backup, name)
+
+    def _restore_set(self, backup, name):
         provider = self.root / f"{name}-provider.env"
         provider.write_text(f"DMXAPI_API_KEY={PROVIDER_B}\n", encoding="utf-8")
         os.chmod(provider, 0o600)

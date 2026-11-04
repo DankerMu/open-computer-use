@@ -23,11 +23,14 @@ from support import (
     FAKE_DOCKER,
     FONT_FILES,
     HISTORICAL_INCOMPATIBLE_SOURCE,
+    NEWER_BIND_FILES,
     ROOT,
     ROLE_ORDER,
     SOURCE_CONSUMER_CONTRACT,
+    UP_FIXTURE_PATHS,
     WEBUI_SYNTHETIC_SHA,
     config_payload,
+    copy_tracked,
     fake_env,
     git_init_commit,
     image_id_for_config,
@@ -41,6 +44,7 @@ from support import (
     seed_healthy_host,
     seed_images,
     serve_font_archive,
+    strip_newer_bind_files,
     synthetic_inventory,
     tmp_dir,
     write_fake_configs,
@@ -1117,6 +1121,19 @@ class OfflineReleaseTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("scripted build failure", result.stderr)
         self.assertFalse(any(" image rm " in line for line in ops(self.state)))
+        self.assertFalse(destination.exists())
+
+    def test_build_of_a_commit_without_a_listed_bind_file_fails_before_building(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        relative = "openwebui/functions/org_prompt_filter.py"
+        subprocess.run(["git", "rm", "-q", relative], cwd=str(ocu), check=True, capture_output=True)
+        subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "drop a bind file"],
+                       cwd=str(ocu), check=True, capture_output=True)
+        destination = self.root / "unlisted-bind-build"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{relative}: missing required build input", result.stderr)
+        self.assertEqual(self.recorded_builds(), [])
         self.assertFalse(destination.exists())
 
     def test_stale_scratch_tag_with_the_same_pid_is_not_a_conflict_and_is_kept(self):
@@ -3811,6 +3828,54 @@ class BindPathCoverageTests(unittest.TestCase):
         }
         self.assertTrue(shipped)
         self.assertLessEqual(shipped, set(release.SOURCE_BIND_PATHS))
+
+    def test_every_listed_bind_file_is_tracked(self):
+        # verify_tracked_source skips a listed file its commit lacks (#715), so this
+        # checkout must track each one it lists.
+        listed = subprocess.run(
+            ["git", "ls-files", "--", *release.SOURCE_BIND_PATHS],
+            cwd=str(ROOT), capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(set(listed.stdout.splitlines()), set(release.SOURCE_BIND_PATHS))
+
+
+class OlderReleaseBindFileTests(unittest.TestCase):
+    """This checkout verifies a retained release that predates some of its bind files (#715)."""
+
+    def setUp(self):
+        self.context = tmp_dir()
+        self.source = Path(self.context.name) / "source"
+        for relative in UP_FIXTURE_PATHS:
+            copy_tracked(relative, self.source)
+        write_font_pin(self.source)
+
+    def tearDown(self):
+        self.context.cleanup()
+
+    def test_release_without_newer_bind_files_verifies(self):
+        strip_newer_bind_files(self.source)
+        commit = git_init_commit(self.source, "release before #712")
+        release.verify_tracked_source(self.source, commit)
+
+    def test_bind_file_added_beside_a_commit_without_it_is_refused(self):
+        strip_newer_bind_files(self.source)
+        commit = git_init_commit(self.source, "release before #712")
+        planted = self.source / NEWER_BIND_FILES[1]
+        planted.write_text("planted\n", encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, f"{NEWER_BIND_FILES[1]} is not in the bundled commit"):
+            release.verify_tracked_source(self.source, commit)
+
+    def test_bind_file_in_the_commit_must_be_present_and_unchanged(self):
+        commit = git_init_commit(self.source, "release with every bind file")
+        release.verify_tracked_source(self.source, commit)
+        path = self.source / NEWER_BIND_FILES[1]
+        original = path.read_bytes()
+        path.unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "differ from the bundled commit"):
+            release.verify_tracked_source(self.source, commit)
+        path.write_bytes(original + b"# changed\n")
+        with self.assertRaisesRegex(release.ReleaseError, "differ from the bundled commit"):
+            release.verify_tracked_source(self.source, commit)
 
 
 if __name__ == "__main__":
