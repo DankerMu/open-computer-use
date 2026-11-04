@@ -390,9 +390,10 @@ Editing:
 - Edit the file on the host as root with any editor and save it as UTF-8. The next chat message uses the new text. No container restart and no `up.sh` are needed. Editors that save by renaming a new file over the old one work, because the directory is mounted, not the file. Do not replace the `prompts` directory itself: the container keeps the old directory until `up.sh` recreates it.
 - The text is sent exactly as written, on every request, so keep it short. The limit is 65536 bytes; a Chinese character takes 3 bytes.
 - An empty or whitespace-only file adds nothing.
-- Open WebUI prompt variables such as `{{CURRENT_DATE}}` and `{{USER_NAME}}` are not substituted: Open WebUI substitutes them before this filter runs. Do not use them. A line with one also makes the Computer Use filter insert its prompt before that paragraph, inside the company text.
-- A missing file, a directory in its place, a file larger than 65536 bytes, or a file that is not UTF-8 makes every chat fail with `company system prompt /etc/ocu/prompts/system-prompt.md is …`, which names the container path of this file, until the file is fixed. `deploy/up.sh` refuses to start, before any Compose command, with `deploy: company system prompt <host path> is …`, and with `deploy: OCU_PROMPTS_DIR is required` when the key is missing or empty.
+- Open WebUI prompt variables such as `{{CURRENT_DATE}}` and `{{USER_NAME}}` are not substituted: Open WebUI substitutes them before this filter runs. Do not use them.
+- A missing file, a directory or symbolic link in its place, a file larger than 65536 bytes, or a file that is not UTF-8 makes every chat fail with `company system prompt /etc/ocu/prompts/system-prompt.md is …`, which names the container path of this file, until the file is fixed. `open-webui` also logs the same line at WARNING, so `docker logs ocu-test-open-webui-1` shows it. `deploy/up.sh` refuses to start, before any Compose command, with `deploy: company system prompt <host path> is …`, and with `deploy: OCU_PROMPTS_DIR is required` when the key is missing or empty. A link is refused because only the directory is mounted: its target would be missing in the container. Copy the file into `prompts/` instead.
 - To stop the injection, switch off Company System Prompt in 管理员面板 > 函数. Chats then no longer read the file. Re-running the initializer switches it on again.
+- `init.sh` installs the function only when `OCU_ORG_PROMPT_FILTER=install`, which the overlay sets on `open-webui-init`. Any other value stops the initializer with `OCU_ORG_PROMPT_FILTER must be unset or install`. Unset, it neither installs nor changes an installed copy.
 
 Upgrade as in [Upgrading an existing deployment](#upgrading-an-existing-deployment), with these additions.
 
@@ -410,9 +411,7 @@ Upgrade as in [Upgrading an existing deployment](#upgrading-an-existing-deployme
 2. **After step 7**, re-run the initializer as in [step 2 of the #590 section](#re-running-the-initializer-and-removing-the-wrapper-model-590). It installs `org_prompt_filter` as Company System Prompt, active and global, with the side effects listed there. Then run step 3's removal script once as a check: it exits 0 only when the three filters and the tool equal the shipped files byte for byte.
 3. Check: write a short identity into the file, for example `你是示例公司的助手。`, and ask a model `你是谁` in a new chat. The answer reflects it. Change the text and ask again: the next answer reflects the change.
 
-Rollback: an older release does not mount the directory, but the function stays in the database, active and global, so every chat fails with `company system prompt … is missing`. Switch off Company System Prompt in 管理员面板 > 函数 after the rollback. The extra `OCU_PROMPTS_DIR` line is ignored by older releases.
-
-`recovery.py backup` does not copy `prompts/`, and `restore` keeps `OCU_PROMPTS_DIR` as captured. Keep a copy of `system-prompt.md` with the backup. After restoring into another root, copy the file into `<new root>/prompts/` and set `OCU_PROMPTS_DIR` to that directory before `activate`; a backup from an older release has no `OCU_PROMPTS_DIR`, and `up.sh` refuses until it is added.
+Rollback to an older release, and backup and restore of the prompt file, are covered in [BACKUP-RESTORE.md](../BACKUP-RESTORE.md).
 
 ## Re-running the initializer and removing the wrapper model (#590)
 
