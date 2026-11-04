@@ -48,6 +48,8 @@ if not any(model.get('id') == target for model in data):
 '''
 VIDEO_FILTER = "video_production_filter"
 VIDEO_FILTER_NAME = "视频制作"
+ORG_FILTER = "org_prompt_filter"
+ORG_FILTER_NAME = "Company System Prompt"
 PUBLIC_GRANTS = [
     {"principal_type": "group", "principal_id": "*", "permission": "read"},
     {"principal_type": "user", "principal_id": "*", "permission": "read"},
@@ -58,6 +60,7 @@ ALLOWED_GET = {
     "/api/v1/tools/id/ai_computer_use",
     "/api/v1/functions/id/computer_use_filter",
     f"/api/v1/functions/id/{VIDEO_FILTER}",
+    f"/api/v1/functions/id/{ORG_FILTER}",
     "/api/v1/configs/models",
 }
 ALLOWED_POST = {
@@ -75,6 +78,9 @@ ALLOWED_POST = {
     f"/api/v1/functions/id/{VIDEO_FILTER}/update",
     f"/api/v1/functions/id/{VIDEO_FILTER}/toggle",
     f"/api/v1/functions/id/{VIDEO_FILTER}/toggle/global",
+    f"/api/v1/functions/id/{ORG_FILTER}/update",
+    f"/api/v1/functions/id/{ORG_FILTER}/toggle",
+    f"/api/v1/functions/id/{ORG_FILTER}/toggle/global",
     "/api/v1/configs/models",
 }
 
@@ -222,6 +228,9 @@ class FakeWebUI:
                     if owner.mode == "video-state-failure" and function_id == VIDEO_FILTER:
                         self.send_error(503)
                         return
+                    if owner.mode == "org-state-failure" and function_id == ORG_FILTER:
+                        self.send_error(503)
+                        return
                     function = owner.functions.get(function_id)
                     if function is None:
                         self.send_error(404)
@@ -277,6 +286,9 @@ class FakeWebUI:
                     return self._json(200, payload)
                 if path == "/api/v1/functions/create":
                     function_id = (payload or {}).get("id")
+                    if owner.mode == "org-create-failure" and function_id == ORG_FILTER:
+                        self.send_error(500)
+                        return
                     if owner.mode == "video-create-failure" and function_id == VIDEO_FILTER:
                         self.send_error(500)
                         return
@@ -296,6 +308,9 @@ class FakeWebUI:
                         current.update(payload or {})
                         owner.functions[function_id] = current
                         return self._json(200, current)
+                    if owner.mode == "org-toggle-failure" and function_id == ORG_FILTER:
+                        self.send_error(500)
+                        return
                     if owner.mode == "video-toggle-failure" and function_id == VIDEO_FILTER:
                         self.send_error(500)
                         return
@@ -447,6 +462,7 @@ class InitWrapperTests(unittest.TestCase):
         self.assertTrue(function["is_active"])
         self.assertTrue(function["is_global"])
         self.assert_video_filter_installed()
+        self.assert_org_filter_installed()
         self.assertEqual(self.webui.posted_config["DEFAULT_MODELS"], PRIMARY_MODEL)
         self.assertEqual(
             self.webui.posted_config["DEFAULT_MODEL_PARAMS"],
@@ -457,15 +473,21 @@ class InitWrapperTests(unittest.TestCase):
         self.assertEqual(self.webui.posted_config["DEFAULT_MODEL_METADATA"], {"keep": True})
         self.assert_no_wrapper_model()
 
+    def assert_function_installed(self, function_id, name):
+        function = self.webui.functions[function_id]
+        shipped = (SOURCE / "functions" / f"{function_id}.py").read_text(encoding="utf-8")
+        self.assertEqual(function["id"], function_id)
+        self.assertEqual(function["name"], name)
+        self.assertEqual(function["content"], shipped)
+        self.assertTrue(function["is_active"])
+        self.assertTrue(function["is_global"])
+        self.assertNotIn(f"POST /api/v1/functions/id/{function_id}/valves/update", self.webui.calls)
+
     def assert_video_filter_installed(self):
-        video = self.webui.functions[VIDEO_FILTER]
-        shipped = (SOURCE / "functions" / f"{VIDEO_FILTER}.py").read_text(encoding="utf-8")
-        self.assertEqual(video["id"], VIDEO_FILTER)
-        self.assertEqual(video["name"], VIDEO_FILTER_NAME)
-        self.assertEqual(video["content"], shipped)
-        self.assertTrue(video["is_active"])
-        self.assertTrue(video["is_global"])
-        self.assertNotIn(f"POST /api/v1/functions/id/{VIDEO_FILTER}/valves/update", self.webui.calls)
+        self.assert_function_installed(VIDEO_FILTER, VIDEO_FILTER_NAME)
+
+    def assert_org_filter_installed(self):
+        self.assert_function_installed(ORG_FILTER, ORG_FILTER_NAME)
 
     def assert_no_wrapper_model(self):
         # The tool reaches every model through the global filter (#590); no
@@ -669,11 +691,30 @@ class InitWrapperTests(unittest.TestCase):
         self.assertTrue((self.data / MARKER_NAME).is_file())
         self.assert_video_filter_installed()
         calls = self.webui.calls
-        self.assertEqual(calls.count("POST /api/v1/functions/create"), 2)  # one per filter
-        self.assertEqual(calls.count(f"POST /api/v1/functions/id/{VIDEO_FILTER}/update"), 1)
-        self.assertEqual(calls.count(f"POST /api/v1/functions/id/{VIDEO_FILTER}/toggle"), 1)
-        self.assertEqual(calls.count(f"POST /api/v1/functions/id/{VIDEO_FILTER}/toggle/global"), 1)
+        self.assertEqual(calls.count("POST /api/v1/functions/create"), 3)  # one per filter
+        for function_id in (VIDEO_FILTER, ORG_FILTER):
+            self.assertEqual(calls.count(f"POST /api/v1/functions/id/{function_id}/update"), 1)
+            self.assertEqual(calls.count(f"POST /api/v1/functions/id/{function_id}/toggle"), 1)
+            self.assertEqual(calls.count(f"POST /api/v1/functions/id/{function_id}/toggle/global"), 1)
         self.assertEqual(self.webui.unexpected, [])
+
+    def test_org_prompt_filter_api_errors_fail_without_marker_then_retry(self):
+        for mode in ("org-create-failure", "org-state-failure", "org-toggle-failure"):
+            with self.subTest(mode=mode):
+                self.webui.functions.clear()
+                self.webui.mode = mode
+                failed = self.run_wrapper()
+                self.assertNotEqual(failed.returncode, 0, self.combined(failed))
+                self.assertIn("ERROR", failed.stderr)
+                self.assertIn(ORG_FILTER, failed.stderr)
+                self.assertFalse((self.data / MARKER_NAME).exists())
+                self.assert_no_secret(failed)
+                self.webui.mode = "success"
+                succeeded = self.run_wrapper()
+                self.assertEqual(succeeded.returncode, 0, self.combined(succeeded))
+                self.assertTrue((self.data / MARKER_NAME).is_file())
+                self.assert_org_filter_installed()
+                (self.data / MARKER_NAME).unlink()
 
     def test_video_filter_api_errors_fail_without_marker_then_retry(self):
         for mode in ("video-create-failure", "video-state-failure", "video-toggle-failure"):
@@ -693,7 +734,7 @@ class InitWrapperTests(unittest.TestCase):
                 self.assert_video_filter_installed()
                 (self.data / MARKER_NAME).unlink()
 
-    def test_wrapper_copies_the_shipped_video_filter(self):
+    def test_wrapper_copies_the_shipped_filters(self):
         hold = self.root / "http-hold"
         self.webui.mode = "success"
         hold.write_text("1", encoding="utf-8")
@@ -711,12 +752,14 @@ class InitWrapperTests(unittest.TestCase):
             self.assertTrue(self.webui.entered.wait(5), "wrapper never reached its first request")
             owned = leftover_init(self.root)
             self.assertEqual(len(owned), 1)
-            copied = (owned[0] / "functions" / f"{VIDEO_FILTER}.py").read_bytes()
+            copied = {function_id: (owned[0] / "functions" / f"{function_id}.py").read_bytes()
+                      for function_id in (VIDEO_FILTER, ORG_FILTER)}
         finally:
             hold.unlink(missing_ok=True)
             self.webui.hold_path = ""
             process.communicate(timeout=20)
-        self.assertEqual(copied, (SOURCE / "functions" / f"{VIDEO_FILTER}.py").read_bytes())
+        self.assertEqual(copied, {function_id: (SOURCE / "functions" / f"{function_id}.py").read_bytes()
+                                  for function_id in (VIDEO_FILTER, ORG_FILTER)})
         self.assertEqual(process.returncode, 0)
 
     def test_success_after_failure_writes_marker_without_secret(self):

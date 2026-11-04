@@ -41,6 +41,11 @@ export FILTER_SOURCE="${SCRIPT_DIR}/functions/computer_link_filter.py"
 # The video switch. Its id is VIDEO_FILTER_ID in computer_link_filter.py.
 VIDEO_FILTER_ID="video_production_filter"
 VIDEO_FILTER_SOURCE="${SCRIPT_DIR}/functions/video_production_filter.py"
+# The company system prompt filter. It reads /etc/ocu/prompts/system-prompt.md,
+# which the deployment mounts; without that file every chat fails until an
+# admin deactivates the function.
+ORG_FILTER_ID="org_prompt_filter"
+ORG_FILTER_SOURCE="${SCRIPT_DIR}/functions/org_prompt_filter.py"
 
 # Sanity checks — run EVERY start (before marker-gate), so stale-default
 # warnings resurface on each restart until the user fixes them.
@@ -255,6 +260,13 @@ echo "[init] Installing video switch filter..."
 install_function "$VIDEO_FILTER_ID" "视频制作" "$VIDEO_FILTER_SOURCE" \
     "Offers the remotion video skill for the next message."
 enable_global_function "$VIDEO_FILTER_ID"
+
+# Install the company system prompt filter, active and global: it puts the
+# deployment's prompt file in front of every chat's system message.
+echo "[init] Installing company system prompt filter..."
+install_function "$ORG_FILTER_ID" "Company System Prompt" "$ORG_FILTER_SOURCE" \
+    "Puts the deployment's company system prompt in front of every chat's system message."
+enable_global_function "$ORG_FILTER_ID"
 
 # Set global DEFAULT_MODEL_PARAMS so every model uses Native Function Calling + streaming
 # without per-model Advanced Params clicks. The old /api/v1/configs/models/default/update

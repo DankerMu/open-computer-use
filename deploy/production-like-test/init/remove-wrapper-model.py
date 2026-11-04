@@ -6,10 +6,10 @@
 The Computer Use tool now reaches every model through the global filter, so the
 "<model> (Computer Use)" row that older initializers created is obsolete. Run
 this once, after open-webui-init has stored the shipped sources. It refuses to
-delete anything until the stored computer_use_filter, video_production_filter
-and ai_computer_use tool each equal their shipped file byte for byte, then
-deletes only rows whose name ends with " (Computer Use)" and whose
-meta.toolIds contains ai_computer_use. A second run removes nothing.
+delete anything until the stored computer_use_filter, video_production_filter,
+org_prompt_filter and ai_computer_use tool each equal their shipped file byte
+for byte, then deletes only rows whose name ends with " (Computer Use)" and
+whose meta.toolIds contains ai_computer_use. A second run removes nothing.
 
 Rows come from two admin endpoints. The old initializer gave the wrapper the
 raw provider model's id, so Open WebUI stored it as a base-model override
@@ -38,6 +38,8 @@ STORED_SOURCES = (
      "functions/computer_link_filter.py"),
     ("video_production_filter", "/api/v1/functions/id/video_production_filter",
      "functions/video_production_filter.py"),
+    ("org_prompt_filter", "/api/v1/functions/id/org_prompt_filter",
+     "functions/org_prompt_filter.py"),
     (TOOL_ID, f"/api/v1/tools/id/{TOOL_ID}", "tools/computer_use_tools.py"),
 )
 WRAPPER_SUFFIX = " (Computer Use)"

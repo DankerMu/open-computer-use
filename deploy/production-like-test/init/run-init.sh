@@ -132,7 +132,7 @@ else:
     print("[init] PRIMARY_CHAT_MODEL is not set; leaving the default model to the admin UI")
     safe_init = init_source
 (work_root / "init.sh").write_text(safe_init, encoding="utf-8")
-for function_file in ("computer_link_filter.py", "video_production_filter.py"):
+for function_file in ("computer_link_filter.py", "video_production_filter.py", "org_prompt_filter.py"):
     (work_root / "functions" / function_file).write_bytes(
         (source_root / "functions" / function_file).read_bytes()
     )
