@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -33,6 +34,7 @@ RECOVERY = ROOT / "deploy" / "recovery.py"
 OLD_SHA = "1" * 40
 OLD_WEBUI_SHA = "2" * 40
 NEW_WEBUI_SHA = "3" * 40
+LATER_WEBUI_SHA = "4" * 40
 UNCHANGED_ROLE = "postgres"
 SECRETS = {
     "POSTGRES_PASSWORD": "pg-secret-sentinel",
@@ -88,11 +90,11 @@ class RetargetTests(unittest.TestCase):
     def tearDown(self):
         self.context.cleanup()
 
-    def write_release(self):
+    def write_release(self, webui_sha: str = NEW_WEBUI_SHA):
         write_release_for_sha(
             self.release_root / "release.json",
             self.sha,
-            NEW_WEBUI_SHA,
+            webui_sha,
             images={role: {"reference": new_reference(role)} for role in RUNTIME_IMAGE_VARS},
         )
 
@@ -102,8 +104,8 @@ class RetargetTests(unittest.TestCase):
         self.runtime.chmod(0o600)
         self.before = self.runtime.read_bytes()
 
-    def backup_path(self) -> Path:
-        return self.config / f"runtime.env.before-{self.sha[:12]}"
+    def backup_path(self, webui_sha: str = NEW_WEBUI_SHA) -> Path:
+        return self.config / f"runtime.env.before-{self.sha[:12]}-{webui_sha[:12].lower()}"
 
     def expected_identity(self) -> dict[str, str]:
         identity = {
@@ -189,8 +191,52 @@ class RetargetTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.before = self.runtime.read_bytes()
         backup = self.backup_path().read_bytes()
-        self.assert_refused("already exists")
+        self.assert_refused(
+            f"{self.backup_path()} already exists; move it aside to retarget to this release again"
+        )
         self.assertEqual(self.backup_path().read_bytes(), backup)
+
+    def test_webui_only_release_keeps_a_backup_of_its_own(self):
+        code, _stdout, stderr = self.run_main()
+        self.assertEqual(code, 0, stderr)
+        first = self.runtime.read_bytes()
+        self.write_release(LATER_WEBUI_SHA)
+        code, stdout, stderr = self.run_main()
+        self.assertEqual(code, 0, stderr)
+        later = self.config / f"runtime.env.before-{self.sha[:12]}-{LATER_WEBUI_SHA[:12]}"
+        self.assertEqual(later, self.backup_path(LATER_WEBUI_SHA))
+        self.assertEqual(stdout.splitlines()[-1], f"backup {later}")
+        self.assertEqual(later.read_bytes(), first)
+        self.assertEqual(self.backup_path().read_bytes(), self.before)
+        self.assertIn(f"WEBUI_SOURCE_SHA={LATER_WEBUI_SHA}\n", self.runtime.read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(p.name for p in self.config.iterdir()),
+            sorted(["runtime.env", self.backup_path().name, later.name]),
+        )
+
+    def test_backup_with_the_ocu_only_name_is_left_alone(self):
+        ocu_only = self.config / f"runtime.env.before-{self.sha[:12]}"
+        ocu_only.write_text("earlier retarget\n", encoding="utf-8")
+        code, _stdout, stderr = self.run_main()
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(ocu_only.read_text(encoding="utf-8"), "earlier retarget\n")
+        self.assertEqual(self.backup_path().read_bytes(), self.before)
+
+    def test_backup_name_lowercases_the_webui_commit(self):
+        self.write_release("AB" * 20)
+        code, _stdout, stderr = self.run_main()
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(
+            (self.config / f"runtime.env.before-{self.sha[:12]}-{'ab' * 6}").is_file(),
+            sorted(p.name for p in self.config.iterdir()),
+        )
+
+    def test_inventory_without_webui_commit_is_refused(self):
+        manifest = self.release_root / "release.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        del payload["webui_source_sha"]
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        self.assert_refused("inventory is missing webui_source_sha")
 
     def test_relative_release_root_is_recorded_as_an_absolute_manifest(self):
         cwd = os.getcwd()
