@@ -547,9 +547,11 @@ def retarget_runtime(runtime_file: Path, release_root: Path) -> tuple[list[tuple
     values = dict(current)
     values.update(selected_runtime_identity(inventory, manifest))
     release.verify_runtime_binding(inventory, values)
-    backup = runtime_file.with_name(
-        f"{runtime_file.name}.before-{inventory['ocu_source_sha'][:12].lower()}"
+    # Both commits: a WebUI-only release keeps the OCU commit and must not collide (#711).
+    release_name = "-".join(
+        inventory[key][:12].lower() for key in ("ocu_source_sha", "webui_source_sha")
     )
+    backup = runtime_file.with_name(f"{runtime_file.name}.before-{release_name}")
     if os.path.lexists(backup):
         raise RecoveryError(
             f"{backup} already exists; move it aside to retarget to this release again"
@@ -874,7 +876,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Rewrite the release identity keys of an existing runtime configuration "
             "to a release root created by release.py import. Other lines stay "
-            "byte-identical; the previous file is kept as <runtime-file>.before-<commit>. Run as root."
+            "byte-identical; the previous file is kept as "
+            "<runtime-file>.before-<ocu-commit-12>-<webui-commit-12>. Run as root."
         ),
     )
     retarget.add_argument("--runtime-file", required=True, help="existing runtime.env to rewrite")

@@ -120,6 +120,14 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **`recovery.py retarget` accepts a WebUI-only release (#711).** The backup
+  of the previous `runtime.env` was named after the target OCU commit alone
+  (`runtime.env.before-<ocu12>`), so a second release with the same OCU commit
+  and another WebUI commit was refused with `already exists; move it aside`.
+  It is now `runtime.env.before-<ocu12>-<webui12>`, the first 12 hex digits of
+  both commits of the target release. Retargeting to a release whose backup
+  exists is still refused with the same message, and backups with the old name
+  are left alone.
 - **`view` shows images to the model (#706).** MCP `view` on a `.png`, `.jpg`,
   `.jpeg`, `.gif` or `.webp` file failed with `validation error for
   viewOutput`, because it returned a list from a tool with a `str` output
