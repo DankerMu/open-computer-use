@@ -145,8 +145,12 @@
   reads `system-prompt.md` in `OCU_PROMPTS_DIR` before anything stops and
   stores it in the set as the `system-prompt` component with its checksum; a
   missing file, a link or non-regular file, or a directory outside the
-  deployment root refuses the backup with the stack still running, and a
-  `runtime.env` without the key (a release before #712) backs up without it.
+  deployment root refuses the backup with the stack still running. So does an
+  `open-webui` mount of `/etc/ocu/prompts` from another directory, or one
+  while `runtime.env` has no `OCU_PROMPTS_DIR`; only with neither the mount nor
+  the key (a release before #712) does the backup go ahead without the file.
+  The bytes are kept as they are, so a file the filter refuses restores and
+  `up.sh` refuses it at activation.
   `restore` writes it to `<new root>/prompts/system-prompt.md` (0755/0644) and
   sets `OCU_PROMPTS_DIR` to that directory with the other data paths, where it
   used to keep the old root. A set without the file restores an empty one,
@@ -158,6 +162,8 @@
   `video_production_filter.py` with `required bind asset is missing`. Bind files
   are now checked against the selected commit: each one it holds must be
   present and unchanged, and one it does not hold must be absent.
+  `release.py build` refuses a commit that does not track every bind file it
+  lists, before any image is built.
 - **`recovery.py retarget` accepts a WebUI-only release (#711).** The backup
   of the previous `runtime.env` was named after the target OCU commit alone
   (`runtime.env.before-<ocu12>`), so a second release with the same OCU commit
