@@ -67,6 +67,16 @@ services:
       CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "200"
       TOOL_RESULT_MAX_CHARS: "50000"
       TOOL_RESULT_PREVIEW_CHARS: "2000"
+    volumes:
+      # The company system prompt, read by org_prompt_filter on every chat
+      # request (#712). A directory, because editors save by renaming a new file
+      # over the old one; never config/, which holds runtime.env.
+      - type: bind
+        source: ${OCU_PROMPTS_DIR:?OCU_PROMPTS_DIR is required}
+        target: /etc/ocu/prompts
+        read_only: true
+        bind:
+          create_host_path: false
     restart: unless-stopped
 
   postgres:

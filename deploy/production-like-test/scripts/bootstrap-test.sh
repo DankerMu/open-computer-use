@@ -266,6 +266,8 @@ public_base_url="${OCU_WEBUI_ORIGIN}/ocu"
 internal_auth_url='http://open-webui:8080/api/v1/ocu/auth'
 chat_data_dir="$deploy_root/data/chat"
 skills_cache_dir="$deploy_root/data/skills-cache"
+# The company system prompt (#712): open-webui mounts this directory read-only.
+prompts_dir="$deploy_root/prompts"
 office_proxy_port=${OCU_OFFICE_PROXY_PORT-8083}
 office_fonts_dir=${OCU_OFFICE_FONTS_DIR-"$deploy_root/data/office-fonts"}
 office_docserver_url='http://documentserver'
@@ -303,6 +305,7 @@ for pair in \
     OCU_WEBUI_AUTH_URL:"$internal_auth_url" \
     OCU_CHAT_DATA_DIR:"$chat_data_dir" \
     OCU_SKILLS_CACHE_DIR:"$skills_cache_dir" \
+    OCU_PROMPTS_DIR:"$prompts_dir" \
     DMXAPI_BASE_URL:"$dmxapi_base_url" \
     RAG_OPENAI_API_BASE_URL:"$rag_openai_api_base_url" \
     RAG_EXTERNAL_RERANKER_URL:"$rag_external_reranker_url" \
@@ -323,6 +326,13 @@ install -d -m 0700 "$runtime_dir" "$deploy_root/backups"
 install -d -m 0755 "$deploy_root/data/chat" "$deploy_root/data/skills-cache"
 if [ ! -d "$office_fonts_dir" ]; then
     install -d -m 0755 "$office_fonts_dir"
+fi
+# Empty injects nothing. An operator's existing file and directory stay as they are.
+if [ ! -d "$prompts_dir" ]; then
+    install -d -m 0755 "$prompts_dir"
+fi
+if [ ! -e "$prompts_dir/system-prompt.md" ]; then
+    install -m 0644 /dev/null "$prompts_dir/system-prompt.md"
 fi
 if [ ! -d "$credentials_parent" ]; then
     install -d -m 0700 "$credentials_parent"
@@ -384,6 +394,7 @@ credentials_tmp=$(mktemp "$credentials_parent/.ocu-test-admin-credentials.XXXXXX
     printf '%s\n' "RAG_RERANKING_MODEL=$rag_reranking_model"
     printf '%s\n' "OCU_CHAT_DATA_DIR=$chat_data_dir"
     printf '%s\n' "OCU_SKILLS_CACHE_DIR=$skills_cache_dir"
+    printf '%s\n' "OCU_PROMPTS_DIR=$prompts_dir"
     printf '%s\n' "OCU_OFFICE_JWT_SECRET=$office_jwt_secret"
     printf '%s\n' "OCU_OFFICE_PROXY_PORT=$office_proxy_port"
     printf '%s\n' "OCU_OFFICE_DOCSERVER_URL=$office_docserver_url"

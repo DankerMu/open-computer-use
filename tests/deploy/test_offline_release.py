@@ -212,6 +212,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
             "openwebui/functions/video_production_filter.py",
+            "openwebui/functions/org_prompt_filter.py",
             "deploy/release.py",
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
@@ -382,6 +383,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
             "openwebui/functions/video_production_filter.py",
+            "openwebui/functions/org_prompt_filter.py",
             "deploy/release.py",
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
@@ -447,6 +449,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
             "openwebui/functions/video_production_filter.py",
+            "openwebui/functions/org_prompt_filter.py",
             "deploy/up.sh",
             "deploy/fonts/prepare_fonts.py",
             "deploy/fonts/fonts.json",
@@ -556,6 +559,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/tools/computer_use_tools.py",
             "openwebui/functions/computer_link_filter.py",
             "openwebui/functions/video_production_filter.py",
+            "openwebui/functions/org_prompt_filter.py",
             "deploy/release.py",
             "deploy/up.sh",
             "deploy/settings.py",
@@ -3296,6 +3300,8 @@ class OfflineReleaseTests(unittest.TestCase):
             self.assertEqual(loaded[record["reference"]]["Id"], record["configuration_digest"], role)
         env = fake_env(self.state)
         Path(env["OCU_OFFICE_FONTS_DIR"]).mkdir()
+        Path(env["OCU_PROMPTS_DIR"]).mkdir()
+        (Path(env["OCU_PROMPTS_DIR"]) / "system-prompt.md").touch()
         env["OCU_RELEASE_MANIFEST"] = str(install / "release.json")
         env["OCU_TEST_ROOT"] = str(install / "source")
         env["SOURCE_SHA"] = payload["ocu_source_sha"]

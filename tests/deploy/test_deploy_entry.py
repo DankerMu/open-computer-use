@@ -322,6 +322,91 @@ class DeployEntryTests(unittest.TestCase):
                 self.assertEqual((decoy / "untouched").read_bytes(), b"wrong project-directory source")
                 self.assertEqual(leftover_tmp(self.state), [])
 
+    def prompt_mount_docs(self):
+        docs = intended_docs()
+        docs["webui.json"]["__unresolved__"] = True
+        docs["webui.json"]["services"]["open-webui"]["volumes"] = [{
+            "type": "bind", "source": "${OCU_PROMPTS_DIR}", "target": "/etc/ocu/prompts",
+            "read_only": True, "bind": {"create_host_path": False},
+        }]
+        return docs
+
+    def prompt_source(self) -> str:
+        row = [row for row in executed_rows(self.state) if row["stack"] == "webui"][-1]
+        mounts = row["consumer_document"]["services"]["open-webui"]["volumes"]
+        return next(m["source"] for m in mounts if m["target"] == "/etc/ocu/prompts")
+
+    def test_company_prompt_directory_is_required(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        for value in (None, ""):
+            with self.subTest(empty=value == ""):
+                invalid = dict(env)
+                if value is None:
+                    invalid.pop("OCU_PROMPTS_DIR")
+                else:
+                    invalid["OCU_PROMPTS_DIR"] = value
+                result = run_script(script, invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("deploy: OCU_PROMPTS_DIR is required", result.stderr)
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual(ops(self.state), [])
+                self.assertEqual(leftover_tmp(self.state), [])
+
+    def test_unusable_company_prompt_refuses_before_engine_contact(self):
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        prompts = self.state / "broken-prompts"
+        prompts.mkdir()
+        path = prompts / "system-prompt.md"
+        cases = {
+            "missing": (None, "is missing"),
+            "directory": ("dir", "is not a regular file"),
+            "over 64 KiB": (b"a" * (64 * 1024 + 1), "is larger than 65536 bytes"),
+            "not UTF-8": ("公司".encode("gbk"), "is not valid UTF-8"),
+        }
+        for label, (content, problem) in cases.items():
+            with self.subTest(label):
+                if path.is_dir():
+                    path.rmdir()
+                elif path.exists():
+                    path.unlink()
+                if content == "dir":
+                    path.mkdir()
+                elif content is not None:
+                    path.write_bytes(content)
+                result = run_script(script, {**env, "OCU_PROMPTS_DIR": str(prompts)})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"deploy: company system prompt {path} {problem}", result.stderr)
+                self.assertNotIn(env["OCU_OFFICE_JWT_SECRET"], result.stdout + result.stderr)
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual(ops(self.state), [])
+                self.assertEqual(leftover_tmp(self.state), [])
+
+    def test_empty_or_filled_company_prompt_starts_and_binds_the_checked_directory(self):
+        env, script, source = prepare_up_context(self.state, extra=self.env)
+        invocation = self.state / "prompt-invocation"
+        prompts = invocation / "prompts"
+        prompts.mkdir(parents=True)
+        decoy = source / "prompts"
+        decoy.mkdir()
+        (decoy / "system-prompt.md").write_bytes(b"\xff wrong project-directory source")
+        write_fake_configs(self.state, self.prompt_mount_docs())
+        for label, content in (("empty", b""), ("whitespace", b" \n\t\n"),
+                               ("at the limit", "身".encode("utf-8") * 21845 + b"a")):
+            with self.subTest(label):
+                (prompts / "system-prompt.md").write_bytes(content)
+                for selected in (str(prompts), "prompts"):
+                    result = subprocess.run(
+                        ["bash", str(script)], cwd=invocation,
+                        env={**env, "OCU_PROMPTS_DIR": selected},
+                        capture_output=True, text=True, timeout=20,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    bound = Path(self.prompt_source())
+                    self.assertTrue(bound.is_absolute())
+                    self.assertEqual(bound.resolve(), prompts.resolve())
+                    self.assertEqual((prompts / "system-prompt.md").read_bytes(), content)
+                    self.assertEqual(leftover_tmp(self.state), [])
+
     def zone_docs(self):
         docs = intended_docs()
         for document in docs.values():
