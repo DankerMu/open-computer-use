@@ -1449,6 +1449,8 @@ else:
         )
         for label, damage, message in cases:
             with self.subTest(label):
+                self._seed_volumes_and_db()
+                (self.state / "stopped.log").unlink(missing_ok=True)
                 damage()
                 try:
                     dest = self.root / f"refused-{label}"
