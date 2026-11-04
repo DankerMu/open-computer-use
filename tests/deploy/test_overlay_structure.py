@@ -592,6 +592,10 @@ class OverlayStructureTests(unittest.TestCase):
                             self.assertNotEqual(source.name, "runtime.env")
                             if mount["target"] == "/etc/ocu/prompts":
                                 self.assertEqual(f"{document}:{name}", "webui.json:open-webui")
+            # Only the stack that mounts the file opts in to installing the filter.
+            init_env = stacks["webui.json"]["services"]["open-webui-init"]["environment"]
+            self.assertEqual(init_env.get("OCU_ORG_PROMPT_FILTER"), "install")
+            self.assertNotIn("OCU_ORG_PROMPT_FILTER", webui.get("environment") or {})
 
     def test_adopted_local_dependencies_exist(self):
         for path in ADOPTED:

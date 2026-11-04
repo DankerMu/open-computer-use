@@ -41,14 +41,19 @@ export FILTER_SOURCE="${SCRIPT_DIR}/functions/computer_link_filter.py"
 # The video switch. Its id is VIDEO_FILTER_ID in computer_link_filter.py.
 VIDEO_FILTER_ID="video_production_filter"
 VIDEO_FILTER_SOURCE="${SCRIPT_DIR}/functions/video_production_filter.py"
-# The company system prompt filter. It reads /etc/ocu/prompts/system-prompt.md,
-# which the deployment mounts; without that file every chat fails until an
-# admin deactivates the function.
+# The company system prompt filter (#712). It reads /etc/ocu/prompts/system-prompt.md
+# and fails every chat when that file is missing, so it is installed only when
+# OCU_ORG_PROMPT_FILTER=install, which the production-like overlay sets next to
+# its mount. Unset leaves an installed copy as it is.
 ORG_FILTER_ID="org_prompt_filter"
 ORG_FILTER_SOURCE="${SCRIPT_DIR}/functions/org_prompt_filter.py"
 
 # Sanity checks — run EVERY start (before marker-gate), so stale-default
 # warnings resurface on each restart until the user fixes them.
+if [[ -n "${OCU_ORG_PROMPT_FILTER+set}" && "$OCU_ORG_PROMPT_FILTER" != "install" ]]; then
+    echo "[init] ERROR: OCU_ORG_PROMPT_FILTER must be unset or install." >&2
+    exit 1
+fi
 if [[ "$ADMIN_PASSWORD" == "admin" || "$ADMIN_PASSWORD" == "change-me" ]]; then
     echo "[init] WARNING: ADMIN_PASSWORD is still the default — change it for anything beyond local dev."
 fi
@@ -261,12 +266,17 @@ install_function "$VIDEO_FILTER_ID" "视频制作" "$VIDEO_FILTER_SOURCE" \
     "Offers the remotion video skill for the next message."
 enable_global_function "$VIDEO_FILTER_ID"
 
-# Install the company system prompt filter, active and global: it puts the
-# deployment's prompt file in front of every chat's system message.
-echo "[init] Installing company system prompt filter..."
-install_function "$ORG_FILTER_ID" "Company System Prompt" "$ORG_FILTER_SOURCE" \
-    "Puts the deployment's company system prompt in front of every chat's system message."
-enable_global_function "$ORG_FILTER_ID"
+# Install the company system prompt filter, active and global, when the
+# deployment mounts its prompt file: it puts that file in front of every chat's
+# system message.
+if [[ "${OCU_ORG_PROMPT_FILTER-}" == "install" ]]; then
+    echo "[init] Installing company system prompt filter..."
+    install_function "$ORG_FILTER_ID" "Company System Prompt" "$ORG_FILTER_SOURCE" \
+        "Puts the deployment's company system prompt in front of every chat's system message."
+    enable_global_function "$ORG_FILTER_ID"
+else
+    echo "[init] OCU_ORG_PROMPT_FILTER is not set; not installing $ORG_FILTER_ID."
+fi
 
 # Set global DEFAULT_MODEL_PARAMS so every model uses Native Function Calling + streaming
 # without per-model Advanced Params clicks. The old /api/v1/configs/models/default/update

@@ -384,9 +384,14 @@ class InitWrapperTests(unittest.TestCase):
             "MARKER_FILE": str(self.data / MARKER_NAME),
             "OCU_INIT_READY_ATTEMPTS": "3",
             "OCU_INIT_READY_SLEEP": "0",
+            # Set by the production-like overlay, which mounts the prompt file.
+            "OCU_ORG_PROMPT_FILTER": "install",
         })
-        if extra_env:
-            env.update(extra_env)
+        for name, value in (extra_env or {}).items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
         return env
 
     def run_wrapper(self, extra_env=None, timeout=20):
@@ -733,6 +738,38 @@ class InitWrapperTests(unittest.TestCase):
                 self.assertTrue((self.data / MARKER_NAME).is_file())
                 self.assert_video_filter_installed()
                 (self.data / MARKER_NAME).unlink()
+
+    def test_org_prompt_filter_is_not_installed_without_the_opt_in(self):
+        self.webui.mode = "success"
+        result = self.run_wrapper({"OCU_ORG_PROMPT_FILTER": None})
+        self.assertEqual(result.returncode, 0, self.combined(result))
+        self.assertTrue((self.data / MARKER_NAME).is_file())
+        self.assertNotIn(ORG_FILTER, self.webui.functions)
+        self.assertEqual([call for call in self.webui.calls if ORG_FILTER in call], [])
+        self.assert_video_filter_installed()
+        self.assertEqual(self.webui.unexpected, [])
+
+    def test_unset_opt_in_leaves_an_installed_org_prompt_filter_alone(self):
+        self.webui.mode = "success"
+        stored = {"id": ORG_FILTER, "name": ORG_FILTER_NAME, "content": "admin-edited source\n",
+                  "is_active": True, "is_global": True}
+        self.webui.functions[ORG_FILTER] = dict(stored)
+        result = self.run_wrapper({"OCU_ORG_PROMPT_FILTER": None})
+        self.assertEqual(result.returncode, 0, self.combined(result))
+        self.assertEqual(self.webui.functions[ORG_FILTER], stored)
+        self.assertEqual([call for call in self.webui.calls if ORG_FILTER in call], [])
+
+    def test_invalid_org_prompt_opt_in_fails_before_any_request(self):
+        for value in ("", "yes", "true", "INSTALL", "install "):
+            with self.subTest(value=value):
+                self.webui.calls.clear()
+                self.webui.mode = "success"
+                result = self.run_wrapper({"OCU_ORG_PROMPT_FILTER": value})
+                self.assertNotEqual(result.returncode, 0, self.combined(result))
+                self.assertIn("OCU_ORG_PROMPT_FILTER must be unset or install", result.stderr)
+                self.assertEqual(self.webui.calls, [])
+                self.assertFalse((self.data / MARKER_NAME).exists())
+                self.assert_no_secret(result)
 
     def test_wrapper_copies_the_shipped_filters(self):
         hold = self.root / "http-hold"
