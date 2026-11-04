@@ -1073,6 +1073,35 @@ def committed_up_fixture(dest_root: Path, *, lock_dir: Path | None = None,
     return git_init_commit(dest_root, "committed deploy fixture")
 
 
+# What a source tree from before the video filter and the company prompt (#712) lacks.
+NEWER_BIND_FILES = (
+    "openwebui/functions/video_production_filter.py",
+    "openwebui/functions/org_prompt_filter.py",
+)
+UP_PROMPT_CHECK_START = "# open-webui mounts this directory read-only and its company prompt filter reads\n"
+UP_PROMPT_CHECK_END = 'CONFIG_DIR="$(mktemp'
+
+
+def strip_newer_bind_files(root: Path) -> None:
+    """Turn a copied fixture tree into an older release: no newer bind files, no prompt check."""
+    release_path = root / "deploy" / "release.py"
+    text = release_path.read_text(encoding="utf-8")
+    for relative in NEWER_BIND_FILES:
+        (root / relative).unlink()
+        line = f'    "{relative}",\n'
+        if line not in text:
+            raise RuntimeError(f"release fixture does not list {relative}")
+        text = text.replace(line, "", 1)
+    release_path.write_text(text, encoding="utf-8")
+    up = root / "deploy" / "up.sh"
+    script = up.read_text(encoding="utf-8")
+    start = script.find(UP_PROMPT_CHECK_START)
+    end = script.find(UP_PROMPT_CHECK_END, start)
+    if start < 0 or end < 0:
+        raise RuntimeError("up.sh fixture is missing the company prompt check")
+    up.write_text(script[:start] + script[end:], encoding="utf-8")
+
+
 def write_release_for_sha(dest: Path, ocu_sha: str, webui_sha: str, *, images=None) -> Path:
     payload = synthetic_inventory(ocu_sha=ocu_sha, webui_sha=webui_sha, images=images)
     write_installed_fonts(dest.parent)

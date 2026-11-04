@@ -23,11 +23,14 @@ from support import (
     FAKE_DOCKER,
     FONT_FILES,
     HISTORICAL_INCOMPATIBLE_SOURCE,
+    NEWER_BIND_FILES,
     ROOT,
     ROLE_ORDER,
     SOURCE_CONSUMER_CONTRACT,
+    UP_FIXTURE_PATHS,
     WEBUI_SYNTHETIC_SHA,
     config_payload,
+    copy_tracked,
     fake_env,
     git_init_commit,
     image_id_for_config,
@@ -41,6 +44,7 @@ from support import (
     seed_healthy_host,
     seed_images,
     serve_font_archive,
+    strip_newer_bind_files,
     synthetic_inventory,
     tmp_dir,
     write_fake_configs,
@@ -3811,6 +3815,45 @@ class BindPathCoverageTests(unittest.TestCase):
         }
         self.assertTrue(shipped)
         self.assertLessEqual(shipped, set(release.SOURCE_BIND_PATHS))
+
+
+class OlderReleaseBindFileTests(unittest.TestCase):
+    """This checkout verifies a retained release that predates some of its bind files (#715)."""
+
+    def setUp(self):
+        self.context = tmp_dir()
+        self.source = Path(self.context.name) / "source"
+        for relative in UP_FIXTURE_PATHS:
+            copy_tracked(relative, self.source)
+        write_font_pin(self.source)
+
+    def tearDown(self):
+        self.context.cleanup()
+
+    def test_release_without_newer_bind_files_verifies(self):
+        strip_newer_bind_files(self.source)
+        commit = git_init_commit(self.source, "release before #712")
+        release.verify_tracked_source(self.source, commit)
+
+    def test_bind_file_added_beside_a_commit_without_it_is_refused(self):
+        strip_newer_bind_files(self.source)
+        commit = git_init_commit(self.source, "release before #712")
+        planted = self.source / NEWER_BIND_FILES[1]
+        planted.write_text("planted\n", encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, f"{NEWER_BIND_FILES[1]} is not in the bundled commit"):
+            release.verify_tracked_source(self.source, commit)
+
+    def test_bind_file_in_the_commit_must_be_present_and_unchanged(self):
+        commit = git_init_commit(self.source, "release with every bind file")
+        release.verify_tracked_source(self.source, commit)
+        path = self.source / NEWER_BIND_FILES[1]
+        original = path.read_bytes()
+        path.unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "differ from the bundled commit"):
+            release.verify_tracked_source(self.source, commit)
+        path.write_bytes(original + b"# changed\n")
+        with self.assertRaisesRegex(release.ReleaseError, "differ from the bundled commit"):
+            release.verify_tracked_source(self.source, commit)
 
 
 if __name__ == "__main__":
