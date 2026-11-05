@@ -35,7 +35,8 @@ services:
       - RAG_EMBEDDING_MODEL_AUTO_UPDATE=false
       # Skip SSL verification for self-signed certs (set to false if needed)
       - ENABLE_OPENAI_API_SSL_VERIFY=${ENABLE_OPENAI_API_SSL_VERIFY:-true}
-      # Auto-init: install Computer Use tool + filter on first startup
+      # Admin account. This stack does not run init.sh; run it yourself to install
+      # the tool and filters (docs/INSTALL.md).
       - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@open-computer-use.dev}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
       # Internal URL of computer-use-server, seeded by init.sh into the Tool

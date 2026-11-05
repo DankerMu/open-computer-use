@@ -24,9 +24,9 @@ See [main README](../../README.md#open-webui-integration) for full setup. Quick 
 1. **Workspace > Tools** → Create → paste `computer_use_tools.py`
 2. Set **Tool ID** to `ai_computer_use` (required for filter integration)
 3. Configure `ORCHESTRATOR_URL`, and provide `OCU_INTERNAL_TOKEN` to the Open WebUI server process. The tool reads it on every call; it is not a Valve. Set `MCP_API_KEY` only when the server requires its optional second MCP credential.
-4. Install companion filter: `computer_link_filter.py` (Workspace > Functions)
+4. Install the companion filters (Workspace > Functions): `computer_link_filter.py` and `video_production_filter.py`; see [Components](../README.md#components) for both and for the optional `org_prompt_filter.py`.
 
-The `docker-compose.webui.yml` stack does this automatically via `init.sh`.
+`openwebui/init.sh` does steps 1-4 against a running Open WebUI. The example `docker-compose.webui.yml` runs the stock upstream image and does **not** run `init.sh`; run it yourself or install by hand, as [INSTALL.md](../../docs/INSTALL.md#quick-start) describes. The production-like deployment runs it in its one-shot `open-webui-init` service.
 
 ## Configuration
 
@@ -48,6 +48,7 @@ All container limits, timeouts, Docker image, and skills remain configured serve
 | `create_file` | `create_file` | Create or overwrite files |
 | `str_replace` | `str_replace` | Edit files by replacing text |
 | `view` | `view` | Read files or list directories (supports line ranges) |
+| `generate_speech` | `generate_speech` | Synthesize speech (e.g. a video voiceover line) into `/mnt/user-data/files/`; needs `TTS_*` on the server |
 | `sub_agent` | `sub_agent` | Delegate complex tasks to Claude Code |
 
 Each tool call authenticates the transport and carries only server-provided user context (`X-Chat-Id`, `X-User-Email`, `X-User-Name`, `X-Mcp-Servers`). Credentials never appear in tool arguments, results, or progress events.
@@ -61,9 +62,9 @@ Each tool call authenticates the transport and carries only server-provided user
 - **Workspace hint**: After an invoked MCP client attempt returns or raises an ordinary caught exception, `_run_tool` emits one best-effort `ocu:workspace_changed` event with `{chat_id, reason: "tool_completed"}`. The hint is not revision authority and does not include tool content. Internal client health/auth rejections still emit it; outer chat/config validation, header construction failure, cancellation, and a missing emitter do not. An emitter exception is swallowed once and cannot change the tool result.
 - **Timeouts**: Client-side timeouts (`CLIENT_HTTP_TIMEOUT=660s`, `SUB_AGENT_CLIENT_TIMEOUT=3660s`) are set higher than server-side to avoid premature disconnects
 
-## Companion Filter
+## Companion Filters
 
-The `computer_link_filter.py` function is **required** alongside this tool:
+`computer_link_filter.py` and `video_production_filter.py` are required alongside this tool; `org_prompt_filter.py` is optional and installed by `init.sh` only with `OCU_ORG_PROMPT_FILTER=install`. [Components](../README.md#components) describes all three. `computer_link_filter.py`:
 
 - **Inlet** (tool attachment and system prompt injection): Attaches this tool to every saved chat and adds the `<available_skills>` XML block so the model knows which skills exist
 - **Outlet** (response post-processing): Detects file URLs in responses and injects preview links, "View file" and "Download archive" buttons

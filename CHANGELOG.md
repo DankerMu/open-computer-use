@@ -141,6 +141,10 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **Tools README matches the example compose (#718).** `openwebui/tools/README.md`
+  no longer says `docker-compose.webui.yml` runs `init.sh` (it runs the stock
+  image; see `docs/INSTALL.md`), lists `generate_speech`, and names the video
+  and optional company prompt filters; the compose comment says the same.
 - **A generated image is shown once (#724).** Open WebUI saves the images of
   `generate_image` and `edit_image` into `/mnt/user-data/files/` (#713), and
   the `<sharing_files>` rule to embed every image there with Markdown image
