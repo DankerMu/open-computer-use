@@ -15,6 +15,7 @@ import sys
 import tarfile
 import time
 import unittest
+from unittest import mock
 
 from support import (
     DEFAULT_RELEASE_DIGESTS,
@@ -3876,6 +3877,106 @@ class OlderReleaseBindFileTests(unittest.TestCase):
         path.write_bytes(original + b"# changed\n")
         with self.assertRaisesRegex(release.ReleaseError, "differ from the bundled commit"):
             release.verify_tracked_source(self.source, commit)
+
+
+def run_git(repo: Path, *args: str, input: bytes | None = None) -> bytes:
+    """Plain git with the test's own environment, as an operator shell would run it."""
+    return subprocess.run(
+        ["git", *args], cwd=str(repo), input=input, capture_output=True, check=True
+    ).stdout
+
+
+class ReleaseGitEnvironmentTests(unittest.TestCase):
+    """A commit SHA alone decides what release git reads (#716)."""
+
+    def setUp(self):
+        self.context = tmp_dir()
+        self.root = Path(self.context.name)
+
+    def tearDown(self):
+        self.context.cleanup()
+
+    def repo(self, name: str, content: bytes) -> tuple[Path, str]:
+        repo = self.root / name
+        repo.mkdir()
+        (repo / "f.txt").write_bytes(content)
+        return repo, git_init_commit(repo, name)
+
+    def replace_blob(self, repo: Path, relative: str, replacement: bytes) -> None:
+        original = run_git(repo, "rev-parse", f"HEAD:{relative}").decode().strip()
+        planted = run_git(repo, "hash-object", "-w", "--stdin", input=replacement).decode().strip()
+        run_git(repo, "replace", "-f", original, planted)
+        # Control: the ref is live for a git that inherits the caller's state.
+        self.assertEqual(run_git(repo, "show", f"HEAD:{relative}"), replacement)
+
+    def test_replace_ref_does_not_change_file_bytes_at_commit(self):
+        repo, commit = self.repo("source", b"committed\n")
+        self.replace_blob(repo, "f.txt", b"replaced\n")
+        self.assertEqual(release.file_bytes_at_commit(repo, commit, "f.txt"), b"committed\n")
+
+    def test_replace_ref_does_not_change_checkout_tracked_tree(self):
+        repo, commit = self.repo("source", b"committed\n")
+        self.replace_blob(repo, "f.txt", b"replaced\n")
+        dest = self.root / "tree"
+        release.checkout_tracked_tree(repo, dest, commit)
+        self.assertEqual((dest / "f.txt").read_bytes(), b"committed\n")
+
+    def test_inherited_git_dir_does_not_redirect_full_commit(self):
+        repo, commit = self.repo("source", b"source\n")
+        other, other_commit = self.repo("other", b"other\n")
+        self.assertNotEqual(commit, other_commit)
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git")}):
+            self.assertEqual(release.full_commit(repo), commit)
+
+    def child_env(self, caller: dict[str, str]) -> dict[str, str]:
+        done = subprocess.CompletedProcess(["git"], 0, stdout="", stderr="")
+        with mock.patch.dict(os.environ, caller, clear=True), mock.patch.object(
+            release.subprocess, "run", return_value=done
+        ) as run:
+            release.git("rev-parse", "HEAD", cwd=self.root)
+        run.assert_called_once()
+        return run.call_args.kwargs["env"]
+
+    def test_git_runs_with_the_allowlist_and_pinned_git_settings(self):
+        # The design's allowlist, written out as this test's own source of truth.
+        kept = {
+            "PATH": "/opt/fake/bin:/usr/bin",
+            "HOME": "/home/operator",
+            "XDG_CONFIG_HOME": "/home/operator/.config",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "LC_CTYPE": "C.UTF-8",
+            "TMPDIR": "/tmp/fake-tmp",
+            "SUDO_UID": "1000",
+        }
+        dropped = {
+            "GIT_DIR": "/elsewhere/.git",
+            "GIT_WORK_TREE": "/elsewhere",
+            "GIT_INDEX_FILE": "/elsewhere/index",
+            "GIT_OBJECT_DIRECTORY": "/elsewhere/objects",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.attributesFile",
+            "GIT_CONFIG_VALUE_0": "/elsewhere/attributes",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "0",
+            "GIT_TERMINAL_PROMPT": "1",
+            "SSH_AUTH_SOCK": "/tmp/fake-agent.sock",
+            "HTTPS_PROXY": "http://proxy.example.test:3128",
+            "SUDO_USER": "operator",
+            "UNRELATED": "value",
+        }
+        env = self.child_env({**kept, **dropped})
+        self.assertEqual(
+            env, {**kept, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
+        )
+        self.assertNotIn("GIT_CONFIG_NOSYSTEM", env)
+
+    def test_unset_allowlisted_variables_stay_unset(self):
+        env = self.child_env({"PATH": "/usr/bin", "GIT_DIR": "/elsewhere/.git"})
+        self.assertEqual(
+            env,
+            {"PATH": "/usr/bin", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"},
+        )
 
 
 if __name__ == "__main__":

@@ -142,6 +142,8 @@ SAFE_WHEEL_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 PINNED_ASSIGNMENT_RE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*=\s*([\"'])([^\"']+)\2\s*$")
 
 _PINNED_DOCKER_HOST: str | None = None
+# Plus every LC_*; SUDO_UID lets root git accept the sudo user's checkout.
+_GIT_ENV_KEYS = frozenset({"PATH", "HOME", "XDG_CONFIG_HOME", "LANG", "TMPDIR", "SUDO_UID"})
 # Room beyond the counted bytes for the source clone's working tree and
 # filesystem overhead; without it an exact-fit import fills the disk.
 IMPORT_SPACE_HEADROOM = 1 << 30
@@ -256,6 +258,16 @@ def docker(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
 def git(
     *args: str, cwd: Path, text: bool = True, input: bytes | str | None = None
 ) -> subprocess.CompletedProcess:
+    # Replace refs and inherited GIT_* variables change the tree a commit SHA reads
+    # (#716). Keep only what finds git and its global safe.directory, root under sudo
+    # included; every call is local, so no credential or proxy variable is needed.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _GIT_ENV_KEYS or key.startswith("LC_")
+    }
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
     return subprocess.run(
         ["git", *args],
         cwd=str(cwd),
@@ -263,6 +275,7 @@ def git(
         text=text,
         input=input,
         check=False,
+        env=env,
     )
 
 
@@ -2561,12 +2574,6 @@ def reconstruct_source(bundle: Path, dest: Path) -> str:
     result = git("clone", "--quiet", str(bundle), str(dest), cwd=dest.parent)
     require_command(result, f"clone source bundle into {dest}")
     return full_commit(dest)
-
-
-def tracked_paths(root: Path) -> list[str]:
-    result = git("ls-files", "-z", cwd=root)
-    require_command(result, f"list tracked files in {root}")
-    return [item for item in result.stdout.split("\0") if item]
 
 
 def file_bytes_at_commit(root: Path, commit: str, relative: str) -> bytes:

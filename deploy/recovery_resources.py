@@ -242,7 +242,7 @@ def _require_root_scoped_path(value: str, deploy_root: Path, name: str) -> Path:
     try:
         resolved = path.resolve()
         root = deploy_root.resolve()
-    except OSError as cop:
+    except (OSError, RuntimeError) as cop:  # RuntimeError: symlink loop before 3.13
         raise RecoveryError(f"{name} cannot be resolved: {cop}") from cop
     if resolved != root and root not in resolved.parents:
         raise RecoveryError(f"{name} is outside the selected deployment root")
@@ -461,7 +461,7 @@ def _require_prompts_mount(name: str, payload: dict, runtime: dict[str, str]) ->
             and mounts[0].get("Type") == "bind"
             and Path(str(mounts[0].get("Source") or "")).resolve() == Path(declared).resolve()
         )
-    except OSError as cop:
+    except (OSError, RuntimeError) as cop:  # RuntimeError: symlink loop before 3.13
         raise RecoveryError(f"OCU_PROMPTS_DIR cannot be resolved: {cop}") from cop
     if not matches:
         raise RecoveryError(f"{name} {PROMPTS_MOUNT} mount does not match OCU_PROMPTS_DIR")

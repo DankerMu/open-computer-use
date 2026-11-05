@@ -3547,6 +3547,32 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self.assertFalse((self.root / "os-backup").exists())
         self.assertFalse((self.root / "os-root").exists())
 
+    def test_symlink_loop_in_a_data_root_is_a_one_line_refusal(self):
+        # Python 3.11/3.12 raise RuntimeError for a symlink loop; 3.13 does not (#722).
+        entry = "runpy.run_module('recovery', run_name='__main__')"
+        injection = (
+            "import pathlib\n"
+            "_real_resolve = pathlib.Path.resolve\n"
+            "def looping_resolve(self, strict=False):\n"
+            f"    if str(self) == {str(self.chat_dir)!r}:\n"
+            "        raise RuntimeError(f'Symlink loop from {str(self)!r}')\n"
+            "    return _real_resolve(self, strict)\n"
+            "pathlib.Path.resolve = looping_resolve\n"
+        )
+        self.launcher.write_text(self.launcher.read_text().replace(entry, injection + entry))
+        dest = self.root / "loop-backup"
+        result = self.run_cli(["backup", "--deploy-root", str(self.deploy_root),
+                               "--destination", str(dest), "--runtime-file", str(self.runtime)])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("recovery: OCU_CHAT_DATA_DIR cannot be resolved: Symlink loop"),
+                        result.stderr)
+        self.assertFalse(dest.exists())
+        self.assertFalse((self.state / "stopped.log").exists())
+
     def _seed_model_links(self):
         workspace = self.state / "volume-data" / f"chat-{CHAT_ID}-workspace"
         outputs = self.chat_dir / CHAT_ID / "outputs"
@@ -4254,6 +4280,41 @@ class CursorLagChatIdTests(unittest.TestCase):
         self.assertIn("chat chat-a cursor 5 leads recovered broker counter 3", message)
         self.assertIn("UPDATE ocu_chat_state SET last_seen_revision = 3 WHERE chat_id = 'chat-a';", message)
         self.assertIn("chat chat-b broker revision probe rewrote broker identity", message)
+
+
+class ResolveLoopTests(unittest.TestCase):
+    """A symlink loop (RuntimeError before Python 3.13) refuses with the variable name (#722)."""
+
+    LOOP = RuntimeError("Symlink loop from '/srv/ocu/data/chat'")
+
+    def setUp(self):
+        import recovery_resources
+
+        self.resources = recovery_resources
+
+    def test_root_scoped_path_loop_names_the_variable(self):
+        with patch.object(Path, "resolve", side_effect=self.LOOP):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                self.resources._require_root_scoped_path(
+                    "/srv/ocu/data/chat", Path("/srv/ocu"), "OCU_CHAT_DATA_DIR"
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "OCU_CHAT_DATA_DIR cannot be resolved: Symlink loop from '/srv/ocu/data/chat'",
+        )
+
+    def test_prompts_mount_loop_names_the_variable(self):
+        payload = {"Mounts": [{"Type": "bind", "Destination": self.resources.PROMPTS_MOUNT,
+                               "Source": "/srv/ocu/prompts"}]}
+        with patch.object(Path, "resolve", side_effect=self.LOOP):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                self.resources._require_prompts_mount(
+                    "ocu-test-open-webui", payload, {"OCU_PROMPTS_DIR": "/srv/ocu/prompts"}
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "OCU_PROMPTS_DIR cannot be resolved: Symlink loop from '/srv/ocu/data/chat'",
+        )
 
 
 if __name__ == "__main__":

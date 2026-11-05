@@ -141,6 +141,20 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **Release git reads only the commit (#716).** `deploy/release.py` runs git
+  with `PATH`, `HOME`, `XDG_CONFIG_HOME`, `LANG`, `LC_*`, `TMPDIR` and
+  `SUDO_UID` from the caller, nothing else, plus `GIT_NO_REPLACE_OBJECTS=1`
+  and `GIT_TERMINAL_PROMPT=0`. A replace ref in the checkout or an inherited
+  `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` or
+  `GIT_CONFIG_*` no longer changes what build, bundle, import and recovery
+  verify read for the SHA the inventory records. Global and system git config,
+  where `safe.directory` lives, still apply. The unused `release.tracked_paths`
+  and `recovery.PATH_KEYS` (#717) are gone.
+- **A symlink loop under the deployment root is a one-line refusal (#722).**
+  On Python 3.11 and 3.12 `Path.resolve()` raises `RuntimeError` for a loop;
+  the data-root and `OCU_PROMPTS_DIR` mount checks of `recovery.py` now turn
+  it into `recovery: <name> cannot be resolved: …`, before anything stops,
+  where the command printed a traceback.
 - **Tools README matches the example compose (#718).** `openwebui/tools/README.md`
   no longer says `docker-compose.webui.yml` runs `init.sh` (it runs the stock
   image; see `docs/INSTALL.md`), lists `generate_speech`, and names the video
