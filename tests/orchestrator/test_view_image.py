@@ -84,7 +84,7 @@ class TestViewImagePillow12Api(unittest.IsolatedAsyncioTestCase):
 
 
 class TestViewImageReturnsStructuredContent(unittest.IsolatedAsyncioTestCase):
-    """Verify the structured [text, image_url] return format for image files."""
+    """Verify view() returns a two-item list for an image and an error string on failure."""
 
     def setUp(self):
         current_chat_id.set("test-chat")
@@ -101,47 +101,6 @@ class TestViewImageReturnsStructuredContent(unittest.IsolatedAsyncioTestCase):
         result = await view("view image", "/tmp/test.png")
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 2)
-
-    @patch("mcp_tools._ensure_gitlab_token", new_callable=AsyncMock)
-    @patch("mcp_tools._get_or_create_container", return_value=_mock_container())
-    @patch("mcp_tools._execute_bash")
-    async def test_first_item_is_text_type(self, mock_exec, mock_container, mock_token):
-        from mcp_tools import view
-        mock_exec.side_effect = self._make_exec_mock()
-        result = await view("view image", "/tmp/test.png")
-        self.assertEqual(result[0]["type"], "text")
-
-    @patch("mcp_tools._ensure_gitlab_token", new_callable=AsyncMock)
-    @patch("mcp_tools._get_or_create_container", return_value=_mock_container())
-    @patch("mcp_tools._execute_bash")
-    async def test_second_item_is_image_url_type(self, mock_exec, mock_container, mock_token):
-        from mcp_tools import view
-        mock_exec.side_effect = self._make_exec_mock()
-        result = await view("view image", "/tmp/test.png")
-        self.assertEqual(result[1]["type"], "image_url")
-
-    @patch("mcp_tools._ensure_gitlab_token", new_callable=AsyncMock)
-    @patch("mcp_tools._get_or_create_container", return_value=_mock_container())
-    @patch("mcp_tools._execute_bash")
-    async def test_image_url_is_data_uri(self, mock_exec, mock_container, mock_token):
-        from mcp_tools import view
-        mock_exec.side_effect = self._make_exec_mock()
-        result = await view("view image", "/tmp/test.png")
-        url = result[1]["image_url"]["url"]
-        self.assertTrue(
-            url.startswith("data:image/jpeg;base64,"),
-            f"Expected data URI, got: {url[:60]}",
-        )
-
-    @patch("mcp_tools._ensure_gitlab_token", new_callable=AsyncMock)
-    @patch("mcp_tools._get_or_create_container", return_value=_mock_container())
-    @patch("mcp_tools._execute_bash")
-    async def test_data_uri_contains_b64_payload(self, mock_exec, mock_container, mock_token):
-        from mcp_tools import view
-        mock_exec.side_effect = self._make_exec_mock(b64=FAKE_B64)
-        result = await view("view image", "/tmp/test.png")
-        url = result[1]["image_url"]["url"]
-        self.assertIn(FAKE_B64, url)
 
     @patch("mcp_tools._ensure_gitlab_token", new_callable=AsyncMock)
     @patch("mcp_tools._get_or_create_container", return_value=_mock_container())

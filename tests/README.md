@@ -86,7 +86,7 @@ consumer retains its explicit empty-prefix configuration and security assertions
 app-import cache family: a key is owned when it is in `names` or starts with a
 prefix. Cleanup retires replacement modules and restores exact entry objects or
 entry absence after normal completion, test-body failure, or setup failure after
-eviction. Six owners share it. The app-importing owners in the first three
+eviction. Seven owners share it. The app-importing owners in the first three
 bullets share `_SERVER_MODULES` plus `_SERVER_PREFIXES` (`mcp_resources*`,
 `office.*`, `cli_adapters.*`) from the same module: the whole server directory
 except the standalone `drawio/` script.
@@ -105,12 +105,20 @@ except the standalone `drawio/` script.
   `isolated_modules` for `docker_manager` plus `docker_manager.*` in `setUp` through
   `self.enterContext(...)`, so `_reload_docker_manager()` reimports inside the owned
   scope and the cleanup runs after `tearDown`, including after a body failure.
+- `orchestrator/test_docker_manager.py`: the cases that need a fresh `docker_manager`
+  enter `isolated_modules` for the shared set minus `context_vars` through
+  `self.enterContext(...)`, so the fresh modules serve the whole test body and the
+  window closes before the data-root cleanup. `context_vars` stays shared because
+  the module binds its ContextVars at import. `TestFreshImportRestoresModules` in
+  the same file runs one case per re-import site through `TestCase.run` and checks
+  the entry `docker_manager` exception classes; for the env-injection site it also
+  checks that `mcp_tools` and `outputs_broker`, absent on entry, are absent after.
 - `test_opencode_alias_map_drop.py::alias_runtime_modules` owns `cli_runtime`,
   `docker_manager` and `outputs_broker`. The autouse `_scrub_opencode_env` requests
   it, so every fresh `cli_runtime` import sits inside the owned scope; a wiring test
   pins that dependency.
 
-`test_file_route_module_ownership.py` covers all six owners with present and absent
+`test_file_route_module_ownership.py` covers the other six owners with present and absent
 entry modules. For the fixture owners, restoration assertions run after actual
 pytest fixture teardown and before emergency cleanup. For the auth, WebSocket and
 alias-map owners, a child pytest run records the entry modules, fails a test body
@@ -144,7 +152,7 @@ import-mode override.
 ### Docker-manager test data ownership
 
 `orchestrator/test_docker_manager.py` owns a private temporary data root across
-imports, reloads and real metadata writes under standalone and pytest execution.
+imports, re-imports and real metadata writes under standalone and pytest execution.
 No caller-provided `BASE_DATA_DIR` is required. Cleanup restores the prior
 environment and cached data root independently and removes only the fixture-owned
 directory, including after setup or test-body failures.

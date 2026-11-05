@@ -20,6 +20,15 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'computer-use-server'))
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests.file_route_module_ownership import (  # noqa: E402
+    _SERVER_MODULES,
+    _SERVER_PREFIXES,
+    isolated_modules,
+)
 from context_vars import (
     current_chat_id,
     current_user_email,
@@ -30,6 +39,11 @@ from context_vars import (
     current_anthropic_base_url,
     current_gateway_token,
 )
+
+# A fresh docker_manager import owns every server module it can first-import
+# (mcp_tools, mcp_resources*, outputs_broker, uploads, ...). context_vars stays
+# shared: the ContextVars imported above must be the ones the fresh modules read.
+_FRESH_IMPORT_MODULES = _SERVER_MODULES - {"context_vars"}
 
 
 # Ten gateway model/flag vars injected via CLAUDE_CODE_PASSTHROUGH_ENVS
@@ -159,25 +173,33 @@ class _RuntimeEnvironmentCase(unittest.TestCase):
         if prior_module is not None:
             prior_module.BASE_DATA_DIR = Path(data_dir.name)
 
+    def _fresh_docker_manager(self):
+        """Import docker_manager (and outputs_broker) afresh for the rest of the test.
+
+        The fresh modules stay in sys.modules until the test's cleanups run, so
+        patch("docker_manager....") and later server imports reach them. On exit the
+        entry modules come back and modules first imported meanwhile are removed.
+        """
+        self.enterContext(isolated_modules(_FRESH_IMPORT_MODULES, _SERVER_PREFIXES))
+        manager = importlib.import_module("docker_manager")
+        importlib.import_module("outputs_broker")
+        return manager
+
 
 class TestDockerManagerEnvInjection(_RuntimeEnvironmentCase):
     """Three-path env-injection matrix + empty-string guard + ANTHROPIC_CUSTOM_HEADERS regression."""
 
     def _reload_docker_manager(self, overrides):
-        """Apply a clean env matrix (clear gateway vars, apply overrides) and reload the module.
+        """Apply a clean env matrix (clear gateway vars, apply overrides) and import docker_manager afresh.
 
-        Returns the reloaded docker_manager module. Caller is responsible for using the
+        Returns the fresh docker_manager module. Caller is responsible for using the
         patch.dict context manager that wraps this method.
         """
         _clear_gateway_env()
         os.environ.pop("OCU_SANDBOX_DNS", None)
         for k, v in overrides.items():
             os.environ[k] = v
-        import docker_manager
-        importlib.reload(docker_manager)
-        if "outputs_broker" in sys.modules:
-            importlib.reload(sys.modules["outputs_broker"])
-        return docker_manager
+        return self._fresh_docker_manager()
 
     def _run_isolated(self, body):
         """Run `body` inside a fresh contextvars.Context so .set() calls do not leak to sibling tests.
@@ -393,16 +415,9 @@ class TestBuildMcpConfigBaseUrlFallback(_RuntimeEnvironmentCase):
     base-url header" path.
     """
 
-    def _reload_docker_manager(self):
-        import docker_manager
-        importlib.reload(docker_manager)
-        if "outputs_broker" in sys.modules:
-            importlib.reload(sys.modules["outputs_broker"])
-        return docker_manager
-
     def test_none_base_url_falls_back_to_module_constant(self):
         """None base_url: config builds successfully, uses module default."""
-        dm = self._reload_docker_manager()
+        dm = self._fresh_docker_manager()
         cfg = dm.build_mcp_config("metabase", None, user_email="alice@example.com")
         self.assertIsNotNone(cfg)
         self.assertIn("metabase", cfg["mcpServers"])
@@ -414,14 +429,14 @@ class TestBuildMcpConfigBaseUrlFallback(_RuntimeEnvironmentCase):
     def test_empty_string_base_url_falls_back_to_module_constant(self):
         """Empty-string base_url: same fallback path as None — covers the
         compose ${VAR:-} scenario that leaves the env set but empty."""
-        dm = self._reload_docker_manager()
+        dm = self._fresh_docker_manager()
         cfg = dm.build_mcp_config("metabase", "", user_email="alice@example.com")
         self.assertIsNotNone(cfg)
         self.assertTrue(cfg["mcpServers"]["metabase"]["url"].endswith("/mcp/metabase"))
 
     def test_explicit_base_url_overrides_module_constant(self):
         """When caller provides a non-empty base_url, it wins (with trailing / stripped)."""
-        dm = self._reload_docker_manager()
+        dm = self._fresh_docker_manager()
         cfg = dm.build_mcp_config(
             "metabase",
             "https://litellm.internal/",
@@ -442,11 +457,56 @@ class TestAnthropicBaseUrlEmptyStringHandling(_RuntimeEnvironmentCase):
         os.getenv returns as "" (not the default). The module falls back to
         the public Anthropic URL via `os.getenv(...) or "https://..."`."""
         with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": ""}, clear=False):
-            import docker_manager
-            importlib.reload(docker_manager)
-            if "outputs_broker" in sys.modules:
-                importlib.reload(sys.modules["outputs_broker"])
-            self.assertEqual(docker_manager.ANTHROPIC_BASE_URL, "https://api.anthropic.com")
+            dm = self._fresh_docker_manager()
+            self.assertEqual(dm.ANTHROPIC_BASE_URL, "https://api.anthropic.com")
+
+
+class TestFreshImportRestoresModules(_RuntimeEnvironmentCase):
+    """#719: each re-import site leaves the caller's server modules as it found them.
+
+    Each test runs one real case through unittest's own TestCase.run and checks
+    module state afterwards. Its own window restores the ambient modules.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(isolated_modules(_FRESH_IMPORT_MODULES, _SERVER_PREFIXES))
+        self.entry = importlib.import_module("docker_manager")
+        self.entry_errors = (self.entry.LifecycleError, self.entry.ChatDeleted)
+
+    def _run_case(self, case):
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertTrue(result.wasSuccessful(), result.failures + result.errors)
+
+    def _assert_entry_errors(self):
+        manager = sys.modules["docker_manager"]
+        self.assertIs(manager, self.entry)
+        self.assertIs(manager.LifecycleError, self.entry_errors[0])
+        self.assertIs(manager.ChatDeleted, self.entry_errors[1])
+
+    def test_env_injection_case_drops_modules_it_first_imported(self):
+        # _create_container lazily imports mcp_resources, which imports mcp_tools.
+        for name in list(sys.modules):
+            if name in ("mcp_tools", "outputs_broker") or name.startswith("mcp_resources"):
+                sys.modules.pop(name)
+        self._run_case(TestDockerManagerEnvInjection(
+            "test_unset_or_empty_server_time_zone_adds_nothing"))
+        self._assert_entry_errors()
+        self.assertNotIn("mcp_tools", sys.modules)
+        self.assertNotIn("outputs_broker", sys.modules)
+        import mcp_tools
+        self.assertIs(mcp_tools.LifecycleError, self.entry.LifecycleError)
+
+    def test_build_mcp_config_case_keeps_entry_classes(self):
+        self._run_case(TestBuildMcpConfigBaseUrlFallback(
+            "test_none_base_url_falls_back_to_module_constant"))
+        self._assert_entry_errors()
+
+    def test_empty_base_url_case_keeps_entry_classes(self):
+        self._run_case(TestAnthropicBaseUrlEmptyStringHandling(
+            "test_empty_env_treats_as_unset_for_anthropic_base_url"))
+        self._assert_entry_errors()
 
 
 if __name__ == "__main__":
