@@ -294,6 +294,17 @@
   bytes, fixed control ports and TTY assertions remain intact. Production behavior
   is unchanged.
 
+- **Orchestrator tests are order-independent and match `view` (#719, #723).** The
+  three places in `test_docker_manager.py` that re-imported `docker_manager` with
+  `importlib.reload` now import it afresh inside `isolated_modules` for the whole
+  test body, so afterwards the entry modules are back and server modules first
+  imported meanwhile (`mcp_tools`, `mcp_resources`, `outputs_broker`, ...) are
+  gone. `test_speech.py` no longer fails after the time-zone cases on a
+  `ChatDeleted` class its `mcp_tools` did not catch. Four `test_view_image.py`
+  cases that asserted the image shape `view` returned before #205 are removed;
+  `test_mcp_tools.py` checks the current shape at the MCP boundary. Production
+  behavior is unchanged.
+
 - **Main CI root-module coverage.** The non-image pytest job runs the complete
   `tests/test_upload_claim.py` and `tests/test_tools.py` modules in one invocation,
   separate from orchestrator collection. A failure in either module fails the
