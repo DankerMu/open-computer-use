@@ -141,6 +141,18 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **A generated image is shown once (#724).** Open WebUI saves the images of
+  `generate_image` and `edit_image` into `/mnt/user-data/files/` (#713), and
+  the `<sharing_files>` rule to embed every image there with Markdown image
+  syntax made the model show them a second time. A paragraph right after that
+  rule now says such an image is already shown in the chat and must not be
+  embedded or linked again; the rule for other images (screenshots, charts)
+  and the examples are unchanged. Replaying the chat against
+  deepseek-v4.1-flash, 16 runs each: 7/16 answers embedded the image again and
+  15/16 linked it before; with this exception and Open WebUI's new workspace
+  note together, 0/16 and 0/16. Either change alone left 1/16 links, so both
+  ship in the same release. The sandbox `README.md` of a chat created before
+  the upgrade keeps the old text.
 - **Backups carry the company system prompt (#715).** `recovery.py backup`
   reads `system-prompt.md` in `OCU_PROMPTS_DIR` before anything stops and
   stores it in the set as the `system-prompt` component with its checksum; a

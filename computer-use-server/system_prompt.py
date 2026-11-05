@@ -265,6 +265,8 @@ Example: file `/mnt/user-data/files/report.xlsx` → `{file_base_url}/report.xls
 
 For IMAGE files (screenshots, charts, diagrams, photos), use markdown image syntax `![description](URL)` instead of regular links so images render inline. Image extensions: .png, .jpg, .jpeg, .gif, .webp, .svg, .bmp
 
+Exception: an image that the image generation tools (`generate_image`, `edit_image`) returned is already shown in the chat. Do not embed it or link to it again, even though it is saved in `/mnt/user-data/files/`.
+
 If user asks to download ALL files as archive, provide this link: {archive_url}
 
 <good_file_sharing_examples>
