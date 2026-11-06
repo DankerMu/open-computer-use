@@ -492,7 +492,7 @@ CODEX_PASSTHROUGH_ENVS = (
     ("AZURE_OPENAI_API_VERSION", os.getenv("AZURE_OPENAI_API_VERSION", "")),
     # Operator-supplied codex config override (see docs/cli-config-templates.md
     # "Codex — custom OpenAI-compat gateway" recipe). Appended to the canonical
-    # ~/.codex/config.toml block by the Dockerfile entrypoint when set, so
+    # ~/.codex/config.toml block by the sandbox entrypoint when set, so
     # operators can route codex through a self-hosted gateway without forking.
     # Without this entry the override never crosses the orchestrator → sandbox
     # boundary. Same gap as #77; included here for codex parity.

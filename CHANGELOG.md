@@ -141,6 +141,22 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **The sandbox CLAUDE.md keeps its Markdown headings (#681).** The root
+  `Dockerfile` wrote the sandbox entrypoint with one `RUN printf` spread over
+  continuation lines, and the Dockerfile parser drops every line that starts
+  with `#` inside a continuation. The CLAUDE.md the entrypoint writes to
+  `/home/assistant/.claude/CLAUDE.md` therefore lost `# Environment`,
+  `## File Locations`, `## Output Rules`, `## Plan Mode — MANDATORY`,
+  `## Verification`, `## Self-Improvement` and `## Useful Commands`, and the
+  script lost its own comments. The entrypoint is now the file
+  `computer-use-server/bin/sandbox-entrypoint.sh`, copied to
+  `/home/assistant/.entrypoint.sh`; apart from the restored `#` lines it is
+  byte for byte the script the image ran before. The sandbox (workspace) image
+  must be rebuilt. The entrypoint lives in the chat's `/home/assistant`
+  volume, which Docker fills from the image only when the volume is created:
+  a new chat gets the headings, while a chat whose volume already exists keeps
+  the old entrypoint, and so the old CLAUDE.md, even when its container is
+  recreated, until retention or chat deletion removes the volume.
 - **Provider keys containing `$` reached the containers with every `$`
   doubled (#691).** `docker compose config` already writes a literal `$` as
   `$$`, and `deploy/up.sh` escaped its output a second time before starting it,
