@@ -142,13 +142,16 @@
 
 ### Fixed
 - **`release.py` operator mistakes are one line (#726).** A missing
-  `--inventory`, one that is not JSON, a symbolic link loop as a path
-  argument, or a release path whose symbolic-link check fails (for example a
-  directory without permission) now ends `build`, `import`, `verify` and
-  `bootstrap` with exit 1 and one `release: …` line naming the argument or
-  path, where the command printed a traceback: `<name> <value> cannot be
-  resolved: …` for every command-line path and `OCU_RELEASE_MANIFEST`,
-  `<path>: cannot read inventory: …` from `load_json_object`. `recovery.py`
+  `--inventory`, one that is not JSON, a symbolic link loop as the
+  `--inventory` or `--delivery` argument, or a release path whose
+  symbolic-link check fails (for example a directory without permission) now
+  ends the command with exit 1 and one `release: …` line naming the argument
+  or path, where it printed a traceback: `<name> <value> cannot be resolved: …`
+  where resolving a command-line path or `OCU_RELEASE_MANIFEST` fails (Python
+  before 3.13 raises there for a loop; 3.13 fails at the later read), and
+  `<path>: cannot read inventory: …` from `load_json_object`. A loop as
+  `--ocu-source`, `--webui-source` or `verify --source` still prints a
+  traceback on 3.13, where it surfaces from the `git` subprocess. `recovery.py`
   reads its manifest the same way, so a manifest that is not JSON is one
   `recovery: …` line too, and `deploy/up.sh` prints
   `deploy: <path>: cannot read inventory: …` for such an inventory.
