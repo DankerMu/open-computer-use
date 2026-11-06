@@ -140,7 +140,8 @@ replaces or removes a server module present on entry, or replaces its classes or
 functions, and checks at exit that `mcp_tools.LifecycleError`, `app.LifecycleError`
 and `outputs_broker.docker_manager` match the current `docker_manager`.
 
-`test_file_route_module_ownership.py` covers the first six owners with present and absent
+`test_file_route_module_ownership.py` covers the six owners other than `test_docker_manager.py`
+and the #730 sites with present and absent
 entry modules. For the fixture owners, restoration assertions run after actual
 pytest fixture teardown and before emergency cleanup. For the auth, WebSocket and
 alias-map owners, a child pytest run records the entry modules, fails a test body
