@@ -72,6 +72,7 @@ services:
       # Loaded from the 0600 provider env file into the deploy shell, never from
       # runtime.env; only this service receives it, and sandboxes never do.
       TTS_API_KEY: ${TTS_API_KEY:-}
+      # No VISION_*: the key would reach every sandbox; describe-image stays unlisted (#720).
       # Do not pass credentials for Claude, Codex, OpenCode, or other external
       # sub-agents.
 

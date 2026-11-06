@@ -5,7 +5,7 @@ description: Describe images (charts, diagrams, tables, screenshots) using Visio
 
 # Describe Image
 
-Analyze images using Vision AI and generate detailed text descriptions in Russian.
+Analyze images using Vision AI and generate detailed text descriptions. Descriptions are in Chinese unless `-l/--language` names another language.
 
 ## Quick Start
 
@@ -25,6 +25,7 @@ python /mnt/skills/public/describe-image/scripts/describe.py \
 |-----------|---------|-------------|
 | `-i, --input` | required | Image file or folder path |
 | `-c, --context` | "" | (optional) Context for better accuracy (e.g., "Sales dashboard Q4") |
+| `-l, --language` | Chinese | (optional) Language of the description (e.g., `English`) |
 | `--page` | 1 | (optional) Page number for folder processing |
 | `--page-size` | 50 | (optional) Images per page (max 100) |
 | `--quiet` | false | (optional) Suppress per-image logging in single-file mode |
@@ -51,6 +52,12 @@ python /mnt/skills/public/describe-image/scripts/describe.py \
 python /mnt/skills/public/describe-image/scripts/describe.py \
     -i dashboard.png \
     -c "Quarterly sales report showing EMEA region performance"
+```
+
+**In another language (default is Chinese):**
+```bash
+python /mnt/skills/public/describe-image/scripts/describe.py \
+    -i chart.png -l English
 ```
 
 **Folder with images (batch processing):**

@@ -625,6 +625,28 @@ def _get_skill_description(skill: SkillInfo) -> str:
     return desc
 
 
+def vision_configured() -> bool:
+    """
+    Whether the orchestrator has a Vision API key, so `describe-image` can work.
+
+    Read at call time: docker_manager imports this module at import time.
+    """
+    import docker_manager
+
+    return bool(docker_manager.VISION_API_KEY)
+
+
+def listed_skills(skills: list[SkillInfo]) -> list[SkillInfo]:
+    """
+    Skills to list to the model: `describe-image` only when Vision is configured.
+
+    Always a new list; `skills` may be the in-memory cache entry, see video_skills.
+    """
+    if vision_configured():
+        return list(skills)
+    return [skill for skill in skills if skill.name != "describe-image"]
+
+
 def build_available_skills_xml(skills: list[SkillInfo]) -> str:
     """
     Generate <available_skills> XML block for system prompt.
@@ -632,7 +654,7 @@ def build_available_skills_xml(skills: list[SkillInfo]) -> str:
     Format matches the existing hardcoded block in system_prompt.py.
     """
     lines = ["<available_skills>"]
-    for skill in skills:
+    for skill in listed_skills(skills):
         desc = _get_skill_description(skill)
         lines.append("<skill>")
         lines.append(f"<name>\n{skill.name}\n</name>")
@@ -651,7 +673,7 @@ def build_sub_agent_skills_text(skills: list[SkillInfo]) -> str:
     Format: "- skill-name: location - Short description"
     """
     lines = []
-    for skill in skills:
+    for skill in listed_skills(skills):
         desc = _get_skill_description(skill)
         # Truncate for sub-agent (shorter)
         if len(desc) > 120:

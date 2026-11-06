@@ -575,6 +575,25 @@ TDD workflow: write test first, watch it fail, write minimal code to pass. Use f
 </available_skills>
 """.strip()
 
+# The describe-image entry of DEFAULT_SKILLS_XML and the blank line after it,
+# removed from the no-email template when Vision is not configured.
+DEFAULT_DESCRIBE_IMAGE_BLOCK = """<skill>
+<name>
+describe-image
+</name>
+<description>
+Describe images (charts, diagrams, tables, screenshots) using Vision AI.
+Use as fallback when you cannot read an image file directly.
+</description>
+<location>
+/mnt/skills/public/describe-image/SKILL.md
+</location>
+</skill>
+
+"""
+if DEFAULT_SKILLS_XML.count(DEFAULT_DESCRIBE_IMAGE_BLOCK) != 1:
+    raise RuntimeError("DEFAULT_SKILLS_XML must contain the describe-image entry exactly once")
+
 
 SYSTEM_PROMPT_AFTER_SKILLS = """
 <filesystem_configuration>
@@ -717,6 +736,8 @@ async def _render_uncached(
         result = build_system_prompt(skills_xml=skills_xml, has_user_skills=has_user_skills)
     else:
         result = SYSTEM_PROMPT_TEMPLATE
+        if not skill_manager.vision_configured():
+            result = result.replace(DEFAULT_DESCRIBE_IMAGE_BLOCK, "", 1)
 
     if chat_id is None:
         # Legacy diagnostic path — leave placeholders intact for downstream

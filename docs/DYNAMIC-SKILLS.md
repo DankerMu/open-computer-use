@@ -28,8 +28,8 @@ Without Settings Wrapper, all 13 public skills are always enabled for everyone.
 | `get_user_skills(email)` | Fetch enabled skills (async, 3-level fallback) |
 | `get_user_skills_sync(email)` | Sync version (reads cache only, for Docker thread) |
 | `ensure_skill_cached(skill)` | Download + extract user-uploaded ZIP |
-| `build_available_skills_xml(skills)` | `<available_skills>` XML for system prompt |
-| `build_sub_agent_skills_text(skills)` | Skill list for sub-agent prompt |
+| `build_available_skills_xml(skills)` | `<available_skills>` XML for system prompt; omits `describe-image` when `VISION_API_KEY` is unset or empty |
+| `build_sub_agent_skills_text(skills)` | Skill list for sub-agent prompt and `/skill-list`; omits `describe-image` when `VISION_API_KEY` is unset or empty |
 | `get_skill_mounts(skills)` | Docker volume mounts dict for user skills |
 
 ## API Endpoints
