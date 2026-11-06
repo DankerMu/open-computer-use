@@ -518,6 +518,24 @@ class OverlayStructureTests(unittest.TestCase):
                             self.assertNotIn("TTS_", text, f"{document}:{service}")
                             self.assertNotIn(key, text, f"{document}:{service}")
 
+    def test_vision_settings_reach_no_service(self):
+        # The deployment does not provide Vision (#720): a key passed to
+        # computer-use-server would reach every sandbox's environment.
+        core = parsed(CORE_OVERRIDE)
+        core_env = override_value(core["services"]["computer-use-server"]["environment"])
+        self.assertEqual([name for name in core_env if name.startswith("VISION_")], [])
+        vision = {"VISION_API_KEY": "vision-key-fixture", "VISION_API_URL": "http://vision.lan/v1",
+                  "VISION_MODEL": "vision-model-fixture"}
+        with tempfile.TemporaryDirectory(prefix="ocu-native-vision-") as raw:
+            stacks = resolved_stacks(Path(raw), "false", extra=vision)
+        server = stacks["core.json"]["services"]["computer-use-server"]["environment"]
+        self.assertEqual([name for name in server if name.startswith("VISION_")], [])
+        for document, body in stacks.items():
+            for service, definition in body["services"].items():
+                text = json.dumps(definition)
+                self.assertNotIn("VISION_", text, f"{document}:{service}")
+                self.assertNotIn("vision-key-fixture", text, f"{document}:{service}")
+
     def test_every_overlay_service_requires_the_host_zone(self):
         services = {f"{stack}:{name}": body
                     for stack, path in OVERLAYS.items()

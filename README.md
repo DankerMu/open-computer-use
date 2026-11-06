@@ -256,7 +256,7 @@ All settings via `.env`:
 | `PUBLIC_BASE_URL` | `http://computer-use-server:8081` | Browser-facing base of the Computer Use server. Baked into `/system-prompt` and returned to the Open WebUI filter in the `X-Public-Base-URL` response header — **single source of truth** for the public URL. It accepts an absolute `http(s)` base (for example `https://cu.example.com/ocu`) or root-relative `/ocu`; a configured value must not end with `/`. [Open WebUI filter URL requirements](docs/openwebui-filter.md#two-url-roles--public-server-env-and-internal-filtertool-valve). |
 | `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS`, `ORCHESTRATOR_URL`, `TOOL_RESULT_MAX_CHARS`, `TOOL_RESULT_PREVIEW_CHARS` | — | Settings on the **`open-webui` container** (not CU-server). Required when embedding — see [Required setup when embedding Open WebUI](#required-setup-when-embedding-open-webui-into-your-own-stack). |
 | `POSTGRES_PASSWORD` | `openwebui` | PostgreSQL password |
-| `VISION_API_KEY` | — | Vision API key (for describe-image) |
+| `VISION_API_KEY` | — | Vision API key (for describe-image). Unset or empty: `describe-image` is not listed in the system prompt, `/skill-list` or the `sub_agent` prompt |
 | `ANTHROPIC_AUTH_TOKEN` | — | Anthropic key (for Claude Code sub-agent) |
 | `MCP_TOKENS_URL` | — | Settings Wrapper URL (optional, see below) |
 | `MCP_TOKENS_API_KEY` | — | Settings Wrapper auth key |

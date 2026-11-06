@@ -7,6 +7,7 @@ Describe image using Vision API (Qwen3-VL).
 Usage:
     python describe.py -i image.png
     python describe.py -i screenshot.jpg -c "This is a dashboard screenshot"
+    python describe.py -i chart.png -l English
     python describe.py -i /path/to/folder --page 1 --page-size 50
 """
 
@@ -24,6 +25,8 @@ import requests
 # Default configuration (can be overridden by env vars)
 DEFAULT_API_URL = "https://api.anthropic.com/v1/chat/completions"
 DEFAULT_MODEL = "gpt-4o"
+# Language of the description unless -l/--language names another one.
+DEFAULT_LANGUAGE = "Chinese"
 
 # Supported image extensions
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -34,7 +37,7 @@ MAX_PAGE_SIZE = 100
 
 SYSTEM_PROMPT = """You are an expert image analyst. Your task is to create accurate and structured text descriptions of images.
 
-IMPORTANT: Always respond in the same language as the user's message.
+IMPORTANT: Always respond in the language the user's message asks for.
 
 Description rules:
 1. Identify the image type (chart, diagram, table, UI screenshot, flowchart, document photo, etc.)
@@ -82,6 +85,7 @@ def describe_image(
     context: str = "",
     timeout: int = 120,
     verbose: bool = True,
+    language: str = DEFAULT_LANGUAGE,
 ) -> dict:
     """Describe image using Vision API."""
     image_path = Path(image_path)
@@ -119,11 +123,10 @@ def describe_image(
     except Exception as e:
         return {"success": False, "error": f"Failed to read image: {e}"}
 
-    # Build user message with optional context
+    # Build user message with optional context; it ends with the answer language.
+    user_text = f"Describe this image. Respond in {language}."
     if context:
-        user_text = f"Context: {context}\n\nDescribe this image."
-    else:
-        user_text = "Describe this image."
+        user_text = f"Context: {context}\n\n{user_text}"
 
     # Build request payload (OpenAI-compatible format)
     payload = {
@@ -198,6 +201,7 @@ def process_folder(
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
     timeout: int = 120,
+    language: str = DEFAULT_LANGUAGE,
 ) -> dict:
     """Process all images in a folder with pagination."""
     folder = Path(folder_path)
@@ -238,7 +242,9 @@ def process_folder(
     results = {}
     with ThreadPoolExecutor(max_workers=page_size) as executor:
         future_to_path = {
-            executor.submit(describe_image, str(img), context, timeout, verbose=False): img
+            executor.submit(
+                describe_image, str(img), context, timeout, verbose=False, language=language
+            ): img
             for img in page_images
         }
 
@@ -306,6 +312,7 @@ Examples:
     # Single image
     python describe.py -i chart.png
     python describe.py -i screenshot.jpg -c "Dashboard showing sales data"
+    python describe.py -i chart.png -l English
 
     # Folder with images (batch processing)
     python describe.py -i /path/to/folder
@@ -318,6 +325,12 @@ Examples:
     )
     parser.add_argument(
         "-c", "--context", default="", help="Optional context about the image(s)"
+    )
+    parser.add_argument(
+        "-l",
+        "--language",
+        default=DEFAULT_LANGUAGE,
+        help=f"Language of the description (default: {DEFAULT_LANGUAGE})",
     )
     parser.add_argument(
         "--page", type=int, default=1, help="Page number for folder processing (default: 1)"
@@ -350,6 +363,7 @@ Examples:
             args.page,
             args.page_size,
             args.timeout,
+            args.language,
         )
 
         if result["success"]:
@@ -372,7 +386,13 @@ Examples:
             sys.exit(1)
     else:
         # Single file processing
-        result = describe_image(args.input, args.context, args.timeout, verbose=not args.quiet)
+        result = describe_image(
+            args.input,
+            args.context,
+            args.timeout,
+            verbose=not args.quiet,
+            language=args.language,
+        )
 
         if result["success"]:
             print("\n" + "=" * 60)

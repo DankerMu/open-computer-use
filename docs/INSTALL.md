@@ -56,7 +56,7 @@ Edit `.env` before starting. Key variables:
 | `OCU_INTERNAL_TOKEN` | Yes | Required service credential on both the Computer Use Server and Open WebUI. The tool and filter read it from the Open WebUI process environment on every call; the filter sends REST Bearer and MCP uses `X-OCU-Internal-Token`. It is not a Valve or model tool argument. |
 | `MCP_API_KEY` | No | Optional second MCP Bearer credential, required only when configured on the Computer Use Server |
 | `ANTHROPIC_AUTH_TOKEN` | No | For Claude Code sub-agent |
-| `VISION_API_KEY` | No | For describe-image skill |
+| `VISION_API_KEY` | No | For describe-image skill. Unset or empty: the skill is not listed in the system prompt, `/skill-list` or the `sub_agent` prompt |
 | `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS`, `TOOL_RESULT_MAX_CHARS`, `TOOL_RESULT_PREVIEW_CHARS`, `ORCHESTRATOR_URL` | No | Settings on the **`open-webui` container** (not CU-server). Required for multi-step tasks, large tool results, and preview rendering. Full guide: [README.md → Required setup when embedding Open WebUI](../README.md#required-setup-when-embedding-open-webui-into-your-own-stack). |
 
 See `.env.example` for the full list with defaults.

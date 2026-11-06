@@ -141,6 +141,19 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **`describe-image` is listed only when Vision is configured (#720).** With
+  `VISION_API_KEY` unset or empty on `computer-use-server`, the system prompt
+  (per user and the no-email template), `/skill-list` and the `sub_agent`
+  prompt no longer name `describe-image`, which could only fail with
+  `VISION_API_KEY not set`. A configured key lists it exactly as before. The
+  skill files in the sandbox are unchanged, so Claude Code inside the sandbox
+  can still find it on its own. `describe.py` answers in Chinese by default;
+  `-l/--language` names another language, also for a folder (its `SKILL.md`
+  said Russian, and the script answered in English). The production-like
+  deployment does not provide Vision: NETWORK-HARDENING says why (the key
+  would be readable in every sandbox, and the sandbox egress allowlist has no
+  Vision API). `SKILL.md` and `describe.py` ship in the sandbox image; existing
+  sandboxes keep the old files until recreated.
 - **Release git reads only the commit (#716).** `deploy/release.py` runs git
   with `PATH`, `HOME`, `XDG_CONFIG_HOME`, `LANG`, `LC_*`, `TMPDIR` and
   `SUDO_UID` from the caller, nothing else, plus `GIT_NO_REPLACE_OBJECTS=1`
