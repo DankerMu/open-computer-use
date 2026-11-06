@@ -3954,6 +3954,52 @@ class ProviderKeyTests(unittest.TestCase):
                 self.assertEqual(env.get(name), value, name)
 
 
+class ProviderFileQuotingTests(unittest.TestCase):
+    """A provider-file line means the same to `set -a; .` and to parse_dotenv (#691)."""
+
+    def setUp(self):
+        self.context = tmp_dir()
+        self.path = Path(self.context.name) / "provider.env"
+
+    def tearDown(self):
+        self.context.cleanup()
+
+    def parsed(self, line: str) -> str:
+        self.path.write_text(f"KEY={line}\n", encoding="utf-8")
+        return recovery.parse_dotenv(self.path)["KEY"]
+
+    def sourced(self) -> str:
+        result = subprocess.run(
+            ["bash", "-c", 'set -a; . "$1"; printf %s "$KEY"', "bash", str(self.path)],
+            capture_output=True, text=True, env={"PATH": os.environ["PATH"]}, check=True,
+        )
+        return result.stdout
+
+    def test_single_quoted_value_matches_the_sourced_value(self):
+        for line, expected in (("'fake$KEY'", "fake$KEY"), ("''", ""), ("plain", "plain"),
+                               ("'a b;c'", "a b;c")):
+            with self.subTest(line=line):
+                self.assertEqual(self.parsed(line), expected)
+                self.assertEqual(self.sourced(), expected)
+
+    def test_unbalanced_or_inner_quotes_are_kept_verbatim(self):
+        for line in ("'", "'a'b'", "'abc", "abc'", "a'b'c"):
+            with self.subTest(line=line):
+                self.assertEqual(self.parsed(line), line)
+
+    def test_quoted_provider_key_reaches_activation_unchanged(self):
+        self.path.write_text("DMXAPI_API_KEY='fake$KEY'\n", encoding="utf-8")
+        provider = recovery.parse_dotenv(self.path)
+        inventory = synthetic_inventory(ocu_sha="a" * 40, webui_sha=WEBUI_SYNTHETIC_SHA)
+        import recovery_resources
+
+        with patch.dict(os.environ, {"DOCKER_HOST": recovery.SUPPORTED_DOCKER_HOST}), patch.object(
+            recovery.release, "_PINNED_DOCKER_HOST", None
+        ):
+            env = recovery_resources.activation_env({}, inventory, Path("/nonexistent-root"), provider)
+        self.assertEqual(env["DMXAPI_API_KEY"], "fake$KEY")
+
+
 class VolumeHelperFailureTests(unittest.TestCase):
     VOLUME = "ocu-test_open-webui-data"
 

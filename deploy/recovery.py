@@ -443,6 +443,10 @@ def parse_dotenv(path: Path) -> dict[str, str]:
                 raise RecoveryError(f"{path}:{index}: malformed assignment")
         if name in values:
             raise RecoveryError(f"{path}:{index}: duplicate assignment {name}")
+        # A provider value with `$` is written KEY='...' (#691); strip that one
+        # pair as `set -a; .` does. Other values are kept verbatim.
+        if len(value) >= 2 and value[0] == value[-1] == "'" and value.count("'") == 2:
+            value = value[1:-1]
         values[name] = value
     return values
 

@@ -567,6 +567,7 @@ class OfflineReleaseTests(unittest.TestCase):
             "openwebui/functions/org_prompt_filter.py",
             "deploy/release.py",
             "deploy/up.sh",
+            "deploy/compose-snapshot.sh",
             "deploy/settings.py",
             "deploy/__init__.py",
             "deploy/check-ports.sh",

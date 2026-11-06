@@ -9,6 +9,8 @@ umask 077
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OVERLAY="$ROOT/deploy/production-like-test"
+# shellcheck source=deploy/compose-snapshot.sh
+. "$ROOT/deploy/compose-snapshot.sh"
 CONFIG_DIR=""
 OWNED_PID=""
 
@@ -209,52 +211,12 @@ core_files=(-p "$PROJECT" --project-directory "$ROOT" -f "$ROOT/docker-compose.y
 webui_files=(-p "$PROJECT" --project-directory "$ROOT" -f "$ROOT/docker-compose.webui.yml" -f "$OVERLAY/compose.webui.override.yml")
 proxy_files=(-p "$PROJECT" --project-directory "$OVERLAY" -f "$OVERLAY/compose.proxy.yml")
 
-resolve() {
-    local dest=$1
-    shift
-    if ! run_owned docker compose "$@" config --format json >"$dest"; then
-        printf '%s\n' 'deploy: compose config failed' >&2
-        return 1
-    fi
-}
-
-freeze() {
-    python3 - "$1" "$2" <<'PY' &
-from __future__ import annotations
-
-import json
-import sys
-from pathlib import Path
-
-
-def escape_dollars(value):
-    if isinstance(value, str):
-        return value.replace("$", "$$")
-    if isinstance(value, list):
-        return [escape_dollars(item) for item in value]
-    if isinstance(value, dict):
-        return {key: escape_dollars(item) for key, item in value.items()}
-    return value
-
-
-source = Path(sys.argv[1])
-destination = Path(sys.argv[2])
-payload = json.loads(source.read_text(encoding="utf-8"))
-destination.write_text(json.dumps(escape_dollars(payload)), encoding="utf-8")
-PY
-    OWNED_PID=$!
-    if ! wait_owned "$OWNED_PID"; then
-        printf '%s\n' 'deploy: snapshot freeze failed' >&2
-        return 1
-    fi
-}
-
 resolve "$CONFIG_DIR/core.json" "${core_files[@]}"
 resolve "$CONFIG_DIR/webui.json" "${webui_files[@]}"
 resolve "$CONFIG_DIR/proxy.json" "${proxy_files[@]}"
-freeze "$CONFIG_DIR/core.json" "$CONFIG_DIR/core.up.json"
-freeze "$CONFIG_DIR/webui.json" "$CONFIG_DIR/webui.up.json"
-freeze "$CONFIG_DIR/proxy.json" "$CONFIG_DIR/proxy.up.json"
+check_snapshot core "$PROJECT" "$ROOT" "${core_files[@]}"
+check_snapshot webui "$PROJECT" "$ROOT" "${webui_files[@]}"
+check_snapshot proxy "$PROJECT" "$OVERLAY" "${proxy_files[@]}"
 if ! run_owned python3 - "$OCU_RELEASE_MANIFEST" "$CONFIG_DIR/core.json" "$CONFIG_DIR/webui.json" "$CONFIG_DIR/proxy.json" <<'PY'
 from __future__ import annotations
 

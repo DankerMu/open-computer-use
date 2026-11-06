@@ -129,12 +129,8 @@ def interpolated_present(value: str, name: str) -> bool:
     return isinstance(value, str) and value.startswith(f"${{{name}?")
 
 
-def resolved_stacks(directory: Path, flag: str, source: Path | None = None,
-                    extra: dict[str, str] | None = None) -> dict:
-    source = source or ROOT
-    directory.mkdir(parents=True, exist_ok=True)
-    empty = directory / "empty.env"
-    empty.write_text("", encoding="utf-8")
+def native_environment(directory: Path, flag: str, extra: dict[str, str] | None = None) -> dict:
+    """Fake values for every name the three stacks interpolate; no daemon is reachable."""
     environment = {
         "PATH": os.environ["PATH"], "HOME": str(directory),
         "DOCKER_CONFIG": str(directory), "COMPOSE_DISABLE_ENV_FILE": "1",
@@ -166,6 +162,16 @@ def resolved_stacks(directory: Path, flag: str, source: Path | None = None,
     environment.update({name: DEFAULT_RELEASE_IMAGES[role]
                         for role, name in RUNTIME_IMAGE_VARS.items()})
     environment.update(extra or {})
+    return environment
+
+
+def resolved_stacks(directory: Path, flag: str, source: Path | None = None,
+                    extra: dict[str, str] | None = None) -> dict:
+    source = source or ROOT
+    directory.mkdir(parents=True, exist_ok=True)
+    empty = directory / "empty.env"
+    empty.write_text("", encoding="utf-8")
+    environment = native_environment(directory, flag, extra)
     standalone = shutil.which("docker-compose")
     command = [standalone] if standalone else ["docker", "compose"]
     overlay = source / "deploy/production-like-test"
@@ -666,6 +672,15 @@ class OverlayStructureTests(unittest.TestCase):
         self.assertFalse(autostart.exists())
         claim = (ROOT / "deploy" / "production-like-test" / "scripts" / "write-deployed-version.sh").read_text(encoding="utf-8")
         self.assertNotIn("private-sandbox-port-bindings.patch", claim)
+
+    def test_compose_files_use_no_env_file(self):
+        # Compose folds env_file into environment in config output, so the snapshot's
+        # hash would never equal the source's and every deploy/up.sh would refuse (#691).
+        for path in (ROOT / "docker-compose.yml", ROOT / "docker-compose.webui.yml",
+                     CORE_OVERRIDE, WEBUI_OVERRIDE, PROXY_COMPOSE):
+            for name, service in parsed(path)["services"].items():
+                with self.subTest(file=path.name, service=name):
+                    self.assertNotIn("env_file", service)
 
     def test_single_pass_dollar_interpolation(self):
         env = {"TOKEN": "HOST_VALUE"}
