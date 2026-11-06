@@ -68,6 +68,11 @@ PROVIDER_A = "credential-A"
 PROVIDER_B = "credential-B"
 EMBEDDING_KEY = "credential-embedding"
 RERANKER_KEY = "credential-reranker"
+SEPARATE_KEYS = {
+    "DMXAPI_API_KEY": PROVIDER_B,
+    "RAG_OPENAI_API_KEY": EMBEDDING_KEY,
+    "RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY,
+}
 TTS_KEY = "credential-tts"
 PRECEDENCE_NOTICE = "recovery: restored persistent provider settings remain in effect"
 COMPANY_PROMPT = "Company rules: answer in Chinese.\n公司规则：先确认需求。\n".encode("utf-8")
@@ -2741,7 +2746,8 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         loads = [line for line in ops(target_state) if line.startswith("docker load ")]
         self.assertEqual([Path(line.split()[-1]).name for line in loads], ["proxy.tar"])
 
-    def _restore_with_separate_keys(self, name):
+    def _restore_with_separate_keys(self, name, keys=None, *, quote=""):
+        keys = keys or SEPARATE_KEYS
         self._edit_db(lambda db: db["config"].append(
             {"key": "rag.openai.api_key", "value": EMBEDDING_KEY, "updated_at": 1700000000}
         ))
@@ -2750,9 +2756,7 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         self.assertEqual(created.returncode, 0, created.stderr)
         provider = self.root / f"{name}-provider.env"
         provider.write_text(
-            f"DMXAPI_API_KEY={PROVIDER_B}\n"
-            f"RAG_OPENAI_API_KEY={EMBEDDING_KEY}\n"
-            f"RAG_EXTERNAL_RERANKER_API_KEY={RERANKER_KEY}\n",
+            "".join(f"{key}={quote}{value}{quote}\n" for key, value in keys.items()),
             encoding="utf-8",
         )
         os.chmod(provider, 0o600)
@@ -2781,16 +2785,13 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         for key in (PROVIDER_B, EMBEDDING_KEY, RERANKER_KEY):
             self.assertNotIn(key, report)
 
-    def _assert_up_received_separate_keys(self, target_state):
+    def _assert_up_received_separate_keys(self, target_state, keys=None):
         runs = [json.loads(line) for line in
                 (target_state / "executed.json").read_text(encoding="utf-8").splitlines()]
+        # What Compose loads from the started snapshot, i.e. what the container gets.
         environment = next(run for run in runs if run["stack"] == "webui")[
-            "document"]["services"][WEBUI_SERVICE]["environment"]
-        self.assertEqual(environment, {
-            "DMXAPI_API_KEY": PROVIDER_B,
-            "RAG_OPENAI_API_KEY": EMBEDDING_KEY,
-            "RAG_EXTERNAL_RERANKER_API_KEY": RERANKER_KEY,
-        })
+            "consumer_document"]["services"][WEBUI_SERVICE]["environment"]
+        self.assertEqual(environment, keys or SEPARATE_KEYS)
 
     def test_recovery_carries_separate_keys_and_prints_neither(self):
         dest, extra, target_state = self._restore_with_separate_keys("separate-keys")
@@ -2801,6 +2802,20 @@ io.open, os.replace, os.fsync = epoch_open, epoch_replace, epoch_fsync
         )
         self.assertEqual(activated.returncode, 0, activated.stderr)
         self._assert_up_received_separate_keys(target_state)
+        self._assert_no_provider_key(activated)
+
+    def test_single_quoted_provider_keys_reach_restore_and_up_unquoted(self):
+        # The documented KEY='...' form for a value with `$` (#691): restore compares the
+        # unquoted key with the persisted one, and activate hands up.sh the unquoted value.
+        keys = {**SEPARATE_KEYS, "DMXAPI_API_KEY": "fake$KEY"}
+        dest, extra, target_state = self._restore_with_separate_keys("quoted-keys", keys, quote="'")
+        delivery, _payload, _source = self._write_retained_delivery()
+        activated = self.run_cli(
+            ["activate", "--destination-root", str(dest), "--retained-delivery", str(delivery)],
+            extra=extra,
+        )
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        self._assert_up_received_separate_keys(target_state, keys)
         self._assert_no_provider_key(activated)
 
     def test_failed_startup_prints_no_provider_key(self):
