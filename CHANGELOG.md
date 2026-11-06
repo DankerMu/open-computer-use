@@ -152,7 +152,9 @@
   `marked.parse`, as soon as a quote opens past 16 levels; the per-line `>`
   count is gone. The table-cell bound is still checked first, so such a table
   is never lexed. Markdown nested at most 16 levels renders as before, at the
-  cost of one extra lex. Standalone preview is unchanged. Rebuild the
+  cost of one extra lex; a line with more than 16 `>` characters that does not
+  nest that deep (`->` arrows, inline HTML) now renders instead of falling
+  back to plain text. Standalone preview is unchanged. Rebuild the
   `computer-use-server` image; no init re-run is needed.
 - **The prompt no longer promises an image description from `view` (#727).**
   The system prompt said `view` returns "an AI description for text models";

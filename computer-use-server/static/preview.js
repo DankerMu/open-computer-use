@@ -391,21 +391,26 @@ const EMBEDDED_IMAGE_LIMIT = 100;
 const QUOTE_TOO_DEEP = Symbol('quote too deep');
 
 // Counts the quote levels marked opens and stops the lex past the limit. marked binds a
-// tokenizer to the options of its lex, so every lex gets a fresh one.
-class QuoteDepthTokenizer extends marked.Tokenizer {
-  depth = 0;
+// tokenizer to the options of its lex, so every lex gets a fresh one. The class is made on
+// first use: importing this module must not need marked.
+let QuoteDepthTokenizer = null;
+function quoteDepthTokenizer() {
+  QuoteDepthTokenizer ??= class extends marked.Tokenizer {
+    depth = 0;
 
-  blockquote(src) {
-    // marked offers each block inside a quote to this rule; only a match opens a level.
-    if (!this.rules.block.blockquote.test(src)) return super.blockquote(src);
-    try {
-      this.depth += 1;
-      if (this.depth > EMBEDDED_QUOTE_DEPTH_LIMIT) throw QUOTE_TOO_DEEP;
-      return super.blockquote(src);
-    } finally {
-      this.depth -= 1;
+    blockquote(src) {
+      // marked offers each block inside a quote to this rule; only a match opens a level.
+      if (!this.rules.block.blockquote.test(src)) return super.blockquote(src);
+      try {
+        this.depth += 1;
+        if (this.depth > EMBEDDED_QUOTE_DEPTH_LIMIT) throw QUOTE_TOO_DEEP;
+        return super.blockquote(src);
+      } finally {
+        this.depth -= 1;
+      }
     }
-  }
+  };
+  return new QuoteDepthTokenizer();
 }
 
 // Cells are counted before lexing, because marked materialises every padded cell.
@@ -419,7 +424,7 @@ function markdownTooCostly(text) {
   for (const line of lines) columns = Math.max(columns, line.split('|').length);
   if (lines.length * columns > EMBEDDED_TABLE_CELL_LIMIT) return true;
   try {
-    marked.lexer(text, { tokenizer: new QuoteDepthTokenizer() });
+    marked.lexer(text, { tokenizer: quoteDepthTokenizer() });
     return false;
   } catch (error) {
     if (error === QUOTE_TOO_DEEP) return true;
