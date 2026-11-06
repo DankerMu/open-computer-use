@@ -1826,6 +1826,7 @@ def _guarded_tools(monkeypatch, ocu):
 def _image_env(monkeypatch):
     _disable_proxy_env(monkeypatch)
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    monkeypatch.setenv("MCP_API_KEY", MCP_API_KEY)
 
 
 @pytest.mark.parametrize(
