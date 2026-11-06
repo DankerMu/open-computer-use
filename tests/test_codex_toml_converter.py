@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
-"""Regression test for Dockerfile codex JSON→TOML converter (WR-01).
+"""Regression test for the sandbox entrypoint's codex JSON→TOML converter (WR-01).
 
-Verifies that the _to_toml_value helper embedded in the Dockerfile entrypoint
+Verifies that the _to_toml_value helper embedded in the sandbox entrypoint
+(computer-use-server/bin/sandbox-entrypoint.sh)
 produces valid TOML for nested dict values (provider config blocks), not the
 invalid JSON-format inline tables that json.dumps() would produce.
 
@@ -14,10 +15,10 @@ import unittest
 
 
 def _to_toml_value(v):
-    """TOML-aware value serializer — mirrors the helper embedded in Dockerfile entrypoint.
+    """TOML-aware value serializer — mirrors the helper embedded in the sandbox entrypoint.
 
-    This is the canonical reference implementation. The Dockerfile inline Python
-    must stay in sync with this function.
+    This is the canonical reference implementation. The entrypoint's inline Python
+    (computer-use-server/bin/sandbox-entrypoint.sh) must stay in sync with this function.
 
     TOML has no null literal, so None is rejected explicitly rather than
     serialized as "null" (invalid TOML) or "" (silently swallowed).
@@ -32,7 +33,7 @@ def _to_toml_value(v):
 
 
 def _build_toml_from_codex_json(d: dict) -> str:
-    """Replicate the Dockerfile entrypoint codex JSON→TOML conversion logic."""
+    """Replicate the sandbox entrypoint's codex JSON→TOML conversion logic."""
     # Strip _spdx/_copyright/_doc keys
     d = {k: v for k, v in d.items() if not k.startswith("_")}
     providers = d.get("model_providers", {}) or {}
