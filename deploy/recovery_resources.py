@@ -237,6 +237,20 @@ def load_runtime(deploy_root: Path, runtime_file: Path | None) -> dict[str, str]
     return recovery.parse_dotenv(path)
 
 
+def load_provider(path: Path) -> dict[str, str]:
+    """The provider file as the deploy shell's `set -a; .` reads it (#691).
+
+    A value with `$` is written KEY='...'; one enclosing pair of single quotes
+    is removed. Any other value, and every other configuration file, is verbatim.
+    """
+    recovery.require_regular_file(path)
+    values = recovery.parse_dotenv(path)
+    for name, value in values.items():
+        if len(value) >= 2 and value[0] == value[-1] == "'" and value.count("'") == 2:
+            values[name] = value[1:-1]
+    return values
+
+
 def _require_root_scoped_path(value: str, deploy_root: Path, name: str) -> Path:
     path = Path(value)
     try:
@@ -1401,8 +1415,7 @@ def restore_deployment(
     collisions = colliding_resources(identity)
     if collisions:
         raise RecoveryError("target already contains " + ", ".join(collisions))
-    recovery.require_regular_file(provider_file)
-    provider = recovery.parse_dotenv(provider_file)
+    provider = load_provider(provider_file)
     selected_inventory = release.load_inventory(
         recovery.confined_component_path(
             recovery_set, payload["components"]["release-inventory"]["path"]
@@ -1703,8 +1716,7 @@ def activate_release(*, destination_root: Path, retained_delivery: Path, docker_
     provider = {}
     provider_path = Path(runtime.get("DMX_ENV_FILE") or "")
     if provider_path:
-        recovery.require_regular_file(provider_path)
-        provider = recovery.parse_dotenv(provider_path)
+        provider = load_provider(provider_path)
     for sandbox in discover_sandboxes():
         if container_running(inspect_container(sandbox["id"])):
             raise RecoveryError("target already has a running sandbox")

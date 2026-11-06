@@ -3955,7 +3955,7 @@ class ProviderKeyTests(unittest.TestCase):
 
 
 class ProviderFileQuotingTests(unittest.TestCase):
-    """A provider-file line means the same to `set -a; .` and to parse_dotenv (#691)."""
+    """A provider-file line means the same to `set -a; .` and to load_provider (#691)."""
 
     def setUp(self):
         self.context = tmp_dir()
@@ -3965,8 +3965,10 @@ class ProviderFileQuotingTests(unittest.TestCase):
         self.context.cleanup()
 
     def parsed(self, line: str) -> str:
+        import recovery_resources
+
         self.path.write_text(f"KEY={line}\n", encoding="utf-8")
-        return recovery.parse_dotenv(self.path)["KEY"]
+        return recovery_resources.load_provider(self.path)["KEY"]
 
     def sourced(self) -> str:
         result = subprocess.run(
@@ -3982,16 +3984,21 @@ class ProviderFileQuotingTests(unittest.TestCase):
                 self.assertEqual(self.parsed(line), expected)
                 self.assertEqual(self.sourced(), expected)
 
+    def test_other_configuration_files_are_read_verbatim(self):
+        self.path.write_text("KEY='fake$KEY'\n", encoding="utf-8")
+        self.assertEqual(recovery.parse_dotenv(self.path)["KEY"], "'fake$KEY'")
+
     def test_unbalanced_or_inner_quotes_are_kept_verbatim(self):
         for line in ("'", "'a'b'", "'abc", "abc'", "a'b'c"):
             with self.subTest(line=line):
                 self.assertEqual(self.parsed(line), line)
 
     def test_quoted_provider_key_reaches_activation_unchanged(self):
-        self.path.write_text("DMXAPI_API_KEY='fake$KEY'\n", encoding="utf-8")
-        provider = recovery.parse_dotenv(self.path)
-        inventory = synthetic_inventory(ocu_sha="a" * 40, webui_sha=WEBUI_SYNTHETIC_SHA)
         import recovery_resources
+
+        self.path.write_text("DMXAPI_API_KEY='fake$KEY'\n", encoding="utf-8")
+        provider = recovery_resources.load_provider(self.path)
+        inventory = synthetic_inventory(ocu_sha="a" * 40, webui_sha=WEBUI_SYNTHETIC_SHA)
 
         with patch.dict(os.environ, {"DOCKER_HOST": recovery.SUPPORTED_DOCKER_HOST}), patch.object(
             recovery.release, "_PINNED_DOCKER_HOST", None

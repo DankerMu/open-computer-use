@@ -75,6 +75,51 @@ def run_helper(config_dir: Path, stacks, environment: dict[str, str]):
                           text=True, timeout=120)
 
 
+def daemon_reachable(environment: dict[str, str]) -> bool:
+    try:
+        return subprocess.run(["docker", "info"], env=environment, capture_output=True,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def freeze_document(value):
+    """What main's removed `freeze` step wrote: every `$` escaped once more."""
+    if isinstance(value, str):
+        return value.replace("$", "$$")
+    if isinstance(value, list):
+        return [freeze_document(item) for item in value]
+    if isinstance(value, dict):
+        return {key: freeze_document(item) for key, item in value.items()}
+    return value
+
+
+def config_hash(environment: dict[str, str], project_dir: Path, empty: Path, snapshot: Path) -> list[str]:
+    """Sorted `service hash` lines of a snapshot loaded as deploy/up.sh starts it."""
+    result = subprocess.run(
+        ["docker", "compose", "-p", "ocu-test", "--project-directory", str(project_dir),
+         "--env-file", str(empty), "-f", str(snapshot), "config", "--hash", "*"],
+        env=environment, capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode:
+        raise AssertionError(f"compose config --hash failed: {result.stderr}")
+    return sorted(result.stdout.splitlines())
+
+
+REAL_STACKS = (
+    ("core", ROOT, ["--project-directory", str(ROOT), "-f", str(ROOT / "docker-compose.yml"),
+                    "-f", str(OVERLAY / "compose.core.override.yml")]),
+    ("webui", ROOT, ["--project-directory", str(ROOT), "-f", str(ROOT / "docker-compose.webui.yml"),
+                     "-f", str(OVERLAY / "compose.webui.override.yml")]),
+    ("proxy", OVERLAY, ["--project-directory", str(OVERLAY), "-f", str(OVERLAY / "compose.proxy.yml")]),
+)
+REAL_SERVICES = {
+    "core": {"workspace", "computer-use-server", "retention-guard", "documentserver"},
+    "webui": {"open-webui", "postgres", "open-webui-init"},
+    "proxy": {"proxy", "messages-ingress"},
+}
+
+
 def local_image(environment: dict[str, str]) -> str | None:
     for image in LOCAL_IMAGES:
         result = subprocess.run(["docker", "image", "inspect", image], env=environment,
@@ -112,6 +157,8 @@ class RealComposeSnapshotTests(unittest.TestCase):
     def test_dollar_value_reaches_the_container_unchanged(self):
         # KEY is set so that a second interpolation would show up as a different value.
         environment = ambient_environment(FAKE=FAKE_VALUE, KEY="hostile-value")
+        if not daemon_reachable(environment):
+            self.skipTest("docker info failed: no reachable Docker daemon to run a container")
         image = local_image(environment)
         if image is None:
             self.skipTest(f"no local image among {', '.join(LOCAL_IMAGES)}; --pull never cannot run one")
@@ -128,17 +175,8 @@ class RealComposeSnapshotTests(unittest.TestCase):
         self.assertEqual(self.printenv(environment, project, snapshot), FAKE_VALUE + "\n")
 
         # Control: the snapshot re-escaped as the removed freeze step did loads doubled.
-        def escape(value):
-            if isinstance(value, str):
-                return value.replace("$", "$$")
-            if isinstance(value, list):
-                return [escape(item) for item in value]
-            if isinstance(value, dict):
-                return {key: escape(item) for key, item in value.items()}
-            return value
-
         frozen = self.config / "frozen.up.json"
-        frozen.write_text(json.dumps(escape(json.loads(snapshot.read_text(encoding="utf-8")))),
+        frozen.write_text(json.dumps(freeze_document(json.loads(snapshot.read_text(encoding="utf-8")))),
                           encoding="utf-8")
         self.assertEqual(self.printenv(environment, project, frozen), "fake$$KEY\n")
 
@@ -173,13 +211,10 @@ class RealComposeSnapshotTests(unittest.TestCase):
             result.stderr.splitlines(),
         )
 
-    def test_real_stacks_load_their_snapshots_unchanged(self):
+    def resolve_real_stacks(self, extra: dict[str, str]) -> dict[str, str]:
+        """Run the helper on the real core, webui and proxy stacks; only `config` runs."""
         environment = native_environment(self.dir, "true", {
-            "DMXAPI_API_KEY": FAKE_VALUE,
-            "OCU_INTERNAL_TOKEN": "fake$$token$",
-            "KEY": "hostile-value",
-            "COMPOSE_PROFILES": "",
-            "COMPOSE_REMOVE_ORPHANS": "false",
+            **extra, "COMPOSE_PROFILES": "", "COMPOSE_REMOVE_ORPHANS": "false",
         })
         # docker compose is a CLI plugin found through the caller's Docker configuration.
         for name in ("HOME", "DOCKER_CONFIG"):
@@ -190,32 +225,42 @@ class RealComposeSnapshotTests(unittest.TestCase):
         for name in ("OCU_RELEASE_FONTS_DIR", "OCU_OFFICE_FONTS_DIR", "OCU_PROMPTS_DIR",
                      "OCU_CHAT_DATA_DIR", "OCU_SKILLS_CACHE_DIR"):
             Path(environment[name]).mkdir(parents=True, exist_ok=True)
-        stacks = (
-            ("core", "ocu-test", ROOT, ["-p", "ocu-test", "--project-directory", str(ROOT),
-                                        "-f", str(ROOT / "docker-compose.yml"),
-                                        "-f", str(OVERLAY / "compose.core.override.yml")]),
-            ("webui", "ocu-test", ROOT, ["-p", "ocu-test", "--project-directory", str(ROOT),
-                                         "-f", str(ROOT / "docker-compose.webui.yml"),
-                                         "-f", str(OVERLAY / "compose.webui.override.yml")]),
-            ("proxy", "ocu-test", OVERLAY, ["-p", "ocu-test", "--project-directory", str(OVERLAY),
-                                            "-f", str(OVERLAY / "compose.proxy.yml")]),
-        )
+        stacks = [(stack, "ocu-test", project_dir, ["-p", "ocu-test", *args])
+                  for stack, project_dir, args in REAL_STACKS]
         result = run_helper(self.config, stacks, environment)
         self.assertEqual(result.returncode, 0, result.stderr)
-        expected = {
-            "core": {"workspace", "computer-use-server", "retention-guard", "documentserver"},
-            "webui": {"open-webui", "postgres", "open-webui-init"},
-            "proxy": {"proxy", "messages-ingress"},
-        }
-        for stack, services in expected.items():
+        for stack, services in REAL_SERVICES.items():
+            lines = (self.config / f"{stack}.src.hash").read_text(encoding="utf-8").splitlines()
+            self.assertEqual({line.split()[0] for line in lines}, services, stack)
+        return environment
+
+    def test_real_stacks_load_their_snapshots_unchanged(self):
+        self.resolve_real_stacks({
+            "DMXAPI_API_KEY": FAKE_VALUE,
+            "OCU_INTERNAL_TOKEN": "fake$$token$",
+            "KEY": "hostile-value",
+        })
+        for stack in REAL_SERVICES:
             with self.subTest(stack=stack):
-                lines = (self.config / f"{stack}.src.hash").read_text(encoding="utf-8").splitlines()
-                self.assertEqual({line.split()[0] for line in lines}, services)
                 self.assertEqual((self.config / f"{stack}.up.hash").read_text(encoding="utf-8"),
-                                 "\n".join(lines) + "\n")
+                                 (self.config / f"{stack}.src.hash").read_text(encoding="utf-8"))
         webui = json.loads((self.config / "webui.up.json").read_text(encoding="utf-8"))
         self.assertEqual(webui["services"]["open-webui"]["environment"]["OPENAI_API_KEY"], "fake$$KEY")
 
+    def test_dollar_free_stacks_hash_as_the_previous_snapshot_did(self):
+        # Without `$` the byte-copy snapshot loads as main's frozen one: nothing is recreated.
+        environment = self.resolve_real_stacks({})
+        empty = self.config / "empty.env"
+        for stack, project_dir, _args in REAL_STACKS:
+            with self.subTest(stack=stack):
+                resolved = (self.config / f"{stack}.json").read_text(encoding="utf-8")
+                self.assertNotIn("$", resolved)
+                frozen = self.config / f"{stack}.frozen.up.json"
+                frozen.write_text(json.dumps(freeze_document(json.loads(resolved))), encoding="utf-8")
+                previous = config_hash(environment, project_dir, empty, frozen)
+                current = config_hash(environment, project_dir, empty, self.config / f"{stack}.up.json")
+                self.assertEqual(len(current), len(REAL_SERVICES[stack]))
+                self.assertEqual(current, previous)
 
 if __name__ == "__main__":
     unittest.main()

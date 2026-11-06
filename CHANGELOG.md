@@ -150,11 +150,14 @@
   `deploy/compose-snapshot.sh` compares, per stack, the `config --hash '*'` of
   the source files with that of the snapshot loaded as `up` loads it; a
   difference, a failed command or empty output stops the run with a
-  `deploy:` message naming the stack, and nothing starts. Configurations
+  `deploy:` message naming the stack, and nothing starts. This needs a
+  Compose with `config --hash` that writes `$` as `$$` in `config` output
+  (verified on v2.40.3); an older one makes `up.sh` refuse. Configurations
   without `$` keep the same per-service hash, so nothing is recreated. The
   compose files must not use `env_file`. A provider-file value with `$` must be
-  single-quoted (`KEY='…'`), and recovery's `parse_dotenv` now strips that one
-  pair of quotes as the shell does. `bootstrap-test.sh` also refuses `;`, `&`,
+  single-quoted (`KEY='…'`); recovery restore and activate now strip that one
+  pair of quotes from provider-file values as the shell does, and still read
+  `runtime.env` verbatim. `bootstrap-test.sh` also refuses `;`, `&`,
   `|`, `(`, `)`, `<`, `>` and any backslash in a `runtime.env` value, which
   `set -a; .` would not keep intact. A key already stored in the WebUI database
   with doubled `$` is not repaired: set it once in the admin UI. No image
