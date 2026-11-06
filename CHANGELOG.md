@@ -141,6 +141,17 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **`release.py` operator mistakes are one line (#726).** A missing
+  `--inventory`, one that is not JSON, a symbolic link loop as a path
+  argument, or a release path whose symbolic-link check fails (for example a
+  directory without permission) now ends `build`, `import`, `verify` and
+  `bootstrap` with exit 1 and one `release: …` line naming the argument or
+  path, where the command printed a traceback: `<name> <value> cannot be
+  resolved: …` for every command-line path and `OCU_RELEASE_MANIFEST`,
+  `<path>: cannot read inventory: …` from `load_json_object`. `recovery.py`
+  reads its manifest the same way, so a manifest that is not JSON is one
+  `recovery: …` line too, and `deploy/up.sh` prints
+  `deploy: <path>: cannot read inventory: …` for such an inventory.
 - **The sandbox CLAUDE.md keeps its Markdown headings (#681).** The root
   `Dockerfile` wrote the sandbox entrypoint with one `RUN printf` spread over
   continuation lines, and the Dockerfile parser drops every line that starts

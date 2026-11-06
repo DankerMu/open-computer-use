@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import hashlib
 import io
 import json
@@ -3978,6 +3980,165 @@ class ReleaseGitEnvironmentTests(unittest.TestCase):
             env,
             {"PATH": "/usr/bin", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"},
         )
+
+
+class ReleaseOperatorErrorTests(unittest.TestCase):
+    """An operator mistake ends in one `release: …` line, not a traceback (#726)."""
+
+    def setUp(self):
+        self.context = tmp_dir()
+        self.root = Path(self.context.name)
+
+    def tearDown(self):
+        self.context.cleanup()
+
+    def run_release(self, *args: str):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "deploy" / "release.py"), *args],
+            cwd=str(self.root), capture_output=True, text=True, check=False, timeout=20,
+        )
+
+    def assert_one_line(self, returncode: int, stderr: str, *named: str) -> None:
+        self.assertEqual(returncode, 1, stderr)
+        self.assertNotIn("Traceback", stderr)
+        lines = stderr.splitlines()
+        self.assertEqual(len(lines), 1, stderr)
+        self.assertTrue(lines[0].startswith("release: "), stderr)
+        for text in named:
+            self.assertIn(text, lines[0])
+
+    def symlink_loop(self) -> Path:
+        first, second = self.root / "loopa", self.root / "loopb"
+        first.symlink_to(second)
+        second.symlink_to(first)
+        return first
+
+    def inventory(self) -> Path:
+        payload = synthetic_inventory(ocu_sha="a" * 40, webui_sha=WEBUI_SYNTHETIC_SHA)
+        return write_inventory(self.root / "release.json", payload)
+
+    def test_missing_inventory(self):
+        result = self.run_release("verify", "--mode", "images",
+                                  "--inventory", str(self.root / "missing.json"))
+        self.assert_one_line(result.returncode, result.stderr,
+                             "missing.json", "cannot read inventory")
+
+    def test_inventory_that_is_not_json(self):
+        bad = self.root / "bad.json"
+        bad.write_text("{", encoding="utf-8")
+        result = self.run_release("verify", "--mode", "images", "--inventory", str(bad))
+        self.assert_one_line(result.returncode, result.stderr, "bad.json", "cannot read inventory")
+
+    def test_inventory_shape_errors_keep_their_message(self):
+        path = self.root / "inventory.json"
+        for text, message in (
+            ('{"a": 1, "a": 2}', "duplicate JSON key 'a'"),
+            ('{} []', f"{path}: inventory contains trailing data"),
+            ("[]", f"{path}: inventory must be a JSON object"),
+        ):
+            with self.subTest(text=text):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(release.ReleaseError) as raised:
+                    release.load_json_object(path)
+                self.assertEqual(str(raised.exception), message)
+
+    def test_inventory_symlink_loop(self):
+        loop = self.symlink_loop()
+        result = self.run_release("verify", "--mode", "images", "--inventory", str(loop))
+        self.assert_one_line(result.returncode, result.stderr, "loopa")
+
+    def test_delivery_symlink_loop(self):
+        loop = self.symlink_loop()
+        install = self.root / "install"
+        result = self.run_release("import", "--delivery", str(loop), "--install-root", str(install))
+        self.assert_one_line(result.returncode, result.stderr, "loopa")
+        self.assertFalse(install.exists())
+
+    def test_unreadable_delivery_directory(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 directory")
+        inventory = self.inventory()
+        delivery = self.root / "delivery"
+        delivery.mkdir()
+        delivery.chmod(0)
+        try:
+            result = self.run_release("verify", "--mode", "delivery", "--inventory", str(inventory),
+                                      "--delivery", str(delivery))
+        finally:
+            delivery.chmod(0o755)
+        self.assert_one_line(result.returncode, result.stderr,
+                             "source.bundle", "symbolic links cannot be checked")
+
+    def test_symlink_check_failure_names_the_path(self):
+        denied = PermissionError(13, "Permission denied")
+        with mock.patch.object(Path, "is_symlink", side_effect=denied):
+            with self.assertRaises(release.ReleaseError) as raised:
+                release.relative_archive_path(self.root, "images/workspace.tar")
+        self.assertIn(str(self.root / "images"), str(raised.exception))
+        self.assertIn("Permission denied", str(raised.exception))
+
+    def test_confined_relative_resolve_failure_names_the_path(self):
+        loop = RuntimeError("Symlink loop")
+        path = self.root / "images"
+        with mock.patch.object(Path, "resolve", side_effect=loop):
+            with self.assertRaises(release.ReleaseError) as raised:
+                release.confined_relative(self.root, path)
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("Symlink loop", str(raised.exception))
+
+    def run_handler(self, argv: list[str], looping: str) -> str:
+        # Python 3.11/3.12 raise RuntimeError for a loop; 3.13 (.python-version) does not.
+        args = release.build_parser().parse_args(argv)
+        real_resolve = Path.resolve
+
+        def resolve(path, *rest, **options):
+            if str(path) == looping:
+                raise RuntimeError(f"Symlink loop from {looping!r}")
+            return real_resolve(path, *rest, **options)
+
+        stderr = io.StringIO()
+        with mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve):
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                args.func(args)
+        self.assertEqual(raised.exception.code, 1)
+        return stderr.getvalue()
+
+    def assert_argument_named(self, argv: list[str], looping: str, name: str) -> None:
+        stderr = self.run_handler(argv, looping)
+        self.assert_one_line(1, stderr, f"release: {name} {looping} cannot be resolved: Symlink loop")
+
+    def test_every_handler_argument_loop_names_the_argument(self):
+        inventory = str(self.inventory())
+        a, b, c = (str(self.root / name) for name in ("a", "b", "c"))
+        build = ["build", "--ocu-source", a, "--webui-source", b, "--destination", c]
+        cases = [
+            (build, a, "--ocu-source"),
+            (build, b, "--webui-source"),
+            (build, c, "--destination"),
+            (["import", "--delivery", a, "--install-root", b], a, "--delivery"),
+            (["import", "--delivery", a, "--install-root", b], b, "--install-root"),
+            (["verify", "--mode", "images", "--inventory", a], a, "--inventory"),
+            (["verify", "--mode", "delivery", "--inventory", inventory, "--delivery", a],
+             a, "--delivery"),
+            (["verify", "--mode", "startup", "--inventory", inventory, "--source", a],
+             a, "--source"),
+        ]
+        for argv, looping, name in cases:
+            with self.subTest(argv=argv[0], name=name):
+                self.assert_argument_named(argv, looping, name)
+        with self.subTest(argv="bootstrap"), mock.patch.dict(os.environ, {"OCU_RELEASE_MANIFEST": a}):
+            self.assert_argument_named(["bootstrap"], a, "OCU_RELEASE_MANIFEST")
+
+    def test_every_resolve_is_in_a_converting_function(self):
+        tree = ast.parse((ROOT / "deploy" / "release.py").read_text(encoding="utf-8"))
+        owners = set()
+        for function in ast.walk(tree):
+            if isinstance(function, ast.FunctionDef):
+                for node in ast.walk(function):
+                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "resolve"):
+                        owners.add(function.name)
+        self.assertEqual(owners, {"resolve_argument", "confined_relative", "verify_release_fonts"})
 
 
 if __name__ == "__main__":
