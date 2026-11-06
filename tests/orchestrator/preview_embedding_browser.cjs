@@ -1421,6 +1421,14 @@ async function main() {
     bytes['quote-at-depth.md'] = Buffer.from(`${'> '.repeat(16)}**At the depth limit**\n\nAfter the quote`);
     bytes['quote-ordinary.md'] = Buffer.from(['# Review notes', '', '> The outer remark.', '>',
       '> > The **inner** remark.', '', 'After the quote'].join('\n'));
+    // marked nests one level deeper for each quote line after a lazy line, whatever the markers per line.
+    const lazyQuote = lines => Array.from({ length: lines },
+      (_, index) => index % 2 ? `lazy ${index}` : `> > quote ${index}`);
+    bytes['quote-lazy-nesting.md'] = Buffer.from(lazyQuote(2000).join('\n'));
+    // 30 lines nest 16 deep and 31 lines 17; the last line is the deepest paragraph.
+    const lazyAtDepth = lazyQuote(30);
+    lazyAtDepth[29] += ' **At the lazy limit**';
+    bytes['quote-lazy-at-depth.md'] = Buffer.from(`${lazyAtDepth.join('\n')}\n\nAfter the quote`);
     bytes['too-large.md'] = Buffer.from('Too large body');
     bytes['unsupported-name.py'] = Buffer.from('Unsupported name body');
     bytes[MARKUP_NAME] = Buffer.from('Markup name body');
@@ -2206,8 +2214,38 @@ async function main() {
       });
     }
     // Rendered directly in embedded mode: the stub lists at most 100 fixtures on its last page.
+    await fileCase('embedded Markdown nested past the depth limit through lazy lines reports ready as plain text within the bound', async () => {
+      const file = 'quote-lazy-nesting.md';
+      assert(bytes[file].length < 30000, `${file} no longer tests the bound`);
+      await remountFiles();
+      await spyOnParsers();
+      const started = Date.now();
+      const shown = await frame().locator('#app').evaluate(async (root, [path, url]) => {
+        const { renderPreviewContent } = await import(new URL('../static/preview.js', document.baseURI).href);
+        const host = document.createElement('div');
+        root.appendChild(host);
+        const rendered = await renderPreviewContent(host,
+          { name: path, path, type: 'markdown', url }, [], () => {}, true);
+        const body = host.querySelector('.markdown-body');
+        void body.scrollWidth;
+        const seen = {
+          rendered,
+          source: body.querySelector('pre')?.textContent,
+          notice: body.querySelector('.truncation-notice')?.textContent,
+          cells: body.querySelectorAll('td, th').length,
+        };
+        host.remove();
+        return seen;
+      }, [file, `/ocu/files/${CHAT}/${file}`]);
+      const elapsed = Date.now() - started;
+      assert.deepEqual(shown,
+        { rendered: true, source: bytes[file].toString(), notice: markdownPlainNotice, cells: 0 });
+      assert(elapsed < wideTableBound, `the document took ${elapsed} ms to lay out`);
+      assert.deepEqual(await parserCalls(), { marked: 0, hljs: 0 });
+    });
     for (const [file, label, depth, emphasis] of [
       ['quote-at-depth.md', 'a quote nested exactly at the depth limit', 16, 'At the depth limit'],
+      ['quote-lazy-at-depth.md', 'quote lines after lazy lines nested exactly at the depth limit', 16, 'At the lazy limit'],
       ['quote-ordinary.md', 'an ordinary two-level quote', 2, 'inner'],
     ]) {
       await fileCase(`embedded Markdown with ${label} renders as quotes`, async () => {

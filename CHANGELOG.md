@@ -141,6 +141,21 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **Embedded Markdown nested past 16 quote levels through lazy lines is shown
+  as plain text (#692).** marked nests one level deeper for each quote line
+  that follows a lazy continuation line, so alternating `> > quote` and plain
+  lines reached 17 levels at 31 lines, while the check counted `>` characters
+  per line. A file of thousands of such lines under 30,000 characters held the
+  WebUI thread for seconds or failed to load. The embedded preview now lexes
+  the text once with marked's own quote rule (without GFM, whose added rules
+  hold no quote lines) and shows plain text with its notice, without calling
+  `marked.parse`, as soon as a quote opens past 16 levels; the per-line `>`
+  count is gone. The table-cell bound is still checked first, so such a table
+  is never lexed. Markdown nested at most 16 levels renders as before, at the
+  cost of one extra lex; a line with more than 16 `>` characters that does not
+  nest that deep (`->` arrows, inline HTML) now renders instead of falling
+  back to plain text. Standalone preview is unchanged. Rebuild the
+  `computer-use-server` image; no init re-run is needed.
 - **The prompt no longer promises an image description from `view` (#727).**
   The system prompt said `view` returns "an AI description for text models";
   neither the Open WebUI tool nor the server does that. It now says `view`
@@ -150,8 +165,9 @@
   way to inspect the image. It names no skill, since `describe-image` is listed
   only with Vision (#720). The tool and its error text are unchanged.
   `docs/KNOWN-BUGS.md` item 5 now describes the current behavior instead of
-  saying MCP tools cannot return images. CI runs `tests/test_describe_image.py`
-  in the orchestrator pytest job. Rebuild the `computer-use-server` image; no
+  saying MCP tools cannot return images. `tests/test_describe_image.py` is
+  wired into `build.yml`'s pytest-orchestrator step (that workflow is currently
+  disabled on the fork). Rebuild the `computer-use-server` image; no
   init re-run is needed.
 - **`describe-image` is listed only when Vision is configured (#720).** With
   `VISION_API_KEY` unset or empty on `computer-use-server`, the system prompt
@@ -346,7 +362,7 @@
   archive route. Rendering shares a thread with the parent, so Markdown over
   30,000 characters shows as plain text with a notice and stops at 200,000
   characters, Markdown whose table size, estimated from the text, is over 200,000
-  cells or with a line of more than 16 `>` characters uses the same view, code
+  cells or with quotes nested more than 16 levels deep (#692) uses the same view, code
   and text over 20,000 characters show without
   highlighting, a spreadsheet shows at most 200 columns per row with a notice and
   1,000 characters per cell, and a fence whose language highlight.js does not

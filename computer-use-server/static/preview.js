@@ -380,23 +380,56 @@ const EMBEDDED_CODE_HIGHLIGHT_LIMIT = 20000;
 const EMBEDDED_SPREADSHEET_COLUMN_LIMIT = 200;
 // marked pads a short row to the header, so a two-character row can cost thousands of cells.
 const EMBEDDED_TABLE_CELL_LIMIT = 200000;
-// Each nested quote level makes marked lex the rest of the quote again.
+// Each nested quote level makes marked lex the rest of the quote again, and each quote
+// line after a lazy continuation line opens one more level, whatever its markers.
 const EMBEDDED_QUOTE_DEPTH_LIMIT = 16;
 // Laying out one long cell of mixed-direction text stalls that thread as well.
 const EMBEDDED_SPREADSHEET_CELL_LIMIT = 1000;
 // Each kept image is a request from the employee's browser.
 const EMBEDDED_IMAGE_LIMIT = 100;
 
-// Counted before lexing, because marked materialises every padded cell.
+const QUOTE_TOO_DEEP = Symbol('quote too deep');
+
+// Counts the quote levels marked opens and stops the lex past the limit. marked binds a
+// tokenizer to the options of its lex, so every lex gets a fresh one. The class is made on
+// first use: importing this module must not need marked.
+let QuoteDepthTokenizer = null;
+function quoteDepthTokenizer() {
+  QuoteDepthTokenizer ??= class extends marked.Tokenizer {
+    depth = 0;
+
+    blockquote(src) {
+      // marked offers each block inside a quote to this rule; only a match opens a level.
+      if (!this.rules.block.blockquote.test(src)) return super.blockquote(src);
+      try {
+        this.depth += 1;
+        if (this.depth > EMBEDDED_QUOTE_DEPTH_LIMIT) throw QUOTE_TOO_DEEP;
+        return super.blockquote(src);
+      } finally {
+        this.depth -= 1;
+      }
+    }
+  };
+  return new QuoteDepthTokenizer();
+}
+
+// Cells are counted before lexing, because marked materialises every padded cell.
 // Lines end as marked ends them: a bare \r is a line break there too.
+// The quote depth is then measured by marked's own lexer without GFM: the rules GFM changes
+// (tables, and a table interrupting a heading or paragraph) hold no quote lines, so the depth
+// is the same and no cell is padded.
 function markdownTooCostly(text) {
   const lines = text.split(/\r\n?|\n/);
   let columns = 0;
-  for (const line of lines) {
-    if (line.split('>').length - 1 > EMBEDDED_QUOTE_DEPTH_LIMIT) return true;
-    columns = Math.max(columns, line.split('|').length);
+  for (const line of lines) columns = Math.max(columns, line.split('|').length);
+  if (lines.length * columns > EMBEDDED_TABLE_CELL_LIMIT) return true;
+  try {
+    marked.lexer(text, { tokenizer: quoteDepthTokenizer() });
+    return false;
+  } catch (error) {
+    if (error === QUOTE_TOO_DEEP) return true;
+    throw error;
   }
-  return lines.length * columns > EMBEDDED_TABLE_CELL_LIMIT;
 }
 
 function renderMarkdownPlainText(container, text) {
