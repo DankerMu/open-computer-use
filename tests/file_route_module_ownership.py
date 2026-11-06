@@ -21,6 +21,10 @@ _SERVER_MODULES = {
     "claude_gateway", "speech",
 }
 _SERVER_PREFIXES = ("mcp_resources", "office.", "cli_adapters.")
+# A fresh server import owns every server module it can first-import. context_vars
+# stays shared: test modules bind its ContextVars at import, and the fresh modules
+# must read those same ContextVars.
+_FRESH_IMPORT_MODULES = _SERVER_MODULES - {"context_vars"}
 
 
 @contextmanager

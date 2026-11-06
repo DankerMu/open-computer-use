@@ -86,7 +86,7 @@ consumer retains its explicit empty-prefix configuration and security assertions
 app-import cache family: a key is owned when it is in `names` or starts with a
 prefix. Cleanup retires replacement modules and restores exact entry objects or
 entry absence after normal completion, test-body failure, or setup failure after
-eviction. Seven owners share it. The app-importing owners in the first three
+eviction. Fourteen owners share it. The app-importing owners in the first three
 bullets share `_SERVER_MODULES` plus `_SERVER_PREFIXES` (`mcp_resources*`,
 `office.*`, `cli_adapters.*`) from the same module: the whole server directory
 except the standalone `drawio/` script.
@@ -117,8 +117,30 @@ except the standalone `drawio/` script.
   `docker_manager` and `outputs_broker`. The autouse `_scrub_opencode_env` requests
   it, so every fresh `cli_runtime` import sits inside the owned scope; a wiring test
   pins that dependency.
+- The #730 orchestrator sites own the shared set minus `context_vars`
+  (`_FRESH_IMPORT_MODULES`) for the scope that uses the fresh modules: the
+  `fresh_server_modules` fixture in `orchestrator/conftest.py` (requested by
+  `test_passthrough_isolation.py`, `test_sub_agent_dispatch.py`,
+  `test_subagent_claude_compat.py` and the `World` users in `test_subagent_gateway.py`),
+  the `world` fixtures of `orchestrator/_office_store.py` and `test_outputs_broker.py`
+  across their `yield`, `self.enterContext(...)` in `test_runtime_cli_endpoint.py` and
+  `test_single_user_mode.py`, and `cls.enterClassContext(...)` in `test_mcp_resources.py`.
+  `office.*` and `outputs_broker` imported inside the window bind its `docker_manager`.
+  `test_lifecycle.py::app_module` owns only `app`, `mcp_tools`, `file_response` and
+  `mcp_resources*`, so `docker_manager` stays shared with that file's `world`.
+  `orchestrator/test_fresh_import_sites.py` runs one real case per site and checks that
+  entry modules and their classes are unchanged and absent modules stay absent.
 
-`test_file_route_module_ownership.py` covers the other six owners with present and absent
+Two orchestrator checks keep the cache single-generation.
+`orchestrator/test_no_bare_reload.py` fails on any call that resolves through the
+file's imports to `importlib.reload` under `orchestrator/` or in
+`file_route_module_ownership.py`; there is no allowlist. The module-scoped autouse
+`_server_module_identity` in `orchestrator/conftest.py` fails a test module that
+replaces or removes a server module present on entry, or replaces its classes or
+functions, and checks at exit that `mcp_tools.LifecycleError`, `app.LifecycleError`
+and `outputs_broker.docker_manager` match the current `docker_manager`.
+
+`test_file_route_module_ownership.py` covers the first six owners with present and absent
 entry modules. For the fixture owners, restoration assertions run after actual
 pytest fixture teardown and before emergency cleanup. For the auth, WebSocket and
 alias-map owners, a child pytest run records the entry modules, fails a test body

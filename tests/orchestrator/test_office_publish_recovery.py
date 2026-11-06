@@ -7,7 +7,6 @@ import asyncio
 import copy
 import errno
 import hashlib
-import importlib
 import json
 import os
 import subprocess
@@ -19,9 +18,9 @@ from docker.errors import NotFound
 from anyio.from_thread import start_blocking_portal
 
 from tests.orchestrator._office_store import CHAT, _outputs
-from tests.orchestrator.test_lifecycle import _bind_outputs_broker, _container, _docker
+from tests.orchestrator.test_lifecycle import _container, _docker
 from tests.orchestrator.test_office_publish import (
-    BASELINE, OBLIGATION, SAVED, SESSION, _prepared, _reload_publish, _sha,
+    BASELINE, OBLIGATION, SAVED, SESSION, _prepared, _sha,
 )
 from tests.orchestrator._office_store import _MARKER_WRITER, _child_env, _stop_child, _wait_marker
 from tests.orchestrator.test_office_sessions import _snapshot
@@ -30,11 +29,6 @@ from tests.orchestrator.test_office_sessions import _snapshot
 def test_sweep_publishes_unstarted_obligation_in_office_only_chat(world, monkeypatch):
     store_mod, manager, data = world
     monkeypatch.setenv("OCU_OFFICE_DOCSERVER_URL", "http://documentserver.invalid")
-    _bind_outputs_broker(manager)
-    for module in ("office.sessions", "office.save_as", "office.publish", "office.resolution", "office.history", "office.restore", "office.sweep"):
-        if module in sys.modules:
-            importlib.reload(sys.modules[module])
-
     from office.sweep import sweep_office_sessions
     from office.versions import read_version_bytes
     from outputs_broker import OutputsBroker

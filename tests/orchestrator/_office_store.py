@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import errno
-import importlib
 import json
 import os
 import subprocess
@@ -14,6 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+
+from tests.file_route_module_ownership import _FRESH_IMPORT_MODULES, _SERVER_PREFIXES, isolated_modules
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER_DIR = ROOT / "computer-use-server"
@@ -218,26 +219,13 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setenv("DOCKER_HOST", NO_DOCKER_SOCKET)
     monkeypatch.setenv("DOCKER_SOCKET", NO_DOCKER_SOCKET)
 
-    import docker_manager
-    import office.store as store_mod
-    import office.versions as versions_mod
-    import office.workspace as workspace_mod
+    # Fresh server modules read this root at import; office.* and outputs_broker
+    # imported inside the test bind them, and the caller's modules come back after.
+    with isolated_modules(_FRESH_IMPORT_MODULES, _SERVER_PREFIXES):
+        import docker_manager
+        import office.store as store_mod
 
-    prior_base = docker_manager.BASE_DATA_DIR
-    importlib.reload(docker_manager)
-    importlib.reload(store_mod)
-    importlib.reload(versions_mod)
-    importlib.reload(workspace_mod)
-    docker_manager._chat_locks.clear()
-    docker_manager._FLOCK_DEPTH.clear()
-    docker_manager._docker_client = None
-    try:
         yield store_mod, docker_manager, data
-    finally:
-        docker_manager._FLOCK_DEPTH.clear()
-        docker_manager._chat_locks.clear()
-        docker_manager._docker_client = None
-        docker_manager.BASE_DATA_DIR = prior_base
 
 
 def _state(data: Path, chat: str = CHAT) -> Path:

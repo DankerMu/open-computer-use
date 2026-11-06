@@ -20,7 +20,6 @@ Contract:
 
 import sys
 import unittest
-from importlib import reload
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,6 +27,12 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "computer-use-server"))
+
+from tests.file_route_module_ownership import (  # noqa: E402
+    _FRESH_IMPORT_MODULES,
+    _SERVER_PREFIXES,
+    isolated_modules,
+)
 
 # The full server stack (mcp, pptx, docx, ...) is heavy and not installed
 # in every dev venv. Skip cleanly if any server import fails — CI has the
@@ -38,31 +43,25 @@ pytest.importorskip("httpx", reason="fastapi.testclient needs httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 
-def _client_with_cli(cli: str) -> TestClient:
-    """Reload docker_manager + app under SUBAGENT_CLI=<cli> and return a TestClient.
+def _client_with_cli(case: unittest.TestCase, cli: str) -> TestClient:
+    """Import docker_manager + app afresh under SUBAGENT_CLI=<cli>; return a TestClient.
 
     docker_manager reads SUBAGENT_CLI at import time (module-load validation
-    is a project invariant — see Pitfall E in cli_runtime RESEARCH.md), so
-    the env var must be patched before the module is imported. We use a
-    single env patch + reload pair per CLI value.
+    is a project invariant — see Pitfall E in cli_runtime RESEARCH.md), and
+    cli_runtime binds `from docker_manager import SUBAGENT_CLI`, so the env var
+    must be patched before the server is imported. The fresh modules serve the
+    rest of the test; the caller's modules come back at cleanup.
     """
     with patch.dict("os.environ", {"SUBAGENT_CLI": cli}, clear=False):
-        import docker_manager  # noqa: F401
-        reload(docker_manager)
-        # cli_runtime binds `from docker_manager import SUBAGENT_CLI` at
-        # import time — must reload after docker_manager so resolve_cli()
-        # sees the patched value, not the first-import snapshot.
-        import cli_runtime
-        reload(cli_runtime)
+        case.enterContext(isolated_modules(_FRESH_IMPORT_MODULES, _SERVER_PREFIXES))
         import app as app_module
-        reload(app_module)
         return TestClient(app_module.app)
 
 
 class RuntimeCliEndpointContract(unittest.TestCase):
 
     def test_default_claude(self):
-        client = _client_with_cli("claude")
+        client = _client_with_cli(self, "claude")
         resp = client.get("/api/runtime/cli")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -76,7 +75,7 @@ class RuntimeCliEndpointContract(unittest.TestCase):
         # CODEX_SUB_AGENT_DEFAULT_MODEL env, default_model is null. The
         # endpoint surfaces this as None instead of crashing on the
         # ValueError raised by resolve_subagent_model.
-        client = _client_with_cli("codex")
+        client = _client_with_cli(self, "codex")
         body = client.get("/api/runtime/cli").json()
         self.assertEqual(body["cli"], "codex")
         self.assertIs(body["supports_cost"], False)
@@ -85,21 +84,21 @@ class RuntimeCliEndpointContract(unittest.TestCase):
     def test_opencode(self):
         # Phase 2: opencode has no hardcoded default — without
         # OPENCODE_SUB_AGENT_DEFAULT_MODEL env, default_model is null.
-        client = _client_with_cli("opencode")
+        client = _client_with_cli(self, "opencode")
         body = client.get("/api/runtime/cli").json()
         self.assertEqual(body["cli"], "opencode")
         self.assertIs(body["supports_cost"], False)
         self.assertIsNone(body["default_model"])
 
     def test_method_allowlist(self):
-        client = _client_with_cli("claude")
+        client = _client_with_cli(self, "claude")
         self.assertEqual(client.post("/api/runtime/cli").status_code, 405)
         self.assertEqual(client.put("/api/runtime/cli").status_code, 405)
         self.assertEqual(client.delete("/api/runtime/cli").status_code, 405)
 
     def test_response_shape_is_minimal(self):
         """No leaked internals — only the three documented keys."""
-        client = _client_with_cli("claude")
+        client = _client_with_cli(self, "claude")
         body = client.get("/api/runtime/cli").json()
         self.assertEqual(set(body.keys()), {"cli", "default_model", "supports_cost"})
 

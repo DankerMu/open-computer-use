@@ -21,7 +21,6 @@ from tests.orchestrator.test_office_publish import (
     SAVED,
     SESSION,
     _prepared,
-    _reload_publish,
     _sha,
     _on_staging_sync,
     _publish,
@@ -77,7 +76,7 @@ def _running(world):
 
 
 def test_running_publish_observes_pause_before_workspace_work_and_releases_owned_fence(
-    world, monkeypatch, _reload_publish,
+    world, monkeypatch,
 ):
     fixture = _running(world)
     container = fixture.container

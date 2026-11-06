@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import importlib
 import json
 import logging
 import shlex
@@ -124,11 +123,6 @@ class World:
             monkeypatch.setenv("OCU_SANDBOX_MESSAGES_ADDRESS", ADDRESS)
         else:
             monkeypatch.delenv("OCU_SANDBOX_MESSAGES_ADDRESS", raising=False)
-        for name in ("docker_manager", "cli_runtime", "mcp_tools"):
-            if name in sys.modules:
-                importlib.reload(sys.modules[name])
-            else:
-                importlib.import_module(name)
         import cli_runtime
         import docker_manager
         import mcp_tools
@@ -193,12 +187,12 @@ class World:
 
 
 @pytest.fixture
-def gateway(monkeypatch):
+def gateway(monkeypatch, fresh_server_modules):
     return World(monkeypatch, "claude", gateway=True)
 
 
 @pytest.fixture
-def gateway_off(monkeypatch):
+def gateway_off(monkeypatch, fresh_server_modules):
     return World(monkeypatch, "claude", gateway=False)
 
 
@@ -257,14 +251,13 @@ def test_missing_token_or_model_refuses_before_any_container_work(gateway, capsy
     _assert_secret_absent(gateway, result, capsys, caplog)
 
 
-def test_missing_gateway_token_is_not_replaced_by_other_anthropic_tokens(monkeypatch, capsys, caplog):
+def test_missing_gateway_token_is_not_replaced_by_other_anthropic_tokens(monkeypatch, capsys, caplog, fresh_server_modules):
     caplog.set_level(logging.DEBUG)
     with monkeypatch.context() as scoped:
         scoped.setenv("ANTHROPIC_AUTH_TOKEN", "srv-canary")
         world = World(scoped, "claude", gateway=True)
         assert world.dm.ANTHROPIC_AUTH_TOKEN == "srv-canary"
         result = world.call(token=None, chat_model="m-1", anthropic_token="req-canary")
-    importlib.reload(sys.modules["docker_manager"])
     assert result == f"Error: {NO_TOKEN}"
     assert world.lookups == []
     assert world.bash == []
@@ -325,7 +318,7 @@ def test_resume_with_empty_task_keeps_the_continue_prompt(gateway_off, task):
     assert not any("base64 -d" in command for command in gateway_off.bash)
 
 
-def test_codex_resume_still_starts_a_fully_briefed_fresh_run(monkeypatch):
+def test_codex_resume_still_starts_a_fully_briefed_fresh_run(monkeypatch, fresh_server_modules):
     world = World(monkeypatch, "codex", gateway=False)
     task = "write and run hello.py"
     world.call(task=task, model="gpt-5-codex", resume_session_id="s-1")
@@ -352,7 +345,7 @@ def test_gateway_off_ignores_forwarded_values_and_expands_the_alias(gateway_off,
     _assert_secret_absent(gateway_off, result, capsys, caplog)
 
 
-def test_codex_with_address_set_keeps_its_own_resolution(monkeypatch, capsys, caplog):
+def test_codex_with_address_set_keeps_its_own_resolution(monkeypatch, capsys, caplog, fresh_server_modules):
     caplog.set_level(logging.DEBUG)
     world = World(monkeypatch, "codex", gateway=True)
     refused = world.call(token=TOKEN, chat_model="m-1", model="sonnet")

@@ -17,6 +17,15 @@ from unittest.mock import patch, MagicMock, AsyncMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'computer-use-server'))
 
 from context_vars import current_chat_id
+from tests.file_route_module_ownership import _FRESH_IMPORT_MODULES, _SERVER_PREFIXES, isolated_modules
+
+
+class _FreshServerModules:
+    """Each test imports mcp_tools afresh under its own env; cleanup restores the caller's."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(isolated_modules(_FRESH_IMPORT_MODULES, _SERVER_PREFIXES))
 
 
 def _mock_container():
@@ -28,17 +37,14 @@ def _mock_container():
     return c
 
 
-class TestValidateChatId(unittest.TestCase):
+class TestValidateChatId(_FreshServerModules, unittest.TestCase):
     """Tests for _validate_chat_id() with different SINGLE_USER_MODE values."""
 
     def test_lenient_mode_no_chat_id_returns_default(self):
         """Default mode (SINGLE_USER_MODE unset) + no chat_id → returns 'default', no error."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SINGLE_USER_MODE", None)
-            # Re-import to pick up new env
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             chat_id, error = mcp_tools._validate_chat_id()
             self.assertEqual(chat_id, "default")
@@ -48,9 +54,7 @@ class TestValidateChatId(unittest.TestCase):
         """Default mode + chat_id present → returns that chat_id, no error."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SINGLE_USER_MODE", None)
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("my-session-123")
             chat_id, error = mcp_tools._validate_chat_id()
             self.assertEqual(chat_id, "my-session-123")
@@ -59,9 +63,7 @@ class TestValidateChatId(unittest.TestCase):
     def test_single_user_mode_preserves_explicit_chat_id(self):
         """SINGLE_USER_MODE=true must not remap a real chat to default."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "true"}, clear=False):
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("must-be-preserved")
             chat_id, error = mcp_tools._validate_chat_id()
             self.assertEqual(chat_id, "must-be-preserved")
@@ -70,9 +72,7 @@ class TestValidateChatId(unittest.TestCase):
     def test_single_user_mode_no_chat_id(self):
         """SINGLE_USER_MODE=true + no chat_id → 'default', no error."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "true"}, clear=False):
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             chat_id, error = mcp_tools._validate_chat_id()
             self.assertEqual(chat_id, "default")
@@ -81,9 +81,7 @@ class TestValidateChatId(unittest.TestCase):
     def test_multi_user_mode_no_chat_id_returns_error(self):
         """SINGLE_USER_MODE=false + no chat_id → error."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "false"}, clear=False):
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             chat_id, error = mcp_tools._validate_chat_id()
             self.assertEqual(chat_id, "default")
@@ -93,25 +91,21 @@ class TestValidateChatId(unittest.TestCase):
     def test_multi_user_mode_with_chat_id_works(self):
         """SINGLE_USER_MODE=false + chat_id present → normal, no error."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "false"}, clear=False):
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("user-session-456")
             chat_id, error = mcp_tools._validate_chat_id()
             self.assertEqual(chat_id, "user-session-456")
             self.assertIsNone(error)
 
 
-class TestDefaultChatWarning(unittest.TestCase):
+class TestDefaultChatWarning(_FreshServerModules, unittest.TestCase):
     """Tests for _get_default_chat_warning() helper."""
 
     def test_lenient_mode_default_chat_returns_warning(self):
         """Default mode + default chat_id → returns warning text."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SINGLE_USER_MODE", None)
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             warning = mcp_tools._get_default_chat_warning()
             self.assertIn("SINGLE_USER_MODE", warning)
@@ -121,9 +115,7 @@ class TestDefaultChatWarning(unittest.TestCase):
         """Default mode + real chat_id → no warning."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SINGLE_USER_MODE", None)
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("real-session")
             warning = mcp_tools._get_default_chat_warning()
             self.assertEqual(warning, "")
@@ -131,9 +123,7 @@ class TestDefaultChatWarning(unittest.TestCase):
     def test_single_user_mode_no_warning(self):
         """SINGLE_USER_MODE=true → no warning ever."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "true"}, clear=False):
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             warning = mcp_tools._get_default_chat_warning()
             self.assertEqual(warning, "")
@@ -141,24 +131,20 @@ class TestDefaultChatWarning(unittest.TestCase):
     def test_multi_user_mode_no_warning(self):
         """SINGLE_USER_MODE=false → no warning (error handled separately)."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "false"}, clear=False):
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             warning = mcp_tools._get_default_chat_warning()
             self.assertEqual(warning, "")
 
 
-class TestBashToolSingleUserMode(unittest.IsolatedAsyncioTestCase):
+class TestBashToolSingleUserMode(_FreshServerModules, unittest.IsolatedAsyncioTestCase):
     """Integration: bash_tool appends warning in lenient mode."""
 
     async def test_bash_tool_lenient_mode_appends_warning(self):
         """bash_tool with default chat_id in lenient mode → result + warning."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SINGLE_USER_MODE", None)
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             ctx = MagicMock()
             ctx.report_progress = AsyncMock()
@@ -175,9 +161,7 @@ class TestBashToolSingleUserMode(unittest.IsolatedAsyncioTestCase):
     async def test_bash_tool_single_user_no_warning(self):
         """bash_tool with SINGLE_USER_MODE=true → result without warning."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "true"}, clear=False):
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             ctx = MagicMock()
             ctx.report_progress = AsyncMock()
@@ -194,9 +178,7 @@ class TestBashToolSingleUserMode(unittest.IsolatedAsyncioTestCase):
     async def test_bash_tool_multi_user_no_chat_id_returns_error(self):
         """bash_tool with SINGLE_USER_MODE=false + no chat_id → error."""
         with patch.dict(os.environ, {"SINGLE_USER_MODE": "false"}, clear=False):
-            import importlib
             import mcp_tools
-            importlib.reload(mcp_tools)
             current_chat_id.set("default")
             ctx = MagicMock()
             ctx.report_progress = AsyncMock()

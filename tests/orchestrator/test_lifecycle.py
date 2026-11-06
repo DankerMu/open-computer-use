@@ -10,7 +10,6 @@ spec, not from recomputing the implementation.
 from __future__ import annotations
 
 import errno
-import importlib
 import json
 import os
 import stat
@@ -23,6 +22,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+from tests.file_route_module_ownership import isolated_modules
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "computer-use-server"
 if str(SERVER_DIR) not in sys.path:
@@ -53,14 +54,6 @@ class Clock:
         self.now += seconds
         return self.now
 
-
-
-def _bind_outputs_broker(docker_manager):
-    """Keep outputs_broker.docker_manager on the live module after neighbor reloads."""
-    import outputs_broker
-
-    importlib.reload(outputs_broker)
-    assert outputs_broker.docker_manager is docker_manager
 
 
 def _apply_env(monkeypatch, tmp_path):
@@ -247,9 +240,7 @@ def _docker(containers=None):
 def world(monkeypatch, tmp_path):
     _apply_env(monkeypatch, tmp_path)
     import docker_manager
-    import outputs_broker
 
-    _bind_outputs_broker(docker_manager)
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
     monkeypatch.setattr(docker_manager, "DOCKER_IMAGE", os.environ["DOCKER_IMAGE"])
     monkeypatch.setattr(docker_manager, "SUBAGENT_CLI", "claude")
@@ -291,61 +282,41 @@ def app_module():
     os.environ["MCP_API_KEY"] = MCP_KEY
     from fastapi.testclient import TestClient
 
-    # Neighbor suites reload docker_manager after this process has already
-    # imported app. importlib.reload replaces LifecycleError on the same
-    # module object, so the name app bound at import time is a different
-    # class from the one tests (and launch_sandbox) raise. Rebind once,
-    # while this client is the only user of the loaded app, so except
-    # clauses see the class identity the rest of the suite is using.
     # mcp_tools.mcp is a process-wide FastMCP singleton whose
     # StreamableHTTPSessionManager.run() is single-use; a prior TestClient
-    # lifespan spends it. Reload app/mcp_tools/mcp_resources so this module
-    # owns a fresh manager without replacing docker_manager.
-    snapshot = {
-        name: sys.modules[name]
-        for name in list(sys.modules)
-        if name in {"app", "mcp_tools", "file_response"} or name.startswith("mcp_resources")
-    }
-    for name in list(snapshot):
-        sys.modules.pop(name, None)
+    # lifespan spends it. Import app/mcp_tools/mcp_resources afresh so this
+    # module owns a fresh manager; docker_manager stays shared with `world`.
     try:
-        import app as loaded
-        import docker_manager
+        with isolated_modules({"app", "mcp_tools", "file_response"}, ("mcp_resources",)):
+            import app as loaded
 
-        saved = {
-            "LifecycleError": loaded.LifecycleError,
-            "startup_idle_sweep": loaded.startup_idle_sweep,
-            "reap_known_sandboxes": loaded.reap_known_sandboxes,
-            "validate_idle_configuration": loaded.validate_idle_configuration,
-            "validate_sandbox_dns_configuration": loaded.validate_sandbox_dns_configuration,
-        }
-        saved_client = getattr(loaded, "_lifecycle_client", None)
-        loaded.LifecycleError = docker_manager.LifecycleError
-        loaded.startup_idle_sweep = lambda now=None: None
-        loaded.reap_known_sandboxes = lambda now=None: None
-        loaded.validate_idle_configuration = lambda *args, **kwargs: (600, 30)
-        loaded.validate_sandbox_dns_configuration = lambda: None
-        with TestClient(loaded.app) as client:
-            loaded._lifecycle_client = client
-            try:
-                yield loaded
-            finally:
-                for key, value in saved.items():
-                    setattr(loaded, key, value)
-                if saved_client is None:
-                    loaded._lifecycle_client = None
-                else:
-                    loaded._lifecycle_client = saved_client
-                assert loaded.startup_idle_sweep is saved["startup_idle_sweep"]
-                assert loaded.reap_known_sandboxes is saved["reap_known_sandboxes"]
-                assert loaded.validate_idle_configuration is saved["validate_idle_configuration"]
-                assert loaded.validate_sandbox_dns_configuration is saved["validate_sandbox_dns_configuration"]
-                assert loaded.LifecycleError is saved["LifecycleError"]
+            saved = {
+                "startup_idle_sweep": loaded.startup_idle_sweep,
+                "reap_known_sandboxes": loaded.reap_known_sandboxes,
+                "validate_idle_configuration": loaded.validate_idle_configuration,
+                "validate_sandbox_dns_configuration": loaded.validate_sandbox_dns_configuration,
+            }
+            saved_client = getattr(loaded, "_lifecycle_client", None)
+            loaded.startup_idle_sweep = lambda now=None: None
+            loaded.reap_known_sandboxes = lambda now=None: None
+            loaded.validate_idle_configuration = lambda *args, **kwargs: (600, 30)
+            loaded.validate_sandbox_dns_configuration = lambda: None
+            with TestClient(loaded.app) as client:
+                loaded._lifecycle_client = client
+                try:
+                    yield loaded
+                finally:
+                    for key, value in saved.items():
+                        setattr(loaded, key, value)
+                    if saved_client is None:
+                        loaded._lifecycle_client = None
+                    else:
+                        loaded._lifecycle_client = saved_client
+                    assert loaded.startup_idle_sweep is saved["startup_idle_sweep"]
+                    assert loaded.reap_known_sandboxes is saved["reap_known_sandboxes"]
+                    assert loaded.validate_idle_configuration is saved["validate_idle_configuration"]
+                    assert loaded.validate_sandbox_dns_configuration is saved["validate_sandbox_dns_configuration"]
     finally:
-        for name in list(sys.modules):
-            if name in {"app", "mcp_tools", "file_response"} or name.startswith("mcp_resources"):
-                sys.modules.pop(name, None)
-        sys.modules.update(snapshot)
         for key in ("OCU_INTERNAL_TOKEN", "PUBLIC_BASE_URL", "MCP_API_KEY"):
             os.environ.pop(key, None)
 
@@ -1368,7 +1339,6 @@ def test_restart_alias_launches_compatible_stopped_sandbox(app_module, monkeypat
     _apply_env(monkeypatch, tmp_path)
     import docker_manager
 
-    _bind_outputs_broker(docker_manager)
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
     docker_manager._docker_client = None
     docker_manager._chat_locks.clear()
@@ -1393,8 +1363,6 @@ def test_restart_alias_launches_compatible_stopped_sandbox(app_module, monkeypat
 def test_describe_route_reports_real_sandbox_state(app_module, monkeypatch, tmp_path):
     _apply_env(monkeypatch, tmp_path)
     import docker_manager
-
-    _bind_outputs_broker(docker_manager)
 
     client = _docker()
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
@@ -2651,8 +2619,6 @@ def test_record_heartbeat_extends_running_idle_only(world):
 def test_heartbeat_route_requires_token_and_extends_idle(app_module, monkeypatch, tmp_path):
     _apply_env(monkeypatch, tmp_path)
     import docker_manager
-
-    _bind_outputs_broker(docker_manager)
 
     client = _docker()
     docker_manager.BASE_DATA_DIR = tmp_path / "data"
