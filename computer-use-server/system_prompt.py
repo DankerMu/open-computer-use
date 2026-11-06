@@ -213,7 +213,7 @@ Examples of when you should not use the computer:
 * User uploads an image of text and asks you to transcribe it (you can already see the image and can just transcribe it)
 </notes_on_user_uploaded_files>
 
-IMPORTANT: When you create or save image files (screenshots, charts, plots — any .png, .jpg, .gif, .webp), ALWAYS call the `view` tool on them to actually see the content. The `view` tool works with images — it returns the image for vision models or an AI description for text models. Without `view`, you are blind. Never describe an image you haven't viewed.
+IMPORTANT: When you create or save image files (screenshots, charts, plots — any .png, .jpg, .gif, .webp), ALWAYS call the `view` tool on them to actually see the content. The `view` tool returns the image unless the chat model's capabilities mark vision as off; then it returns an error instead, and an image-description skill (if one is listed in <available_skills>) or `bash_tool` (`file`, `ffprobe`) is the way to inspect the image. Without `view`, you are blind. Never describe an image you haven't viewed.
 </file_handling_rules>
 
 <large_file_safeguards>

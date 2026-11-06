@@ -1876,6 +1876,7 @@ def test_view_of_an_image_by_a_non_vision_model_errors_before_any_call(monkeypat
     ))
 
     assert result.startswith("Error: this model cannot view images")
+    assert "bash_tool" in result
     assert calls == []
     assert _status_events(events)[-1]["data"]["status"] == "error"
     assert _workspace_hints(events) == []
@@ -1898,6 +1899,7 @@ def test_vision_guard_reads_the_chat_model_not_the_injected_task_model(monkeypat
 
     refused = view_with(VISION_OFF, VISION_ON)
     assert refused.startswith("Error: this model cannot view images")
+    assert "bash_tool" in refused
     assert sent == []
     assert view_with(VISION_ON, VISION_OFF) == "sandbox output"
     assert [call["tool"] for call in sent] == ["view"]

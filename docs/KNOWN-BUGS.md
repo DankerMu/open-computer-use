@@ -61,17 +61,15 @@ TypeError: 'NoneType' object is not callable
 
 ---
 
-## 5. MCP tools cannot return images to the model (Open WebUI limitation)
+## 5. Models whose vision is off cannot see images through `view`
 
-**Severity:** Medium (functional limitation)
+**Severity:** Low (functional limitation)
 
-**Issue:** Open WebUI does not support `image` content type in MCP tool results — only `text` is handled. This means tools cannot return screenshots or images back to the model for analysis.
+**Status:** Since [#706](https://github.com/DankerMu/open-webui/issues/706), `view` on an image (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) returns it to the model: the server answers with the `Image: <path>` text plus an MCP image block (a JPEG, longest side at most 768 px), and the Open WebUI tool passes it on as a `data:image/jpeg;base64,…` string, which Open WebUI gives the model as an input image.
 
-**Impact:** Tools like Playwright (page screenshots) or bash (generated charts) cannot pass visual output directly to the model. The model never sees the image, so it can't reason about what's on screen.
+**Issue:** When the chat model's capabilities mark vision as off (`info.meta.capabilities.vision` is `false`), the Open WebUI tool refuses `view` of an image before calling the server and returns an error that names `bash_tool` (for example `file` or `ffprobe` for size and format). A model with vision unset is treated as vision-capable and gets the image. `view` never returns a text description of an image ([#727](https://github.com/DankerMu/open-webui/issues/727)); the system prompt says so.
 
-**Workaround:** The `describe-image` skill works around this by calling a separate vision model (e.g., GPT-4o, Qwen-VL) to describe the image as text, which is then returned to the main model. Playwright and other skills save images to `/mnt/user-data/files/` as HTTP links for the user to view in the file preview panel.
-
-**Root cause:** Open WebUI's MCP integration only passes `text` content blocks from tool responses to the model. This is an upstream limitation — see [open-webui/open-webui](https://github.com/open-webui/open-webui) for progress on image tool result support.
+**Workaround:** Use a vision-capable chat model, or inspect the image with `bash_tool`. An image-description skill can describe it as text when one is listed in the prompt's `<available_skills>`; `describe-image` is listed only when `VISION_API_KEY` is configured on `computer-use-server` ([#720](https://github.com/DankerMu/open-webui/issues/720)), which the production-like deployment does not do.
 
 ---
 

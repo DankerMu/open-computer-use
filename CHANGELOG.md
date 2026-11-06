@@ -141,6 +141,18 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **The prompt no longer promises an image description from `view` (#727).**
+  The system prompt said `view` returns "an AI description for text models";
+  neither the Open WebUI tool nor the server does that. It now says `view`
+  returns the image unless the chat model's capabilities mark vision as off,
+  in which case it returns an error and an image-description skill (when one
+  is listed in `<available_skills>`) or `bash_tool` (`file`, `ffprobe`) is the
+  way to inspect the image. It names no skill, since `describe-image` is listed
+  only with Vision (#720). The tool and its error text are unchanged.
+  `docs/KNOWN-BUGS.md` item 5 now describes the current behavior instead of
+  saying MCP tools cannot return images. CI runs `tests/test_describe_image.py`
+  in the orchestrator pytest job. Rebuild the `computer-use-server` image; no
+  init re-run is needed.
 - **`describe-image` is listed only when Vision is configured (#720).** With
   `VISION_API_KEY` unset or empty on `computer-use-server`, the system prompt
   (per user and the no-email template), `/skill-list` and the `sub_agent`
