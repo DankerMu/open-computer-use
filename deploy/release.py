@@ -215,6 +215,13 @@ def fail(message: str, code: int = 1) -> None:
     raise SystemExit(code)
 
 
+def resolve_argument(name: str, value: str) -> Path:
+    try:
+        return Path(value).resolve()
+    except (OSError, RuntimeError) as exc:  # RuntimeError: symlink loop before 3.13
+        raise ReleaseError(f"{name} {value} cannot be resolved: {exc}") from exc
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -1272,8 +1279,11 @@ def verify_source_bundle(
 
 def load_json_object(path: Path) -> dict:
     decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_keys)
-    text = path.read_text(encoding="utf-8")
-    payload, index = decoder.raw_decode(text)
+    try:
+        text = path.read_text(encoding="utf-8")
+        payload, index = decoder.raw_decode(text)
+    except (OSError, UnicodeError, ValueError) as exc:  # ValueError includes JSONDecodeError
+        raise ReleaseError(f"{path}: cannot read inventory: {exc}") from exc
     if index != len(text.rstrip()):
         trailing = text[index:].strip()
         if trailing:
@@ -1400,8 +1410,11 @@ def checkout_tracked_tree(source: Path, dest: Path, commit: str) -> None:
 
 
 def confined_relative(root: Path, path: Path) -> str:
-    resolved_root = root.resolve()
-    resolved = path.resolve()
+    try:
+        resolved_root = root.resolve()
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:  # RuntimeError: symlink loop before 3.13
+        raise ReleaseError(f"{path}: cannot be resolved: {exc}") from exc
     try:
         relative = resolved.relative_to(resolved_root)
     except ValueError as exc:
@@ -2159,7 +2172,11 @@ def relative_archive_path(root: Path, value: str) -> Path:
     path = root
     for part in Path(value).parts:
         path = path / part
-        if path.is_symlink():
+        try:
+            linked = path.is_symlink()
+        except OSError as exc:
+            raise ReleaseError(f"{path}: symbolic links cannot be checked: {exc}") from exc
+        if linked:
             raise ReleaseError(f"{path}: symbolic links are not allowed")
     confined_relative(root, path)
     return path
@@ -3007,7 +3024,9 @@ def bootstrap_dotenv_assignments(payload: dict, provided: dict[str, str]) -> lis
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     try:
-        payload = load_inventory(Path(os.environ["OCU_RELEASE_MANIFEST"]).resolve())
+        payload = load_inventory(
+            resolve_argument("OCU_RELEASE_MANIFEST", os.environ["OCU_RELEASE_MANIFEST"])
+        )
         lines = bootstrap_dotenv_assignments(payload, dict(os.environ))
     except KeyError:
         fail("OCU_RELEASE_MANIFEST is required")
@@ -3076,9 +3095,9 @@ def parse_role_args(raw: list[str]) -> dict[str, dict[str, str]]:
 def cmd_build(args: argparse.Namespace) -> int:
     try:
         payload = build_release(
-            ocu_source=Path(args.ocu_source).resolve(),
-            webui_source=Path(args.webui_source).resolve(),
-            destination=Path(args.destination).resolve(),
+            ocu_source=resolve_argument("--ocu-source", args.ocu_source),
+            webui_source=resolve_argument("--webui-source", args.webui_source),
+            destination=resolve_argument("--destination", args.destination),
             postgres_image=args.postgres_image,
             build_args=parse_role_args(args.build_arg or []),
         )
@@ -3092,8 +3111,8 @@ def cmd_build(args: argparse.Namespace) -> int:
 def cmd_import(args: argparse.Namespace) -> int:
     try:
         payload = import_release(
-            delivery=Path(args.delivery).resolve(),
-            install_root=Path(args.install_root).resolve(),
+            delivery=resolve_argument("--delivery", args.delivery),
+            install_root=resolve_argument("--install-root", args.install_root),
         )
     except ReleaseError as exc:
         fail(str(exc))
@@ -3103,19 +3122,19 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     try:
-        payload = load_inventory(Path(args.inventory).resolve())
+        payload = load_inventory(resolve_argument("--inventory", args.inventory))
         if args.mode == "images":
             verify_local_images(payload)
         elif args.mode == "delivery":
             if not args.delivery:
                 raise ReleaseError("verify --mode delivery requires --delivery")
-            delivery = Path(args.delivery).resolve()
+            delivery = resolve_argument("--delivery", args.delivery)
             verify_source_bundle(delivery, payload)
             verify_archive_set(delivery, payload)
         else:
             if not args.source:
                 raise ReleaseError("verify --mode startup requires --source")
-            source = Path(args.source).resolve()
+            source = resolve_argument("--source", args.source)
             verify_tracked_source(source, payload["ocu_source_sha"])
             require_supported_source_contract(
                 source, payload.get("source_consumer_contract")

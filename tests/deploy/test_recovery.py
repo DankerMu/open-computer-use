@@ -4385,5 +4385,26 @@ class ResolveLoopTests(unittest.TestCase):
         )
 
 
+class ManifestReadTests(unittest.TestCase):
+    """A recovery manifest that is not JSON is a one-line refusal (#726)."""
+
+    def test_verify_of_a_manifest_that_is_not_json(self):
+        with tmp_dir() as name:
+            recovery_set = Path(name) / "set"
+            recovery_set.mkdir()
+            (recovery_set / recovery.MANIFEST_NAME).write_text("{", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(RECOVERY), "verify", "--recovery-set", str(recovery_set)],
+                cwd=str(ROOT), capture_output=True, text=True, check=False, timeout=30,
+            )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("recovery: "), result.stderr)
+        self.assertIn(recovery.MANIFEST_NAME, lines[0])
+        self.assertIn("cannot read inventory", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()
