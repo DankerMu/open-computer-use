@@ -6,12 +6,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import importlib
 import errno
 import os
 import stat
 import threading
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -27,13 +25,6 @@ SAVED = b"published-v2"
 
 def _sha(body):
     return hashlib.sha256(body).hexdigest()
-
-
-@pytest.fixture(autouse=True)
-def _reload_publish(world):
-    for module in ("office.save_as", "office.publish", "office.resolution", "office.history", "office.restore"):
-        if module in sys.modules:
-            importlib.reload(sys.modules[module])
 
 
 def _prepared(world, sandbox_state="exited", path="report.docx"):

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import errno
 import hashlib
-import importlib
 import json
 import os
 import stat
@@ -22,6 +21,8 @@ import uuid
 from pathlib import Path
 
 import pytest
+
+from tests.file_route_module_ownership import _FRESH_IMPORT_MODULES, _SERVER_PREFIXES, isolated_modules
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER_DIR = ROOT / "computer-use-server"
@@ -35,30 +36,17 @@ NO_DOCKER_SOCKET = "unix:///tmp/ocu-acceptance-no-docker.sock"
 
 @pytest.fixture
 def world(monkeypatch, tmp_path):
-    """Reload lifecycle configuration into one isolated real filesystem root."""
+    """Import lifecycle configuration afresh into one isolated real filesystem root."""
     data = tmp_path / "data"
     monkeypatch.setenv("BASE_DATA_DIR", str(data))
     monkeypatch.setenv("DOCKER_HOST", NO_DOCKER_SOCKET)
     monkeypatch.setenv("DOCKER_SOCKET", NO_DOCKER_SOCKET)
 
-    import docker_manager
-    import outputs_broker
+    with isolated_modules(_FRESH_IMPORT_MODULES, _SERVER_PREFIXES):
+        import docker_manager
+        import outputs_broker
 
-    prior_base = docker_manager.BASE_DATA_DIR
-    importlib.reload(docker_manager)
-    # outputs_broker must retain the docker_manager module object, not aliases
-    # captured before this reload.
-    importlib.reload(outputs_broker)
-    docker_manager._chat_locks.clear()
-    docker_manager._FLOCK_DEPTH.clear()
-    docker_manager._docker_client = None
-    try:
         yield outputs_broker, docker_manager, data
-    finally:
-        docker_manager._FLOCK_DEPTH.clear()
-        docker_manager._chat_locks.clear()
-        docker_manager._docker_client = None
-        docker_manager.BASE_DATA_DIR = prior_base
 
 
 def _outputs(data: Path, chat: str = CHAT) -> Path:

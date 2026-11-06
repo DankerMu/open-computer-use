@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import importlib
 import io
 import json
 import os
@@ -32,7 +31,6 @@ def test_office_sweep_never_opens_or_flocks_canary_after_lock_precheck(world, mo
 
     import office.sweep as sweep
 
-    importlib.reload(sweep)
     external = data.parent / "external"
     external.mkdir()
     canary = external / "canary"

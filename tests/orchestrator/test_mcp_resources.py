@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.file_route_module_ownership import _FRESH_IMPORT_MODULES, _SERVER_PREFIXES, isolated_modules
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -35,14 +36,12 @@ class McpResourcesContract(unittest.TestCase):
         os.environ["BASE_DATA_DIR"] = cls._tmp
 
         sys.path.insert(0, str(ROOT / "computer-use-server"))
-        # Fresh imports so BASE_DATA_DIR is picked up
+        # Fresh imports so BASE_DATA_DIR is picked up; the caller's come back after the class.
+        cls.enterClassContext(isolated_modules(_FRESH_IMPORT_MODULES, _SERVER_PREFIXES))
         import uploads as uploads_mod
-        import importlib
-        importlib.reload(uploads_mod)
 
         import mcp_tools  # noqa: F401 — the singleton
         import mcp_resources as mr
-        importlib.reload(mr)
 
         cls.mcp_tools = mcp_tools
         cls.mcp_resources = mr

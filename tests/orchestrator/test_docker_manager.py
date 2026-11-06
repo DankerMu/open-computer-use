@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tests.file_route_module_ownership import (  # noqa: E402
-    _SERVER_MODULES,
+    _FRESH_IMPORT_MODULES,
     _SERVER_PREFIXES,
     isolated_modules,
 )
@@ -39,11 +39,6 @@ from context_vars import (
     current_anthropic_base_url,
     current_gateway_token,
 )
-
-# A fresh docker_manager import owns every server module it can first-import
-# (mcp_tools, mcp_resources*, outputs_broker, uploads, ...). context_vars stays
-# shared: the ContextVars imported above must be the ones the fresh modules read.
-_FRESH_IMPORT_MODULES = _SERVER_MODULES - {"context_vars"}
 
 
 # Ten gateway model/flag vars injected via CLAUDE_CODE_PASSTHROUGH_ENVS

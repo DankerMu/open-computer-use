@@ -12,8 +12,8 @@ SUBAGENT_CLI=opencode, extra_env["OPENCODE_CONFIG"] must equal
 "/tmp/opencode.json" so docker exec'd subprocesses inherit it and OpenCode
 never falls back to ~/.local/share/opencode/auth.json (Pitfall 7 reopen).
 
-Mirrors tests/orchestrator/test_docker_manager.py pattern: monkeypatch.setenv
-+ importlib.reload(docker_manager) + mocked docker client + capture
+Mirrors tests/orchestrator/test_docker_manager.py pattern: env patch + a fresh
+docker_manager import (`fresh_server_modules`) + mocked docker client + capture
 `containers.create(environment=...)` kwargs (the actual sandbox container is
 created via `client.containers.create(**config)` — `containers.run` is only
 used for the ephemeral directory-setup shim).
@@ -21,7 +21,6 @@ used for the ephemeral directory-setup shim).
 
 from __future__ import annotations
 
-import importlib
 import os
 import sys
 from pathlib import Path
@@ -109,7 +108,7 @@ def _clear_phase6_auth_env():
     Without this, a stale OPENAI_API_KEY from a sibling test (or the developer's
     shell) would survive `monkeypatch.setenv` only for the keys we explicitly
     set, but the module-level tuples are built at import time from os.getenv —
-    `importlib.reload` re-runs them, so the pre-reload os.environ state IS the
+    the fresh import runs them, so the pre-import os.environ state IS the
     test fixture. Be explicit.
     """
     for key in (
@@ -155,7 +154,7 @@ def _clear_phase6_auth_env():
     ],
 )
 def test_passthrough_isolation(
-    cli, expected_keys, forbidden_keys, expected_opencode_config, tmp_path
+    cli, expected_keys, forbidden_keys, expected_opencode_config, tmp_path, fresh_server_modules
 ):
     """With all three host auth env vars set, only the active CLI's allowlist
     crosses into extra_env. Closes Pitfall 1 (auth bleed across CLIs).
@@ -184,10 +183,9 @@ def test_passthrough_isolation(
         for k, v in overrides.items():
             os.environ[k] = v
 
-        # Re-import docker_manager so module-level os.getenv() reads (which build
+        # Import docker_manager afresh so module-level os.getenv() reads (which build
         # _PASSTHROUGH_BY_CLI and SUBAGENT_CLI) pick up the new env.
         import docker_manager
-        importlib.reload(docker_manager)
         docker_manager.BASE_DATA_DIR = tmp_path / "data"
 
         client, fake_container = _build_mock_docker_client()

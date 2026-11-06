@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import errno
 import fcntl
-import importlib
 import os
 import subprocess
 import sys
@@ -20,13 +19,6 @@ from tests.orchestrator._office_store import (
 )
 
 LOCK_NAME = ".office-lookup.lock"
-
-
-@pytest.fixture(autouse=True)
-def _reload_lookup_admission(world):
-    from office import lookup_admission
-
-    importlib.reload(lookup_admission)
 
 
 @contextmanager

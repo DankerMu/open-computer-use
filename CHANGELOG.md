@@ -141,6 +141,19 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **Orchestrator tests no longer split `LifecycleError` by order (#730).** Every
+  orchestrator test that re-imported a server module with `importlib.reload`, or
+  popped it without restoring it, now imports it afresh inside `isolated_modules`
+  for the fixture, test or class that uses it. `test_speech.py` no longer fails
+  after `test_passthrough_isolation.py` or `test_runtime_cli_endpoint.py`. The
+  rebinding workarounds (`_bind_outputs_broker`, the `LifecycleError` rebinding in
+  `test_lifecycle.py::app_module`, the Office `office.*` reload fixtures) are gone.
+  `test_no_bare_reload.py` rejects any new `importlib.reload` call, and an
+  autouse check in `tests/orchestrator/conftest.py` fails a test module that
+  replaces a server module, its classes or functions, or leaves `mcp_tools`, `app`
+  or `outputs_broker` bound to another `docker_manager`. Production behavior is
+  unchanged.
+
 - **`release.py` operator mistakes are one line (#726).** A missing
   `--inventory`, one that is not JSON, a symbolic link loop as the
   `--inventory` or `--delivery` argument, or a release path whose

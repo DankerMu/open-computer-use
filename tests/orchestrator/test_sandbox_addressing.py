@@ -151,8 +151,8 @@ class ServiceAddressTests(unittest.TestCase):
         }})
         self.assertEqual(get_container_service_address("chat-1", TTYD_PORT), "127.0.0.1:45000")
 
-    # Neighbour suites importlib.reload(docker_manager); the fault class is read
-    # from the module at raise time, so assertions must not bind it at import.
+    # The fault class is read from docker_manager, the module that raises it; the
+    # orchestrator conftest keeps that module and its classes stable across suites.
     def _unassigned_gateway_attrs(self, published):
         return {
             "HostConfig": {"PortBindings": {

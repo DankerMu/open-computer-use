@@ -146,7 +146,7 @@ def _scrub_dev_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
-def test_claude_dispatch_byte_compat(fixture, monkeypatch):
+def test_claude_dispatch_byte_compat(fixture, monkeypatch, fresh_server_modules):
     """SUBAGENT_CLI=claude (default): cli_runtime.dispatch builds the same
     shell command as v0.9.2.0's mcp_tools.sub_agent inline claude_command,
     and parse_result returns the same SubAgentResult.
@@ -158,11 +158,7 @@ def test_claude_dispatch_byte_compat(fixture, monkeypatch):
     """
     _scrub_dev_env(monkeypatch)
 
-    # Drop modules so cli_runtime re-imports cleanly under the test env.
-    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
-        sys.modules.pop(mod, None)
-
-    # Import the freshly-loaded dispatch + Cli.
+    # fresh_server_modules: cli_runtime imports afresh under the test env.
     from cli_runtime import dispatch as cli_dispatch, Cli
     # Sanity: default SUBAGENT_CLI resolves to claude.
     from cli_runtime import resolve_cli
@@ -239,14 +235,11 @@ def test_claude_dispatch_byte_compat(fixture, monkeypatch):
     assert model_display == "sonnet"
 
 
-def test_claude_dispatch_resume_byte_compat(fixture, monkeypatch):
+def test_claude_dispatch_resume_byte_compat(fixture, monkeypatch, fresh_server_modules):
     """RESUME branch byte-compat: same as above but with resume_session_id set.
     Verifies the resume argv (no --model, no --append-system-prompt) is
     assembled identically to v0.9.2.0."""
     _scrub_dev_env(monkeypatch)
-
-    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
-        sys.modules.pop(mod, None)
 
     from cli_runtime import dispatch as cli_dispatch
     case = fixture["resume"]
@@ -298,14 +291,12 @@ def test_claude_dispatch_resume_byte_compat(fixture, monkeypatch):
     assert sub_result.session_id == "abc-123-session"
 
 
-def test_claude_dispatch_with_headers_env_byte_compat(fixture, monkeypatch):
+def test_claude_dispatch_with_headers_env_byte_compat(fixture, monkeypatch, fresh_server_modules):
     """Headers env (ANTHROPIC_CUSTOM_HEADERS path): when mcp_tools passes a
     non-empty headers_env (because user_email is set), dispatch concatenates
     it BEFORE the argv - exactly the v0.9.2.0 shape."""
     _scrub_dev_env(monkeypatch)
 
-    for mod in ("cli_runtime", "docker_manager", "outputs_broker"):
-        sys.modules.pop(mod, None)
     from cli_runtime import dispatch as cli_dispatch
 
     case = fixture["new_session"]

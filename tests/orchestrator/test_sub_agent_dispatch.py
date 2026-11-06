@@ -21,13 +21,12 @@ The cost rendering branch was inlined into mcp_tools.sub_agent by Phase 5
 plan 05-05 (verified at mcp_tools.py:1092-1095). This suite is the
 regression guard that prevents future drift.
 
-Mirrors the env-scrub + module-reload pattern from
+Mirrors the env-scrub + fresh-import pattern from
 tests/orchestrator/test_subagent_claude_compat.py so local-dev shells
 with model-override env vars exported do not break the assertions.
 """
 
 import asyncio
-import importlib
 import inspect
 import os
 import sys
@@ -92,20 +91,6 @@ def _make_ctx():
     return ctx
 
 
-def _reload_runtime():
-    """Reload cli_runtime + mcp_tools so module-level env reads settle.
-
-    Order matters: docker_manager validates SUBAGENT_CLI at import time,
-    cli_runtime imports from docker_manager, mcp_tools imports from
-    cli_runtime.
-    """
-    for mod_name in ("docker_manager", "cli_runtime", "mcp_tools"):
-        if mod_name in sys.modules:
-            importlib.reload(sys.modules[mod_name])
-        else:
-            importlib.import_module(mod_name)
-
-
 def _unwrap_tool(tool_obj):
     """Return the original async function behind FastMCP @mcp.tool() wrapping."""
     return getattr(tool_obj, "fn", None) or getattr(tool_obj, "__wrapped__", None) or tool_obj
@@ -149,7 +134,7 @@ def _install_common_stubs(monkeypatch, mcp_tools, fake_dispatch):
 # Test 1 — MCP signature regression guard.
 # ===========================================================================
 
-def test_signature_is_byte_identical(monkeypatch):
+def test_signature_is_byte_identical(monkeypatch, fresh_server_modules):
     """v0.9.2.0 contract: sub_agent(task, description, ctx, model='',
     max_turns=0, working_directory='/home/assistant', resume_session_id='').
 
@@ -157,7 +142,6 @@ def test_signature_is_byte_identical(monkeypatch):
     """
     _scrub_dev_env(monkeypatch)
     monkeypatch.setenv("SUBAGENT_CLI", "claude")
-    _reload_runtime()
     import mcp_tools
 
     fn = _unwrap_tool(mcp_tools.sub_agent)
@@ -187,7 +171,7 @@ def test_signature_is_byte_identical(monkeypatch):
     ("opencode", "opencode"),
 ])
 def test_dispatch_routes_to_correct_adapter(
-    monkeypatch, cli_value, expected_cli_str,
+    monkeypatch, cli_value, expected_cli_str, fresh_server_modules,
 ):
     """resolve_cli() inside the dispatch boundary must reflect SUBAGENT_CLI."""
     _scrub_dev_env(monkeypatch)
@@ -200,7 +184,6 @@ def test_dispatch_routes_to_correct_adapter(
         monkeypatch.setenv("OPENCODE_SUB_AGENT_DEFAULT_MODEL", "anthropic/claude-sonnet-4-6")
     elif cli_value == "codex":
         monkeypatch.setenv("CODEX_SUB_AGENT_DEFAULT_MODEL", "gpt-5-codex")
-    _reload_runtime()
     import cli_runtime
     import mcp_tools
 
@@ -250,7 +233,7 @@ def test_dispatch_routes_to_correct_adapter(
 # Test 2b — generated sub-agent prompt names only the workspace files path.
 # ===========================================================================
 
-def test_dispatch_system_prompt_names_only_workspace_files_path(monkeypatch):
+def test_dispatch_system_prompt_names_only_workspace_files_path(monkeypatch, fresh_server_modules):
     """mcp_tools.sub_agent builds the prompt that dispatch receives.
 
     Issue 113: that generated text names /mnt/user-data/files as the
@@ -260,7 +243,6 @@ def test_dispatch_system_prompt_names_only_workspace_files_path(monkeypatch):
     """
     _scrub_dev_env(monkeypatch)
     monkeypatch.setenv("SUBAGENT_CLI", "claude")
-    _reload_runtime()
     import mcp_tools
 
     captured = {}
@@ -293,7 +275,7 @@ def test_dispatch_system_prompt_names_only_workspace_files_path(monkeypatch):
 # ===========================================================================
 
 @pytest.mark.parametrize("cli_value", ["codex", "opencode"])
-def test_cost_rendering_unavailable_for_none(monkeypatch, cli_value):
+def test_cost_rendering_unavailable_for_none(monkeypatch, cli_value, fresh_server_modules):
     """Pitfall 4 + Phase 7 success criterion 5.
 
     cost_usd=None (codex always; opencode when usage is missing) must
@@ -307,7 +289,6 @@ def test_cost_rendering_unavailable_for_none(monkeypatch, cli_value):
         monkeypatch.setenv("OPENCODE_SUB_AGENT_DEFAULT_MODEL", "anthropic/claude-sonnet-4-6")
     elif cli_value == "codex":
         monkeypatch.setenv("CODEX_SUB_AGENT_DEFAULT_MODEL", "gpt-5-codex")
-    _reload_runtime()
     import mcp_tools
 
     async def fake_dispatch(**kwargs):
@@ -336,11 +317,10 @@ def test_cost_rendering_unavailable_for_none(monkeypatch, cli_value):
     assert "$0.0000" not in result
 
 
-def test_cost_rendering_dollar_for_float(monkeypatch):
+def test_cost_rendering_dollar_for_float(monkeypatch, fresh_server_modules):
     """Positive case: a float cost renders as $X.XXXX (4-decimal USD)."""
     _scrub_dev_env(monkeypatch)
     monkeypatch.setenv("SUBAGENT_CLI", "claude")
-    _reload_runtime()
     import mcp_tools
 
     async def fake_dispatch(**kwargs):
