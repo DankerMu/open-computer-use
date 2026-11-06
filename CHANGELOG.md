@@ -141,6 +141,13 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **`tests/test_tools.py` no longer depends on the ambient `MCP_API_KEY` (#731).**
+  `_image_env` now sets `MCP_API_KEY` to the key the tests give the Open WebUI
+  tool, as the other guarded tests do, so the image tests check the bearer
+  against a known key. With any other value in the environment, such as CI's
+  `ci-mcp-token`, 27 of them failed their preflight with HTTP 401. The tests
+  that remove the key to cover the unconfigured path are unchanged. Test-only.
+
 - **Orchestrator tests no longer split `LifecycleError` by order (#730).** Every
   orchestrator test that re-imported a server module with `importlib.reload`, or
   popped it without restoring it, now imports it afresh inside `isolated_modules`
