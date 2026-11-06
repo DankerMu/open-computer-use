@@ -141,6 +141,27 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **Provider keys containing `$` reached the containers with every `$`
+  doubled (#691).** `docker compose config` already writes a literal `$` as
+  `$$`, and `deploy/up.sh` escaped its output a second time before starting it,
+  so `DMXAPI_API_KEY`, `RAG_OPENAI_API_KEY`, `RAG_EXTERNAL_RERANKER_API_KEY` and
+  any other value with `$` arrived changed. `up.sh` now starts the `config`
+  output unchanged. Before any `compose up` the new sourced helper
+  `deploy/compose-snapshot.sh` compares, per stack, the `config --hash '*'` of
+  the source files with that of the snapshot loaded as `up` loads it; a
+  difference, a failed command or empty output stops the run with a
+  `deploy:` message naming the stack, and nothing starts. This needs a
+  Compose with `config --hash` that writes `$` as `$$` in `config` output
+  (verified on v2.40.3); an older one makes `up.sh` refuse. Configurations
+  without `$` keep the same per-service hash, so nothing is recreated. The
+  compose files must not use `env_file`. A provider-file value with `$` must be
+  single-quoted (`KEY='…'`); recovery restore and activate now strip that one
+  pair of quotes from provider-file values as the shell does, and still read
+  `runtime.env` verbatim. `bootstrap-test.sh` also refuses `;`, `&`,
+  `|`, `(`, `)`, `<`, `>` and any backslash in a `runtime.env` value, which
+  `set -a; .` would not keep intact. A key already stored in the WebUI database
+  with doubled `$` is not repaired: set it once in the admin UI. No image
+  rebuild is needed; the change is in the release's `source/deploy/`.
 - **Embedded Markdown nested past 16 quote levels through lazy lines is shown
   as plain text (#692).** marked nests one level deeper for each quote line
   that follows a lazy continuation line, so alternating `> > quote` and plain

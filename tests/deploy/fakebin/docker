@@ -219,12 +219,33 @@ def services_for(stack: str, profiles: set[str]) -> list[str]:
     return []
 
 
+def escape_dollars(value):
+    """Compose writes a literal `$` as `$$` in `config` output."""
+    if isinstance(value, str):
+        return value.replace("$", "$$")
+    if isinstance(value, list):
+        return [escape_dollars(item) for item in value]
+    if isinstance(value, dict):
+        return {key: escape_dollars(item) for key, item in value.items()}
+    return value
+
+
 def compose_config(state: Path, argv: list[str]) -> int:
     hold_named(state, "FAKE_DOCKER_HOLD_CONFIG", "entered-config")
     fail = state / "config-fail"
     if fail.exists():
         sys.stderr.write("compose config failed\n")
         return 1
+    payload, error = source_model(state, argv)
+    if payload is None:
+        sys.stderr.write(error)
+        return 1
+    sys.stdout.write(json.dumps(escape_dollars(payload)))
+    return 0
+
+
+def source_model(state: Path, argv: list[str]):
+    """The model Compose loads from the source files: (payload, None) or (None, error)."""
     files = compose_files(argv)
     config_dir = state / "config"
     mapping = {
@@ -241,21 +262,63 @@ def compose_config(state: Path, argv: list[str]) -> int:
                 chosen = config_dir / name
                 break
     if chosen is None or not chosen.exists():
-        sys.stderr.write("resolved compose document is missing\n")
-        return 1
+        return None, "resolved compose document is missing\n"
     try:
         payload = json.loads(chosen.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
-        sys.stderr.write("resolved compose document is missing\n")
-        return 1
+        return None, "resolved compose document is missing\n"
     if payload.get("__unresolved__") is True:
         body = {key: value for key, value in payload.items() if key != "__unresolved__"}
         try:
             payload = interpolate_value(body, os.environ)
         except UnsupportedInterpolation as exc:
-            sys.stderr.write(f"unsupported interpolation: {exc}\n")
-            return 1
-    sys.stdout.write(json.dumps(payload))
+            return None, f"unsupported interpolation: {exc}\n"
+    return payload, None
+
+
+def snapshot_model(path: Path):
+    """The model Compose loads from a snapshot: `$$` becomes `$`, as at `up`."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        return interpolate_value(document, os.environ), None
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None, "snapshot is unreadable\n"
+    except UnsupportedInterpolation as exc:
+        return None, f"unsupported interpolation: {exc}\n"
+
+
+def compose_config_hash(state: Path, argv: list[str]) -> int:
+    """`config --hash '*'`: one `service hash` line per loaded service.
+
+    Hashes agree exactly when the loaded service models agree. Injections, per
+    stack and side (`source` or `snapshot`): `hash-fail-<stack>-<side>` exits 1,
+    `hash-empty-<stack>-<side>` prints nothing, `hash-mismatch-<stack>` changes
+    every snapshot hash.
+    """
+    hold_named(state, "FAKE_DOCKER_HOLD_HASH", "entered-hash")
+    if argv[argv.index("--hash") + 1 :][:1] != ["*"]:
+        sys.stderr.write("fake config --hash supports only '*'\n")
+        return 1
+    files = compose_files(argv)
+    stack = stack_from_files(files)
+    snapshot = any(is_snapshot_file(path) for path in files)
+    side = "snapshot" if snapshot else "source"
+    if (state / f"hash-fail-{stack}-{side}").exists():
+        sys.stderr.write(f"compose config --hash failed for {stack}\n")
+        return 1
+    if snapshot:
+        payload, error = snapshot_model(Path(files[0]))
+    else:
+        payload, error = source_model(state, argv)
+    if payload is None:
+        sys.stderr.write(error)
+        return 1
+    if (state / f"hash-empty-{stack}-{side}").exists():
+        return 0
+    salt = "mismatch" if snapshot and (state / f"hash-mismatch-{stack}").exists() else ""
+    for name, service in (payload.get("services") or {}).items():
+        digest = hashlib.sha256((salt + json.dumps(service, sort_keys=True)).encode("utf-8"))
+        sys.stdout.write(f"{name} {digest.hexdigest()}\n")
     return 0
 
 
@@ -2074,6 +2137,8 @@ def main(argv: list[str]) -> int:
         return docker_run(state, argv[1:])
     if argv and argv[0] == "compose":
         rest = argv[1:]
+        if "config" in rest and "--hash" in rest:
+            return compose_config_hash(state, rest)
         if "config" in rest:
             return compose_config(state, rest)
         if "up" in rest:

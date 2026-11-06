@@ -86,6 +86,21 @@ def proxy_snapshot_ops(state_dir: Path, verb: str) -> list[list[str]]:
     ]
 
 
+SOURCE_STACK_FILES = {
+    "compose.core.override.yml": "core",
+    "compose.webui.override.yml": "webui",
+    "compose.proxy.yml": "proxy",
+}
+
+
+def stack_of(argv: list[str]) -> str | None:
+    """The stack a source-file compose command names, or None."""
+    for token in argv:
+        if Path(token).name in SOURCE_STACK_FILES:
+            return SOURCE_STACK_FILES[Path(token).name]
+    return None
+
+
 def executed_rows(state_dir: Path) -> list[dict]:
     path = state_dir / "executed.json"
     if not path.exists():
@@ -954,6 +969,82 @@ class DeployEntryTests(unittest.TestCase):
         self.assertNotEqual(consumer["environment"]["OCU_INTERNAL_TOKEN"], "synthetic" + env["TOKEN"])
         self.assertNotIn(env["TOKEN"], consumer["environment"]["OCU_INTERNAL_TOKEN"])
         self.assertTrue(rows["webui"]["snapshot"])
+
+    def assert_nothing_started(self):
+        self.assertEqual(starts(self.state), [])
+        self.assertEqual(executed_rows(self.state), [])
+        self.assertEqual(compose_up_ops(self.state), [])
+        self.assertEqual(leftover_tmp(self.state), [])
+        self.assert_no_destructive()
+
+    def test_snapshot_loading_differently_from_its_source_starts_nothing(self):
+        (self.state / "hash-mismatch-webui").write_text("1", encoding="utf-8")
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "deploy: the webui snapshot does not load as its source configuration; refusing to start",
+            result.stderr.splitlines(),
+        )
+        self.assert_nothing_started()
+
+    def test_failed_or_empty_hash_starts_nothing(self):
+        cases = (
+            ("fail", "source", "deploy: compose config --hash failed for the proxy source"),
+            ("fail", "snapshot", "deploy: compose config --hash failed for the proxy snapshot"),
+            ("empty", "source", "deploy: compose config --hash printed nothing for proxy"),
+            ("empty", "snapshot", "deploy: compose config --hash printed nothing for proxy"),
+        )
+        for kind, side, message in cases:
+            with self.subTest(kind=kind, side=side):
+                injected = self.state / f"hash-{kind}-proxy-{side}"
+                injected.write_text("1", encoding="utf-8")
+                try:
+                    result = self.up()
+                finally:
+                    injected.unlink()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr.splitlines())
+                self.assert_nothing_started()
+
+    def test_snapshot_hash_loads_the_snapshot_as_compose_up_does(self):
+        result = self.up()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        compose = compose_ops(self.state)
+        for stack in ("core", "webui", "proxy"):
+            with self.subTest(stack=stack):
+                name = f"{stack}.up.json"
+                [hashed] = [argv for argv in compose if argv[-3:] == ["config", "--hash", "*"]
+                            and any(Path(token).name == name for token in argv)]
+                [started] = [argv for argv in compose if "up" in argv
+                             and any(Path(token).name == name for token in argv)]
+                self.assertEqual(hashed[: hashed.index("config")], started[: started.index("up")])
+                [resolved] = [argv for argv in compose if argv[-3:] == ["config", "--format", "json"]
+                              and stack_of(argv) == stack]
+                [source] = [argv for argv in compose if argv[-3:] == ["config", "--hash", "*"]
+                            and stack_of(argv) == stack and not any(t.endswith(".up.json") for t in argv)]
+                self.assertEqual(source[: source.index("config")], resolved[: resolved.index("config")])
+
+    def test_dollar_free_snapshot_is_the_resolved_document_unchanged(self):
+        docs = intended_docs()
+        self.assertNotIn("$", json.dumps(docs))
+        result = self.up()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {row["stack"]: row for row in executed_rows(self.state)}
+        for stack in ("core", "webui", "proxy"):
+            with self.subTest(stack=stack):
+                self.assertTrue(rows[stack]["snapshot"])
+                self.assertEqual(rows[stack]["document"], docs[f"{stack}.json"])
+                self.assertEqual(rows[stack]["consumer_document"], docs[f"{stack}.json"])
+
+    def test_term_during_hash_removes_temporary_configs_and_children(self):
+        self._signal_during_hold(
+            signal.SIGTERM,
+            hold_env="FAKE_DOCKER_HOLD_HASH",
+            entered_name="entered-hash",
+            require_resolved=True,
+        )
+        self.assertEqual(starts(self.state), [])
+        self.assertEqual(executed_rows(self.state), [])
 
     def _signal_during_hold(self, sig, *, hold_env, entered_name, require_resolved=False, require_snapshots=False):
         write_network(

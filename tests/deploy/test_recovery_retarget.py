@@ -151,6 +151,14 @@ class RetargetTests(unittest.TestCase):
         self.assert_no_secret(stderr)
         self.assert_unchanged(names)
 
+    def test_single_quoted_runtime_value_is_kept_verbatim(self):
+        # runtime.env is not a provider file: a quoted value survives the rewrite as written (#691).
+        self.lines.append(("CUSTOM_VALUE", "'p$ss&b=2'"))
+        self.write_runtime(self.lines)
+        code, _stdout, stderr = self.run_main()
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("CUSTOM_VALUE='p$ss&b=2'\n", self.runtime.read_text(encoding="utf-8"))
+
     def test_rewrites_exactly_the_identity_keys_and_keeps_a_backup(self):
         code, stdout, stderr = self.run_main()
         self.assertEqual(code, 0, stderr)
@@ -446,6 +454,35 @@ class PersistSelectedIdentityTests(unittest.TestCase):
         self.assertEqual(list(published)[2:], list(recovery.IDENTITY_KEYS[1:]))
         self.assertEqual(stat.S_IMODE(runtime.lstat().st_mode), 0o600)
         self.assertEqual([p.name for p in config.iterdir()], ["runtime.env"])
+
+    def test_single_quoted_runtime_value_round_trips_through_activation_and_restore(self):
+        # Activation and restore read runtime.env verbatim and write it back unchanged (#691).
+        context = tmp_dir()
+        self.addCleanup(context.cleanup)
+        root = Path(context.name)
+        inventory = release.load_inventory(
+            write_release_for_sha(root / "inventory" / "release.json", OLD_SHA, OLD_WEBUI_SHA)
+        )
+        line = "CUSTOM_VALUE='http://h/r?a=1&b=2$x'\n"
+        config = root / "config"
+        config.mkdir(mode=0o700)
+        config.chmod(0o700)
+        runtime = config / "runtime.env"
+        runtime.write_text("COMPOSE_PROJECT_NAME=ocu-test\n" + line, encoding="utf-8")
+        runtime.chmod(0o600)
+        recovery_resources.persist_selected_runtime_identity(
+            destination_root=root, inventory=inventory, current=recovery.parse_dotenv(runtime),
+        )
+        self.assertIn(line, runtime.read_text(encoding="utf-8"))
+
+        captured = root / "captured.env"
+        captured.write_text("COMPOSE_PROJECT_NAME=ocu-test\n" + line, encoding="utf-8")
+        target = root / "target"
+        recovery_resources.materialize_runtime(
+            recovery.parse_dotenv(captured), destination_root=target,
+            provider_file=root / "provider.env", inventory=inventory,
+        )
+        self.assertIn(line, (target / "config" / "runtime.env").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

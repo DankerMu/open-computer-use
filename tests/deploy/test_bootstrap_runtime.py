@@ -759,6 +759,25 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
                     self.assert_unpublished()
                     self.assertNotIn(PROVIDER_SENTINEL, self.combined(result))
 
+    def test_shell_metacharacters_and_backslash_refuse_before_publish(self):
+        # runtime.env is loaded with `set -a; .`, which would not keep these intact (#691).
+        for char in (";", "&", "|", "(", ")", "<", ">", "\\"):
+            with self.subTest(char=char):
+                result = self.run_bootstrap({"PRIMARY_CHAT_MODEL": f"model{char}a"})
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("PRIMARY_CHAT_MODEL cannot be safely represented", result.stderr)
+                self.assert_unpublished()
+
+    def test_ordinary_punctuation_is_published_as_given(self):
+        given = {"PRIMARY_CHAT_MODEL": "org/chat-a_1.5:latest+b,c@d%e~f",
+                 "RAG_EXTERNAL_RERANKER_URL": "http://lan-reranker:8002/v1/rerank?x"}
+        result = self.run_bootstrap(given)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        for name, value in given.items():
+            self.assertEqual(runtime.get(name), value, name)
+        self.assert_no_temp_residue()
+
     def test_model_endpoint_keys_reach_neither_runtime_nor_output(self):
         keys = {
             "RAG_OPENAI_API_KEY": EMBEDDING_KEY_SENTINEL,

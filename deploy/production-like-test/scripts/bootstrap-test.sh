@@ -74,10 +74,11 @@ require_nonempty() {
     fi
 }
 
-# Values written into runtime.env must be a single dotenv assignment that both
-# `sed -n 's/^NAME=//p'` and Compose interpolation can consume without quoting.
-# Reject newlines, NULs, and characters that would inject extra assignments,
-# shell metacharacters, or executable content across those consumers.
+# Values written into runtime.env must be a single dotenv assignment that
+# `sed -n 's/^NAME=//p'`, Compose interpolation and `set -a; . runtime.env` all
+# consume unchanged without quoting. Reject line breaks, control characters,
+# `$`, backquotes, quotes, backslashes, `=`, spaces, tabs, `;`, `&`, `|`, `(`,
+# `)`, `<`, `>`, and a value that starts with `#` and contains another.
 safe_dotenv_value() {
     local name=$1
     local value=$2
@@ -87,7 +88,7 @@ safe_dotenv_value() {
             ;;
     esac
     case "$value" in
-        *'$'*|*'`'*|*'\\'*|*'"'*|*"'"*|'#'*'#'*|*'='*|*' '*|*$'\t'*)
+        *'$'*|*'`'*|*\\*|*'"'*|*"'"*|'#'*'#'*|*'='*|*' '*|*$'\t'*|*[';&|()<>']*)
             fail "${name} cannot be safely represented for dotenv consumers"
             ;;
     esac
