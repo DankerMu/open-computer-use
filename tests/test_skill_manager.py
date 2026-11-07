@@ -4,8 +4,9 @@
 
 Seams: `ensure_skill_cached`, `get_user_skills` / `get_user_skills_sync` and
 `get_skill_mounts`. Only the registry HTTP calls (`_download_skill_zip`,
-`_fetch_user_config`, `_load_user_config_cache`) are replaced. Every cache,
-manifest and host path points into the test's temp root.
+`_fetch_user_config`, `_load_user_config_cache`) are replaced; one test also
+wraps `zipfile.ZipFile.open` in a pass-through recorder. Every cache, manifest
+and host path points into the test's temp root.
 """
 from __future__ import annotations
 
@@ -148,6 +149,9 @@ REJECTED = {
     "e-symlink-entry": symlink_zip,
     "f-2001-entries": many_entries_zip,
     "g-declared-size-over-200mb": bomb_zip,
+    "i-stripped-prefix-absolute": lambda root: zip_of(
+        [("x/SKILL.md", b"# new\n"), (f"x//{root}/DS_ESCAPE", b"escaped")]
+    ),
 }
 
 
@@ -169,12 +173,56 @@ def test_declared_size_case_inflates_past_200mb():
     assert sum(i.file_size for i in info) > 200 * MB
 
 
+def test_declared_size_rejects_before_any_entry_is_read(sm, monkeypatch):
+    data = bomb_zip(None)
+    opened = []
+    original_open = zipfile.ZipFile.open
+
+    def recording_open(self, name, *args, **kwargs):
+        opened.append(getattr(name, "filename", name))
+        return original_open(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", recording_open)
+    serve_zip(sm, monkeypatch, data)
+
+    assert cache(sm) is None
+    assert opened == []
+
+
+# ---------------------------------------------------------------------------
+# Archive limits are inclusive: at most 2000 entries, at most 200 MB declared
+# ---------------------------------------------------------------------------
+
+def infos(count, sizes=()):
+    entries = [zipfile.ZipInfo(f"f{i}.txt") for i in range(count)]
+    for info, size in zip(entries, sizes):
+        info.file_size = size
+    return entries
+
+
+@pytest.mark.parametrize("entries", [
+    pytest.param(lambda: infos(2000), id="2000-entries"),
+    pytest.param(lambda: infos(2, [100 * MB, 100 * MB]), id="200mb-declared"),
+])
+def test_archive_at_limit_is_accepted(sm, entries):
+    assert sm._check_zip_entries(entries()) is None
+
+
+@pytest.mark.parametrize("entries", [
+    pytest.param(lambda: infos(2001), id="2001-entries"),
+    pytest.param(lambda: infos(2, [100 * MB, 100 * MB + 1]), id="200mb-plus-1-declared"),
+])
+def test_archive_over_limit_is_rejected(sm, entries):
+    with pytest.raises(ValueError):
+        sm._check_zip_entries(entries())
+
+
 # ---------------------------------------------------------------------------
 # Registry name cases
 # ---------------------------------------------------------------------------
 
 def bad_names(root):
-    return ["../outside-rel", "a/b", f"{root}/abs", "..", "ok\n"]
+    return ["../outside-rel", "a/b", f"{root}/abs", "..", "ok\n", "a..b"]
 
 
 def plant_bad_caches(sm, root):
