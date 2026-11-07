@@ -12,7 +12,10 @@ import io
 import json
 import logging
 import os
+import posixpath
+import re
 import shutil
+import stat
 import tempfile
 import time
 import zipfile
@@ -42,6 +45,10 @@ MEMORY_CACHE_TTL = 60       # seconds — in-memory cache for user skill lists
 API_TIMEOUT = 5             # seconds — HTTP timeout for API calls
 ZIP_DOWNLOAD_TIMEOUT = 30   # seconds — HTTP timeout for ZIP download
 MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50 MB — max ZIP download size
+# Extraction limits; match the WebUI skill upload validator (ocu-uploaded-skills).
+MAX_ZIP_ENTRIES = 2000
+MAX_UNZIPPED_SIZE = 200 * 1024 * 1024  # 200 MB — stops decompression bombs
+SKILL_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]*")
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -371,6 +378,22 @@ async def _download_skill_zip(name: str) -> Optional[bytes]:
 # ZIP cache management
 # ---------------------------------------------------------------------------
 
+def _check_zip_entries(infos: list[zipfile.ZipInfo]) -> None:
+    """Raise ValueError unless every raw entry is safe to extract (before any write)."""
+    if len(infos) > MAX_ZIP_ENTRIES:
+        raise ValueError(f"{len(infos)} entries, limit {MAX_ZIP_ENTRIES}")
+    if sum(info.file_size for info in infos) > MAX_UNZIPPED_SIZE:
+        raise ValueError(f"declared size over {MAX_UNZIPPED_SIZE} bytes")
+    for info in infos:
+        name = info.filename
+        if posixpath.isabs(name) or ".." in name.split("/") or "\\" in name:
+            raise ValueError(f"unsafe entry path {name!r}")
+        # No type bits (writestr, Windows tools) counts as a regular file.
+        file_type = stat.S_IFMT(info.external_attr >> 16)
+        if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+            raise ValueError(f"entry {name!r} is not a regular file or directory")
+
+
 async def ensure_skill_cached(skill: SkillInfo) -> Optional[str]:
     """
     Ensure a user-uploaded skill is cached on disk.
@@ -413,6 +436,10 @@ async def ensure_skill_cached(skill: SkillInfo) -> Optional[str]:
         tmp_dir = tempfile.mkdtemp(dir=SKILLS_CACHE_DIR, prefix=f".{skill.name}-")
 
         with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            _check_zip_entries(zf.infolist())
+            root = os.path.realpath(tmp_dir)
+            unzipped = 0
+
             # Detect if ZIP has a top-level directory wrapper
             names = zf.namelist()
             prefix = ""
@@ -429,10 +456,16 @@ async def ensure_skill_cached(skill: SkillInfo) -> Optional[str]:
                 if not rel_path:
                     continue
 
-                target = os.path.join(tmp_dir, rel_path)
+                target = os.path.join(root, rel_path)
+                if not os.path.realpath(target).startswith(root + os.sep):
+                    raise ValueError(f"entry {member.filename!r} escapes the cache")
                 os.makedirs(os.path.dirname(target), exist_ok=True)
-                with open(target, "wb") as f:
-                    f.write(zf.read(member.filename))
+                with zf.open(member) as src, open(target, "wb") as f:
+                    while chunk := src.read(1024 * 1024):
+                        unzipped += len(chunk)
+                        if unzipped > MAX_UNZIPPED_SIZE:
+                            raise ValueError(f"unzipped size over {MAX_UNZIPPED_SIZE} bytes")
+                        f.write(chunk)
 
         # Make files world-readable (container user is non-root)
         os.chmod(tmp_dir, 0o755)
@@ -497,14 +530,19 @@ def _parse_api_skills(enabled_skills: list[dict]) -> list[SkillInfo]:
     result = []
     seen_names = set()
     for s in enabled_skills:
+        name = s.get("name")
+        # The name becomes a cache path and a host bind-mount source.
+        if not (isinstance(name, str) and SKILL_NAME_RE.fullmatch(name) and ".." not in name):
+            logger.warning(f"[SKILLS] Dropping skill with invalid name {name!r}")
+            continue
         result.append(SkillInfo(
-            name=s["name"],
+            name=name,
             description=s.get("description", ""),
             category=s.get("category", "user"),
             skill_path=s.get("skill_path"),
             zip_sha256=s.get("zip_sha256"),
         ))
-        seen_names.add(s["name"])
+        seen_names.add(name)
 
     # Ensure default public skills are always included
     for name in DEFAULT_PUBLIC_SKILLS:
