@@ -32,15 +32,21 @@ aliases after service authorization.
 | GitLab Host       | X-Gitlab-Host          | X-OpenWebUI-Gitlab-Host        | No       | gitlab.com                      |
 | Anthropic API Key | X-Anthropic-Api-Key    | X-OpenWebUI-Anthropic-Api-Key  | No       | ANTHROPIC_AUTH_TOKEN env        |
 | Anthropic Base URL| X-Anthropic-Base-Url   | X-OpenWebUI-Anthropic-Base-Url | No       | ANTHROPIC_BASE_URL env          |
-| MCP Tokens URL    | X-Mcp-Tokens-Url       | X-OpenWebUI-Mcp-Tokens-Url     | No       | MCP_TOKENS_URL env              |
-| MCP Tokens API Key| X-Mcp-Tokens-Api-Key   | X-OpenWebUI-Mcp-Tokens-Api-Key | No       | MCP_TOKENS_API_KEY env          |
+| MCP Tokens URL    | X-Mcp-Tokens-Url       | X-OpenWebUI-Mcp-Tokens-Url     | No       | GITLAB_TOKENS_URL env (paired)  |
+| MCP Tokens API Key| X-Mcp-Tokens-Api-Key   | X-OpenWebUI-Mcp-Tokens-Api-Key | No       | GITLAB_TOKENS_API_KEY env (paired) |
 | MCP Servers       | X-Mcp-Servers          | X-OpenWebUI-Mcp-Servers        | No       | —                               |
 | Gateway token     | X-OCU-Gateway-Token    | —                              | No       | — (sub_agent gateway mode only) |
 | Chat model        | X-Chat-Model           | —                              | No       | — (sub_agent gateway mode only) |
 
+The two MCP Tokens headers only select the GitLab-token fetch, and only as a pair: when
+X-Mcp-Tokens-Url is set, the fetch uses it with X-Mcp-Tokens-Api-Key and sends nothing if
+that header key is empty; an env key is never sent to a header URL. Without the URL header
+the fetch uses GITLAB_TOKENS_URL with GITLAB_TOKENS_API_KEY, and sends nothing if either is empty.
+
 Environment Variables (computer-use-orchestrator defaults):
-- MCP_TOKENS_URL: MCP Tokens Wrapper service (optional, for centralized token management)
-- MCP_TOKENS_API_KEY: Internal API key for MCP Tokens Wrapper
+- GITLAB_TOKENS_URL: external MCP Tokens Wrapper for the GitLab-token fetch (optional; empty = no fetch)
+- GITLAB_TOKENS_API_KEY: internal API key for that wrapper (empty = no fetch)
+- MCP_TOKENS_URL / MCP_TOKENS_API_KEY: skill registry and /api/skill-stats only, never the GitLab fetch
 - ANTHROPIC_AUTH_TOKEN: Shared LiteLLM proxy key for Claude Code sub-agent
 - ANTHROPIC_BASE_URL: LLM API base URL (default: https://api.anthropic.com)
 - CLAUDE_SUB_AGENT_DEFAULT_MODEL: Default model for sub_agent when SUBAGENT_CLI=claude (default: sonnet)
@@ -173,7 +179,6 @@ from docker_manager import (
     LifecycleError,
     DOCKER_SOCKET, DOCKER_IMAGE, CONTAINER_MEM_LIMIT, CONTAINER_CPU_LIMIT,
     COMMAND_TIMEOUT, ENABLE_NETWORK, PUBLIC_BASE_URL,
-    MCP_TOKENS_URL, MCP_TOKENS_API_KEY,
     SUB_AGENT_MAX_TURNS, SUB_AGENT_TIMEOUT,
     ANTHROPIC_DEFAULT_SONNET_MODEL,
     ANTHROPIC_DEFAULT_OPUS_MODEL,

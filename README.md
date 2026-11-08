@@ -258,14 +258,16 @@ All settings via `.env`:
 | `POSTGRES_PASSWORD` | `openwebui` | PostgreSQL password |
 | `VISION_API_KEY` | — | Vision API key (for describe-image). Unset or empty: `describe-image` is not listed in the system prompt, `/skill-list` or the `sub_agent` prompt |
 | `ANTHROPIC_AUTH_TOKEN` | — | Anthropic key (for Claude Code sub-agent) |
-| `MCP_TOKENS_URL` | — | Settings Wrapper URL (optional, see below) |
-| `MCP_TOKENS_API_KEY` | — | Settings Wrapper auth key |
+| `MCP_TOKENS_URL` | — | Skill registry (Settings Wrapper) URL for per-user and custom skills (optional, see below) |
+| `MCP_TOKENS_API_KEY` | — | Skill registry auth key; also checked by `/api/skill-stats` |
+| `GITLAB_TOKENS_URL` | — | MCP Tokens Wrapper URL for per-user GitLab tokens (optional, see below); empty sends no request |
+| `GITLAB_TOKENS_API_KEY` | — | MCP Tokens Wrapper auth key; empty sends no request |
 
 ### Custom Skills & Token Management (optional)
 
 By default, all 13 built-in skills are available to everyone. For per-user skill access and custom skills, deploy the **Settings Wrapper** — see [settings-wrapper/README.md](settings-wrapper/README.md).
 
-**Personal Access Tokens (PATs):** The settings wrapper can also store encrypted per-user PATs for external services (GitLab, Confluence, Jira, etc.). The server fetches them by user email and injects into the sandbox — so each user's AI has access to their repos/docs without sharing credentials. The server-side code for token injection is implemented (`docker_manager.py`), but the Open WebUI tool doesn't pass the required headers yet. This is on the roadmap — if you need PAT management, [open an issue](https://github.com/Wide-Moat/open-computer-use/issues).
+**Personal Access Tokens (PATs):** An external MCP Tokens Wrapper can store encrypted per-user PATs for external services (GitLab, Confluence, Jira, etc.); the settings wrapper in this repository has no tokens route and does not serve them. The server fetches GitLab tokens by user email from `GET {GITLAB_TOKENS_URL}/api/internal/tokens/{email}/gitlab` and injects them into the sandbox only when `GITLAB_TOKENS_URL` and `GITLAB_TOKENS_API_KEY` are both set (the skill registry's `MCP_TOKENS_*` pair is never used for this) — so each user's AI has access to their repos/docs without sharing credentials. The server-side code for token injection is implemented (`docker_manager.py`), but the Open WebUI tool doesn't pass the required headers yet. This is on the roadmap — if you need PAT management, [open an issue](https://github.com/Wide-Moat/open-computer-use/issues).
 
 ## MCP Client Integrations
 

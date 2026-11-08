@@ -603,8 +603,10 @@ All via environment variables:
 | `TTS_VOICE` | _(empty)_ | Default `voice` when the call gives none; empty sends no `voice`. |
 | `TTS_API_KEY` | _(empty)_ | Sent as `Authorization: Bearer`; empty sends no header. Read by this server only: never passed to sandboxes, returned, logged or recorded, and removed from upstream error text. |
 | `TTS_TIMEOUT_SECONDS` | `120` | Speech request timeout. Must be a positive integer; an explicitly empty or other value refuses startup. Keep it below the Open WebUI tool's 660-second client timeout. |
-| `MCP_TOKENS_URL` | _(empty)_ | Settings wrapper URL (optional) |
-| `MCP_TOKENS_API_KEY` | _(empty)_ | Settings wrapper auth key |
+| `MCP_TOKENS_URL` | _(empty)_ | Skill registry URL (optional): per-user skill config and skill downloads (`skill_manager.py`). Not used for GitLab tokens. |
+| `MCP_TOKENS_API_KEY` | _(empty)_ | Skill registry auth key; also the key `/api/skill-stats` checks in `X-Internal-Api-Key`. Never sent to the GitLab-token service. |
+| `GITLAB_TOKENS_URL` | _(empty)_ | External MCP Tokens Wrapper for per-user GitLab tokens (`GET {url}/api/internal/tokens/{email}/gitlab`). Empty: no GitLab-token request is sent. |
+| `GITLAB_TOKENS_API_KEY` | _(empty)_ | `X-Internal-Api-Key` for `GITLAB_TOKENS_URL`. Empty: no GitLab-token request is sent. The `X-Mcp-Tokens-Url` header overrides this pair only together with `X-Mcp-Tokens-Api-Key`; an env key is never sent to a header URL. |
 
 ### Sandbox network host support
 

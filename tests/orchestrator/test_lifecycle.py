@@ -529,8 +529,8 @@ def test_tool_path_recreation_ignores_request_credentials(world, monkeypatch):
     docker_manager, client, _clock, _tmp = world
     _meta(docker_manager, CHAT, user_email="saved@example", user_name="Saved")
     monkeypatch.setattr(docker_manager, "ANTHROPIC_AUTH_TOKEN", "server-fallback-token")
-    monkeypatch.setattr(docker_manager, "MCP_TOKENS_URL", "http://tokens.example")
-    monkeypatch.setattr(docker_manager, "MCP_TOKENS_API_KEY", "wrapper-key")
+    monkeypatch.setattr(docker_manager, "GITLAB_TOKENS_URL", "http://tokens.example")
+    monkeypatch.setattr(docker_manager, "GITLAB_TOKENS_API_KEY", "wrapper-key")
     looked_up = []
 
     async def fetch(email, url, key):
@@ -2378,8 +2378,8 @@ def test_server_recreate_uses_metadata_skills_and_trusted_token_lookup(world, mo
         return []
 
     monkeypatch.setattr(docker_manager.skill_manager, "get_user_skills_sync", skills)
-    monkeypatch.setattr(docker_manager, "MCP_TOKENS_URL", "http://tokens.example")
-    monkeypatch.setattr(docker_manager, "MCP_TOKENS_API_KEY", "wrapper-key")
+    monkeypatch.setattr(docker_manager, "GITLAB_TOKENS_URL", "http://tokens.example")
+    monkeypatch.setattr(docker_manager, "GITLAB_TOKENS_API_KEY", "wrapper-key")
 
     async def fetch(email, url, key):
         assert email == "saved@example"

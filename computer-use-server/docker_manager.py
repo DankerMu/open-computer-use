@@ -433,9 +433,11 @@ TTYD_PORT = int(os.getenv("TTYD_PORT", "7681"))  # web terminal
 SANDBOX_PUBLISHED_PORTS = (CDP_PORT, TTYD_PORT)
 BASE_DATA_DIR = Path(os.getenv("BASE_DATA_DIR", "/data"))
 
-# MCP Tokens Wrapper for GitLab token fetching
-MCP_TOKENS_URL = os.getenv("MCP_TOKENS_URL", "")
-MCP_TOKENS_API_KEY = os.getenv("MCP_TOKENS_API_KEY", "")
+# External MCP Tokens Wrapper for GitLab token fetching. Its own pair, never the skill
+# registry's: the registry has no tokens route and its key is the service token (#776).
+# Empty URL or key: no GitLab-token request is sent.
+GITLAB_TOKENS_URL = os.getenv("GITLAB_TOKENS_URL", "")
+GITLAB_TOKENS_API_KEY = os.getenv("GITLAB_TOKENS_API_KEY", "")
 
 # Sub-agent configuration — per-CLI default models (D-03/D-04).
 # The legacy single SUB_AGENT_DEFAULT_MODEL global was removed in Phase 2;
@@ -627,7 +629,7 @@ async def _fetch_gitlab_token(email: str, mcp_tokens_url: str, mcp_tokens_api_ke
         GitLab token string or None if not found/error
     """
     if not mcp_tokens_api_key:
-        print("[GITLAB] MCP_TOKENS_API_KEY not configured, skipping token fetch")
+        print("[GITLAB] GITLAB_TOKENS_API_KEY not configured, skipping token fetch")
         return None
 
     if not email:
@@ -668,24 +670,27 @@ async def _ensure_gitlab_token():
     if current_gitlab_token.get():
         return
 
-    # Try to fetch from MCP Tokens Wrapper
+    # Try to fetch from MCP Tokens Wrapper. URL and key are chosen as a pair: a header URL
+    # goes only with the header key, so an env key never reaches a header-chosen URL.
     user_email = current_user_email.get()
-    mcp_tokens_url = current_mcp_tokens_url.get() or MCP_TOKENS_URL
-    mcp_tokens_api_key = current_mcp_tokens_api_key.get() or MCP_TOKENS_API_KEY
+    if current_mcp_tokens_url.get():
+        tokens_url, tokens_api_key = current_mcp_tokens_url.get(), current_mcp_tokens_api_key.get()
+    else:
+        tokens_url, tokens_api_key = GITLAB_TOKENS_URL, GITLAB_TOKENS_API_KEY
 
-    if user_email and mcp_tokens_url and mcp_tokens_api_key:
-        token = await _fetch_gitlab_token(user_email, mcp_tokens_url, mcp_tokens_api_key)
+    if user_email and tokens_url and tokens_api_key:
+        token = await _fetch_gitlab_token(user_email, tokens_url, tokens_api_key)
         if token:
             current_gitlab_token.set(token)
 
 def _server_gitlab_token(email: str):
     """Trusted server-side GitLab token lookup by metadata email. Never uses request credentials."""
-    if not email or not MCP_TOKENS_URL or not MCP_TOKENS_API_KEY:
+    if not email or not GITLAB_TOKENS_URL or not GITLAB_TOKENS_API_KEY:
         return None
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(_fetch_gitlab_token(email, MCP_TOKENS_URL, MCP_TOKENS_API_KEY))
+        return asyncio.run(_fetch_gitlab_token(email, GITLAB_TOKENS_URL, GITLAB_TOKENS_API_KEY))
     return None
 
 
