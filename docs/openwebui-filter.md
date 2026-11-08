@@ -30,6 +30,10 @@ The filter reads `OCU_INTERNAL_TOKEN` from the Open WebUI process environment on
 
 The server response must include `X-Public-Base-URL`; the filter does not substitute the internal `ORCHESTRATOR_URL` when the header is absent. Redirects are rejected. Cache entries are scoped to chat, user and feature set (`X-OCU-Features`, empty for none) and are cleared when the internal origin or token changes. A transient transport failure may use a stale entry from the same authority; missing credentials, 401/403 responses, redirects, and missing public metadata never do.
 
+`inlet()` and `outlet()` are coroutines, which Open WebUI awaits. Only the HTTP exchange with `/system-prompt` runs off Open WebUI's event loop, in a worker thread (`asyncio.to_thread`); the loop keeps serving other users and any request OCU makes back into Open WebUI while it renders the prompt, such as the uploaded-skill registry lookup. The cache is read and written only on the event loop. Every clear of the cache (an authority change, a missing or invalid token or `ORCHESTRATOR_URL`, a 401/403 or redirect, a missing `X-Public-Base-URL`) advances a generation counter. A fetch that completes after a clear is returned to its own request but not cached, does not clear the cache again, and does not fall back to an entry read before that clear. A cancelled request leaves the cache unchanged. Concurrent misses for the same key are not merged: each fetches.
+
+Each cache miss holds one thread of Python's default executor, which has `min(32, CPU count + 4)` threads, for up to the 10 s request timeout. A burst of slow misses can queue behind each other, but it no longer stalls the event loop.
+
 ## Video switch
 
 `openwebui/functions/video_production_filter.py` is a toggle filter (`toggle = True`) installed as `video_production_filter`, named 视频制作, active and global. Open WebUI shows it as a switch in every model's integrations menu, off by default and reset when the user changes chats, and its own inlet changes nothing.

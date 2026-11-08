@@ -153,6 +153,19 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **The Computer Use filter no longer blocks Open WebUI's event loop (#777).**
+  `inlet()` and `outlet()` of `computer_link_filter.py` (5.3.0) are coroutines,
+  and the `/system-prompt` fetch runs in a worker thread. A prompt-cache miss
+  no longer stalls every Open WebUI user for up to the 10 s timeout, and a
+  request OCU makes back into Open WebUI during the fetch, such as the
+  uploaded-skill registry lookup, is served instead of timing out. The cache
+  stays on the event loop: a fetch that completes after the cache was cleared,
+  by an authority change or a rejection, is returned but not cached, does not
+  clear the cache, and does not fall back to an older entry. Each miss holds
+  one default-executor thread for up to 10 s; a burst of slow misses can queue
+  but does not stall the loop. No new dependency; the other filters are
+  unchanged.
+
 - **Skill ZIPs accept only stored and deflate entries (#762).** The skill cache
   rejects a registry ZIP when any entry uses another compression method, such as
   bzip2 or lzma, before any entry is read: `ensure_skill_cached` returns `None`,

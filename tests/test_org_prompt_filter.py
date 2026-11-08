@@ -8,7 +8,9 @@ system prompt after filters, so the company prompt ends up right after it and
 before the Computer Use prompt, whichever of the two filters runs first.
 """
 
+import asyncio
 import copy
+import inspect
 import logging
 import os
 import sys
@@ -55,7 +57,10 @@ def run(body, metadata=None):
 def computer_use_filter():
     clf = computer_link_filter.Filter()
     # The orchestrator is a dependency: answer its prompt fetch directly.
-    clf._fetch_system_prompt = lambda *_args: ("http://localhost:8081", CU_PROMPT)
+    async def fetch(*_args):
+        return ("http://localhost:8081", CU_PROMPT)
+
+    clf._fetch_system_prompt = fetch
     return clf
 
 
@@ -202,7 +207,8 @@ def test_company_prompt_precedes_the_computer_use_prompt(prompt_file, system, co
     body = chat(system)
     order = (org, clf) if company_first else (clf, org)
     for flt in order:
-        body = flt.inlet(body, __metadata__=metadata)
+        result = flt.inlet(body, __metadata__=metadata)
+        body = asyncio.run(result) if inspect.iscoroutine(result) else result
     expected = [COMPANY] + ([USER_PROMPT] if system else []) + [CU_PROMPT]
     assert [m["role"] for m in body["messages"]] == ["system", "user"]
     assert body["messages"][0]["content"] == "\n\n".join(expected)

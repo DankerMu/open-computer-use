@@ -3,13 +3,19 @@
 """
 title: Computer Use Filter
 author: Open Computer Use Contributors
-version: 5.2.0
+version: 5.3.0
 required_open_webui_version: 0.5.17
 description: Attaches the Computer Use tool to every saved chat and authenticated HTTP-fetches the Computer Use system prompt from the internal orchestrator, with an LRU cache for transient failures. outlet() decorates assistant messages with a concrete-file preview link and optional archive link.
 
 This filter works in conjunction with Computer Use Tools (computer_use_tools.py).
 
 FUNCTIONALITY:
+- inlet() and outlet() are coroutines, which Open WebUI awaits. The /system-prompt
+  HTTP exchange runs in a worker thread (asyncio.to_thread), so it never blocks
+  Open WebUI's event loop, and a request OCU makes back into Open WebUI during the
+  fetch is served. The prompt cache is read and written only on the event loop; a
+  fetch that completes after the cache was cleared is returned but not cached, and
+  it neither clears the cache nor falls back to an older entry.
 - inlet(): For every saved chat (a UUID chat_id; channel, temporary and local chats
   are excluded), adds the "ai_computer_use" tool to the request after any tools the
   user selected, whatever the model. Then, unless INJECT_SYSTEM_PROMPT is off, fetches the
@@ -70,6 +76,7 @@ Security:
             Label for the archive-download markdown link.
 """
 
+import asyncio
 import os
 import re
 import time
@@ -322,11 +329,18 @@ class Filter:
             tuple[str, str, str], tuple[float, tuple[str, str]]
         ] = OrderedDict()
         self._cache_authority: Optional[tuple[str, str]] = None
+        # Grows by one at every clear of _prompt_cache. A fetch caches, clears
+        # or falls back only while the generation it started under is current.
+        self._cache_generation = 0
+
+    def _clear_prompt_cache(self) -> None:
+        self._prompt_cache.clear()
+        self._cache_generation += 1
 
     def _configured_authority(self) -> Optional[tuple[str, str]]:
         token = os.environ.get("OCU_INTERNAL_TOKEN", "")
         if not _is_http_safe_credential(token):
-            self._prompt_cache.clear()
+            self._clear_prompt_cache()
             self._cache_authority = None
             print("[ComputerUseFilter] OCU_INTERNAL_TOKEN is unavailable; skipping system prompt")
             return None
@@ -336,7 +350,7 @@ class Filter:
         orchestrator = self.valves.ORCHESTRATOR_URL.rstrip("/")
         parsed = urllib.parse.urlparse(orchestrator)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            self._prompt_cache.clear()
+            self._clear_prompt_cache()
             self._cache_authority = None
             print(
                 f"[ComputerUseFilter] Unsupported orchestrator URL scheme: "
@@ -346,17 +360,31 @@ class Filter:
 
         authority = (orchestrator, token)
         if self._cache_authority is not None and self._cache_authority != authority:
-            self._prompt_cache.clear()
+            self._clear_prompt_cache()
         self._cache_authority = authority
         return authority
 
-    def _fetch_system_prompt(
+    def _request_prompt(self, req: urllib.request.Request) -> tuple[str, str | None]:
+        """Do the blocking HTTP exchange; return the prompt and X-Public-Base-URL.
+
+        It runs in a worker thread and touches no cache state.
+        """
+        with self._no_redirect_opener.open(req, timeout=10) as resp:  # noqa: S310
+            return resp.read().decode("utf-8"), resp.headers.get("X-Public-Base-URL")
+
+    async def _fetch_system_prompt(
         self, chat_id: str, user_email: str = "", features: str = ""
     ) -> Optional[tuple[str, str]]:
-        """Fetch an authorized prompt, retaining stale data only for transport failures."""
+        """Fetch an authorized prompt, retaining stale data only for transport failures.
+
+        Only the HTTP exchange leaves the event loop. Every cache read and write
+        stays on it, and after the exchange a result touches the cache only if
+        no clear happened while it was in flight.
+        """
         authority = self._configured_authority()
         if authority is None:
             return None
+        generation = self._cache_generation
         orchestrator, token = authority
         now = time.time()
         cache_key = (chat_id, user_email, features)
@@ -381,11 +409,10 @@ class Filter:
             req.add_header("Authorization", f"Bearer {token}")
             if features:
                 req.add_header("X-OCU-Features", features)
-            with self._no_redirect_opener.open(req, timeout=10) as resp:  # noqa: S310
-                prompt = resp.read().decode("utf-8")
-                public_url = resp.headers.get("X-Public-Base-URL")
+            prompt, public_url = await asyncio.to_thread(self._request_prompt, req)
             if not public_url:
-                self._prompt_cache.clear()
+                if self._cache_generation == generation:
+                    self._clear_prompt_cache()
                 print(
                     "[ComputerUseFilter] System prompt response omitted "
                     "X-Public-Base-URL"
@@ -393,15 +420,17 @@ class Filter:
                 return None
 
             entry = (public_url, prompt)
-            self._prompt_cache[cache_key] = (now, entry)
-            self._prompt_cache.move_to_end(cache_key)
-            while len(self._prompt_cache) > _PROMPT_CACHE_MAX_SIZE:
-                self._prompt_cache.popitem(last=False)
+            if self._cache_generation == generation:
+                self._prompt_cache[cache_key] = (now, entry)
+                self._prompt_cache.move_to_end(cache_key)
+                while len(self._prompt_cache) > _PROMPT_CACHE_MAX_SIZE:
+                    self._prompt_cache.popitem(last=False)
             return entry
 
         except urllib.error.HTTPError as error:
             if error.code in (401, 403) or 300 <= error.code < 400:
-                self._prompt_cache.clear()
+                if self._cache_generation == generation:
+                    self._clear_prompt_cache()
                 print(
                     f"[ComputerUseFilter] System prompt request rejected "
                     f"(HTTP {error.code})"
@@ -417,9 +446,9 @@ class Filter:
                 f"{type(error).__name__}"
             )
 
-        return cached[1] if cached else None
+        return cached[1] if cached and self._cache_generation == generation else None
 
-    def inlet(
+    async def inlet(
         self,
         body: dict,
         __user__: Optional[dict] = None,
@@ -443,7 +472,7 @@ class Filter:
         user_email = __user__.get("email", "") if __user__ else ""
 
         features = _prompt_features(__metadata__, __model__)
-        fetched = self._fetch_system_prompt(chat_id, user_email, features)
+        fetched = await self._fetch_system_prompt(chat_id, user_email, features)
         if not fetched:
             # Unavailable, unauthorized, or incomplete prompt metadata leaves the body unchanged.
             return body
@@ -506,7 +535,7 @@ class Filter:
         body["messages"] = messages
         return body
 
-    def outlet(
+    async def outlet(
         self,
         body: dict,
         __user__: Optional[dict] = None,
@@ -534,7 +563,7 @@ class Filter:
         )
         if public_url is None:
             user_email = __user__.get("email", "") if __user__ else ""
-            fetched = self._fetch_system_prompt(chat_id, user_email)
+            fetched = await self._fetch_system_prompt(chat_id, user_email)
             if not fetched:
                 return body
             public_url = fetched[0]
