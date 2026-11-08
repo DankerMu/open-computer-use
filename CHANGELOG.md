@@ -3,6 +3,14 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **Gateway denies the internal skill registry prefix (#754).** The browser
+  gateway in `deploy/proxy/nginx.conf.in` answers every request whose
+  normalized path lies under `/api/v1/ocu/skills/api/internal/` with a plain
+  404 from nginx, whatever its method, cookies or `X-Internal-Api-Key`, and
+  never forwards it to WebUI; encoded and dot-segment forms normalize into the
+  same row. Other `/api/v1/ocu/skills` paths, including
+  `/api/v1/ocu/skills/api/internal` without the trailing slash, still reach
+  WebUI. The row takes effect in a rebuilt proxy image.
 - **Uploaded-skill `/` marker rewrite (#752).** After the Computer Use filter
   (5.2.0) injects its prompt, the inlet replaces each
   `<$ocu--{name}|{label}>` in user messages, string content and text parts,

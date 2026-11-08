@@ -6,7 +6,10 @@ configuration and token before generating the self-contained, secret-bearing
 `render.py`: changing any row requires updating that fingerprint and reviewing the
 route/auth/method/mutation/transport implications together. Unknown methods and
 `/ocu/` paths do not contact OCU. Outside `/ocu`, the gateway listener forwards
-to WebUI. The second listener forwards only to DocumentServer after session auth.
+to WebUI, with one exception: the internal skill registry prefix
+`/api/v1/ocu/skills/api/internal/` answers 404 for every method and is never
+forwarded, with or without cookies or an `X-Internal-Api-Key` header. The
+second listener forwards only to DocumentServer after session auth.
 
 ## Provision and run
 
