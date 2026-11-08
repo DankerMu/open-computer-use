@@ -1200,6 +1200,250 @@ class ValveSchema(unittest.TestCase):
         self.assertNotIn("OCU_INTERNAL_TOKEN", valve_fields)
 
 
+# --- `/` uploaded-skill marker rewrite (#752) ---------------------------------
+
+
+def _skill_sentence(name: str) -> str:
+    # Spelled out from design.md Decision 9 of the ocu-uploaded-skills change.
+    return f"用户通过 / 指定使用 skill `{name}`，先阅读 `<available_skills>` 中它的 `SKILL.md` 再动手"
+
+
+@pytest.fixture
+def prompt_fetch():
+    with patch(
+        "urllib.request.OpenerDirector.open", return_value=_urlopen_mock("PROMPT")
+    ) as opener:
+        yield opener
+
+
+def _chat_body(*messages: dict) -> dict:
+    return {"tool_ids": [], "messages": list(messages)}
+
+
+def _user(content) -> dict:
+    return {"role": "user", "content": content}
+
+
+def _run_inlet(body: dict, chat_id: str = CHAT_ID, f=None) -> dict:
+    return (f or _make_filter()).inlet(body, __metadata__={"chat_id": chat_id})
+
+
+def test_marker_single_is_rewritten_and_names_the_skill(prompt_fetch):
+    body = _run_inlet(_chat_body(_user("请用 <$ocu--invoice-builder|invoice-builder> 生成发票")))
+
+    assert body["messages"][1] == _user("请用 invoice-builder 生成发票")
+    assert _system_content(body) == "PROMPT\n\n" + _skill_sentence("invoice-builder")
+
+
+def test_marker_repeated_adds_the_sentence_once(prompt_fetch):
+    marker = "<$ocu--invoice-builder|invoice-builder>"
+    body = _run_inlet(_chat_body(_user(f"{marker} 和 {marker}")))
+
+    assert body["messages"][1]["content"] == "invoice-builder 和 invoice-builder"
+    assert _system_content(body).count(_skill_sentence("invoice-builder")) == 1
+    assert _system_content(body).endswith("\n\n" + _skill_sentence("invoice-builder"))
+
+
+def test_marker_two_names_add_two_sentences_in_order(prompt_fetch):
+    body = _run_inlet(_chat_body(_user("<$ocu--a|a> 然后 <$ocu--b|b>")))
+
+    assert body["messages"][1]["content"] == "a 然后 b"
+    assert _system_content(body) == (
+        "PROMPT\n\n" + _skill_sentence("a") + "\n" + _skill_sentence("b")
+    )
+
+
+def test_marker_label_is_shown_and_the_name_is_instructed(prompt_fetch):
+    body = _run_inlet(_chat_body(_user("用 <$ocu--invoice-builder|Invoice Builder>")))
+
+    assert body["messages"][1]["content"] == "用 Invoice Builder"
+    assert _system_content(body) == "PROMPT\n\n" + _skill_sentence("invoice-builder")
+
+
+def test_marker_in_an_earlier_message_is_rewritten_without_a_sentence(prompt_fetch):
+    body = _run_inlet(
+        _chat_body(
+            _user("用 <$ocu--old|old>"),
+            {"role": "assistant", "content": "好"},
+            _user("继续"),
+        )
+    )
+
+    assert body["messages"][1:] == [
+        _user("用 old"),
+        {"role": "assistant", "content": "好"},
+        _user("继续"),
+    ]
+    assert _system_content(body) == "PROMPT"
+
+
+def test_marker_only_the_last_user_message_adds_sentences(prompt_fetch):
+    body = _run_inlet(
+        _chat_body(
+            _user("<$ocu--old|old>"),
+            {"role": "assistant", "content": "好"},
+            _user("<$ocu--new|new>"),
+        )
+    )
+
+    assert [m["content"] for m in body["messages"][1:]] == ["old", "好", "new"]
+    assert _system_content(body) == "PROMPT\n\n" + _skill_sentence("new")
+
+
+@pytest.mark.parametrize("earlier", (False, True), ids=("last", "earlier"))
+def test_marker_in_text_parts_is_rewritten_and_other_parts_kept(prompt_fetch, earlier):
+    image = {"type": "image_url", "image_url": {"url": "data:x"}}
+    parts = [{"type": "text", "text": "用 <$ocu--a|a>"}, copy.deepcopy(image)]
+    messages = [_user(parts)]
+    if earlier:
+        messages += [{"role": "assistant", "content": "好"}, _user("继续")]
+
+    body = _run_inlet(_chat_body(*messages))
+
+    assert body["messages"][1]["content"] == [{"type": "text", "text": "用 a"}, image]
+    expected_system = "PROMPT" if earlier else "PROMPT\n\n" + _skill_sentence("a")
+    assert _system_content(body) == expected_system
+
+
+@pytest.mark.parametrize(
+    ("system", "expected_head"),
+    (
+        ("existing", "existing\n\nPROMPT"),
+        ("before\n\n{{CURRENT_DATE}}", "before\n\nPROMPT\n\n{{CURRENT_DATE}}"),
+        (
+            [{"type": "text", "text": "hello"}],
+            str([{"type": "text", "text": "hello"}]) + "\n\nPROMPT",
+        ),
+        (None, "PROMPT"),
+    ),
+    ids=("plain", "template", "list", "none"),
+)
+def test_marker_sentence_ends_every_system_message_form(
+    prompt_fetch, system, expected_head
+):
+    messages = [_user("<$ocu--a|a>")]
+    if system is not None:
+        messages.insert(0, {"role": "system", "content": copy.deepcopy(system)})
+
+    body = _run_inlet(_chat_body(*messages))
+
+    assert body["messages"][0] == {
+        "role": "system",
+        "content": expected_head + "\n\n" + _skill_sentence("a"),
+    }
+    assert body["messages"][1] == _user("a")
+
+
+@pytest.mark.parametrize(
+    ("system", "expected_system"),
+    ((None, "PROMPT"), ("existing", "existing\n\nPROMPT")),
+    ids=("no-system", "existing-system"),
+)
+def test_marker_free_body_matches_the_injected_prompt_only(
+    prompt_fetch, system, expected_system
+):
+    messages = [
+        _user("plain text"),
+        {"role": "assistant", "content": "ok"},
+        _user([{"type": "text", "text": "parts <b>bold</b>"}]),
+    ]
+    if system is not None:
+        messages.insert(0, {"role": "system", "content": system})
+    original_users = copy.deepcopy([m for m in messages if m["role"] == "user"])
+
+    body = _run_inlet(_chat_body(*messages))
+
+    assert body["tool_ids"] == ["ai_computer_use"]
+    assert [m for m in body["messages"] if m["role"] == "user"] == original_users
+    assert _system_content(body) == expected_system
+
+
+def _marker_body() -> dict:
+    return _chat_body(_user("请用 <$ocu--invoice-builder|invoice-builder> 生成发票"))
+
+
+def test_marker_left_raw_for_a_chat_without_a_workspace(prompt_fetch):
+    original = _marker_body()
+    body = _run_inlet(copy.deepcopy(original), chat_id=f"temporary:{CHAT_ID}")
+
+    assert body == original
+    prompt_fetch.assert_not_called()
+
+
+def test_marker_left_raw_when_prompt_injection_is_off(prompt_fetch):
+    f = _make_filter()
+    f.valves.INJECT_SYSTEM_PROMPT = False
+    original = _marker_body()
+    body = _run_inlet(copy.deepcopy(original), f=f)
+
+    assert body["messages"] == original["messages"]
+    assert body["tool_ids"] == ["ai_computer_use"]
+
+
+def test_marker_left_raw_without_the_internal_token(prompt_fetch, monkeypatch):
+    monkeypatch.delenv("OCU_INTERNAL_TOKEN")
+    original = _marker_body()
+    body = _run_inlet(copy.deepcopy(original))
+
+    assert body["messages"] == original["messages"]
+    assert body["tool_ids"] == ["ai_computer_use"]
+    prompt_fetch.assert_not_called()
+
+
+def test_marker_left_raw_when_the_prompt_fetch_is_unauthorized():
+    original = _marker_body()
+    rejected = urllib.error.HTTPError("http://localhost:8081", 401, "unauthorized", {}, None)
+    with patch("urllib.request.OpenerDirector.open", side_effect=rejected):
+        body = _run_inlet(copy.deepcopy(original))
+
+    assert body["messages"] == original["messages"]
+    assert body["tool_ids"] == ["ai_computer_use"]
+
+
+def test_marker_in_assistant_or_system_messages_is_left_verbatim(prompt_fetch):
+    body = _run_inlet(
+        _chat_body(
+            {"role": "system", "content": "sys <$ocu--a|a>"},
+            {"role": "assistant", "content": "said <$ocu--b|b>"},
+            _user("plain"),
+        )
+    )
+
+    assert body["messages"] == [
+        {"role": "system", "content": "sys <$ocu--a|a>\n\nPROMPT"},
+        {"role": "assistant", "content": "said <$ocu--b|b>"},
+        _user("plain"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "<$ocu--Bad Name|x>",
+        "<$ocu--a_b|x>",
+        "<$ocu--x`y|x>",
+        "<$ocu--invoice-builder>",
+        "<$ocu--" + "a" * 65 + "|x>",
+    ),
+    ids=("upper-and-space", "underscore", "backtick", "no-pipe", "name-too-long"),
+)
+def test_marker_outside_the_grammar_is_left_verbatim(prompt_fetch, text):
+    body = _run_inlet(_chat_body(_user(f"用 {text}")))
+
+    assert body["messages"][1] == _user(f"用 {text}")
+    assert _system_content(body) == "PROMPT"
+
+
+def test_marker_sentence_never_enters_the_prompt_cache(prompt_fetch):
+    f = _make_filter()
+    _run_inlet(_chat_body(_user("<$ocu--a|a>")), f=f)
+    body = _run_inlet(_chat_body(_user("plain")), f=f)
+
+    assert _system_content(body) == "PROMPT"
+    assert [entry[1][1] for entry in f._prompt_cache.values()] == ["PROMPT"]
+    assert prompt_fetch.call_count == 1
+
+
 
 
 if __name__ == "__main__":

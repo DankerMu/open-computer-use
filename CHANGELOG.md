@@ -3,6 +3,18 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **Uploaded-skill `/` marker rewrite (#752).** After the Computer Use filter
+  (5.2.0) injects its prompt, the inlet replaces each
+  `<$ocu--{name}|{label}>` in user messages, string content and text parts,
+  with `{label}`. For each distinct `{name}` in the last user message it
+  appends to the system message one sentence telling the model to read that
+  skill's `SKILL.md` in `<available_skills>` first; the cached prompt is
+  unchanged. Only a name matching the upload-name rule
+  `[a-z0-9][a-z0-9-]{0,63}` is recognised; other `<$ocu--` text, and markers
+  in assistant or system messages, stay verbatim. When the inlet skips the
+  prompt, the raw marker is left for Open WebUI's native mention stripping. A
+  marker mounts nothing: the sandbox mounts only skills in the user's
+  enabled set.
 - **Company system prompt from a Markdown file (#712).**
   `openwebui/functions/org_prompt_filter.py` reads
   `/etc/ocu/prompts/system-prompt.md` on every chat request and puts its text,

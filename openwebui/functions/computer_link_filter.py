@@ -3,7 +3,7 @@
 """
 title: Computer Use Filter
 author: Open Computer Use Contributors
-version: 5.1.0
+version: 5.2.0
 required_open_webui_version: 0.5.17
 description: Attaches the Computer Use tool to every saved chat and authenticated HTTP-fetches the Computer Use system prompt from the internal orchestrator, with an LRU cache for transient failures. outlet() decorates assistant messages with a concrete-file preview link and optional archive link.
 
@@ -24,6 +24,12 @@ FUNCTIONALITY:
   Transient transport failures may use a stale same-authority cache entry; missing
   credentials, authorization failures, redirects, and missing public metadata skip
   injection.
+  Once the prompt is injected, each `/` uploaded-skill marker <$ocu--{name}|{label}>
+  in a user message (string content or text parts) becomes {label}. For every
+  distinct {name} in the last user message, one sentence telling the model to read
+  that skill's SKILL.md in <available_skills> is appended to the system message.
+  A marker outside the grammar stays verbatim; when injection is skipped, every
+  marker stays raw for Open WebUI's native mention stripping.
 - outlet(): Decorates assistant messages only when they contain a concrete file URL for
   the current chat under the public base cached for any entry of that chat.
   PREVIEW_MODE="button" appends one markdown link to the first matching file URL;
@@ -102,6 +108,12 @@ _SAVED_CHAT_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
 )
 
+# The `/` menu's uploaded-skill marker <$ocu--{name}|{label}>. The name class is
+# the WebUI upload-name rule and the label class that of native mention stripping,
+# so only a grammar-checked name can reach the system message.
+_SKILL_MARKER_RE = re.compile(r"<\$ocu--([a-z0-9][a-z0-9-]{0,63})\|([^>]*)>")
+_SKILL_SENTENCE = "用户通过 / 指定使用 skill `{name}`，先阅读 `<available_skills>` 中它的 `SKILL.md` 再动手"
+
 
 def _saved_chat_id(chat_id: object) -> bool:
     """True only for a saved chat's id, the only kind with a Computer Use workspace."""
@@ -125,6 +137,38 @@ def _prompt_features(metadata: Optional[dict], model: Optional[dict]) -> str:
         isinstance(item, dict) and item.get("id") == VIDEO_FILTER_ID for item in filters
     )
     return "video" if active else ""
+
+
+def _rewrite_skill_markers(messages: list) -> list[str]:
+    """Replace each skill marker in user messages with its label, in place.
+
+    Returns the distinct skill names of the last user message, in order.
+    """
+    names: list[str] = []
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            slots = [(message, "content")]
+        elif isinstance(content, list):
+            slots = [
+                (part, "text")
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ]
+        else:
+            slots = []
+        names = [
+            match.group(1)
+            for holder, key in slots
+            for match in _SKILL_MARKER_RE.finditer(holder[key])
+        ]
+        for holder, key in slots:
+            holder[key] = _SKILL_MARKER_RE.sub(r"\2", holder[key])
+    return list(dict.fromkeys(names))
 
 
 def _find_block_start(content: str, pos: int) -> int:
@@ -446,6 +490,15 @@ class Filter:
                     messages[system_msg_idx]["content"] = str(existing_content) + "\n\n" + system_prompt
         else:
             messages.insert(0, {"role": "system", "content": system_prompt})
+            system_msg_idx = 0
+
+        # Every branch above left a string system message holding the prompt. The
+        # sentences go on that message only, never into the cached prompt.
+        names = _rewrite_skill_markers(messages)
+        if names:
+            messages[system_msg_idx]["content"] += "\n\n" + "\n".join(
+                _SKILL_SENTENCE.format(name=name) for name in names
+            )
 
         body["messages"] = messages
         return body
