@@ -23,6 +23,16 @@ PROXY_PORT = int(os.environ.get("OCU_TEST_PROXY_PORT", "18782"))
 OFFICE_PROXY_PORT = int(os.environ.get("OCU_TEST_OFFICE_PROXY_PORT", "18783"))
 GRANT = "synthetic-payload.synthetic-signature"
 ERROR_LOG = RECORD.parent / "runtime" / "error.log"
+INTERNAL_KEY = "synthetic-internal-api-key"
+INTERNAL_PATHS = ("/api/v1/ocu/skills/api/internal/user-config/x@y.z",
+                  "/api/v1/ocu/skills/api/internal/skills/a/download")
+# Raw targets that nginx normalizes into the internal prefix before location matching.
+INTERNAL_NORMALIZED = ("/api/v1/ocu/skills/api/%69nternal/user-config/x",
+                       "/api/v1/ocu/skills/api%2Finternal/user-config/x",
+                       "/api/v1/ocu/skills//api/internal/user-config/x",
+                       "/api/v1/ocu/skills/api/internal/../internal/user-config/x",
+                       "/api/v1/ocu/skills/./api/internal/user-config/x",
+                       "/api/v1/ocu/skills/x/%2e%2e/api/internal/user-config/x")
 OFFICE_ROWS = (
     ("documents/file-123/sessions", "POST"),
     ("sessions/session-123", "GET"),
@@ -1022,6 +1032,34 @@ class NativeProxyTests(unittest.TestCase):
                          ["sandbox allow-scripts allow-forms"])
         self.assertEqual([value for key, value in headers if key.lower() == "x-content-type-options"],
                          ["nosniff"])
+
+    def test_internal_skill_registry_prefix_never_reaches_webui(self):
+        credentials = (("none", {}), ("cookie", {"Cookie": "session=owner"}),
+                       ("internal-key", {"X-Internal-Api-Key": INTERNAL_KEY}))
+        cases = [(path, method) for path in INTERNAL_PATHS
+                 for method in ("GET", "HEAD", "POST", "PUT", "DELETE")]
+        cases += [(path, "GET") for path in INTERNAL_NORMALIZED]
+        for path, method in cases:
+            for label, headers in credentials:
+                with self.subTest(path=path, method=method, credentials=label):
+                    before = self.snapshot()
+                    status, _, body = self.request(path, method, dict(headers))
+                    self.assertEqual((status, self.since("auth", before), self.since("ocu", before)),
+                                     (404, [], []), body)
+
+    def test_skill_routes_outside_internal_prefix_still_reach_webui(self):
+        for method, path in (("GET", "/api/v1/ocu/skills/"),
+                             ("GET", "/api/v1/ocu/skills/admin"),
+                             ("POST", "/api/v1/ocu/skills/a/toggle"),
+                             ("GET", "/api/v1/ocu/skills/api/internalx"),
+                             ("GET", "/api/v1/ocu/skills/api/internal")):
+            with self.subTest(method=method, path=path):
+                before = self.snapshot()
+                status, _, body = self.request(path, method, self.owner())
+                self.assertEqual((status, body), (200, b"webui"))
+                self.assertEqual([(row["method"], row["target"]) for row in self.since("auth", before)],
+                                 [(method, path)])
+                self.assertEqual(self.since("ocu", before), [])
 
     def test_webui_default_location_preserves_http_and_bidirectional_websocket(self):
         before = self.snapshot()

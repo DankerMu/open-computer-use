@@ -21,6 +21,7 @@ render_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(render_module)
 NGINX = "/opt/homebrew/bin/nginx"
 ORIGIN = "http://127.0.0.1:18780"
+INTERNAL_DENY = "location ^~ /api/v1/ocu/skills/api/internal/ { return 404; }"
 
 
 class RenderTests(unittest.TestCase):
@@ -66,6 +67,18 @@ class RenderTests(unittest.TestCase):
                     self.assertEqual(self.output.read_bytes(), original)
                 finally:
                     self.env[name] = previous
+
+    def test_internal_skill_registry_deny_precedes_gateway_catch_all_only(self):
+        self.render()
+        rendered = self.output.read_text()
+        gateway = rendered.index("server {")
+        office = rendered.index("server {", gateway + 1)
+        self.assertEqual(rendered.count(INTERNAL_DENY), 1)
+        self.assertLess(gateway, rendered.index(INTERNAL_DENY))
+        self.assertLess(rendered.index(INTERNAL_DENY), rendered.index("location / {", gateway))
+        self.assertNotIn(INTERNAL_DENY, rendered[office:])
+        self.assertEqual(subprocess.run([NGINX, "-t", "-c", str(self.output)],
+                                        capture_output=True).returncode, 0)
 
     def test_office_inputs_are_required_and_failed_render_preserves_config(self):
         self.render()

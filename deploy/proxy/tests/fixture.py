@@ -54,6 +54,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._serve()
 
+    def do_PUT(self):
+        self._serve()
+
     def do_DELETE(self):
         self._serve()
 

@@ -107,6 +107,21 @@ if [[ "$status" == "200" && "$payload" == "webui" ]]; then
 else
     fail "webui origin was not forwarded"
 fi
+internal_status="$(python3 - "$LISTEN_PORT" <<'PY'
+import http.client, sys
+conn = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=5)
+conn.request("GET", "/api/v1/ocu/skills/api/internal/user-config/x",
+             headers={"X-Internal-Api-Key": "synthetic-internal-api-key"})
+resp = conn.getresponse()
+resp.read()
+print(resp.status)
+PY
+)"
+if [[ "$internal_status" == "404" ]] && ! grep -qF '/api/v1/ocu/skills/api/internal/' "$RECORD"; then
+    pass "internal skill registry prefix is denied before WebUI"
+else
+    fail "internal skill registry prefix answered $internal_status"
+fi
 ocu_forward="$(python3 - "$LISTEN_PORT" <<'PY'
 import http.client, sys
 conn = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=5)
