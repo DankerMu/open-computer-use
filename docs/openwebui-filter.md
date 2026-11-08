@@ -36,6 +36,16 @@ The server response must include `X-Public-Base-URL`; the filter does not substi
 
 The Computer Use filter treats a request as video-enabled when `__metadata__["filter_ids"]` contains `video_production_filter` and that id is among `__model__["filters"]`, which Open WebUI fills only from active toggle filters. For a regular model, deactivating the filter turns the feature off even for a client that keeps sending the id; a client using a direct connection supplies its own model item, `filters` included. The switch is a user-interface control, not a security boundary: it only adds an installed skill to the prompt. A video-enabled request fetches `/system-prompt` with `X-OCU-Features: video`, and the prompt lists the `remotion` skill. `outlet()` needs only the public base, so it uses any cached entry for the chat.
 
+## Uploaded-skill marker
+
+Picking an uploaded skill in the Open WebUI `/` menu sends the marker `<$ocu--{name}|{label}>` in the message text. After the inlet has injected the prompt, it replaces each marker in every user message, in string content and in text parts, with `{label}`. For each distinct `{name}` in the last user message it appends one sentence to the system message, after the prompt and any template block:
+
+> 用户通过 / 指定使用 skill `{name}`，先阅读 `<available_skills>` 中它的 `SKILL.md` 再动手
+
+(English: the user picked skill `{name}` with `/`; read its `SKILL.md` in `<available_skills>` before acting.) Sentences for several names are joined by a newline, and markers in earlier user messages add none. The sentence is added to the request only, never to the cached prompt, and it mounts nothing: the sandbox mounts only skills in the user's enabled set.
+
+A marker matches only when `{name}` follows the upload-name rule (`[a-z0-9][a-z0-9-]{0,63}`) and `{label}` contains no `<` or `>`; the `<` exclusion keeps the scan linear in the message length. Any other `<$ocu--` text, and markers in assistant or system messages, are left verbatim; native mention stripping may still reduce such a marker downstream, for example one whose label holds `<`. When the inlet returns early (no saved chat, `INJECT_SYSTEM_PROMPT` off, no token, or a failed or unauthorized prompt fetch), the body keeps the raw marker, and Open WebUI's native mention stripping later reduces it to `{label}`.
+
 ## Concrete file links
 
 For each assistant message, `outlet()` finds the first URL under `{PUBLIC_BASE_URL}/files/{chat_id}/`: an absolute base matches its exact origin and path, while a root-relative base matches only root-relative links. It appends the configured preview label to that exact file URL, preserving percent-encoding, query string, and fragment. Bare-prose sentence punctuation is excluded from the target; explicit Markdown and angle destinations remain literal. The label is added at most once even when the file URL was already ordinary message text.
