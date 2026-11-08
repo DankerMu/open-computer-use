@@ -177,6 +177,21 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **GitLab-token fetch has its own configuration (#776).** The fetch run by
+  the five GitLab-aware MCP tools and by a server-credential sandbox rebuild
+  now reads `GITLAB_TOKENS_URL` and `GITLAB_TOKENS_API_KEY`, not the skill
+  registry's `MCP_TOKENS_URL`/`MCP_TOKENS_API_KEY`. With either empty it sends
+  no request, so a registry URL (#753) no longer draws a failing request, an
+  email-bearing log line and up to 5 s of wait per call, and
+  `OCU_INTERNAL_TOKEN` no longer goes to the GitLab path. The
+  `X-Mcp-Tokens-Url` header overrides the pair only together with
+  `X-Mcp-Tokens-Api-Key`; an env key is never sent to a header URL.
+  `docker_manager.MCP_TOKENS_URL` and `MCP_TOKENS_API_KEY` are removed.
+  **Upgrade:** a deployment that used `MCP_TOKENS_URL` for an external MCP
+  Tokens Wrapper must set `GITLAB_TOKENS_URL` and `GITLAB_TOKENS_API_KEY` to
+  keep GitLab tokens; a client that sends `X-Mcp-Tokens-Url` without
+  `X-Mcp-Tokens-Api-Key` now gets no GitLab token. The production-like overlay
+  sets neither variable, so GitLab fetching stays off there.
 - **The Computer Use filter no longer blocks Open WebUI's event loop (#777).**
   `inlet()` and `outlet()` of `computer_link_filter.py` (5.3.0) are coroutines,
   and the `/system-prompt` fetch runs in a worker thread. A prompt-cache miss
