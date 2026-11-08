@@ -220,6 +220,24 @@ class DeployEntryTests(unittest.TestCase):
                         self.assertEqual(ops(self.state), [])
                         self.assertEqual(leftover_tmp(self.state), [])
 
+    def test_internal_token_is_required_before_engine_contact(self):
+        # #753 renders the registry key from this token; without it nothing is rendered.
+        env, script, _source = prepare_up_context(self.state, extra=self.env)
+        for value in (None, ""):
+            with self.subTest(empty=value == ""):
+                invalid = dict(env)
+                if value is None:
+                    invalid.pop("OCU_INTERNAL_TOKEN")
+                else:
+                    invalid["OCU_INTERNAL_TOKEN"] = value
+                result = run_script(script, invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("deploy: OCU_INTERNAL_TOKEN is required", result.stderr)
+                self.assertNotIn("MCP_TOKENS_", result.stdout + result.stderr)
+                self.assertEqual(starts(self.state), [])
+                self.assertEqual(ops(self.state), [])
+                self.assertEqual(leftover_tmp(self.state), [])
+
     def test_invalid_office_inputs_refuse_before_engine_contact(self):
         env, script, _source = prepare_up_context(self.state, extra=self.env)
         cases = [("OCU_OFFICE_PROXY_PORT", value) for value in ("abc", "0", "65536", "８０")]

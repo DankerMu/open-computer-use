@@ -40,6 +40,12 @@ services:
       BASE_DATA_DIR: ${OCU_CHAT_DATA_DIR}
       SKILLS_CACHE_DIR: ${OCU_SKILLS_CACHE_DIR}
       SKILLS_CACHE_HOST_PATH: ${OCU_SKILLS_CACHE_DIR}
+      # The WebUI uploaded-skill registry (#753). Absent from runtime.env means
+      # the registry on the control-plane bridge; set means that value; an
+      # explicitly empty MCP_TOKENS_URL= disables it. The key is the shared
+      # internal token, interpolated here and never copied into runtime.env.
+      MCP_TOKENS_URL: ${MCP_TOKENS_URL-http://open-webui:8080/api/v1/ocu/skills}
+      MCP_TOKENS_API_KEY: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
       ORCHESTRATOR_CONTAINER_NAME: ocu-test-computer-use-server
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
       OCU_PUBLIC_PREFIX: /ocu

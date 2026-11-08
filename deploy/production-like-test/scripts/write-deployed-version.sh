@@ -52,6 +52,17 @@ tts_policy() {
         "$configured" "${model:-none}" "${voice:-none}" "$(tts_value TTS_TIMEOUT_SECONDS 120)"
 }
 
+# A runtime.env without the key (every one bootstrap writes, and those from
+# before #753) gets the registry URL from Compose; only an explicitly empty
+# value disables it. Neither the URL nor the internal key is printed.
+registry_configured() {
+    if grep -q '^MCP_TOKENS_URL=' "$runtime_file" && [ -z "$(env_value MCP_TOKENS_URL)" ]; then
+        printf '%s' no
+    else
+        printf '%s' yes
+    fi
+}
+
 manifest=${OCU_RELEASE_MANIFEST:-$(env_value OCU_RELEASE_MANIFEST)}
 if [ -z "$manifest" ]; then
     printf '%s\n' 'OCU_RELEASE_MANIFEST is required' >&2
@@ -110,6 +121,7 @@ PY
     printf -- '- Sandbox CDP/ttyd published ports: dedicated sandbox bridge gateway (`%s`)\n' "$(env_value OCU_SANDBOX_GATEWAY)"
     printf -- '- Stopped sandbox retention: container and workspace volume removed after `SANDBOX_RETENTION_DAYS=%s` days stopped; chat files kept until the chat is deleted\n' "$(retention_days)"
     tts_policy
+    printf -- '- Uploaded-skill registry: configured `%s`; the registry URL and internal key are not recorded\n' "$(registry_configured)"
     printf -- '- Offline mode: `OFFLINE_MODE=true`; version update checks disabled; embedding/rerank auto-update disabled\n'
     printf -- '- LAN OpenAI/RAG endpoints remain the configured provider URLs; local Draw.io and Pyodide materials stay enabled\n'
     printf '\n## Deployment-local modifications\n\n'

@@ -49,6 +49,7 @@ PROVIDER_SENTINEL = "provider-secret-not-for-logs"
 EMBEDDING_KEY_SENTINEL = "embedding-secret-not-for-logs"
 RERANKER_KEY_SENTINEL = "reranker-secret-not-for-logs"
 TTS_KEY_SENTINEL = "tts-secret-not-for-logs"
+REGISTRY_KEY_SENTINEL = "registry-key-not-for-the-record"
 ORIGIN = "https://workbench.example.test"
 PUBLIC_BASE = ORIGIN + "/ocu"
 INTERNAL_AUTH = "http://open-webui:8080/api/v1/ocu/auth"
@@ -501,6 +502,11 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
             gateway=runtime["OCU_SANDBOX_GATEWAY"],
         )
         token = runtime["OCU_INTERNAL_TOKEN"]
+        # #753 wires the registry key in Compose: runtime.env keeps one copy of the token.
+        runtime_text = self.runtime_path().read_text(encoding="utf-8")
+        self.assertEqual(runtime_text.count(token), 1)
+        self.assertIn(f"\nOCU_INTERNAL_TOKEN={token}\n", "\n" + runtime_text)
+        self.assertNotIn("MCP_TOKENS_", runtime_text)
         env, script, source = self.consumer_up_env(runtime)
         up = subprocess.run(
             ["bash", str(script)],
@@ -520,6 +526,10 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
             if line
         ]
         self.assertEqual([row["stack"] for row in executed], ["core", "webui", "proxy"])
+        # The token may appear only inside the recorded resolved documents.
+        self.assertNotIn(token, (self.state / "ops.log").read_text(encoding="utf-8"))
+        for row in executed:
+            self.assertNotIn(token, " ".join(row["argv"]), row["stack"])
         by_stack = {row["stack"]: row for row in executed}
         for stack, service in (("core", OCU_SERVICE), ("webui", WEBUI_SERVICE), ("proxy", PROXY_SERVICE)):
             self.assertEqual(
@@ -978,6 +988,58 @@ raise SystemExit(subprocess.run([os.environ["OCU_TEST_REAL_OPENSSL"], *sys.argv[
             "timeout `300` seconds", record)
         self.assertNotIn(TTS_KEY_SENTINEL, record)
         self.assertNotIn("tts-host.lan", record)
+
+    def test_version_record_reports_the_skill_registry_without_the_key_or_url(self):
+        created = self.run_bootstrap()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        runtime = parse_env_file(self.runtime_path())
+        seed_images(self.state, {
+            runtime[name]: {"Id": default_config_id(role), "Os": "linux", "Architecture": "amd64"}
+            for role, name in (
+                ("workspace", "DOCKER_IMAGE"), ("computer-use-server", "COMPUTER_USE_SERVER_IMAGE"),
+                ("retention-guard", "RETENTION_GUARD_IMAGE"), ("proxy", "OCU_PROXY_IMAGE"),
+                ("open-webui", "OPENWEBUI_IMAGE"), ("postgres", "POSTGRES_IMAGE"),
+                ("documentserver", "DOCUMENTSERVER_IMAGE"),
+            )
+        })
+        (self.state / "now-epoch").write_text("1800000000", encoding="utf-8")
+        env = dict(self.env)
+        env["OCU_RELEASE_MANIFEST"] = runtime["OCU_RELEASE_MANIFEST"]
+        lines = [line for line in self.runtime_path().read_text(encoding="utf-8").splitlines()
+                 if not line.startswith("MCP_TOKENS_")]
+        hidden = (REGISTRY_KEY_SENTINEL, runtime["OCU_INTERNAL_TOKEN"], "open-webui:8080", "x.example")
+
+        def write_version(extra_lines):
+            self.runtime_path().write_text(
+                "".join(line + "\n" for line in (*lines, *extra_lines)), encoding="utf-8")
+            result = subprocess.run(
+                ["bash", str(WRITE_VERSION)], cwd=str(ROOT), capture_output=True,
+                text=True, env=env, check=False, timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = (self.deploy_root / "DEPLOYED_VERSION.md").read_text(encoding="utf-8")
+            for value in hidden:
+                self.assertNotIn(value, self.combined(result))
+                self.assertNotIn(value, record)
+            return record
+
+        def status(configured):
+            return (f"- Uploaded-skill registry: configured `{configured}`; "
+                    "the registry URL and internal key are not recorded\n")
+
+        # As bootstrap wrote it, and as a runtime.env from before #753: Compose passes the URL.
+        self.assertIn(status("yes"), write_version(()))
+        self.assertIn(status("yes"), write_version(("MCP_TOKENS_URL=http://x.example/y",)))
+        # Only an explicitly empty value disables the registry.
+        self.assertIn(status("no"), write_version(("MCP_TOKENS_URL=",)))
+        # A key misplaced into runtime.env is still never recorded.
+        record = write_version(("MCP_TOKENS_URL=http://x.example/y",
+                                f"MCP_TOKENS_API_KEY={REGISTRY_KEY_SENTINEL}"))
+        self.assertIn(status("yes"), record)
+        self.assertEqual(record.count("Uploaded-skill registry"), 1)
+        script = WRITE_VERSION.read_text(encoding="utf-8")
+        for name in ("OCU_INTERNAL_TOKEN", "MCP_TOKENS_API_KEY"):
+            self.assertNotIn(name, script)
 
     def test_descriptor_engine_identity_bootstraps_and_records_distinct_configuration(self):
         images_path = self.state / "images.json"

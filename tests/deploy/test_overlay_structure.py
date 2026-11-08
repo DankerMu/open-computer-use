@@ -92,6 +92,8 @@ MESSAGES_ENTRYPOINT = ["nginx", "-e", "stderr", "-p", "/var/lib/nginx/", "-c", M
 # up.sh exports the host's zone name as OCU_HOST_TZ (#708).
 HOST_ZONE = "Asia/Shanghai"
 OVERLAYS = {"core": CORE_OVERRIDE, "webui": WEBUI_OVERRIDE, "proxy": PROXY_COMPOSE}
+# The WebUI uploaded-skill registry on the control-plane bridge (#753).
+REGISTRY_URL = "http://open-webui:8080/api/v1/ocu/skills"
 
 
 class ComposeLoader(yaml.SafeLoader):
@@ -523,6 +525,57 @@ class OverlayStructureTests(unittest.TestCase):
                             text = json.dumps(definition)
                             self.assertNotIn("TTS_", text, f"{document}:{service}")
                             self.assertNotIn(key, text, f"{document}:{service}")
+
+    def test_registry_settings_reach_only_the_computer_use_server(self):
+        # #753: the skill manager reads the WebUI registry with the shared internal token.
+        core = parsed(CORE_OVERRIDE)
+        core_env = override_value(core["services"]["computer-use-server"]["environment"])
+        url = core_env["MCP_TOKENS_URL"]
+        self.assertEqual(url, "${MCP_TOKENS_URL-http://open-webui:8080/api/v1/ocu/skills}")
+        self.assertEqual(interpolate_value(url, {}), REGISTRY_URL)
+        self.assertEqual(interpolate_value(url, {"MCP_TOKENS_URL": ""}), "")
+        self.assertEqual(interpolate_value(url, {"MCP_TOKENS_URL": "http://x.example/y"}),
+                         "http://x.example/y")
+        self.assertTrue(interpolated(core_env["MCP_TOKENS_API_KEY"], "OCU_INTERNAL_TOKEN"))
+        webui = parsed(WEBUI_OVERRIDE)
+        proxy = parsed(PROXY_COMPOSE)
+        others = {f"core:{name}": service for name, service in core["services"].items()
+                  if name != "computer-use-server"}
+        others.update({f"webui:{name}": service for name, service in webui["services"].items()})
+        others.update({f"proxy:{name}": service for name, service in proxy["services"].items()})
+        for label, service in others.items():
+            with self.subTest(service=label):
+                # By name: WebUI and the proxy legitimately carry OCU_INTERNAL_TOKEN.
+                self.assertNotIn("MCP_TOKENS_", json.dumps(service))
+
+    def test_native_compose_resolves_the_registry_settings(self):
+        cases = (
+            ("unset", {}, REGISTRY_URL),
+            ("empty", {"MCP_TOKENS_URL": ""}, ""),
+            ("set", {"MCP_TOKENS_URL": "http://x.example/y"}, "http://x.example/y"),
+        )
+        with tempfile.TemporaryDirectory(prefix="ocu-native-registry-") as raw:
+            for label, extra, expected in cases:
+                with self.subTest(case=label):
+                    # resolved_stacks refuses a non-zero exit and any "is not set" warning.
+                    stacks = resolved_stacks(Path(raw) / label, "false", extra=extra)
+                    server = stacks["core.json"]["services"]["computer-use-server"]["environment"]
+                    self.assertEqual(server.get("MCP_TOKENS_URL"), expected)
+                    self.assertEqual(server.get("MCP_TOKENS_API_KEY"), "native-fixture-ocu_internal_token")
+                    self.assertEqual(server["MCP_TOKENS_API_KEY"], server["OCU_INTERNAL_TOKEN"])
+                    for document, body in stacks.items():
+                        for service, definition in body["services"].items():
+                            if (document, service) == ("core.json", "computer-use-server"):
+                                continue
+                            environment = definition.get("environment") or {}
+                            for name in ("MCP_TOKENS_API_KEY", "MCP_TOKENS_URL"):
+                                self.assertNotIn(name, environment, f"{document}:{service}")
+
+    def test_native_compose_refuses_an_empty_internal_token(self):
+        with (tempfile.TemporaryDirectory(prefix="ocu-native-no-token-") as raw,
+              self.assertRaises(AssertionError) as raised):
+            resolved_stacks(Path(raw), "false", extra={"OCU_INTERNAL_TOKEN": ""})
+        self.assertIn("OCU_INTERNAL_TOKEN is required", str(raised.exception))
 
     def test_vision_settings_reach_no_service(self):
         # The deployment does not provide Vision (#720): a key passed to

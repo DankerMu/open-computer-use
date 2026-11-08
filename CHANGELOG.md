@@ -3,6 +3,22 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **Production-like overlay reads the WebUI skill registry (#753).**
+  `compose.core.override.yml` gives `computer-use-server`, and no other
+  service, `MCP_TOKENS_URL` (default
+  `http://open-webui:8080/api/v1/ocu/skills`) and `MCP_TOKENS_API_KEY`,
+  interpolated from the existing `OCU_INTERNAL_TOKEN`. A `runtime.env`
+  without `MCP_TOKENS_URL`, including one written before this change, gets
+  the registry on the next `deploy/up.sh`; a set value is used as given; an
+  explicitly empty `MCP_TOKENS_URL=` disables it. `bootstrap-test.sh` is
+  unchanged, so `runtime.env` holds no second copy of the token.
+  `write-deployed-version.sh` records `Uploaded-skill registry: configured
+  yes|no` without the URL or the key. Deploy the WebUI image with the
+  registry routes before OCU (NETWORK-HARDENING). An existing deployment
+  must re-run the initializer (#590 step 2) after `deploy/up.sh`, so that
+  the stored Computer Use filter becomes 5.3.0 (#777); the stored
+  synchronous filter would hold Open WebUI's event loop while OCU calls
+  back into the registry.
 - **Gateway denies the internal skill registry prefix (#754).** The browser
   gateway in `deploy/proxy/nginx.conf.in` answers every request whose
   normalized path lies under `/api/v1/ocu/skills/api/internal/` with a plain
