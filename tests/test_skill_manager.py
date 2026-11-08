@@ -2,11 +2,14 @@
 # Copyright (c) 2025 Open Computer Use Contributors
 """Registry skill ZIPs and names stay inside the skills cache (open-webui#740).
 
-Seams: `ensure_skill_cached`, `get_user_skills` / `get_user_skills_sync` and
-`get_skill_mounts`. Only the registry HTTP calls (`_download_skill_zip`,
-`_fetch_user_config`, `_load_user_config_cache`) are replaced; one test also
-wraps `zipfile.ZipFile.open` in a pass-through recorder. Every cache, manifest
-and host path points into the test's temp root.
+Only stored and deflate entries are extracted (open-webui#762).
+
+Seams: `ensure_skill_cached`, `_check_zip_entries`, `get_user_skills` /
+`get_user_skills_sync` and `get_skill_mounts`. Only the registry HTTP calls
+(`_download_skill_zip`, `_fetch_user_config`, `_load_user_config_cache`) are
+replaced; the before-any-read tests also wrap `zipfile.ZipFile.open` in a
+pass-through recorder. Every cache, manifest and host path points into the
+test's temp root.
 """
 from __future__ import annotations
 
@@ -91,10 +94,10 @@ def zip_of(entries):
     return buf.getvalue()
 
 
-def typed(name, mode):
+def typed(name, mode, method=zipfile.ZIP_DEFLATED):
     info = zipfile.ZipInfo(name)
     info.external_attr = mode << 16
-    info.compress_type = zipfile.ZIP_DEFLATED
+    info.compress_type = method
     return info
 
 
@@ -130,6 +133,17 @@ def bomb_zip(_root):
     return buf.getvalue()
 
 
+def method_zip(skill_md_method, payload_method=None):
+    """SKILL.md packed with skill_md_method, plus payload.bin unless payload_method is None."""
+    entries = [(typed("SKILL.md", stat.S_IFREG | 0o644, skill_md_method), b"# new\n")]
+    if payload_method is not None:
+        entries.append((typed("payload.bin", stat.S_IFREG | 0o644, payload_method), bytes(4096)))
+    data = zip_of(entries)
+    methods = [info.compress_type for info in zipfile.ZipFile(io.BytesIO(data)).infolist()]
+    assert methods == [skill_md_method] + ([payload_method] if payload_method is not None else [])
+    return data
+
+
 REJECTED = {
     "a-relative-traversal": lambda root: zip_of(
         [("SKILL.md", b"# new\n"), ("../../REL_ESCAPE", b"escaped")]
@@ -152,6 +166,9 @@ REJECTED = {
     "i-stripped-prefix-absolute": lambda root: zip_of(
         [("x/SKILL.md", b"# new\n"), (f"x//{root}/DS_ESCAPE", b"escaped")]
     ),
+    "bzip2-entry": lambda root: method_zip(zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2),
+    "lzma-entry": lambda root: method_zip(zipfile.ZIP_DEFLATED, zipfile.ZIP_LZMA),
+    "bzip2-skill-md": lambda root: method_zip(zipfile.ZIP_BZIP2),
 }
 
 
@@ -173,8 +190,7 @@ def test_declared_size_case_inflates_past_200mb():
     assert sum(i.file_size for i in info) > 200 * MB
 
 
-def test_declared_size_rejects_before_any_entry_is_read(sm, monkeypatch):
-    data = bomb_zip(None)
+def assert_rejected_before_any_read(sm, monkeypatch, data):
     opened = []
     original_open = zipfile.ZipFile.open
 
@@ -187,6 +203,39 @@ def test_declared_size_rejects_before_any_entry_is_read(sm, monkeypatch):
 
     assert cache(sm) is None
     assert opened == []
+
+
+def test_declared_size_rejects_before_any_entry_is_read(sm, monkeypatch):
+    assert_rejected_before_any_read(sm, monkeypatch, bomb_zip(None))
+
+
+@pytest.mark.parametrize("case", ["bzip2-entry", "lzma-entry"])
+def test_compression_method_rejects_before_any_entry_is_read(sm, monkeypatch, case):
+    assert_rejected_before_any_read(sm, monkeypatch, REJECTED[case](None))
+
+
+# ---------------------------------------------------------------------------
+# Compression methods: only stored and deflate reads are output-bounded
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("method", "label"), [
+    pytest.param(zipfile.ZIP_BZIP2, "bzip2", id="bzip2"),
+    pytest.param(zipfile.ZIP_LZMA, "lzma", id="lzma"),
+    pytest.param(99, "99", id="unnamed-99"),
+])
+def test_unbounded_compression_method_is_rejected(sm, method, label):
+    assert method not in zipfile.compressor_names or zipfile.compressor_names[method] == label
+    entries = [typed("SKILL.md", 0, zipfile.ZIP_DEFLATED), typed("payload.bin", 0, method)]
+    with pytest.raises(ValueError, match=rf"'payload\.bin' uses compression method {label};"):
+        sm._check_zip_entries(entries)
+
+
+@pytest.mark.parametrize("method", [
+    pytest.param(zipfile.ZIP_STORED, id="stored"),
+    pytest.param(zipfile.ZIP_DEFLATED, id="deflated"),
+])
+def test_bounded_compression_method_is_accepted(sm, method):
+    assert sm._check_zip_entries([typed("SKILL.md", 0, method), typed("x.txt", 0, method)]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +365,20 @@ def writestr_zip():
     return data
 
 
-VALID = {"flat": flat_zip, "wrapped-with-dir-entries": wrapped_zip, "writestr-no-type-bits": writestr_zip}
+def stored_zip():
+    data = zip_of([
+        (typed("SKILL.md", stat.S_IFREG | 0o600, zipfile.ZIP_STORED), b"# new\n"),
+        (typed("scripts/run.py", stat.S_IFREG | 0o700, zipfile.ZIP_STORED), b"print('run')\n"),
+    ])
+    for info in zipfile.ZipFile(io.BytesIO(data)).infolist():
+        assert info.compress_type == zipfile.ZIP_STORED
+    return data
+
+
+VALID = {
+    "flat": flat_zip, "wrapped-with-dir-entries": wrapped_zip, "writestr-no-type-bits": writestr_zip,
+    "flat-stored": stored_zip,
+}
 
 
 def assert_cached(sm, result):

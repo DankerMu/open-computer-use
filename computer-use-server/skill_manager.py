@@ -48,6 +48,9 @@ MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50 MB — max ZIP download size
 # Extraction limits; match the WebUI skill upload validator (ocu-uploaded-skills).
 MAX_ZIP_ENTRIES = 2000
 MAX_UNZIPPED_SIZE = 200 * 1024 * 1024  # 200 MB — stops decompression bombs
+# Only methods whose zipfile read is output-bounded (open-webui#762): bzip2 and lzma
+# inflate a whole block per read, so MAX_UNZIPPED_SIZE would count after the memory is gone.
+ZIP_METHODS = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
 SKILL_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]*")
 
 # ---------------------------------------------------------------------------
@@ -388,6 +391,9 @@ def _check_zip_entries(infos: list[zipfile.ZipInfo]) -> None:
         name = info.filename
         if posixpath.isabs(name) or ".." in name.split("/") or "\\" in name:
             raise ValueError(f"unsafe entry path {name!r}")
+        if info.compress_type not in ZIP_METHODS:
+            method = zipfile.compressor_names.get(info.compress_type, info.compress_type)
+            raise ValueError(f"entry {name!r} uses compression method {method}; only stored and deflate")
         # No type bits (writestr, Windows tools) counts as a regular file.
         file_type = stat.S_IFMT(info.external_attr >> 16)
         if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):

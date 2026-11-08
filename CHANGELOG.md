@@ -153,6 +153,16 @@
   its value. The retention guard's 168-hour ceiling is unchanged.
 
 ### Fixed
+- **Skill ZIPs accept only stored and deflate entries (#762).** The skill cache
+  rejects a registry ZIP when any entry uses another compression method, such as
+  bzip2 or lzma, before any entry is read: `ensure_skill_cached` returns `None`,
+  removes its temporary directory and keeps the previous cache and manifest.
+  Python's ZIP reader decompresses a whole bzip2 or lzma block per read, so the
+  200 MB unzipped limit was counted only after the memory was taken; a small
+  archive with a small declared size could exhaust `computer-use-server`
+  memory. Stored and deflate ZIPs cache as before. This matches the WebUI
+  upload validator (#761), for whatever the configured registry serves.
+
 - **`tests/test_tools.py` no longer depends on the ambient `MCP_API_KEY` (#731).**
   `_image_env` now sets `MCP_API_KEY` to the key the tests give the Open WebUI
   tool, as the other guarded tests do, so the image tests check the bearer
