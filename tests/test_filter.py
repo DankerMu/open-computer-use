@@ -5,6 +5,7 @@
 Run: python -m pytest tests/test_filter.py -v
 """
 
+import asyncio
 import copy
 import os
 import socket
@@ -13,8 +14,11 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs
 from unittest.mock import MagicMock, patch
 
@@ -210,11 +214,11 @@ def test_inlet_authenticates_real_guard_and_preserves_insertion(monkeypatch):
                 {"role": "user", "content": "hi"},
             ],
         }
-        result = filter_.inlet(
+        result = asyncio.run(filter_.inlet(
             body,
             __user__={"email": "person@example.test"},
             __metadata__={"chat_id": CHAT_ID},
-        )
+        ))
 
     assert result["messages"] == [
         {
@@ -250,7 +254,7 @@ def test_guard_rejection_does_not_reuse_a_stale_prompt(monkeypatch, capsys):
             ("https://webui.example/ocu", "stale prompt"),
         )
         filter_._cache_authority = (origin, "wrong-filter-token")
-        result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
+        result = asyncio.run(filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID}))
 
     assert _system_content(result) == ""
     assert records[0]["headers"]["authorization"] == "Bearer wrong-filter-token"
@@ -276,7 +280,7 @@ def test_forbidden_response_does_not_reuse_a_stale_prompt(monkeypatch):
             ("https://webui.example/ocu", "stale prompt"),
         )
         filter_._cache_authority = (origin, "filter-test-token")
-        result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
+        result = asyncio.run(filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID}))
 
     assert _system_content(result) == ""
     assert records[0]["headers"]["authorization"] == "Bearer filter-test-token"
@@ -289,7 +293,7 @@ def test_missing_filter_credential_does_not_use_a_warm_prompt(monkeypatch):
         time.time(),
         ("https://webui.example/ocu", "warm prompt"),
     )
-    result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
+    result = asyncio.run(filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID}))
     assert _system_content(result) == ""
 
 
@@ -299,7 +303,7 @@ def test_missing_public_base_header_does_not_use_internal_url(monkeypatch):
     records = []
     with _live_asgi(_prompt_app(records, "headerless prompt", None)) as origin:
         filter_ = _make_filter(origin)
-        result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
+        result = asyncio.run(filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID}))
 
     assert _system_content(result) == ""
     assert len(records) == 1
@@ -319,11 +323,11 @@ def test_missing_public_base_header_does_not_reuse_stale_prompt_or_link_metadata
             (public_base, "stale prompt"),
         )
         filter_._cache_authority = (origin, "filter-test-token")
-        inlet_result = filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
-        outlet_result = filter_.outlet(
+        inlet_result = asyncio.run(filter_.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID}))
+        outlet_result = asyncio.run(filter_.outlet(
             {"messages": [{"role": "assistant", "content": original}]},
             __metadata__={"chat_id": CHAT_ID},
-        )
+        ))
 
     assert _system_content(inlet_result) == ""
     assert outlet_result["messages"][0]["content"] == original
@@ -341,17 +345,17 @@ def test_cache_refreshes_when_token_or_internal_origin_changes(monkeypatch):
         _prompt_app(second_records, "second prompt", "https://webui.example/ocu")
     ) as second_origin:
         filter_ = _make_filter(first_origin)
-        assert filter_._fetch_system_prompt(CHAT_ID, "person@example.test") == (
+        assert asyncio.run(filter_._fetch_system_prompt(CHAT_ID, "person@example.test")) == (
             "https://webui.example/ocu",
             "first prompt",
         )
         filter_.valves.ORCHESTRATOR_URL = second_origin
-        assert filter_._fetch_system_prompt(CHAT_ID, "person@example.test") == (
+        assert asyncio.run(filter_._fetch_system_prompt(CHAT_ID, "person@example.test")) == (
             "https://webui.example/ocu",
             "second prompt",
         )
         monkeypatch.setenv("OCU_INTERNAL_TOKEN", "second-filter-token")
-        assert filter_._fetch_system_prompt(CHAT_ID, "person@example.test") == (
+        assert asyncio.run(filter_._fetch_system_prompt(CHAT_ID, "person@example.test")) == (
             "https://webui.example/ocu",
             "second prompt",
         )
@@ -379,7 +383,7 @@ def test_outlet_does_not_reuse_cached_links_after_credential_rotation(monkeypatc
         "urllib.request.OpenerDirector.open",
         side_effect=urllib.error.URLError("connection refused"),
     ):
-        result = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
+        result = asyncio.run(filter_.outlet(body, __metadata__={"chat_id": CHAT_ID}))
 
     assert result["messages"][0]["content"] == file_url
 
@@ -399,7 +403,7 @@ def test_redirect_does_not_contact_the_other_origin(monkeypatch):
 
         origin = Starlette(routes=[Route("/system-prompt", redirect)])
         with _live_asgi(origin) as source:
-            result = _make_filter(source)._fetch_system_prompt(CHAT_ID, "")
+            result = asyncio.run(_make_filter(source)._fetch_system_prompt(CHAT_ID, ""))
 
     assert result is None
     assert target_records == []
@@ -421,7 +425,7 @@ def test_outlet_links_the_first_current_chat_file_without_a_preview_shell(monkey
         ]
     }
 
-    result = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
+    result = asyncio.run(filter_.outlet(body, __metadata__={"chat_id": CHAT_ID}))
     content = result["messages"][0]["content"]
     assert f"[🖥️ Open preview]({first_file})" in content
     assert f"[🖥️ Open preview]({second_file})" not in content
@@ -437,8 +441,8 @@ def test_outlet_adds_one_preview_label_when_the_file_url_is_already_present(monk
     _prime_cache(filter_, CHAT_ID, public_url=public_base)
     body = {"messages": [{"role": "assistant", "content": f"Open {file_url}"}]}
 
-    first = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
-    second = filter_.outlet(first, __metadata__={"chat_id": CHAT_ID})
+    first = asyncio.run(filter_.outlet(body, __metadata__={"chat_id": CHAT_ID}))
+    second = asyncio.run(filter_.outlet(first, __metadata__={"chat_id": CHAT_ID}))
     preview_link = f"[🖥️ Open preview]({file_url})"
     assert second["messages"][0]["content"].count(preview_link) == 1
 
@@ -457,7 +461,7 @@ def test_outlet_leaves_browser_only_and_archive_urls_unchanged(monkeypatch):
         ]
     }
 
-    result = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
+    result = asyncio.run(filter_.outlet(body, __metadata__={"chat_id": CHAT_ID}))
     assert [message["content"] for message in result["messages"]] == [
         browser_only,
         archive_only,
@@ -472,10 +476,10 @@ def test_outlet_does_not_match_foreign_public_bases_or_chats(monkeypatch):
     foreign_base = f"https://webui.example/ocu-else/files/{CHAT_ID}/report.html"
     foreign_chat = f"{public_base}/files/{CHAT_ID}-other/report.html"
     original = f"{foreign_base} {foreign_chat}"
-    result = filter_.outlet(
+    result = asyncio.run(filter_.outlet(
         {"messages": [{"role": "assistant", "content": original}]},
         __metadata__={"chat_id": CHAT_ID},
-    )
+    ))
     assert result["messages"][0]["content"] == original
 
 def test_outlet_supports_root_relative_public_base_without_matching_foreign_absolute_urls(monkeypatch):
@@ -494,7 +498,7 @@ def test_outlet_supports_root_relative_public_base_without_matching_foreign_abso
         ]
     }
 
-    result = filter_.outlet(body, __metadata__={"chat_id": CHAT_ID})
+    result = asyncio.run(filter_.outlet(body, __metadata__={"chat_id": CHAT_ID}))
     content = result["messages"][0]["content"]
     assert f"[🖥️ Open preview]({local_file})" in content
     assert f"[🖥️ Open preview]({foreign_file})" not in content
@@ -517,17 +521,17 @@ def test_outlet_does_not_restart_root_relative_match_inside_foreign_absolute_url
     filter_ = _make_filter()
     _prime_cache(filter_, CHAT_ID, public_url=public_base)
 
-    foreign_result = filter_.outlet(
+    foreign_result = asyncio.run(filter_.outlet(
         {"messages": [{"role": "assistant", "content": foreign_file}]},
         __metadata__={"chat_id": CHAT_ID},
-    )
+    ))
 
     assert foreign_result["messages"][0]["content"] == foreign_file
 
-    local_result = filter_.outlet(
+    local_result = asyncio.run(filter_.outlet(
         {"messages": [{"role": "assistant", "content": local_file}]},
         __metadata__={"chat_id": CHAT_ID},
-    )
+    ))
     assert f"[🖥️ Open preview]({local_file})" in local_result["messages"][0]["content"]
 
 def test_outlet_trims_sentence_punctuation_from_bare_file_urls(monkeypatch):
@@ -538,10 +542,10 @@ def test_outlet_trims_sentence_punctuation_from_bare_file_urls(monkeypatch):
     filter_ = _make_filter()
     _prime_cache(filter_, CHAT_ID, public_url=public_base)
 
-    result = filter_.outlet(
+    result = asyncio.run(filter_.outlet(
         {"messages": [{"role": "assistant", "content": f"Finished: {punctuated_file}"}]},
         __metadata__={"chat_id": CHAT_ID},
-    )
+    ))
 
     content = result["messages"][0]["content"]
     assert f"[🖥️ Open preview]({expected_file})" in content
@@ -558,10 +562,10 @@ def test_outlet_trims_terminal_exclamation_and_question_marks_from_bare_file_url
     filter_ = _make_filter()
     _prime_cache(filter_, CHAT_ID, public_url=public_base)
 
-    result = filter_.outlet(
+    result = asyncio.run(filter_.outlet(
         {"messages": [{"role": "assistant", "content": f"Finished: {file_url}{sentence_punctuation}"}]},
         __metadata__={"chat_id": CHAT_ID},
-    )
+    ))
 
     content = result["messages"][0]["content"]
     assert f"[🖥️ Open preview]({file_url})" in content
@@ -592,10 +596,10 @@ def test_outlet_preserves_trailing_punctuation_in_explicit_file_url_destinations
     filter_ = _make_filter()
     _prime_cache(filter_, CHAT_ID, public_url="https://webui.example/ocu")
 
-    result = filter_.outlet(
+    result = asyncio.run(filter_.outlet(
         {"messages": [{"role": "assistant", "content": message_content}]},
         __metadata__={"chat_id": CHAT_ID},
-    )
+    ))
 
     assert f"[🖥️ Open preview]({literal_file})" in result["messages"][0]["content"]
 
@@ -641,12 +645,12 @@ def test_video_header_requires_the_switch_and_the_active_model_filter(
     if filter_ids is not None:
         metadata["filter_ids"] = filter_ids
     with _live_asgi(_prompt_app(records, "server prompt", "https://webui.example/ocu")) as origin:
-        result = _make_filter(origin).inlet(
+        result = asyncio.run(_make_filter(origin).inlet(
             _active_body(),
             __user__={"email": "person@example.test"},
             __metadata__=metadata,
             __model__=model,
-        )
+        ))
 
     assert len(records) == 1
     assert records[0]["headers"].get("x-ocu-features") == expected
@@ -664,7 +668,7 @@ def test_video_and_plain_requests_in_one_chat_use_separate_cache_entries(monkeyp
         filter_ = _make_filter(origin)
         contents = [
             _system_content(
-                filter_.inlet(_active_body(), __user__=user, __metadata__=metadata, __model__=VIDEO_MODEL)
+                asyncio.run(filter_.inlet(_active_body(), __user__=user, __metadata__=metadata, __model__=VIDEO_MODEL))
             )
             for metadata in (video_metadata, plain_metadata, video_metadata, plain_metadata)
         ]
@@ -691,14 +695,14 @@ def test_video_inlet_fetch_then_outlet_decorates_from_the_cache(monkeypatch):
     user = {"email": "person@example.test"}
     with _live_asgi(_prompt_app(records, "server prompt", public_base)) as origin:
         filter_ = _make_filter(origin)
-        inlet_result = filter_.inlet(
+        inlet_result = asyncio.run(filter_.inlet(
             _active_body(), __user__=user, __metadata__=metadata, __model__=VIDEO_MODEL
-        )
-        outlet_result = filter_.outlet(
+        ))
+        outlet_result = asyncio.run(filter_.outlet(
             {"messages": [{"role": "assistant", "content": f"rendered {file_url}"}]},
             __user__=user,
             __metadata__=metadata,
-        )
+        ))
 
     assert _system_content(inlet_result) == "server prompt [features: video]"
     assert outlet_result["messages"][0]["content"] == (
@@ -725,7 +729,7 @@ class OrchestratorUrlNormalisation(unittest.TestCase):
 
     def test_inlet_does_not_emit_double_slash(self):
         f = _make_filter("http://localhost:8081/")
-        body = f.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
+        body = asyncio.run(f.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID}))
         self.assertNotIn("//files/", _system_content(body))
 
 
@@ -734,13 +738,13 @@ class EmptyChatIdHandling(unittest.TestCase):
 
     def test_inlet_skips_injection_when_chat_id_is_none(self):
         f = _make_filter()
-        body = f.inlet(_active_body(), __metadata__={})
+        body = asyncio.run(f.inlet(_active_body(), __metadata__={}))
         self.assertEqual("", _system_content(body),
                          "System prompt should not be injected when chat_id is missing")
 
     def test_inlet_skips_injection_when_metadata_missing(self):
         f = _make_filter()
-        body = f.inlet(_active_body(), __metadata__=None)
+        body = asyncio.run(f.inlet(_active_body(), __metadata__=None))
         self.assertEqual("", _system_content(body))
 
 
@@ -757,15 +761,15 @@ class BaselineBehaviour(unittest.TestCase):
 
     def test_inlet_injects_when_tool_active_and_chat_id_present(self):
         f = _make_filter()
-        body = f.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
+        body = asyncio.run(f.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID}))
         self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", _system_content(body))
 
     def test_inlet_attaches_tool_and_prompt_when_no_tool_selected(self):
         f = _make_filter()
-        body = f.inlet(
+        body = asyncio.run(f.inlet(
             {"tool_ids": [], "messages": [{"role": "user", "content": "hi"}]},
             __metadata__={"chat_id": CHAT_ID},
-        )
+        ))
         self.assertEqual(body["tool_ids"], ["ai_computer_use"])
         self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", _system_content(body))
 
@@ -783,7 +787,7 @@ class BaselineBehaviour(unittest.TestCase):
                 {"role": "user", "content": "hi"},
             ],
         }
-        result = f.inlet(body, __metadata__={"chat_id": CHAT_ID})
+        result = asyncio.run(f.inlet(body, __metadata__={"chat_id": CHAT_ID}))
         # Did not raise; injection still happened somewhere in the system slot
         system_content = result["messages"][0]["content"]
         self.assertIsInstance(system_content, str)
@@ -794,8 +798,8 @@ class BaselineBehaviour(unittest.TestCase):
         _prime_cache(f, CHAT_ID)
         link = f"http://localhost:8081/files/{CHAT_ID}/report.pdf"
         body = {"messages": [{"role": "assistant", "content": f"see {link}"}]}
-        out1 = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
-        out2 = f.outlet(out1, __metadata__={"chat_id": CHAT_ID})
+        out1 = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
+        out2 = asyncio.run(f.outlet(out1, __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(
             out1["messages"][0]["content"],
             out2["messages"][0]["content"],
@@ -816,7 +820,7 @@ class BaselineBehaviour(unittest.TestCase):
                 {"role": "tool", "content": f"tool output {link}"},
             ]
         }
-        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+        out = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(out["messages"][0]["content"], original_user)
         self.assertEqual(out["messages"][1]["content"], original_system)
         self.assertNotIn("archive", out["messages"][2]["content"].lower())
@@ -831,7 +835,7 @@ class BaselineBehaviour(unittest.TestCase):
         other_link = "http://localhost:8081/files/other-chat/report.pdf"
         original_content = f"see artefact from the other chat: {other_link}"
         body = {"messages": [{"role": "assistant", "content": original_content}]}
-        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+        out = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(
             out["messages"][0]["content"],
             original_content,
@@ -856,34 +860,34 @@ class HarnessToolInjection(unittest.TestCase):
         return {**fields, "messages": [{"role": "user", "content": "hi"}]}
 
     def test_missing_tool_key_is_created_with_the_tool(self):
-        body = _make_filter().inlet(self._body(), __metadata__={"chat_id": CHAT_ID})
+        body = asyncio.run(_make_filter().inlet(self._body(), __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(body["tool_ids"], ["ai_computer_use"])
         self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", _system_content(body))
 
     def test_user_selected_tools_stay_first_and_in_order(self):
-        body = _make_filter().inlet(
+        body = asyncio.run(_make_filter().inlet(
             self._body(tool_ids=["web_search", "calculator"]),
             __metadata__={"chat_id": CHAT_ID},
-        )
+        ))
         self.assertEqual(body["tool_ids"], ["web_search", "calculator", "ai_computer_use"])
 
     def test_already_selected_tool_appears_exactly_once(self):
-        body = _make_filter().inlet(
+        body = asyncio.run(_make_filter().inlet(
             self._body(tool_ids=["web_search", "ai_computer_use", "calculator"]),
             __metadata__={"chat_id": CHAT_ID},
-        )
+        ))
         self.assertEqual(body["tool_ids"], ["web_search", "ai_computer_use", "calculator"])
 
     def test_prompt_valve_off_still_attaches_the_tool(self):
         f = _make_filter()
         f.valves.INJECT_SYSTEM_PROMPT = False
-        body = f.inlet(self._body(tool_ids=["web_search"]), __metadata__={"chat_id": CHAT_ID})
+        body = asyncio.run(f.inlet(self._body(tool_ids=["web_search"]), __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(body["tool_ids"], ["web_search", "ai_computer_use"])
         self.assertEqual("", _system_content(body))
         self.urlopen.assert_not_called()
 
     def test_upper_case_saved_chat_id_gets_the_tool_and_prompt(self):
-        body = _make_filter().inlet(self._body(tool_ids=[]), __metadata__={"chat_id": CHAT_ID.upper()})
+        body = asyncio.run(_make_filter().inlet(self._body(tool_ids=[]), __metadata__={"chat_id": CHAT_ID.upper()}))
         self.assertEqual(body["tool_ids"], ["ai_computer_use"])
         self.assertIn(f"http://localhost:8081/files/{CHAT_ID}", _system_content(body))
 
@@ -900,7 +904,7 @@ class HarnessToolInjection(unittest.TestCase):
         ):
             for original in (self._body(), self._body(tool_ids=["web_search"])):
                 with self.subTest(metadata=metadata, original=original):
-                    body = _make_filter().inlet(copy.deepcopy(original), __metadata__=metadata)
+                    body = asyncio.run(_make_filter().inlet(copy.deepcopy(original), __metadata__=metadata))
                     self.assertEqual(body, original)
         self.urlopen.assert_not_called()
 
@@ -919,7 +923,7 @@ class SystemPromptFetchCache(unittest.TestCase):
             "urllib.request.OpenerDirector.open",
             return_value=_urlopen_mock("PROMPT_V1", public_base_url="http://pub:8081"),
         ):
-            result = f._fetch_system_prompt("chat-a", "")
+            result = asyncio.run(f._fetch_system_prompt("chat-a", ""))
         self.assertEqual(result, ("http://pub:8081", "PROMPT_V1"))
         self.assertIn(("chat-a", "", ""), f._prompt_cache)
         self.assertEqual(f._prompt_cache[("chat-a", "", "")][1], ("http://pub:8081", "PROMPT_V1"))
@@ -929,7 +933,7 @@ class SystemPromptFetchCache(unittest.TestCase):
         f = _make_filter()
         f._prompt_cache[("chat-a", "", "")] = (time.time(), ("http://pub:8081", "CACHED"))
         with patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("open must not be called")) as m:
-            result = f._fetch_system_prompt("chat-a", "")
+            result = asyncio.run(f._fetch_system_prompt("chat-a", ""))
         self.assertEqual(result, ("http://pub:8081", "CACHED"))
         m.assert_not_called()
 
@@ -937,7 +941,7 @@ class SystemPromptFetchCache(unittest.TestCase):
         f = _make_filter()
         f._prompt_cache[("chat-a", "", "")] = (time.time() - 301, ("http://pub:8081", "OLD"))
         with patch("urllib.request.OpenerDirector.open", return_value=_urlopen_mock("FRESH")):
-            result = f._fetch_system_prompt("chat-a", "")
+            result = asyncio.run(f._fetch_system_prompt("chat-a", ""))
         self.assertEqual(result[1], "FRESH")
         self.assertGreater(f._prompt_cache[("chat-a", "", "")][0], time.time() - 5)
 
@@ -945,7 +949,7 @@ class SystemPromptFetchCache(unittest.TestCase):
         f = _make_filter()
         with patch("urllib.request.OpenerDirector.open", side_effect=lambda *a, **kw: _urlopen_mock("P")):
             for i in range(1, 102):  # 101 distinct chat ids
-                f._fetch_system_prompt(f"chat-{i}", "")
+                asyncio.run(f._fetch_system_prompt(f"chat-{i}", ""))
         self.assertEqual(len(f._prompt_cache), 100)
         self.assertNotIn(("chat-1", "", ""), f._prompt_cache)
         self.assertIn(("chat-101", "", ""), f._prompt_cache)
@@ -957,13 +961,13 @@ class SystemPromptFetchCache(unittest.TestCase):
             ("http://pub:8081", "STALE"),
         )
         with patch("urllib.request.OpenerDirector.open", side_effect=urllib.error.URLError("conn refused")):
-            result = f._fetch_system_prompt("chat-a", "")
+            result = asyncio.run(f._fetch_system_prompt("chat-a", ""))
         self.assertEqual(result, ("http://pub:8081", "STALE"))
 
     def test_cold_cache_returns_none_when_server_down(self):
         f = _make_filter()
         with patch("urllib.request.OpenerDirector.open", side_effect=urllib.error.URLError("conn refused")):
-            result = f._fetch_system_prompt("chat-x", "")
+            result = asyncio.run(f._fetch_system_prompt("chat-x", ""))
         self.assertIsNone(result, f"Expected None on cold-cache failure, got {result!r}")
 
     def test_user_email_propagated_to_query_string(self):
@@ -980,7 +984,7 @@ class SystemPromptFetchCache(unittest.TestCase):
             return _urlopen_mock("P")
 
         with patch("urllib.request.OpenerDirector.open", side_effect=_capture):
-            f._fetch_system_prompt("chat-a", "user@example.com")
+            asyncio.run(f._fetch_system_prompt("chat-a", "user@example.com"))
         self.assertIn("chat_id=chat-a", captured["url"])
         self.assertIn("user_email=user%40example.com", captured["url"])
 
@@ -991,7 +995,7 @@ class SystemPromptFetchCache(unittest.TestCase):
         """
         f = _make_filter("file:///etc/passwd")
         with patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("must not be called")) as m:
-            result = f._fetch_system_prompt("chat-a", "")
+            result = asyncio.run(f._fetch_system_prompt("chat-a", ""))
         self.assertIsNone(result)
         m.assert_not_called()
 
@@ -1002,7 +1006,7 @@ class SystemPromptFetchCache(unittest.TestCase):
             ("http://pub:8081", "STALE"),
         )
         with patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("must not be called")):
-            result = f._fetch_system_prompt("chat-a", "")
+            result = asyncio.run(f._fetch_system_prompt("chat-a", ""))
         self.assertIsNone(result)
 
     def test_narrow_exception_propagates_programming_errors(self):
@@ -1012,7 +1016,7 @@ class SystemPromptFetchCache(unittest.TestCase):
         f = _make_filter()
         with patch("urllib.request.OpenerDirector.open", side_effect=AttributeError("boom")):
             with self.assertRaises(AttributeError):
-                f._fetch_system_prompt("chat-a", "")
+                asyncio.run(f._fetch_system_prompt("chat-a", ""))
 
     def test_cache_isolates_different_users_on_same_chat(self):
         """Two users sharing a chat_id must NOT see each other's baked <available_skills>."""
@@ -1023,8 +1027,8 @@ class SystemPromptFetchCache(unittest.TestCase):
             return _urlopen_mock(next(prompts))
 
         with patch("urllib.request.OpenerDirector.open", side_effect=_serve_next):
-            a = f._fetch_system_prompt("chat-shared", "alice@example.com", "")
-            b = f._fetch_system_prompt("chat-shared", "bob@example.com", "")
+            a = asyncio.run(f._fetch_system_prompt("chat-shared", "alice@example.com", ""))
+            b = asyncio.run(f._fetch_system_prompt("chat-shared", "bob@example.com", ""))
         self.assertEqual(a[1], "PROMPT_FOR_ALICE")
         self.assertEqual(b[1], "PROMPT_FOR_BOB")
         self.assertIn(("chat-shared", "alice@example.com", ""), f._prompt_cache)
@@ -1046,7 +1050,7 @@ class PreviewButton(unittest.TestCase):
 
     def test_outlet_appends_preview_button_by_default(self):
         f = self._filter()
-        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID})
+        body = asyncio.run(f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID}))
         content = body["messages"][0]["content"]
         self.assertIn(
             f"[🖥️ Open preview](http://localhost:8081/files/{CHAT_ID}/report.pdf)", content
@@ -1054,7 +1058,7 @@ class PreviewButton(unittest.TestCase):
 
     def test_outlet_never_emits_fenced_html_or_iframe(self):
         f = self._filter()
-        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID})
+        body = asyncio.run(f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID}))
         content = body["messages"][0]["content"]
         self.assertNotIn("<iframe", content)
         self.assertNotIn("```html", content)
@@ -1062,8 +1066,8 @@ class PreviewButton(unittest.TestCase):
     def test_outlet_preview_button_is_idempotent(self):
         f = self._filter()
         body = _assistant_body_with_file()
-        out1 = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
-        out2 = f.outlet(out1, __metadata__={"chat_id": CHAT_ID})
+        out1 = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
+        out2 = asyncio.run(f.outlet(out1, __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(out1["messages"][0]["content"], out2["messages"][0]["content"])
         self.assertEqual(
             out2["messages"][0]["content"].count("[🖥️ Open preview]"),
@@ -1073,7 +1077,7 @@ class PreviewButton(unittest.TestCase):
     def test_outlet_preview_mode_off_skips_button(self):
         f = self._filter()
         f.valves.PREVIEW_MODE = "off"
-        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID})
+        body = asyncio.run(f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID}))
         self.assertNotIn("[🖥️ Open preview]", body["messages"][0]["content"])
         self.assertIn(
             f"[📦 Download all files as archive](http://localhost:8081/files/{CHAT_ID}/archive)",
@@ -1083,7 +1087,7 @@ class PreviewButton(unittest.TestCase):
     def test_outlet_archive_button_off_skips_archive_without_disabling_preview(self):
         f = self._filter()
         f.valves.ARCHIVE_BUTTON = "off"
-        body = f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID})
+        body = asyncio.run(f.outlet(_assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID}))
         content = body["messages"][0]["content"]
         self.assertIn(
             f"[🖥️ Open preview](http://localhost:8081/files/{CHAT_ID}/report.pdf)", content
@@ -1095,7 +1099,7 @@ class PreviewButton(unittest.TestCase):
         other_link = "http://localhost:8081/files/other-chat/report.pdf"
         original = f"see artefact from another chat: {other_link}"
         body = {"messages": [{"role": "assistant", "content": original}]}
-        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+        out = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(out["messages"][0]["content"], original)
 
     def test_outlet_not_added_to_non_assistant_roles(self):
@@ -1108,7 +1112,7 @@ class PreviewButton(unittest.TestCase):
                 {"role": "tool", "content": f"t {link}"},
             ]
         }
-        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+        out = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
         for msg in out["messages"]:
             self.assertNotIn("[🖥️ Open preview]", msg["content"])
             self.assertNotIn("archive", msg["content"].lower())
@@ -1145,7 +1149,7 @@ class OutletCacheRecovery(unittest.TestCase):
             "urllib.request.OpenerDirector.open",
             side_effect=urllib.error.URLError("connection refused"),
         ):
-            out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+            out = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(
             out["messages"][0]["content"],
             original,
@@ -1159,7 +1163,7 @@ class OutletCacheRecovery(unittest.TestCase):
         link = f"http://localhost:8081/files/{CHAT_ID}/report.pdf"
         body = {"messages": [{"role": "assistant", "content": f"see {link}"}]}
         # Note: no __user__ passed
-        out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+        out = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
         decorated = out["messages"][0]["content"]
         self.assertIn(
             f"[🖥️ Open preview](http://localhost:8081/files/{CHAT_ID}/report.pdf)", decorated
@@ -1180,7 +1184,7 @@ class OutletCacheRecovery(unittest.TestCase):
             "urllib.request.OpenerDirector.open",
             side_effect=urllib.error.URLError("connection refused"),
         ):
-            out = f.outlet(body, __metadata__={"chat_id": CHAT_ID})
+            out = asyncio.run(f.outlet(body, __metadata__={"chat_id": CHAT_ID}))
         self.assertEqual(out["messages"][0]["content"], original)
 
 
@@ -1225,7 +1229,7 @@ def _user(content) -> dict:
 
 
 def _run_inlet(body: dict, chat_id: str = CHAT_ID, f=None) -> dict:
-    return (f or _make_filter()).inlet(body, __metadata__={"chat_id": chat_id})
+    return asyncio.run((f or _make_filter()).inlet(body, __metadata__={"chat_id": chat_id}))
 
 
 def test_marker_single_is_rewritten_and_names_the_skill(prompt_fetch):
@@ -1475,6 +1479,391 @@ def test_marker_sentence_never_enters_the_prompt_cache(prompt_fetch):
     assert prompt_fetch.call_count == 1
 
 
+# --- Async filter: the prompt fetch runs off the event loop (#777) ------------
+
+PUB = "http://localhost:8081"
+OTHER_CHAT = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+ROTATED_TOKEN = "rotated-filter-token"
+
+
+def _callback_prompt_app(callback: dict):
+    """A /system-prompt stub that calls back into the test's loop before answering.
+
+    Like OCU calling the WebUI skill registry (#753), it answers the prompt only
+    when the callback endpoint answered within 3 s, and 503 otherwise.
+    """
+
+    def system_prompt(_request):
+        try:
+            with urllib.request.urlopen(callback["url"], timeout=3) as response:
+                answered = response.read() == b"ok"
+        except OSError:
+            answered = False
+        if not answered:
+            return PlainTextResponse("registry callback timed out", status_code=503)
+        return PlainTextResponse("PROMPT", headers={"X-Public-Base-URL": PUB})
+
+    return Starlette(routes=[Route("/system-prompt", system_prompt)])
+
+
+async def _answer_ok(reader, writer):
+    try:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        )
+        await writer.drain()
+    except (ConnectionError, asyncio.IncompleteReadError):
+        # A blocked loop accepts the callback only after the stub gave up and
+        # closed its socket; nobody reads that late answer.
+        pass
+    finally:
+        writer.close()
+
+
+async def _timed_with_callback(callback: dict, call):
+    """Serve the callback endpoint on this loop and time one filter call."""
+    server = await asyncio.start_server(_answer_ok, "127.0.0.1", 0)
+    callback["url"] = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/registry"
+    try:
+        started = time.perf_counter()
+        result = await call()
+        elapsed = time.perf_counter() - started
+    finally:
+        server.close()
+        await server.wait_closed()
+    return result, elapsed
+
+
+def test_inlet_serves_a_callback_into_its_own_loop_during_the_fetch(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    callback = {}
+    with _live_asgi(_callback_prompt_app(callback)) as origin:
+        f = _make_filter(origin)
+        body, elapsed = asyncio.run(
+            _timed_with_callback(
+                callback,
+                lambda: f.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID}),
+            )
+        )
+
+    assert (_system_content(body), elapsed < 2) == ("PROMPT", True), (
+        f"inlet took {elapsed:.2f} s"
+    )
+
+
+def test_outlet_cache_miss_serves_a_callback_into_its_own_loop(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    callback = {}
+    file_url = f"{PUB}/files/{CHAT_ID}/report.pdf"
+    with _live_asgi(_callback_prompt_app(callback)) as origin:
+        f = _make_filter(origin)
+        assert len(f._prompt_cache) == 0
+        body, elapsed = asyncio.run(
+            _timed_with_callback(
+                callback,
+                lambda: f.outlet(
+                    _assistant_body_with_file(), __metadata__={"chat_id": CHAT_ID}
+                ),
+            )
+        )
+
+    linked = f"[🖥️ Open preview]({file_url})" in body["messages"][0]["content"]
+    assert (linked, elapsed < 2) == (True, True), f"outlet took {elapsed:.2f} s"
+
+
+def test_concurrent_inlets_all_get_the_prompt_within_the_cache_limit(monkeypatch):
+    _disable_proxy_env(monkeypatch)
+    monkeypatch.setattr(computer_link_filter, "_PROMPT_CACHE_MAX_SIZE", 5)
+    chat_ids = [f"{index:08x}-3b4d-4e8f-a1b2-c3d4e5f60718" for index in range(20)]
+    records = []
+    with _live_asgi(_prompt_app(records, "PROMPT", PUB)) as origin:
+        f = _make_filter(origin)
+
+        async def all_inlets():
+            return await asyncio.gather(
+                *(
+                    f.inlet(_active_body(), __metadata__={"chat_id": chat_id})
+                    for chat_id in chat_ids
+                )
+            )
+
+        bodies = asyncio.run(all_inlets())
+
+    assert [_system_content(body) for body in bodies] == ["PROMPT"] * 20
+    assert len(f._prompt_cache) <= 5
+
+
+def _prompt_response(_req):
+    return _urlopen_mock("PROMPT", public_base_url=PUB)
+
+
+def _headerless_response(_req):
+    response = _urlopen_mock("PROMPT")
+    response.headers = {}
+    return response
+
+
+def _unauthorized(req):
+    raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+
+def _transport_down(_req):
+    raise urllib.error.URLError("down")
+
+
+def _hold_open(monkeypatch, outcome, other_outcome=None):
+    """Park the CHAT_ID prompt request in its worker thread until released.
+
+    A request for OTHER_CHAT gets `other_outcome` at once. Nothing here runs on
+    the event loop or on a uvicorn loop.
+    """
+    events = SimpleNamespace(
+        received=threading.Event(),
+        release=threading.Event(),
+        finished=threading.Event(),
+    )
+
+    def held(_opener, req, timeout=None):
+        if other_outcome is not None and OTHER_CHAT in req.full_url:
+            return other_outcome(req)
+        try:
+            events.received.set()
+            events.release.wait(5)
+            return outcome(req)
+        finally:
+            events.finished.set()
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", held)
+    return events
+
+
+def _race_a_clear(f, events, clear):
+    """Run the fixed order: start the fetch, clear while it is held, release it."""
+
+    async def scenario():
+        task = asyncio.create_task(f._fetch_system_prompt(CHAT_ID, ""))
+        try:
+            assert await asyncio.to_thread(events.received.wait, 5)
+            cleared = await clear()
+        finally:
+            events.release.set()
+        return await task, cleared
+
+    return asyncio.run(scenario())
+
+
+def _switch_authority(f, monkeypatch):
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", ROTATED_TOKEN)
+    f._configured_authority()
+
+
+def test_fetch_completing_after_an_authority_switch_is_returned_not_cached(monkeypatch):
+    f = _make_filter()
+    events = _hold_open(monkeypatch, _prompt_response)
+
+    async def clear():
+        _switch_authority(f, monkeypatch)
+
+    result, _ = _race_a_clear(f, events, clear)
+
+    assert result == (PUB, "PROMPT")
+    assert (CHAT_ID, "", "") not in f._prompt_cache
+    assert f._cache_authority == (PUB, ROTATED_TOKEN)
+
+
+def test_late_rejection_keeps_entries_stored_after_the_newer_clear(monkeypatch):
+    f = _make_filter()
+    events = _hold_open(monkeypatch, _unauthorized)
+
+    async def clear():
+        _switch_authority(f, monkeypatch)
+        _prime_cache(f, OTHER_CHAT)
+
+    result, _ = _race_a_clear(f, events, clear)
+
+    assert result is None
+    assert (OTHER_CHAT, "", "") in f._prompt_cache
+
+
+def test_transport_error_after_a_clear_does_not_return_the_old_entry(monkeypatch):
+    f = _make_filter()
+    f._prompt_cache[(CHAT_ID, "", "")] = (
+        time.time() - computer_link_filter._PROMPT_TTL_SECONDS - 1,
+        (PUB, "STALE"),
+    )
+    events = _hold_open(monkeypatch, _transport_down)
+
+    async def clear():
+        _switch_authority(f, monkeypatch)
+
+    result, _ = _race_a_clear(f, events, clear)
+
+    assert result is None
+
+
+def test_fetch_completing_after_a_same_authority_clear_is_not_cached(monkeypatch):
+    f = _make_filter()
+    events = _hold_open(monkeypatch, _prompt_response)
+
+    async def clear():
+        monkeypatch.setenv("OCU_INTERNAL_TOKEN", "")
+        f._configured_authority()
+        monkeypatch.setenv("OCU_INTERNAL_TOKEN", "filter-test-token")
+        f._configured_authority()
+
+    result, _ = _race_a_clear(f, events, clear)
+
+    assert f._cache_authority == (PUB, "filter-test-token")
+    assert result == (PUB, "PROMPT")
+    assert (CHAT_ID, "", "") not in f._prompt_cache
+
+
+@pytest.mark.parametrize(
+    "other_outcome",
+    [_unauthorized, _headerless_response],
+    ids=["concurrent-401", "concurrent-missing-header"],
+)
+def test_fetch_completing_after_a_concurrent_rejection_is_not_cached(
+    monkeypatch, other_outcome
+):
+    f = _make_filter()
+    events = _hold_open(monkeypatch, _prompt_response, other_outcome)
+
+    async def clear():
+        return await f._fetch_system_prompt(OTHER_CHAT, "")
+
+    result, other_result = _race_a_clear(f, events, clear)
+
+    assert other_result is None
+    assert result == (PUB, "PROMPT")
+    assert (CHAT_ID, "", "") not in f._prompt_cache
+
+
+def _recorded(name: str):
+    def method(self, *args, **kwargs):
+        self.threads.append(threading.get_ident())
+        return getattr(OrderedDict, name)(self, *args, **kwargs)
+
+    method.__name__ = name
+    return method
+
+
+class _RecordingCache(OrderedDict):
+    """An OrderedDict that records the thread of each operation the filter uses."""
+
+    def __init__(self, threads: list):
+        super().__init__()
+        self.threads = threads
+
+
+for _name in (
+    "get",
+    "__getitem__",
+    "__setitem__",
+    "__contains__",
+    "move_to_end",
+    "popitem",
+    "clear",
+    "items",
+    "__len__",
+):
+    setattr(_RecordingCache, _name, _recorded(_name))
+
+
+def test_cache_and_authority_are_touched_only_on_the_loop_thread():
+    cache_threads: list = []
+    attribute_threads: list = []
+    opener_threads: list = []
+
+    class RecordingFilter(computer_link_filter.Filter):
+        def __setattr__(self, name, value):
+            if name in ("_cache_authority", "_cache_generation"):
+                attribute_threads.append(threading.get_ident())
+            super().__setattr__(name, value)
+
+    f = RecordingFilter()
+    f._prompt_cache = _RecordingCache(cache_threads)
+    miss, rejected, down = (
+        f"{index:08x}-0000-4000-8000-000000000000" for index in range(1, 4)
+    )
+
+    def opener(effect):
+        def open_(*args, **_kwargs):
+            opener_threads.append(threading.get_ident())
+            return effect(
+                next(arg for arg in args if isinstance(arg, urllib.request.Request))
+            )
+
+        return patch("urllib.request.OpenerDirector.open", side_effect=open_)
+
+    def must_not_open(_req):
+        raise AssertionError("a cache hit must not fetch")
+
+    paths = [
+        ("cache miss", _prompt_response, miss),
+        ("cache hit", must_not_open, miss),
+        ("401", _unauthorized, rejected),
+        ("transport error", _transport_down, down),
+    ]
+
+    async def drive():
+        loop_thread = threading.get_ident()
+        seen = {}
+        for name, effect, chat_id in paths:
+            del cache_threads[:], attribute_threads[:], opener_threads[:]
+            with opener(effect):
+                await f.inlet(_active_body(), __metadata__={"chat_id": chat_id})
+                await f.outlet(
+                    _assistant_body_with_file(chat_id),
+                    __metadata__={"chat_id": chat_id},
+                )
+            seen[name] = (
+                list(cache_threads),
+                list(attribute_threads),
+                list(opener_threads),
+            )
+        return loop_thread, seen
+
+    loop_thread, seen = asyncio.run(drive())
+
+    for name, (cache_ops, attribute_writes, opens) in seen.items():
+        assert cache_ops, f"{name}: no cache operation recorded"
+        assert set(cache_ops) == {loop_thread}, name
+        assert set(attribute_writes) == {loop_thread}, name
+        assert loop_thread not in opens, name
+    assert seen["cache hit"][2] == []
+    assert {name for name, (_, _, opens) in seen.items() if opens} == {
+        "cache miss",
+        "401",
+        "transport error",
+    }
+
+
+def test_cancelled_inlet_leaves_the_cache_and_generation_untouched(monkeypatch):
+    f = _make_filter()
+    _prime_cache(f, OTHER_CHAT)
+    events = _hold_open(monkeypatch, _prompt_response)
+
+    async def scenario():
+        before = (OrderedDict(f._prompt_cache), f._cache_generation)
+        task = asyncio.create_task(
+            f.inlet(_active_body(), __metadata__={"chat_id": CHAT_ID})
+        )
+        try:
+            assert await asyncio.to_thread(events.received.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            events.release.set()
+        assert await asyncio.to_thread(events.finished.wait, 5)
+        await asyncio.sleep(0)
+        return before, (OrderedDict(f._prompt_cache), f._cache_generation)
+
+    before, after = asyncio.run(scenario())
+
+    assert after == before
 
 
 if __name__ == "__main__":
