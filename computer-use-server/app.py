@@ -31,7 +31,7 @@ import aiohttp
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, Response, Depends, WebSocket, WebSocketDisconnect, Body, Query
 import claude_gateway
 import speech
-from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded
+from auth_guard import AuthGuardMiddleware, canonical_chat_id, AuthGuardError, startup_preflight, _guarded, _credential_matches
 from office.router import OfficeAvailabilityMiddleware, create_office_router
 from office import config as office_config
 from office.control_plane import install_source_access_log_filter
@@ -291,7 +291,7 @@ async def verify_mcp_auth(credentials: HTTPAuthorizationCredentials = Depends(se
             headers={"WWW-Authenticate": "Bearer"}
         )
 
-    if credentials.credentials != MCP_API_KEY:
+    if not _credential_matches(credentials.credentials, MCP_API_KEY):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
@@ -1697,7 +1697,7 @@ async def skill_stats(x_internal_api_key: Optional[str] = Header(default=None)):
     Requires X-Internal-Api-Key header (matches MCP_TOKENS_API_KEY env var).
     """
     api_key = os.getenv("MCP_TOKENS_API_KEY", "")
-    if api_key and x_internal_api_key != api_key:
+    if api_key and not _credential_matches(x_internal_api_key or "", api_key):
         raise HTTPException(status_code=403, detail="Forbidden")
     async with _central_log_lock:
         result = await asyncio.get_event_loop().run_in_executor(None, _harvest_and_get_stats)
