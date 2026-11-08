@@ -44,7 +44,7 @@ Picking an uploaded skill in the Open WebUI `/` menu sends the marker `<$ocu--{n
 
 (English: the user picked skill `{name}` with `/`; read its `SKILL.md` in `<available_skills>` before acting.) Sentences for several names are joined by a newline, and markers in earlier user messages add none. The sentence is added to the request only, never to the cached prompt, and it mounts nothing: the sandbox mounts only skills in the user's enabled set.
 
-A marker matches only when `{name}` follows the upload-name rule (`[a-z0-9][a-z0-9-]{0,63}`) and `{label}` contains no `>`. Any other `<$ocu--` text, and markers in assistant or system messages, are left verbatim. When the inlet returns early (no saved chat, `INJECT_SYSTEM_PROMPT` off, no token, or a failed or unauthorized prompt fetch), the body keeps the raw marker, and Open WebUI's native mention stripping later reduces it to `{label}`.
+A marker matches only when `{name}` follows the upload-name rule (`[a-z0-9][a-z0-9-]{0,63}`) and `{label}` contains no `<` or `>`; the `<` exclusion keeps the scan linear in the message length. Any other `<$ocu--` text, and markers in assistant or system messages, are left verbatim; native mention stripping may still reduce such a marker downstream, for example one whose label holds `<`. When the inlet returns early (no saved chat, `INJECT_SYSTEM_PROMPT` off, no token, or a failed or unauthorized prompt fetch), the body keeps the raw marker, and Open WebUI's native mention stripping later reduces it to `{label}`.
 
 ## Concrete file links
 

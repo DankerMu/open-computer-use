@@ -109,9 +109,11 @@ _SAVED_CHAT_ID_RE = re.compile(
 )
 
 # The `/` menu's uploaded-skill marker <$ocu--{name}|{label}>. The name class is
-# the WebUI upload-name rule and the label class that of native mention stripping,
-# so only a grammar-checked name can reach the system message.
-_SKILL_MARKER_RE = re.compile(r"<\$ocu--([a-z0-9][a-z0-9-]{0,63})\|([^>]*)>")
+# the WebUI upload-name rule, so only a grammar-checked name can reach the system
+# message. The label excludes `<` as well as `>`: every match attempt stops at the
+# next `<`, which keeps the scan linear on unterminated markers. A label holding
+# `<` is left to native mention stripping, whose label class is `[^>]*`.
+_SKILL_MARKER_RE = re.compile(r"<\$ocu--([a-z0-9][a-z0-9-]{0,63})\|([^<>]*)>")
 _SKILL_SENTENCE = "用户通过 / 指定使用 skill `{name}`，先阅读 `<available_skills>` 中它的 `SKILL.md` 再动手"
 
 
@@ -145,6 +147,11 @@ def _rewrite_skill_markers(messages: list) -> list[str]:
     Returns the distinct skill names of the last user message, in order.
     """
     names: list[str] = []
+
+    def to_label(match: re.Match) -> str:
+        names.append(match.group(1))
+        return match.group(2)
+
     for message in messages:
         if message.get("role") != "user":
             continue
@@ -161,13 +168,9 @@ def _rewrite_skill_markers(messages: list) -> list[str]:
             ]
         else:
             slots = []
-        names = [
-            match.group(1)
-            for holder, key in slots
-            for match in _SKILL_MARKER_RE.finditer(holder[key])
-        ]
+        names.clear()
         for holder, key in slots:
-            holder[key] = _SKILL_MARKER_RE.sub(r"\2", holder[key])
+            holder[key] = _SKILL_MARKER_RE.sub(to_label, holder[key])
     return list(dict.fromkeys(names))
 
 

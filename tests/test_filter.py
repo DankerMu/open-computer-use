@@ -1424,14 +1424,45 @@ def test_marker_in_assistant_or_system_messages_is_left_verbatim(prompt_fetch):
         "<$ocu--x`y|x>",
         "<$ocu--invoice-builder>",
         "<$ocu--" + "a" * 65 + "|x>",
+        "<$ocu---a|x>",
+        "<$ocu--Abc|x>",
+        "<$ocu--a|x<y>",
     ),
-    ids=("upper-and-space", "underscore", "backtick", "no-pipe", "name-too-long"),
+    ids=(
+        "upper-and-space",
+        "underscore",
+        "backtick",
+        "no-pipe",
+        "name-too-long",
+        "leading-hyphen",
+        "upper-case",
+        "label-with-lt",
+    ),
 )
 def test_marker_outside_the_grammar_is_left_verbatim(prompt_fetch, text):
     body = _run_inlet(_chat_body(_user(f"用 {text}")))
 
     assert body["messages"][1] == _user(f"用 {text}")
     assert _system_content(body) == "PROMPT"
+
+
+def test_marker_name_of_64_characters_is_rewritten(prompt_fetch):
+    name = "a" * 64
+    body = _run_inlet(_chat_body(_user(f"用 <$ocu--{name}|x>")))
+
+    assert body["messages"][1] == _user("用 x")
+    assert _system_content(body) == "PROMPT\n\n" + _skill_sentence(name)
+
+
+def test_marker_scan_is_linear_on_unterminated_markers(prompt_fetch):
+    text = "<$ocu--a|" * 20000
+    started = time.perf_counter()
+    body = _run_inlet(_chat_body(_user(text)))
+    elapsed = time.perf_counter() - started
+
+    assert body["messages"][1] == _user(text)
+    assert _system_content(body) == "PROMPT"
+    assert elapsed < 1.0, f"inlet took {elapsed:.2f}s on 180 KB of unterminated markers"
 
 
 def test_marker_sentence_never_enters_the_prompt_cache(prompt_fetch):
