@@ -682,14 +682,43 @@ def check_upload_name(filename: str) -> Path:
     return relative
 
 
+def _receipted_copy_present(chat_id: str, stored_name: str) -> bool:
+    """Probe a receipted name as a regular file under outputs, never following links.
+
+    A name failing the upload-name rule is a corrupt receipt, not a missing
+    copy. Only not-found, the traversal denial (symlink, directory or other
+    non-regular entry, or such an ancestor) and an absent outputs root count
+    as missing; any other OSError propagates.
+    """
+    try:
+        parts = check_upload_name(stored_name).parts
+    except HTTPException as exc:
+        raise CorruptReceiptsError("import receipts are corrupt") from exc
+    root_fd = _open_outputs_root(chat_id)
+    if root_fd is None:
+        return False
+    try:
+        close_fd(_open_regular_relative(root_fd, parts))
+        return True
+    except (FileNotFoundError, HTTPException):
+        return False
+    finally:
+        close_fd(root_fd)
+
+
 def store_upload(
     chat_id: str, filename: str, content: bytes, attachment_id: str | None = None,
+    *, reimport_missing: bool = False,
 ) -> tuple[str, str, int]:
     """Publish bytes under ``outputs/`` with the collision suffix; return name, md5, size.
 
     Shared by the upload route and the generate_speech tool. Keeps blocking
     lock and file operations on one worker thread under the chat's
     create-capable lifecycle lock, which refuses a tombstoned chat.
+
+    A receipted ``attachment_id`` returns its recorded record. With
+    ``reimport_missing``, a record whose copy no longer opens as a regular
+    file is published again as a new upload and its receipt rewritten.
 
     Ancestors stay pinned by directory fds from the chat root. Staging is a
     private ``.ocu`` file; publication hard-links from that directory into
@@ -705,7 +734,9 @@ def store_upload(
         receipts = read_import_receipts(chat_dir) if attachment_id else None
         if attachment_id and attachment_id in receipts:
             record = receipts[attachment_id]
-            return record["stored_name"], record["md5"], record["size"]
+            if not reimport_missing or _receipted_copy_present(
+                    chat_id, record["stored_name"]):
+                return record["stored_name"], record["md5"], record["size"]
         parent_parts = () if relative.parent == Path(".") else relative.parent.parts
         if any(part in {"", ".", ".."} for part in parent_parts):
             raise HTTPException(status_code=403, detail="Invalid upload path")
