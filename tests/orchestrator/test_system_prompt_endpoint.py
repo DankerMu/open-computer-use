@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "computer-use-server"))
 
@@ -21,6 +23,16 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import app as app_module  # noqa: E402
 import skill_manager as skill_manager_module  # noqa: E402
+import system_prompt  # noqa: E402
+
+COPY_KNOWLEDGE_OPENING = "If a `copy_knowledge_file` tool is available"
+COPY_KNOWLEDGE_SENTENCE = (
+    "If a `copy_knowledge_file` tool is available, it brings a knowledge-base document's "
+    "original file into `/mnt/user-data/files/`, where you can process it like an uploaded file."
+)
+UPLOADED_NOTES_OPEN = "<notes_on_user_uploaded_files>"
+UPLOADED_NOTES_CLOSE = "</notes_on_user_uploaded_files>"
+USER_SKILLS_XML = "<available_skills>\n<skill>\n<name>\nexample\n</name>\n</skill>\n</available_skills>"
 
 
 class SystemPromptEndpointContract(unittest.TestCase):
@@ -202,6 +214,33 @@ class SystemPromptEndpointContract(unittest.TestCase):
             body,
             r"(?is)/mnt/user-data/files.{0,400}(uploaded|generated).{0,400}(uploaded|generated)",
         )
+
+    def test_uploaded_files_notes_carry_copy_knowledge_file_sentence(self):
+        """DankerMu/open-webui#785: a saved chat's prompt tells the model, inside
+        the uploaded-files notes, what an available copy tool does."""
+        resp = self.client.get(
+            "/system-prompt", params={"chat_id": "3f6c1e2a-8b4d-4c7e-9a15-2d0f6b8e4c31"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertEqual(body.count(COPY_KNOWLEDGE_OPENING), 1)
+        self.assertEqual(body.count(COPY_KNOWLEDGE_SENTENCE), 1)
+        self.assertEqual(body.count(UPLOADED_NOTES_OPEN), 1)
+        self.assertEqual(body.count(UPLOADED_NOTES_CLOSE), 1)
+        self.assertLess(body.index(UPLOADED_NOTES_OPEN), body.index(COPY_KNOWLEDGE_SENTENCE))
+        self.assertLess(body.index(COPY_KNOWLEDGE_SENTENCE), body.index(UPLOADED_NOTES_CLOSE))
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    (
+        system_prompt.SYSTEM_PROMPT_TEMPLATE,
+        system_prompt.build_system_prompt(skills_xml=USER_SKILLS_XML),
+    ),
+    ids=("template", "built"),
+)
+def test_every_prompt_variant_carries_copy_knowledge_file_sentence_once(prompt):
+    assert prompt.count(COPY_KNOWLEDGE_SENTENCE) == 1
 
 
 

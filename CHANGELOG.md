@@ -3,6 +3,11 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **Prompt sentence for `copy_knowledge_file` (#785).** The uploaded-files
+  notes of every rendered prompt, and of the `README.md` written into a new
+  sandbox, end with ``If a `copy_knowledge_file` tool is available, it brings
+  a knowledge-base document's original file into `/mnt/user-data/files/`,
+  where you can process it like an uploaded file.``
 - **Production-like overlay reads the WebUI skill registry (#753).**
   `compose.core.override.yml` gives `computer-use-server`, and no other
   service, `MCP_TOKENS_URL` (default
