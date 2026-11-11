@@ -24,7 +24,7 @@ import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Literal
+from typing import Annotated, Optional, Dict, List, Any, Literal
 from urllib.parse import quote, urlsplit
 
 import aiohttp
@@ -658,6 +658,9 @@ async def upload_file(
     filename: str,
     file: UploadFile = File(...),
     x_ocu_attachment_id: Optional[str] = Header(default=None, alias="X-OCU-Attachment-Id"),
+    # Annotated keeps the Python default None for in-process callers of upload_file.
+    x_ocu_reimport_missing: Annotated[
+        Optional[str], Header(alias="X-OCU-Reimport-Missing")] = None,
 ):
     """
     Upload a file to the chat workspace files directory.
@@ -671,14 +674,23 @@ async def upload_file(
         Success message with file info
 
     Raises:
-        400: Invalid filename or security violation
+        400: Invalid filename, security violation, or a malformed
+            X-OCU-Reimport-Missing header (present but not "1", or "1"
+            without an attachment id)
     """
     chat_id = sanitize_chat_id(chat_id)
     attachment_id = (x_ocu_attachment_id or "").strip() or None
+    reimport_missing = x_ocu_reimport_missing is not None
+    if reimport_missing and x_ocu_reimport_missing != "1":
+        raise HTTPException(status_code=400, detail="X-OCU-Reimport-Missing must be 1")
+    if reimport_missing and attachment_id is None:
+        raise HTTPException(
+            status_code=400, detail="X-OCU-Reimport-Missing requires X-OCU-Attachment-Id")
     try:
         content = await file.read()
         stored_name, md5_hash, size = await asyncio.to_thread(
-            store_upload, chat_id, filename, content, attachment_id
+            store_upload, chat_id, filename, content, attachment_id,
+            reimport_missing=reimport_missing,
         )
 
         # Publication is already committed. Discovery reports a separate outcome,

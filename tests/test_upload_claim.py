@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -85,6 +86,14 @@ def _upload(client, name, body, attachment_id=None):
     headers = HEADERS if attachment_id is None else {
         **HEADERS, "X-OCU-Attachment-Id": attachment_id,
     }
+    return client.post(f"/api/uploads/{CHAT}/{name}", headers=headers,
+                       files={"file": ("attachment", body)})
+
+
+def _reimport(client, name, body, attachment_id=None, value="1"):
+    headers = {**HEADERS, "X-OCU-Reimport-Missing": value}
+    if attachment_id is not None:
+        headers["X-OCU-Attachment-Id"] = attachment_id
     return client.post(f"/api/uploads/{CHAT}/{name}", headers=headers,
                        files={"file": ("attachment", body)})
 
@@ -346,6 +355,240 @@ def test_headerless_upload_does_not_create_or_mutate_receipts(upload_server):
     assert _receipts(uploads) == receipts
     listed = _imports(client)
     assert listed.status_code == 200 and listed.json() == {"ids": ["F1"]}
+
+
+ORIGINAL = b"imported-original"
+ORIGINAL_RESPONSE = {"status": "success", "filename": "brief.docx",
+                     "size": 17, "md5": "d75428910d5a127b64d0164ef3da01ff"}
+AGAIN = b"knowledge-bytes-again"
+
+
+def _success(name, body):
+    return {"status": "success", "filename": name, "size": len(body),
+            "md5": hashlib.md5(body).hexdigest()}
+
+
+def _receipted_pair(client, uploads):
+    """Receipt F1 as brief.docx beside bystander F2; return the receipt bytes."""
+    assert _upload(client, "brief.docx", ORIGINAL, attachment_id="F1").status_code == 200
+    assert _upload(client, "other.txt", b"other", attachment_id="F2").status_code == 200
+    return (uploads.parent / ".ocu" / "imports.json").read_bytes()
+
+
+def _assert_restored(client, uploads, prior_bytes, name, body):
+    prior = json.loads(prior_bytes)
+    receipts = _receipts(uploads)
+    assert set(receipts) == {"F1", "F2"}
+    assert receipts["F2"] == prior["F2"]
+    record = receipts["F1"]
+    assert (record["stored_name"], record["size"], record["md5"]) == (
+        name, len(body), hashlib.md5(body).hexdigest())
+    assert record["imported_at"] != prior["F1"]["imported_at"]
+    assert (uploads / name).read_bytes() == body
+    listed = _imports(client)
+    assert listed.status_code == 200 and sorted(listed.json()["ids"]) == ["F1", "F2"]
+
+
+def test_reimport_header_first_copy_stores_file_and_records_receipt(upload_server):
+    client, uploads = upload_server
+    response = _reimport(client, "brief.docx", ORIGINAL, attachment_id="F1")
+    assert response.status_code == 200
+    assert response.json() == ORIGINAL_RESPONSE
+    assert (uploads / "brief.docx").read_bytes() == ORIGINAL
+    record = _receipts(uploads)["F1"]
+    assert (record["stored_name"], record["size"], record["md5"]) == (
+        "brief.docx", 17, ORIGINAL_RESPONSE["md5"])
+
+
+def test_reimport_header_keeps_edited_copy_and_reports_receipt(upload_server):
+    client, uploads = upload_server
+    prior = _receipted_pair(client, uploads)
+    (uploads / "brief.docx").write_bytes(b"user-edited-bytes-longer")
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1")
+    assert response.status_code == 200
+    assert response.json() == ORIGINAL_RESPONSE
+    assert (uploads / "brief.docx").read_bytes() == b"user-edited-bytes-longer"
+    assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx", "other.txt"]
+    assert (uploads.parent / ".ocu" / "imports.json").read_bytes() == prior
+
+
+def test_reimport_header_restores_deleted_copy_and_rewrites_receipt(upload_server):
+    client, uploads = upload_server
+    prior = _receipted_pair(client, uploads)
+    (uploads / "brief.docx").unlink()
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1")
+    assert response.status_code == 200
+    assert response.json() == _success("brief.docx", AGAIN)
+    assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx", "other.txt"]
+    _assert_restored(client, uploads, prior, "brief.docx", AGAIN)
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink"])
+def test_reimport_header_suffixes_copy_beside_non_regular_occupant(upload_server, kind):
+    client, uploads = upload_server
+    prior = _receipted_pair(client, uploads)
+    occupant = uploads / "brief.docx"
+    occupant.unlink()
+    target = uploads.parent / "target.docx"
+    target.write_bytes(b"target-bytes")
+    if kind == "directory":
+        occupant.mkdir()
+        (occupant / "child").write_bytes(b"child-bytes")
+    else:
+        occupant.symlink_to(target)
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1")
+    assert response.status_code == 200
+    assert response.json() == _success("brief (2).docx", AGAIN)
+    _assert_restored(client, uploads, prior, "brief (2).docx", AGAIN)
+    if kind == "directory":
+        assert occupant.is_dir() and not occupant.is_symlink()
+        assert [path.name for path in occupant.iterdir()] == ["child"]
+        assert (occupant / "child").read_bytes() == b"child-bytes"
+    else:
+        assert occupant.is_symlink() and occupant.readlink() == target
+    assert target.read_bytes() == b"target-bytes"
+    assert sorted(path.name for path in uploads.iterdir()) == [
+        "brief (2).docx", "brief.docx", "other.txt"]
+
+
+def test_concurrent_reimports_of_deleted_copy_store_one_file(upload_server):
+    client, uploads = upload_server
+    prior = _receipted_pair(client, uploads)
+    (uploads / "brief.docx").unlink()
+    barrier = threading.Barrier(2)
+
+    def send(_):
+        barrier.wait(timeout=10)
+        response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1")
+        assert response.status_code == 200
+        return response.json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(send, range(2)))
+    assert results == [_success("brief.docx", AGAIN)] * 2
+    assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx", "other.txt"]
+    _assert_restored(client, uploads, prior, "brief.docx", AGAIN)
+
+
+@pytest.mark.parametrize("deleted", [False, True], ids=["fresh", "deleted"])
+@pytest.mark.parametrize("value", ["yes", ""], ids=["yes", "empty"])
+def test_reimport_header_invalid_value_is_rejected_before_storage(
+        upload_server, value, deleted):
+    client, uploads = upload_server
+    prior = None
+    if deleted:
+        prior = _receipted_pair(client, uploads)
+        (uploads / "brief.docx").unlink()
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1", value=value)
+    assert response.request.headers["X-OCU-Reimport-Missing"] == value
+    assert response.status_code == 400
+    receipt = uploads.parent / ".ocu" / "imports.json"
+    if deleted:
+        assert sorted(path.name for path in uploads.iterdir()) == ["other.txt"]
+        assert receipt.read_bytes() == prior
+    else:
+        assert not uploads.exists() and not receipt.exists()
+
+
+@pytest.mark.parametrize("attachment_id", [None, "   "], ids=["absent", "whitespace"])
+def test_reimport_header_without_attachment_id_is_rejected(upload_server, attachment_id):
+    client, uploads = upload_server
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id=attachment_id)
+    assert response.request.headers.get("X-OCU-Attachment-Id") == attachment_id
+    assert response.status_code == 400
+    assert not uploads.exists()
+    assert not (uploads.parent / ".ocu" / "imports.json").exists()
+
+
+def test_reimport_header_with_corrupt_receipts_fails_without_writing(upload_server):
+    client, uploads = upload_server
+    _receipted_pair(client, uploads)
+    (uploads / "brief.docx").unlink()
+    receipt = uploads.parent / ".ocu" / "imports.json"
+    receipt.write_text("{not-json")
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1")
+    assert response.status_code == 500
+    assert sorted(path.name for path in uploads.iterdir()) == ["other.txt"]
+    assert receipt.read_text() == "{not-json"
+
+
+@pytest.mark.parametrize("crafted", ["absolute", "parent"])
+def test_reimport_header_rejects_receipt_name_outside_outputs(upload_server, crafted):
+    client, uploads = upload_server
+    _receipted_pair(client, uploads)
+    (uploads / "brief.docx").unlink()
+    outside = uploads.parent / "outside.docx"
+    outside.write_bytes(b"outside-bytes")
+    receipt = uploads.parent / ".ocu" / "imports.json"
+    receipts = json.loads(receipt.read_bytes())
+    receipts["F1"]["stored_name"] = str(outside) if crafted == "absolute" else "../outside.docx"
+    receipt.write_text(json.dumps(receipts))
+    before = receipt.read_bytes()
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "import receipts are corrupt"}
+    assert sorted(path.name for path in uploads.iterdir()) == ["other.txt"]
+    assert receipt.read_bytes() == before
+    assert outside.read_bytes() == b"outside-bytes"
+
+
+def test_reimport_probe_io_error_fails_without_writing(upload_server, monkeypatch):
+    import descriptor_io
+
+    client, uploads = upload_server
+    prior = _receipted_pair(client, uploads)
+    original = descriptor_io.open_regular
+
+    def failing_open(path, **kwargs):
+        if path == "brief.docx":
+            raise descriptor_io.DescriptorOpenError(
+                OSError(errno.EIO, "injected probe failure"))
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(descriptor_io, "open_regular", failing_open)
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1")
+    assert response.status_code == 500
+    assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx", "other.txt"]
+    assert (uploads / "brief.docx").read_bytes() == ORIGINAL
+    assert (uploads.parent / ".ocu" / "imports.json").read_bytes() == prior
+
+
+def test_reimport_receipt_write_failure_retries_from_restored_copy(upload_server, monkeypatch):
+    import uploads as upload_store
+
+    client, uploads = upload_server
+    assert _upload(client, "brief.docx", ORIGINAL, attachment_id="F1").status_code == 200
+    receipt = uploads.parent / ".ocu" / "imports.json"
+    prior = receipt.read_bytes()
+    (uploads / "brief.docx").unlink()
+    original = upload_store.write_import_receipts
+
+    def fail_once(chat_dir, receipts):
+        raise OSError("injected receipt write failure")
+
+    monkeypatch.setattr(upload_store, "write_import_receipts", fail_once)
+    failed = _reimport(client, "brief.docx", ORIGINAL, attachment_id="F1")
+    assert failed.status_code == 500
+    assert receipt.read_bytes() == prior
+    assert (uploads / "brief.docx").read_bytes() == ORIGINAL
+    monkeypatch.setattr(upload_store, "write_import_receipts", original)
+    retry = _reimport(client, "brief.docx", ORIGINAL, attachment_id="F1")
+    assert retry.status_code == 200
+    assert retry.json() == ORIGINAL_RESPONSE
+    assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx"]
+    assert receipt.read_bytes() == prior
+
+
+def test_reimport_header_recreates_removed_outputs_root(upload_server):
+    client, uploads = upload_server
+    prior = _receipted_pair(client, uploads)
+    shutil.rmtree(uploads)
+    assert (uploads.parent / ".ocu" / "imports.json").is_file()
+    response = _reimport(client, "brief.docx", AGAIN, attachment_id="F1")
+    assert response.status_code == 200
+    assert response.json() == _success("brief.docx", AGAIN)
+    assert sorted(path.name for path in uploads.iterdir()) == ["brief.docx"]
+    _assert_restored(client, uploads, prior, "brief.docx", AGAIN)
 
 
 def test_receipts_live_outside_uploads_and_record_original_metadata(upload_server):
