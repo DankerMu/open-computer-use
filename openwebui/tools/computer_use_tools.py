@@ -3,7 +3,7 @@
 """
 title: Computer Use Tools
 author: OpenWebUI Implementation
-version: 4.2.0
+version: 4.3.0
 
 Thin MCP client proxy to computer-use-orchestrator. All tool configuration is server-side.
 ORCHESTRATOR_URL and optional MCP_API_KEY are Valves; OCU_INTERNAL_TOKEN is read from the process environment per call.
@@ -692,15 +692,18 @@ class Tools:
             return "[TOOL ERROR] chat_id is required."
         return self._configuration_error()
 
-    async def _emit_terminal_error(self, emitter, description: str) -> None:
+    async def _emit_status(self, emitter, description: str, status: str, done: bool) -> None:
         if not emitter:
             return
         try:
             await emitter({"type": "status", "data": {
-                "description": description, "status": "error", "done": True,
+                "description": description, "status": status, "done": done,
             }})
         except Exception:
             pass
+
+    async def _emit_terminal_error(self, emitter, description: str) -> None:
+        await self._emit_status(emitter, description, "error", True)
 
     async def _emit_workspace_hint(self, emitter, chat_id: str) -> None:
         if not emitter:
@@ -842,14 +845,7 @@ class Tools:
             return f"{error}\n\n{sync_warning}" if sync_warning else error
 
         async def emit(description: str, status: str, done: bool):
-            if not emitter:
-                return
-            try:
-                await emitter({"type": "status", "data": {
-                    "description": description, "status": status, "done": done,
-                }})
-            except Exception:
-                pass
+            await self._emit_status(emitter, description, status, done)
 
         await emit(in_progress_desc, "in_progress", False)
         invoked = False
@@ -1100,6 +1096,57 @@ class Tools:
             extra_headers=await _gateway_headers(__request__, __metadata__, __user__),
         )
 
+    async def copy_knowledge_file(
+        self,
+        file_id: str,
+        description: str,
+        __event_emitter__: Callable[[dict], Awaitable[None]] = None,
+        __metadata__: dict = None,
+    ) -> str:
+        """
+        Copy one knowledge-base document's original file into /mnt/user-data/files/, so the sandbox can process it.
+        1. Find the file's id with the knowledge tools (search_knowledge_files or query_knowledge_files).
+        2. Copy it with this tool; the result names its path under /mnt/user-data/files/.
+        3. Process the copy there, for example extract its figures with the docx or pdf skill.
+        4. Show each extracted figure to the user as a markdown image ![description](URL) with its workspace file link.
+        Only a file in a knowledge base the chat's owner can read is copied; copying it again returns the same path.
+
+        :param file_id: The knowledge-base file's id, from the knowledge tools
+        :param description: Why I'm copying this file
+        :return: The sandbox path of the copy, or an error
+        """
+        chat_id, error = await self._prepare_tool_call(__metadata__, __event_emitter__)
+        if error:
+            return error
+        emitter = __event_emitter__
+        await self._emit_status(emitter, description or "Copying knowledge file...", "in_progress", False)
+        entry, result = await _knowledge_file_entry(chat_id, file_id)
+        if entry is not None:
+            # Re-import: the receipt dedupes repeat copies, and a deleted copy is stored again.
+            sync_result = await asyncio.to_thread(
+                _sync_uploaded_files,
+                self.valves.ORCHESTRATOR_URL,
+                chat_id,
+                [entry],
+                os.environ.get("OCU_INTERNAL_TOKEN", ""),
+                debug=self.valves.DEBUG_LOGGING,
+                extra_headers={"X-OCU-Reimport-Missing": "1"},
+            )
+            if sync_result["synced"]:
+                stored_name = sync_result["stored"][0][1]
+                result = "\n\n".join([
+                    f"Copied {entry['name']} to /mnt/user-data/files/{stored_name}",
+                    *sync_result.get("warnings", []),
+                ])
+            else:
+                result = f"Error: upload of {entry['name']} failed"
+        if result.startswith("Error:"):
+            await self._emit_terminal_error(emitter, "Knowledge file copy failed")
+            return result
+        await self._emit_status(emitter, "Knowledge file copied", "complete", True)
+        await self._emit_workspace_hint(emitter, chat_id)
+        return result
+
 
 # ============================================================================
 # File sync helper (HTTP — no SSH needed)
@@ -1182,8 +1229,7 @@ async def _readable_files(candidates: list, user) -> list:
     entries = []
     for file_id, image_only in candidates:
         try:
-            row = await Files.get_file_by_id(file_id)
-            meta = (row.meta or {}) if row is not None else {}
+            row, meta, entry = await _load_file(Files, file_id)
             if row is None or not row.path:
                 reason = "no stored file"
             elif image_only and not str(meta.get("content_type") or "").startswith("image/"):
@@ -1191,13 +1237,83 @@ async def _readable_files(candidates: list, user) -> list:
             elif row.user_id != owner.id and not await has_access_to_file(file_id, "read", owner):
                 reason = "no read access for the requesting user"
             else:
-                name = os.path.basename(meta.get("name") or row.filename or file_id)
-                entries.append({"id": row.id, "name": name, "path": row.path})
+                entries.append(entry())
                 continue
         except Exception as e:
             reason = f"{type(e).__name__}: {e}"
         print(f"[SYNC] File {file_id} skipped: {reason}")
     return entries
+
+
+async def _load_file(Files, file_id: str):
+    """Load a WebUI file row for a resolver: (row, meta, entry).
+
+    entry() builds the sync entry {"id", "name", "path"}, named after the basename of
+    meta.name, else the filename, else the id. Each resolver calls it only after its
+    own checks pass, so naming never runs for a refused row.
+    """
+    row = await Files.get_file_by_id(file_id)
+    meta = (row.meta or {}) if row is not None else {}
+
+    def entry():
+        name = os.path.basename(meta.get("name") or row.filename or file_id)
+        return {"id": row.id, "name": name, "path": row.path}
+
+    return row, meta, entry
+
+
+async def _knowledge_file_entry(chat_id: str, file_id: str):
+    """(sync entry, None) for a file the chat's owner may read through a knowledge base,
+    else (None, the Error: result).
+
+    The subject is the chat's owner, whoever calls the tool. Administrator status, direct
+    file ownership and the legacy meta.collection_name grant nothing. Access is checked
+    before the stored path, so an unreadable file never reveals whether it has bytes.
+    """
+    try:
+        from open_webui.models.chats import Chats
+
+        owner_id = getattr(await Chats.get_chat_by_id(chat_id), "user_id", None)
+    except Exception as e:
+        print(f"[COPY] Chat {chat_id} not read: {type(e).__name__}: {e}")
+        owner_id = None
+    if not owner_id:
+        return None, "Error: chat not found"
+    try:
+        from open_webui.models.files import Files
+
+        row, _, entry = await _load_file(Files, file_id)
+        if row is None:
+            return None, f"Error: file {file_id} not found"
+        if not await _owner_can_read_knowledge_file(file_id, owner_id):
+            return None, f"Error: file {file_id} is not in a knowledge base the chat owner can read"
+        if not row.path:
+            return None, f"Error: file {file_id} has no stored bytes"
+        return entry(), None
+    except Exception as e:
+        print(f"[COPY] File {file_id} lookup failed: {type(e).__name__}: {e}")
+        return None, f"Error: lookup of file {file_id} failed"
+
+
+async def _owner_can_read_knowledge_file(file_id: str, owner_id: str) -> bool:
+    """True when a knowledge base linked to the file is owned by, or read-granted to,
+    the owner: directly, through one of the owner's groups, or to every user (user:*)."""
+    from open_webui.models.access_grants import AccessGrants
+    from open_webui.models.groups import Groups
+    from open_webui.models.knowledge import Knowledges
+
+    group_ids = None
+    for knowledge in await Knowledges.get_knowledges_by_file_id(file_id):
+        if knowledge.user_id == owner_id:
+            return True
+        if group_ids is None:
+            group_ids = {group.id for group in await Groups.get_groups_by_member_id(owner_id)}
+        if await AccessGrants.has_access(
+            user_id=owner_id, resource_type="knowledge", resource_id=knowledge.id,
+            permission="read", user_group_ids=group_ids,
+        ):
+            return True
+    return False
 
 
 def _imported_attachment_ids(orchestrator_url, chat_id, headers):
@@ -1233,8 +1349,13 @@ def _sync_uploaded_files(
     entries: list,
     internal_token: str,
     debug: bool = False,
+    *,
+    extra_headers: Optional[dict] = None,
 ) -> dict:
-    """Upload resolved files ({"id", "name", "path"} from _readable_files) by WebUI id."""
+    """Upload resolved files ({"id", "name", "path"} from a resolver) by WebUI id.
+
+    extra_headers are sent on every upload, after the attachment-id header.
+    """
     import requests
 
     headers = {"Authorization": f"Bearer {internal_token}"}
@@ -1269,6 +1390,7 @@ def _sync_uploaded_files(
             upload_headers = {
                 **headers,
                 "X-OCU-Attachment-Id": attachment_id,
+                **(extra_headers or {}),
             }
             with open(source_path, "rb") as f:
                 files_data = {"file": (filename, f, "application/octet-stream")}

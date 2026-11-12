@@ -3,6 +3,19 @@
 ## Unreleased — `main` branch
 
 ### Added
+- **`copy_knowledge_file` tool (#786).** The Open WebUI tool (4.3.0) offers
+  `copy_knowledge_file(file_id, description)`, which copies one WebUI file into
+  `/mnt/user-data/files/` and returns `Copied <name> to
+  /mnt/user-data/files/<stored name>`. It copies only a file linked to a
+  knowledge base that the chat's owner owns or may read through a grant to the
+  owner, one of the owner's groups or every user (`user:*`); the caller,
+  administrator status and the legacy `collection_name` metadata grant nothing.
+  The upload carries `X-OCU-Attachment-Id: <file id>` and
+  `X-OCU-Reimport-Missing: 1`, so a repeated copy returns the existing path, an
+  edited copy is kept and a deleted copy is stored again; attachment and
+  chat-image sync still send no re-import header. A refusal or failure returns
+  an `Error:` line and a refusal uploads nothing. An existing deployment must
+  re-run the initializer (#590 step 2), so that the stored tool becomes 4.3.0.
 - **Prompt sentence for `copy_knowledge_file` (#785).** The uploaded-files
   notes of every rendered prompt, and of the `README.md` written into a new
   sandbox, end with ``If a `copy_knowledge_file` tool is available, it brings
