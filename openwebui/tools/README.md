@@ -50,6 +50,7 @@ All container limits, timeouts, Docker image, and skills remain configured serve
 | `view` | `view` | Read files or list directories (supports line ranges) |
 | `generate_speech` | `generate_speech` | Synthesize speech (e.g. a video voiceover line) into `/mnt/user-data/files/`; needs `TTS_*` on the server |
 | `sub_agent` | `sub_agent` | Delegate complex tasks to Claude Code |
+| `copy_knowledge_file` | none (wrapper only) | Copy one file from a knowledge base the chat's owner can read into `/mnt/user-data/files/`; a repeated copy returns the same path, a deleted copy is stored again |
 
 Each tool call authenticates the transport and carries only server-provided user context (`X-Chat-Id`, `X-User-Email`, `X-User-Name`, `X-Mcp-Servers`). Credentials never appear in tool arguments, results, or progress events.
 

@@ -11,6 +11,7 @@ import asyncio
 import errno
 import inspect
 import os
+import re
 import urllib.parse
 import json
 import socket
@@ -380,15 +381,18 @@ class _GuardedOCU:
                 raise RuntimeError("upload form missing file")
             filename = request.path_params["filename"]
             attachment_id = request.headers.get("x-ocu-attachment-id")
-            self.uploads.append(
-                {"filename": filename, "attachment_id": attachment_id}
-            )
+            reimport_missing = request.headers.get("x-ocu-reimport-missing")
+            record = {"filename": filename, "attachment_id": attachment_id}
+            if reimport_missing is not None:
+                record["reimport_missing"] = reimport_missing
+            self.uploads.append(record)
             try:
                 result = await ocu_app.upload_file(
                     request.path_params["chat_id"],
                     filename,
                     uploaded,
                     attachment_id,
+                    x_ocu_reimport_missing=reimport_missing,
                 )
             except HTTPException as exc:
                 return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
@@ -517,35 +521,62 @@ def _invoke_public_tool(tools, method, chat_id, files, command="echo ready", use
     return tools.sub_agent("inspect attachment", "delegate", **common)
 
 
-def _row(filename, content, user_id=OWNER["id"], content_type="application/octet-stream"):
-    return {"filename": filename, "content": content, "user_id": user_id, "content_type": content_type}
+_STORED = object()
+
+
+def _row(filename, content, user_id=OWNER["id"], content_type="application/octet-stream",
+         path=_STORED, collection_name=None):
+    spec = {"filename": filename, "content": content, "user_id": user_id, "content_type": content_type}
+    if path is not _STORED:
+        spec["path"] = path
+    if collection_name is not None:
+        spec["collection_name"] = collection_name
+    return spec
 
 
 class _FakeWebUI:
-    """The Open WebUI modules the tool imports: storage, files, users, chats, file access.
+    """The Open WebUI modules the tool imports: storage, files, users, chats, file access,
+    knowledge bases, access grants and groups.
 
-    `files` maps a file id to a _row(); each row's storage key is webui/<id>.
-    `chats` maps a chat id to (owner id, history messages). `grants` holds
-    (file_id, user_id) pairs that has_access_to_file grants for read.
+    `files` maps a file id to a _row(); each row's storage key is webui/<id>, unless the
+    row sets `path`, which stores no bytes under it. `chats` maps a chat id to (owner id,
+    history messages). `grants` holds (file_id, user_id) pairs that has_access_to_file
+    grants for read. `knowledge` maps a knowledge-base id to (owner id, member file ids);
+    `kb_grants` holds (resource type, resource id, principal type, principal id,
+    permission) rows; `groups` maps a user id to group ids; `faults` maps a fake method
+    name to the exception it raises.
     """
 
-    def __init__(self, monkeypatch, tmp_path, files=None, chats=None, grants=(), chat_error=None):
+    def __init__(self, monkeypatch, tmp_path, files=None, chats=None, grants=(), chat_error=None,
+                 knowledge=None, kb_grants=(), groups=None, faults=None):
         self.fetched_dir = tmp_path / "webui-fetched"
         self.rows = {}
         self.contents = {}
         for file_id, spec in (files or {}).items():
+            meta = {"name": spec["filename"], "content_type": spec["content_type"]}
+            if "collection_name" in spec:
+                meta["collection_name"] = spec["collection_name"]
             row = types.SimpleNamespace(
                 id=file_id, user_id=spec["user_id"], filename=spec["filename"],
-                path=f"webui/{file_id}",
-                meta={"name": spec["filename"], "content_type": spec["content_type"]},
+                path=spec.get("path", f"webui/{file_id}"), meta=meta,
             )
             self.rows[file_id] = row
-            self.contents[row.path] = spec["content"]
+            if "path" not in spec:
+                self.contents[row.path] = spec["content"]
         self.chats = chats or {}
         self.grants = set(grants)
         self.chat_error = chat_error
+        self.knowledge = knowledge or {}
+        self.kb_grants = set(kb_grants)
+        self.groups = groups or {}
+        self.faults = faults or {}
         self.get_file_calls, self.fetched, self.lookups, self.access_checks = [], [], [], []
+        self.chat_lookups, self.knowledge_lookups, self.group_lookups, self.grant_checks = [], [], [], []
         self._install(monkeypatch)
+
+    def _fault(self, name):
+        if name in self.faults:
+            raise self.faults[name]
 
     def get_file(self, key):
         self.get_file_calls.append(key)
@@ -567,6 +598,7 @@ class _FakeWebUI:
             @staticmethod
             async def get_file_by_id(file_id, db=None):
                 webui.lookups.append(file_id)
+                webui._fault("get_file_by_id")
                 return webui.rows.get(file_id)
 
         class Users:
@@ -579,19 +611,53 @@ class _FakeWebUI:
 
         class Chats:
             @staticmethod
-            async def get_chat_by_id(chat_id, db=None):
+            async def get_chat_by_id(id, db=None):
+                webui.chat_lookups.append(id)
                 if webui.chat_error is not None:
                     raise webui.chat_error
-                if chat_id not in webui.chats:
+                if id not in webui.chats:
                     return None
-                owner_id, messages = webui.chats[chat_id]
+                owner_id, messages = webui.chats[id]
                 return types.SimpleNamespace(
-                    id=chat_id, user_id=owner_id, chat={"history": {"messages": messages}}
+                    id=id, user_id=owner_id, chat={"history": {"messages": messages}}
                 )
 
         async def has_access_to_file(file_id, access_type, user, db=None, user_group_ids=None):
             webui.access_checks.append((file_id, access_type, user.id))
             return access_type == "read" and (file_id, user.id) in webui.grants
+
+        class Knowledges:
+            @staticmethod
+            async def get_knowledges_by_file_id(file_id, db=None):
+                webui.knowledge_lookups.append(file_id)
+                webui._fault("get_knowledges_by_file_id")
+                return [
+                    types.SimpleNamespace(id=kb_id, user_id=owner_id)
+                    for kb_id, (owner_id, members) in webui.knowledge.items()
+                    if file_id in members
+                ]
+
+        class Groups:
+            @staticmethod
+            async def get_groups_by_member_id(user_id, db=None):
+                webui.group_lookups.append(user_id)
+                webui._fault("get_groups_by_member_id")
+                return [types.SimpleNamespace(id=group_id) for group_id in webui.groups.get(user_id, ())]
+
+        class AccessGrants:
+            @staticmethod
+            async def has_access(user_id, resource_type, resource_id, permission="read",
+                                 user_group_ids=None, db=None):
+                webui.grant_checks.append((user_id, resource_type, resource_id, permission, user_group_ids))
+                assert (resource_type, permission) == ("knowledge", "read")
+                webui._fault("has_access")
+                if user_group_ids is None:
+                    user_group_ids = {g.id for g in await Groups.get_groups_by_member_id(user_id)}
+                principals = {("user", "*"), ("user", user_id)} | {("group", g) for g in user_group_ids}
+                return any(
+                    (resource_type, resource_id, kind, principal, permission) in webui.kb_grants
+                    for kind, principal in principals
+                )
 
         modules = {}
         for name in (
@@ -606,6 +672,9 @@ class _FakeWebUI:
             ("open_webui.models.users", "Users", Users),
             ("open_webui.models.chats", "Chats", Chats),
             ("open_webui.utils.access_control.files", "has_access_to_file", has_access_to_file),
+            ("open_webui.models.knowledge", "Knowledges", Knowledges),
+            ("open_webui.models.groups", "Groups", Groups),
+            ("open_webui.models.access_grants", "AccessGrants", AccessGrants),
         ):
             modules[name] = types.ModuleType(name)
             setattr(modules[name], attribute, value)
@@ -771,6 +840,7 @@ def test_public_tools_sync_new_attachment_before_command(monkeypatch, tmp_path, 
         assert len(upload) == 1
         assert upload[0]["method"] == "POST"
         assert upload[0]["headers"].get("x-ocu-attachment-id") == "F1"
+        assert "x-ocu-reimport-missing" not in upload[0]["headers"]
         assert len(imports) == 1
         assert imports[0]["method"] == "GET"
         assert ocu.uploads == [{"filename": "brief.docx", "attachment_id": "F1"}]
@@ -2235,6 +2305,386 @@ def test_a_chat_image_entry_naming_a_non_image_file_is_not_synced(monkeypatch, t
     assert webui.lookups == [DOC_BRIEF]
     assert webui.get_file_calls == []
     assert ocu.uploads == []
+
+# --- copy_knowledge_file: a knowledge-base file the chat owner can read (#786) ---
+
+KB_FILE = "F-kb"
+KB_NAME = "报告.docx"
+KB_BYTES = b"knowledge original"
+KB_CHAT = "chat-kb"
+COPIED = f"Copied {KB_NAME} to /mnt/user-data/files/{KB_NAME}"
+UNREADABLE = f"Error: file {KB_FILE} is not in a knowledge base the chat owner can read"
+COPY_PROGRESS = {"description": "read the report", "status": "in_progress", "done": False}
+COPY_DONE = {"description": "Knowledge file copied", "status": "complete", "done": True}
+COPY_FAILED = {"description": "Knowledge file copy failed", "status": "error", "done": True}
+KB_OF_OTHER = {"K": (OTHER["id"], {KB_FILE})}
+
+
+def _kb_webui(monkeypatch, tmp_path, chat_owner=OWNER, files=None, knowledge=None, **kwargs):
+    if files is None:
+        files = {KB_FILE: _row(KB_NAME, KB_BYTES, user_id=OTHER["id"])}
+    if knowledge is None:
+        knowledge = {"K": (chat_owner["id"], {KB_FILE})}
+    return _FakeWebUI(
+        monkeypatch, tmp_path, files=files, knowledge=knowledge,
+        chats={KB_CHAT: (chat_owner["id"], {})}, **kwargs,
+    )
+
+
+def _copy_file(tools, chat_id=KB_CHAT, user=OWNER, description="read the report"):
+    """Call the tool with the injections Open WebUI offers, filtered by its signature."""
+    events = []
+    offered = {
+        "__event_emitter__": lambda e: _collect(events, e),
+        "__metadata__": {"chat_id": chat_id},
+        "__user__": user,
+        "__files__": [_attachment("F-attached", "attached.docx")],
+        "__request__": None,
+    }
+    accepted = inspect.signature(tools.copy_knowledge_file).parameters
+    injected = {name: value for name, value in offered.items() if name in accepted}
+    return asyncio.run(tools.copy_knowledge_file(KB_FILE, description, **injected)), events
+
+
+def _assert_uploaded(ocu, webui, chat_id, events, posts=1, progress=COPY_PROGRESS):
+    """Only upload POSTs with both headers reached OCU: no /imports, no /mcp."""
+    assert [(r["method"], r["path"]) for r in ocu.requests] == [
+        ("POST", f"/api/uploads/{chat_id}/{KB_NAME}")
+    ] * posts
+    assert all(
+        r["headers"].get("x-ocu-attachment-id") == KB_FILE
+        and r["headers"].get("x-ocu-reimport-missing") == "1"
+        for r in ocu.requests
+    )
+    assert ocu.uploads == [
+        {"filename": KB_NAME, "attachment_id": KB_FILE, "reimport_missing": "1"}
+    ] * posts
+    assert webui.access_checks == []
+    assert _workspace_hints(events) == [_hint(chat_id)] * posts
+    assert [e["data"] for e in _status_events(events)] == [progress, COPY_DONE] * posts
+
+
+def _assert_refused(ocu, webui, result, events, expected):
+    assert result == expected
+    assert ocu.requests == []
+    assert webui.access_checks == []
+    assert webui.get_file_calls == []
+    assert _workspace_hints(events) == []
+    assert [e["data"] for e in _status_events(events)] == [COPY_PROGRESS, COPY_FAILED]
+
+
+@pytest.mark.parametrize(
+    ("caller", "chat_owner", "setup", "expected"),
+    (
+        pytest.param(OWNER, OWNER, {}, COPIED, id="owner-owned-kb"),
+        pytest.param(OWNER, OWNER, {
+            "knowledge": KB_OF_OTHER, "kb_grants": [("knowledge", "K", "user", OWNER["id"], "read")],
+        }, COPIED, id="direct-grant"),
+        pytest.param(OWNER, OWNER, {
+            "knowledge": KB_OF_OTHER, "kb_grants": [("knowledge", "K", "group", "G", "read")],
+            "groups": {OWNER["id"]: ["G"], OTHER["id"]: ["G-other"]},
+        }, COPIED, id="group-grant"),
+        pytest.param(OWNER, OWNER, {
+            "knowledge": KB_OF_OTHER, "kb_grants": [("knowledge", "K", "user", "*", "read")],
+        }, COPIED, id="open-to-everyone"),
+        pytest.param(OWNER, OWNER, {
+            "knowledge": {"K1": (OTHER["id"], {KB_FILE}), "K2": (OWNER["id"], {KB_FILE})},
+        }, COPIED, id="several-kbs"),
+        pytest.param(OWNER, OWNER, {"knowledge": KB_OF_OTHER}, UNREADABLE, id="ungranted"),
+        pytest.param(OWNER, OWNER, {
+            "knowledge": KB_OF_OTHER, "kb_grants": [("knowledge", "K", "user", OWNER["id"], "write")],
+        }, UNREADABLE, id="write-only-grant"),
+        pytest.param(ADMIN, OWNER, {"knowledge": {"K": (ADMIN["id"], {KB_FILE})}},
+                     UNREADABLE, id="admin-in-another-users-chat"),
+        pytest.param(OTHER, OWNER, {}, COPIED, id="other-caller-owner-may-read"),
+        pytest.param(ADMIN, ADMIN, {"knowledge": KB_OF_OTHER}, UNREADABLE, id="admin-owner-without-grant"),
+        pytest.param(OWNER, OWNER, {
+            "files": {KB_FILE: _row(KB_NAME, KB_BYTES, user_id=OTHER["id"], collection_name="K")},
+            "knowledge": {"K": (OWNER["id"], set())},
+        }, UNREADABLE, id="legacy-name-only"),
+        pytest.param(OWNER, OWNER, {
+            "files": {KB_FILE: _row(KB_NAME, KB_BYTES)}, "knowledge": {},
+        }, UNREADABLE, id="own-upload-outside-any-kb"),
+        pytest.param(OWNER, OWNER, {"files": {}}, f"Error: file {KB_FILE} not found", id="unknown-id"),
+        pytest.param(OWNER, OWNER, {
+            "files": {KB_FILE: _row(KB_NAME, KB_BYTES, user_id=OTHER["id"], path=None)},
+        }, f"Error: file {KB_FILE} has no stored bytes", id="no-stored-bytes"),
+        pytest.param(OWNER, OWNER, {
+            "files": {KB_FILE: _row(KB_NAME, KB_BYTES, user_id=OTHER["id"], path=None)},
+            "knowledge": KB_OF_OTHER,
+        }, UNREADABLE, id="unreadable-hides-missing-bytes"),
+    ),
+)
+def test_copy_knowledge_file_judges_the_chat_owners_access(
+    monkeypatch, tmp_path, caller, chat_owner, setup, expected
+):
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path, chat_owner, **setup)
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result, events = _copy_file(_guarded_tools(monkeypatch, ocu), user=caller)
+
+    if expected == COPIED:
+        assert result == COPIED
+        _assert_uploaded(ocu, webui, KB_CHAT, events)
+        assert ocu.stored_files(KB_CHAT) == {KB_NAME: KB_BYTES}
+        assert webui.get_file_calls == [f"webui/{KB_FILE}"]
+    else:
+        _assert_refused(ocu, webui, result, events, expected)
+        assert ocu.stored_files(KB_CHAT) == {}
+    assert webui.chat_lookups == [KB_CHAT]
+    assert webui.knowledge_lookups == ([] if "not found" in expected else [KB_FILE])
+    owner_groups = set(setup.get("groups", {}).get(chat_owner["id"], ()))
+    assert all(check == (chat_owner["id"], "knowledge", check[2], "read", owner_groups)
+               for check in webui.grant_checks)
+    assert set(webui.group_lookups) <= {chat_owner["id"]}
+
+
+def _seeded_copies(monkeypatch, tmp_path, between):
+    """Copy twice in one chat, running between(outputs dir) after the first copy."""
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path)
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        tools = _guarded_tools(monkeypatch, ocu)
+        first, first_events = _copy_file(tools)
+        between(ocu.chat_uploads(KB_CHAT))
+        second, second_events = _copy_file(tools)
+    assert first == second == COPIED
+    _assert_uploaded(ocu, webui, KB_CHAT, first_events + second_events, posts=2)
+    return ocu
+
+
+def test_copying_a_file_twice_in_one_chat_stores_one_file(monkeypatch, tmp_path):
+    ocu = _seeded_copies(monkeypatch, tmp_path, lambda root: None)
+    assert ocu.stored_files(KB_CHAT) == {KB_NAME: KB_BYTES}
+
+
+def test_a_deleted_workspace_file_is_copied_again(monkeypatch, tmp_path):
+    ocu = _seeded_copies(monkeypatch, tmp_path, lambda root: (root / KB_NAME).unlink())
+    assert ocu.stored_files(KB_CHAT) == {KB_NAME: KB_BYTES}
+
+
+def test_an_edited_workspace_file_is_kept(monkeypatch, tmp_path):
+    ocu = _seeded_copies(monkeypatch, tmp_path, lambda root: (root / KB_NAME).write_bytes(b"edited"))
+    assert ocu.stored_files(KB_CHAT) == {KB_NAME: b"edited"}
+
+
+def test_copy_into_an_occupied_name_returns_the_suffixed_path(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path)
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        root = ocu.chat_uploads(KB_CHAT)
+        root.mkdir(parents=True)
+        (root / KB_NAME).write_bytes(b"unrelated")
+        result, events = _copy_file(_guarded_tools(monkeypatch, ocu))
+
+    assert result == f"Copied {KB_NAME} to /mnt/user-data/files/报告 (2).docx"
+    assert ocu.stored_files(KB_CHAT) == {KB_NAME: b"unrelated", "报告 (2).docx": KB_BYTES}
+    _assert_uploaded(ocu, webui, KB_CHAT, events)
+
+
+def test_copy_reports_a_discovery_failure_after_storing(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path)
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        root = ocu.chat_uploads(KB_CHAT)
+        root.mkdir(parents=True)
+        with monkeypatch.context() as faults:
+            _fail_directory_enumeration(faults, root)
+            result, events = _copy_file(_guarded_tools(monkeypatch, ocu))
+
+    assert result == (
+        f"{COPIED}\n\n[DISCOVERY WARNING] File '{KB_NAME}' was stored, but workspace "
+        "file discovery failed (io_error). Do not upload it again."
+    )
+    assert ocu.stored_files(KB_CHAT) == {KB_NAME: KB_BYTES}
+    _assert_uploaded(ocu, webui, KB_CHAT, events)
+
+
+def test_an_empty_description_shows_the_fallback_progress_text(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path)
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result, events = _copy_file(_guarded_tools(monkeypatch, ocu), description="")
+
+    assert result == COPIED
+    _assert_uploaded(ocu, webui, KB_CHAT, events, progress={
+        "description": "Copying knowledge file...", "status": "in_progress", "done": False,
+    })
+
+
+def test_copy_storage_error_is_an_upload_error_and_writes_nothing(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path, files={
+        KB_FILE: _row(KB_NAME, KB_BYTES, user_id=OTHER["id"], path="webui/gone"),
+    })
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result, events = _copy_file(_guarded_tools(monkeypatch, ocu))
+        assert ocu.requests == []
+        imports = requests.get(
+            f"{ocu.url}/api/uploads/{KB_CHAT}/imports",
+            headers={"Authorization": f"Bearer {INTERNAL_TOKEN}"}, timeout=5,
+        )
+
+    assert result == f"Error: upload of {KB_NAME} failed"
+    assert webui.get_file_calls == ["webui/gone"]
+    assert webui.access_checks == []
+    assert ocu.stored_files(KB_CHAT) == {}
+    assert imports.json()["ids"] == []
+    assert _workspace_hints(events) == []
+    assert [e["data"] for e in _status_events(events)] == [COPY_PROGRESS, COPY_FAILED]
+
+
+def test_copy_upload_http_error_is_an_upload_error_without_retry(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path)
+    with _local_origin(lambda request: (500, {}, b"storage failed")) as origin:
+        tools = _tools_with_token(monkeypatch)
+        tools.valves.ORCHESTRATOR_URL = origin.url
+        result, events = _copy_file(tools)
+
+    assert result == f"Error: upload of {KB_NAME} failed"
+    assert [(r["method"], r["path"]) for r in origin.requests] == [
+        ("POST", f"/api/uploads/{KB_CHAT}/{urllib.parse.quote(KB_NAME, safe='')}")
+    ]
+    assert origin.requests[0]["headers"].get("x-ocu-attachment-id") == KB_FILE
+    assert origin.requests[0]["headers"].get("x-ocu-reimport-missing") == "1"
+    assert webui.access_checks == []
+    assert _workspace_hints(events) == []
+
+
+def test_copy_to_an_unreachable_server_is_an_upload_error(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    _kb_webui(monkeypatch, tmp_path)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    listener.close()
+    tools = _tools_with_token(monkeypatch)
+    tools.valves.ORCHESTRATOR_URL = f"http://127.0.0.1:{port}"
+
+    result, _ = _copy_file(tools)
+    assert result == f"Error: upload of {KB_NAME} failed"
+
+
+@pytest.mark.parametrize(
+    "fault", ("get_file_by_id", "get_knowledges_by_file_id", "get_groups_by_member_id", "has_access")
+)
+def test_a_failing_lookup_is_an_error_result(monkeypatch, tmp_path, fault):
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path, knowledge=KB_OF_OTHER, faults={fault: RuntimeError("db down")})
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result, events = _copy_file(_guarded_tools(monkeypatch, ocu))
+
+    _assert_refused(ocu, webui, result, events, f"Error: lookup of file {KB_FILE} failed")
+
+
+@pytest.mark.parametrize("chat", ("missing", "raises", "no-owner"))
+def test_copy_in_a_chat_that_cannot_be_found_looks_up_no_file(monkeypatch, tmp_path, chat):
+    _image_env(monkeypatch)
+    webui = _kb_webui(monkeypatch, tmp_path, chat_error=RuntimeError("db down") if chat == "raises" else None)
+    if chat == "missing":
+        webui.chats.clear()
+    if chat == "no-owner":
+        webui.chats[KB_CHAT] = ("", {})
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result, events = _copy_file(_guarded_tools(monkeypatch, ocu))
+
+    _assert_refused(ocu, webui, result, events, "Error: chat not found")
+    assert webui.chat_lookups == [KB_CHAT]
+    assert webui.lookups == webui.knowledge_lookups == []
+
+
+def _block_network(monkeypatch):
+    calls = []
+
+    def blocked(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise OSError("network must not run")
+
+    monkeypatch.setattr(requests, "get", blocked)
+    monkeypatch.setattr(requests, "post", blocked)
+    monkeypatch.setattr(computer_use_tools.urllib.request.OpenerDirector, "open", blocked)
+    return calls
+
+
+def _assert_no_webui_lookups(webui):
+    assert webui.lookups == webui.chat_lookups == webui.knowledge_lookups == []
+    assert webui.group_lookups == webui.grant_checks == webui.get_file_calls == webui.access_checks == []
+
+
+@pytest.mark.parametrize(
+    ("internal", "mcp_key", "expected"),
+    (
+        ("", "", "[CONFIG ERROR] OCU_INTERNAL_TOKEN must be a non-empty HTTP-safe server credential."),
+        (INTERNAL_TOKEN, "invalid\r\nmcp key",
+         "[CONFIG ERROR] MCP_API_KEY must be empty or safely transmittable as an HTTP header."),
+    ),
+)
+def test_copy_with_unusable_credentials_rejects_before_any_lookup(
+    monkeypatch, tmp_path, internal, mcp_key, expected
+):
+    webui = _kb_webui(monkeypatch, tmp_path)
+    calls = _block_network(monkeypatch)
+    monkeypatch.setenv("OCU_INTERNAL_TOKEN", internal)
+    tools = computer_use_tools.Tools()
+    tools.valves.MCP_API_KEY = mcp_key
+    result, events = _copy_file(tools)
+
+    assert result == expected
+    assert calls == []
+    _assert_no_webui_lookups(webui)
+    assert _workspace_hints(events) == []
+    assert [e["data"] for e in _status_events(events)] == [
+        {"description": "Computer Use configuration error", "status": "error", "done": True}
+    ]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (None, {"chat_id": None}, {"chat_id": ""}, {"chat_id": " \t"}),
+    ids=("absent", "none", "empty", "whitespace"),
+)
+def test_empty_chat_rejects_copy_knowledge_file_before_work(monkeypatch, tmp_path, metadata):
+    webui = _kb_webui(monkeypatch, tmp_path)
+    calls = _block_network(monkeypatch)
+
+    def fall_through(*args, **kwargs):
+        raise AssertionError("sub_agent must not run")
+
+    monkeypatch.setattr(computer_use_tools.Tools, "sub_agent", fall_through)
+    tools = _tools_with_token(monkeypatch)
+    events = []
+    result = asyncio.run(tools.copy_knowledge_file(
+        KB_FILE, "read the report",
+        __event_emitter__=lambda e: _collect(events, e), __metadata__=metadata,
+    ))
+
+    assert result == "[TOOL ERROR] chat_id is required."
+    assert calls == []
+    _assert_no_webui_lookups(webui)
+    assert _workspace_hints(events) == []
+    assert [e["data"] for e in _status_events(events)] == [
+        {"description": "Chat ID is required", "status": "error", "done": True}
+    ]
+
+
+def test_copy_knowledge_file_description_carries_the_flow():
+    doc = computer_use_tools.Tools.copy_knowledge_file.__doc__
+    # Open WebUI's parse_description: the lines before the first :param or :return line.
+    description = []
+    for line in (line.strip() for line in doc.strip().split("\n")):
+        if re.match(r":param", line) or re.match(r":return", line):
+            break
+        description.append(line)
+    description = "\n".join(description)
+
+    assert "search_knowledge_files" in description or "query_knowledge_files" in description
+    for token in ("docx", "pdf", "/mnt/user-data/files/", "!["):
+        assert token in description
+    params = {m.group(1) for m in (re.match(r":param (\w+):", line.strip()) for line in doc.splitlines()) if m}
+    assert params == {"file_id", "description"}
+    assert "__files__" not in inspect.signature(computer_use_tools.Tools.copy_knowledge_file).parameters
+
 
 if __name__ == "__main__":
     unittest.main()
