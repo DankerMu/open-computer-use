@@ -12,6 +12,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import unittest
@@ -24,6 +25,7 @@ MUSIC_DIR = ROOT / "deploy" / "music"
 if str(MUSIC_DIR) not in sys.path:
     sys.path.insert(0, str(MUSIC_DIR))
 
+import listening_page  # noqa: E402
 import music_candidates  # noqa: E402
 
 LISTENING_PAGE = MUSIC_DIR / "listening_page.py"
@@ -236,6 +238,117 @@ class ListeningPageTests(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in output.parent.iterdir()), ["page"])
 
 
+# Runs the page script in a vm context with a strict DOM stub; prints what the export button produced.
+EXPORT_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const input = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const elements = {};
+for (const id of ["candidate-ids", "reviewer", "date", "status", "export"]) {
+  elements[id] = {value: "", textContent: "", listeners: {},
+                  addEventListener(type, listener) { this.listeners[type] = listener; }};
+}
+elements["candidate-ids"].textContent = input.ids_text;
+const blobs = new Map();
+const revoked = [];
+let clicked = null;
+const document = {
+  getElementById(id) {
+    if (!(id in elements)) throw new Error(`unexpected element id ${id}`);
+    return elements[id];
+  },
+  querySelector(selector) {
+    const match = /^input\[name="decision-([a-z0-9-]+)"\]:checked$/.exec(selector);
+    if (!match) throw new Error(`unexpected selector ${selector}`);
+    return match[1] in input.checked ? {value: input.checked[match[1]]} : null;
+  },
+  createElement(tag) {
+    if (tag !== "a") throw new Error(`unexpected element ${tag}`);
+    return {href: "", download: "", click() { clicked = {href: this.href, download: this.download}; }};
+  },
+};
+const URL = {
+  createObjectURL(blob) { const href = `blob:export-${blobs.size}`; blobs.set(href, blob); return href; },
+  revokeObjectURL(href) { revoked.push(href); },
+};
+const setTimeout = (callback) => callback();
+vm.runInNewContext(input.script, {document, URL, Blob, setTimeout});
+const prefilled = elements.date.value;
+elements.reviewer.value = input.reviewer;
+elements.date.value = input.date;
+if (typeof elements.export.listeners.click !== "function") throw new Error("no click listener on export");
+elements.export.listeners.click();
+(async () => {
+  const body = clicked ? await blobs.get(clicked.href).text() : null;
+  process.stdout.write(JSON.stringify({prefilled, status: elements.status.textContent, revoked,
+                                       download: clicked && clicked.download, href: clicked && clicked.href, body}));
+})();
+"""
+
+
+class ScriptParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.ids_text, self.script = None, None
+        self._target = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "script":
+            self._target = "ids_text" if attributes.get("id") == "candidate-ids" else "script"
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._target = None
+
+    def handle_data(self, data):
+        if self._target:
+            setattr(self, self._target, data)
+
+
+class ExportScriptTests(unittest.TestCase):
+    candidates = manifest()["candidates"]
+
+    def export(self, directory: Path, checked: dict) -> dict:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not on PATH; the page export script needs a JavaScript runtime")
+        page = ScriptParser()
+        page.feed(listening_page.render(self.candidates))
+        self.assertIsNotNone(page.ids_text)
+        self.assertIsNotNone(page.script)
+        harness, data = directory / "harness.js", directory / "input.json"
+        harness.write_text(EXPORT_HARNESS, encoding="utf-8")
+        data.write_text(json.dumps({"script": page.script, "ids_text": page.ids_text, "checked": checked,
+                                    "reviewer": "  Fixture Reviewer ", "date": "2026-11-16"}), encoding="utf-8")
+        result = subprocess.run([node, str(harness), str(data)], text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertRegex(output["prefilled"], r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+        return output
+
+    def test_complete_export_is_accepted_by_load_decisions(self):
+        with tmp_dir() as directory:
+            output = self.export(Path(directory), {"calm-direct": "approve", "loop-member": "drop"})
+            self.assertEqual(output["status"], "Exported 2 decisions.")
+            self.assertEqual(output["download"], "music-decisions.json")
+            self.assertEqual(output["revoked"], [output["href"]])
+            path = Path(directory) / "music-decisions.json"
+            path.write_text(output["body"], encoding="utf-8")
+            self.assertEqual(music_candidates.load_decisions(path, self.candidates),
+                             {"calm-direct": "approve", "loop-member": "drop"})
+            export = json.loads(output["body"])
+            self.assertEqual((export["reviewer"], export["date"]), ("Fixture Reviewer", "2026-11-16"))
+
+    def test_partial_selection_exports_nothing(self):
+        with tmp_dir() as directory:
+            output = self.export(Path(directory), {"calm-direct": "approve"})
+            self.assertEqual(output["status"], "No decision yet for: loop-member")
+            self.assertIsNone(output["download"])
+            self.assertIsNone(output["body"])
+            self.assertEqual(output["revoked"], [])
+
+
 class ManifestLoaderTests(unittest.TestCase):
     def load(self, data: dict):
         with tmp_dir() as directory:
@@ -270,7 +383,7 @@ class ManifestLoaderTests(unittest.TestCase):
     def test_non_slug_id_is_rejected(self):
         for value in ("Calm-Direct", "calm_direct", "calm direct", "../calm", ""):
             with self.subTest(value):
-                self.assert_rejected(lambda data: data["candidates"][0].update(id=value), "id")
+                self.assert_rejected(lambda data: data["candidates"][0].update(id=value), "id must match")
 
     def test_wayback_sha1_must_be_32_base32_characters(self):
         hex_digest = hashlib.sha1(PACK).hexdigest()
@@ -297,7 +410,7 @@ class DecisionLoaderTests(unittest.TestCase):
     def test_invalid_decisions_are_rejected(self):
         cases = {
             "yes": ([{"id": "calm-direct", "decision": "yes"}, {"id": "loop-member", "decision": "drop"}],
-                    "decision"),
+                    "decision must be approve or drop"),
             "unknown": ([{"id": "calm-direct", "decision": "approve"}, {"id": "loop-member", "decision": "drop"},
                          {"id": "stranger", "decision": "drop"}], "unknown"),
             "missing": ([{"id": "calm-direct", "decision": "approve"}], "missing"),

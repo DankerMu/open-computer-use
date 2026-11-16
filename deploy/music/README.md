@@ -3,7 +3,7 @@
 This directory holds the CC0 background-music candidates for the explainer kit, with their licence evidence, and the tool that builds a local listening page from them. No audio is committed. The OCU pre-commit refuses files over 500 KB, so this follows the font bundle in `deploy/fonts/`: the repository pins each source by URL, SHA-256 and size, and the tool downloads and verifies it.
 
 - `candidates.json` lists the candidates.
-- `excluded.json` lists works that were considered and rejected, one entry per work.
+- `excluded.json` lists works rejected for a licence conflict (another licence, an ISRC or a commercial release) or for their access terms, one entry per work. Works dropped for selection reasons, such as `loops.zip`, are not listed.
 - `evidence/` holds one small text snapshot per evidence page.
 - `music_candidates.py` loads and verifies these files.
 - `listening_page.py` builds the listening page.
