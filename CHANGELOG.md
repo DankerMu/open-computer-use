@@ -158,6 +158,14 @@
   `delete_failed`.
 
 ### Changed
+- **The workspace base image is pinned by digest (#815).** The root
+  `Dockerfile` names
+  `ubuntu:24.04@sha256:78d4744ead1f5b19b04d0df558ab182a5300903900755e515b2ca4d10eb2044d`,
+  and a new release inventory records the workspace material `{"name": "base",
+  "kind": "base-image", "requested": "ubuntu@sha256:…"}`; a root recipe
+  without exactly one digested `FROM`, with an `AS` alias, or with an `ARG`
+  before it fails `release.py build` before any image is built. Version-2
+  inventories without the material still verify, import and retarget.
 - **Containers and sandboxes follow the host's time zone (#708).** `deploy/up.sh`
   resolves the host's IANA zone name on every run, from the `/etc/localtime`
   link into `/usr/share/zoneinfo/` or else the first line of `/etc/timezone`

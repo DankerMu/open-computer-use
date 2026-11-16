@@ -68,6 +68,10 @@ def digest_for(tag: str) -> str:
     return "sha256:" + hashlib.sha256(tag.encode("utf-8")).hexdigest()
 
 
+# The fixture root recipe's immutable base, as release.workspace_base records it.
+WORKSPACE_BASE_DIGEST = "sha256:" + "e" * 64
+
+
 # The import free-space precheck: its headroom and the two probes tests substitute.
 SPACE_HEADROOM = 1 << 30
 SPACE_FREE_PROBE = "        available = shutil.disk_usage(path).free\n"
@@ -536,7 +540,8 @@ class OfflineReleaseTests(unittest.TestCase):
         ocu.mkdir()
         webui.mkdir()
         (ocu / "Dockerfile").write_text(
-            "FROM scratch\nARG CLAUDE_CODE_VERSION=2.1.112\nARG CODEX_VERSION=0.125.0\n",
+            f"FROM ubuntu:24.04@{WORKSPACE_BASE_DIGEST}\n"
+            "ARG CLAUDE_CODE_VERSION=2.1.112\nARG CODEX_VERSION=0.125.0\n",
             encoding="utf-8",
         )
         (ocu / "computer-use-server" / "Dockerfile").parent.mkdir(parents=True)
@@ -2122,6 +2127,52 @@ class OfflineReleaseTests(unittest.TestCase):
                 self.assertFalse(self.recorded_builds())
                 self.assertFalse(any(set(row.split()) & {"build", "pull", "tag", "load"}
                                      for row in ops(self.state)))
+
+    def test_workspace_base_comes_from_committed_recipe(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        destination = self.root / "workspace-base"
+        result = self.build_cmd(ocu, webui, destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = json.loads((destination / "release.json").read_text())
+        self.assertEqual(inventory["images"]["workspace"]["build"]["materials"], [
+            {"name": "claude-code", "requested": "2.1.112", "kind": "build-arg"},
+            {"name": "codex", "requested": "0.125.0", "kind": "build-arg"},
+            {"name": "base", "kind": "base-image",
+             "requested": "ubuntu@" + WORKSPACE_BASE_DIGEST},
+        ])
+        verified = self.verify_cmd(destination / "release.json", delivery=destination)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_workspace_recipe_refuses_undigested_or_ambiguous_base_before_build(self):
+        ocu, webui, _ocu_sha, _webui_sha = self.write_committed_sources()
+        recipe = ocu / "Dockerfile"
+        pinned = f"FROM ubuntu:24.04@{WORKSPACE_BASE_DIGEST}"
+        second = "FROM debian:12@sha256:" + "f" * 64
+        early_arg = "ARG CLAUDE_CODE_VERSION=2.1.112"
+        cases = (
+            ("FROM ubuntu:24.04\n", "FROM ubuntu:24.04", None),
+            ("FROM ubuntu:24.04@sha256:" + "e" * 63 + "\n",
+             "FROM ubuntu:24.04@sha256:" + "e" * 63, None),
+            (f"{pinned} AS workspace\n", f"{pinned} AS workspace", None),
+            (f"{pinned}\n{second}\n", second, pinned),
+            (f"{early_arg}\n{pinned}\n", early_arg, None),
+            ("# no base\nLABEL description=workspace\n", "no FROM line", None),
+        )
+        for index, (source, quoted, absent) in enumerate(cases):
+            with self.subTest(source=source):
+                recipe.write_text(source)
+                git_init_commit(ocu, f"invalid workspace base {index}")
+                destination = self.root / f"bad-workspace-base-{index}"
+                result = self.build_cmd(ocu, webui, destination)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("workspace recipe", result.stderr)
+                self.assertIn(quoted, result.stderr)
+                if absent is not None:
+                    self.assertNotIn(absent, result.stderr)
+                self.assertFalse(self.recorded_builds())
+                self.assertFalse(any(set(row.split()) & {"build", "pull", "tag", "load"}
+                                     for row in ops(self.state)))
+                self.assertFalse((destination / "release.json").exists())
 
     def test_seven_image_release_starts_with_documentserver_compose_service(self):
         env, script, _source = prepare_up_context(self.state)

@@ -308,9 +308,10 @@ tar -czf skills_backup.tar.gz skills/
 
 ### Custom Base Image
 
-Edit Dockerfile:
+Edit Dockerfile. The root `FROM` must name its base by `@sha256:` digest, or the release build refuses it:
 ```dockerfile
-FROM ubuntu:24.04  # Change to different base
+# Change to a different base; keep the @sha256: digest
+FROM ubuntu:24.04@sha256:78d4744ead1f5b19b04d0df558ab182a5300903900755e515b2ca4d10eb2044d
 ```
 
 ### Additional Packages
