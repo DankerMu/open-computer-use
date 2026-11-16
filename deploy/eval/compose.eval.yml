@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2026 Open Computer Use Contributors
+# Isolated evaluation stack on a shared Docker host. Not part of any release.
+# An override on the upstream docker-compose.yml and docker-compose.webui.yml;
+# run it only through deploy/eval/start.sh and deploy/eval/stop.sh, which export
+# ${EVAL_ROOT}/stack.env and ${EVAL_ROOT}/images.env and invoke:
+#   docker compose -p ocu-eval --project-directory <checkout> --env-file <empty file> \
+#     -f docker-compose.yml -f docker-compose.webui.yml -f deploy/eval/compose.eval.yml …
+# Every object belongs to project ocu-eval. Only open-webui publishes, on loopback.
+# Sandboxes run with networking disabled, so they publish no port and reach no address.
+
+services:
+  # The workspace image is loaded from the release package; nothing is built.
+  workspace:
+    profiles: ["never"]
+
+  # Upstream cleanup removes every orchestrator container and chat-*-workspace
+  # volume on the host, including other projects' ones.
+  cleanup:
+    profiles: ["never"]
+
+  computer-use-server:
+    image: ${COMPUTER_USE_SERVER_IMAGE:?COMPUTER_USE_SERVER_IMAGE is required}
+    build: !reset null
+    container_name: ocu-eval-computer-use-server
+    # The upstream dependency is the disabled workspace build job.
+    depends_on: !reset {}
+    ports: !override []
+    volumes: !override
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Same host and container path: the daemon mounts chat data into sandboxes
+      # by the path the orchestrator sees. start.sh creates it; a missing
+      # directory fails instead of being created by the daemon.
+      - type: bind
+        source: ${EVAL_ROOT:?EVAL_ROOT is required}/data
+        target: ${EVAL_ROOT:?EVAL_ROOT is required}/data
+        bind:
+          create_host_path: false
+    environment: !override
+      ENABLE_NETWORK: "false"
+      BASE_DATA_DIR: ${EVAL_ROOT:?EVAL_ROOT is required}/data
+      DOCKER_IMAGE: ${DOCKER_IMAGE:?DOCKER_IMAGE is required}
+      MCP_API_KEY: ${MCP_API_KEY:?MCP_API_KEY is required}
+      OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
+      # Speech stays unconfigured until the evaluation's speech adapter exists.
+      TTS_BASE_URL: ""
+      TTS_MODEL: ""
+      TTS_VOICE: ""
+      TTS_API_KEY: ""
+
+  open-webui:
+    image: ${OPENWEBUI_IMAGE:?OPENWEBUI_IMAGE is required}
+    container_name: ocu-eval-open-webui
+    ports: !override
+      - "127.0.0.1:${EVAL_WEBUI_PORT:?EVAL_WEBUI_PORT is required}:8080"
+    environment: !override
+      DATABASE_URL: postgresql://openwebui:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/openwebui
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY is required}
+      OPENAI_API_BASE_URL: https://www.dmxapi.cn/v1
+      # Read by start.sh from the 0600 provider key file. stop.sh exports it
+      # empty, because compose down interpolates it but never uses it.
+      OPENAI_API_KEY: ${EVAL_PROVIDER_KEY?EVAL_PROVIDER_KEY is required}
+      ENABLE_OLLAMA_API: "false"
+      OFFLINE_MODE: "true"
+      ENABLE_OCU_WORKSPACE: "true"
+      OCU_INTERNAL_URL: http://computer-use-server:8081
+      OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
+      ENABLE_OCU_OFFICE_EDIT: "false"
+
+  postgres:
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
+    container_name: ocu-eval-postgres
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+
+  # One-shot setup, as in deploy/production-like-test/compose.webui.override.yml:
+  # installs the Computer Use tool and filters once the API is reachable.
+  open-webui-init:
+    image: ${OPENWEBUI_IMAGE:?OPENWEBUI_IMAGE is required}
+    container_name: ocu-eval-open-webui-init
+    user: "0:0"
+    entrypoint: ["/bin/bash", "/bootstrap/run-init.sh"]
+    depends_on:
+      open-webui:
+        condition: service_started
+    environment:
+      WEBUI_URL: http://open-webui:8080
+      ADMIN_EMAIL: ${ADMIN_EMAIL:?ADMIN_EMAIL is required}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      ORCHESTRATOR_URL: http://computer-use-server:8081
+      MCP_API_KEY: ${MCP_API_KEY:?MCP_API_KEY is required}
+      PRIMARY_CHAT_MODEL: qwen3.8-27b
+    volumes:
+      - ./openwebui:/app/source:ro
+      - ./deploy/production-like-test/init/run-init.sh:/bootstrap/run-init.sh:ro
+      - open-webui-data:/app/backend/data
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
