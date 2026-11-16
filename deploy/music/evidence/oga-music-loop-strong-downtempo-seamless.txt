@@ -1,0 +1,16 @@
+Evidence: OpenGameArt page "Music loop, strong, downtempo, seamless" (live)
+Captured: 2026-11-16
+Page: https://opengameart.org/content/music-loop-strong-downtempo-seamless
+
+Title: Music loop, strong, downtempo, seamless
+Author: Nostromo Tuesday, December 7, 2021 - 23:41
+Art Type: Music
+Tags: loop seamless strong downtempo
+License(s): CC0
+
+Description and files: Preview: Just a simple seamless music loop I made for fun. Public domain, use it anywhere you like, commercially or not. No attribution needed. Single-run version included. File(s): space_ranger_seamless_loop.wav 12.7 Mb [ 109 download(s)] space_ranger_single_run.wav 13.7 Mb [ 37 download(s)] space_ranger_seamless_loop_preview_no_watermark.mp3 2.9 Mb [ 54 download(s)]
+
+Linked files:
+https://opengameart.org/sites/default/files/space_ranger_seamless_loop.wav
+https://opengameart.org/sites/default/files/space_ranger_seamless_loop_preview_no_watermark_0.mp3
+https://opengameart.org/sites/default/files/space_ranger_single_run.wav

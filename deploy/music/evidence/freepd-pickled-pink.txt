@@ -1,0 +1,21 @@
+Evidence: Pickled Pink by Kevin MacLeod (FreePD, archived)
+Captured: 2026-11-16, from the Wayback Machine. FreePD.com closed in 2025.
+
+CC0 statement (FreePD home page)
+Capture: https://web.archive.org/web/20240528025710/https://www.freepd.com/
+Quote: "This music is all licensed CC0 1.0 Universal Public Domain Dedication."
+Quote: "Must I credit the musician in my film? Nope - but we do like it."
+Quote: "Can I buy exclusive rights to any of these tracks? No. The CC0 licensing is a one-way trip ."
+
+Track listing (FreePD upbeat.php)
+Capture: https://web.archive.org/web/20240528012725/https://freepd.com/upbeat.php
+Row: "Pickled Pink Time: 2:55 Download Written by Kevin MacLeod . Is the title weak alliteration? Half-spoonerism? We don't know. It is a lovely ukulele tune, though. I also likes the flutes! This music is available for commercial and non-commercial purposes."
+Audio link on that page: /music/Pickled Pink.mp3
+
+Hash chain
+Original file capture: http://web.archive.org/web/20190404013549id_/https://freepd.com/music/Pickled%20Pink.mp3
+Wayback CDX digest (base32 SHA-1): RPJ7354A7DBZE7SBAKPTXFL7RJ7NS2DD
+Mirror file: https://archive.org/download/freepd/upbeat/Pickled%20Pink.mp3
+Mirror SHA-1 (archive.org/metadata/freepd): 8bd3fdf780f8c3927e41029f3b957f8a7ed96863
+Mirror SHA-256: 3eacbde6e5322792cec71bc4942c4f7bff86f6b33e1836a1520db198c475b904
+Mirror size: 7164179 bytes

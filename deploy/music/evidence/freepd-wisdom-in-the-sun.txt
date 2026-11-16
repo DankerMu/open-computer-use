@@ -1,0 +1,21 @@
+Evidence: Wisdom in the Sun by Kevin MacLeod (FreePD, archived)
+Captured: 2026-11-16, from the Wayback Machine. FreePD.com closed in 2025.
+
+CC0 statement (FreePD home page)
+Capture: https://web.archive.org/web/20240528025710/https://www.freepd.com/
+Quote: "This music is all licensed CC0 1.0 Universal Public Domain Dedication."
+Quote: "Must I credit the musician in my film? Nope - but we do like it."
+Quote: "Can I buy exclusive rights to any of these tracks? No. The CC0 licensing is a one-way trip ."
+
+Track listing (FreePD misc.php)
+Capture: https://web.archive.org/web/20241216000928/https://freepd.com/misc.php
+Row: "Wisdom in the Sun Time: 2:35 Download Written by Kevin MacLeod . Relaxed, peaceful and serene track made with warm guitars, gentle bass and bells. This music is available for commercial and non-commercial purposes."
+Audio link on that page: /music/Wisdom in the Sun.mp3
+
+Hash chain
+Original file capture: http://web.archive.org/web/20190404011027id_/https://freepd.com/music/Wisdom%20in%20the%20Sun.mp3
+Wayback CDX digest (base32 SHA-1): ZUJF2MPT47LGUZEQPCKZVXVQCWX4GNE3
+Mirror file: https://archive.org/download/freepd/misc/Wisdom%20in%20the%20Sun.mp3
+Mirror SHA-1 (archive.org/metadata/freepd): cd125d31f3e7d66a649078959adeb015afc3349b
+Mirror SHA-256: 07ac4ab1f6d54893615d48aeee8bb3f2e5c1f2d16c6385973c97b28ef83c7ee0
+Mirror size: 4953366 bytes

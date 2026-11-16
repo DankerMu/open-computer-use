@@ -1,0 +1,538 @@
+{
+  "version": 1,
+  "candidates": [
+    {
+      "id": "inventing-flight",
+      "mood": "calm-curious",
+      "loop": false,
+      "title": "Inventing Flight",
+      "author": "Bryan Teoh",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/upbeat/Inventing%20Flight.mp3",
+        "sha256": "916e736efa3caed4ea8534e727670dbac41af0fb44f00fa667aebaab9b2b6407",
+        "size": 2840034
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-inventing-flight.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20201031121814id_/https://freepd.com/music/Inventing%20Flight.mp3",
+        "wayback_sha1": "YBOJN7VVLEJDI2SMZCMT6GAIZRN6ICGF"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Inventing Flight Bryan Teoh\") and the MusicBrainz recording search (recording \"Inventing Flight\", artist \"Bryan Teoh\") found no release of this title by this author. www.bryanteoh.com (home and listen pages; the listen page embeds SoundCloud playlists, which were not enumerated) does not list it, and none of the 29 Bryan Teoh songs the iTunes Search API returns for the artist has this title."
+    },
+    {
+      "id": "from-page-to-practice",
+      "mood": "calm-curious",
+      "loop": false,
+      "title": "From Page to Practice",
+      "author": "Bryan Teoh",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/upbeat/From%20Page%20to%20Practice.mp3",
+        "sha256": "dd20cb51c948a14e45d71b9a03b9d6afc48a4b7fd7b5020da623fbd86390b519",
+        "size": 2733479
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-from-page-to-practice.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20201031111228id_/https://freepd.com/music/From%20Page%20to%20Practice.mp3",
+        "wayback_sha1": "MGUG44R77JS4E5JNA2H4TEHC6E4CG5KY"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"From Page to Practice Bryan Teoh\") and the MusicBrainz recording search (recording \"From Page to Practice\", artist \"Bryan Teoh\") found no release of this title by this author. www.bryanteoh.com (home and listen pages; the listen page embeds SoundCloud playlists, which were not enumerated) does not list it, and none of the 29 Bryan Teoh songs the iTunes Search API returns for the artist has this title."
+    },
+    {
+      "id": "arpent",
+      "mood": "calm-curious",
+      "loop": false,
+      "title": "Arpent",
+      "author": "Kevin MacLeod",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/electronic/Arpent.mp3",
+        "sha256": "ef06d8b524c196a31954dfb1f3261e7d37459e43f4afd9df31ee2965c6094a56",
+        "size": 6486643
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-arpent.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190403162834id_/https://freepd.com/music/Arpent.mp3",
+        "wayback_sha1": "N2NLIFLYZS5IPVSRLKONUSYZE5N3PAIR"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Arpent Kevin MacLeod\") and the MusicBrainz recording search (recording \"Arpent\", artist \"Kevin MacLeod\") found no release of this title by this author. incompetech.com/music/royalty-free/pieces.json (1,443 CC BY pieces with ISRCs) has no piece titled \"Arpent\"."
+    },
+    {
+      "id": "painting-room",
+      "mood": "calm-curious",
+      "loop": false,
+      "title": "Painting Room",
+      "author": "Kevin MacLeod",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/misc/Painting%20Room.mp3",
+        "sha256": "ddfb9a5aa5420f1894902b290b7afc421ae644f6b5f4d4d9e24e5d464d95b1d1",
+        "size": 3395954
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-painting-room.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190404004747id_/https://freepd.com/music/Painting%20Room.mp3",
+        "wayback_sha1": "DTLV2D7IJR5O4OLGN36MGGTQ6OROVTLJ"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Painting Room Kevin MacLeod\") and the MusicBrainz recording search (recording \"Painting Room\", artist \"Kevin MacLeod\") found no release of this title by this author. incompetech.com/music/royalty-free/pieces.json (1,443 CC BY pieces with ISRCs) has no piece titled \"Painting Room\"."
+    },
+    {
+      "id": "wisdom-in-the-sun",
+      "mood": "calm-curious",
+      "loop": false,
+      "title": "Wisdom in the Sun",
+      "author": "Kevin MacLeod",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/misc/Wisdom%20in%20the%20Sun.mp3",
+        "sha256": "07ac4ab1f6d54893615d48aeee8bb3f2e5c1f2d16c6385973c97b28ef83c7ee0",
+        "size": 4953366
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-wisdom-in-the-sun.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190404011027id_/https://freepd.com/music/Wisdom%20in%20the%20Sun.mp3",
+        "wayback_sha1": "ZUJF2MPT47LGUZEQPCKZVXVQCWX4GNE3"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Wisdom in the Sun Kevin MacLeod\") and the MusicBrainz recording search (recording \"Wisdom in the Sun\", artist \"Kevin MacLeod\") found no release of this title by this author. incompetech.com/music/royalty-free/pieces.json (1,443 CC BY pieces with ISRCs) has no piece titled \"Wisdom in the Sun\"."
+    },
+    {
+      "id": "infinite-wonder",
+      "mood": "calm-curious",
+      "loop": false,
+      "title": "Infinite Wonder",
+      "author": "Kevin MacLeod",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/misc/Infinite%20Wonder.mp3",
+        "sha256": "490f745de87525dd6da563da266c8823804a3f787573ff317b4788d6d5566e54",
+        "size": 7606774
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-infinite-wonder.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190404143329id_/https://freepd.com/music/Infinite%20Wonder.mp3",
+        "wayback_sha1": "OWCONOUZKTHG6FTZIRE7LPSF6I5MGRSJ"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Infinite Wonder Kevin MacLeod\") and the MusicBrainz recording search (recording \"Infinite Wonder\", artist \"Kevin MacLeod\") found no release of this title by this author. incompetech.com/music/royalty-free/pieces.json (1,443 CC BY pieces with ISRCs) has no piece titled \"Infinite Wonder\"."
+    },
+    {
+      "id": "observing-the-star",
+      "mood": "calm-curious",
+      "loop": false,
+      "title": "Observing The Star",
+      "author": "yd",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/ObservingTheStar.zip",
+        "sha256": "295ecdc6daa96c0101a022d3a09314fc6ed86342ffee7387e8e9854ace3f8a30",
+        "size": 786020,
+        "member": {
+          "name": "ObservingTheStar.ogg",
+          "sha256": "d208059cbe7b21154a9b7844d98ac9ad754617a5a321c5e507d203a907abe665",
+          "size": 786458
+        }
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-another-space-background-track.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/another-space-background-track"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Observing The Star yd\") and the MusicBrainz recording search (recording \"Observing The Star\", artist \"yd\") found no release of this title by this author. The OpenGameArt page lists CC0 as the licence and names yd as the author."
+    },
+    {
+      "id": "inspiration",
+      "mood": "upbeat-corporate",
+      "loop": false,
+      "title": "Inspiration",
+      "author": "Rafael Krux",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/upbeat/Inspiration.mp3",
+        "sha256": "a254227da398809c79a0c753073a3a92c7341672abc92bb0166b6326e126f0b4",
+        "size": 5530068
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-inspiration.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190404080750id_/https://freepd.com/music/Inspiration.mp3",
+        "wayback_sha1": "5R3VSPPP2ADGLUXSYRHLFMANB7LMYIL5"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Inspiration Rafael Krux\") and the MusicBrainz recording search (recording \"Inspiration\", artist \"Rafael Krux\") found no release of this title by this author. www.rafaelkrux.com (home, both album pages, terms) does not list it. The only iTunes near match, \"Chamber Inspirations\" by Rafael Krux (2:31, 2022), is a different title and length."
+    },
+    {
+      "id": "advertime",
+      "mood": "upbeat-corporate",
+      "loop": false,
+      "title": "Advertime",
+      "author": "Rafael Krux",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/upbeat/Advertime.mp3",
+        "sha256": "6f0d4433cf788304d60add551cc460dd877865e6d84a2ab3fa7d15ba3f55d6ce",
+        "size": 5360940
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-advertime.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20200518035353id_/https://freepd.com/music/Advertime.mp3",
+        "wayback_sha1": "DFWNH6WHQITHEW3FFXQNYICP4YA3KCVZ"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Advertime Rafael Krux\") and the MusicBrainz recording search (recording \"Advertime\", artist \"Rafael Krux\") found no release of this title by this author. www.rafaelkrux.com (home, both album pages, terms) does not list it."
+    },
+    {
+      "id": "funshine",
+      "mood": "upbeat-corporate",
+      "loop": false,
+      "title": "Funshine",
+      "author": "Kevin MacLeod",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/upbeat/Funshine.mp3",
+        "sha256": "b98b226927367a977377fe4f75d1cf59e4366ca2f444c2c7d23d13e7f506f532",
+        "size": 6756665
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-funshine.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190403200041id_/https://freepd.com/music/Funshine.mp3",
+        "wayback_sha1": "FPFGPPDETTJSM76MMMYLRK52NJX4RJSX"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Funshine Kevin MacLeod\") and the MusicBrainz recording search (recording \"Funshine\", artist \"Kevin MacLeod\") found no release of this title by this author. incompetech.com/music/royalty-free/pieces.json (1,443 CC BY pieces with ISRCs) has no piece titled \"Funshine\"."
+    },
+    {
+      "id": "pickled-pink",
+      "mood": "upbeat-corporate",
+      "loop": false,
+      "title": "Pickled Pink",
+      "author": "Kevin MacLeod",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/upbeat/Pickled%20Pink.mp3",
+        "sha256": "3eacbde6e5322792cec71bc4942c4f7bff86f6b33e1836a1520db198c475b904",
+        "size": 7164179
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-pickled-pink.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190404013549id_/https://freepd.com/music/Pickled%20Pink.mp3",
+        "wayback_sha1": "RPJ7354A7DBZE7SBAKPTXFL7RJ7NS2DD"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Pickled Pink Kevin MacLeod\") and the MusicBrainz recording search (recording \"Pickled Pink\", artist \"Kevin MacLeod\") found no release of this title by this author. incompetech.com/music/royalty-free/pieces.json (1,443 CC BY pieces with ISRCs) has no piece titled \"Pickled Pink\"."
+    },
+    {
+      "id": "goodnightmare",
+      "mood": "upbeat-corporate",
+      "loop": false,
+      "title": "Goodnightmare",
+      "author": "Kevin MacLeod",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/electronic/Goodnightmare.mp3",
+        "sha256": "b3793f15317a70bbbd857fa4a77872a42bcdc27445f25bce397bb7a442f91b9c",
+        "size": 7684215
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-goodnightmare.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190403191346id_/https://freepd.com/music/Goodnightmare.mp3",
+        "wayback_sha1": "UIHBQIXTIV7C4LLBTGR7DQTB7F6I67BO"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Goodnightmare Kevin MacLeod\") and the MusicBrainz recording search (recording \"Goodnightmare\", artist \"Kevin MacLeod\") found no release of this title by this author. incompetech.com/music/royalty-free/pieces.json (1,443 CC BY pieces with ISRCs) has no piece titled \"Goodnightmare\"."
+    },
+    {
+      "id": "and-just-like-that",
+      "mood": "upbeat-corporate",
+      "loop": false,
+      "title": "And Just Like That",
+      "author": "Bryan Teoh",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/upbeat/And%20Just%20Like%20That.mp3",
+        "sha256": "75e6438a8d6d1dcb54dd42cc02f4944b484e73dac48502eb78514c438cada914",
+        "size": 2287556
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-and-just-like-that.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20201102125616id_/https://freepd.com/music/And%20Just%20Like%20That.mp3",
+        "wayback_sha1": "7JQSK77OK3WDPC7KMJEGMDY5M5VXD7EQ"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"And Just Like That Bryan Teoh\") and the MusicBrainz recording search (recording \"And Just Like That\", artist \"Bryan Teoh\") found no release of this title by this author. www.bryanteoh.com (home and listen pages; the listen page embeds SoundCloud playlists, which were not enumerated) does not list it, and none of the 29 Bryan Teoh songs the iTunes Search API returns for the artist has this title."
+    },
+    {
+      "id": "motions",
+      "mood": "neutral-serious",
+      "loop": false,
+      "title": "Motions",
+      "author": "Rafael Krux",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/upbeat/Motions.mp3",
+        "sha256": "af6380fde14f41dc4762a0a69c558bfd03a8a88c10cb5c8f578a6d0bcb4750be",
+        "size": 4677248
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-motions.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190403185023id_/https://freepd.com/music/Motions.mp3",
+        "wayback_sha1": "CU4SK2KLUXV3ZZV3VXBXVAQ32BNTMAET"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Motions Rafael Krux\") and the MusicBrainz recording search (recording \"Motions\", artist \"Rafael Krux\") found no release of this title by this author. www.rafaelkrux.com (home, both album pages, terms) does not list it."
+    },
+    {
+      "id": "beat-one",
+      "mood": "neutral-serious",
+      "loop": false,
+      "title": "Beat One",
+      "author": "Kevin MacLeod",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://archive.org/download/freepd/electronic/Beat%20One.mp3",
+        "sha256": "930dd4c6c88a2abb153f52e56a7c74bd041008f5afa4835602469dba3676aed8",
+        "size": 5835821
+      },
+      "evidence": {
+        "kind": "archived",
+        "snapshot": "deploy/music/evidence/freepd-beat-one.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://web.archive.org/web/20240528025710/https://www.freepd.com/",
+        "wayback_capture": "http://web.archive.org/web/20190403154057id_/https://freepd.com/music/Beat%20One.mp3",
+        "wayback_sha1": "SGMRYJ56XEFFL54L4IEA4E6R52AVAYXH"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Beat One Kevin MacLeod\") and the MusicBrainz recording search (recording \"Beat One\", artist \"Kevin MacLeod\") found no release of this title by this author. incompetech.com/music/royalty-free/pieces.json (1,443 CC BY pieces with ISRCs) has no piece titled \"Beat One\"."
+    },
+    {
+      "id": "my-very-own-dead-ship",
+      "mood": "neutral-serious",
+      "loop": false,
+      "title": "My Very Own Dead Ship",
+      "author": "yd",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/projects.zip",
+        "sha256": "331bbbad879811fc0b74d89993c930a78d2170e15240e369f91aaa3f00ed7441",
+        "size": 4193982,
+        "member": {
+          "name": "MyVeryOwnDeadShip.ogg",
+          "sha256": "08d572588e3106723eb1d80c75951dbb8df16051c5a0b008bfb3709f2da20346",
+          "size": 4571806
+        }
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-background-space-track.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/background-space-track"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"MyVeryOwnDeadShip yd\") and the MusicBrainz recording search (recording \"MyVeryOwnDeadShip\", artist \"yd\") found no release of this title by this author. The OpenGameArt page lists CC0 as the licence and names yd as the author."
+    },
+    {
+      "id": "spacetime",
+      "mood": "neutral-serious",
+      "loop": false,
+      "title": "Spacetime",
+      "author": "Alexander Ehlers",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/Alexander%20Ehlers%20-%20Free%20Music%20Pack.zip",
+        "sha256": "99a1ce81856b35ba71e04870b6deac47fbded314308d5eb8e4de519649e38021",
+        "size": 31380370,
+        "member": {
+          "name": "Alexander Ehlers - Free Music Pack/Alexander Ehlers - Spacetime.mp3",
+          "sha256": "4d8aee2da93a980bcb351c327076931799ddde1d783cb1448257420bcf8d8c3a",
+          "size": 4646578
+        }
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-free-music-pack.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/free-music-pack"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Spacetime Alexander Ehlers\") and the MusicBrainz recording search (recording \"Spacetime\", artist \"Alexander Ehlers\") found no release of this title by this author. The iTunes Search API returns no song by Alexander Ehlers. The OpenGameArt page lists CC0 as the licence; its uploader, tricksntraps, writes that they composed the 7 tracks, and the zip and its file names credit Alexander Ehlers."
+    },
+    {
+      "id": "twists",
+      "mood": "neutral-serious",
+      "loop": false,
+      "title": "Twists",
+      "author": "Alexander Ehlers",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/Alexander%20Ehlers%20-%20Free%20Music%20Pack.zip",
+        "sha256": "99a1ce81856b35ba71e04870b6deac47fbded314308d5eb8e4de519649e38021",
+        "size": 31380370,
+        "member": {
+          "name": "Alexander Ehlers - Free Music Pack/Alexander Ehlers - Twists.mp3",
+          "sha256": "649c6d0cc5355cb0f3aa4d795a745a8193b71286165081d53e766f54a2c0b45d",
+          "size": 7206578
+        }
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-free-music-pack.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/free-music-pack"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Twists Alexander Ehlers\") and the MusicBrainz recording search (recording \"Twists\", artist \"Alexander Ehlers\") found no release of this title by this author. The iTunes Search API returns no song by Alexander Ehlers. The OpenGameArt page lists CC0 as the licence; its uploader, tricksntraps, writes that they composed the 7 tracks, and the zip and its file names credit Alexander Ehlers."
+    },
+    {
+      "id": "great-mission",
+      "mood": "neutral-serious",
+      "loop": false,
+      "title": "Great Mission",
+      "author": "Alexander Ehlers",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/Alexander%20Ehlers%20-%20Free%20Music%20Pack.zip",
+        "sha256": "99a1ce81856b35ba71e04870b6deac47fbded314308d5eb8e4de519649e38021",
+        "size": 31380370,
+        "member": {
+          "name": "Alexander Ehlers - Free Music Pack/Alexander Ehlers - Great mission.mp3",
+          "sha256": "651b9a20e24bfa78a6b508367e32193a42dc6d33790cf5797d4f8836aafbc220",
+          "size": 4745843
+        }
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-free-music-pack.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/free-music-pack"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Great Mission Alexander Ehlers\") and the MusicBrainz recording search (recording \"Great Mission\", artist \"Alexander Ehlers\") found no release of this title by this author. The iTunes Search API returns no song by Alexander Ehlers. The OpenGameArt page lists CC0 as the licence; its uploader, tricksntraps, writes that they composed the 7 tracks, and the zip and its file names credit Alexander Ehlers."
+    },
+    {
+      "id": "snowfall-loop",
+      "mood": "loop",
+      "loop": true,
+      "title": "Snowfall (Looped ver.)",
+      "author": "Kistol",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/Snowfall%20%28Looped%20ver.%29_0.ogg",
+        "sha256": "803113b1ee1c9b9ee638b1b1ffd9553fa973759595c12c452bd9090bb58e4651",
+        "size": 877451
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-snowfall.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/snowfall"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Snowfall Kistol\") and the MusicBrainz recording search (recording \"Snowfall\", artist \"Kistol\") found no release of this title by this author. The OpenGameArt page lists CC0 as the licence and names Kistol as the author."
+    },
+    {
+      "id": "heavenly-loop",
+      "mood": "loop",
+      "loop": true,
+      "title": "Heavenly Loop",
+      "author": "isaiah658",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/Heavenly%20Loop.flac",
+        "sha256": "1324464c995635ce1a7833c5b3f33eba7356b60e17e802ebbf286bd1abe0a5a4",
+        "size": 2057506
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-heavenly-loop.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/heavenly-loop"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Heavenly Loop isaiah658\") and the MusicBrainz recording search (recording \"Heavenly Loop\", artist \"isaiah658\") found no release of this title by this author. The iTunes Search API returns no song by isaiah658. The OpenGameArt page lists CC0 as the licence and names isaiah658 as the author."
+    },
+    {
+      "id": "space-ranger-loop",
+      "mood": "loop",
+      "loop": true,
+      "title": "Music loop, strong, downtempo, seamless",
+      "author": "Nostromo",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/space_ranger_seamless_loop.wav",
+        "sha256": "b7af8f7ca80958bcc79cb49faac128cd85093e484b8a42e661c2cda623a6521c",
+        "size": 12700878
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-music-loop-strong-downtempo-seamless.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/music-loop-strong-downtempo-seamless"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Space Ranger Nostromo\") and the MusicBrainz recording search (recording \"Space Ranger\", artist \"Nostromo\") found no release of this title by this author. The OpenGameArt page lists CC0 as the licence and names Nostromo as the author."
+    },
+    {
+      "id": "simple-menu-loop",
+      "mood": "loop",
+      "loop": true,
+      "title": "Simple menu/background music loop",
+      "author": "polosik",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/simple_loop.ogg",
+        "sha256": "31ffea0b986eaba7f3f5c3ddf50dc2f68f51085a7a232cc346af6af722b72550",
+        "size": 2885847
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-simple-menubackground-music-loop.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/simple-menubackground-music-loop"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Simple Loop polosik\") and the MusicBrainz recording search (recording \"Simple Loop\", artist \"polosik\") found no release of this title by this author. The OpenGameArt page lists CC0 as the licence and names polosik as the author."
+    },
+    {
+      "id": "piano-loop",
+      "mood": "loop",
+      "loop": true,
+      "title": "Emotional piano loop",
+      "author": "extenz",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "source": {
+        "url": "https://opengameart.org/sites/default/files/Piano%20Loop.wav",
+        "sha256": "6280cf2a20c9d941ddb012656143c53044f32bed54c2a0d1411a3fdfbbbcad6d",
+        "size": 4910368
+      },
+      "evidence": {
+        "kind": "live",
+        "snapshot": "deploy/music/evidence/oga-emotional-piano-loop.txt",
+        "captured": "2026-11-16",
+        "capture_url": "https://opengameart.org/content/emotional-piano-loop"
+      },
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Piano Loop extenz\") and the MusicBrainz recording search (recording \"Piano Loop\", artist \"extenz\") found no release of this title by this author. The OpenGameArt page lists CC0 as the licence and names extenz as the author."
+    }
+  ]
+}

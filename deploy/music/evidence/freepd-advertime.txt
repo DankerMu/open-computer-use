@@ -1,0 +1,21 @@
+Evidence: Advertime by Rafael Krux (FreePD, archived)
+Captured: 2026-11-16, from the Wayback Machine. FreePD.com closed in 2025.
+
+CC0 statement (FreePD home page)
+Capture: https://web.archive.org/web/20240528025710/https://www.freepd.com/
+Quote: "This music is all licensed CC0 1.0 Universal Public Domain Dedication."
+Quote: "Must I credit the musician in my film? Nope - but we do like it."
+Quote: "Can I buy exclusive rights to any of these tracks? No. The CC0 licensing is a one-way trip ."
+
+Track listing (FreePD upbeat.php)
+Capture: https://web.archive.org/web/20240528012725/https://freepd.com/upbeat.php
+Row: "Advertime Time: 2:14 Download Written by Rafael Krux . Uplifting, positive and light track made with acoustic guitars, piano and light percussion. Perfect for commercials, advertising or generally happy moments. This music is available for commercial and non-commercial purposes."
+Audio link on that page: /music/Advertime.mp3
+
+Hash chain
+Original file capture: http://web.archive.org/web/20200518035353id_/https://freepd.com/music/Advertime.mp3
+Wayback CDX digest (base32 SHA-1): DFWNH6WHQITHEW3FFXQNYICP4YA3KCVZ
+Mirror file: https://archive.org/download/freepd/upbeat/Advertime.mp3
+Mirror SHA-1 (archive.org/metadata/freepd): 196cd3fac78226725b652de0dc204fe601b50ab9
+Mirror SHA-256: 6f0d4433cf788304d60add551cc460dd877865e6d84a2ab3fa7d15ba3f55d6ce
+Mirror size: 5360940 bytes

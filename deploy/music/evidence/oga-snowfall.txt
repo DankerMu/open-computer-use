@@ -1,0 +1,15 @@
+Evidence: OpenGameArt page "Snowfall" (live)
+Captured: 2026-11-16
+Page: https://opengameart.org/content/snowfall
+
+Title: Snowfall
+Author: Kistol Wednesday, September 18, 2013 - 07:35
+Art Type: Music
+Tags: waltz piano loop loopable
+License(s): CC0
+
+Description and files: Preview: The 'looped' version should repeat seamlessly with no clicks or errors. If it doesn't, please contact me and I'll see what I can do. The preview is the non-looped version. ogg versions encoded at q.05 / 160kbps vbr. Attribution Instructions: Music by Kistol, but credit is not required. File(s): Snowfall (Looped ver.).ogg 877.5 Kb [ 2870 download(s)] Snowfall.ogg 1.1 Mb [ 1467 download(s)]
+
+Linked files:
+https://opengameart.org/sites/default/files/Snowfall%20%28Looped%20ver.%29_0.ogg
+https://opengameart.org/sites/default/files/Snowfall_0.ogg

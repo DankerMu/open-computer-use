@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "excluded": [
+    {
+      "title": "Screen Saver",
+      "author": "Kevin MacLeod",
+      "source": "https://archive.org/download/freepd/upbeat/Screen%20Saver.mp3",
+      "conflict": "CC BY on incompetech.com, ISRC USUAN1900046",
+      "reason": "Dual-listed: incompetech offers the same title and length (3:02) under CC BY and pre-registers its music with YouTube Content ID."
+    },
+    {
+      "title": "Limit 70",
+      "author": "Kevin MacLeod",
+      "source": "https://archive.org/download/freepd/upbeat/Limit%2070.mp3",
+      "conflict": "CC BY on incompetech.com, ISRC USUAN1900042",
+      "reason": "Dual-listed: incompetech offers the same title and length (5:02) under CC BY and pre-registers its music with YouTube Content ID."
+    },
+    {
+      "title": "Energizing",
+      "author": "Kevin MacLeod",
+      "source": "https://archive.org/download/freepd/misc/Energizing.mp3",
+      "conflict": "CC BY on incompetech.com, ISRC USUAN1900040",
+      "reason": "Dual-listed: incompetech offers the same title and length (2:13) under CC BY and pre-registers its music with YouTube Content ID."
+    },
+    {
+      "title": "Study and Relax",
+      "author": "Kevin MacLeod",
+      "source": "https://archive.org/download/freepd/featured/Study%20and%20Relax.mp3",
+      "conflict": "CC BY on incompetech.com, ISRC USUAN1900030",
+      "reason": "Dual-listed: incompetech offers the same title and length (3:43) under CC BY and pre-registers its music with YouTube Content ID."
+    },
+    {
+      "title": "Celebration",
+      "author": "Alexander Nakarada",
+      "source": "https://archive.org/download/freepd/misc/Celebration.mp3",
+      "conflict": "title shared with the CC BY incompetech piece \"Celebration\" (4:38), ISRC USUAN1900023",
+      "reason": "Probably a title collision: FreePD's 2:23 track is credited to Alexander Nakarada, not Kevin MacLeod. Excluded anyway because the composer's other outlets could not be checked (his former site serpentsoundstudios.com now serves unrelated content)."
+    },
+    {
+      "title": "River Meditation",
+      "author": "Jason Shaw",
+      "source": "https://archive.org/download/freepd/misc/River%20Meditation.mp3",
+      "conflict": "CC BY 4.0 on audionautix.com",
+      "reason": "The composer publishes his music on Audionautix under a Creative Commons Attribution 4.0 licence."
+    },
+    {
+      "title": "City Sunshine",
+      "author": "Kevin MacLeod",
+      "source": "https://archive.org/download/freepd/upbeat/City%20Sunshine.mp3",
+      "conflict": "commercial release of the same recording: album \"Spring Chicken\" (2018-05-10) on iTunes and Spotify, MusicBrainz release 7757faa0-aa53-4e3a-89ac-d6f62c002238",
+      "reason": "Also sold and streamed through commercial distributors, which raises the Content ID risk; the iTunes Search API and MusicBrainz both list it (2026-11-16)."
+    },
+    {
+      "title": "Meditating Beat",
+      "author": "Kevin MacLeod",
+      "source": "https://archive.org/download/freepd/electronic/Meditating%20Beat.mp3",
+      "conflict": "commercial release of the same recording: album \"Spring Chicken\" (2018-05-10) on iTunes and Spotify, MusicBrainz release 7757faa0-aa53-4e3a-89ac-d6f62c002238",
+      "reason": "Also sold and streamed through commercial distributors, which raises the Content ID risk; the iTunes Search API and MusicBrainz both list it (2026-11-16)."
+    },
+    {
+      "title": "Happy Whistling Ukulele",
+      "author": "Rafael Krux",
+      "source": "https://archive.org/download/freepd/upbeat/Happy%20Whistling%20Ukulele.mp3",
+      "conflict": "commercial release: iTunes single \"Happy Whistling Ukulele - Single\" (2018-04-28)",
+      "reason": "Also sold through a commercial distributor, which raises the Content ID risk (iTunes Search API, 2026-11-16)."
+    },
+    {
+      "title": "Ukulele Song",
+      "author": "Rafael Krux",
+      "source": "https://archive.org/download/freepd/upbeat/Ukulele%20Song.mp3",
+      "conflict": "commercial release: iTunes single \"Ukulele Song - Single\" (2018-04-28)",
+      "reason": "Also sold through a commercial distributor, which raises the Content ID risk (iTunes Search API, 2026-11-16)."
+    },
+    {
+      "title": "Space Arp F Chords",
+      "author": "BuytheField",
+      "source": "https://freesound.org/people/BuytheField/sounds/473996/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Ambient Space Texture",
+      "author": "Andrewkn",
+      "source": "https://freesound.org/people/Andrewkn/sounds/474864/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Decline (Loop)",
+      "author": "Andrewkn",
+      "source": "https://freesound.org/people/Andrewkn/sounds/476772/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Calm background Music",
+      "author": "Bertsz",
+      "source": "https://freesound.org/people/Bertsz/sounds/671900/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Space Travel Universe",
+      "author": "Antenalosmusic",
+      "source": "https://freesound.org/people/Antenalosmusic/sounds/712797/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Free Uplifting Music",
+      "author": "Seth_Makes_Sounds",
+      "source": "https://freesound.org/people/Seth_Makes_Sounds/sounds/670819/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Easy Going Music Loop",
+      "author": "Seth_Makes_Sounds",
+      "source": "https://freesound.org/people/Seth_Makes_Sounds/sounds/691837/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Perspire (Loop)",
+      "author": "JapanYoshiTheGamer",
+      "source": "https://freesound.org/people/JapanYoshiTheGamer/sounds/713517/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "A Hectic Backpacker Trip",
+      "author": "dekstromoramid",
+      "source": "https://freesound.org/people/dekstromoramid/sounds/441150/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Lincoln Soundtrack",
+      "author": "TheWandermiles",
+      "source": "https://freesound.org/people/TheWandermiles/sounds/582263/",
+      "conflict": null,
+      "reason": "Freesound originals download only with an OAuth2 login; the anonymous previews are lossy re-encodes and are not the work as published."
+    },
+    {
+      "title": "Weird Science",
+      "author": "John Bartmann",
+      "source": "https://freemusicarchive.org/music/John_Bartmann/making-soundtracks-is-easy/weird-science/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    },
+    {
+      "title": "Lofi Jam",
+      "author": "John Bartmann",
+      "source": "https://freemusicarchive.org/music/John_Bartmann/moody-beats/lofi-jam/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    },
+    {
+      "title": "Drifting Piano",
+      "author": "HoliznaCC0",
+      "source": "https://freemusicarchive.org/music/holiznacc0/background-music/drifting-piano/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    },
+    {
+      "title": "Wetlands (Lofi Calm Relaxed)",
+      "author": "HoliznaCC0",
+      "source": "https://freemusicarchive.org/music/holiznacc0/public-domain-lofi/wetlands-lofi-calm-relaxed/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    },
+    {
+      "title": "Tranquil Mindscape (Lofi Happy Reflection)",
+      "author": "HoliznaCC0",
+      "source": "https://freemusicarchive.org/music/holiznacc0/public-domain-lofi/tranquil-mindscape-lofi-happy-reflection/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    },
+    {
+      "title": "Lucid (Lofi Dreamy Chill)",
+      "author": "HoliznaCC0",
+      "source": "https://freemusicarchive.org/music/holiznacc0/public-domain-lofi/lucid-lofi-dreamy-chill-1/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    },
+    {
+      "title": "Cliff Road Chill",
+      "author": "Komiku",
+      "source": "https://freemusicarchive.org/music/Komiku/Helice_Awesome_Dance_Adventure_/cliff-road-chill/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    },
+    {
+      "title": "A Calm Moment to Remember Before Taking the Dangerous Road",
+      "author": "Komiku",
+      "source": "https://freemusicarchive.org/music/Komiku/Helice_Awesome_Dance_Adventure_/a-calm-moment-to-remember-before-taking-the-dangerous-road/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    },
+    {
+      "title": "One Cool Minute",
+      "author": "Loyalty Freak Music",
+      "source": "https://freemusicarchive.org/music/Loyalty_Freak_Music/MINIMAL_AMBIENT_BOUNCE/Loyalty_Freak_Music_-_MINIMAL_AMBIENT_BOUNCE_-_02_One_Cool_Minute/",
+      "conflict": null,
+      "reason": "FMA downloads need a login, and its Terms of Use forbid deep links to audio files and automated requests."
+    }
+  ]
+}
