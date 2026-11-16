@@ -1807,6 +1807,33 @@ def documentserver_base(ocu_root: Path) -> str:
     return bases[0].split()[1]
 
 
+def workspace_base(ocu_root: Path) -> str:
+    recipe = require_tracked_regular_file(ocu_root, ROLE_SPECS["workspace"]["dockerfile"])
+    base = None
+    for raw in recipe.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        keyword = line.split()[0].upper()
+        if keyword == "ARG" and base is None:
+            raise ReleaseError(f"workspace recipe declares ARG before FROM: {line}")
+        if keyword != "FROM":
+            continue
+        if base is not None:
+            raise ReleaseError(f"workspace recipe has more than one FROM: {line}")
+        match = re.fullmatch(
+            r"(?i:FROM)\s+([^\s:@]+)(?::[\w][\w.-]*)?@sha256:([0-9a-f]{64})", line
+        )
+        if match is None:
+            raise ReleaseError(
+                f"workspace recipe FROM needs <image>[:<tag>]@sha256:<64 hex> and no AS alias: {line}"
+            )
+        base = f"{match[1]}@sha256:{match[2]}"
+    if base is None:
+        raise ReleaseError("workspace recipe has no FROM line")
+    return base
+
+
 def material_versions(
     role: str,
     arguments: dict[str, str],
@@ -1815,7 +1842,11 @@ def material_versions(
     webui_root: Path | None = None,
 ) -> list[dict]:
     if role == "workspace":
-        return workspace_materials(arguments)
+        if ocu_root is None:
+            raise ReleaseError("OCU source is required for workspace base provenance")
+        return workspace_materials(arguments) + [
+            {"name": "base", "kind": "base-image", "requested": workspace_base(ocu_root)}
+        ]
     if role == "computer-use-server":
         if ocu_root is None:
             raise ReleaseError(
