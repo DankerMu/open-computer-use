@@ -4,8 +4,10 @@
 # Start the isolated ocu-eval stack from the images bound by load.sh.
 # Requires EVAL_ROOT and EVAL_WEBUI_PORT. Reads ${EVAL_ROOT}/stack.env,
 # ${EVAL_ROOT}/images.env and the provider key file ${EVAL_KEY_FILE} (default
-# ${EVAL_ROOT}/dmxapi.key); each must be a 0600 regular file owned by the caller.
-# Values are exported into the compose environment only and never printed.
+# $HOME/.ocu-eval-dmxapi.key, outside EVAL_ROOT so the evaluation's key-leak
+# search over EVAL_ROOT never finds it); each must be a 0600 regular file owned
+# by the caller. Values are exported into the compose environment only and never
+# printed. Exits non-zero unless open-webui-init finishes with status 0.
 set -euo pipefail
 umask 077
 
@@ -16,11 +18,11 @@ trap eval_cleanup EXIT
 
 eval_require_root
 eval_require_port
-key_file="${EVAL_KEY_FILE:-$EVAL_ROOT/dmxapi.key}"
+key_file="${EVAL_KEY_FILE:-$HOME/.ocu-eval-dmxapi.key}"
 eval_require_private "$key_file"
 eval_export_stack
 eval_export_images
-eval_require_space
+eval_require_space 0
 
 EVAL_PROVIDER_KEY=$(<"$key_file")
 if [[ -z "$EVAL_PROVIDER_KEY" || "$EVAL_PROVIDER_KEY" == *[[:space:]]* ]]; then
@@ -31,3 +33,10 @@ export EVAL_PROVIDER_KEY
 # The orchestrator's data directory; the compose bind refuses to create it.
 mkdir -p -- "$EVAL_ROOT/data"
 eval_compose up -d --no-build --pull never
+# compose wait (Compose 2.20+) exits with the one-shot initializer's status.
+status=0
+eval_compose wait open-webui-init || status=$?
+if (( status != 0 )); then
+    eval_fail "open-webui-init exited with status $status; the stack is still running (docker logs ocu-eval-open-webui-init)"
+fi
+printf '%s\n' "eval: ocu-eval is up and open-webui-init finished"

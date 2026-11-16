@@ -42,6 +42,10 @@ services:
       DOCKER_IMAGE: ${DOCKER_IMAGE:?DOCKER_IMAGE is required}
       MCP_API_KEY: ${MCP_API_KEY:?MCP_API_KEY is required}
       OCU_INTERNAL_TOKEN: ${OCU_INTERNAL_TOKEN:?OCU_INTERNAL_TOKEN is required}
+      # Production's value (bootstrap-test.sh). The upstream 600-second default
+      # would reap the sandbox of a run that makes no sandbox tool call for ten
+      # minutes, in the middle of a render.
+      CONTAINER_IDLE_TIMEOUT: "259200"
       # Speech stays unconfigured until the evaluation's speech adapter exists.
       TTS_BASE_URL: ""
       TTS_MODEL: ""
@@ -55,6 +59,11 @@ services:
       - "127.0.0.1:${EVAL_WEBUI_PORT:?EVAL_WEBUI_PORT is required}:8080"
     environment: !override
       DATABASE_URL: postgresql://openwebui:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/openwebui
+      # WebUI creates this admin during startup, before it serves, and disables
+      # signup; open-webui-init then signs in as the existing admin. Without it
+      # the first client to reach the port could sign up as admin.
+      WEBUI_ADMIN_EMAIL: ${ADMIN_EMAIL:?ADMIN_EMAIL is required}
+      WEBUI_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY is required}
       OPENAI_API_BASE_URL: https://www.dmxapi.cn/v1
       # Read by start.sh from the 0600 provider key file. stop.sh exports it

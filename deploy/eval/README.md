@@ -13,17 +13,24 @@ This directory runs Open WebUI and Computer Use on a shared Docker host as one c
 - Sandboxes run with `ENABLE_NETWORK=false`. They publish no port and reach no address.
 - The orchestrator's data directory is `${EVAL_ROOT}/data`, bound at the same path.
 - DocumentServer, retention-guard and the proxy are not run. The host firewall, host networks and the Docker daemon configuration are not changed.
+- Without the proxy there is no `/ocu` path, so the workspace sidebar does not work in a browser. WebUI reaches the orchestrator directly at `http://computer-use-server:8081`, and the evaluation driver goes through WebUI's API, so neither needs it.
+- WebUI creates the admin from `stack.env` during startup, before it serves requests, and disables signup. `open-webui-init` then signs in as that admin, so no client can sign up as admin first.
+- Sandboxes stop after three days idle (`CONTAINER_IDLE_TIMEOUT=259200`, as in production). The upstream 600-second default would stop the sandbox of a run that makes no sandbox tool call for ten minutes, in the middle of a render.
 
-## Files under `EVAL_ROOT`
+## Files
+
+`EVAL_ROOT` must be a directory owned by the caller that is not group- or other-writable; the scripts refuse any other.
 
 | Path | Written by | Contents |
 | --- | --- | --- |
 | `${EVAL_ROOT}/src` | operator | OCU checkout at the commit under evaluation |
 | `${EVAL_ROOT}/stack.env` | `secrets.sh init` | stack secrets, mode 0600, written once |
-| `${EVAL_KEY_FILE}` | operator | provider key file, mode 0600; default `${EVAL_ROOT}/dmxapi.key` |
+| `${EVAL_KEY_FILE}` | operator | provider key file, mode 0600; default `$HOME/.ocu-eval-dmxapi.key` |
 | `${EVAL_ROOT}/images.env` | `load.sh` | image references bound to the `RUNTIME_IMAGE_VARS` names |
 | `${EVAL_ROOT}/loaded-images.txt` | `load.sh` | references that were absent before a load, for cleanup |
 | `${EVAL_ROOT}/data` | `start.sh` | orchestrator data: per-chat outputs |
+
+The provider key file stays outside `EVAL_ROOT`: the evaluation's key-leak check searches every file under `EVAL_ROOT`, so a key stored there would always fail it.
 
 `stack.env`, the provider key file and `images.env` are refused unless each is a regular file, not a symlink, owned by the caller, with mode 0600. The scripts export their values into the compose environment only. They never print a value.
 
@@ -31,7 +38,7 @@ This directory runs Open WebUI and Computer Use on a shared Docker host as one c
 
 ## Free-space floor
 
-`load.sh` and `start.sh` refuse to proceed when Docker's root filesystem has less than 15 GiB (16106127360 bytes) free. `load.sh` checks before every `docker load`. The root is `DockerRootDir` from the local daemon, found the same way as `deploy/release.py` finds it, and `df -Pk` measures it. The refusal states the free space and the floor.
+`load.sh` and `start.sh` refuse to proceed when Docker's root filesystem has less than 15 GiB (16106127360 bytes) free. Before every `docker load`, `load.sh` also requires room for that archive unpacked above the floor: the floor plus `IMPORT_UNPACK_FACTOR` (read from `deploy/release.py`) times the archive size. The root is `DockerRootDir` from the local daemon, found the same way as `deploy/release.py` finds it, and `df -Pk` measures it. The refusal states the free space, the archive's required bytes and the floor.
 
 To see the refusal, put a `df` that reports 1 GiB free first on `PATH`. Both scripts then exit before any `docker load` or `compose up`.
 
@@ -47,7 +54,7 @@ rm -rf "$fake"
 
 ## Operator steps
 
-Commands run on the evaluation host as the evaluation user. Placeholders are in angle brackets. The host needs `bash`, `python3` 3.9 or newer (`deploy/release.py` is imported), `df` and Docker with Compose v2.
+Commands run on the evaluation host as the evaluation user. Placeholders are in angle brackets. The host needs `bash`, `python3` 3.9 or newer (`deploy/release.py` is imported), `df` and Docker with Compose 2.20 or newer (`start.sh` uses `docker compose wait`).
 
 1. Prepare the root and the checkout.
 
@@ -61,7 +68,7 @@ Commands run on the evaluation host as the evaluation user. Placeholders are in 
 2. Store the provider key without echoing it: paste the key at the silent prompt and press Enter. `printf` is a shell builtin, so the key never appears on a command line.
 
    ```bash
-   IFS= read -rs key && (umask 077 && printf '%s\n' "$key" >"$EVAL_ROOT/dmxapi.key"); unset key
+   IFS= read -rs key && (umask 077 && printf '%s\n' "$key" >"$HOME/.ocu-eval-dmxapi.key"); unset key
    ```
 
    To keep it elsewhere, set `EVAL_KEY_FILE=<path>` for `start.sh`.
@@ -83,6 +90,8 @@ Commands run on the evaluation host as the evaluation user. Placeholders are in 
    ```bash
    EVAL_WEBUI_PORT=<port> "$EVAL_ROOT/src/deploy/eval/start.sh"
    ```
+
+   After `up -d`, `start.sh` waits for `open-webui-init` with `docker compose wait`. It exits non-zero, naming the service and its status, unless the initializer finishes with status 0. The stack stays up for inspection either way.
 
    From the workstation: `ssh -N -L <local-port>:127.0.0.1:<port> <user>@<eval-host>`.
 

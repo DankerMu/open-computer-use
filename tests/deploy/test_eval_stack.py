@@ -195,9 +195,11 @@ class EvalComposeConfigTests(unittest.TestCase):
         environment = server["environment"]
         self.assertEqual(set(environment), {
             "ENABLE_NETWORK", "BASE_DATA_DIR", "DOCKER_IMAGE", "MCP_API_KEY", "OCU_INTERNAL_TOKEN",
-            "TTS_BASE_URL", "TTS_MODEL", "TTS_VOICE", "TTS_API_KEY",
+            "TTS_BASE_URL", "TTS_MODEL", "TTS_VOICE", "TTS_API_KEY", "CONTAINER_IDLE_TIMEOUT",
         })
         self.assertEqual(environment["ENABLE_NETWORK"], "false")
+        # Production's three days, not the upstream 600 s that reaps a long render.
+        self.assertEqual(environment["CONTAINER_IDLE_TIMEOUT"], "259200")
         self.assertEqual(environment["BASE_DATA_DIR"], str(self.eval_root / "data"))
         self.assertEqual(environment["DOCKER_IMAGE"], DEFAULT_RELEASE_IMAGES["workspace"])
         for name in ("TTS_BASE_URL", "TTS_MODEL", "TTS_VOICE", "TTS_API_KEY"):
@@ -213,6 +215,8 @@ class EvalComposeConfigTests(unittest.TestCase):
         webui = document["services"]["open-webui"]["environment"]
         self.assertEqual(webui, {
             "DATABASE_URL": f"postgresql://openwebui:{fake['POSTGRES_PASSWORD']}@postgres:5432/openwebui",
+            "WEBUI_ADMIN_EMAIL": ADMIN_EMAIL,
+            "WEBUI_ADMIN_PASSWORD": fake["ADMIN_PASSWORD"],
             "WEBUI_SECRET_KEY": fake["WEBUI_SECRET_KEY"],
             "OPENAI_API_BASE_URL": "https://www.dmxapi.cn/v1",
             "OPENAI_API_KEY": fake[PROVIDER_KEY_VAR],
@@ -223,6 +227,10 @@ class EvalComposeConfigTests(unittest.TestCase):
             "OCU_INTERNAL_TOKEN": fake["OCU_INTERNAL_TOKEN"],
             "ENABLE_OCU_OFFICE_EDIT": "false",
         })
+        # The admin password reaches only WebUI and its initializer.
+        for name in ("computer-use-server", "postgres"):
+            self.assertFalse(fake["ADMIN_PASSWORD"] in json.dumps(document["services"][name]),
+                             f"the admin password reached {name}")
         postgres = document["services"]["postgres"]["environment"]
         self.assertEqual(postgres["POSTGRES_PASSWORD"], fake["POSTGRES_PASSWORD"])
         init = document["services"]["open-webui-init"]
@@ -263,6 +271,9 @@ class EvalComposeSourceTests(unittest.TestCase):
         for name in ("workspace", "cleanup"):
             self.assertEqual(source["services"][name]["profiles"], ["never"], name)
         self.assertEqual(source["services"]["computer-use-server"]["depends_on"], {"!reset": {}})
+        webui = source["services"]["open-webui"]["environment"]["!override"]
+        self.assertTrue(webui["WEBUI_ADMIN_EMAIL"].startswith("${ADMIN_EMAIL:?"))
+        self.assertTrue(webui["WEBUI_ADMIN_PASSWORD"].startswith("${ADMIN_PASSWORD:?"))
         required = {"EVAL_ROOT", "EVAL_WEBUI_PORT", *SERVICE_IMAGE_VARS.values(), "DOCKER_IMAGE",
                     *STACK_NAMES}
         seen = set()
@@ -271,7 +282,11 @@ class EvalComposeSourceTests(unittest.TestCase):
             if name in required:
                 seen.add(name)
                 self.assertTrue(modifier.startswith(":?"), f"{name} must use the :? form")
-        self.assertEqual(seen, required)
+            if name == PROVIDER_KEY_VAR:
+                seen.add(name)
+                # Set-but-empty is allowed: stop.sh exports it empty for compose down.
+                self.assertTrue(modifier.startswith("?"), f"{name} must use the ? form")
+        self.assertEqual(seen, required | {PROVIDER_KEY_VAR})
         self.assertNotIn("env_file", text)
 
 
@@ -322,6 +337,11 @@ elif args[:1] == ["compose"]:
     record["env_file_empty"] = os.path.getsize(env_file) == 0
     with open(os.path.join(state, "compose-env.jsonl"), "a", encoding="utf-8") as log:
         log.write(json.dumps(record) + "\n")
+    if "wait" in args:
+        status = int(os.environ.get("EVAL_STUB_WAIT_EXIT", "0"))
+        if status:
+            print(f'container "stub" exited with status code {status}')
+        sys.exit(status)
 else:
     print("docker stub: unexpected call", file=sys.stderr)
     sys.exit(97)
@@ -378,8 +398,10 @@ class EvalScriptCase(unittest.TestCase):
         environment.update(extra)
         return {name: value for name, value in environment.items() if value is not None}
 
-    def run_script(self, script: Path, *args: str, **extra) -> subprocess.CompletedProcess:
-        result = subprocess.run(["bash", str(script), *args], cwd=self.tmp, env=self.environment(**extra),
+    def run_script(self, script: Path, *args: str, cwd: Path | None = None,
+                   **extra) -> subprocess.CompletedProcess:
+        result = subprocess.run(["bash", str(script), *args], cwd=cwd or self.tmp,
+                                env=self.environment(**extra),
                                 capture_output=True, text=True, timeout=120, check=False)
         # Before any assertion that could print stdout or stderr.
         self.assert_no_leak(result, self.planted_values())
@@ -430,8 +452,14 @@ class EvalScriptCase(unittest.TestCase):
         body = "".join(f"{name}={value}\n" for name, value in values.items())
         return self.write_private(self.eval_root / "stack.env", body, mode)
 
-    def write_key(self, path: Path | None = None, mode: int = 0o600) -> Path:
-        return self.write_private(path or self.eval_root / "dmxapi.key", PLANTED_KEY + "\n", mode)
+    @property
+    def key_path(self) -> Path:
+        # HOME is self.tmp, so this is start.sh's default $HOME/.ocu-eval-dmxapi.key.
+        return self.tmp / ".ocu-eval-dmxapi.key"
+
+    def write_key(self, path: Path | None = None, mode: int = 0o600, text: str | None = None) -> Path:
+        return self.write_private(path or self.key_path, PLANTED_KEY + "\n" if text is None else text,
+                                  mode)
 
     def write_images(self, mode: int = 0o600) -> Path:
         body = "".join(f"{RUNTIME_IMAGE_VARS[role]}={DEFAULT_RELEASE_IMAGES[role]}\n"
@@ -495,7 +523,7 @@ class EvalSecretsTests(EvalScriptCase):
         self.write_images()
         result = self.run_script(START)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.compose_records()), 1)
+        self.assertEqual(len(self.compose_records()), 2)
 
     def test_init_refuses_a_symlink_or_missing_root(self):
         target = self.write_private(self.tmp / "elsewhere", "untouched\n")
@@ -509,6 +537,36 @@ class EvalSecretsTests(EvalScriptCase):
         usage = self.run_script(SECRETS)
         self.assertNotEqual(usage.returncode, 0)
         self.assertIn("usage: secrets.sh init", usage.stderr)
+
+
+    def test_eval_root_writable_by_group_or_others_is_refused(self):
+        for mode in (0o775, 0o757):
+            with self.subTest(mode=oct(mode)):
+                self.eval_root.chmod(mode)
+                try:
+                    result = self.run_script(SECRETS, "init")
+                finally:
+                    self.eval_root.chmod(0o700)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("EVAL_ROOT", result.stderr)
+                self.assertIn("writable", result.stderr)
+                self.assertFalse((self.eval_root / "stack.env").exists())
+
+    def test_scripts_ignore_python_modules_in_the_working_directory(self):
+        hostile = self.tmp / "hostile"
+        hostile.mkdir()
+        marker = self.tmp / "hostile-module-ran"
+        for name in ("secrets", "json"):
+            (hostile / f"{name}.py").write_text(
+                f"open({str(marker)!r}, 'a').write({name!r} + '\\n')\n"
+                f"raise RuntimeError('hostile {name} module imported')\n", encoding="utf-8")
+        init = self.run_script(SECRETS, "init", cwd=hostile)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        self.write_key()
+        self.write_images()
+        start = self.run_script(START, cwd=hostile)
+        self.assertEqual(start.returncode, 0, start.stderr)
+        self.assertFalse(marker.exists(), "a module from the working directory was imported")
 
 
 class EvalLoadTests(EvalScriptCase):
@@ -549,6 +607,20 @@ class EvalLoadTests(EvalScriptCase):
         self.assertFalse([argv for argv in self.calls("docker") if argv[:1] == ["load"]])
         self.assertFalse((self.eval_root / "images.env").exists())
 
+    def test_archive_that_does_not_fit_above_the_floor_is_not_loaded(self):
+        package = self.make_package()
+        # Above the plain floor, below floor + 3 x the first archive (workspace).
+        free_kb = FLOOR_BYTES // 1024 + 1
+        needed = 3 * (package / "images" / "workspace.tar").stat().st_size
+        self.assertGreater(needed, 1024)
+        result = self.run_script(LOAD, str(package), EVAL_STUB_DF_KB=str(free_kb))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(free_kb * 1024), result.stderr)
+        self.assertIn(str(needed), result.stderr)
+        self.assertIn(str(FLOOR_BYTES), result.stderr)
+        self.assertFalse([argv for argv in self.calls("docker") if argv[:1] == ["load"]])
+        self.assertFalse((self.eval_root / "images.env").exists())
+
     def test_checksum_mismatch_refuses_before_any_load(self):
         package = self.make_package()
         archive = package / "images" / "open-webui.tar"
@@ -565,7 +637,8 @@ class EvalLoadTests(EvalScriptCase):
         self.seed_image(DEFAULT_RELEASE_IMAGES["open-webui"], "sha256:" + "c" * 64)
         result = self.run_script(LOAD, str(package))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(DEFAULT_RELEASE_IMAGES["open-webui"], result.stderr)
+        self.assertIn(f"existing image {DEFAULT_RELEASE_IMAGES['open-webui']} conflicts with the release",
+                      result.stderr)
         self.assertFalse([argv for argv in self.calls("docker") if argv[:1] == ["load"]])
         self.assertFalse((self.eval_root / "loaded-images.txt").exists())
 
@@ -577,16 +650,15 @@ class EvalLoadTests(EvalScriptCase):
 
 
 class EvalStartStopTests(EvalScriptCase):
-    def assert_compose(self, action: list[str]) -> dict:
+    def assert_compose(self, actions: list[list[str]]) -> dict:
         composes = [argv for argv in self.calls("docker") if argv[:1] == ["compose"]]
-        self.assertEqual(len(composes), 1)
-        argv = composes[0]
-        self.assertEqual(argv[:5], ["compose", "-p", PROJECT, "--project-directory", str(ROOT)])
-        self.assertEqual(argv[5], "--env-file")
-        self.assertEqual(argv[7:13], ["-f", str(ROOT / "docker-compose.yml"),
-                                      "-f", str(ROOT / "docker-compose.webui.yml"),
-                                      "-f", str(COMPOSE_EVAL)])
-        self.assertEqual(argv[13:], action)
+        self.assertEqual([argv[13:] for argv in composes], actions)
+        for argv in composes:
+            self.assertEqual(argv[:5], ["compose", "-p", PROJECT, "--project-directory", str(ROOT)])
+            self.assertEqual(argv[5], "--env-file")
+            self.assertEqual(argv[7:13], ["-f", str(ROOT / "docker-compose.yml"),
+                                          "-f", str(ROOT / "docker-compose.webui.yml"),
+                                          "-f", str(COMPOSE_EVAL)])
         record = self.compose_records()[0]
         self.assertIs(record["env_file_empty"], True)
         self.assertEqual(record["COMPOSE_PROFILES"], "")
@@ -604,9 +676,15 @@ class EvalStartStopTests(EvalScriptCase):
         self.write_images()
         result = self.run_script(START)
         self.assertEqual(result.returncode, 0, result.stderr)
-        record = self.assert_compose(["up", "-d", "--no-build", "--pull", "never"])
+        record = self.assert_compose([["up", "-d", "--no-build", "--pull", "never"],
+                                      ["wait", "open-webui-init"]])
         self.assertTrue(record[PROVIDER_KEY_VAR] == sha256_hex(PLANTED_KEY.encode()),
                         "provider key not exported")
+        # The spec's key-leak check searches every file under EVAL_ROOT.
+        for path in self.eval_root.rglob("*"):
+            if path.is_file():
+                self.assertFalse(PLANTED_KEY.encode() in path.read_bytes(),
+                                 f"the provider key is stored under EVAL_ROOT: {path.name}")
         self.assertTrue((self.eval_root / "data").is_dir())
         self.assertEqual(self.calls("df")[0][-1], str(self.docker_root))
         self.assert_no_forbidden_operation()
@@ -620,6 +698,31 @@ class EvalStartStopTests(EvalScriptCase):
         self.assertTrue(self.compose_records()[0][PROVIDER_KEY_VAR]
                         == sha256_hex(PLANTED_KEY.encode()), "provider key not exported")
 
+    def test_start_fails_naming_the_initializer_when_it_fails(self):
+        self.write_stack()
+        self.write_key()
+        self.write_images()
+        result = self.run_script(START, EVAL_STUB_WAIT_EXIT="3")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("open-webui-init", result.stderr)
+        self.assertIn("status 3", result.stderr)
+        self.assert_compose([["up", "-d", "--no-build", "--pull", "never"],
+                             ["wait", "open-webui-init"]])
+
+    def test_start_refuses_an_empty_or_multi_line_key(self):
+        self.write_stack()
+        self.write_images()
+        for case, text in (("empty", ""), ("two-line", PLANTED_KEY + "\nfake-second-line\n")):
+            with self.subTest(case=case):
+                self.write_key(text=text)
+                (self.state / "calls.jsonl").unlink(missing_ok=True)
+                result = self.run_script(START)
+                self.assertFalse("fake-second-line" in result.stdout + result.stderr,
+                                 "key file content reached script output")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(self.key_path), result.stderr)
+                self.assertFalse([argv for argv in self.calls("docker") if argv[:1] == ["compose"]])
+
     def test_start_refuses_low_free_space(self):
         self.write_stack()
         self.write_key()
@@ -631,17 +734,19 @@ class EvalStartStopTests(EvalScriptCase):
         self.assertFalse([argv for argv in self.calls("docker") if argv[:1] == ["compose"]])
 
     def test_start_refuses_unsafe_or_missing_private_files(self):
-        writers = {"stack.env": self.write_stack, "dmxapi.key": self.write_key,
+        writers = {"stack.env": self.write_stack, ".ocu-eval-dmxapi.key": self.write_key,
                    "images.env": self.write_images}
+        paths = {"stack.env": self.eval_root / "stack.env", ".ocu-eval-dmxapi.key": self.key_path,
+                 "images.env": self.eval_root / "images.env"}
         for target in writers:
             for case in ("mode-0644", "symlink", "missing"):
                 with self.subTest(target=target, case=case):
-                    for path in self.eval_root.iterdir():
-                        path.unlink()
+                    for path in paths.values():
+                        path.unlink(missing_ok=True)
                     for name, writer in writers.items():
                         if name != target:
                             writer()
-                    path = self.eval_root / target
+                    path = paths[target]
                     if case == "mode-0644":
                         writers[target](mode=0o644)
                     elif case == "symlink":
@@ -679,7 +784,7 @@ class EvalStartStopTests(EvalScriptCase):
         self.write_images()
         result = self.run_script(STOP)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_compose(["down"])
+        self.assert_compose([["down"]])
         self.assert_no_forbidden_operation()
 
     def test_stop_refuses_an_unsafe_stack_file(self):

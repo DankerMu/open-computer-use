@@ -7,7 +7,8 @@
 # A reference that already exists with another image id is refused, so no tag on
 # the host is ever moved. References absent before the load are appended to
 # ${EVAL_ROOT}/loaded-images.txt for cleanup; ${EVAL_ROOT}/images.env binds each
-# reference to its RUNTIME_IMAGE_VARS name. Docker's root keeps a 15 GiB floor.
+# reference to its RUNTIME_IMAGE_VARS name. Docker's root keeps a 15 GiB floor,
+# and before each load also room for that archive unpacked above the floor.
 set -euo pipefail
 umask 077
 
@@ -24,15 +25,16 @@ if [[ ! -d "$1" || ! -f "$1/release.json" ]]; then
 fi
 PACKAGE="$(cd "$1" && pwd -P)"
 eval_require_root
-eval_require_space
+eval_require_space 0
 EVAL_TMP=$(mktemp -d "${TMPDIR:-/tmp}/ocu-eval.XXXXXX")
 
 # plan: verify every archive and the host's existing references, then print one
-# "<load|present> <variable> <reference> <archive>" line per role.
+# "<load|present> <variable> <reference> <archive> <unpack bytes>" line per role.
+# The unpack estimate is release.py's IMPORT_UNPACK_FACTOR times the archive size.
 # verify: every reference now resolves to the identity release.json declares.
 eval_images() {
     # shellcheck disable=SC2086 # the role list splits on purpose
-    python3 - "$EVAL_SOURCE/deploy" "$PACKAGE" "$1" $EVAL_ROLES <<'PY'
+    python3 -I - "$EVAL_SOURCE/deploy" "$PACKAGE" "$1" $EVAL_ROLES <<'PY'
 from pathlib import Path
 import sys
 
@@ -70,7 +72,8 @@ try:
                 raise release.ReleaseError(f"{role}: archive digest for {tag} does not match release.json")
         present = release.existing_reference(reference, identities=identities) is not None
         rows.append(("present" if present else "load", release.RUNTIME_IMAGE_VARS[role],
-                     reference, str(archive)))
+                     reference, str(archive),
+                     str(release.IMPORT_UNPACK_FACTOR * archive.stat().st_size)))
 except release.ReleaseError as cop:
     sys.exit(f"eval: {cop}")
 for row in rows:
@@ -80,9 +83,9 @@ PY
 
 eval_images plan >"$EVAL_TMP/plan" || exit 1
 : >"$EVAL_TMP/images.env"
-while IFS=$'\t' read -r action name reference archive; do
+while IFS=$'\t' read -r action name reference archive needed; do
     if [[ "$action" == "load" ]]; then
-        eval_require_space
+        eval_require_space "$needed" "$archive"
         # Recorded before the load, so an interrupted load is still cleaned up.
         if ! grep -Fxq -- "$reference" "$EVAL_ROOT/loaded-images.txt" 2>/dev/null; then
             printf '%s\n' "$reference" >>"$EVAL_ROOT/loaded-images.txt"

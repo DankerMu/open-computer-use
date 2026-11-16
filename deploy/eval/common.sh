@@ -2,6 +2,8 @@
 # Copyright (c) 2026 Open Computer Use Contributors
 # Shared checks for the ocu-eval scripts; sourced, never executed. Secret values
 # travel only through exported variables: no function prints a value it reads.
+# Every inline Python runs isolated (-I): a module in the working directory, such
+# as a json.py or secrets.py, is never imported, and PYTHON* variables are ignored.
 # shellcheck shell=bash
 
 EVAL_PROJECT="ocu-eval"
@@ -31,6 +33,20 @@ eval_require_root() {
     if [[ "$EVAL_ROOT" != /* || ! -d "$EVAL_ROOT" || -L "$EVAL_ROOT" ]]; then
         eval_fail "EVAL_ROOT must be an existing absolute directory, not a symlink: $EVAL_ROOT"
     fi
+    # Another writer could replace stack.env or images.env between checks.
+    python3 -I - "$EVAL_ROOT" <<'PY' || exit 1
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+info = os.lstat(root)
+if info.st_uid != os.getuid():
+    sys.exit(f"eval: EVAL_ROOT {root} must be owned by the caller")
+mode = stat.S_IMODE(info.st_mode)
+if mode & 0o022:
+    sys.exit(f"eval: EVAL_ROOT {root} must not be group- or other-writable, found {mode:04o}")
+PY
     export EVAL_ROOT
 }
 
@@ -47,7 +63,7 @@ eval_require_port() {
 # A regular file, not a symlink, owned by the caller, mode exactly 0600.
 eval_require_private() {
     local path=$1
-    python3 - "$path" <<'PY' || exit 1
+    python3 -I - "$path" <<'PY' || exit 1
 import os
 import stat
 import sys
@@ -106,7 +122,7 @@ eval_export_stack() {
 # The image variable names for the four roles, from release.py.
 eval_image_names() {
     # shellcheck disable=SC2086 # the role list splits on purpose
-    python3 - "$EVAL_SOURCE/deploy" $EVAL_ROLES <<'PY'
+    python3 -I - "$EVAL_SOURCE/deploy" $EVAL_ROLES <<'PY'
 import sys
 
 sys.path.insert(0, sys.argv[1])
@@ -124,10 +140,12 @@ eval_export_images() {
 }
 
 # Free space on Docker's root filesystem. The root comes from release.py's
-# local-daemon DockerRootDir lookup; df measures it.
+# local-daemon DockerRootDir lookup; df measures it. With an archive, the free
+# space must also cover that archive's unpacked size above the floor.
+# Usage: eval_require_space <needed bytes, 0 for the plain floor> [<archive>]
 eval_require_space() {
-    local docker_root line available
-    docker_root=$(python3 - "$EVAL_SOURCE/deploy" <<'PY'
+    local needed=$1 archive=${2:-} docker_root line available
+    docker_root=$(python3 -I - "$EVAL_SOURCE/deploy" <<'PY'
 import sys
 
 sys.path.insert(0, sys.argv[1])
@@ -150,6 +168,9 @@ PY
     available=$((available * 1024))
     if (( available < EVAL_FLOOR_BYTES )); then
         eval_fail "Docker root $docker_root has $available bytes free; the floor is $EVAL_FLOOR_BYTES bytes (15 GiB)"
+    fi
+    if (( available < EVAL_FLOOR_BYTES + needed )); then
+        eval_fail "Docker root $docker_root has $available bytes free; loading $archive needs $needed bytes above the floor of $EVAL_FLOOR_BYTES bytes (15 GiB)"
     fi
 }
 

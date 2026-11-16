@@ -18,7 +18,7 @@ fi
 eval_require_root
 
 # shellcheck disable=SC2086 # the name list splits on purpose
-python3 - "$EVAL_ROOT/stack.env" $EVAL_STACK_NAMES <<'PY'
+python3 -I - "$EVAL_ROOT/stack.env" $EVAL_STACK_NAMES <<'PY'
 import os
 import secrets
 import string
