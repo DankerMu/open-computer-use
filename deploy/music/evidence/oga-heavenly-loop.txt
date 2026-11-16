@@ -1,0 +1,15 @@
+Evidence: OpenGameArt page "Heavenly Loop" (live)
+Captured: 2026-11-16
+Page: https://opengameart.org/content/heavenly-loop
+
+Title: Heavenly Loop
+Author: isaiah658 Friday, August 11, 2017 - 17:59
+Art Type: Music
+Tags: heavenly heaven choir Angel angels dream dreamy Ambient seamless loop
+License(s): CC0
+
+Description and files: Preview: A seamless heavenly / dreamy sound loop. While it is a short loop, it seems to hold up quite well against repetition and would be suitable to use for about 1 to 2 minutes. Could work on a title screen, a menu, a cutscene or something. It's very ambient and doesn't try to draw too much attention but rather set the mood. It was made using only ZynAddSubFX in LMMS. Copyright/Attribution Notice: Credit to isaiah658 is not need but is appreciated. File(s): Heavenly Loop.ogg 1.2 Mb [ 1053 download(s)] Heavenly Loop.flac 2.1 Mb [ 222 download(s)]
+
+Linked files:
+https://opengameart.org/sites/default/files/Heavenly%20Loop.flac
+https://opengameart.org/sites/default/files/Heavenly%20Loop_0.ogg

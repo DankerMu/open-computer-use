@@ -1,0 +1,21 @@
+Evidence: Painting Room by Kevin MacLeod (FreePD, archived)
+Captured: 2026-11-16, from the Wayback Machine. FreePD.com closed in 2025.
+
+CC0 statement (FreePD home page)
+Capture: https://web.archive.org/web/20240528025710/https://www.freepd.com/
+Quote: "This music is all licensed CC0 1.0 Universal Public Domain Dedication."
+Quote: "Must I credit the musician in my film? Nope - but we do like it."
+Quote: "Can I buy exclusive rights to any of these tracks? No. The CC0 licensing is a one-way trip ."
+
+Track listing (FreePD misc.php)
+Capture: https://web.archive.org/web/20241216000928/https://freepd.com/misc.php
+Row: "Painting Room Time: 1:46 Download Written by Kevin MacLeod . Simple, melodic and beautiful song played with gentle and warm celtic harp. This music is available for commercial and non-commercial purposes."
+Audio link on that page: /music/Painting Room.mp3
+
+Hash chain
+Original file capture: http://web.archive.org/web/20190404004747id_/https://freepd.com/music/Painting%20Room.mp3
+Wayback CDX digest (base32 SHA-1): DTLV2D7IJR5O4OLGN36MGGTQ6OROVTLJ
+Mirror file: https://archive.org/download/freepd/misc/Painting%20Room.mp3
+Mirror SHA-1 (archive.org/metadata/freepd): 1cd75d0fe84c7aee39666efcc31a70f3a2eacd69
+Mirror SHA-256: ddfb9a5aa5420f1894902b290b7afc421ae644f6b5f4d4d9e24e5d464d95b1d1
+Mirror size: 3395954 bytes

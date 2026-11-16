@@ -1,0 +1,14 @@
+Evidence: OpenGameArt page "Simple menu/background music loop" (live)
+Captured: 2026-11-16
+Page: https://opengameart.org/content/simple-menubackground-music-loop
+
+Title: Simple menu/background music loop
+Author: polosik Saturday, April 4, 2026 - 04:46
+Art Type: Music
+Tags: calm music
+License(s): CC0
+
+Description and files: Preview: a simple loop i made can be used in a main menu a dialog scene or any other stuff you can image :) File(s): simple_loop.ogg 2.9 Mb [ 142 download(s)]
+
+Linked files:
+https://opengameart.org/sites/default/files/simple_loop.ogg

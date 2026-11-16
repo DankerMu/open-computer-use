@@ -1,0 +1,21 @@
+Evidence: Infinite Wonder by Kevin MacLeod (FreePD, archived)
+Captured: 2026-11-16, from the Wayback Machine. FreePD.com closed in 2025.
+
+CC0 statement (FreePD home page)
+Capture: https://web.archive.org/web/20240528025710/https://www.freepd.com/
+Quote: "This music is all licensed CC0 1.0 Universal Public Domain Dedication."
+Quote: "Must I credit the musician in my film? Nope - but we do like it."
+Quote: "Can I buy exclusive rights to any of these tracks? No. The CC0 licensing is a one-way trip ."
+
+Track listing (FreePD misc.php)
+Capture: https://web.archive.org/web/20241216000928/https://freepd.com/misc.php
+Row: "Infinite Wonder Time: 3:10 Download Written by Kevin MacLeod . Inspiring and uplifting track made with beautiful vintage synths. Vangelis would be proud! This music is available for commercial and non-commercial purposes."
+Audio link on that page: /music/Infinite Wonder.mp3
+
+Hash chain
+Original file capture: http://web.archive.org/web/20190404143329id_/https://freepd.com/music/Infinite%20Wonder.mp3
+Wayback CDX digest (base32 SHA-1): OWCONOUZKTHG6FTZIRE7LPSF6I5MGRSJ
+Mirror file: https://archive.org/download/freepd/misc/Infinite%20Wonder.mp3
+Mirror SHA-1 (archive.org/metadata/freepd): 7584e6ba9954ce6f16794449f5be45f23ac34649
+Mirror SHA-256: 490f745de87525dd6da563da266c8823804a3f787573ff317b4788d6d5566e54
+Mirror size: 7606774 bytes

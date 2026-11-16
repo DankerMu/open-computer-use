@@ -1,0 +1,21 @@
+Evidence: From Page to Practice by Bryan Teoh (FreePD, archived)
+Captured: 2026-11-16, from the Wayback Machine. FreePD.com closed in 2025.
+
+CC0 statement (FreePD home page)
+Capture: https://web.archive.org/web/20240528025710/https://www.freepd.com/
+Quote: "This music is all licensed CC0 1.0 Universal Public Domain Dedication."
+Quote: "Must I credit the musician in my film? Nope - but we do like it."
+Quote: "Can I buy exclusive rights to any of these tracks? No. The CC0 licensing is a one-way trip ."
+
+Track listing (FreePD upbeat.php)
+Capture: https://web.archive.org/web/20240528012725/https://freepd.com/upbeat.php
+Row: "From Page to Practice Time: 2:17 Download Written by Bryan Teoh . Inspired by new day and you're anticipating a big good life change. Maybe it's no longer 2020. This music is available for commercial and non-commercial purposes."
+Audio link on that page: /music/From Page to Practice.mp3
+
+Hash chain
+Original file capture: http://web.archive.org/web/20201031111228id_/https://freepd.com/music/From%20Page%20to%20Practice.mp3
+Wayback CDX digest (base32 SHA-1): MGUG44R77JS4E5JNA2H4TEHC6E4CG5KY
+Mirror file: https://archive.org/download/freepd/upbeat/From%20Page%20to%20Practice.mp3
+Mirror SHA-1 (archive.org/metadata/freepd): 61a86e723ffa65c2752d068fc990e2f138237558
+Mirror SHA-256: dd20cb51c948a14e45d71b9a03b9d6afc48a4b7fd7b5020da623fbd86390b519
+Mirror size: 2733479 bytes

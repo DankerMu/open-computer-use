@@ -1,0 +1,21 @@
+Evidence: And Just Like That by Bryan Teoh (FreePD, archived)
+Captured: 2026-11-16, from the Wayback Machine. FreePD.com closed in 2025.
+
+CC0 statement (FreePD home page)
+Capture: https://web.archive.org/web/20240528025710/https://www.freepd.com/
+Quote: "This music is all licensed CC0 1.0 Universal Public Domain Dedication."
+Quote: "Must I credit the musician in my film? Nope - but we do like it."
+Quote: "Can I buy exclusive rights to any of these tracks? No. The CC0 licensing is a one-way trip ."
+
+Track listing (FreePD upbeat.php)
+Capture: https://web.archive.org/web/20240528012725/https://freepd.com/upbeat.php
+Row: "And Just Like That Time: 1:54 Download Written by Bryan Teoh . Fun, shiny, clean toddler and playful puppies in joy-mode. This music is available for commercial and non-commercial purposes."
+Audio link on that page: /music/And Just Like That.mp3
+
+Hash chain
+Original file capture: http://web.archive.org/web/20201102125616id_/https://freepd.com/music/And%20Just%20Like%20That.mp3
+Wayback CDX digest (base32 SHA-1): 7JQSK77OK3WDPC7KMJEGMDY5M5VXD7EQ
+Mirror file: https://archive.org/download/freepd/upbeat/And%20Just%20Like%20That.mp3
+Mirror SHA-1 (archive.org/metadata/freepd): fa61257fee56ec378bea6248660f1d676b71fc90
+Mirror SHA-256: 75e6438a8d6d1dcb54dd42cc02f4944b484e73dac48502eb78514c438cada914
+Mirror size: 2287556 bytes

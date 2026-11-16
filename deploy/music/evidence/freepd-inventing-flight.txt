@@ -1,0 +1,21 @@
+Evidence: Inventing Flight by Bryan Teoh (FreePD, archived)
+Captured: 2026-11-16, from the Wayback Machine. FreePD.com closed in 2025.
+
+CC0 statement (FreePD home page)
+Capture: https://web.archive.org/web/20240528025710/https://www.freepd.com/
+Quote: "This music is all licensed CC0 1.0 Universal Public Domain Dedication."
+Quote: "Must I credit the musician in my film? Nope - but we do like it."
+Quote: "Can I buy exclusive rights to any of these tracks? No. The CC0 licensing is a one-way trip ."
+
+Track listing (FreePD upbeat.php)
+Capture: https://web.archive.org/web/20240528012725/https://freepd.com/upbeat.php
+Row: "Inventing Flight Time: 2:24 Download Written by Bryan Teoh . Delightful, pleasant, grand, discovery or NatGeo. This music is available for commercial and non-commercial purposes."
+Audio link on that page: /music/Inventing Flight.mp3
+
+Hash chain
+Original file capture: http://web.archive.org/web/20201031121814id_/https://freepd.com/music/Inventing%20Flight.mp3
+Wayback CDX digest (base32 SHA-1): YBOJN7VVLEJDI2SMZCMT6GAIZRN6ICGF
+Mirror file: https://archive.org/download/freepd/upbeat/Inventing%20Flight.mp3
+Mirror SHA-1 (archive.org/metadata/freepd): c05c96feb55912346a4cc8993f1808cc5be408c5
+Mirror SHA-256: 916e736efa3caed4ea8534e727670dbac41af0fb44f00fa667aebaab9b2b6407
+Mirror size: 2840034 bytes
