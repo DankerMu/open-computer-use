@@ -627,6 +627,14 @@ class EvalSecretsTests(EvalScriptCase):
                 self.assertIn("nothing to add", again.stdout)
                 self.assertTrue(path.read_bytes() == after, "a second init changed stack.env")
 
+    def assert_no_value_echoed(self, body: str, result: subprocess.CompletedProcess):
+        """No value of a refused stack.env, nor a bare line in it, reaches stdout or stderr."""
+        values = [line.partition("=")[2] or line for line in body.splitlines() if line]
+        self.assertTrue(values, "nothing planted to check")
+        output = result.stdout + result.stderr
+        for value in values:
+            self.assertFalse(value in output, "a stack.env value reached script output")
+
     def test_init_refuses_an_unsafe_or_unknown_stack_file(self):
         earlier = {name: PLANTED[name] for name in EARLIER_STACK_NAMES}
         valid = "".join(f"{name}={value}\n" for name, value in earlier.items())
@@ -650,20 +658,23 @@ class EvalSecretsTests(EvalScriptCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("stack.env", result.stderr)
                 self.assertIn(reason, result.stderr)
-                self.assertFalse(unknown_value in result.stdout + result.stderr,
-                                 "a stack.env value reached script output")
+                self.assert_no_value_echoed(body, result)
                 self.assertTrue(path.read_bytes() == original, "a refused stack.env changed")
                 self.assertEqual(stat.S_IMODE(path.lstat().st_mode), mode)
                 self.assertEqual(sorted(entry.name for entry in self.eval_root.iterdir()),
                                  ["stack.env"])
         with self.subTest(case="symlink"):
             (self.eval_root / "stack.env").unlink(missing_ok=True)
-            target = self.write_private(self.tmp / "elsewhere", valid)
+            # Values outside PLANTED, so only this check can see them echoed.
+            elsewhere = "".join(f"{name}=fake-elsewhere-{index}\n"
+                                for index, name in enumerate(EARLIER_STACK_NAMES))
+            target = self.write_private(self.tmp / "elsewhere", elsewhere)
             (self.eval_root / "stack.env").symlink_to(target)
             result = self.run_script(SECRETS, "init")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("symlink", result.stderr)
-            self.assertEqual(target.read_text(encoding="utf-8"), valid)
+            self.assert_no_value_echoed(elsewhere, result)
+            self.assertEqual(target.read_text(encoding="utf-8"), elsewhere)
             self.assertTrue((self.eval_root / "stack.env").is_symlink())
 
     def test_init_output_starts_the_stack(self):

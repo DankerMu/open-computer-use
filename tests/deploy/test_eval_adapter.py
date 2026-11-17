@@ -28,6 +28,7 @@ from unittest import mock
 
 import aiohttp
 import uvicorn
+import uvicorn.logging
 
 ROOT = Path(__file__).resolve().parents[2]
 ADAPTER_FILE = ROOT / "deploy" / "eval" / "adapter" / "eval_adapter.py"
@@ -497,6 +498,52 @@ class SpeechRequestTests(AdapterCase):
                         async with self.adapter.app.router.lifespan_context(self.adapter.app):
                             pass
                 self.assertIn(name, str(caught.exception))
+
+
+class LogRedactionTests(AdapterCase):
+    def capture_on(self, name: str, formatter: logging.Formatter | None = None) -> Capture:
+        """A capture attached to one logger itself, where its filters run."""
+        capture = Capture()
+        if formatter is not None:
+            capture.setFormatter(formatter)
+        logger = logging.getLogger(name)
+        logger.addHandler(capture)
+        self.addCleanup(logger.removeHandler, capture)
+        return capture
+
+    async def test_access_lines_redact_secrets_in_the_query(self):
+        # uvicorn's own access format, with the colors that would split an exact match off.
+        access = self.capture_on("uvicorn.access", uvicorn.logging.AccessFormatter(
+            '%(client_addr)s - "%(request_line)s" %(status_code)s', use_colors=False))
+        self.upstream.reply = replay(MP3)
+        query = f"?k={PROVIDER_KEY}&t={ADAPTER_TOKEN}"
+        status, _, _ = await self.call(SPEECH_PATH + query, body={
+            "model": MODEL, "input": TEXT, "response_format": "mp3"})
+        self.assertEqual(status, 200)
+        status, _, _ = await self.call(f"/healthz?k={PROVIDER_KEY}", method="GET", token=None)
+        self.assertEqual(status, 200)
+        expected = (f'"POST {SPEECH_PATH}?k={REDACTED}&t={REDACTED} HTTP/1.1" 200',
+                    f'"GET /healthz?k={REDACTED} HTTP/1.1" 200')
+        self.assertEqual(len(access.lines), 2, access.lines)
+        for line, request_line in zip(access.lines, expected):
+            self.assertIn(request_line, line)
+            for secret in (PROVIDER_KEY, ADAPTER_TOKEN):
+                self.assertNotIn(secret, line)
+
+    async def test_adapter_and_uvicorn_error_records_are_redacted(self):
+        records = (
+            ("message", (f"saw {PROVIDER_KEY} and {ADAPTER_TOKEN}",)),
+            ("tuple args", ("saw %s and %s", PROVIDER_KEY, ADAPTER_TOKEN)),
+            ("dict args", ("saw %(key)s and %(token)s",
+                           {"key": PROVIDER_KEY, "token": ADAPTER_TOKEN})),
+        )
+        for name in (self.adapter.LOGGER_NAME, "uvicorn.error"):
+            capture = self.capture_on(name, logging.Formatter("%(message)s"))
+            for shape, arguments in records:
+                with self.subTest(logger=name, shape=shape):
+                    capture.lines.clear()
+                    logging.getLogger(name).warning(*arguments)
+                    self.assertEqual(capture.lines, [f"saw {REDACTED} and {REDACTED}"])
 
 
 class OcuSpeechClientTests(AdapterCase):
