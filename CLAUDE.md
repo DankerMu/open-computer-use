@@ -29,6 +29,8 @@ All new source files MUST include an SPDX license header as the first comment:
 
 Always include: `# Copyright (c) 2025 Open Computer Use Contributors`
 
+Third-party files under `remotion-template/src/kit/` are the exception: they keep their source's SPDX licence identifier and a `Source:` line naming the source repository, commit, path and licence, and carry no Open Computer Use copyright.
+
 The FSL-1.1-Apache-2.0 license permits use, modification, forking, internal self-hosting, and redistribution. It prohibits offering the Software as a hosted or embedded service that competes with our paid version(s). Each release automatically converts to Apache-2.0 two years after publication.
 
 ## Building the Docker image
