@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -62,8 +63,6 @@ SIGNIN_RETRY_SECONDS = 3
 # EVAL_ROOT's filesystem, and thousands of entries must not make collection unbounded.
 MAX_MP4_BYTES = 4 * 1024 ** 3
 MAX_MP4_FILES = 20
-# common.sh's 15 GiB floor, also kept free on EVAL_ROOT's filesystem while copying outputs.
-FLOOR_BYTES = 15 * 1024 ** 3
 DATA_URI_LIMIT = 4096
 REASON_LIMIT = 200
 REDACTED = "[REDACTED]"
@@ -93,7 +92,11 @@ class CallFailed(Exception):
 
 
 class TooLarge(Exception):
-    """An output above the size cap or the free space above the floor."""
+    """An output above the size cap: the model made it."""
+
+
+class NoSpace(Exception):
+    """The run directory's filesystem cannot hold an output: an infrastructure fault."""
 
 
 class Redactor:
@@ -192,6 +195,7 @@ class WebUI:
             if status == 200:
                 return payload
             if status == 404:
+                # WebUI 6b95a4995 answers an unknown chat with 401; this branch is defensive.
                 return None
             detail = f"HTTP {status}"
             if status == 401:
@@ -312,7 +316,8 @@ def infrastructure_fault(calls) -> str | None:
     return None
 
 
-def classify(stopped: bool, message: dict | None, call_failure: str | None, valid_mp4: bool):
+def classify(stopped: bool, message: dict | None, call_failure: str | None, valid_mp4: bool,
+             skipped: list):
     """The outcome table: (outcome, class, reason); the first matching row wins."""
     calls = tool_calls(message or {})
     error = message_error(message or {})
@@ -331,6 +336,11 @@ def classify(stopped: bool, message: dict | None, call_failure: str | None, vali
         return "failed", "infra", "task lost"
     if call_failure is not None:
         return "failed", "infra", call_failure
+    for entry in [] if valid_mp4 else skipped:
+        if entry["reason"] == "no space":
+            return "failed", "infra", f"disk: no space for {entry['name']}"
+        if entry["reason"].startswith("collect failed"):
+            return "failed", "infra", f"driver: {entry['reason']}"
     fault = None if valid_mp4 else infrastructure_fault(calls)
     if fault:
         return "failed", "infra", fault
@@ -403,22 +413,40 @@ class Driver:
         try:
             try:
                 self.first_signin()
-                recovered = self.recover()
+                self.recover()
                 self.context = self.preflight()
             except CallFailed as failure:
                 raise Refusal(str(failure)) from None
             for request, repetition in plan:
-                # An interrupted attempt counts toward the three.
-                left = MAX_ATTEMPTS - recovered.get((self.args.phase, request["id"], repetition), 0)
+                left = MAX_ATTEMPTS - self.trailing_infra(request["id"], repetition)
                 if left <= 0:
                     self.redactor.say(f"eval: runs/{self.args.phase}/{request['id']} r{repetition}: "
-                                      "no attempt left after interrupted attempts")
+                                      f"no attempt left after {MAX_ATTEMPTS} infra attempts")
                 for _ in range(left):
                     if self.attempt(request, repetition)["failure_class"] != "infra":
                         break
         finally:
             os.close(lock)
         return 0
+
+    def trailing_infra(self, request_id: str, repetition: int) -> int:
+        """The infra attempts at the end of a slot on disk, interrupted ones included.
+
+        An infra failure is rerun at most twice across batches; a slot whose latest
+        attempt is not infra starts fresh."""
+        base = self.root / "runs" / self.args.phase / request_id
+        numbers = sorted(int(match[2]) for match in map(RUN_DIR.fullmatch, os.listdir(base) if base.is_dir() else [])
+                         if match and int(match[1]) == repetition)
+        count = 0
+        for number in reversed(numbers):
+            try:
+                manifest = json.loads((base / f"r{repetition}-a{number}" / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                manifest = {"failure_class": "infra"}
+            if manifest.get("failure_class") != "infra":
+                break
+            count += 1
+        return count
 
     def first_signin(self):
         for attempt in range(1, SIGNIN_TRIES + 1):
@@ -552,12 +580,9 @@ class Driver:
         self.redactor.write_json(run_dir / "manifest.json", manifest)
         return manifest
 
-    def recover(self) -> dict:
-        """Run directories an earlier driver left without a manifest become failed attempts.
-
-        Returns the number recovered per (phase, request id, repetition)."""
+    def recover(self):
+        """Run directories an earlier driver left without a manifest become failed attempts."""
         ledger = self.ledger()
-        recovered: dict = {}
         for run_dir in sorted(self.root.glob("runs/*/*/r*-a*")):
             match = RUN_DIR.fullmatch(run_dir.name)
             if match is None or not run_dir.is_dir() or (run_dir / "manifest.json").exists():
@@ -580,9 +605,6 @@ class Driver:
             self.manifest(run_dir, run_dir.parent.name, int(match[1]), int(match[2]), chat_id=chat_id,
                           started_at=pending.get("started_at"), failure_reason="driver interrupted")
             self.redactor.say(f"eval: {run_dir.relative_to(self.root)} failed infra: driver interrupted")
-            key = (run_dir.parent.parent.name, run_dir.parent.name, int(match[1]))
-            recovered[key] = recovered.get(key, 0) + 1
-        return recovered
 
     def body(self, prompt: str, user_message_id: str, assistant_id: str, now: int) -> dict:
         local = datetime.datetime.fromtimestamp(now, SHANGHAI)
@@ -641,24 +663,35 @@ class Driver:
             time.sleep(min(POLL_SECONDS, left))
 
     def collect(self, chat_id: str, run_dir: Path) -> tuple[list, list]:
-        """Copy the regular .mp4 files directly in the chat's outputs, then probe each copy."""
+        """The probed MP4 copies and the skipped outputs; a fault here never ends the batch."""
+        mp4, skipped = [], []
+        try:
+            self.gather(chat_id, run_dir, mp4, skipped)
+        except Exception as error:  # noqa: BLE001 - sandbox-made outputs must not end the batch
+            skipped.append({"name": "outputs", "reason": f"collect failed: {type(error).__name__}"})
+        return mp4, skipped
+
+    def gather(self, chat_id: str, run_dir: Path, mp4: list, skipped: list):
+        """Copy and probe the regular .mp4 files directly in the chat's outputs."""
         try:
             directory = os.open(self.root / "data" / chat_id / "outputs",
                                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except FileNotFoundError:
-            return [], []
+            return
         except OSError as error:
-            return [], [{"name": "outputs", "reason": f"unreadable: {error.strerror}"}]
-        copied, skipped = [], []
+            skipped.append({"name": "outputs", "reason": f"unreadable: {error.strerror}"})
+            return
+        considered = beyond = 0
         try:
             for name in sorted(os.listdir(directory)):
                 if not name.endswith(".mp4"):
                     continue
+                if considered == MAX_MP4_FILES:
+                    beyond += 1
+                    continue
+                considered += 1
                 # The sandbox picks the bytes of a name; the manifest holds UTF-8 only.
                 shown = os.fsencode(name).decode("utf-8", "backslashreplace")
-                if len(copied) + len(skipped) >= MAX_MP4_FILES:
-                    skipped.append({"name": shown, "reason": "too many"})
-                    continue
                 if shown != name:
                     skipped.append({"name": shown, "reason": "name is not UTF-8"})
                     continue
@@ -669,14 +702,17 @@ class Driver:
                     elif not stat.S_ISREG(mode):
                         skipped.append({"name": name, "reason": "not a regular file"})
                     else:
-                        copied.append(self.copy(directory, name, run_dir / name))
+                        mp4.append(self.probe(run_dir, self.copy(directory, name, run_dir / name)))
                 except TooLarge:
                     skipped.append({"name": name, "reason": "too large"})
+                except NoSpace:
+                    skipped.append({"name": name, "reason": "no space"})
                 except OSError as error:
                     skipped.append({"name": name, "reason": f"unreadable: {error.strerror or error}"})
         finally:
             os.close(directory)
-        return [self.probe(run_dir, entry) for entry in copied], skipped
+        if beyond:
+            skipped.append({"name": "outputs", "reason": f"{beyond} more .mp4 entries"})
 
     @staticmethod
     def copy(directory: int, name: str, target: Path) -> dict:
@@ -685,9 +721,11 @@ class Driver:
             info = os.fstat(source)
             if not stat.S_ISREG(info.st_mode):
                 raise OSError("not a regular file")
-            space = os.statvfs(target.parent)
-            if info.st_size > min(MAX_MP4_BYTES, space.f_bavail * space.f_frsize - FLOOR_BYTES):
+            if info.st_size > MAX_MP4_BYTES:
                 raise TooLarge
+            space = os.statvfs(target.parent)
+            if info.st_size > space.f_bavail * space.f_frsize:
+                raise NoSpace
             digest, size = hashlib.sha256(), 0
             output = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
@@ -699,9 +737,11 @@ class Driver:
                     view = memoryview(chunk)
                     while view:
                         view = view[os.write(output, view):]
-            except BaseException:
+            except BaseException as error:
                 os.close(output)
                 os.unlink(target)
+                if isinstance(error, OSError) and error.errno in (errno.ENOSPC, errno.EDQUOT):
+                    raise NoSpace from None
                 raise
             os.close(output)
         finally:
@@ -768,12 +808,9 @@ class Driver:
             failure = str(error)
             if chat_id is not None and not self.stopped:
                 self.abandon(chat_id)
-        try:
-            mp4, skipped = self.collect(chat_id, run_dir) if chat_id else ([], [])
-        except Exception as error:  # noqa: BLE001 - sandbox-made outputs must not end the batch
-            mp4, skipped = [], [{"name": "outputs", "reason": f"collect failed: {type(error).__name__}"}]
+        mp4, skipped = self.collect(chat_id, run_dir) if chat_id else ([], [])
         outcome, failure_class, reason = classify(self.stopped, message, failure,
-                                                  any(entry["valid"] for entry in mp4))
+                                                  any(entry["valid"] for entry in mp4), skipped)
         manifest = self.manifest(
             run_dir, request["id"], repetition, number, chat_id=chat_id, started_at=pending["started_at"],
             elapsed_seconds=round(time.monotonic() - started, 3), outcome=outcome,

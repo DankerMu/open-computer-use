@@ -10,6 +10,7 @@ intervals can be shortened; the run.sh tests run the real entry point.
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import errno
 import hashlib
 import importlib.util
 import io
@@ -18,11 +19,13 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import unittest
 from unittest import mock
@@ -947,6 +950,47 @@ class DriverFlowTests(DriverCase):
         self.assertEqual([path.name for path in self.run_dirs()], ["r1-a1", "r1-a2", "r1-a3"])
         self.assertEqual(len(self.webui.posts), 2)
 
+    def test_the_rerun_budget_counts_infra_attempts_of_earlier_batches(self):
+        other = REQUESTS[1]["id"]
+        run_dir = self.eval_root / "runs" / "smoke" / other / "r1-a1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "pending.json").write_text(json.dumps({
+            "user_message_id": str(uuid.uuid4()), "started_at": "2026-11-17T08:00:00Z",
+            "chat_id": str(uuid.uuid4())}), encoding="utf-8")
+        # A batch for another request recovers it.
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.manifest(run_dir)["failure_reason"], "driver interrupted")
+        posts = len(self.webui.posts)
+        self.webui.scenarios = [scenario(message={"done": False, "output": []})]
+        code, _, _ = self.drive(request=other)
+        self.assertEqual(code, 0)
+        self.assertEqual([path.name for path in self.run_dirs(other)], ["r1-a1", "r1-a2", "r1-a3"])
+        self.assertEqual(len(self.webui.posts) - posts, 2)
+
+    def test_the_rerun_budget_survives_a_preflight_refusal_after_recovery(self):
+        run_dir = self.interrupted_dir({"user_message_id": str(uuid.uuid4()),
+                                        "started_at": "2026-11-17T08:00:00Z", "chat_id": str(uuid.uuid4())})
+        self.webui.default_params["stream_response"] = False
+        code, _, _ = self.drive()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.manifest(run_dir)["failure_reason"], "driver interrupted")
+        self.webui.default_params["stream_response"] = True
+        self.webui.scenarios = [scenario(message={"done": False, "output": []})]
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        self.assertEqual([path.name for path in self.run_dirs()], ["r1-a1", "r1-a2", "r1-a3"])
+        self.assertEqual(len(self.webui.posts), 2)
+
+    def test_a_slot_whose_last_attempt_was_not_infra_starts_fresh(self):
+        self.webui.scenarios = [scenario()]
+        self.assertEqual(self.drive()[0], 0)
+        self.webui.scenarios = [scenario(message={"done": False, "output": []})]
+        self.assertEqual(self.drive()[0], 0)
+        self.assertEqual([path.name for path in self.run_dirs()], ["r1-a1", "r1-a2", "r1-a3", "r1-a4"])
+        self.assertEqual(self.drive()[0], 0)
+        self.assertEqual(len(self.run_dirs()), 4, "three infra attempts in a row leave no budget")
+
     def test_three_interrupted_attempts_leave_no_new_attempt(self):
         base = self.eval_root / "runs" / "smoke" / FIRST["id"]
         for number in (1, 2, 3):
@@ -1101,33 +1145,106 @@ class DriverFlowTests(DriverCase):
         self.assertFalse((run_dir / "huge.mp4").exists())
         self.assertEqual([entry["name"] for entry in manifest["mp4"]], ["video.mp4"])
 
-    def test_an_mp4_that_would_cross_the_free_space_floor_is_not_copied(self):
-        with mock.patch.object(DRIVER, "FLOOR_BYTES", 1 << 62):
+    def assert_first_attempt(self, outcome: tuple, attempts: int = 3) -> dict:
+        dirs = self.run_dirs()
+        self.assertEqual(len(dirs), attempts)
+        manifest = self.manifest(dirs[0])
+        self.assertEqual((manifest["outcome"], manifest["failure_class"], manifest["failure_reason"]),
+                         outcome)
+        return manifest
+
+    def test_an_mp4_larger_than_the_free_space_is_an_infra_failure(self):
+        full = types.SimpleNamespace(f_bavail=0, f_frsize=4096)
+        with mock.patch.object(DRIVER.os, "statvfs", return_value=full):
             code, _, _ = self.drive()
         self.assertEqual(code, 0)
-        run_dir = self.run_dirs()[0]
-        self.assertEqual(self.manifest(run_dir)["skipped_outputs"],
-                         [{"name": "video.mp4", "reason": "too large"}])
-        self.assertFalse((run_dir / "video.mp4").exists())
+        manifest = self.assert_first_attempt(("failed", "infra", "disk: no space for video.mp4"))
+        self.assertEqual(manifest["skipped_outputs"], [{"name": "video.mp4", "reason": "no space"}])
+        self.assertFalse((self.run_dirs()[0] / "video.mp4").exists())
 
-    def test_only_the_first_mp4_entries_are_considered(self):
+    def test_a_full_disk_while_copying_is_an_infra_failure_without_a_partial_file(self):
+        real_write = os.write
+
+        def write(descriptor, data):
+            if bytes(data) == MP4_BYTES:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write(descriptor, data)
+
+        with mock.patch.object(DRIVER.os, "write", write):
+            code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        manifest = self.assert_first_attempt(("failed", "infra", "disk: no space for video.mp4"))
+        self.assertEqual(manifest["skipped_outputs"], [{"name": "video.mp4", "reason": "no space"}])
+        for run_dir in self.run_dirs():
+            self.assertFalse((run_dir / "video.mp4").exists())
+
+    def test_a_file_that_grows_or_fails_mid_copy_leaves_no_partial_file(self):
+        real_read, real_fstat = os.read, os.fstat
+
+        def grows(descriptor, count):
+            data = real_read(descriptor, count)
+            return data + b"!" if data else data
+
+        def fails_at_the_end(descriptor, count):
+            data = real_read(descriptor, count)
+            if not data:
+                raise OSError(errno.EIO, "Input/output error")
+            return data
+
+        cases = {"unreadable: the file grew while it was copied": grows,
+                 "unreadable: Input/output error": fails_at_the_end}
+        for reason, faulty in cases.items():
+            with self.subTest(reason):
+                def read(descriptor, count, faulty=faulty):
+                    if stat.S_ISREG(real_fstat(descriptor).st_mode):
+                        return faulty(descriptor, count)
+                    return real_read(descriptor, count)
+
+                with mock.patch.object(DRIVER.os, "read", read):
+                    code, _, _ = self.drive()
+                self.assertEqual(code, 0)
+                run_dir = self.run_dirs()[-1]
+                manifest = self.manifest(run_dir)
+                self.assertEqual(manifest["skipped_outputs"], [{"name": "video.mp4", "reason": reason}])
+                self.assertFalse((run_dir / "video.mp4").exists())
+                self.assertEqual(manifest["failure_class"], "model")
+
+    def test_entries_past_the_cap_get_one_summary(self):
         self.webui.scenarios = [scenario(outputs={"a.mp4": MP4_BYTES, "b.mp4": MP4_BYTES,
-                                                  "c.mp4": MP4_BYTES})]
+                                                  "c.mp4": MP4_BYTES, "d.mp4": MP4_BYTES})]
         with mock.patch.object(DRIVER, "MAX_MP4_FILES", 2):
             code, _, _ = self.drive()
         self.assertEqual(code, 0)
         manifest = self.only_manifest()
         self.assertEqual([entry["name"] for entry in manifest["mp4"]], ["a.mp4", "b.mp4"])
-        self.assertEqual(manifest["skipped_outputs"], [{"name": "c.mp4", "reason": "too many"}])
+        self.assertEqual(manifest["skipped_outputs"], [{"name": "outputs", "reason": "2 more .mp4 entries"}])
 
-    def test_a_failure_while_collecting_does_not_stop_the_batch(self):
+    def test_a_failure_while_collecting_is_an_infra_failure(self):
         with mock.patch.object(DRIVER.Driver, "copy", side_effect=RuntimeError("boom")):
             code, _, _ = self.drive()
         self.assertEqual(code, 0)
-        manifest = self.manifest(self.run_dirs()[0])
+        manifest = self.assert_first_attempt(("failed", "infra", "driver: collect failed: RuntimeError"))
         self.assertEqual(manifest["mp4"], [])
         self.assertEqual(manifest["skipped_outputs"], [{"name": "outputs", "reason": "collect failed: RuntimeError"}])
-        self.assertEqual(manifest["failure_reason"], "no valid MP4")
+
+    def test_a_failure_while_collecting_keeps_the_entries_already_probed(self):
+        self.webui.scenarios = [scenario(outputs={"a.mp4": MP4_BYTES, "b.mp4": MP4_BYTES})]
+        real_copy = DRIVER.Driver.copy
+        copies = []
+
+        def copy(directory, name, target):
+            copies.append(name)
+            if len(copies) == 2:
+                raise RuntimeError("boom")
+            return real_copy(directory, name, target)
+
+        with mock.patch.object(DRIVER.Driver, "copy", staticmethod(copy)):
+            code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        manifest = self.only_manifest()
+        self.assertEqual([(entry["name"], entry["valid"]) for entry in manifest["mp4"]], [("a.mp4", True)])
+        self.assertEqual(manifest["skipped_outputs"], [{"name": "outputs", "reason": "collect failed: RuntimeError"}])
+        self.assertEqual(manifest["outcome"], "succeeded")
 
     def test_counts_equal_the_hand_count(self):
         output = [
