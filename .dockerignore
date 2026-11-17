@@ -69,6 +69,8 @@ logs/
 # Test files
 test/
 tests/
+# Template tests ship neither into the image nor into projects copied from it.
+remotion-template/tests/
 *.test.js
 *.spec.js
 *.test.py
