@@ -450,6 +450,21 @@ class RealMusicFilesTests(unittest.TestCase):
         counts = {mood: sum(item["mood"] == mood for item in candidates) for mood in MOODS}
         print(f"\nmusic candidates per mood: {json.dumps(counts)}; excluded works: {len(works)}")
 
+    def test_tracked_approval_is_the_unmodified_export(self):
+        path = MUSIC_DIR / "approvals.json"
+        self.assertEqual(sha256(path.read_bytes()), "207fcbd170d914cb96135e30fb03a6a2e9b7fccde5873d0e6b96ab1b45c99b6b")
+        candidates = music_candidates.load_candidates(MUSIC_DIR / "candidates.json", ROOT)
+        decisions = music_candidates.load_decisions(path, candidates)
+        self.assertEqual(set(decisions), {item["id"] for item in candidates})
+        self.assertEqual(len(decisions), 24)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((data["reviewer"], data["date"]), ("Danker", "2026-11-16"))
+        approved = {
+            mood: sum(item["mood"] == mood and decisions[item["id"]] == "approve" for item in candidates)
+            for mood in MOODS
+        }
+        self.assertEqual(approved, {"calm-curious": 6, "upbeat-corporate": 2, "neutral-serious": 3, "loop": 4})
+
     def test_no_audio_binary_is_tracked(self):
         tracked = subprocess.check_output(["git", "ls-files", "-z", "deploy/music"], cwd=ROOT).decode().split("\0")
         self.assertEqual([path for path in tracked if Path(path).suffix.lower() in AUDIO_SUFFIXES], [])
