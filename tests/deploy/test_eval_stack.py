@@ -37,10 +37,12 @@ START = EVAL_DIR / "start.sh"
 STOP = EVAL_DIR / "stop.sh"
 PROJECT = "ocu-eval"
 EVAL_ROLES = ("workspace", "computer-use-server", "open-webui", "postgres")
-STARTED = {"computer-use-server", "open-webui", "postgres", "open-webui-init"}
+STARTED = {"computer-use-server", "open-webui", "postgres", "open-webui-init", "adapter"}
 OMITTED = {"workspace", "cleanup", "proxy", "messages-ingress", "documentserver", "retention-guard"}
-STACK_NAMES = ("OCU_INTERNAL_TOKEN", "MCP_API_KEY", "WEBUI_SECRET_KEY",
-               "POSTGRES_PASSWORD", "ADMIN_EMAIL", "ADMIN_PASSWORD")
+# The six names of #816, then the adapter token of #817.
+EARLIER_STACK_NAMES = ("OCU_INTERNAL_TOKEN", "MCP_API_KEY", "WEBUI_SECRET_KEY",
+                       "POSTGRES_PASSWORD", "ADMIN_EMAIL", "ADMIN_PASSWORD")
+STACK_NAMES = (*EARLIER_STACK_NAMES, "ADAPTER_TOKEN")
 ADMIN_EMAIL = "eval-admin@ocu-eval.local"
 PROVIDER_KEY_VAR = "EVAL_PROVIDER_KEY"
 INIT_CONTAINER = "ocu-eval-open-webui-init"
@@ -49,7 +51,12 @@ SERVICE_IMAGE_VARS = {
     "open-webui": "OPENWEBUI_IMAGE",
     "open-webui-init": "OPENWEBUI_IMAGE",
     "postgres": "POSTGRES_IMAGE",
+    "adapter": "COMPUTER_USE_SERVER_IMAGE",
 }
+TTS_NAMES = ("TTS_BASE_URL", "TTS_MODEL", "TTS_VOICE", "TTS_API_KEY")
+ADAPTER_HEALTHCHECK = ["CMD", "python3", "-I", "-c",
+                       "import urllib.request; "
+                       "urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=5)"]
 WEBUI_PORT = "3390"
 # 15 GiB on Docker's root filesystem, stated in bytes by the scripts.
 FLOOR_BYTES = 15 * 1024 ** 3
@@ -63,6 +70,7 @@ PLANTED = {
     "POSTGRES_PASSWORD": "fake-postgres-password",
     "ADMIN_EMAIL": ADMIN_EMAIL,
     "ADMIN_PASSWORD": "fake-admin-password",
+    "ADAPTER_TOKEN": "fake-adapter-token",
 }
 PLANTED_KEY = "fake-provider-key"
 SECRET_VALUES = tuple(value for name, value in PLANTED.items() if name != "ADMIN_EMAIL") + (PLANTED_KEY,)
@@ -144,7 +152,7 @@ class EvalComposeConfigTests(unittest.TestCase):
         self.assertNotIn("is not set", result.stderr)
         return json.loads(result.stdout)
 
-    def test_project_runs_exactly_the_four_services(self):
+    def test_project_runs_exactly_the_started_services(self):
         document = self.resolved()
         self.assertEqual(document["name"], PROJECT)
         self.assertEqual(set(document["services"]), STARTED)
@@ -172,7 +180,8 @@ class EvalComposeConfigTests(unittest.TestCase):
     def test_bind_sources_stay_inside_the_allowed_set(self):
         document = self.resolved()
         allowed = {"/var/run/docker.sock", str(ROOT / "openwebui"),
-                   str(ROOT / "deploy/production-like-test/init/run-init.sh")}
+                   str(ROOT / "deploy/production-like-test/init/run-init.sh"),
+                   str(ROOT / "deploy/eval/adapter")}
         root_prefix = str(self.eval_root) + "/"
         for name, service in document["services"].items():
             for mount in service.get("volumes") or []:
@@ -203,8 +212,13 @@ class EvalComposeConfigTests(unittest.TestCase):
         self.assertEqual(environment["CONTAINER_IDLE_TIMEOUT"], "259200")
         self.assertEqual(environment["BASE_DATA_DIR"], str(self.eval_root / "data"))
         self.assertEqual(environment["DOCKER_IMAGE"], DEFAULT_RELEASE_IMAGES["workspace"])
-        for name in ("TTS_BASE_URL", "TTS_MODEL", "TTS_VOICE", "TTS_API_KEY"):
-            self.assertEqual(environment[name], "", name)
+        # Speech goes through the adapter; the server holds the adapter token, not the key.
+        self.assertEqual({name: environment[name] for name in TTS_NAMES}, {
+            "TTS_BASE_URL": "http://adapter:8090/v1",
+            "TTS_MODEL": "mimo-v2.5-tts",
+            "TTS_VOICE": "",
+            "TTS_API_KEY": config_environment(self.tmp, self.eval_root)["ADAPTER_TOKEN"],
+        })
         self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertFalse([name for name in environment
                           if name.startswith(("VISION_", "ANTHROPIC_"))])
@@ -229,7 +243,7 @@ class EvalComposeConfigTests(unittest.TestCase):
             "ENABLE_OCU_OFFICE_EDIT": "false",
         })
         # The admin password reaches only WebUI and its initializer.
-        for name in ("computer-use-server", "postgres"):
+        for name in ("computer-use-server", "postgres", "adapter"):
             self.assertFalse(fake["ADMIN_PASSWORD"] in json.dumps(document["services"][name]),
                              f"the admin password reached {name}")
         postgres = document["services"]["postgres"]["environment"]
@@ -253,6 +267,50 @@ class EvalComposeConfigTests(unittest.TestCase):
             ("bind", str(ROOT / "deploy/production-like-test/init/run-init.sh"), "/bootstrap/run-init.sh"),
             ("volume", "open-webui-data", "/app/backend/data"),
         })
+
+    def test_adapter_service_shape(self):
+        document = self.resolved()
+        fake = config_environment(self.tmp, self.eval_root)
+        adapter = document["services"]["adapter"]
+        self.assertEqual(adapter["container_name"], "ocu-eval-adapter")
+        self.assertEqual(adapter["image"], fake["COMPUTER_USE_SERVER_IMAGE"])
+        self.assertNotIn("build", adapter)
+        self.assertFalse(adapter.get("ports"))
+        self.assertEqual(adapter["user"], "65534:65534")
+        self.assertEqual(adapter["security_opt"], ["no-new-privileges:true"])
+        self.assertEqual(adapter["restart"], "unless-stopped")
+        self.assertEqual(adapter["entrypoint"], [
+            "python3", "-I", "-m", "uvicorn", "eval_adapter:app", "--app-dir", "/eval-adapter",
+            "--host", "0.0.0.0", "--port", "8090"])
+        # Compose renders the empty override as an empty list; it replaces the image CMD.
+        self.assertEqual(adapter["command"], [])
+        self.assertEqual(adapter["working_dir"], "/eval-adapter")
+        self.assertEqual(adapter["healthcheck"]["test"], ADAPTER_HEALTHCHECK)
+        self.assertEqual(len(adapter["volumes"]), 1)
+        mount = adapter["volumes"][0]
+        self.assertEqual((mount["type"], mount["source"], mount["target"], mount.get("read_only")),
+                         ("bind", str(ROOT / "deploy/eval/adapter"), "/eval-adapter", True))
+        self.assertEqual(adapter["environment"], {
+            "PROVIDER_KEY": fake[PROVIDER_KEY_VAR],
+            "ADAPTER_TOKEN": fake["ADAPTER_TOKEN"],
+            "UPSTREAM_BASE_URL": "https://www.dmxapi.cn/v1",
+        })
+
+    def test_provider_key_and_adapter_token_reach_only_their_services(self):
+        document = self.resolved()
+        fake = config_environment(self.tmp, self.eval_root)
+        services = document["services"]
+        holders = {name for name, service in services.items()
+                   if fake[PROVIDER_KEY_VAR] in json.dumps(service)}
+        self.assertEqual(holders, {"open-webui", "adapter"})
+        token = fake["ADAPTER_TOKEN"]
+        holders = {name for name, service in services.items() if token in json.dumps(service)}
+        self.assertEqual(holders, {"adapter", "computer-use-server"})
+        server = services["computer-use-server"]
+        self.assertEqual([name for name, value in server["environment"].items() if token in value],
+                         ["TTS_API_KEY"])
+        self.assertNotIn(token, json.dumps({key: value for key, value in server.items()
+                                            if key != "environment"}))
 
     def test_unset_eval_root_fails_loud(self):
         environment = config_environment(self.tmp, self.eval_root)
@@ -288,6 +346,7 @@ class EvalComposeSourceTests(unittest.TestCase):
                 # Set-but-empty is allowed: stop.sh exports it empty for compose down.
                 self.assertTrue(modifier.startswith("?"), f"{name} must use the ? form")
         self.assertEqual(seen, required | {PROVIDER_KEY_VAR})
+        self.assertIn("${ADAPTER_TOKEN:?", body)
         self.assertNotIn("env_file", text)
 
 
@@ -532,9 +591,91 @@ class EvalSecretsTests(EvalScriptCase):
         self.assertEqual(len(set(secrets)), len(secrets), "secrets must be independent")
         before = path.read_bytes()
         again = self.run_script(SECRETS, "init")
-        self.assertNotEqual(again.returncode, 0)
-        self.assertIn("exists", again.stderr)
-        self.assertTrue(path.read_bytes() == before, "stack.env was overwritten")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("nothing to add", again.stdout)
+        self.assertTrue(path.read_bytes() == before, "a second init changed stack.env")
+        self.assertEqual(stat.S_IMODE(path.lstat().st_mode), 0o600)
+
+    def test_init_appends_only_the_missing_names(self):
+        earlier = {name: PLANTED[name] for name in EARLIER_STACK_NAMES}
+        for case, trailer in (("newline-terminated", "\n"), ("unterminated", "")):
+            with self.subTest(case=case):
+                (self.eval_root / "stack.env").unlink(missing_ok=True)
+                body = "\n".join(f"{name}={value}" for name, value in earlier.items()) + trailer
+                path = self.write_private(self.eval_root / "stack.env", body)
+                original = path.read_bytes()
+                result = self.run_script(SECRETS, "init")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                after = path.read_bytes()
+                lines = after.decode("ascii").splitlines()
+                self.assertEqual(lines[:len(earlier)], original.decode("ascii").splitlines(),
+                                 "an existing line changed")
+                self.assertTrue(after.startswith(original.rstrip(b"\n")))
+                self.assertTrue(after.endswith(b"\n"))
+                self.assertEqual(len(lines), len(STACK_NAMES))
+                name, _, token = lines[-1].partition("=")
+                self.assertEqual(name, "ADAPTER_TOKEN")
+                self.assertTrue(re.fullmatch(r"[A-Za-z0-9]{32,}", token), "token is not alphanumeric")
+                self.assertNotIn(token, earlier.values())
+                info = path.lstat()
+                self.assertTrue(stat.S_ISREG(info.st_mode))
+                self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+                self.assertEqual(sorted(entry.name for entry in self.eval_root.iterdir()),
+                                 ["stack.env"], "a temporary file was left behind")
+                again = self.run_script(SECRETS, "init")
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertIn("nothing to add", again.stdout)
+                self.assertTrue(path.read_bytes() == after, "a second init changed stack.env")
+
+    def assert_no_value_echoed(self, body: str, result: subprocess.CompletedProcess):
+        """No value of a refused stack.env, nor a bare line in it, reaches stdout or stderr."""
+        values = [line.partition("=")[2] or line for line in body.splitlines() if line]
+        self.assertTrue(values, "nothing planted to check")
+        output = result.stdout + result.stderr
+        for value in values:
+            self.assertFalse(value in output, "a stack.env value reached script output")
+
+    def test_init_refuses_an_unsafe_or_unknown_stack_file(self):
+        earlier = {name: PLANTED[name] for name in EARLIER_STACK_NAMES}
+        valid = "".join(f"{name}={value}\n" for name, value in earlier.items())
+        unknown_value = "fake-unknown-value"
+        cases = (
+            ("mode-0644", valid, 0o644, "0600"),
+            ("unknown name", valid + f"UNKNOWN_NAME={unknown_value}\n", 0o600, "UNKNOWN_NAME"),
+            ("repeated name", valid + f"MCP_API_KEY={unknown_value}\n", 0o600, "MCP_API_KEY"),
+            ("malformed value", valid.replace(PLANTED["MCP_API_KEY"],
+                                              PLANTED["MCP_API_KEY"] + "'$(x)"), 0o600,
+             "MCP_API_KEY"),
+            ("not NAME=value", valid + "fake-unknown-value\n", 0o600, "NAME=value"),
+            ("empty line", valid + "\n", 0o600, "NAME=value"),
+        )
+        for case, body, mode, reason in cases:
+            with self.subTest(case=case):
+                (self.eval_root / "stack.env").unlink(missing_ok=True)
+                path = self.write_private(self.eval_root / "stack.env", body, mode)
+                original = path.read_bytes()
+                result = self.run_script(SECRETS, "init")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("stack.env", result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assert_no_value_echoed(body, result)
+                self.assertTrue(path.read_bytes() == original, "a refused stack.env changed")
+                self.assertEqual(stat.S_IMODE(path.lstat().st_mode), mode)
+                self.assertEqual(sorted(entry.name for entry in self.eval_root.iterdir()),
+                                 ["stack.env"])
+        with self.subTest(case="symlink"):
+            (self.eval_root / "stack.env").unlink(missing_ok=True)
+            # Values outside PLANTED, so only this check can see them echoed.
+            elsewhere = "".join(f"{name}=fake-elsewhere-{index}\n"
+                                for index, name in enumerate(EARLIER_STACK_NAMES))
+            target = self.write_private(self.tmp / "elsewhere", elsewhere)
+            (self.eval_root / "stack.env").symlink_to(target)
+            result = self.run_script(SECRETS, "init")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("symlink", result.stderr)
+            self.assert_no_value_echoed(elsewhere, result)
+            self.assertEqual(target.read_text(encoding="utf-8"), elsewhere)
+            self.assertTrue((self.eval_root / "stack.env").is_symlink())
 
     def test_init_output_starts_the_stack(self):
         self.assertEqual(self.run_script(SECRETS, "init").returncode, 0)
@@ -811,6 +952,50 @@ class EvalStartStopTests(EvalScriptCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(name, result.stderr)
                 self.assertFalse(self.calls("docker"))
+
+    def adapter_source_copy(self) -> tuple[Path, Path]:
+        """start.sh and common.sh in a scratch source tree, so a mode can be changed safely."""
+        source = self.tmp / "src"
+        (source / "deploy" / "eval" / "adapter").mkdir(parents=True)
+        for name in ("start.sh", "common.sh"):
+            shutil.copy2(EVAL_DIR / name, source / "deploy" / "eval" / name)
+        for name in ("release.py", "fonts"):
+            (source / "deploy" / name).symlink_to(ROOT / "deploy" / name)
+        adapter = source / "deploy" / "eval" / "adapter" / "eval_adapter.py"
+        adapter.write_text("app = None\n", encoding="utf-8")
+        adapter.chmod(0o644)
+        return source / "deploy" / "eval" / "start.sh", adapter
+
+    def test_start_refuses_an_adapter_file_others_cannot_read(self):
+        self.write_stack()
+        self.write_key()
+        self.write_images()
+        script, adapter = self.adapter_source_copy()
+        # Control: the scratch tree reaches compose up when the adapter is world-readable.
+        control = self.run_script(script)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual([argv[13:] for argv in self.calls("docker") if argv[:1] == ["compose"]],
+                         [["up", "-d", "--no-build", "--pull", "never"]])
+        for case, path, mode in (("file 0600", adapter, 0o600),
+                                 ("directory 0700", adapter.parent, 0o700)):
+            with self.subTest(case=case):
+                (self.state / "calls.jsonl").unlink(missing_ok=True)
+                path.chmod(mode)
+                try:
+                    result = self.run_script(script)
+                finally:
+                    path.chmod(0o755 if path.is_dir() else 0o644)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(path), result.stderr)
+                self.assertFalse([argv for argv in self.calls("docker") if argv[:1] == ["compose"]])
+
+    def test_checkout_adapter_directory_is_readable_by_others(self):
+        directory = EVAL_DIR / "adapter"
+        self.assertEqual(stat.S_IMODE(directory.stat().st_mode) & 0o005, 0o005)
+        for path in directory.rglob("*"):
+            mode = stat.S_IMODE(path.stat().st_mode)
+            self.assertEqual(mode & (0o005 if path.is_dir() else 0o004),
+                             0o005 if path.is_dir() else 0o004, path.name)
 
     def test_stop_runs_down_without_the_key_file(self):
         self.write_stack()

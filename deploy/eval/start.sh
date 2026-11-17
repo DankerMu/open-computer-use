@@ -18,6 +18,38 @@ trap eval_cleanup EXIT
 
 eval_require_root
 eval_require_port
+# The adapter runs as uid 65534 from a read-only bind of deploy/eval/adapter, and
+# start.sh waits only for open-webui-init, so an unreadable file would surface
+# only later, as a restarting adapter. Refuse first, naming the path.
+python3 -I - "$EVAL_SOURCE/deploy/eval/adapter" <<'PY' || exit 1
+import os
+import stat
+import sys
+
+
+def check(path):
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as error:
+        sys.exit(f"eval: cannot inspect {path}: {error.strerror}")
+    if stat.S_ISDIR(mode) and mode & 0o005 != 0o005:
+        sys.exit(f"eval: {path} must be readable and searchable by others (the adapter runs as "
+                 f"uid 65534), found {stat.S_IMODE(mode):04o}; clone the checkout under umask 022")
+    if not stat.S_ISDIR(mode) and not mode & 0o004:
+        sys.exit(f"eval: {path} must be readable by others (the adapter runs as uid 65534), "
+                 f"found {stat.S_IMODE(mode):04o}; clone the checkout under umask 022")
+
+
+def fail(error):
+    sys.exit(f"eval: cannot list {error.filename}: {error.strerror}")
+
+
+root = sys.argv[1]
+check(root)
+for directory, subdirectories, files in os.walk(root, onerror=fail):
+    for name in subdirectories + files:
+        check(os.path.join(directory, name))
+PY
 key_file="${EVAL_KEY_FILE:-$HOME/.ocu-eval-dmxapi.key}"
 eval_require_private "$key_file"
 eval_export_stack
