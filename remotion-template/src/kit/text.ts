@@ -134,16 +134,17 @@ export function units(text: string, {segmenter = USE_INTL_SEGMENTER}: WrapOption
 	return ranges.map((_, k) => chars.slice(cuts[k], cuts[k + 1]).join(''));
 }
 
-// The trailing run of closing marks and spaces hangs: its closing marks up
-// to HANG em, and its spaces, are not part of the core width.
+// The core width leaves out the unit's trailing spaces and hangs the
+// closing marks of its trailing run of closing marks and spaces, up to HANG
+// em. A space before a closing mark is drawn, so it counts.
 function measure(unit: string): Measure {
 	const chars = Array.from(unit);
-	let closing = 0;
+	let i = chars.length;
 	let spaces = 0;
-	for (let i = chars.length - 1; i >= 0; i -= 1) {
-		if (CLOSING.has(chars[i])) closing += width(chars[i]);
-		else if (chars[i] === SPACE) spaces += width(chars[i]);
-		else break;
+	for (; i > 0 && chars[i - 1] === SPACE; i -= 1) spaces += width(SPACE);
+	let closing = 0;
+	for (; i > 0 && (CLOSING.has(chars[i - 1]) || chars[i - 1] === SPACE); i -= 1) {
+		if (CLOSING.has(chars[i - 1])) closing += width(chars[i - 1]);
 	}
 	const total = sum(chars);
 	return {total, core: total - Math.min(closing, HANG) - spaces};
@@ -152,14 +153,16 @@ function measure(unit: string): Measure {
 function leadingOpeningWidth(unit: string): number {
 	let total = 0;
 	for (const ch of unit) {
-		if (!OPENING.has(ch)) break;
+		if (!OPENING.has(ch) && ch !== SPACE) break;
 		total += width(ch);
 	}
 	return total;
 }
 
-// Pieces of the shape `opening* char? (closing | space)*`: opening marks
-// bind to the character after them, closing marks to the character before.
+// Pieces of the shape `(opening | space)* char? (closing | space)*`:
+// opening marks, and spaces between or after them, bind to the character
+// after them; closing marks bind to the character before. A space ends a
+// piece only after a character or a closing mark.
 function splitByCharacter(unit: string): string[] {
 	const pieces: string[] = [];
 	let piece = '';
@@ -167,7 +170,7 @@ function splitByCharacter(unit: string): string[] {
 	for (const ch of unit) {
 		if (CLOSING.has(ch) || ch === SPACE) {
 			piece += ch;
-			tail = true;
+			tail = tail || ch !== SPACE;
 			continue;
 		}
 		if (tail) {
@@ -214,7 +217,13 @@ export function wrapLines(
 			throw new RangeError(`opening marks of ${JSON.stringify(unit)} fill maxWidth ${maxWidth}`);
 		}
 		if (line !== '') breakLine();
-		for (const piece of splitByCharacter(unit)) place(piece, measure(piece));
+		for (const piece of splitByCharacter(unit)) {
+			const pieceMeasure = measure(piece);
+			if (pieceMeasure.core > maxWidth + EPSILON) {
+				throw new RangeError(`piece ${JSON.stringify(piece)} is wider than maxWidth ${maxWidth}`);
+			}
+			place(piece, pieceMeasure);
+		}
 	}
 	if (line !== '') lines.push(line);
 	return lines;

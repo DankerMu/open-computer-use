@@ -32,8 +32,9 @@ function sum(text) {
   return Array.from(text).reduce((total, ch) => total + width(ch), 0);
 }
 
-// The line's trailing run of closing marks and U+0020 hangs: its closing
-// marks up to HANG em, and its spaces, are not counted.
+// The line's trailing run of closing marks and U+0020 hangs its closing
+// marks, up to HANG em. Only the spaces after the last other character are
+// left out; a space before a closing mark is drawn and counts.
 function trailingRun(line) {
   const chars = Array.from(line);
   let start = chars.length;
@@ -42,10 +43,10 @@ function trailingRun(line) {
 }
 
 function lineWidth(line) {
-  const run = trailingRun(line);
-  const closing = run.filter((ch) => CLOSING.has(ch)).reduce((total, ch) => total + width(ch), 0);
-  const spaces = run.filter((ch) => ch === " ").reduce((total, ch) => total + width(ch), 0);
-  return sum(line) - Math.min(closing, HANG) - spaces;
+  const closing = trailingRun(line)
+    .filter((ch) => CLOSING.has(ch))
+    .reduce((total, ch) => total + width(ch), 0);
+  return fullWidth(line) - Math.min(closing, HANG);
 }
 
 // The visible line: trailing spaces take no room at a line end.
@@ -111,6 +112,72 @@ test("units keep ASCII runs and numbers with 万/亿 whole", () => {
         assertLineRules(text, lines, maxWidth, `${text} @${maxWidth} segmenter=${segmenter}`);
         assert.ok(lines.some((line) => line.includes(expected[0].trim())), `${text} @${maxWidth} splits its run`);
       }
+    }
+  }
+  // The same runs inside a text that does wrap at 12 and 16.
+  const text = "据统计，约30万公里的光纤在2024-11-17前完成铺设；COVID-19 疫苗覆盖3.5亿人，e.g. 例如CO2排放也被记录。";
+  for (const segmenter of MODES) {
+    for (const maxWidth of [12, 16]) {
+      const lines = wrapLines(text, maxWidth, { segmenter });
+      assert.ok(lines.length > 1, `@${maxWidth} wraps`);
+      assertLineRules(text, lines, maxWidth, `@${maxWidth} segmenter=${segmenter}`);
+      for (const run of ["30万", "2024-11-17", "COVID-19", "3.5亿", "e.g.", "CO2"]) {
+        assert.ok(lines.some((line) => line.includes(run)), `@${maxWidth} segmenter=${segmenter} splits ${run}`);
+      }
+    }
+  }
+});
+
+test("万/亿 join only a digit, and a sign joins only a following digit", () => {
+  for (const segmenter of MODES) {
+    assert.deepEqual(units("a万", { segmenter }), ["a", "万"]);
+    assert.deepEqual(units("+5亿", { segmenter }), ["+5亿"]);
+    assert.deepEqual(units("a+1", { segmenter }), ["a", "+1"]);
+  }
+});
+
+test("spaces before closing marks are drawn and count toward the line", () => {
+  const rows = [
+    ["研究使用 COVID-19 ）。结果", 8],
+    ["一二三四五六七八 ……", 8],
+    ["一二三四五六 ）。后", 6],
+    ["wait ... ok", 5],
+    ["He paused . . . then left", 8],
+  ];
+  for (const [text, maxWidth] of rows) {
+    for (const segmenter of MODES) {
+      assertLineRules(text, wrapLines(text, maxWidth, { segmenter }), maxWidth, `${text} @${maxWidth} segmenter=${segmenter}`);
+    }
+  }
+});
+
+test("a split piece still wider than maxWidth throws RangeError naming it", () => {
+  const rows = [
+    ["太好了！！！！！！！！！！", 8, "了！！！！！！！！！！"],
+    ["他说：“……………”", 4, "“……………”"],
+    ["他说：“……”。", 2, "“……”。"],
+    ["《「好」》。！", 4, "《「好」》。！"],
+  ];
+  for (const [text, maxWidth, piece] of rows) {
+    for (const segmenter of MODES) {
+      assert.throws(
+        () => wrapLines(text, maxWidth, { segmenter }),
+        (error) => error instanceof RangeError && error.message.includes(piece) && error.message.includes(String(maxWidth)),
+        `${text} @${maxWidth} segmenter=${segmenter}`,
+      );
+    }
+  }
+});
+
+test("opening marks and the spaces after them bind to the next character", () => {
+  for (const segmenter of MODES) {
+    // The leading run of opening marks and spaces alone fills the width.
+    assert.throws(() => wrapLines("（ abc", 2, { segmenter }), RangeError);
+    assert.throws(() => wrapLines("《 「 字字", 4, { segmenter }), RangeError);
+    assert.deepEqual(wrapLines("（ abc", 3, { segmenter }), ["（ a", "bc"]);
+    assert.deepEqual(wrapLines("（ abc", 4, { segmenter }), ["（ ab", "c"]);
+    for (const maxWidth of [5, 6, 8]) {
+      assertLineRules("《 「 字字", wrapLines("《 「 字字", maxWidth, { segmenter }), maxWidth, `@${maxWidth}`);
     }
   }
 });
@@ -216,11 +283,19 @@ test("long mixed strings keep every rule at widths 8, 12 and 16", () => {
     "样本量达到123456789人次，约1.2亿，覆盖30万个社区。";
   assert.ok(Array.from(text).length > 200);
   for (const ch of CLOSING_PUNCTUATION) assert.ok(text.includes(ch), `missing closing mark ${ch}`);
-  for (const segmenter of MODES) {
-    for (const maxWidth of [8, 12, 16]) {
-      const lines = wrapLines(text, maxWidth, { segmenter });
-      assert.ok(lines.length > 1);
-      assertLineRules(text, lines, maxWidth, `@${maxWidth} segmenter=${segmenter}`);
+  // Every closing mark after a space, alone and in pairs, behind Han and
+  // ASCII words: the spaces are drawn mid-run and count.
+  const marks = Array.from(CLOSING_PUNCTUATION);
+  const spaced = marks
+    .map((ch, i) => `${i % 2 ? "数据" : "data"} ${ch}${i % 3 ? "" : ` ${marks[(i + 5) % marks.length]}`}`)
+    .join("后来");
+  for (const sample of [text, `${text}${spaced}结束`]) {
+    for (const segmenter of MODES) {
+      for (const maxWidth of [8, 12, 16]) {
+        const lines = wrapLines(sample, maxWidth, { segmenter });
+        assert.ok(lines.length > 1);
+        assertLineRules(sample, lines, maxWidth, `@${maxWidth} segmenter=${segmenter}`);
+      }
     }
   }
 });
