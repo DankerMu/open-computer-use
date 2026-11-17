@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "reviewer": "Danker",
+  "date": "2026-11-16",
+  "decisions": [
+    {
+      "id": "inventing-flight",
+      "decision": "approve"
+    },
+    {
+      "id": "from-page-to-practice",
+      "decision": "approve"
+    },
+    {
+      "id": "arpent",
+      "decision": "approve"
+    },
+    {
+      "id": "painting-room",
+      "decision": "drop"
+    },
+    {
+      "id": "wisdom-in-the-sun",
+      "decision": "approve"
+    },
+    {
+      "id": "infinite-wonder",
+      "decision": "approve"
+    },
+    {
+      "id": "observing-the-star",
+      "decision": "approve"
+    },
+    {
+      "id": "inspiration",
+      "decision": "approve"
+    },
+    {
+      "id": "advertime",
+      "decision": "drop"
+    },
+    {
+      "id": "funshine",
+      "decision": "drop"
+    },
+    {
+      "id": "pickled-pink",
+      "decision": "drop"
+    },
+    {
+      "id": "goodnightmare",
+      "decision": "drop"
+    },
+    {
+      "id": "and-just-like-that",
+      "decision": "approve"
+    },
+    {
+      "id": "motions",
+      "decision": "drop"
+    },
+    {
+      "id": "beat-one",
+      "decision": "approve"
+    },
+    {
+      "id": "my-very-own-dead-ship",
+      "decision": "drop"
+    },
+    {
+      "id": "spacetime",
+      "decision": "approve"
+    },
+    {
+      "id": "twists",
+      "decision": "drop"
+    },
+    {
+      "id": "great-mission",
+      "decision": "approve"
+    },
+    {
+      "id": "snowfall-loop",
+      "decision": "approve"
+    },
+    {
+      "id": "heavenly-loop",
+      "decision": "approve"
+    },
+    {
+      "id": "space-ranger-loop",
+      "decision": "approve"
+    },
+    {
+      "id": "simple-menu-loop",
+      "decision": "approve"
+    },
+    {
+      "id": "piano-loop",
+      "decision": "drop"
+    }
+  ]
+}

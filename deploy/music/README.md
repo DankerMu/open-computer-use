@@ -7,8 +7,9 @@ This directory holds the CC0 background-music candidates for the explainer kit, 
 - `evidence/` holds one small text snapshot per evidence page.
 - `music_candidates.py` loads and verifies these files.
 - `listening_page.py` builds the listening page.
+- `approvals.json` records the listening decisions (see Approval).
 
-Nothing here enters the workspace image. Normalization, the image install and the tracked approval file come later (tasks 6.2 to 6.4).
+Nothing here enters the workspace image. The source manifest, normalization and the image install come later (tasks 6.3 and 6.4).
 
 ## Evidence rule
 
@@ -53,6 +54,14 @@ Each evidence snapshot is a trimmed plain-text extract of the statement page, un
 `excluded.json` holds `{"version": 1, "excluded": [{"title", "author", "source", "conflict", "reason"}]}`.
 
 The listening page exports `{"version": 1, "reviewer", "date", "decisions": [{"id", "decision"}]}`, with `decision` exactly `approve` or `drop`. `music_candidates.load_decisions` accepts an export only if it has one decision for every candidate, no unknown id and no duplicate.
+
+## Approval
+
+`approvals.json` is the user's listening-page export, committed unmodified. Its SHA-256 is `207fcbd170d914cb96135e30fb03a6a2e9b7fccde5873d0e6b96ab1b45c99b6b`. The approval date is the export's `date` field, `2026-11-16`.
+
+It approves 15 of the 24 candidates and drops 9. Approved per mood: calm-curious 6, upbeat-corporate 2, neutral-serious 3, loop 4. Upbeat-corporate and neutral-serious fall short of the target of four; the shortfall is reported, not treated as an error.
+
+The source manifest of task 6.3 takes its approver and approval date from this file. The static test checks the SHA-256, the reviewer, the date and these counts, so any edit to the file fails.
 
 ## Listening page
 
