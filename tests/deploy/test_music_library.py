@@ -417,6 +417,15 @@ class ExclusionFileTests(unittest.TestCase):
             "extra measured key": (lambda data: data["excluded"][0]["measured"].update(peak=0.0), "fields"),
             "top-level key": (lambda data: data.update(reviewer="someone"), "version 1"),
             "decided by": (lambda data: data["excluded"][0].update(decided_by="orchestrator"), "decided_by"),
+            "version": (lambda data: data.update(version=2), "version 1"),
+            "measured bool": (lambda data: data["excluded"][0]["measured"].update(true_peak_dbtp=True),
+                              "direct-tone: invalid measured fields"),
+            "measured string": (lambda data: data["excluded"][0]["measured"].update(integrated_lufs="-20.0"),
+                                "direct-tone: invalid measured fields"),
+            "date": (lambda data: data["excluded"][0].update(date="2026-02-30"), "direct-tone: invalid reason or date"),
+            "empty reason": (lambda data: data["excluded"][0].update(reason=" "), "direct-tone: invalid reason or date"),
+            "non-string reason": (lambda data: data["excluded"][0].update(reason=7),
+                                  "direct-tone: invalid reason or date"),
         }
         for name, (mutate, message) in cases.items():
             with self.subTest(name), self.assertRaisesRegex(MusicError, re.escape(message)):
@@ -564,6 +573,30 @@ class LoudnessTests(RefusalAssertions):
             self.assertEqual(calls, ["quiet-tone.mp3"])
             loudness = float(re.search(r"I (-?[0-9.]+) LUFS", message).group(1))
             self.assertAlmostEqual(loudness, -22, delta=0.5)
+
+    def test_output_peak_above_the_ceiling_after_encoding_fails(self):
+        encode = music_library._encode
+        calls = []
+
+        def louder(source, target, gain, *rest):
+            calls.append(target.name)
+            return encode(source, target, gain + 0.4, *rest)
+
+        with tmp_dir() as directory:
+            root = Path(directory)
+            audio = root / "audio"
+            audio.mkdir()
+            tracks = [track("capped-loop", "loop", render(audio, "capped.wav", CAPPED, 10, ["-c:a", "pcm_s16le"]),
+                            ".wav")]
+            library = write_library(root, tracks)
+            with mock.patch.object(music_library, "_encode", louder):
+                message = self.assert_refused(library, "capped-loop", "out of tolerance")
+            self.assertEqual(calls, ["capped-loop.wav"])
+            # Only the true peak is out: the loudness stays inside -16 ± 0.5 LUFS.
+            loudness = float(re.search(r"I (-?[0-9.]+) LUFS", message).group(1))
+            peak = float(re.search(r"TP (-?[0-9.]+) dBTP", message).group(1))
+            self.assertLessEqual(abs(loudness + 16), 0.5, message)
+            self.assertGreater(peak, -1.5, message)
 
     def test_fetched_sources_build(self):
         with tmp_dir() as directory:
