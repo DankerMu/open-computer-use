@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "requests": [
+    {
+      "id": "explainer-sky-blue",
+      "kind": "explainer",
+      "repetitions": 2,
+      "prompt": "为什么白天的天空是蓝色的，而日出日落时又会变成橙红色？请做一个两分钟左右的科普讲解视频，用通俗的语言讲给没有物理基础的同事听。"
+    },
+    {
+      "id": "explainer-fever-immunity",
+      "kind": "explainer",
+      "repetitions": 2,
+      "prompt": "人感冒发烧时，身体为什么会主动升高体温？发烧到底是在帮忙还是添乱？请做一个三分钟以内的科普视频，讲清楚免疫系统在其中做了什么。"
+    },
+    {
+      "id": "explainer-bread-browning",
+      "kind": "explainer",
+      "repetitions": 2,
+      "prompt": "面包烤过之后为什么会变成金黄色，还散发出香味？请做一个两分钟左右的科普视频，讲讲烘烤时食物里发生了哪些化学变化，适合普通观众看。"
+    },
+    {
+      "id": "explainer-four-seasons",
+      "kind": "explainer",
+      "repetitions": 2,
+      "prompt": "为什么地球上会有春夏秋冬四季？很多人以为夏天热是因为离太阳更近，其实并不是。请帮我做一个两分钟左右的科普视频，用简单的比喻把原因讲清楚，讲给小学高年级的孩子听。"
+    },
+    {
+      "id": "explainer-phone-fast-charging",
+      "kind": "explainer",
+      "repetitions": 2,
+      "prompt": "手机快充为什么能在半小时内充进一大半电量，快充满时却越来越慢？请做一个两分钟左右的科普讲解视频，顺便说说日常怎样充电对电池更友好。"
+    },
+    {
+      "id": "course-phishing-email",
+      "kind": "course",
+      "repetitions": 1,
+      "prompt": "请给新入职的员工做一节信息安全培训短课视频，主题是如何识别钓鱼邮件：讲清楚常见的三种伪装手法、收到可疑邮件后该怎么处理，最后留两道小测验题，时长三分钟左右。"
+    },
+    {
+      "id": "promo-lunch-fitness-class",
+      "kind": "promo",
+      "repetitions": 1,
+      "prompt": "我们行政部下个月起推出员工午间健身班，每周二、周四中午十二点半在三楼活动室上课，免费报名。请做一条一分钟左右的部门宣传视频，在公司大屏上循环播放，语气轻松活泼一些。"
+    },
+    {
+      "id": "report-sales-q3",
+      "kind": "report",
+      "repetitions": 1,
+      "prompt": "请把我们销售部2026年第三季度的工作汇报做成一个两分钟左右的视频：季度销售额1260万元，同比增长18%；新签客户42家，其中华东区占一半；回款率93%，比上季度提高5个百分点；第四季度目标是销售额1500万元。"
+    }
+  ]
+}

@@ -4,6 +4,8 @@
 
 This directory runs Open WebUI and Computer Use on a shared Docker host as one compose project, `ocu-eval`. It uses release images from a package, unmodified. It is evaluation tooling and is not part of any release.
 
+`requests.json` is the evaluation's request set. It is fixed before the baseline run, and changing it after the baseline voids the comparison.
+
 ## What the stack is
 
 - `compose.eval.yml` overrides the upstream `docker-compose.yml` and `docker-compose.webui.yml`.
