@@ -7,6 +7,8 @@
 #   docker compose -p ocu-eval --project-directory <checkout> --env-file <empty file> \
 #     -f docker-compose.yml -f docker-compose.webui.yml -f deploy/eval/compose.eval.yml …
 # Every object belongs to project ocu-eval. Only open-webui publishes, on loopback.
+# The provider key reaches only open-webui and the adapter; the server speaks
+# through the adapter with the adapter token.
 # Sandboxes run with networking disabled, so they publish no port and reach no address.
 
 services:
@@ -46,11 +48,45 @@ services:
       # would reap the sandbox of a run that makes no sandbox tool call for ten
       # minutes, in the middle of a render.
       CONTAINER_IDLE_TIMEOUT: "259200"
-      # Speech stays unconfigured until the evaluation's speech adapter exists.
-      TTS_BASE_URL: ""
-      TTS_MODEL: ""
+      # Speech through the evaluation adapter, which holds the provider key.
+      # An empty voice lets the provider pick its default (mimo_default).
+      TTS_BASE_URL: http://adapter:8090/v1
+      TTS_MODEL: mimo-v2.5-tts
       TTS_VOICE: ""
-      TTS_API_KEY: ""
+      TTS_API_KEY: ${ADAPTER_TOKEN:?ADAPTER_TOKEN is required}
+
+  # Evaluation-only adapter between OCU's speech client and dmxapi
+  # (deploy/eval/adapter/eval_adapter.py). It reuses the server image's Python,
+  # FastAPI, uvicorn and aiohttp; nothing is built. The entrypoint and command
+  # replace the image's server preflight and server command, and the healthcheck
+  # replaces the image's 8081 probe. Reachable only inside the project network.
+  adapter:
+    image: ${COMPUTER_USE_SERVER_IMAGE:?COMPUTER_USE_SERVER_IMAGE is required}
+    container_name: ocu-eval-adapter
+    # nobody: the bind is world-readable (start.sh checks it) and nothing is written.
+    user: "65534:65534"
+    working_dir: /eval-adapter
+    entrypoint: ["python3", "-I", "-m", "uvicorn", "eval_adapter:app", "--app-dir", "/eval-adapter",
+                 "--host", "0.0.0.0", "--port", "8090"]
+    command: []
+    volumes:
+      - ./deploy/eval/adapter:/eval-adapter:ro
+    environment:
+      # start.sh reads it from the 0600 provider key file; stop.sh exports it empty.
+      PROVIDER_KEY: ${EVAL_PROVIDER_KEY?EVAL_PROVIDER_KEY is required}
+      ADAPTER_TOKEN: ${ADAPTER_TOKEN:?ADAPTER_TOKEN is required}
+      UPSTREAM_BASE_URL: https://www.dmxapi.cn/v1
+    healthcheck:
+      # The slim image has no curl.
+      test: ["CMD", "python3", "-I", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
   open-webui:
     image: ${OPENWEBUI_IMAGE:?OPENWEBUI_IMAGE is required}

@@ -1,0 +1,181 @@
+{
+ "mp3_with_instructions_and_voice": {
+  "status": 200,
+  "content_type": "application/json",
+  "request": {
+   "model": "mimo-v2.5-tts",
+   "messages": [
+    {
+     "role": "user",
+     "content": "用温和、清晰的语气"
+    },
+    {
+     "role": "assistant",
+     "content": "你好，这是一段评测用的语音合成测试。"
+    }
+   ],
+   "audio": {
+    "format": "mp3",
+    "voice": "冰糖"
+   }
+  },
+  "body": {
+   "id": "a478a0ca98194fe4ba9a825b3ff450fb",
+   "choices": [
+    {
+     "finish_reason": "stop",
+     "index": 0,
+     "message": {
+      "content": "",
+      "role": "assistant",
+      "audio": {
+       "id": "cb1d61956bfe408ab4c764151492dfde",
+       "data": "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",
+       "expires_at": null,
+       "transcript": null
+      },
+      "tool_calls": null
+     }
+    }
+   ],
+   "created": 1794881037,
+   "model": "mimo-v2.5-tts",
+   "object": "chat.completion",
+   "usage": {
+    "prompt_tokens": 140,
+    "completion_tokens": 24,
+    "total_tokens": 164,
+    "prompt_tokens_details": {
+     "cached_tokens": 110,
+     "text_tokens": 0,
+     "audio_tokens": 0,
+     "image_tokens": 0
+    },
+    "completion_tokens_details": {
+     "text_tokens": 0,
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "input_tokens_details": null,
+    "claude_cache_creation_5_m_tokens": 0,
+    "claude_cache_creation_1_h_tokens": 0,
+    "cost": "¥0"
+   },
+   "_recorded_note": "audio data truncated to the first 1536 of 26880 bytes"
+  }
+ },
+ "wav_default_voice": {
+  "status": 200,
+  "content_type": "application/json",
+  "request": {
+   "model": "mimo-v2.5-tts",
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "你好，这是一段评测用的语音合成测试。"
+    }
+   ],
+   "audio": {
+    "format": "wav"
+   }
+  },
+  "body": {
+   "id": "8129c0bc573c401f906079983000cd71",
+   "choices": [
+    {
+     "finish_reason": "stop",
+     "index": 0,
+     "message": {
+      "content": "",
+      "role": "assistant",
+      "audio": {
+       "id": "9d5f00c794bf44038de23d3fd418592c",
+       "data": "UklGRiSUAgBXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGF0YQCUAgDy//P/7//v//D/8f/v//D/8P/v/+7/8P/u/+7/7//w//H/8f/x//D/8P/x//D/8v/x//L/8v/y//H/8v/y//H/8f/y//P/9P/z//P/8//y//L/9P/z//L/8v/z//L/8f/v//D/7v/w/+//7//u/+7/7//t/+3/7P/q/+z/7P/s/+z/7P/t/+3/6//r/+v/6v/q/+j/6f/o/+j/6f/m/+f/5//n/+f/5v/m/+j/5v/m/+f/6P/o/+j/5//n/+j/5//n/+b/5v/k/+X/5v/n/+X/5f/m/+b/5P/l/+X/4//k/+P/4//j/+L/4P/j/+T/4v/i/+P/5P/k/+T/5P/j/+P/4//k/+L/5P/k/+T/5P/j/+P/5f/m/+X/5v/l/+T/5f/k/+X/5v/n/+j/5v/m/+f/5v/m/+X/6f/q/+f/6P/o/+f/6P/o/+f/6f/p/+n/6//r/+3/7f/t/+7/7P/s/+3/8P/v/+//8f/x//P/8//0//T/8v/y//T/9P/z//T/9P/1//T/9f/1//X/9//1//X/9f/2//b/9v/4//j/9//3//X/9//4//j/+P/4//j/+f/5//f/+P/7//n//P/+////AgAAAAAAAQAAAAMAAwACAAMAAAACAAIAAwACAAMABQAHAAYABwAMAAoADAALAAoACgAIAAgABwAIAAcACAAKAAsACgALAAoACwALAAgACAAJAAoACwAOAA0ADQAMAA4ADgANAA8ADwAQAA8AEAARABEAEQAPABEAEgAQAA8AEgARABAADwARABEAEQATABMAFAAUABUAFgAVABUAFgAXABcAGQAaABoAHAAcAB0AHQAdAB0AHgAgAB4AIQAgAB8AIAAiACAAIAAgACAAIwAiACQAIwAjACMAJAAiACUAJgAmACYAJwApACoAKQApACcAJwAoACcAKAAqACkAKwAtACsAKgAqACkAKQArACwAKQAqACoAKQArACsAKwArACsAKgApACkAKQAqAC0AKwAqAC0ALAApACsAKwAoACgAKgAqACwALAAtAC0AKwAsACwALAAtAC8ALgAtAC8ALwAuAC0ALgAtAC4ALwAsACwALAAuAC0ALgAvAC4ALQAsAC0AKwArACsALAAsACwALgAsACoALQAtACwALAAuAC0AKQAqACsAKwAsACsAKwAsACoAKQAnACcAKAAqACkAJwAnACcAJwAmACYAJAAmACUAIwAmACEAJAAkACQAJAAjACMAJAAjACIAJAAhACEAIAAjACQAIwAiACQAIwAkACQAIgAmACYAJQAmACQAIwAlACMAIAAhACEAIAAgACAAIQAhACAAIgAgACEAIgAhACEAIAAhACIAHwAfAB8AHQAdAB0AGwAbABkAGgAZABgAFwAXABkAGAAYABgAGAAWABcAFgAYABYAFQAUABQAFwAXABUAFQAVABUAFAASABIAEgAPAA4ADwANAAwADQAOAA0ACwALAAsACwAIAAgABwAGAAgACAAHAAUABAAFAAQABQAFAAQABgAGAAUABgADAAUAAwADAAIAAAABAAEAAAD//////////wEA///8//7//P/6//v/+//8//v/+//8//v//f/9//3//f/7//z//P/6//n/+f/4//j/9//5//j/+P/3//n/9//5//j/9//4//f/9//4//n/+P/3//f/+P/4//X/9v/3//b/9//4//X/9v/1//X/9f/4//b/9v/3//X/9f/0//b/9P/3//f/9P/3//b/9P/3//b/9f/1//b/9v/2//j/+P/1//b/9//3//n/+P/6//r/+f/6//r/+//6//v//P/8//3//v8AAAAA//8CAAAAAwAEAAMABgAGAAYABgAJAAcABwAKAAoACQAKAAkADAANAA0ADwARABEAEQARABEAEwASABIAEwAUABMAFQAUABMAEwAUABUAFAAWABUAFQAWABgAGAAXABoAGAAYABoAHAAbABkAGgAYABsAGgAbAB0A",
+       "expires_at": null,
+       "transcript": null
+      },
+      "tool_calls": null
+     }
+    }
+   ],
+   "created": 1794881039,
+   "model": "mimo-v2.5-tts",
+   "object": "chat.completion",
+   "usage": {
+    "prompt_tokens": 134,
+    "completion_tokens": 24,
+    "total_tokens": 158,
+    "prompt_tokens_details": {
+     "cached_tokens": 123,
+     "text_tokens": 0,
+     "audio_tokens": 0,
+     "image_tokens": 0
+    },
+    "completion_tokens_details": {
+     "text_tokens": 0,
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "input_tokens_details": null,
+    "claude_cache_creation_5_m_tokens": 0,
+    "claude_cache_creation_1_h_tokens": 0,
+    "cost": "¥0"
+   },
+   "_recorded_note": "audio data truncated to the first 1536 of 169004 bytes"
+  }
+ },
+ "unknown_voice_400": {
+  "status": 400,
+  "content_type": "application/json; charset=utf-8",
+  "request": {
+   "model": "mimo-v2.5-tts",
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "你好，这是一段评测用的语音合成测试。"
+    }
+   ],
+   "audio": {
+    "format": "wav",
+    "voice": "alloy"
+   }
+  },
+  "body": {
+   "error": {
+    "message": "Param Incorrect",
+    "type": "upstream_error",
+    "param": "Unknown voice: alloy. Available voices: [mimo_default, 冰糖, 茉莉, 苏打, 白桦, Mia, Chloe, Milo, Dean]",
+    "code": "400"
+   }
+  }
+ },
+ "unknown_model": {
+  "status": 503,
+  "content_type": "application/json; charset=utf-8",
+  "request": {
+   "model": "mimo-v2.5-tts-nonexistent",
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "你好，这是一段评测用的语音合成测试。"
+    }
+   ],
+   "audio": {
+    "format": "wav"
+   }
+  },
+  "body": {
+   "error": {
+    "code": "model_not_found",
+    "message": "分组 default 下模型 mimo-v2.5-tts-nonexistent 无可用渠道（distributor） (request id: 20261117020400791622425c14228f5kONWeGoc)",
+    "type": "dmx_api_error"
+   }
+  }
+ }
+}
