@@ -16,6 +16,8 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,7 @@ from unittest import mock
 import urllib.error
 import uuid
 
+from test_eval_cleanup import FLOCK_SHIM
 from support import (
     DEFAULT_RELEASE_IMAGES,
     ROOT,
@@ -64,6 +67,10 @@ LOW_KB = 10 * 1024 ** 2
 VALID_PROBE = {"streams": [{"codec_type": "video", "codec_name": "h264"},
                            {"codec_type": "audio", "codec_name": "aac"}],
                "format": {"duration": "12.500000"}}
+MANIFEST_KEYS = {
+    "version", "phase", "request_id", "kind", "repetition", "attempt", "chat_id", "release",
+    "webui_image_id", "models", "started_at", "elapsed_seconds", "outcome", "failure_class",
+    "failure_reason", "check", "counts", "mp4", "skipped_outputs"}
 MP4_BYTES = b"\x00\x00\x00\x18ftypmp42fake-mp4-body"
 
 
@@ -153,6 +160,8 @@ def scenario(**overrides):
         "tasks_status": None,     # an HTTP status every task-list GET answers with
         "chat_status": None,      # an HTTP status the chat GET answers with
         "drop_answer": False,     # create the chat, then close the POST without answering
+        "post_status": None,      # create the chat, then answer the POST with this HTTP status
+        "forget": False,          # drop the chat right after creating it: later GETs do not find it
         "outputs": {"video.mp4": MP4_BYTES},
     }
     base.update(overrides)
@@ -193,6 +202,7 @@ class FakeWebUI(ThreadingHTTPServer):
         self.state: dict[str, dict] = {}
         self.tokens: set[str] = set()
         self.first_poll: dict | None = None
+        self.list_status: int | None = None  # an HTTP status the chat-list GET answers with
 
     def start(self):
         threading.Thread(target=self.serve_forever, daemon=True).start()
@@ -229,7 +239,10 @@ class FakeWebUI(ThreadingHTTPServer):
         outputs = self.eval_root / "data" / chat_id / "outputs"
         outputs.mkdir(parents=True)
         for name, content in current["outputs"].items():
-            if isinstance(content, tuple):
+            if isinstance(content, tuple) and content[0] == "sparse":
+                with open(outputs / name, "wb") as stream:
+                    stream.truncate(content[1])
+            elif isinstance(content, tuple):
                 (outputs / name).symlink_to(content[1])
             else:
                 (outputs / name).write_bytes(content)
@@ -279,9 +292,13 @@ class FakeHandler(BaseHTTPRequestHandler):
             with server.lock:
                 server.posts.append(body)
                 chat_id, current = server.create_chat(body)
+                if current["forget"]:
+                    del server.chats[chat_id]
             if current["drop_answer"]:
                 self.close_connection = True
                 return None
+            if current["post_status"]:
+                return self.reply(current["post_status"], {"detail": "failure"})
             return self.reply(200, {"status": True, "task_ids": ["task-1"], "chat_id": chat_id})
         if self.path.startswith("/api/tasks/chat/") and self.path.endswith("/stop"):
             chat_id = self.path.split("/")[4]
@@ -318,6 +335,8 @@ class FakeHandler(BaseHTTPRequestHandler):
                 return self.reply(200, {"task_ids": ["task-1"]})
             return self.reply(200, {"task_ids": []})
         if self.path == "/api/v1/chats/?page=1":
+            if server.list_status:
+                return self.reply(server.list_status, {"detail": "failure"})
             listing = sorted(server.chats.values(), key=lambda chat: -chat["updated_at"])
             return self.reply(200, [{"id": chat["id"], "title": chat["title"],
                                      "updated_at": chat["updated_at"],
@@ -326,7 +345,8 @@ class FakeHandler(BaseHTTPRequestHandler):
             chat_id = self.path.rsplit("/", 1)[1]
             state = server.state.get(chat_id, {})
             if chat_id not in server.chats:
-                return self.reply(404, {"detail": "Not Found"})
+                # WebUI 6b95a4995 routers/chats.py: an unknown chat is a 401, not a 404.
+                return self.reply(401, {"detail": "We could not find what you're looking for :/"})
             if state.get("chat_status"):
                 return self.reply(state["chat_status"], {"detail": "Not Found"})
             return self.reply(200, server.chats[chat_id])
@@ -581,6 +601,38 @@ class DriverEntryPointTests(DriverCase):
         self.assertEqual(result.stdout.splitlines()[-1], f"eval: done {result.returncode}")
         self.assertEqual(self.webui.posts, [])
 
+    def test_a_running_driver_holds_the_lock_against_cleanup_and_a_second_driver(self):
+        self.write_files()
+        if shutil.which("flock") is None:
+            # macOS has no flock(1): the same flock(2) lock on fd 9; the host has util-linux flock.
+            shim = self.bin / "flock"
+            shim.write_text(FLOCK_SHIM.replace("__PYTHON__", sys.executable), encoding="utf-8")
+            shim.chmod(0o755)
+        self.webui.scenarios = [scenario(until_stop=True)]
+        argv = ["bash", str(RUN), "--package", str(self.package), "--phase", "smoke",
+                "--request", FIRST["id"]]
+        driver = subprocess.Popen(argv, cwd=self.tmp, env=self.environment(), start_new_session=True,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 60
+            while self.webui.first_poll is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertIsNotNone(self.webui.first_poll, "the driver never polled")
+            docker_calls = len(self.calls("docker"))
+            cleanup = subprocess.run(["bash", str(EVAL_DIR / "cleanup.sh"), "--runs-only"], cwd=self.tmp,
+                                     env=self.environment(), capture_output=True, text=True,
+                                     timeout=60, check=False)
+            self.assertNotEqual(cleanup.returncode, 0)
+            self.assertIn("eval.lock", cleanup.stderr)
+            self.assertEqual(len(self.calls("docker")), docker_calls, "cleanup ran a docker command")
+            code, _, stderr = self.drive()
+            self.assertNotEqual(code, 0)
+            self.assertIn("eval.lock", stderr)
+            self.assertEqual(len(self.webui.posts), 1)
+        finally:
+            os.killpg(driver.pid, signal.SIGTERM)
+            driver.wait(timeout=30)
+
     def test_whole_request_set_runs_in_file_order_with_its_repetitions(self):
         self.write_files()
         result = self.run_script()
@@ -627,16 +679,8 @@ class DriverFlowTests(DriverCase):
         self.assertEqual((manifest["chat_id"], manifest["outcome"]), (chat_id, "succeeded"))
 
     def test_post_lost_without_a_chat_is_infra(self):
-        self.webui.scenarios = [scenario(drop_answer=True)]
-        original = FakeWebUI.create_chat
-
-        def forget(server, body):
-            chat_id, current = original(server, body)
-            server.chats.pop(chat_id)
-            return chat_id, current
-
-        with mock.patch.object(FakeWebUI, "create_chat", forget):
-            code, _, _ = self.drive()
+        self.webui.scenarios = [scenario(drop_answer=True, forget=True)]
+        code, _, _ = self.drive()
         self.assertEqual(code, 0)
         manifests = [self.manifest(path) for path in self.run_dirs()]
         self.assertEqual(len(manifests), 3)
@@ -661,6 +705,108 @@ class DriverFlowTests(DriverCase):
         self.assertEqual(len(refused), 2)
         self.assertEqual(len(self.webui.posts), 1)
         self.assertEqual(self.only_manifest()["outcome"], "succeeded")
+
+    def test_post_http_error_with_the_chat_created_is_found_and_ledgered(self):
+        self.webui.scenarios = [scenario(post_status=500)]
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.webui.posts), 1)
+        chat_id = next(iter(self.webui.chats))
+        self.assertEqual(self.ledger(), [chat_id])
+        manifest = self.only_manifest()
+        self.assertEqual((manifest["chat_id"], manifest["outcome"]), (chat_id, "succeeded"))
+
+    def test_post_http_error_without_a_chat_names_the_status(self):
+        self.webui.scenarios = [scenario(post_status=500, forget=True)]
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        manifest = self.manifest(self.run_dirs()[0])
+        self.assertEqual((manifest["failure_class"], manifest["failure_reason"], manifest["chat_id"]),
+                         ("infra", "POST /api/chat/completions: HTTP 500", None))
+        self.assertEqual(self.ledger(), [])
+
+    def test_failed_lookup_after_a_lost_answer_stops_without_a_manifest(self):
+        self.webui.scenarios = [scenario(drop_answer=True), scenario()]
+        self.webui.list_status = 500
+        code, _, stderr = self.drive()
+        self.assertNotEqual(code, 0)
+        self.assertIn("refused", stderr)
+        self.assertIn("/api/v1/chats/?page=1", stderr)
+        self.assertEqual(len(self.webui.posts), 1, "the request is never sent twice")
+        run_dir = self.run_dirs()[0]
+        self.assertEqual([path.name for path in self.run_dirs()], ["r1-a1"])
+        self.assertFalse((run_dir / "manifest.json").exists())
+        pending = json.loads((run_dir / "pending.json").read_text(encoding="utf-8"))
+        self.assertNotIn("chat_id", pending)
+        self.assertEqual(self.ledger(), [])
+        # The next driver run repeats the lookup, records the chat and goes on.
+        self.webui.list_status = None
+        chat_id = next(iter(self.webui.chats))
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        recovered = self.manifest(run_dir)
+        self.assertEqual((recovered["failure_reason"], recovered["chat_id"]),
+                         ("driver interrupted", chat_id))
+        self.assertEqual(self.ledger()[0], chat_id)
+
+    def test_an_abandoned_chat_is_stopped_before_the_next_post(self):
+        self.webui.scenarios = [scenario(tasks_status=500)]
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        chat_ids = list(self.webui.chats)
+        self.assertEqual(self.webui.stops, chat_ids)
+        posts = [path for method, path in self.webui.paths if method == "POST"
+                 and (path == "/api/chat/completions" or path.endswith("/stop"))]
+        self.assertEqual(posts, [path for chat_id in chat_ids
+                                 for path in ("/api/chat/completions", f"/api/tasks/chat/{chat_id}/stop")])
+        for path in self.run_dirs():
+            self.assertEqual(self.manifest(path)["failure_class"], "infra")
+
+    def test_free_space_is_checked_before_every_attempt(self):
+        self.webui.scenarios = [scenario(message={"done": False, "output": []})]
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.run_dirs()), 3)
+        self.assertEqual(len(self.calls("df")), 3)
+
+    def test_initial_sign_in_retries_a_reset_connection(self):
+        real_open = DRIVER.OPENER.open
+        resets = []
+
+        def open_(request, *args, **kwargs):
+            if request.full_url.endswith("/api/v1/auths/signin") and len(resets) < 2:
+                resets.append(request.full_url)
+                raise ConnectionResetError(54, "Connection reset by peer")
+            return real_open(request, *args, **kwargs)
+
+        with mock.patch.object(DRIVER, "SIGNIN_RETRY_SECONDS", 0.01), \
+                mock.patch.object(DRIVER.OPENER, "open", open_):
+            code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(resets), 2)
+        self.assertEqual(self.only_manifest()["outcome"], "succeeded")
+
+    def test_initial_sign_in_gives_up_after_its_tries(self):
+        def refuse(request, *args, **kwargs):
+            raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+        with mock.patch.object(DRIVER, "SIGNIN_RETRY_SECONDS", 0.01), \
+                mock.patch.object(DRIVER.OPENER, "open", refuse):
+            code, _, stderr = self.drive()
+        self.assertNotEqual(code, 0)
+        self.assertIn("/api/v1/auths/signin", stderr)
+        self.assertEqual(self.run_dirs(), [])
+
+    def test_failure_reason_stays_on_one_stdout_line(self):
+        self.webui.scenarios = [scenario(message={"done": True, "output": [],
+                                                  "error": {"content": "first line\nsecond\r\nthird"}})]
+        code, stdout, _ = self.drive()
+        self.assertEqual(code, 0)
+        lines = stdout.splitlines()
+        self.assertEqual(len(lines), 3)
+        for line in lines:
+            self.assertTrue(line.startswith("eval: runs/smoke/"), line)
+            self.assertIn("first line second third", line)
 
     def test_each_preflight_failure_refuses_before_any_post(self):
         def drop(items, key):
@@ -779,11 +925,40 @@ class DriverFlowTests(DriverCase):
                           recovered["chat_id"], recovered["attempt"], recovered["repetition"]),
                          ("failed", "infra", "driver interrupted", chat_id, 1, 1))
         self.assertEqual(recovered["started_at"], "2026-11-17T08:00:00Z")
+        self.assertEqual(set(recovered), MANIFEST_KEYS)
+        for name in ("release", "webui_image_id", "models", "counts", "elapsed_seconds", "check"):
+            self.assertIsNone(recovered[name], name)
+        self.assertEqual((recovered["mp4"], recovered["skipped_outputs"], recovered["version"],
+                          recovered["phase"], recovered["request_id"], recovered["kind"]),
+                         ([], [], 1, "smoke", FIRST["id"], FIRST["kind"]))
         self.assertEqual([path.name for path in self.run_dirs()], ["r1-a1", "r1-a2"])
         self.assertEqual(self.manifest(self.run_dirs()[1])["attempt"], 2)
         self.assertEqual(self.ledger()[0], chat_id)
         self.assertEqual(self.ledger().count(chat_id), 1)
         self.assertIn("driver interrupted", stdout)
+
+    def test_an_interrupted_attempt_uses_up_one_of_the_three(self):
+        chat_id = str(uuid.uuid4())
+        self.interrupted_dir({"user_message_id": str(uuid.uuid4()),
+                              "started_at": "2026-11-17T08:00:00Z", "chat_id": chat_id})
+        self.webui.scenarios = [scenario(message={"done": False, "output": []})]
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        self.assertEqual([path.name for path in self.run_dirs()], ["r1-a1", "r1-a2", "r1-a3"])
+        self.assertEqual(len(self.webui.posts), 2)
+
+    def test_three_interrupted_attempts_leave_no_new_attempt(self):
+        base = self.eval_root / "runs" / "smoke" / FIRST["id"]
+        for number in (1, 2, 3):
+            (base / f"r1-a{number}").mkdir(parents=True)
+            (base / f"r1-a{number}" / "pending.json").write_text(json.dumps({
+                "user_message_id": str(uuid.uuid4()), "started_at": "2026-11-17T08:00:00Z",
+                "chat_id": str(uuid.uuid4())}), encoding="utf-8")
+        code, stdout, _ = self.drive()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.webui.posts, [])
+        self.assertEqual([path.name for path in self.run_dirs()], ["r1-a1", "r1-a2", "r1-a3"])
+        self.assertIn("no attempt left", stdout)
 
     def test_interrupted_run_without_a_chat_id_is_found_by_its_user_message(self):
         # An earlier driver sent the POST and died before it read the answer.
@@ -818,10 +993,7 @@ class DriverFlowTests(DriverCase):
         self.assertEqual(code, 0)
         manifest = self.only_manifest()
         chat_id = next(iter(self.webui.chats))
-        self.assertEqual(set(manifest), {
-            "version", "phase", "request_id", "kind", "repetition", "attempt", "chat_id", "release",
-            "webui_image_id", "models", "started_at", "elapsed_seconds", "outcome", "failure_class",
-            "failure_reason", "check", "counts", "mp4", "skipped_outputs"})
+        self.assertEqual(set(manifest), MANIFEST_KEYS)
         self.assertEqual(manifest["version"], 1)
         self.assertEqual((manifest["phase"], manifest["request_id"], manifest["kind"]),
                          ("smoke", FIRST["id"], FIRST["kind"]))
@@ -890,6 +1062,72 @@ class DriverFlowTests(DriverCase):
         self.assertEqual(manifest["skipped_outputs"], [{"name": "leak.mp4", "reason": "symlink"}])
         self.assertEqual([entry["name"] for entry in manifest["mp4"]], ["video.mp4"])
         self.assert_no_leak_anywhere()
+
+    def listdir_adding(self, *extra: str):
+        real = os.listdir
+
+        def listdir(path="."):
+            names = real(path)
+            return names + list(extra) if isinstance(path, int) else names
+
+        return mock.patch.object(DRIVER.os, "listdir", listdir)
+
+    def test_a_vanished_output_is_skipped(self):
+        with self.listdir_adding("ghost.mp4"):
+            code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        manifest = self.only_manifest()
+        self.assertEqual(manifest["skipped_outputs"],
+                         [{"name": "ghost.mp4", "reason": "unreadable: No such file or directory"}])
+        self.assertEqual([entry["name"] for entry in manifest["mp4"]], ["video.mp4"])
+
+    def test_a_name_that_is_not_utf8_is_skipped(self):
+        with self.listdir_adding("bad\udcff.mp4"):
+            code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        manifest = self.only_manifest()
+        self.assertEqual(manifest["skipped_outputs"],
+                         [{"name": "bad\\xff.mp4", "reason": "name is not UTF-8"}])
+        self.assertEqual(manifest["outcome"], "succeeded")
+
+    def test_an_mp4_over_the_size_cap_is_not_copied(self):
+        self.webui.scenarios = [scenario(outputs={"video.mp4": MP4_BYTES,
+                                                  "huge.mp4": ("sparse", 4 * 1024 ** 3 + 1)})]
+        code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        run_dir = self.run_dirs()[0]
+        manifest = self.manifest(run_dir)
+        self.assertEqual(manifest["skipped_outputs"], [{"name": "huge.mp4", "reason": "too large"}])
+        self.assertFalse((run_dir / "huge.mp4").exists())
+        self.assertEqual([entry["name"] for entry in manifest["mp4"]], ["video.mp4"])
+
+    def test_an_mp4_that_would_cross_the_free_space_floor_is_not_copied(self):
+        with mock.patch.object(DRIVER, "FLOOR_BYTES", 1 << 62):
+            code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        run_dir = self.run_dirs()[0]
+        self.assertEqual(self.manifest(run_dir)["skipped_outputs"],
+                         [{"name": "video.mp4", "reason": "too large"}])
+        self.assertFalse((run_dir / "video.mp4").exists())
+
+    def test_only_the_first_mp4_entries_are_considered(self):
+        self.webui.scenarios = [scenario(outputs={"a.mp4": MP4_BYTES, "b.mp4": MP4_BYTES,
+                                                  "c.mp4": MP4_BYTES})]
+        with mock.patch.object(DRIVER, "MAX_MP4_FILES", 2):
+            code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        manifest = self.only_manifest()
+        self.assertEqual([entry["name"] for entry in manifest["mp4"]], ["a.mp4", "b.mp4"])
+        self.assertEqual(manifest["skipped_outputs"], [{"name": "c.mp4", "reason": "too many"}])
+
+    def test_a_failure_while_collecting_does_not_stop_the_batch(self):
+        with mock.patch.object(DRIVER.Driver, "copy", side_effect=RuntimeError("boom")):
+            code, _, _ = self.drive()
+        self.assertEqual(code, 0)
+        manifest = self.manifest(self.run_dirs()[0])
+        self.assertEqual(manifest["mp4"], [])
+        self.assertEqual(manifest["skipped_outputs"], [{"name": "outputs", "reason": "collect failed: RuntimeError"}])
+        self.assertEqual(manifest["failure_reason"], "no valid MP4")
 
     def test_counts_equal_the_hand_count(self):
         output = [
@@ -961,12 +1199,13 @@ class OutcomeTableTests(DriverCase):
         self.assertEqual((got["outcome"], got["class"]), ("failed", "infra"))
         self.assertRegex(got["reason"], r"^GET /api/tasks/chat/[0-9a-f-]{36}: HTTP 503$")
 
-    def test_row_7_missing_chat(self):
+    def test_row_7_missing_chat_answered_404(self):
+        # The fixture's contract: a 404 for the chat is "chat missing".
         self.assert_outcome(("failed", "infra", "chat missing"), chat_status=404)
 
-    def test_row_7_chat_refused_after_a_fresh_sign_in(self):
-        # WebUI main answers a chat it cannot find with 401: one new sign-in, then infra.
-        got = self.outcome(chat_status=401)
+    def test_row_7_unknown_chat_is_refused_after_a_fresh_sign_in(self):
+        # WebUI answers a chat it cannot find with 401: one new sign-in, then infra.
+        got = self.outcome(forget=True)
         self.assertEqual((got["outcome"], got["class"]), ("failed", "infra"))
         self.assertRegex(got["reason"], r"^GET /api/v1/chats/[0-9a-f-]{36}: HTTP 401$")
         self.assertEqual(len(self.webui.tokens), 1 + 3, "one sign-in per batch and one per attempt")

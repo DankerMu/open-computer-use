@@ -58,7 +58,11 @@ def option(name):
 def image_matches(image, name):
     return name in (image["ref"], image["id"])
 if args[:1] == ["compose"]:
-    pass
+    if world.get("compose_fails"):
+        fail("compose down failed")
+elif args[:2] == ["network", "ls"]:
+    for name in world.get("compose_networks", []):
+        print(name)
 elif args[:2] == ["container", "ls"] and option("--filter").startswith("label="):
     for name in world.get("compose_containers", []):
         print(name)
@@ -396,6 +400,25 @@ class CleanupFullTests(CleanupCase):
         self.assertEqual(self.mutations(), [])
         self.assertIn("images.env", again.stdout)
 
+    def test_failed_compose_down_keeps_the_bind_files_and_fails(self):
+        self.world["compose_fails"] = True
+        self.save_world()
+        result = self.cleanup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.eval_root / "images.env").is_file())
+        self.assertTrue((self.eval_root / "loaded-images.txt").is_file())
+        self.assertEqual([argv for argv in self.calls() if argv[:2] == ["image", "rm"]], [])
+
+    def test_without_images_env_a_remaining_project_network_fails(self):
+        self.assertEqual(self.cleanup().returncode, 0)
+        self.world = self.load_world()
+        self.world["compose_networks"] = ["ocu-eval_default"]
+        self.save_world()
+        again = self.cleanup()
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("ocu-eval_default", again.stderr)
+        self.assertEqual(self.mutations(), [])
+
     def test_without_images_env_a_remaining_project_container_fails(self):
         self.assertEqual(self.cleanup().returncode, 0)
         self.world = self.load_world()
@@ -403,7 +426,8 @@ class CleanupFullTests(CleanupCase):
         self.save_world()
         again = self.cleanup()
         self.assertNotEqual(again.returncode, 0)
-        self.assertIn("ocu-eval containers remain", again.stderr)
+        self.assertIn("ocu-eval objects remain", again.stderr)
+        self.assertIn("ocu-eval-postgres", again.stderr)
         self.assertEqual(self.mutations(), [])
 
 

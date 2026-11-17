@@ -54,6 +54,16 @@ HTTP_TIMEOUT = 60
 POST_TIMEOUT = 120
 DOCKER_TIMEOUT = 600
 MAX_ATTEMPTS = 3
+# start.sh returns once open-webui-init has exited; on the host the first sign-in right
+# after it was reset while WebUI was still coming up, so a batch's first sign-in is retried.
+SIGNIN_TRIES = 5
+SIGNIN_RETRY_SECONDS = 3
+# The sandbox writes the outputs directory. A runaway render or a sparse file must not fill
+# EVAL_ROOT's filesystem, and thousands of entries must not make collection unbounded.
+MAX_MP4_BYTES = 4 * 1024 ** 3
+MAX_MP4_FILES = 20
+# common.sh's 15 GiB floor, also kept free on EVAL_ROOT's filesystem while copying outputs.
+FLOOR_BYTES = 15 * 1024 ** 3
 DATA_URI_LIMIT = 4096
 REASON_LIMIT = 200
 REDACTED = "[REDACTED]"
@@ -80,6 +90,10 @@ class Refusal(Exception):
 
 class CallFailed(Exception):
     """A WebUI call that failed after its retries; the text is the failure reason."""
+
+
+class TooLarge(Exception):
+    """An output above the size cap or the free space above the floor."""
 
 
 class Redactor:
@@ -118,6 +132,12 @@ def describe(error: BaseException) -> str:
     return type(error).__name__
 
 
+def transient(error: BaseException | None) -> bool:
+    """A connection that was refused or reset: the server was not ready to answer."""
+    reason = getattr(error, "reason", error)
+    return isinstance(reason, (ConnectionRefusedError, ConnectionResetError))
+
+
 class WebUI:
     def __init__(self, port: str, email: str, password: str, redactor: Redactor):
         self.base = f"http://127.0.0.1:{port}"
@@ -149,7 +169,7 @@ class WebUI:
             status, payload = self.exchange("POST", "/api/v1/auths/signin",
                                             {"email": self.email, "password": self.password})
         except (OSError, http.client.HTTPException, ValueError) as error:
-            raise CallFailed(f"POST /api/v1/auths/signin: {describe(error)}") from None
+            raise CallFailed(f"POST /api/v1/auths/signin: {describe(error)}") from error
         token = payload.get("token") if status == 200 and isinstance(payload, dict) else None
         if not isinstance(token, str) or not token:
             raise CallFailed(f"POST /api/v1/auths/signin: HTTP {status}")
@@ -220,7 +240,13 @@ class WebUI:
         else:
             raise CallFailed("POST /api/chat/completions: connection refused")
         # The request may have created the chat: find it instead of sending it again.
-        chat_id = self.find_chat(user_message_id, since)
+        try:
+            chat_id = self.find_chat(user_message_id, since)
+        except CallFailed as failure:
+            # No manifest: the chat may exist outside the ledger, and the next run's
+            # recovery repeats this lookup from pending.json.
+            raise Refusal(f"the POST answer was lost and the chat lookup failed ({failure}); "
+                          "the next run looks the chat up again") from None
         if chat_id is None:
             raise CallFailed(lost)
         return chat_id
@@ -376,18 +402,33 @@ class Driver:
         lock = take_lock(self.root)
         try:
             try:
-                self.webui.signin()
-                self.recover()
+                self.first_signin()
+                recovered = self.recover()
                 self.context = self.preflight()
             except CallFailed as failure:
                 raise Refusal(str(failure)) from None
             for request, repetition in plan:
-                for _ in range(MAX_ATTEMPTS):
+                # An interrupted attempt counts toward the three.
+                left = MAX_ATTEMPTS - recovered.get((self.args.phase, request["id"], repetition), 0)
+                if left <= 0:
+                    self.redactor.say(f"eval: runs/{self.args.phase}/{request['id']} r{repetition}: "
+                                      "no attempt left after interrupted attempts")
+                for _ in range(left):
                     if self.attempt(request, repetition)["failure_class"] != "infra":
                         break
         finally:
             os.close(lock)
         return 0
+
+    def first_signin(self):
+        for attempt in range(1, SIGNIN_TRIES + 1):
+            try:
+                self.webui.signin()
+                return
+            except CallFailed as failure:
+                if attempt == SIGNIN_TRIES or not transient(failure.__cause__):
+                    raise
+            time.sleep(SIGNIN_RETRY_SECONDS)
 
     def require_space(self):
         """eval_require_space 0 of common.sh, before every attempt."""
@@ -511,9 +552,12 @@ class Driver:
         self.redactor.write_json(run_dir / "manifest.json", manifest)
         return manifest
 
-    def recover(self):
-        """Run directories an earlier driver left without a manifest become failed attempts."""
+    def recover(self) -> dict:
+        """Run directories an earlier driver left without a manifest become failed attempts.
+
+        Returns the number recovered per (phase, request id, repetition)."""
         ledger = self.ledger()
+        recovered: dict = {}
         for run_dir in sorted(self.root.glob("runs/*/*/r*-a*")):
             match = RUN_DIR.fullmatch(run_dir.name)
             if match is None or not run_dir.is_dir() or (run_dir / "manifest.json").exists():
@@ -536,6 +580,9 @@ class Driver:
             self.manifest(run_dir, run_dir.parent.name, int(match[1]), int(match[2]), chat_id=chat_id,
                           started_at=pending.get("started_at"), failure_reason="driver interrupted")
             self.redactor.say(f"eval: {run_dir.relative_to(self.root)} failed infra: driver interrupted")
+            key = (run_dir.parent.parent.name, run_dir.parent.name, int(match[1]))
+            recovered[key] = recovered.get(key, 0) + 1
+        return recovered
 
     def body(self, prompt: str, user_message_id: str, assistant_id: str, now: int) -> dict:
         local = datetime.datetime.fromtimestamp(now, SHANGHAI)
@@ -607,16 +654,26 @@ class Driver:
             for name in sorted(os.listdir(directory)):
                 if not name.endswith(".mp4"):
                     continue
-                mode = os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode
-                if stat.S_ISLNK(mode):
-                    skipped.append({"name": name, "reason": "symlink"})
-                elif not stat.S_ISREG(mode):
-                    skipped.append({"name": name, "reason": "not a regular file"})
-                else:
-                    try:
+                # The sandbox picks the bytes of a name; the manifest holds UTF-8 only.
+                shown = os.fsencode(name).decode("utf-8", "backslashreplace")
+                if len(copied) + len(skipped) >= MAX_MP4_FILES:
+                    skipped.append({"name": shown, "reason": "too many"})
+                    continue
+                if shown != name:
+                    skipped.append({"name": shown, "reason": "name is not UTF-8"})
+                    continue
+                try:
+                    mode = os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode
+                    if stat.S_ISLNK(mode):
+                        skipped.append({"name": name, "reason": "symlink"})
+                    elif not stat.S_ISREG(mode):
+                        skipped.append({"name": name, "reason": "not a regular file"})
+                    else:
                         copied.append(self.copy(directory, name, run_dir / name))
-                    except OSError as error:
-                        skipped.append({"name": name, "reason": f"unreadable: {error.strerror or error}"})
+                except TooLarge:
+                    skipped.append({"name": name, "reason": "too large"})
+                except OSError as error:
+                    skipped.append({"name": name, "reason": f"unreadable: {error.strerror or error}"})
         finally:
             os.close(directory)
         return [self.probe(run_dir, entry) for entry in copied], skipped
@@ -625,19 +682,28 @@ class Driver:
     def copy(directory: int, name: str, target: Path) -> dict:
         source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         try:
-            if not stat.S_ISREG(os.fstat(source).st_mode):
+            info = os.fstat(source)
+            if not stat.S_ISREG(info.st_mode):
                 raise OSError("not a regular file")
+            space = os.statvfs(target.parent)
+            if info.st_size > min(MAX_MP4_BYTES, space.f_bavail * space.f_frsize - FLOOR_BYTES):
+                raise TooLarge
             digest, size = hashlib.sha256(), 0
             output = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
                 while chunk := os.read(source, 1 << 20):
-                    digest.update(chunk)
                     size += len(chunk)
+                    if size > info.st_size:
+                        raise OSError("the file grew while it was copied")
+                    digest.update(chunk)
                     view = memoryview(chunk)
                     while view:
                         view = view[os.write(output, view):]
-            finally:
+            except BaseException:
                 os.close(output)
+                os.unlink(target)
+                raise
+            os.close(output)
         finally:
             os.close(source)
         return {"name": name, "size": size, "sha256": digest.hexdigest()}
@@ -661,6 +727,13 @@ class Driver:
                       if isinstance(stream, dict) and stream.get("codec_type") == "video"), None)
         return {**entry, "duration": duration, "video_codec": codec,
                 "valid": codec is not None and duration is not None and duration > 0}
+
+    def abandon(self, chat_id: str):
+        """Best effort: a chat the driver stops following must not keep running."""
+        try:
+            self.webui.call("POST", f"/api/tasks/chat/{chat_id}/stop")
+        except CallFailed as failure:
+            self.redactor.say(f"eval: could not stop chat {chat_id}: {failure}", sys.stderr)
 
     def attempt(self, request: dict, repetition: int) -> dict:
         self.require_space()
@@ -693,7 +766,12 @@ class Driver:
             message = message if isinstance(message, dict) else {}
         except CallFailed as error:
             failure = str(error)
-        mp4, skipped = self.collect(chat_id, run_dir) if chat_id else ([], [])
+            if chat_id is not None and not self.stopped:
+                self.abandon(chat_id)
+        try:
+            mp4, skipped = self.collect(chat_id, run_dir) if chat_id else ([], [])
+        except Exception as error:  # noqa: BLE001 - sandbox-made outputs must not end the batch
+            mp4, skipped = [], [{"name": "outputs", "reason": f"collect failed: {type(error).__name__}"}]
         outcome, failure_class, reason = classify(self.stopped, message, failure,
                                                   any(entry["valid"] for entry in mp4))
         manifest = self.manifest(
@@ -703,7 +781,7 @@ class Driver:
             skipped_outputs=skipped, **self.context)
         line = f"eval: {run_dir.relative_to(self.root)} {outcome}"
         if failure_class:
-            line += f" {failure_class}: {manifest['failure_reason']}"
+            line += f" {failure_class}: " + re.sub(r"[\r\n]+", " ", manifest["failure_reason"])
         self.redactor.say(line)
         return manifest
 

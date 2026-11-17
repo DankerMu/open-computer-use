@@ -69,6 +69,7 @@ if [[ -e "$loaded" ]]; then
 fi
 
 failed=false
+compose_down=true
 have_images=false
 if [[ -e "$EVAL_ROOT/images.env" || -L "$EVAL_ROOT/images.env" ]]; then
     eval_export_images
@@ -76,14 +77,19 @@ if [[ -e "$EVAL_ROOT/images.env" || -L "$EVAL_ROOT/images.env" ]]; then
 fi
 if ! $runs_only; then
     if $have_images; then
-        "$EVAL_SOURCE/deploy/eval/stop.sh" || failed=true
-    elif ! remaining=$(docker container ls --all --quiet --filter "label=com.docker.compose.project=$EVAL_PROJECT"); then
+        if ! "$EVAL_SOURCE/deploy/eval/stop.sh"; then
+            compose_down=false
+            failed=true
+        fi
+    elif ! containers=$(docker container ls --all --filter "label=com.docker.compose.project=$EVAL_PROJECT" --format '{{.Names}}') \
+        || ! networks=$(docker network ls --filter "label=com.docker.compose.project=$EVAL_PROJECT" --format '{{.Name}}'); then
         failed=true
-    elif [[ -n "$remaining" ]]; then
-        printf '%s\n' "eval: $EVAL_ROOT/images.env is absent, but ocu-eval containers remain; compose down needs it (run load.sh)" >&2
+    elif [[ -n "$containers$networks" ]]; then
+        printf '%s\n' "eval: $EVAL_ROOT/images.env is absent, but ocu-eval objects remain:" ${containers:+"$containers"} ${networks:+"$networks"} \
+            "compose down needs images.env (run load.sh)" >&2
         failed=true
     else
-        printf '%s\n' "eval: $EVAL_ROOT/images.env is absent and no ocu-eval container remains; nothing to stop"
+        printf '%s\n' "eval: $EVAL_ROOT/images.env is absent and no ocu-eval container or network remains; nothing to stop"
     fi
 fi
 
@@ -156,6 +162,9 @@ if ! $runs_only; then
     fi
     if [[ -n "${kept[*]-}" ]]; then
         printf '%s\n' "eval: a chat removal failed; images stay for the next run" >&2
+    elif ! $compose_down; then
+        # Containers may still use the images; images.env stays so a rerun can stop them.
+        printf '%s\n' "eval: compose down failed; images, images.env and loaded-images.txt stay" >&2
     else
         images_gone=true
         targets=()

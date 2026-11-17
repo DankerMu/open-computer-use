@@ -165,12 +165,12 @@ Each attempt has its own directory, `${EVAL_ROOT}/runs/<phase>/<request id>/r<re
 
 - `pending.json`: the user message id and start time, written before the request is sent, then the chat id.
 - `transcript.json`: the chat as WebUI returns it. Strings over 4096 characters that start with `data:` are replaced by `<data-uri sha256=… bytes=…>`.
-- The MP4 files: only regular files directly in the chat's `outputs/` directory. Symlinks and other entries ending in `.mp4` are not copied and are listed in `skipped_outputs`.
+- The MP4 files: only regular files directly in the chat's `outputs/` directory, at most 20 entries. These are not copied and are listed in `skipped_outputs` with the reason: symlinks and other entries ending in `.mp4`; entries that vanish or cannot be read; names that are not UTF-8; files over 4 GiB, or larger than the free space above the 15 GiB floor; and entries past the twentieth. A failed copy leaves no partial file, and a failure while collecting never stops the batch.
 - `manifest.json` (version 1), written last. Its fields: `phase`, `request_id`, `kind`, `repetition`, `attempt`, `chat_id`, and `release` (`ocu_source_sha`, `webui_source_sha`, `release_json_sha256`, and per role `reference` and `image_id`). Then `webui_image_id`, `models` (`chat`, `image`, `image_edit`, `speech`), `started_at` (UTC), `elapsed_seconds`, `outcome` (`succeeded` or `failed`), `failure_class` (`null`, `infra`, `kit` or `model`), `failure_reason` (at most 200 characters), and `check` (`null` until the kit defines one). Last come `counts` (`tool_calls`, `image_calls`, `speech_calls`), `mp4` (per file: `name`, `size`, `sha256`, `duration`, `video_codec`, `valid`) and `skipped_outputs`.
 
 An MP4 is valid when `ffprobe` from the workspace image, run offline, reports a video stream and a duration above 0.
 
-A directory without `manifest.json` was left by a driver that died. The next driver run marks it `failed`, `infra`, `driver interrupted`. It records the chat id from `pending.json`, or finds the chat by its user message id and adds it to the ledger. That manifest has `null` release, models, counts and elapsed time. It keeps its attempt number but does not use up the reruns of the new run.
+A directory without `manifest.json` was left by a driver that died. The next driver run marks it `failed`, `infra`, `driver interrupted`. It records the chat id from `pending.json`, or finds the chat by its user message id and adds it to the ledger. That manifest has `null` release, models, counts and elapsed time. It counts as one of the three attempts: after one interrupted attempt the request and repetition get at most two more, and after three, none.
 
 ### Outcomes and reruns
 
@@ -190,7 +190,7 @@ The first matching row wins:
 
 A failed run keeps its MP4 files. No run gets `kit` until the kit defines its failure output. An `infra` outcome is rerun at most twice, each attempt in its own directory with its own manifest.
 
-The driver never sends the same request twice. When the answer to a sent request is lost, it finds the chat through the chat list. If none is found, the attempt is `infra` with reason `post lost`. It repeats the request only when the connection was refused before anything was sent.
+The driver never sends the same request twice. When the answer to a sent request is lost, it finds the chat through the chat list. If the lookup finds none, the attempt is `infra` with reason `post lost`, or `POST /api/chat/completions: HTTP <status>` when WebUI answered with an error. If the lookup itself fails, the driver writes no manifest and stops the batch with a non-zero exit. The chat may exist outside the ledger, so the next run's recovery repeats the lookup from `pending.json`. The driver repeats the request only when the connection was refused before anything was sent. When it stops following a chat after a failed WebUI call, it asks WebUI once to stop that chat's task. The first sign-in of a batch is retried up to five times, 3 seconds apart, while WebUI refuses or resets the connection.
 
 ## Cleanup
 
@@ -207,7 +207,7 @@ EVAL_WEBUI_PORT=<port> "$EVAL_ROOT/src/deploy/eval/cleanup.sh"   # everything
   2. `docker volume rm` of the volumes labelled `com.docker.compose.project=ocu-eval` whose names start `ocu-eval_`. WebUI's volume holds the image settings, including the adapter token, so the image configuration of task 2.4 must be written again after a reload.
   3. `docker image rm`, without `-f`, of each reference in `loaded-images.txt` and each image labelled `ocu-eval`.
 
-  If a per-chat step failed, no image is removed, so the helper image stays for the next run. `images.env` and `loaded-images.txt` are removed only when every image is gone. After that, a further full run skips compose down and exits 0.
+  If a per-chat step or compose down failed, no image is removed, so the helper image stays for the next run. `images.env` and `loaded-images.txt` are removed only when every image is gone. After that, a further full run skips compose down: it exits 0 when no container or network labelled with the project remains, and non-zero, naming them, otherwise.
 - Cleanup never prunes, never uses `docker image rm -f`, and never removes a name it did not compute. `runs/`, `stack.env`, `src/` and `packages/` stay.
 
 The driver holds an exclusive lock on `${EVAL_ROOT}/eval.lock` for its whole batch. `cleanup.sh` takes it with `flock -n` and refuses while a driver runs. A second driver refuses too.
