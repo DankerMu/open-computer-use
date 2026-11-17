@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// Copyright (c) 2025 Open Computer Use Contributors
+//
+// Theme tokens of the explainer kit. Two candidates share one shape; task 4.6
+// keeps one. The kit's colours live only here, in Onda's 12 `Brand` slots, so
+// `brandToCssVars` re-skins the Onda primitives from them. Fonts name only the
+// family the workspace image installs. Springs are Onda's own objects.
+
+import {SPRING_SMOOTH, SPRING_SNAPPY} from './onda/motion.ts';
+
+const FONT = '"Noto Sans CJK SC"';
+
+const canvas = {width: 1920, height: 1080, fps: 30};
+
+// 5% title-safe margins on each side leave a 90% by 90% inner box.
+const safeArea = {top: 54, right: 96, bottom: 54, left: 96};
+
+const type = {
+	weights: {regular: 400, bold: 700},
+	sizes: {title: 96, heading: 64, body: 48, caption: 36, minimum: 32},
+	lineHeight: 1.4,
+	letterSpacing: 0,
+};
+
+const spacing = [8, 16, 24, 32, 48, 64, 96, 128];
+
+const motion = {
+	transitionFrames: 15,
+	springs: {smooth: SPRING_SMOOTH, snappy: SPRING_SNAPPY},
+};
+
+export const themes = {
+	light: {
+		canvas,
+		safeArea,
+		brand: {
+			bg: '#F7F8FA',
+			surface: '#FFFFFF',
+			surface2: '#EBEEF3',
+			border: '#D5DAE3',
+			borderLit: '#AEB6C4',
+			text: '#141821',
+			dim: '#4A5365',
+			faint: '#6E7789',
+			accent: '#1F6FEB',
+			accentSoft: 'rgba(31, 111, 235, 0.12)',
+			fontDisplay: FONT,
+			fontBody: FONT,
+		},
+		type,
+		spacing,
+		motion,
+	},
+	dark: {
+		canvas,
+		safeArea,
+		brand: {
+			bg: '#0B0E14',
+			surface: '#151A23',
+			surface2: '#1F2633',
+			border: '#2A3241',
+			borderLit: '#3D4759',
+			text: '#F3F5F8',
+			dim: '#AEB7C6',
+			faint: '#7D8799',
+			accent: '#4C9AFF',
+			accentSoft: 'rgba(76, 154, 255, 0.18)',
+			fontDisplay: FONT,
+			fontBody: FONT,
+		},
+		type,
+		spacing,
+		motion,
+	},
+};
