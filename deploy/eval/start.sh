@@ -33,10 +33,19 @@ export EVAL_PROVIDER_KEY
 # The orchestrator's data directory; the compose bind refuses to create it.
 mkdir -p -- "$EVAL_ROOT/data"
 eval_compose up -d --no-build --pull never
-# compose wait (Compose 2.20+) exits with the one-shot initializer's status.
-status=0
-eval_compose wait open-webui-init || status=$?
+# compose.eval.yml names every container <project>-<service>.
+EVAL_INIT_CONTAINER="$EVAL_PROJECT-open-webui-init"
+# docker wait returns the initializer's exit code whether it is still running or
+# has already exited. After the first start it exits within a second (the marker
+# is in the volume), and compose wait, which lists only running containers in
+# Compose 2.20-2.36, would then fail instead of reporting status 0.
+if ! status=$(docker wait "$EVAL_INIT_CONTAINER"); then
+    eval_fail "cannot read the exit status of $EVAL_INIT_CONTAINER: docker wait failed"
+fi
+if [[ ! "$status" =~ ^[0-9]+$ ]]; then
+    eval_fail "docker wait $EVAL_INIT_CONTAINER returned no exit status"
+fi
 if (( status != 0 )); then
-    eval_fail "open-webui-init exited with status $status; the stack is still running (docker logs ocu-eval-open-webui-init)"
+    eval_fail "open-webui-init exited with status $status; the stack is still running (docker logs $EVAL_INIT_CONTAINER)"
 fi
 printf '%s\n' "eval: ocu-eval is up and open-webui-init finished"

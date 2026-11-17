@@ -54,7 +54,7 @@ rm -rf "$fake"
 
 ## Operator steps
 
-Commands run on the evaluation host as the evaluation user. Placeholders are in angle brackets. The host needs `bash`, `python3` 3.9 or newer (`deploy/release.py` is imported), `df` and Docker with Compose 2.20 or newer (`start.sh` uses `docker compose wait`).
+Commands run on the evaluation host as the evaluation user. Placeholders are in angle brackets. The host needs `bash`, `python3` 3.9 or newer (`deploy/release.py` is imported), `df` and Docker with Compose v2.
 
 1. Prepare the root and the checkout.
 
@@ -91,7 +91,7 @@ Commands run on the evaluation host as the evaluation user. Placeholders are in 
    EVAL_WEBUI_PORT=<port> "$EVAL_ROOT/src/deploy/eval/start.sh"
    ```
 
-   After `up -d`, `start.sh` waits for `open-webui-init` with `docker compose wait`. It exits non-zero, naming the service and its status, unless the initializer finishes with status 0. The stack stays up for inspection either way.
+   After `up -d`, `start.sh` reads the exit status of the `ocu-eval-open-webui-init` container with `docker wait`, which works whether the initializer is still running or has already exited. It exits non-zero unless that status is 0, naming the service and its status. A missing container or an unreadable status is also a failure. The stack stays up for inspection either way.
 
    From the workstation: `ssh -N -L <local-port>:127.0.0.1:<port> <user>@<eval-host>`.
 

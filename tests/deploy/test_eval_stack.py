@@ -43,6 +43,7 @@ STACK_NAMES = ("OCU_INTERNAL_TOKEN", "MCP_API_KEY", "WEBUI_SECRET_KEY",
                "POSTGRES_PASSWORD", "ADMIN_EMAIL", "ADMIN_PASSWORD")
 ADMIN_EMAIL = "eval-admin@ocu-eval.local"
 PROVIDER_KEY_VAR = "EVAL_PROVIDER_KEY"
+INIT_CONTAINER = "ocu-eval-open-webui-init"
 SERVICE_IMAGE_VARS = {
     "computer-use-server": "COMPUTER_USE_SERVER_IMAGE",
     "open-webui": "OPENWEBUI_IMAGE",
@@ -337,11 +338,28 @@ elif args[:1] == ["compose"]:
     record["env_file_empty"] = os.path.getsize(env_file) == 0
     with open(os.path.join(state, "compose-env.jsonl"), "a", encoding="utf-8") as log:
         log.write(json.dumps(record) + "\n")
+    containers_path = os.path.join(state, "containers.json")
+    if "up" in args and os.environ.get("EVAL_STUB_INIT", "exited") == "exited":
+        # The initializer has finished before anything can wait on it.
+        with open(containers_path, "w", encoding="utf-8") as stream:
+            json.dump({"__INIT__": {"running": False,
+                                    "status": os.environ.get("EVAL_STUB_INIT_STATUS", "0")}},
+                      stream)
     if "wait" in args:
-        status = int(os.environ.get("EVAL_STUB_WAIT_EXIT", "0"))
-        if status:
-            print(f'container "stub" exited with status code {status}')
-        sys.exit(status)
+        # Compose v2.20-v2.36 lists only running containers for compose wait.
+        print("no containers for project", file=sys.stderr)
+        sys.exit(1)
+elif args[:1] == ["wait"]:
+    containers_path = os.path.join(state, "containers.json")
+    containers = {}
+    if os.path.exists(containers_path):
+        with open(containers_path, encoding="utf-8") as stream:
+            containers = json.load(stream)
+    container = containers.get(args[1])
+    if len(args) != 2 or container is None:
+        print("Error response from daemon: No such container: " + args[-1], file=sys.stderr)
+        sys.exit(1)
+    print(container["status"])
 else:
     print("docker stub: unexpected call", file=sys.stderr)
     sys.exit(97)
@@ -381,7 +399,8 @@ class EvalScriptCase(unittest.TestCase):
         for name, body in (("docker", DOCKER_STUB), ("df", DF_STUB)):
             path = self.bin / name
             path.write_text(body.replace("__PYTHON__", sys.executable)
-                            .replace("__WATCHED__", repr(watched)), encoding="utf-8")
+                            .replace("__WATCHED__", repr(watched))
+                            .replace("__INIT__", INIT_CONTAINER), encoding="utf-8")
             path.chmod(0o755)
 
     def environment(self, **extra) -> dict[str, str]:
@@ -523,7 +542,7 @@ class EvalSecretsTests(EvalScriptCase):
         self.write_images()
         result = self.run_script(START)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.compose_records()), 2)
+        self.assertEqual(len(self.compose_records()), 1)
 
     def test_init_refuses_a_symlink_or_missing_root(self):
         target = self.write_private(self.tmp / "elsewhere", "untouched\n")
@@ -676,8 +695,9 @@ class EvalStartStopTests(EvalScriptCase):
         self.write_images()
         result = self.run_script(START)
         self.assertEqual(result.returncode, 0, result.stderr)
-        record = self.assert_compose([["up", "-d", "--no-build", "--pull", "never"],
-                                      ["wait", "open-webui-init"]])
+        # The initializer had already exited when start.sh asked for its status.
+        record = self.assert_compose([["up", "-d", "--no-build", "--pull", "never"]])
+        self.assertEqual(self.calls("docker")[-1], ["wait", INIT_CONTAINER])
         self.assertTrue(record[PROVIDER_KEY_VAR] == sha256_hex(PLANTED_KEY.encode()),
                         "provider key not exported")
         # The spec's key-leak check searches every file under EVAL_ROOT.
@@ -698,16 +718,29 @@ class EvalStartStopTests(EvalScriptCase):
         self.assertTrue(self.compose_records()[0][PROVIDER_KEY_VAR]
                         == sha256_hex(PLANTED_KEY.encode()), "provider key not exported")
 
-    def test_start_fails_naming_the_initializer_when_it_fails(self):
+    def test_start_reports_the_initializer_status_by_container_name(self):
         self.write_stack()
         self.write_key()
         self.write_images()
-        result = self.run_script(START, EVAL_STUB_WAIT_EXIT="3")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("open-webui-init", result.stderr)
-        self.assertIn("status 3", result.stderr)
-        self.assert_compose([["up", "-d", "--no-build", "--pull", "never"],
-                             ["wait", "open-webui-init"]])
+        cases = (
+            ("exited-0", {"EVAL_STUB_INIT_STATUS": "0"}, 0, "open-webui-init finished"),
+            ("exited-3", {"EVAL_STUB_INIT_STATUS": "3"}, 1, "open-webui-init exited with status 3"),
+            ("missing", {"EVAL_STUB_INIT": "missing"}, 1, INIT_CONTAINER),
+            ("non-integer", {"EVAL_STUB_INIT_STATUS": "not-a-status"}, 1, "no exit status"),
+        )
+        for case, extra, expected, message in cases:
+            with self.subTest(case=case):
+                (self.state / "calls.jsonl").unlink(missing_ok=True)
+                (self.state / "compose-env.jsonl").unlink(missing_ok=True)
+                (self.state / "containers.json").unlink(missing_ok=True)
+                result = self.run_script(START, **extra)
+                self.assertEqual(result.returncode != 0, bool(expected), result.stderr)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assert_compose([["up", "-d", "--no-build", "--pull", "never"]])
+                self.assertEqual(self.calls("docker")[-1], ["wait", INIT_CONTAINER])
+                if case == "exited-3":
+                    self.assertIn(f"docker logs {INIT_CONTAINER}", result.stderr)
+                self.assert_no_forbidden_operation()
 
     def test_start_refuses_an_empty_or_multi_line_key(self):
         self.write_stack()
