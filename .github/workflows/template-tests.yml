@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# Remotion template tests: `npm ci` in remotion-template, then node:test over
+# remotion-template/tests/. Standalone because build.yml is disabled and
+# pushes images on main; this job builds and pushes nothing and reads no
+# secrets.
+
+name: template-tests
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  template-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22.23.2'
+      - name: Install template dependencies
+        working-directory: remotion-template
+        run: npm ci
+      - name: Run template tests
+        # Quoted: node expands the glob itself; Node 22 does not expand directories.
+        run: node --test "remotion-template/tests/*.test.mjs"
