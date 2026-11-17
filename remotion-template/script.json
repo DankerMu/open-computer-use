@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "title": "水的旅行：认识水循环",
+  "music": "none",
+  "hook": {
+    "kind": "hook",
+    "narration": [
+      ["昨天落下的雨水", "可能来自遥远的海洋"],
+      ["水是怎样完成", "这趟旅行的呢"]
+    ],
+    "content": { "title": "水的环球旅行", "subtitle": "蒸发、凝结、降水与径流" }
+  },
+  "chapters": [
+    {
+      "name": "蒸发",
+      "scenes": [
+        {
+          "kind": "question",
+          "narration": [["太阳晒热海面", "海水去了哪里"]],
+          "content": { "question": "海水为什么会悄悄变少" }
+        },
+        {
+          "kind": "concept-card",
+          "narration": [
+            ["液态水吸收热量", "变成看不见的水蒸气"],
+            ["水蒸气随着热空气", "一起升上天空"]
+          ],
+          "content": {
+            "kicker": "第一步",
+            "title": "蒸发",
+            "points": ["阳光提供热量", "水变成水蒸气", "水蒸气随空气上升"],
+            "conclusion": "海洋是最大的水源"
+          }
+        }
+      ]
+    },
+    {
+      "name": "凝结",
+      "scenes": [
+        {
+          "kind": "cause-effect",
+          "narration": [
+            ["越往高处", "空气越冷"],
+            ["水蒸气遇冷", "凝结成小水滴"],
+            ["无数小水滴聚在一起", "就成了云"]
+          ],
+          "content": { "cause": "高空气温降低", "effect": "水蒸气凝结成云", "link": "遇冷" }
+        }
+      ]
+    },
+    {
+      "name": "降水",
+      "scenes": [
+        {
+          "kind": "process-steps",
+          "narration": [
+            ["云里的水滴越聚越大", "最后落回地面"],
+            ["雨水渗入土壤", "或者汇入河流"],
+            ["河流最终流回海洋", "旅行重新开始"]
+          ],
+          "content": {
+            "steps": [
+              { "label": "降水", "detail": "雨和雪落回地面" },
+              { "label": "下渗", "detail": "一部分渗入土壤" },
+              { "label": "径流", "detail": "一部分汇入河流" },
+              { "label": "回到海洋", "detail": "河流流回大海" }
+            ]
+          }
+        },
+        {
+          "kind": "key-number",
+          "narration": [["地球上大约百分之九十七的水", "都在海洋里"]],
+          "content": { "value": 97, "unit": "%", "label": "海水占地球总水量" }
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "kind": "summary",
+    "narration": [["蒸发、凝结、降水和径流", "让水在地球上不停旅行"]],
+    "content": {
+      "points": ["蒸发让水升上天空", "凝结让水蒸气变成云", "降水和径流送水回家"]
+    }
+  },
+  "endCard": {
+    "kind": "end-card",
+    "content": { "title": "谢谢观看", "subtitle": "下次一起探索天气的秘密" }
+  }
+}

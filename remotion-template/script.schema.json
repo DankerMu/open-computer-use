@@ -13,7 +13,7 @@
     },
     "music": {
       "type": "string",
-      "pattern": "^[a-z0-9-]+$",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,39}$",
       "description": "\"none\", or the id of a track in the music library."
     },
     "hook": {
@@ -926,6 +926,23 @@
         "kind",
         "content"
       ],
+      "additionalProperties": false
+    },
+    "voice": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "generate_speech voice; empty or absent means the server's default voice.",
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9._-]*$"
+        },
+        "instructions": {
+          "description": "generate_speech instructions, the same for every block.",
+          "type": "string",
+          "maxLength": 200
+        }
+      },
       "additionalProperties": false
     }
   },

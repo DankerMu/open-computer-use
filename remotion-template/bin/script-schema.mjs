@@ -26,6 +26,10 @@ export const LIMITS = {
   blocks: { min: 1, max: 4 },
   block: 16,
   customScenes: 1,
+  musicId: 40,
+  voice: { id: 64, instructions: 200 },
+  bytes: 1024 * 1024,
+  echo: 40,
   content: {
     hook: { title: 16, subtitle: 24 },
     question: { question: 24 },
@@ -60,7 +64,8 @@ export const IMAGE_NAME = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(png|jpg|
 
 const CUSTOM = "custom";
 const CHAPTER_KINDS = [...BODY_KINDS, CUSTOM];
-const MUSIC_ID = /^[a-z0-9-]+$/;
+const MUSIC_ID = new RegExp(`^[a-z0-9][a-z0-9-]{0,${LIMITS.musicId - 1}}$`);
+const VOICE_ID = /^[A-Za-z0-9._-]*$/;
 const COMPONENT = /^[A-Z][A-Za-z0-9]{0,39}$/;
 const NON_EMPTY = "non-empty";
 const SLOTS = { hook: "hook", summary: "summary", endCard: "end-card" };
@@ -166,12 +171,27 @@ export const scriptSchema = z
     title: chars(LIMITS.title),
     music: z
       .string()
-      .regex(MUSIC_ID, "none or a track id of a-z, 0-9 and -")
+      .regex(MUSIC_ID, `none or a track id: a-z or 0-9 first, then a-z, 0-9 or -, at most ${LIMITS.musicId} characters`)
       .describe('"none", or the id of a track in the music library.'),
     hook: scene("hook"),
     chapters: list(chapter, LIMITS.chapters, "chapters"),
     summary: scene("summary"),
     endCard: scene("end-card", list(sentence, LIMITS.endCardSentences, "sentences").optional()),
+    voice: z
+      .strictObject({
+        id: z
+          .string()
+          .max(LIMITS.voice.id, `${LIMITS.voice.id} characters`)
+          .regex(VOICE_ID, "letters, digits, . _ or -")
+          .optional()
+          .describe("generate_speech voice; empty or absent means the server's default voice."),
+        instructions: z
+          .string()
+          .max(LIMITS.voice.instructions, `${LIMITS.voice.instructions} characters`)
+          .optional()
+          .describe("generate_speech instructions, the same for every block."),
+      })
+      .optional(),
   })
   .describe(
     "Explainer video script, version 1: a hook, 3–5 chapters, a summary and an end card. " +
@@ -205,9 +225,22 @@ function fieldPath(path) {
   return path.map((key, i) => (typeof key === "number" ? `[${key}]` : i === 0 ? key : `.${key}`)).join("");
 }
 
+const ESCAPES = { "\n": "\\n", "\t": "\\t", "\r": "\\r" };
+
+// Bounds a model-written string echoed into an error: at most LIMITS.echo
+// code points plus …, then C0, DEL, C1, U+2028 and U+2029 written as escapes.
+function echo(text) {
+  const points = [...text];
+  const cut = points.length > LIMITS.echo ? `${points.slice(0, LIMITS.echo).join("")}…` : text;
+  return cut.replace(
+    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g,
+    (c) => ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
 function chapterLabel(root, index) {
   const name = valueAt(root, ["chapters", index, "name"]);
-  return typeof name === "string" ? `${index + 1} ${name}` : `${index + 1}`;
+  return typeof name === "string" ? `${index + 1} ${echo(name)}` : `${index + 1}`;
 }
 
 function sceneWhere(root, chapterIndex, sceneIndex) {
@@ -269,7 +302,7 @@ function error({ chapter, scene, where, field }, problem, limit) {
 
 function issueErrors(root, issue) {
   if (issue.code === "unrecognized_keys") {
-    return issue.keys.map((key) => error(locate(root, [...issue.path, key]), "is not allowed", "unknown key"));
+    return issue.keys.map((key) => error(locate(root, [...issue.path, echo(key)]), "is not allowed", "unknown key"));
   }
   const [problem, limit] = describe(issue, isMissing(root, issue.path));
   return [error(locate(root, issue.path), problem, limit)];
@@ -301,10 +334,15 @@ function customErrors(root) {
 const fileError = (problem, limit) =>
   error({ chapter: null, scene: null, where: "script", field: "script.json" }, problem, limit);
 
+const tooLarge = () => ({ ok: false, errors: [fileError("is too large to validate", "size")] });
+
 // Checks the text of a script.json. Returns {ok: true, script} with the end
-// card's narration always an array, or {ok: false, errors}.
+// card's narration always an array and voice always {id, instructions}, or
+// {ok: false, errors}. TextEncoder, not Buffer, because the renderer imports
+// this module inside the Remotion bundle.
 export function validateScript(text) {
   if (typeof text !== "string") throw new TypeError("validateScript expects the text of script.json");
+  if (new TextEncoder().encode(text).length > LIMITS.bytes) return tooLarge();
   if (text.trim() === "") return { ok: false, errors: [fileError("is empty", NON_EMPTY)] };
   let root;
   try {
@@ -313,10 +351,19 @@ export function validateScript(text) {
     return { ok: false, errors: [fileError(`is not valid JSON (${parseError.message})`, "JSON")] };
   }
   if (!isObject(root)) return { ok: false, errors: [fileError("is not a JSON object", "object")] };
-  const parsed = scriptSchema.safeParse(root);
-  const errors = [...(parsed.success ? [] : parsed.error.issues.flatMap((issue) => issueErrors(root, issue))), ...customErrors(root)];
+  let parsed;
+  let errors;
+  try {
+    parsed = scriptSchema.safeParse(root);
+    errors = [...(parsed.success ? [] : parsed.error.issues.flatMap((issue) => issueErrors(root, issue))), ...customErrors(root)];
+  } catch (thrown) {
+    // zod overflows the stack above about 105,000 nested issues.
+    if (thrown instanceof RangeError) return tooLarge();
+    throw thrown;
+  }
   if (errors.length) return { ok: false, errors };
   const script = parsed.data;
   script.endCard.narration ??= [];
+  script.voice = { id: script.voice?.id ?? "", instructions: script.voice?.instructions ?? "" };
   return { ok: true, script };
 }
