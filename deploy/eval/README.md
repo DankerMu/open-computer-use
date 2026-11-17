@@ -46,6 +46,9 @@ Because the adapter runs as uid 65534, every file under `deploy/eval/adapter` mu
 | `${EVAL_ROOT}/images.env` | `load.sh` | image references bound to the `RUNTIME_IMAGE_VARS` names |
 | `${EVAL_ROOT}/loaded-images.txt` | `load.sh` | references that were absent before a load, for cleanup |
 | `${EVAL_ROOT}/data` | `start.sh` | orchestrator data: per-chat outputs |
+| `${EVAL_ROOT}/runs` | `run.sh` | one directory per attempt: transcript, MP4 files, manifest |
+| `${EVAL_ROOT}/chats.txt` | `run.sh`, operator | chat ledger: every chat id the driver created, for cleanup |
+| `${EVAL_ROOT}/eval.lock` | `run.sh`, `cleanup.sh` | lock held by a running driver |
 
 The provider key file stays outside `EVAL_ROOT`: the evaluation's key-leak check searches every file under `EVAL_ROOT`, so a key stored there would always fail it.
 
@@ -128,9 +131,97 @@ Commands run on the evaluation host as the evaluation user. Placeholders are in 
    EVAL_WEBUI_PORT=<port> "$EVAL_ROOT/src/deploy/eval/stop.sh"
    ```
 
+## Running requests
+
+`run.sh` sends evaluation requests through WebUI's chat API on the running stack and records each attempt. It runs on the evaluation host, so the admin credentials never leave it. A run can take an hour, so start it detached and follow its log:
+
+```bash
+mkdir -p "$EVAL_ROOT/snap/<label>"
+EVAL_WEBUI_PORT=<port> setsid nohup "$EVAL_ROOT/src/deploy/eval/run.sh" \
+    --package "$EVAL_ROOT/packages/<release>" --phase smoke --request <request id> \
+    >"$EVAL_ROOT/snap/<label>/run.log" 2>&1 &
+```
+
+- `--phase` is `baseline`, `after` or `smoke`. Use `smoke` for any run that is neither the baseline nor the after run.
+- Without `--request`, it runs every request of `requests.json` in file order, each `repetitions` times. With `--request` and no `--repetition`, it runs repetition 1.
+- It prints one line per attempt and always ends with `eval: done <exit status>`. It exits 0 when every attempt ended with a manifest, whatever the outcome.
+- It reads `stack.env`, `images.env` and the provider key file as `start.sh` does. The key reaches `driver.py` on stdin, never on a command line or in an environment. The driver runs with the host's `python3` (3.10 or newer, standard library only).
+
+Before the first chat, the driver checks the stack and refuses with a reason:
+
+- the running `ocu-eval-*` containers run the images of `images.env`, and each `images.env` reference is the one in the package's `release.json`;
+- `qwen3.8-27b` holds the `video_production_filter` filter;
+- `computer_use_filter` and `video_production_filter` are active and global;
+- image generation and editing are on, both with engine `openai` and base URL `http://adapter:8090/v1`;
+- `DEFAULT_MODEL_PARAMS` has `function_calling` `native` and `stream_response` true.
+
+Before every attempt it applies the 15 GiB free-space floor. A refusal stops the batch with a non-zero exit.
+
+Each attempt creates one chat with the video switch and image generation on, waits up to 60 minutes, then stops the chat. Every value of `stack.env`, the provider key and the session token are replaced by `[REDACTED]` in every file and output line.
+
+### Run directory and manifest
+
+Each attempt has its own directory, `${EVAL_ROOT}/runs/<phase>/<request id>/r<repetition>-a<attempt>/`, with the next free attempt number:
+
+- `pending.json`: the user message id and start time, written before the request is sent, then the chat id.
+- `transcript.json`: the chat as WebUI returns it. Strings over 4096 characters that start with `data:` are replaced by `<data-uri sha256=… bytes=…>`.
+- The MP4 files: only regular files directly in the chat's `outputs/` directory, among the first 20 entries ending in `.mp4`. These are not copied and are listed in `skipped_outputs` with the reason: symlinks and other entries; entries that vanish or cannot be read; names that are not UTF-8; files over 4 GiB (`too large`); and files the run directory's filesystem cannot hold (`no space`). Entries past the twentieth get one summary entry. A failed copy leaves no partial file. A failure while collecting never stops the batch, and the MP4 files already recorded stay.
+- `manifest.json` (version 1), written last. Its fields: `phase`, `request_id`, `kind`, `repetition`, `attempt`, `chat_id`, and `release` (`ocu_source_sha`, `webui_source_sha`, `release_json_sha256`, and per role `reference` and `image_id`). Then `webui_image_id`, `models` (`chat`, `image`, `image_edit`, `speech`), `started_at` (UTC), `elapsed_seconds`, `outcome` (`succeeded` or `failed`), `failure_class` (`null`, `infra`, `kit` or `model`), `failure_reason` (at most 200 characters), and `check` (`null` until the kit defines one). Last come `counts` (`tool_calls`, `image_calls`, `speech_calls`), `mp4` (per file: `name`, `size`, `sha256`, `duration`, `video_codec`, `valid`) and `skipped_outputs`.
+
+An MP4 is valid when `ffprobe` from the workspace image, run offline, reports a video stream and a duration above 0.
+
+A directory without `manifest.json` was left by a driver that died. The next driver run marks it `failed`, `infra`, `driver interrupted`. It records the chat id from `pending.json`, or finds the chat by its user message id and adds it to the ledger. That manifest has `null` release, models, counts and elapsed time. It counts as an `infra` attempt.
+
+### Outcomes and reruns
+
+The first matching row wins:
+
+| # | Condition | Class | Reason |
+| --- | --- | --- | --- |
+| 1 | not stopped, message `done` with no error, at least one valid MP4 | — (`succeeded`) | — |
+| 2 | the driver stopped the chat at 60 minutes | `model` | `time limit` |
+| 3 | an `ask_user` call is `pending` | `model` | `asked the user` |
+| 4 | the message error starts `Tool-call limit reached` | `model` | `tool-call limit` |
+| 5 | any other message error | `infra` | `model API: <error>` |
+| 6 | the task list emptied and the message is not `done` | `infra` | `task lost` |
+| 7 | a WebUI call failed after three retries, the chat is missing, or the POST was lost | `infra` | the call |
+| 7a | no valid MP4, and an output could not be copied for lack of space, or collecting failed | `infra` | `disk: no space for <name>` or `driver: collect failed: <class>` |
+| 8 | no valid MP4, and a speech or image result shows an adapter failure, or a tool result starts with a tool-wrapper transport prefix | `infra` | `adapter: <tool>` or `orchestrator: <tool>` |
+| 9 | anything else | `model` | `no valid MP4` |
+
+A failed run keeps its MP4 files. No run gets `kit` until the kit defines its failure output. An `infra` outcome is rerun at most twice, each attempt in its own directory with its own manifest. The budget is read from disk, across batches. A request and repetition gets three attempts minus the `infra` attempts, interrupted ones included, that end its list of attempts. When none is left, it is skipped. One whose latest attempt is not `infra` starts fresh.
+
+The driver never sends the same request twice. When the answer to a sent request is lost, it finds the chat through the chat list. If the lookup finds none, the attempt is `infra` with reason `post lost`, or `POST /api/chat/completions: HTTP <status>` when WebUI answered with an error. If the lookup itself fails, the driver writes no manifest and stops the batch with a non-zero exit. The chat may exist outside the ledger, so the next run's recovery repeats the lookup from `pending.json`. The driver repeats the request only when the connection was refused before anything was sent. When it stops following a chat after a failed WebUI call, it asks WebUI once to stop that chat's task. The first sign-in of a batch is retried up to five times, 3 seconds apart, while WebUI refuses or resets the connection.
+
+## Cleanup
+
+`cleanup.sh` removes the evaluation's Docker objects by exact name. It exits 0 only when every target is gone. Running it again after a partial failure finishes the rest.
+
+```bash
+EVAL_WEBUI_PORT=<port> "$EVAL_ROOT/src/deploy/eval/cleanup.sh"   # everything
+"$EVAL_ROOT/src/deploy/eval/cleanup.sh" --runs-only                # only the ledger's chats
+```
+
+- **Both modes**, for each chat id in `chats.txt`: the sandbox container `owui-chat-<id>`, the volume `chat-<id>-workspace`, and `${EVAL_ROOT}/data/<id>`. The directory is root-owned, so a `--network none` helper container of the workspace image removes it. `chats.txt` is rewritten to keep only the ids whose objects could not all be removed.
+- **Full mode** also runs, in this order:
+  1. `stop.sh`'s compose down, before the per-chat steps.
+  2. `docker volume rm` of the volumes labelled `com.docker.compose.project=ocu-eval` whose names start `ocu-eval_`. WebUI's volume holds the image settings, including the adapter token, so the image configuration of task 2.4 must be written again after a reload.
+  3. `docker image rm`, without `-f`, of each reference in `loaded-images.txt` and each image labelled `ocu-eval`.
+
+  If a per-chat step or compose down failed, no image is removed, so the helper image stays for the next run. `images.env` and `loaded-images.txt` are removed only when every image is gone. After that, a further full run skips compose down: it exits 0 when no container or network labelled with the project remains, and non-zero, naming them, otherwise.
+- Cleanup never prunes, never uses `docker image rm -f`, and never removes a name it did not compute. `runs/`, `stack.env`, `src/` and `packages/` stay.
+
+The driver holds an exclusive lock on `${EVAL_ROOT}/eval.lock` for its whole batch. `cleanup.sh` takes it with `flock -n` and refuses while a driver runs. A second driver refuses too.
+
+To have cleanup remove a chat made outside the driver, for example a manual probe, append its id to the ledger. The id must be a lowercase UUID on its own line:
+
+```bash
+printf '%s\n' <chat id> >>"$EVAL_ROOT/chats.txt"
+```
+
 ## Host rules
 
-- Never run `docker system prune`, `docker image prune`, `docker volume prune`, `docker compose down -v` or `--rmi`, and never remove an object outside project `ocu-eval`. Cleanup removes only the references in `loaded-images.txt` and the chats recorded by the evaluation.
+- Never run `docker system prune`, `docker image prune`, `docker volume prune`, `docker compose down -v` or `--rmi`, and never remove an object outside project `ocu-eval`. `cleanup.sh` removes only the project's compose objects, the images in `loaded-images.txt` or labelled `ocu-eval`, and the chats in `chats.txt`.
 - Never change the host firewall, host networks or `/etc/docker/daemon.json`.
 - Never print `stack.env` or the provider key file, and never pass a value on a command line.
 - Record the container, image, network and volume lists of other projects before and after a start and stop, and compare them.
