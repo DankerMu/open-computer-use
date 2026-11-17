@@ -48,6 +48,16 @@ This product uses a multi-license model:
    Remotion Company License before using Remotion, including through an
    image built from this repository. Terms: https://www.remotion.dev/license
 
+6. THIRD-PARTY SOURCES IN THE EXPLAINER KIT (remotion-template/src/kit/):
+   Files vendored from other projects keep their source's license. Each
+   names its source, commit and license in its header, and the license
+   text ships beside it.
+
+   - Onda: degueba/onda, commit 3c814051269597b31fee1603bef7ccfb93d091b6,
+     lib/, licensed under MIT, Copyright (c) 2026 Rodrigo Botelho. Vendored
+     into remotion-template/src/kit/onda/ with its license text in
+     remotion-template/src/kit/onda/LICENSE.
+
 Attribution required: include "Open Computer Use" and a link to
 https://github.com/Wide-Moat/open-computer-use in any copies or
 substantial portions of the Licensed Work.
