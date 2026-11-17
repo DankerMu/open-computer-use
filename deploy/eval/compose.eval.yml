@@ -87,6 +87,9 @@ services:
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+    # One 64 MiB image edit holds a few copies of its images (body, files,
+    # base64, upstream JSON); the limit keeps a runaway request off the shared host.
+    mem_limit: 1g
 
   open-webui:
     image: ${OPENWEBUI_IMAGE:?OPENWEBUI_IMAGE is required}

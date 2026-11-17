@@ -1,0 +1,133 @@
+{
+ "_recorded": "2026-11-17 UTC, POST https://www.dmxapi.cn/v1/responses; b64_json truncated to the first 1536 decoded bytes; the signed url replaced",
+ "cases": {
+  "gen_b64": {
+   "request": {
+    "model": "doubao-seedream-5-0-flash-260915",
+    "input": "一只橘猫坐在窗台上看雨，水彩风格",
+    "size": "2048x2048",
+    "watermark": false,
+    "response_format": "b64_json"
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "body": {
+    "model": "doubao-seedream-5-0-flash-260915",
+    "created": 1794890108,
+    "data": [
+     {
+      "b64_json": "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",
+      "size": "2048x2048",
+      "output_format": "jpeg",
+      "background": "opaque",
+      "_note": "truncated from 875874 bytes"
+     }
+    ],
+    "usage": {
+     "total_tokens": 1200,
+     "input_tokens": 0,
+     "input_tokens_details": {
+      "cached_tokens": 0
+     },
+     "output_tokens": 1200,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "cost": "¥0.12"
+    }
+   }
+  },
+  "gen_default_format": {
+   "request": {
+    "model": "doubao-seedream-5-0-flash-260915",
+    "input": "一只橘猫坐在窗台上看雨，水彩风格",
+    "size": "1440x2560",
+    "watermark": false
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "body": {
+    "model": "doubao-seedream-5-0-flash-260915",
+    "created": 1794890118,
+    "data": [
+     {
+      "url": "https://ark-acg-cn-beijing.tos-cn-beijing.volces.com/<signed object url replaced>.jpeg",
+      "size": "1440x2560",
+      "output_format": "jpeg",
+      "background": "opaque"
+     }
+    ],
+    "usage": {
+     "total_tokens": 1200,
+     "input_tokens": 0,
+     "input_tokens_details": {
+      "cached_tokens": 0
+     },
+     "output_tokens": 1200,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "cost": "¥0.12"
+    }
+   }
+  },
+  "edit_b64": {
+   "request": {
+    "model": "doubao-seedream-5-0-flash-260915",
+    "input": "把猫换成一只白色的小狗，其他保持不变",
+    "image": [
+     "data:image/png;base64,<the gen_b64 image, JPEG bytes>"
+    ],
+    "size": "2048x2048",
+    "watermark": false,
+    "response_format": "b64_json"
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "body": {
+    "model": "doubao-seedream-5-0-flash-260915",
+    "created": 1794890132,
+    "data": [
+     {
+      "b64_json": "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",
+      "size": "2048x2048",
+      "output_format": "jpeg",
+      "background": "opaque",
+      "_note": "truncated from 820620 bytes"
+     }
+    ],
+    "usage": {
+     "total_tokens": 1200,
+     "input_tokens": 0,
+     "input_tokens_details": {
+      "cached_tokens": 0
+     },
+     "output_tokens": 1200,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "cost": "¥0.12"
+    }
+   }
+  },
+  "bad_size": {
+   "request": {
+    "model": "doubao-seedream-5-0-flash-260915",
+    "input": "test",
+    "size": "100x100",
+    "watermark": false,
+    "response_format": "b64_json"
+   },
+   "status": 502,
+   "content_type": "application/json; charset=utf-8",
+   "body": {
+    "error": {
+     "message": "upstream API error (status 400): {\"error\":{\"code\":\"InvalidParameter\",\"message\":\"The parameter `size` specified in the request are not valid: image area must be at least 921600 pixels. Request id: 021794890134690f03de131648b6a84481dc8a11850669d9b8395\",\"param\":\"size\",\"type\":\"BadRequest\"}}",
+     "type": "dmxapi_api_error",
+     "param": "",
+     "code": "dmxapi_upstream_400"
+    }
+   }
+  }
+ }
+}
