@@ -8,8 +8,10 @@ This directory holds the CC0 background-music candidates for the explainer kit, 
 - `music_candidates.py` loads and verifies these files.
 - `listening_page.py` builds the listening page.
 - `approvals.json` records the listening decisions (see Approval).
+- `music_library.py` fetches and normalizes the approved tracks and writes the library manifest (see Library).
+- `library-excluded.json` lists approved tracks the user excluded after their loudness was measured (see Library).
 
-Nothing here enters the workspace image. The source manifest, normalization and the image install come later (tasks 6.3 and 6.4).
+Nothing here enters the workspace image yet. The image install comes later (task 6.4).
 
 ## Evidence rule
 
@@ -61,7 +63,7 @@ The listening page exports `{"version": 1, "reviewer", "date", "decisions": [{"i
 
 It approves 15 of the 24 candidates and drops 9. Approved per mood: calm-curious 6, upbeat-corporate 2, neutral-serious 3, loop 4. Upbeat-corporate and neutral-serious fall short of the target of four; the shortfall is reported, not treated as an error.
 
-The source manifest of task 6.3 takes its approver and approval date from this file. The static test checks the SHA-256, the reviewer, the date and these counts, so any edit to the file fails.
+The library manifest (see Library) takes its approver and approval date from this file. The static test checks the SHA-256, the reviewer, the date and these counts, so any edit to the file fails.
 
 ## Listening page
 
@@ -78,3 +80,75 @@ The tool refuses an existing output directory. It builds the page in a temporary
 Open `index.html` in a browser, enter the reviewer and the date, decide every track, and export. The downloads are untrusted data. Keep the output outside the repository, and run Python that reads it with `-I`.
 
 `python -m unittest discover -s tests/deploy -p test_music_listening.py -v` runs the tests, including a static check of the tracked files that prints the per-mood counts.
+
+## Library
+
+The source manifest of the library is the approved subset of `candidates.json`, read together with `approvals.json` and `library-excluded.json`. A candidate ships only if the approval file approves it and `library-excluded.json` does not list it. No second copy of the source fields is kept: `candidates.json` already pins each source's URL, size and SHA-256, its zip member, licence evidence, mood, loop flag and re-release note.
+
+```bash
+python3 -I deploy/music/music_library.py fetch --out <new sources directory>
+python3 -I deploy/music/music_library.py build --sources <sources directory> --out <new library directory>
+python3 -I deploy/music/music_library.py report
+```
+
+Every command takes `--candidates`, `--approvals`, `--excluded` and `--root`, which default to this directory's files and the repository root. The script uses only the standard library, `ffmpeg` and `ffprobe`.
+
+- `fetch` downloads each approved source and verifies it as the listening page does. A zip track yields only its member. Dropped candidates are not downloaded.
+- `build` reads `<id><suffix>` from the sources directory and checks it against its pin again: the member's SHA-256 and size for a zip track, the source's otherwise. Then it normalizes each track and writes the library.
+- `report` prints the shipped count per mood against the target of four, for example `calm-curious 4/4`, and one line per excluded track with its measurements and reason. A shortfall is printed, not treated as an error.
+
+`fetch` and `build` refuse an existing output directory. They work in a temporary sibling directory and rename it into place only after every track has passed, so a failure leaves no output. A digest mismatch, a missing source, an infeasible gain or an output out of tolerance fails and names the track.
+
+Normalization applies one constant gain per track, loop or not. `ffmpeg -af ebur128=peak=true` measures the source's integrated loudness `I` and true peak `TP`. The gain is `min(-16 - I, -1.5 - TP)` dB: the gain to -16 LUFS, capped so the true peak stays at -1.5 dBTP.
+
+- When the predicted loudness `I + gain`, rounded to one decimal, is at least -16.5 LUFS, the output is `volume=<gain>dB` alone. A capped track therefore ships up to 0.5 LU below -16 LUFS, inside the tolerance.
+- Otherwise the build fails, naming the track with its `I`, `TP`, loudness range, the gain it needs and the loudness the cap would leave. No limiter, compressor or `loudnorm` is applied: a limiter pass lands below the target and limits sample peaks, not true peaks; `loudnorm` misses the target on peaky material; and a loop needs a constant gain to stay seamless.
+
+`library-excluded.json` records the approved tracks the rule cannot ship. On 2026-11-17 the real sources were measured, and the user decided the same day to exclude four approved tracks rather than add a limiter or a margin:
+
+- `infinite-wonder`, `space-ranger-loop` and `observing-the-star` fall outside the tolerance even with the cap;
+- `and-just-like-that` passes the prediction, but after 320 kb/s MP3 encoding no gain meets both limits: -1.9 dB gives -16.6 LUFS at -1.4 dBTP, and -2.0 dB gives -16.7 LUFS at -1.6 dBTP.
+
+MP3 encoding can raise the true peak by about 0.1 dB, so a non-loop track whose cap binds can fail the check after encoding. The check stays unchanged: such a track fails the build, naming its measured values. The file is unrelated to the licence exclusions in `excluded.json`:
+
+```json
+{"version": 1, "excluded": [{
+  "id": "space-ranger-loop",
+  "reason": "peak cap leaves it at -17.1 LUFS; a loop takes no limiter",
+  "measured": {"integrated_lufs": -15.7, "true_peak_dbtp": -0.1, "loudness_range_lu": 1.6},
+  "decided_by": "user", "date": "2026-11-17"
+}]}
+```
+
+Every entry has exactly these fields; `measured` holds the source's ebur128 values. Each `id` must be an approved candidate and appear once, and `decided_by` must be `user`. Every command subtracts the listed ids, so the library ships 11 tracks: calm-curious 4, upbeat-corporate 1, neutral-serious 3, loop 3.
+
+Non-loop tracks become stereo MP3 at a constant 320 kb/s (`libmp3lame`). Loop tracks become stereo 16-bit WAV. Both keep the source's sample rate, so a loop's sample count is unchanged. Each output is measured again, and `abs(I + 16) <= 0.5` and `TP <= -1.5` must hold.
+
+The output directory is self-contained:
+
+- `<id>.mp3` or `<id>.wav` per track;
+- `evidence/` with the approved tracks' snapshots;
+- `approvals.json`, a copy of the approval file;
+- `manifest.json`, written last.
+
+`manifest.json`, version 1. Every path in it is relative to the manifest's directory:
+
+```json
+{"version": 1,
+ "approvals": {"file": "approvals.json", "sha256": "<hex>", "reviewer": "Danker", "date": "2026-11-16"},
+ "tracks": [{
+   "id": "observing-the-star", "mood": "calm-curious", "loop": false, "title": "...", "author": "yd",
+   "file": "observing-the-star.mp3", "format": "mp3", "sample_rate": 44100, "duration_seconds": 123.456,
+   "source_url": "https://...", "licence_url": "https://...", "evidence": "evidence/<file>",
+   "source_sha256": "<hex>", "member": {"name": "<zip member>", "sha256": "<hex>"},
+   "shipped_sha256": "<hex>", "integrated_lufs": -16.0, "true_peak_dbtp": -3.2,
+   "rerelease_note": "Searched ...", "approver": "Danker", "approval_date": "2026-11-16"
+ }]}
+```
+
+- `source_sha256` is the digest of the downloaded file, which is the zip for a zip track. `member` (`{name, sha256}`) is present only for zip tracks.
+- `integrated_lufs` and `true_peak_dbtp` are the values measured after encoding.
+- `approver` and `approval_date` equal `approvals.reviewer` and `approvals.date`.
+- Tracks appear in `candidates.json` order.
+
+`python -m unittest discover -s tests/deploy -p test_music_library.py -v` runs the library tests. The loudness tests generate short tracks with `ffmpeg -f lavfi` and skip only when `ffmpeg` is not on `PATH`.

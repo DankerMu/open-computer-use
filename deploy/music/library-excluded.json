@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "excluded": [
+    {
+      "id": "infinite-wonder",
+      "reason": "linear gain to -16 LUFS would put the true peak at -0.3 dBTP; the peak cap leaves it at -17.2 LUFS",
+      "measured": {"integrated_lufs": -21.8, "true_peak_dbtp": -6.1, "loudness_range_lu": 8.5},
+      "decided_by": "user",
+      "date": "2026-11-17"
+    },
+    {
+      "id": "space-ranger-loop",
+      "reason": "peak cap leaves it at -17.1 LUFS; a loop takes no limiter",
+      "measured": {"integrated_lufs": -15.7, "true_peak_dbtp": -0.1, "loudness_range_lu": 1.6},
+      "decided_by": "user",
+      "date": "2026-11-17"
+    },
+    {
+      "id": "observing-the-star",
+      "reason": "peak cap leaves it at -23.3 LUFS",
+      "measured": {"integrated_lufs": -22.3, "true_peak_dbtp": -0.5, "loudness_range_lu": 10.5},
+      "decided_by": "user",
+      "date": "2026-11-17"
+    },
+    {
+      "id": "and-just-like-that",
+      "reason": "after 320 kb/s MP3 encoding no gain meets both limits: -1.9 dB gives -16.6 LUFS at -1.4 dBTP, -2.0 dB gives -16.7 LUFS at -1.6 dBTP",
+      "measured": {"integrated_lufs": -14.6, "true_peak_dbtp": 0.4, "loudness_range_lu": 4.7},
+      "decided_by": "user",
+      "date": "2026-11-17"
+    }
+  ]
+}
