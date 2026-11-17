@@ -296,6 +296,14 @@ class EvalComposeConfigTests(unittest.TestCase):
             "UPSTREAM_BASE_URL": "https://www.dmxapi.cn/v1",
         })
 
+    def test_adapter_memory_limit_is_one_gibibyte_and_nothing_else_is_added(self):
+        adapter = self.resolved()["services"]["adapter"]
+        # Compose renders mem_limit as a byte count (v2.40: the string "1073741824").
+        self.assertEqual(int(adapter["mem_limit"]), 1024 ** 3)
+        self.assertEqual(set(adapter), {
+            "command", "container_name", "entrypoint", "environment", "healthcheck", "image",
+            "mem_limit", "networks", "restart", "security_opt", "user", "volumes", "working_dir"})
+
     def test_provider_key_and_adapter_token_reach_only_their_services(self):
         document = self.resolved()
         fake = config_environment(self.tmp, self.eval_root)
