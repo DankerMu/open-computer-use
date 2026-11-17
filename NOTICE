@@ -48,15 +48,38 @@ This product uses a multi-license model:
    Remotion Company License before using Remotion, including through an
    image built from this repository. Terms: https://www.remotion.dev/license
 
-6. THIRD-PARTY SOURCES IN THE EXPLAINER KIT (remotion-template/src/kit/):
-   Files vendored from other projects keep their source's license. Each
-   names its source, commit and license in its header, and the license
-   text ships beside it.
+6. THIRD-PARTY SOURCES IN THE EXPLAINER KIT (remotion-template/src/kit/,
+   remotion-template/bin/):
+   The kit takes two kinds of material from other projects. Files vendored
+   from another project keep their source's license; each names its source,
+   commit and license in its header, and the license text ships beside it.
+   Formats or ideas borrowed from another project are implemented in this
+   repository's own FSL-1.1-Apache-2.0 code, which copies no code from the
+   source; they are listed below with the source's license and its required
+   notice, and a file whose format comes from such a source names it in a
+   Source line of its header.
 
    - Onda: degueba/onda, commit 3c814051269597b31fee1603bef7ccfb93d091b6,
      lib/, licensed under MIT, Copyright (c) 2026 Rodrigo Botelho. Vendored
      into remotion-template/src/kit/onda/ with its license text in
      remotion-template/src/kit/onda/LICENSE.
+
+   - anything2explainer: Vincentwei1021/anything2explainer, commit
+     4f738189d866a8a1d1abd008456303617279a2c2, licensed under
+     PolyForm-Noncommercial-1.0.0
+     (https://polyformproject.org/licenses/noncommercial/1.0.0). Format
+     borrowed, no code: the narration shape of
+     remotion-template/bin/script-schema.mjs, with short chapter names,
+     caption blocks of at most 16 characters and a few sentences per scene.
+     Required Notice: Copyright (c) 2026 Vincent Wei (https://github.com/Vincentwei1021/anything2explainer)
+
+   - video-talkcraft: Vincentwei1021/video-talkcraft, commit
+     e19acbd958e45dbe0773817cffdf5b0e7646bf1c, licensed under
+     PolyForm-Noncommercial-1.0.0
+     (https://polyformproject.org/licenses/noncommercial/1.0.0). Idea
+     borrowed, no code: a typed parameter table per scene kind, as in the
+     content of each scene kind in remotion-template/bin/script-schema.mjs.
+     Required Notice: Copyright (c) 2026 Vincent Wei (https://github.com/Vincentwei1021/video-talkcraft)
 
 Attribution required: include "Open Computer Use" and a link to
 https://github.com/Wide-Moat/open-computer-use in any copies or

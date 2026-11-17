@@ -24,6 +24,21 @@ const HEADER_LINES = 3;
 const SPDX_LINE = /^\/\/ SPDX-License-Identifier: (\S+)$/;
 const SOURCE_PREFIX = "// Source:";
 const SOURCE_LINE = /^\/\/ Source: ([^\s/]+\/[^\s/]+) ([0-9a-f]{40}) (\S+) (\S+)$/;
+// Required Notice lines of sources whose formats or ideas the kit borrows.
+// A source without a Source line (video-talkcraft) is protected only here.
+const REQUIRED_NOTICES = [
+  {
+    notice: "Required Notice: Copyright (c) 2026 Vincent Wei (https://github.com/Vincentwei1021/anything2explainer)",
+    commit: "4f738189d866a8a1d1abd008456303617279a2c2",
+    licence: "PolyForm-Noncommercial-1.0.0",
+  },
+  {
+    notice: "Required Notice: Copyright (c) 2026 Vincent Wei (https://github.com/Vincentwei1021/video-talkcraft)",
+    commit: "e19acbd958e45dbe0773817cffdf5b0e7646bf1c",
+    licence: "PolyForm-Noncommercial-1.0.0",
+  },
+];
+const NOTICE_REPO = /\(https:\/\/github\.com\/([^\s/]+\/[^\s/)]+)\)$/;
 
 // A missing root scans as empty: before any vendoring there is no src/kit/,
 // and the "some file names a source" test is what fails then.
@@ -163,6 +178,39 @@ test("the licence text ships beside every third-party file", () => {
     }
     if (header.spdx === "MIT" && !text.includes("Permission is hereby granted")) {
       errors.push(`${rel(path)}: ${rel(licencePath)} lacks the MIT permission grant`);
+    }
+  }
+  assert.deepEqual(errors, []);
+});
+
+test("every Required Notice appears once in NOTICE, in its project's paragraph and row", () => {
+  const notice = readFileSync(join(REPO, "NOTICE"), "utf8");
+  const paragraphs = notice.split(/\n[ \t]*\n/);
+  const rows = readFileSync(join(REPO, "THIRD-PARTY-LICENSES.md"), "utf8")
+    .split("\n")
+    .filter((line) => line.trimStart().startsWith("|"));
+  const errors = [];
+  for (const { notice: line, commit, licence } of REQUIRED_NOTICES) {
+    const repo = line.match(NOTICE_REPO)[1];
+    const count = notice.split("\n").filter((text) => text.trim() === line).length;
+    if (count !== 1) errors.push(`${repo}: expected its Required Notice once as a NOTICE line, found ${count}`);
+    const paragraph = paragraphs.filter((text) => text.includes(repo));
+    if (paragraph.length !== 1) {
+      errors.push(`${repo}: expected exactly one NOTICE paragraph naming it, found ${paragraph.length}`);
+    } else {
+      if (!paragraph[0].split("\n").some((text) => text.trim() === line)) {
+        errors.push(`${repo}: its NOTICE paragraph lacks the Required Notice line`);
+      }
+      if (!paragraph[0].includes(commit)) errors.push(`${repo}: NOTICE paragraph lacks commit ${commit}`);
+      if (!hasLicenceToken(paragraph[0], licence)) errors.push(`${repo}: NOTICE paragraph lacks licence ${licence}`);
+    }
+    const row = rows.filter((text) => text.includes(repo));
+    if (row.length !== 1) {
+      errors.push(`${repo}: expected exactly one THIRD-PARTY-LICENSES.md row naming it, found ${row.length}`);
+    } else {
+      if (!row[0].includes(commit.slice(0, 8))) errors.push(`${repo}: row lacks commit prefix ${commit.slice(0, 8)}`);
+      if (!hasLicenceToken(row[0], licence)) errors.push(`${repo}: row lacks licence ${licence}`);
+      if (!row[0].includes(line)) errors.push(`${repo}: row lacks its Required Notice`);
     }
   }
   assert.deepEqual(errors, []);
