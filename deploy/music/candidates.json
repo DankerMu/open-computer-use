@@ -156,7 +156,7 @@
         "captured": "2026-11-16",
         "capture_url": "https://opengameart.org/content/another-space-background-track"
       },
-      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Observing The Star yd\") and the MusicBrainz recording search (recording \"Observing The Star\", artist \"yd\") found no release of this title by this author. The OpenGameArt page lists CC0 as the licence and names yd as the author."
+      "rerelease_note": "Searched 2026-11-16: the iTunes Search API (term \"Observing The Star yd\") and the MusicBrainz recording search (recording \"Observing The Star\", artist \"yd\") found no release of this title by this author. The OpenGameArt page lists CC0 as the licence and names yd as the author. Searched 2026-11-17 under the OpenGameArt page title: the iTunes Search API (term \"Another space background track\", with and without \"yd\") found no track of that title or by that author, and MusicBrainz recording searches for \"Another space background track\" and \"Observing The Star\" (any artist) returned 0 recordings."
     },
     {
       "id": "inspiration",
