@@ -227,7 +227,8 @@ function fieldPath(path) {
 
 const ESCAPES = { "\n": "\\n", "\t": "\\t", "\r": "\\r" };
 
-// Bounds a model-written string echoed into an error: at most LIMITS.echo
+// Bounds a string echoed into an error (a chapter name, an unknown key, a
+// JSON.parse message quoting the input): at most LIMITS.echo
 // code points plus …, then C0, DEL, C1, U+2028 and U+2029 written as escapes.
 function echo(text) {
   const points = [...text];
@@ -348,7 +349,7 @@ export function validateScript(text) {
   try {
     root = JSON.parse(text);
   } catch (parseError) {
-    return { ok: false, errors: [fileError(`is not valid JSON (${parseError.message})`, "JSON")] };
+    return { ok: false, errors: [fileError(`is not valid JSON (${echo(parseError.message)})`, "JSON")] };
   }
   if (!isObject(root)) return { ok: false, errors: [fileError("is not a JSON object", "object")] };
   let parsed;

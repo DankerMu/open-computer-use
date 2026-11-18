@@ -338,6 +338,19 @@ test("an invalid script prints at most 20 messages and the remaining count", asy
   assert.equal(errLines[21], "  … and 5 more");
 });
 
+test("a script that is not JSON prints the header and one indented line", async (t) => {
+  const box = await project(t, null);
+  writeFileSync(join(box.root, "script.json"), '{"a": [1,\n]}');
+  const result = await kit(["voice"], box.root, box);
+  assert.equal(result.code, 1);
+  assert.equal(result.out, "");
+  const errLines = result.err.split("\n");
+  assert.equal(errLines.length, 3, JSON.stringify(result.err));
+  assert.equal(errLines[0], "kit voice: script.json is invalid");
+  assert.match(errLines[1], /^ {2}script: script\.json is not valid JSON \(.+…\) \(limit JSON\)$/);
+  assert.equal(errLines[2], "");
+});
+
 test("a missing script.json exits 1 with not found", async (t) => {
   const box = await project(t, null);
   unlinkSync(join(box.root, "script.json"));

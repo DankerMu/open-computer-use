@@ -180,6 +180,19 @@ test("text that is not JSON gives one JSON error", () => {
   assert.match(result.errors[0].message, /^script: script\.json is not valid JSON \(.+\) \(limit JSON\)$/);
 });
 
+test("a JSON parse message is cut to 40 code points and escaped onto one line", () => {
+  const result = validate('{"a": [1,\n]}');
+  assert.deepEqual(located(result), [top("script.json", "JSON")]);
+  const { message } = result.errors[0];
+  assert.doesNotMatch(message, /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+  const inner = message.match(/^script: script\.json is not valid JSON \((.+)\) \(limit JSON\)$/)[1];
+  // V8 quotes the input, so its message exceeds 40 code points; each escape
+  // stands for one original code point.
+  assert.ok(inner.endsWith("…"), inner);
+  assert.equal([...inner.replace(/\\(?:[ntr]|u[0-9a-f]{4})/g, "x")].length, 41, inner);
+  assert.match(inner, /\\n/);
+});
+
 test("a root that is not an object gives one object error", () => {
   for (const text of ["[]", "null", "1", '"x"']) rejects(text, [top("script.json", "object")]);
 });
