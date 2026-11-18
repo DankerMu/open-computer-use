@@ -3,8 +3,10 @@
 //
 // The kit probe composition. Each target's scene plays in its own Sequence,
 // as the renderer places scenes, so the scene sees its own frame and length.
-// At every rendered frame the active scene's root is measured and logged as
-// one `kit-probe <JSON>` console line, which bin/probe.mjs collects.
+// At every rendered frame, once the scene root covers the canvas and the
+// scene's own delayRender handles have released, the active scene's root is
+// measured and logged as one `kit-probe <JSON>` console line, which
+// bin/probe.mjs collects.
 
 import React, {useLayoutEffect, useMemo, useRef} from 'react';
 import {
@@ -32,6 +34,28 @@ const FPS = 30;
 // measurement waits until the scene root covers the canvas, for at most
 // this many animation frames.
 const ATTACH_FRAMES = 120;
+// A scene's own delayRender handles (an <Img> loading, data being fetched)
+// hold its final layout; measuring earlier records the frame before it. The
+// wait stays below the 28 s Remotion gives the probe's own handle (30 s
+// default minus 2 s), so this error, naming the handles, comes first.
+const PENDING_WAIT_MS = 20000;
+
+// Remotion 4.0.537 keeps the pending delayRender handles in
+// window.remotion_delayRenderHandles and their labels in
+// window.remotion_delayRenderTimeouts (delay-render.js).
+type DelayRenderWindow = {
+	remotion_delayRenderHandles?: unknown;
+	remotion_delayRenderTimeouts?: Record<string, {label: string | null} | undefined>;
+};
+
+function pendingOthers(own: number): string[] {
+	const scope = window as unknown as DelayRenderWindow;
+	const handles = scope.remotion_delayRenderHandles;
+	if (!Array.isArray(handles)) throw new Error('kit probe: cannot read the pending delayRender handles');
+	return handles
+		.filter((handle) => handle !== own)
+		.map((handle) => scope.remotion_delayRenderTimeouts?.[String(handle)]?.label ?? 'unlabelled');
+}
 
 function sceneFor(scenes: Scenes, key: string) {
 	if (!Object.prototype.hasOwnProperty.call(scenes, key)) {
@@ -60,6 +84,8 @@ const ProbeTargets = ({targets, scenes}: ProbeProps & {scenes: Scenes}) => {
 		const handle = delayRender(`kit probe: measuring frame ${frame}`);
 		let settled = false;
 		let waited = 0;
+		let quiet = false;
+		const started = performance.now();
 		const settle = () => {
 			if (settled) return;
 			settled = true;
@@ -81,6 +107,24 @@ const ProbeTargets = ({targets, scenes}: ProbeProps & {scenes: Scenes}) => {
 					if (waited > ATTACH_FRAMES) {
 						throw new Error(`kit probe: the scene root at frame ${frame} never covered the ${width}x${height} canvas`);
 					}
+					quiet = false;
+					requestAnimationFrame(attempt);
+					return;
+				}
+				const pending = pendingOthers(handle);
+				if (pending.length > 0) {
+					if (performance.now() - started > PENDING_WAIT_MS) {
+						const names = pending.map((label) => JSON.stringify(label)).join(', ');
+						throw new Error(`kit probe: frame ${frame} still waits on delayRender ${names} after ${PENDING_WAIT_MS} ms`);
+					}
+					quiet = false;
+					requestAnimationFrame(attempt);
+					return;
+				}
+				// One animation frame with nothing pending, so the layout the
+				// released handles allowed is the one measured.
+				if (!quiet) {
+					quiet = true;
 					requestAnimationFrame(attempt);
 					return;
 				}

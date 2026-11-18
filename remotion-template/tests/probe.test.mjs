@@ -31,7 +31,7 @@ function resultOf(...frames) {
 }
 
 function record(over = {}) {
-  return { path: P1, text: "光", glyphBox: { x: 200, y: 200, width: 48, height: 67.2 }, minFontSizePx: 48, lines: ["光"], clippedBy: [], ...over };
+  return { path: P1, text: "光", glyphBox: { x: 200, y: 200, width: 48, height: 67.2 }, minFontSizePx: 48, scale: 1, lines: ["光"], clippedBy: [], ...over };
 }
 
 function box(x, y, width, height) {
@@ -111,7 +111,7 @@ test("probe frames reject non-integer and out-of-range inputs, naming the field"
   for (const [field, value] of rows) {
     assert.throws(
       () => probeFrames({ ...good, [field]: value }),
-      (error) => error instanceof RangeError && error.message.includes(field),
+      (error) => error instanceof RangeError && error.message.startsWith(`${field} `),
       `${field} = ${String(value)}`,
     );
   }
@@ -375,6 +375,81 @@ test("hidden text is never judged", () => {
   assert.deepEqual(violations(resultOf(frame), theme), []);
 });
 
+// --- scaled records, spaced line starts, clipped overflow ---------------------------
+
+test("the vertical tolerance scales with the record's rendered scale", () => {
+  const scaled = (glyphBox) => record({ glyphBox, scale: 2 });
+  const safeRows = [
+    [box(200, 52, 100, 50), []],
+    [box(200, 51.99, 100, 50), ["top 2.01 px"]],
+    [box(200, 978, 100, 50), []],
+    [box(200, 978.01, 100, 50), ["bottom 2.01 px"]],
+    // Horizontal edges keep 0.5 px whatever the scale.
+    [box(95.49, 200, 100, 50), ["left 0.51 px"]],
+  ];
+  for (const [glyphBox, details] of safeRows) {
+    assert.deepEqual(
+      brief(violations(resultOf(frameOf({ texts: [scaled(glyphBox)] })), theme)),
+      details.map((detail) => ({ rule: "outside safe area", path: P1, detail })),
+      JSON.stringify(glyphBox),
+    );
+  }
+  const glyphBox = box(200, 200, 384, 134.4);
+  const clips = [{ rule: "mask clips", path: P1, detail: `by ${P1}` }];
+  const maskRows = [
+    [box(200, 202, 384, 132.4), []],
+    [box(200, 202.01, 384, 132.39), clips],
+    [box(200, 200, 384, 132.4), []],
+    [box(200, 200, 384, 132.39), clips],
+    [box(200.51, 200, 383.49, 134.4), clips],
+  ];
+  for (const [clipBox, expected] of maskRows) {
+    const frame = frameOf({
+      texts: [record({ glyphBox, scale: 2, clippedBy: [P1] })],
+      masks: [{ path: P1, clipPath: "none", clipBox }],
+    });
+    assert.deepEqual(brief(violations(resultOf(frame), theme)), expected, JSON.stringify(clipBox));
+  }
+  // A scale below 1 keeps the 1 px floor.
+  assert.deepEqual(violations(resultOf(frameOf({ texts: [record({ glyphBox: box(200, 53, 100, 50), scale: 0.5 })] })), theme), []);
+});
+
+test("a record without a scale is refused", () => {
+  const { scale: _scale, ...unscaled } = record();
+  assert.throws(() => violations(resultOf(frameOf({ texts: [unscaled] })), theme), /^Error: kit probe: record "div:nth-child\(1\)" has no scale$/);
+});
+
+test("a line starting with spaces before a forbidden mark is reported at the mark", () => {
+  const frame = frameOf({ texts: [record({ text: "光的折射  ，速度", lines: ["光的折射", "  ，速度"] })] });
+  assert.deepEqual(brief(violations(resultOf(frame), theme)), [
+    { rule: "line start", path: P1, detail: 'line 2 starts with "，"' },
+  ]);
+  // A line of spaces only starts with no mark.
+  const blank = frameOf({ texts: [record({ text: "光  ", lines: ["光", "  "] })] });
+  assert.deepEqual(violations(resultOf(blank), theme), []);
+});
+
+test("text wholly outside a measurable mask is not judged against the safe area", () => {
+  const outside = box(1900, 300, 240, 67.2);
+  const frameWith = (clipBox, clipPath = "none") =>
+    frameOf({
+      texts: [record({ glyphBox: outside, clippedBy: [P1] })],
+      masks: [{ path: P1, clipPath, clipBox }],
+    });
+  // A camera viewport at 200–600: the text is not shown.
+  assert.deepEqual(violations(resultOf(frameWith(box(200, 300, 400, 100))), theme), []);
+  // A viewport the text reaches into: shown in part, so both rules apply.
+  assert.deepEqual(brief(violations(resultOf(frameWith(box(1800, 300, 200, 100))), theme)), [
+    { rule: "outside safe area", path: P1, detail: "right 316 px" },
+    { rule: "mask clips", path: P1, detail: `by ${P1}` },
+  ]);
+  // A mask that cannot be measured exempts nothing.
+  assert.deepEqual(brief(violations(resultOf(frameWith(null, "circle(50%)")), theme)), [
+    { rule: "outside safe area", path: P1, detail: "right 316 px" },
+    { rule: "mask clips", path: P1, detail: `by ${P1}: clip-path circle(50%) is not measurable` },
+  ]);
+});
+
 // --- formatViolation ----------------------------------------------------------------
 
 test("a violation line names target, role, frame, rule, path and detail", () => {
@@ -424,6 +499,10 @@ test("invalid targets reject with a named error before anything is bundled", asy
       );
     }
     await assert.rejects(probe({ entryPoint: "", targets: [target] }), /^Error: kit probe: entryPoint must be a non-empty path$/);
+    await assert.rejects(
+      probe({ entryPoint: "/nonexistent/entry.tsx", targets: [target], publicDir: "" }),
+      /^Error: kit probe: publicDir must be a non-empty path$/,
+    );
     assert.deepEqual(readdirSync(scratch), []);
   } finally {
     if (saved === undefined) delete process.env.TMPDIR;

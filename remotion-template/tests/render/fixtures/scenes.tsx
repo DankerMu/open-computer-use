@@ -6,8 +6,8 @@
 // for `scroll`, whose box both scrolls and cuts its text). Positions are
 // canvas pixels against the theme's safe area, 96–1824 × 54–1026.
 
-import React from 'react';
-import {interpolate, useCurrentFrame, useVideoConfig} from 'remotion';
+import React, {useEffect, useState} from 'react';
+import {Img, continueRender, delayRender, interpolate, staticFile, useCurrentFrame, useVideoConfig} from 'remotion';
 import {fontPresent} from '../../../src/kit/probe/measure';
 import {textStyle, wrapLines} from '../../../src/kit/text';
 import {themes} from '../../../src/kit/theme';
@@ -61,6 +61,20 @@ const Fits = () => {
 					矢量文字
 				</text>
 			</svg>
+			{/* The overflow mask of 4 above, drawn at scale 2: the 0.6 px
+			    offset becomes 1.2 px, inside the scaled 2 px tolerance. */}
+			<div style={{position: 'absolute', left: 1400, top: 840, transform: 'scale(2)', transformOrigin: 'top left'}}>
+				<div style={{width: 192, height: 67.2, overflow: 'hidden'}}>
+					<div style={{...line, position: 'static'}}>放大遮罩</div>
+				</div>
+			</div>
+			{/* Hidden through an ancestor, placed outside the safe area. */}
+			<div style={{position: 'absolute', left: 20, top: 980, opacity: 0}}>
+				<div style={{...line, position: 'static'}}>祖先透明</div>
+			</div>
+			<div style={{position: 'absolute', left: 1800, top: 980, visibility: 'hidden'}}>
+				<div style={{...line, position: 'static'}}>祖先隐藏</div>
+			</div>
 		</>
 	);
 };
@@ -102,6 +116,66 @@ const MaskSmall = () => (
 		<div style={{...line, left: 600, top: 300, clipPath: 'circle(50%)'}}>圆形遮罩</div>
 	</>
 );
+
+// A viewport (as a camera pans) holding text wholly outside it, past the
+// safe area: the text is not shown, so no rule applies.
+const Camera = () => (
+	<div style={{position: 'absolute', left: 200, top: 300, width: 400, height: 100, overflow: 'hidden'}}>
+		<div style={{...line, left: 1700, top: 0}}>镜头外文字</div>
+	</div>
+);
+
+// Negative insets reach past the 96 px border box around the 240 px text.
+const ClipNegative = () => (
+	<div style={{...line, left: 200, top: 200, width: 96, clipPath: 'inset(-10px -200px -10px -10px)'}}>负值裁剪框</div>
+);
+
+// A smaller inline span sets the record's minimum font size.
+const InlineSmall = () => (
+	<div style={{...line, left: 200, top: 300}}>
+		正文<span style={{fontSize: 24}}>注</span>大字
+	</div>
+);
+
+// Collapsible spaces before the comma render nothing.
+const WrapStartSpaces = () => (
+	<div data-kit-text="光的折射  ，速度" style={{...line, left: 200, top: 300}}>
+		<div>光的折射</div>
+		<div>{'  ，速度'}</div>
+	</div>
+);
+
+// public/late.png is 1000 x 1000 (one colour, 4.4 KB). Before it loads its
+// height is 0 and the text sits inside the safe area; once loaded the text
+// lies past the bottom edge. A tiny image loaded before a measurement that
+// did not wait for it; this one does not.
+const LateImage = () => (
+	<div style={{position: 'absolute', left: 200, top: 60, display: 'flex', flexDirection: 'column'}}>
+		<Img src={staticFile('late.png')} style={{width: 1000}} />
+		<div style={{...line, position: 'static'}}>图片下方</div>
+	</div>
+);
+
+// Holds its own delayRender for about 1 s, then moves the text past the
+// safe area's right edge and releases the handle.
+const DelayedMove = () => {
+	const [handle] = useState(() => delayRender('fixture: delayed move'));
+	const [moved, setMoved] = useState(false);
+	useEffect(() => {
+		const timer = setTimeout(() => setMoved(true), 1000);
+		return () => clearTimeout(timer);
+	}, []);
+	useEffect(() => {
+		if (moved) continueRender(handle);
+	}, [moved, handle]);
+	return <div style={{...line, left: moved ? 1700 : 200, top: 300}}>延迟移动</div>;
+};
+
+// Never releases its own delayRender: the probe gives up, naming it.
+const Stuck = () => {
+	useState(() => delayRender('fixture: never released'));
+	return <div style={{...line, left: 200, top: 300}}>一直等待</div>;
+};
 
 // The viewBox halves its user units: 48 user-unit text renders at 24 px.
 const SvgFont = () => (
@@ -152,6 +226,13 @@ export const scenes = {
 	'wrap-start-lines': WrapStartLines,
 	'scaled-font': ScaledFont,
 	'mask-small': MaskSmall,
+	camera: Camera,
+	'clip-negative': ClipNegative,
+	'inline-small': InlineSmall,
+	'wrap-start-spaces': WrapStartSpaces,
+	'late-image': LateImage,
+	'delayed-move': DelayedMove,
+	stuck: Stuck,
 	'svg-font': SvgFont,
 	'text-differs': TextDiffers,
 	'custom-overflow': CustomOverflow,

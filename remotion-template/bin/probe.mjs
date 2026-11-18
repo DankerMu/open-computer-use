@@ -8,10 +8,11 @@
 // `kit-probe <JSON>` lines into the result (version 1). It must run with the
 // working directory at the project root: Remotion finds the headless shell
 // under node_modules/.remotion there. The bundle goes to a fresh directory
-// under os.tmpdir(), removed when probe() settles.
+// under os.tmpdir(); it and the one browser probe() opens are removed and
+// closed when probe() settles.
 
 import { bundle } from "@remotion/bundler";
-import { renderFrames, selectComposition } from "@remotion/renderer";
+import { openBrowser, renderFrames, selectComposition } from "@remotion/renderer";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -20,10 +21,12 @@ import { escapeLine } from "./script-schema.mjs";
 const COMPOSITION = "KitProbe";
 const RECORD_PREFIX = "kit-probe ";
 const LINE_START_MARKS = new Set(Array.from("，。！？、；：）」』"));
-// Box comparisons tolerate 0.5 px horizontally and 1 px vertically. Glyph
-// rects trimmed about their centre sat 0.2–0.8 px above the line box in the
-// image's shell (32, 36, 48, 64 and 96 px at line height 1.4), so a mask
-// exactly the size of its line needs more than 0.5 px vertically.
+// Box comparisons tolerate 0.5 px horizontally and 1 px vertically, the
+// vertical one times the record's rendered scale when that is above 1.
+// Glyph rects trimmed about their centre sat 0.2–0.8 px above the line box
+// in the image's shell (32, 36, 48, 64 and 96 px at line height 1.4), so a
+// mask exactly the size of its line needs more than 0.5 px vertically, and
+// a scaled line carries that offset scaled.
 const TOLERANCE_X = 0.5;
 const TOLERANCE_Y = 1;
 
@@ -119,9 +122,12 @@ function renderFailure(error, placed) {
   return new Error(`kit probe: ${where}${message}`, { cause: error });
 }
 
-export async function probe({ entryPoint, targets } = {}) {
+// publicDir defaults to Remotion's own default, public/ under the working
+// directory (the project root).
+export async function probe({ entryPoint, targets, publicDir = "public" } = {}) {
   const placed = placeTargets(targets);
   if (typeof entryPoint !== "string" || entryPoint === "") fail("entryPoint must be a non-empty path");
+  if (typeof publicDir !== "string" || publicDir === "") fail("publicDir must be a non-empty path");
   const indexes = [...new Set(placed.flatMap((t) => t.frames.map(({ frame }) => t.offset + frame)))].sort((a, b) => a - b);
   const inputProps = {
     targets: placed.map(({ scene, props, durationInFrames }) => ({ scene, props, durationInFrames })),
@@ -132,18 +138,29 @@ export async function probe({ entryPoint, targets } = {}) {
   } catch (error) {
     fail(`cannot create a temporary directory (${error.message})`);
   }
+  let browser = null;
   try {
     const lines = [];
     let composition;
     try {
       // remotion.config.ts applies only to `npx remotion`; the project's
       // node_modules is the image's root-owned one, so no webpack cache.
-      const serveUrl = await bundle({ entryPoint: resolve(entryPoint), outDir: join(dir, "bundle"), enableCaching: false });
-      composition = await selectComposition({ serveUrl, id: COMPOSITION, inputProps });
+      // public/ is linked into the throwaway bundle rather than copied.
+      const serveUrl = await bundle({
+        entryPoint: resolve(entryPoint),
+        outDir: join(dir, "bundle"),
+        enableCaching: false,
+        publicDir: resolve(publicDir),
+        symlinkPublicDir: true,
+      });
+      // One browser for both steps, closed below whatever happens.
+      browser = await openBrowser("chrome");
+      composition = await selectComposition({ serveUrl, id: COMPOSITION, inputProps, puppeteerInstance: browser });
       await renderFrames({
         composition,
         serveUrl,
         inputProps,
+        puppeteerInstance: browser,
         frames: indexes,
         imageFormat: "none",
         outputDir: null,
@@ -173,37 +190,55 @@ export async function probe({ entryPoint, targets } = {}) {
       frames: placed.flatMap((t) => t.frames.map(({ role, frame }) => frameOf(t, role, frame))),
     };
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    try {
+      if (browser !== null) await browser.close({ silent: true });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 }
 
 // --- rules ------------------------------------------------------------------
 
-function crossedEdges(glyph, safe) {
+function verticalTolerance(record) {
+  if (!Number.isFinite(record.scale)) fail(`record ${JSON.stringify(record.path)} has no scale`);
+  return TOLERANCE_Y * Math.max(1, record.scale);
+}
+
+function crossedEdges(glyph, safe, toleranceY) {
   return [
     ["left", safe.left - glyph.x, TOLERANCE_X],
-    ["top", safe.top - glyph.y, TOLERANCE_Y],
+    ["top", safe.top - glyph.y, toleranceY],
     ["right", glyph.x + glyph.width - safe.right, TOLERANCE_X],
-    ["bottom", glyph.y + glyph.height - safe.bottom, TOLERANCE_Y],
+    ["bottom", glyph.y + glyph.height - safe.bottom, toleranceY],
   ]
     .map(([edge, distance, tolerance]) => [edge, round(distance), tolerance])
     .filter(([, distance, tolerance]) => distance > tolerance)
     .map(([edge, distance]) => `${edge} ${distance} px`);
 }
 
-function contains(outer, inner) {
+function contains(outer, inner, toleranceY) {
   return (
     round(outer.x - inner.x) <= TOLERANCE_X &&
-    round(outer.y - inner.y) <= TOLERANCE_Y &&
+    round(outer.y - inner.y) <= toleranceY &&
     round(inner.x + inner.width - (outer.x + outer.width)) <= TOLERANCE_X &&
-    round(inner.y + inner.height - (outer.y + outer.height)) <= TOLERANCE_Y
+    round(inner.y + inner.height - (outer.y + outer.height)) <= toleranceY
   );
 }
 
-function intersects(a, b) {
+function intersects(a, b, toleranceY) {
   const overlapX = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
   const overlapY = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
-  return round(overlapX) > TOLERANCE_X && round(overlapY) > TOLERANCE_Y;
+  return round(overlapX) > TOLERANCE_X && round(overlapY) > toleranceY;
+}
+
+// The masks clipping a record, each with its entry from the frame.
+function masksOf(record, masks) {
+  return record.clippedBy.map((path) => {
+    const mask = masks.get(path);
+    if (mask === undefined) fail(`no mask entry for ${JSON.stringify(path)}`);
+    return mask;
+  });
 }
 
 const isInside = (path, ancestor) => ancestor === "" || path === ancestor || path.startsWith(`${ancestor}>`);
@@ -246,9 +281,16 @@ export function violations(result, theme) {
     for (const { path, input, rendered } of frame.marked) {
       if (rendered !== input) report("text differs", path, `rendered "${rendered}", input "${input}"`);
     }
+    const masks = new Map(frame.masks.map((mask) => [mask.path, mask]));
     for (const record of frame.texts) {
-      const crossed = crossedEdges(record.glyphBox, safe);
-      if (crossed.length > 0) report("outside safe area", record.path, crossed.join(", "));
+      const toleranceY = verticalTolerance(record);
+      // Text wholly outside a measurable mask is not shown; the mask rule
+      // judges clipped overflow.
+      const unrevealed = masksOf(record, masks).some(
+        ({ clipBox }) => clipBox !== null && !intersects(clipBox, record.glyphBox, toleranceY),
+      );
+      const crossed = crossedEdges(record.glyphBox, safe, toleranceY);
+      if (!unrevealed && crossed.length > 0) report("outside safe area", record.path, crossed.join(", "));
     }
     for (const { path, scrollWidth, clientWidth } of frame.scrolls) {
       report("scrolls", path, `scrollWidth ${scrollWidth} > clientWidth ${clientWidth}`);
@@ -261,19 +303,19 @@ export function violations(result, theme) {
       for (const record of block) {
         for (const line of record.lines) {
           n += 1;
-          const mark = Array.from(line)[0];
+          // The first code point that is not white space: collapsible
+          // spaces before a mark render nothing.
+          const mark = Array.from(line).find((point) => /\S/.test(point));
           if (n > 1 && LINE_START_MARKS.has(mark)) report("line start", record.path, `line ${n} starts with "${mark}"`);
         }
       }
     }
-    const masks = new Map(frame.masks.map((mask) => [mask.path, mask]));
     for (const record of frame.texts) {
-      for (const path of record.clippedBy) {
-        const mask = masks.get(path);
-        if (mask === undefined) fail(`no mask entry for ${JSON.stringify(path)}`);
-        if (mask.clipBox === null) {
-          report("mask clips", record.path, `by ${path}: clip-path ${mask.clipPath} is not measurable`);
-        } else if (intersects(mask.clipBox, record.glyphBox) && !contains(mask.clipBox, record.glyphBox)) {
+      const toleranceY = verticalTolerance(record);
+      for (const { path, clipPath, clipBox } of masksOf(record, masks)) {
+        if (clipBox === null) {
+          report("mask clips", record.path, `by ${path}: clip-path ${clipPath} is not measurable`);
+        } else if (intersects(clipBox, record.glyphBox, toleranceY) && !contains(clipBox, record.glyphBox, toleranceY)) {
           report("mask clips", record.path, `by ${path}`);
         }
       }

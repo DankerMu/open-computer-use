@@ -19,6 +19,7 @@ type TextRecord = {
 	text: string;
 	glyphBox: Box;
 	minFontSizePx: number;
+	scale: number;
 	lines: string[];
 	clippedBy: string[];
 };
@@ -60,10 +61,18 @@ function unite(a: Edges | null, b: Edges): Edges {
 	};
 }
 
+// An empty box stays at its left/top edge rather than turning negative.
+function normalize(e: Edges): Edges {
+	return {left: e.left, top: e.top, right: Math.max(e.left, e.right), bottom: Math.max(e.top, e.bottom)};
+}
+
 function intersect(a: Edges, b: Edges): Edges {
-	const left = Math.max(a.left, b.left);
-	const top = Math.max(a.top, b.top);
-	return {left, top, right: Math.max(left, Math.min(a.right, b.right)), bottom: Math.max(top, Math.min(a.bottom, b.bottom))};
+	return normalize({
+		left: Math.max(a.left, b.left),
+		top: Math.max(a.top, b.top),
+		right: Math.min(a.right, b.right),
+		bottom: Math.min(a.bottom, b.bottom),
+	});
 }
 
 // `<tag>:nth-child(<i>)` steps from root, joined by `>`; root itself is ''.
@@ -155,13 +164,13 @@ function insetOf(clipPath: string, border: Edges, scale: number): Edges | null {
 }
 
 // Overflow clips to the padding box; an inset() clip-path to that inset of
-// the border box; both to their intersection; any other clip-path is not
-// measurable.
+// the border box, which negative insets extend beyond the border box; both
+// to their intersection; any other clip-path is not measurable.
 function clipBoxOf(el: Element, root: Element): Box | null {
 	const style = getComputedStyle(el);
 	const scale = renderedScale(el, root);
 	const border = edgesOf(el.getBoundingClientRect());
-	let clip = border;
+	let clip: Edges | null = null;
 	if (CLIPPING_OVERFLOW.has(style.overflowX) || CLIPPING_OVERFLOW.has(style.overflowY)) {
 		clip = {
 			left: border.left + parseFloat(style.borderLeftWidth) * scale,
@@ -173,8 +182,9 @@ function clipBoxOf(el: Element, root: Element): Box | null {
 	if (style.clipPath !== 'none') {
 		const inset = insetOf(style.clipPath, border, scale);
 		if (inset === null) return null;
-		clip = intersect(clip, inset);
+		clip = clip === null ? normalize(inset) : intersect(clip, inset);
 	}
+	if (clip === null) throw new Error(`kit probe: "${pathOf(el, root)}" is not a clipping element`);
 	return toBox(clip);
 }
 
@@ -205,11 +215,13 @@ function measureRecord(el: Element, nodes: Text[], root: Element): TextRecord {
 	const range = document.createRange();
 	let glyphs: Edges | null = null;
 	let minFontSize = Infinity;
+	let maxScale = 0;
 	let previous: Edges | null = null;
 	const lines: string[] = [];
 	for (const node of nodes) {
 		const parent = node.parentElement as Element;
 		const scale = renderedScale(parent, root);
+		maxScale = Math.max(maxScale, scale);
 		const lineHeight = lineHeightOf(parent, scale);
 		minFontSize = Math.min(minFontSize, parseFloat(getComputedStyle(parent).fontSize) * scale);
 		let offset = 0;
@@ -235,6 +247,7 @@ function measureRecord(el: Element, nodes: Text[], root: Element): TextRecord {
 		text: nodes.map((node) => node.data).join(''),
 		glyphBox: toBox(glyphs),
 		minFontSizePx: round(minFontSize),
+		scale: round(maxScale),
 		lines,
 		clippedBy: chain(el, root).filter(isClipping).map((e) => pathOf(e, root)),
 	};
