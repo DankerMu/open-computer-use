@@ -227,16 +227,29 @@ function fieldPath(path) {
 
 const ESCAPES = { "\n": "\\n", "\t": "\\t", "\r": "\\r" };
 
-// Bounds a string echoed into an error (a chapter name, an unknown key, a
-// JSON.parse message quoting the input): at most LIMITS.echo
-// code points plus …, then C0, DEL, C1, U+2028 and U+2029 written as escapes.
-function echo(text) {
-  const points = [...text];
-  const cut = points.length > LIMITS.echo ? `${points.slice(0, LIMITS.echo).join("")}…` : text;
-  return cut.replace(
+// Keeps text on one line: C0, DEL, C1, U+2028 and U+2029 written as
+// escapes. Used alone for a JSON.parse message (V8 bounds it, and its
+// positional form ends with the line and column) and for an ffmpeg reason.
+export function escapeLine(text) {
+  return text.replace(
     /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g,
     (c) => ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
+}
+
+// Bounds a string echoed into an error (a chapter name, an unknown key): at
+// most LIMITS.echo code points plus …, then escaped. Reads no further than
+// the code point after the limit, so a long string costs no more than a
+// short one.
+function echo(text) {
+  let cut = "";
+  let count = 0;
+  for (const point of text) {
+    if (count === LIMITS.echo) return `${escapeLine(cut)}…`;
+    cut += point;
+    count++;
+  }
+  return escapeLine(text);
 }
 
 function chapterLabel(root, index) {
@@ -248,6 +261,16 @@ function sceneWhere(root, chapterIndex, sceneIndex) {
   const kind = valueAt(root, ["chapters", chapterIndex, "scenes", sceneIndex, "kind"]);
   const shown = CHAPTER_KINDS.includes(kind) ? kind : "unknown kind";
   return `chapter ${chapterLabel(root, chapterIndex)}, scene ${sceneIndex + 1} (${shown})`;
+}
+
+// Names the scene at a 1-based playback index (hook 1, the chapter scenes,
+// the summary, the end card) as the messages above do; index is the s<n> of
+// the scene's voice stems. Takes a script returned by validateScript.
+export function playbackWhere(script, index) {
+  const chapterScenes = script.chapters.flatMap((chapterValue, c) => chapterValue.scenes.map((_, s) => sceneWhere(script, c, s)));
+  const names = [SLOTS.hook, ...chapterScenes, SLOTS.summary, SLOTS.endCard];
+  if (!Number.isInteger(index) || index < 1 || index > names.length) throw new RangeError(`no scene at playback index ${index}`);
+  return names[index - 1];
 }
 
 // Splits a path into where it lies (chapter, scene, <where>) and the field
@@ -349,7 +372,7 @@ export function validateScript(text) {
   try {
     root = JSON.parse(text);
   } catch (parseError) {
-    return { ok: false, errors: [fileError(`is not valid JSON (${echo(parseError.message)})`, "JSON")] };
+    return { ok: false, errors: [fileError(`is not valid JSON (${escapeLine(parseError.message)})`, "JSON")] };
   }
   if (!isObject(root)) return { ok: false, errors: [fileError("is not a JSON object", "object")] };
   let parsed;

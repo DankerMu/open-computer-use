@@ -70,7 +70,8 @@ This product uses a multi-license model:
      (https://polyformproject.org/licenses/noncommercial/1.0.0). Format
      borrowed, no code: the narration shape of
      remotion-template/bin/script-schema.mjs, with short chapter names,
-     caption blocks of at most 16 characters and a few sentences per scene.
+     caption blocks of at most 16 characters and a few sentences per scene,
+     and the gap numbers of remotion-template/bin/scene-timing.mjs.
      Required Notice: Copyright (c) 2026 Vincent Wei (https://github.com/Vincentwei1021/anything2explainer)
 
    - video-talkcraft: Vincentwei1021/video-talkcraft, commit
