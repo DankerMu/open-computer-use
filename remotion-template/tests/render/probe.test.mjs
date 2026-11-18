@@ -50,11 +50,13 @@ const FAILING_FRAMES = { "entrance-end": 10, midpoint: 30, "pre-exit": 59 };
 
 const TARGETS = [
   target("fits", "fits", 90, 15),
+  // Not last: a scene that saw the composition's remaining length instead
+  // of its own would still be inside the safe area at its frame 59.
+  target("late-overflow", "late-overflow", 60, 10),
   // entranceEnd 30 equals the midpoint, floor(60 / 2).
   target("fits-entrance-mid", "fits", 60, 30),
   target("font-absent", "font-absent", 10, 0),
   ...Object.keys(FAILING).map((name) => target(name, name, 60, 10)),
-  target("late-overflow", "late-overflow", 60, 10),
 ];
 
 const PARAGRAPH = "光线从空气斜射入水中时，传播方向发生改变。";
@@ -193,10 +195,10 @@ test("an entrance ending on the midpoint gives two equal frames that differ only
 test("each failing scene gives exactly its own violations", () => {
   const found = violations(first, theme);
   const expected = [
+    { target: "late-overflow", role: "pre-exit", frame: 59, rule: "outside safe area", path: "div:nth-child(1)" },
     ...Object.entries(FAILING).flatMap(([id, rules]) =>
       ROLES.flatMap((role) => rules.map(([rule, path]) => ({ target: id, role, frame: FAILING_FRAMES[role], rule, path }))),
     ),
-    { target: "late-overflow", role: "pre-exit", frame: 59, rule: "outside safe area", path: "div:nth-child(1)" },
   ];
   assert.deepEqual(
     found.map(({ target: id, role, frame, rule, path }) => ({ target: id, role, frame, rule, path })),
