@@ -182,6 +182,15 @@ test("opening marks and the spaces after them bind to the next character", () =>
   }
 });
 
+test("in a character split only a character or a closing mark ends a piece", () => {
+  // The #825 follow-up: a space or an opening mark never closes a piece, so
+  // （ and the space after it stay with a, and the closing 」 ends its piece.
+  const text = "好（」（ abcdefg";
+  const lines = wrapLines(text, 3, { segmenter: false });
+  assert.deepEqual(lines, ["好", "（」", "（ a", "bcd", "efg"]);
+  assertLineRules(text, lines, 3, "@3");
+});
+
 test("quotes and brackets bind to their characters and a long closing run hangs only 2 em", () => {
   const text = "“光”（折射）……。」";
   assert.deepEqual(units(text, { segmenter: false }), ["“光”", "（折", "射）……。」"]);
