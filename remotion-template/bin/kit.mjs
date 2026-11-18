@@ -8,56 +8,21 @@
 // subcommand. Exit codes: 0 success, 1 a refused or failed step, 2 a usage
 // error. Imports only node: built-ins and the kit's own modules; no network.
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import {
-  chmod,
-  copyFile,
-  lstat,
-  mkdir,
-  mkdtemp,
-  open,
-  readFile,
-  readdir,
-  realpath,
-  rename,
-  rm,
-  rmdir,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, rmdir, symlink } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateScript } from "./script-schema.mjs";
+import { Refusal, lstatOrNull, notFound, publicDir, readScript, sayer, writeAtomic } from "./kit-io.mjs";
+import { timeline } from "./timeline.mjs";
 import { blockStems } from "./voice-stem.mjs";
 
 const PROJECT_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const NOT_COPIED = new Set(["node_modules", "tests", "out"]);
-const SHOWN_ERRORS = 20;
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp"]);
 const IMAGE_STEM = 60;
 
-// A refused step: printed as `kit <subcommand>: <message>`, then any detail
-// lines as they are.
-class Refusal extends Error {
-  constructor(message, exitCode = 1, detail = []) {
-    super(message);
-    this.exitCode = exitCode;
-    this.detail = detail;
-  }
-}
-
-const notFound = (thrown) => thrown?.code === "ENOENT" || thrown?.code === "ENOTDIR";
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
-
-async function lstatOrNull(path) {
-  try {
-    return await lstat(path);
-  } catch (thrown) {
-    if (notFound(thrown)) return null;
-    throw thrown;
-  }
-}
 
 async function isRegularFile(path) {
   return (await lstatOrNull(path))?.isFile() ?? false;
@@ -69,39 +34,7 @@ async function isTemplate(root) {
   return (await lstatOrNull(join(root, "node_modules")))?.isDirectory() ?? false;
 }
 
-// --- script.json ------------------------------------------------------------
-
-async function readScript(ctx) {
-  const path = join(ctx.root, "script.json");
-  let text;
-  try {
-    text = await readFile(path, "utf8");
-  } catch (thrown) {
-    if (notFound(thrown)) throw new Refusal(`${path}: not found`);
-    throw thrown;
-  }
-  const result = validateScript(text);
-  if (result.ok) return result.script;
-  const detail = result.errors.slice(0, SHOWN_ERRORS).map((error) => `  ${error.message}`);
-  if (result.errors.length > SHOWN_ERRORS) detail.push(`  … and ${result.errors.length - SHOWN_ERRORS} more`);
-  throw new Refusal("script.json is invalid", 1, detail);
-}
-
 // --- project files ----------------------------------------------------------
-
-// Creates root/public/<sub> when absent; refuses a symlink or non-directory
-// on the way.
-async function publicDir(root, sub) {
-  let path = root;
-  for (const part of ["public", sub]) {
-    path = join(path, part);
-    const stat = await lstatOrNull(path);
-    if (stat === null) await mkdir(path);
-    else if (stat.isSymbolicLink()) throw new Refusal(`${path}: is a symlink`);
-    else if (!stat.isDirectory()) throw new Refusal(`${path}: is not a directory`);
-  }
-  return path;
-}
 
 // Reads a regular file without following a final symlink.
 async function readRegular(path) {
@@ -111,18 +44,6 @@ async function readRegular(path) {
     return await handle.readFile();
   } finally {
     await handle.close();
-  }
-}
-
-// Writes dir/name through a temporary file in dir and one rename.
-async function writeAtomic(dir, name, data) {
-  const temp = join(dir, `.${name}.${randomBytes(6).toString("hex")}.partial`);
-  try {
-    await writeFile(temp, data, { flag: "wx" });
-    await rename(temp, join(dir, name));
-  } catch (thrown) {
-    await rm(temp, { force: true });
-    throw thrown;
   }
 }
 
@@ -228,8 +149,15 @@ async function voiceImport(ctx) {
   let imported = 0;
   const missing = [];
   for (const stem of stems) {
-    if (await isRegularFile(join(voiceDir, `${stem}.wav`))) {
+    const target = await lstatOrNull(join(voiceDir, `${stem}.wav`));
+    if (target?.isFile()) {
       imported++;
+      continue;
+    }
+    // A rename cannot replace a directory; the stem stays missing.
+    if (target?.isDirectory()) {
+      ctx.say(`public/voice/${stem}.wav is not a regular file; counted missing`);
+      missing.push(stem);
       continue;
     }
     const source = await findSpeech(ctx, names, stem);
@@ -298,6 +226,7 @@ const COMMANDS = {
   voice: { usage: "node bin/kit.mjs voice", args: 0, fromTemplate: false, run: voice },
   "voice-import": { usage: "node bin/kit.mjs voice-import", args: 0, fromTemplate: false, run: voiceImport },
   image: { usage: 'node bin/kit.mjs image "<path>"', args: 1, fromTemplate: false, run: image },
+  timeline: { usage: "node bin/kit.mjs timeline", args: 0, fromTemplate: false, run: timeline },
 };
 
 // io: {root, videosRoot, filesRoot, stdout, stderr}; resolves to the exit code.
@@ -309,7 +238,7 @@ export async function run(argv, io) {
     return 2;
   }
   const command = COMMANDS[name];
-  const say = (line) => io.stderr.write(`kit ${name}: ${line}\n`);
+  const say = sayer(io, name);
   const ctx = { ...io, root: resolve(io.root), args, say };
   try {
     if (args.length !== command.args) throw new Refusal(`usage: ${command.usage}`, 2);

@@ -16,6 +16,7 @@ import {
   IMAGE_NAME,
   LIMITS,
   VIDEO,
+  playbackWhere,
   scriptJsonSchema,
   scriptSchema,
   validateScript,
@@ -180,17 +181,25 @@ test("text that is not JSON gives one JSON error", () => {
   assert.match(result.errors[0].message, /^script: script\.json is not valid JSON \(.+\) \(limit JSON\)$/);
 });
 
-test("a JSON parse message is cut to 40 code points and escaped onto one line", () => {
-  const result = validate('{"a": [1,\n]}');
+// The parse message is escaped by echo's rule but not cut (#827 follow-up):
+// V8's positional form ends `in JSON at position N (line L column C)`.
+const parseMessage = (text) => {
+  const result = validate(text);
   assert.deepEqual(located(result), [top("script.json", "JSON")]);
-  const { message } = result.errors[0];
-  assert.doesNotMatch(message, /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
-  const inner = message.match(/^script: script\.json is not valid JSON \((.+)\) \(limit JSON\)$/)[1];
-  // V8 quotes the input, so its message exceeds 40 code points; each escape
-  // stands for one original code point.
-  assert.ok(inner.endsWith("…"), inner);
-  assert.equal([...inner.replace(/\\(?:[ntr]|u[0-9a-f]{4})/g, "x")].length, 41, inner);
+  return result.errors[0].message.match(/^script: script\.json is not valid JSON \((.+)\) \(limit JSON\)$/)[1];
+};
+
+test("a positional JSON parse message keeps its line and column", () => {
+  const inner = parseMessage('{"version": 1,');
+  assert.ok(inner.includes("(line 1 column 15)"), inner);
+  assert.ok(!inner.includes("…"), inner);
+});
+
+test("a quoting JSON parse message is escaped onto one line, not cut", () => {
+  const inner = parseMessage('{"a": [1,\n]}');
+  assert.doesNotMatch(inner, /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
   assert.match(inner, /\\n/);
+  assert.ok(!inner.includes("…"), inner);
 });
 
 test("a root that is not an object gives one object error", () => {
@@ -603,6 +612,48 @@ test("an unknown key is cut and escaped in field and message", () => {
   assert.equal(result.errors[0].message, 'script: a\\nb\\u2028c\\u0008"\\ is not allowed (limit unknown key)');
   const long = validate(withScene(minimal(), 0, 0, (s) => (s.content[`${"k".repeat(40)}\n${"z".repeat(10)}`] = 1)));
   assert.deepEqual(located(long), [{ chapter: "1 现象", scene: 1, field: `content.${"k".repeat(40)}…`, limit: "unknown key" }]);
+});
+
+test("echo stops at the 41st code point: a 450,000-character chapter name with 68,000 unknown keys validates in under 2 s", () => {
+  const script = minimal();
+  script.chapters[0].name = "a".repeat(450000);
+  const digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const content = script.chapters[0].scenes[0].content;
+  for (let i = 0; i < 68000; i++) content[digits[i % 62] + digits[Math.floor(i / 62) % 62] + digits[Math.floor(i / 3844)]] = 0;
+  const text = JSON.stringify(script);
+  assert.ok(Buffer.byteLength(text) < 1024 * 1024, `${Buffer.byteLength(text)} bytes`);
+  const started = performance.now();
+  const result = validate(text);
+  const elapsed = performance.now() - started;
+  assert.equal(result.ok, false);
+  assert.equal(result.errors.length, 68001);
+  const label = `1 ${"a".repeat(40)}…`;
+  for (const error of result.errors) assert.equal(error.chapter, label);
+  assert.ok(elapsed < 2000, `${Math.round(elapsed)} ms`);
+});
+
+// --- playbackWhere ------------------------------------------------------------
+
+test("playbackWhere names a 1-based playback scene as 3.4's messages do", () => {
+  const raw = minimal();
+  raw.chapters[1].scenes.push(
+    { kind: "question", narration: [["光会拐弯"]], content: { question: "为什么" } },
+    { kind: "comparison", narration: [["光会拐弯"]], content: { left: { title: "空气", points: ["快"] }, right: { title: "水", points: ["慢"] } } },
+  );
+  const result = validate(raw);
+  assert.equal(result.ok, true, JSON.stringify(result.errors));
+  const names = Array.from({ length: 8 }, (_, i) => playbackWhere(result.script, i + 1));
+  assert.deepEqual(names, [
+    "hook",
+    "chapter 1 现象, scene 1 (question)",
+    "chapter 2 原理, scene 1 (question)",
+    "chapter 2 原理, scene 2 (question)",
+    "chapter 2 原理, scene 3 (comparison)",
+    "chapter 3 应用, scene 1 (question)",
+    "summary",
+    "end-card",
+  ]);
+  for (const index of [0, 9, 1.5]) assert.throws(() => playbackWhere(result.script, index), RangeError);
 });
 
 // --- nested strict objects and per-kind limits (#826 finding) ---------------

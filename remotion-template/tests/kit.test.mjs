@@ -347,7 +347,8 @@ test("a script that is not JSON prints the header and one indented line", async 
   const errLines = result.err.split("\n");
   assert.equal(errLines.length, 3, JSON.stringify(result.err));
   assert.equal(errLines[0], "kit voice: script.json is invalid");
-  assert.match(errLines[1], /^ {2}script: script\.json is not valid JSON \(.+…\) \(limit JSON\)$/);
+  assert.match(errLines[1], /^ {2}script: script\.json is not valid JSON \(.+\) \(limit JSON\)$/);
+  assert.ok(!errLines[1].includes("…"), errLines[1]);
   assert.equal(errLines[2], "");
 });
 
@@ -455,6 +456,47 @@ test("a second voice-import after the sources are deleted succeeds and deletes n
   assert.deepEqual(tree(box.root), before);
 });
 
+test("a directory at public/voice/<stem>.wav is not satisfied: voice asks for it, voice-import counts it missing", async (t) => {
+  const box = await voiceProject(t);
+  for (const stem of box.stems) box.put(`${stem}.wav`);
+  const [a] = box.stems;
+  mkdirSync(join(box.root, "public", "voice", `${a}.wav`), { recursive: true });
+  const asked = await kit(["voice"], box.root, box);
+  assert.equal(asked.code, 0);
+  assert.equal(asked.err, "kit voice: 6 of 6 blocks need speech\n");
+  assert.ok(lines(asked.out)[0].includes(`"${a}.wav"`), asked.out);
+  const result = await kit(["voice-import"], box.root, box);
+  assert.equal(result.code, 1);
+  assert.equal(result.out, "");
+  assert.equal(
+    result.err,
+    `kit voice-import: public/voice/${a}.wav is not a regular file; counted missing\n` +
+      "kit voice-import: imported 5 of 6\n" +
+      `kit voice-import: missing ${a}.wav\n`,
+  );
+  assert.ok(lstatSync(join(box.root, "public", "voice", `${a}.wav`)).isDirectory());
+  for (const stem of box.stems.slice(1)) assert.equal(box.imported(stem), `${stem}.wav`);
+});
+
+test("an injected EACCES is a failed step with exit 1", async (t) => {
+  const box = await voiceProject(t);
+  const denied = Object.assign(new Error("EACCES: permission denied, write"), { code: "EACCES" });
+  let err = "";
+  const code = await run(["voice"], {
+    root: box.root,
+    videosRoot: box.videos,
+    filesRoot: box.files,
+    stdout: {
+      write: () => {
+        throw denied;
+      },
+    },
+    stderr: { write: (text) => (err += text) },
+  });
+  assert.equal(code, 1);
+  assert.equal(err, "kit voice: EACCES: permission denied, write\n");
+});
+
 test("voice-import refuses a public or public/voice that is a symlink or not a directory", async (t) => {
   const box = await voiceProject(t);
   for (const stem of box.stems) box.put(`${stem}.wav`);
@@ -512,6 +554,35 @@ test("image sanitizes names", async (t) => {
   }
   box.put("abs (1).jpg");
   assert.equal((await box.image(join(box.files, "abs (1).jpg"))).out, "abs-1.jpg\n");
+});
+
+test("image sanitizing cuts after collapsing dots and trims both ends of the cut", async (t) => {
+  const box = await imageProject(t);
+  const cases = [
+    [`---${"a".repeat(60)}.png`, `${"a".repeat(57)}.png`],
+    [`a${"..b".repeat(30)}.png`, `a${".b".repeat(29)}.png`],
+    [`${"a".repeat(61)}.png`, `${"a".repeat(60)}.png`],
+    ["a_.png", "a_.png"],
+  ];
+  for (const [source, expected] of cases) {
+    box.put(source);
+    const result = await box.image(source);
+    assert.deepEqual(result, { code: 0, out: `${expected}\n`, err: "" }, source);
+  }
+});
+
+test("image refuses a sibling directory whose name extends the files root", async (t) => {
+  const box = await imageProject(t);
+  const sibling = `${box.files}2`;
+  mkdirSync(sibling);
+  writeFileSync(join(sibling, "x.png"), "sibling");
+  for (const arg of [join(sibling, "x.png"), "../files2/x.png"]) {
+    const result = await box.image(arg);
+    assert.equal(result.code, 1, arg);
+    assert.equal(result.out, "");
+    assert.equal(result.err, `kit image: ${arg}: is outside ${box.files}\n`);
+  }
+  assert.equal(existsSync(join(box.root, "public")), false);
 });
 
 test("a different file with the same name gets -2; an identical file reuses the name", async (t) => {
