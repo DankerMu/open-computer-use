@@ -43,6 +43,8 @@ const FAILING = {
     ["mask clips", "div:nth-child(1)>div:nth-child(1)"],
     ["mask clips", "div:nth-child(2)"],
   ],
+  // Chrome computes display: block for SVG <text>, so <text> holds the record.
+  "svg-font": [["font size", "svg:nth-child(1)>text:nth-child(1)"]],
   "text-differs": [["text differs", "div:nth-child(1)"]],
   "custom-overflow": [["outside safe area", "div:nth-child(1)"]],
 };
@@ -68,6 +70,7 @@ const FITS_TEXTS = [
   ["div:nth-child(4)>div:nth-child(1)", "遮罩文字", ["遮罩文字"]],
   ["div:nth-child(5)", "揭示文字", ["揭示文字"]],
   ["div:nth-child(6)", "光在水中传播变慢", ["光在水中传", "播变慢"]],
+  ["svg:nth-child(8)>text:nth-child(1)", "矢量文字", ["矢量文字"]],
 ];
 
 let first;
@@ -133,29 +136,32 @@ test("fits records every text with its rendered lines", () => {
     assert.deepEqual(frame.hidden, [{ path: "div:nth-child(7)", text: "隐藏文字" }], label);
     assert.deepEqual(frame.scrolls, [], label);
 
-    const [line1, line2, edge, minimum, maskText, reveal] = frame.texts;
+    const [line1, line2, edge, minimum, maskText, reveal, , svgText] = frame.texts;
     // The paragraph's two block lines at 48 px with line height 1.4.
     near(union([line1.glyphBox, line2.glyphBox]).height, 2 * 1.4 * 48, `${label} paragraph height`);
     near(edge.glyphBox.x + edge.glyphBox.width, 1824, `${label} edge right`);
     assert.equal(minimum.minFontSizePx, 32, label);
     assert.equal(line1.minFontSizePx, 48, label);
+    assert.equal(svgText.minFontSizePx, 48, label);
 
     assert.deepEqual(maskText.clippedBy, ["div:nth-child(4)"], label);
     assert.deepEqual(reveal.clippedBy, ["div:nth-child(5)"], label);
+    // An <svg> clips to its viewport: the UA style sets overflow: hidden.
     assert.deepEqual(
       frame.masks.map(({ path }) => path),
-      ["div:nth-child(4)", "div:nth-child(5)"],
+      ["div:nth-child(4)", "div:nth-child(5)", "svg:nth-child(8)"],
       label,
     );
     assert.equal(frame.masks[0].clipPath, "none", label);
     assert.match(frame.masks[1].clipPath, /^inset\(/, label);
-    // The overflow mask is its 200 × 70 padding box; the reveal's inset
-    // reached 0, so its box is the element's border box: 4 glyphs of 50 px
-    // wide, one 70 px line (50 px × 1.4) high.
-    const [overflowMask, revealMask] = frame.masks.map((mask) => mask.clipBox);
+    // The overflow mask is its 192 × 67.2 padding box; the reveal's inset
+    // reached 0, so its box is the element's border box: 4 glyphs of 48 px
+    // wide, one 67.2 px line (48 px × 1.4) high.
+    const [overflowMask, revealMask, svgMask] = frame.masks.map((mask) => mask.clipBox);
     for (const [actual, expected, name] of [
-      [overflowMask, { x: 200, y: 420, width: 200, height: 70 }, "overflow mask"],
-      [revealMask, { x: 200, y: 560, width: 200, height: 70 }, "reveal mask"],
+      [overflowMask, { x: 200, y: 420, width: 192, height: 67.2 }, "overflow mask"],
+      [revealMask, { x: 200, y: 560, width: 192, height: 67.2 }, "reveal mask"],
+      [svgMask, { x: 1000, y: 700, width: 400, height: 100 }, "svg viewport"],
     ]) {
       for (const key of ["x", "y", "width", "height"]) near(actual[key], expected[key], `${label} ${name} ${key}`);
     }

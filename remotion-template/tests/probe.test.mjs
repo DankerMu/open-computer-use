@@ -5,8 +5,9 @@
 // rules over hand-written results, the violation line and target
 // validation. Expected values come from the task 3.7 fixture: the safe area
 // of theme.ts is 96–1824 × 54–1026 with a 32 px minimum, every box
-// comparison has a 0.5 px tolerance, and only ，。！？、；：）」』 may not start a
-// line. The browser half lives in tests/render/ and runs only in the image.
+// comparison tolerates 0.5 px horizontally (left, right) and 1 px
+// vertically (top, bottom), and only ，。！？、；：）」』 may not start a line.
+// The browser half lives in tests/render/ and runs only in the image.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -155,16 +156,16 @@ test("a marked element whose rendered text differs from its input is reported", 
 
 // --- violations: outside safe area ----------------------------------------------
 
-test("glyph boxes 0.5 px past a safe-area edge pass and 0.51 px fail", () => {
+test("glyph boxes past a safe-area edge pass up to 0.5 px sideways and 1 px vertically", () => {
   const rows = [
     [box(95.5, 200, 100, 50), []],
     [box(95.49, 200, 100, 50), ["left 0.51 px"]],
-    [box(200, 53.5, 100, 50), []],
-    [box(200, 53.49, 100, 50), ["top 0.51 px"]],
     [box(1724.5, 200, 100, 50), []],
     [box(1724.51, 200, 100, 50), ["right 0.51 px"]],
-    [box(200, 976.5, 100, 50), []],
-    [box(200, 976.51, 100, 50), ["bottom 0.51 px"]],
+    [box(200, 53, 100, 50), []],
+    [box(200, 52.99, 100, 50), ["top 1.01 px"]],
+    [box(200, 977, 100, 50), []],
+    [box(200, 977.01, 100, 50), ["bottom 1.01 px"]],
     [box(96, 54, 1728, 972), []],
   ];
   for (const [glyphBox, details] of rows) {
@@ -283,24 +284,41 @@ function masked(glyphBox, clipBox, clipPath = "none") {
   });
 }
 
-test("a mask cutting a glyph box is reported, 0.5 px of overhang passes and 0.51 px fails", () => {
+test("a mask cutting a glyph box is reported, past 0.5 px sideways or 1 px vertically", () => {
   const glyphBox = box(200, 200, 200, 67.2);
-  assert.deepEqual(violations(resultOf(masked(glyphBox, box(200, 200, 200, 67.2))), theme), []);
-  assert.deepEqual(violations(resultOf(masked(glyphBox, box(200, 200, 199.5, 67.2))), theme), []);
-  assert.deepEqual(brief(violations(resultOf(masked(glyphBox, box(200, 200, 199.49, 67.2))), theme)), [
-    { rule: "mask clips", path: P1, detail: `by ${P1}` },
-  ]);
-  assert.deepEqual(brief(violations(resultOf(masked(glyphBox, box(200, 200, 190, 67.2))), theme)), [
-    { rule: "mask clips", path: P1, detail: `by ${P1}` },
-  ]);
+  const clips = [{ rule: "mask clips", path: P1, detail: `by ${P1}` }];
+  const rows = [
+    [box(200, 200, 200, 67.2), []],
+    [box(200, 200, 190, 67.2), clips],
+    // Right edge: 0.5 px overhang passes, 0.51 px fails.
+    [box(200, 200, 199.5, 67.2), []],
+    [box(200, 200, 199.49, 67.2), clips],
+    // Left edge.
+    [box(200.5, 200, 199.5, 67.2), []],
+    [box(200.51, 200, 199.49, 67.2), clips],
+    // Top edge: 1 px passes, 1.01 px fails.
+    [box(200, 201, 200, 66.2), []],
+    [box(200, 201.01, 200, 66.19), clips],
+    // Bottom edge.
+    [box(200, 200, 200, 66.2), []],
+    [box(200, 200, 200, 66.19), clips],
+  ];
+  for (const [clipBox, expected] of rows) {
+    assert.deepEqual(brief(violations(resultOf(masked(glyphBox, clipBox)), theme)), expected, JSON.stringify(clipBox));
+  }
 });
 
 test("a glyph box wholly outside its mask is not yet revealed", () => {
   const glyphBox = box(200, 200, 200, 67.2);
-  // Disjoint, and overlapping by exactly the 0.5 px tolerance.
+  // Disjoint, and overlapping by exactly the tolerance: 0.5 px sideways,
+  // 1 px vertically.
   assert.deepEqual(violations(resultOf(masked(glyphBox, box(600, 200, 200, 67.2))), theme), []);
   assert.deepEqual(violations(resultOf(masked(glyphBox, box(399.5, 200, 200, 67.2))), theme), []);
   assert.deepEqual(brief(violations(resultOf(masked(glyphBox, box(399.49, 200, 200, 67.2))), theme)), [
+    { rule: "mask clips", path: P1, detail: `by ${P1}` },
+  ]);
+  assert.deepEqual(violations(resultOf(masked(glyphBox, box(200, 266.2, 200, 100))), theme), []);
+  assert.deepEqual(brief(violations(resultOf(masked(glyphBox, box(200, 266.19, 200, 100))), theme)), [
     { rule: "mask clips", path: P1, detail: `by ${P1}` },
   ]);
 });

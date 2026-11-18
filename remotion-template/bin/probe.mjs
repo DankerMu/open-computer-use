@@ -20,7 +20,12 @@ import { escapeLine } from "./script-schema.mjs";
 const COMPOSITION = "KitProbe";
 const RECORD_PREFIX = "kit-probe ";
 const LINE_START_MARKS = new Set(Array.from("，。！？、；：）」』"));
-const TOLERANCE = 0.5;
+// Box comparisons tolerate 0.5 px horizontally and 1 px vertically. Glyph
+// rects trimmed about their centre sat 0.2–0.8 px above the line box in the
+// image's shell (32, 36, 48, 64 and 96 px at line height 1.4), so a mask
+// exactly the size of its line needs more than 0.5 px vertically.
+const TOLERANCE_X = 0.5;
+const TOLERANCE_Y = 1;
 
 const round = (n) => Math.round(n * 100) / 100;
 const shown = (value) => (typeof value === "string" ? JSON.stringify(value) : String(value));
@@ -176,29 +181,29 @@ export async function probe({ entryPoint, targets } = {}) {
 
 function crossedEdges(glyph, safe) {
   return [
-    ["left", safe.left - glyph.x],
-    ["top", safe.top - glyph.y],
-    ["right", glyph.x + glyph.width - safe.right],
-    ["bottom", glyph.y + glyph.height - safe.bottom],
+    ["left", safe.left - glyph.x, TOLERANCE_X],
+    ["top", safe.top - glyph.y, TOLERANCE_Y],
+    ["right", glyph.x + glyph.width - safe.right, TOLERANCE_X],
+    ["bottom", glyph.y + glyph.height - safe.bottom, TOLERANCE_Y],
   ]
-    .map(([edge, distance]) => [edge, round(distance)])
-    .filter(([, distance]) => distance > TOLERANCE)
+    .map(([edge, distance, tolerance]) => [edge, round(distance), tolerance])
+    .filter(([, distance, tolerance]) => distance > tolerance)
     .map(([edge, distance]) => `${edge} ${distance} px`);
 }
 
 function contains(outer, inner) {
   return (
-    round(outer.x - inner.x) <= TOLERANCE &&
-    round(outer.y - inner.y) <= TOLERANCE &&
-    round(inner.x + inner.width - (outer.x + outer.width)) <= TOLERANCE &&
-    round(inner.y + inner.height - (outer.y + outer.height)) <= TOLERANCE
+    round(outer.x - inner.x) <= TOLERANCE_X &&
+    round(outer.y - inner.y) <= TOLERANCE_Y &&
+    round(inner.x + inner.width - (outer.x + outer.width)) <= TOLERANCE_X &&
+    round(inner.y + inner.height - (outer.y + outer.height)) <= TOLERANCE_Y
   );
 }
 
 function intersects(a, b) {
   const overlapX = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
   const overlapY = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
-  return round(overlapX) > TOLERANCE && round(overlapY) > TOLERANCE;
+  return round(overlapX) > TOLERANCE_X && round(overlapY) > TOLERANCE_Y;
 }
 
 const isInside = (path, ancestor) => ancestor === "" || path === ancestor || path.startsWith(`${ancestor}>`);

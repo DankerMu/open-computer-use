@@ -16,12 +16,6 @@ const theme = themes.light;
 const BODY = theme.type.sizes.body;
 const PARAGRAPH = '光线从空气斜射入水中时，传播方向发生改变。';
 const PARAGRAPH_WIDTH = 12;
-// The two masks hold 50 px text, whose line box (70 px) is whole pixels.
-// Measured in the image at 48 px: a code point's rect spans y 98–168 on a
-// line box of 100–167.2, so the rect trimmed about its centre spans
-// 99.4–166.6. It crosses a mask exactly the size of its line by 0.6 px,
-// past the 0.5 px tolerance, and is reported.
-const MASKED = {fontSize: 50} as const;
 
 // One line of body text, never wrapped by CSS.
 const line = {
@@ -50,14 +44,23 @@ const Fits = () => {
 			</div>
 			<div style={{...line, left: 1824 - 480, top: 300, width: 480, textAlign: 'right'}}>右侧对齐</div>
 			<div style={{...line, left: 200, top: 300, fontSize: theme.type.sizes.minimum}}>最小字号</div>
-			<div style={{position: 'absolute', left: 200, top: 420, width: 200, height: 70, overflow: 'hidden'}}>
-				<div style={{...line, ...MASKED, position: 'static'}}>遮罩文字</div>
+			{/* Masks exactly the size of their 48 px line: the trimmed glyph
+			    box sits 0.6 px above the line box, inside the 1 px vertical
+			    tolerance. */}
+			<div style={{position: 'absolute', left: 200, top: 420, width: 192, height: 67.2, overflow: 'hidden'}}>
+				<div style={{...line, position: 'static'}}>遮罩文字</div>
 			</div>
-			<div style={{...line, ...MASKED, left: 200, top: 560, clipPath: `inset(0 ${hidden}% 0 0)`}}>揭示文字</div>
+			<div style={{...line, left: 200, top: 560, clipPath: `inset(0 ${hidden}% 0 0)`}}>揭示文字</div>
 			<div style={{...textStyle(theme), position: 'absolute', left: 1000, top: 420, fontSize: BODY, width: '5.5em'}}>
 				光在水中传播变慢
 			</div>
 			<div style={{...line, left: 20, top: 20, opacity: 0}}>隐藏文字</div>
+			{/* SVG text at viewBox scale 1: 48 px rendered. */}
+			<svg viewBox="0 0 400 100" width="400" height="100" style={{position: 'absolute', left: 1000, top: 700}}>
+				<text x="0" y="70" fontSize="48" fontFamily={theme.brand.fontBody}>
+					矢量文字
+				</text>
+			</svg>
 		</>
 	);
 };
@@ -100,6 +103,15 @@ const MaskSmall = () => (
 	</>
 );
 
+// The viewBox halves its user units: 48 user-unit text renders at 24 px.
+const SvgFont = () => (
+	<svg viewBox="0 0 400 200" width="200" height="100" style={{position: 'absolute', left: 200, top: 300}}>
+		<text x="0" y="120" fontSize="48" fontFamily={theme.brand.fontBody}>
+			矢量文字
+		</text>
+	</svg>
+);
+
 const TextDiffers = () => (
 	<div data-kit-text="光的折射现象" style={{...line, left: 200, top: 300}}>
 		光的折射
@@ -140,6 +152,7 @@ export const scenes = {
 	'wrap-start-lines': WrapStartLines,
 	'scaled-font': ScaledFont,
 	'mask-small': MaskSmall,
+	'svg-font': SvgFont,
 	'text-differs': TextDiffers,
 	'custom-overflow': CustomOverflow,
 	'late-overflow': LateOverflow,
