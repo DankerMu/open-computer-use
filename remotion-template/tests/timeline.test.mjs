@@ -34,6 +34,7 @@ import { validateScript } from "../bin/script-schema.mjs";
 import { blockStems } from "../bin/voice-stem.mjs";
 import { layout } from "../bin/scene-timing.mjs";
 import { run } from "../bin/kit.mjs";
+import { lengthError } from "../bin/timeline.mjs";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const RUN_HINT = "kit timeline: run node bin/kit.mjs voice, then voice-import\n";
@@ -67,7 +68,10 @@ function minimal() {
 }
 
 // Tone lengths in seconds for minimal()'s six blocks: about 63.6 s in total.
-const IN_WINDOW = [9, 8, 7, 10, 9, 10];
+// The hook's block starts on frame 40 exactly; 9.02 s trims to about 434,865
+// samples, ending 1,265 samples into a frame, so a floored endFrame would
+// end before the tone does.
+const IN_WINDOW = [9.02, 8, 7, 10, 9, 10];
 
 function ffmpeg(args) {
   const result = spawnSync("ffmpeg", ["-nostdin", "-v", "error", "-y", ...args], { maxBuffer: 64 * 1024 * 1024 });
@@ -262,6 +266,10 @@ test("timeline places every block on its audio and writes a -16 LUFS narration o
   const blocks = timeline.scenes.flatMap((scene) => scene.sentences.flatMap((sentence) => sentence.blocks));
   const runs = audibleRuns(samples);
   assert.equal(runs.length, blocks.length);
+  assert.ok(
+    blocks.some((block) => block.endSample % 1600 > 1000),
+    "the fixture needs a block ending late in a frame, so that a floored endFrame is caught",
+  );
   blocks.forEach((block, i) => {
     const { onset, offset } = runs[i];
     const on = Math.floor(onset / 1600);
@@ -458,22 +466,82 @@ test("a script under 60 s fails, stating its length rounded down", async (t) => 
 
 // --- ffmpeg and the CLI ------------------------------------------------------------
 
+// Runs `process.execPath bin/kit.mjs timeline` in the project with the
+// given PATH and asserts exit 1, no stdout, the exact stderr, and an
+// unchanged project: same listings, timeline.json and narration.wav
+// byte-identical, no temporary file left.
+function childFailsWith(box, path, expected) {
+  const before = tree(box.root);
+  const result = spawnSync(process.execPath, [join(box.root, "bin", "kit.mjs"), "timeline"], {
+    cwd: box.root,
+    env: { PATH: path },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, expected);
+  assert.deepEqual(tree(box.root), before);
+}
+
 test("ffmpeg absent from PATH fails, naming it", async (t) => {
   const box = await project(t);
   const empty = join(box.base, "empty-path");
   mkdirSync(empty);
   writeFileSync(join(box.root, "timeline.json"), "old timeline\n");
   writeFileSync(join(box.root, "public", "narration.wav"), "old narration");
-  const before = tree(box.root);
-  const result = spawnSync(process.execPath, [join(box.root, "bin", "kit.mjs"), "timeline"], {
-    cwd: box.root,
-    env: { PATH: empty },
-    encoding: "utf8",
-  });
-  assert.equal(result.status, 1, result.stderr);
-  assert.equal(result.stdout, "");
-  assert.equal(result.stderr, "kit timeline: ffmpeg: not found on PATH\n");
-  assert.deepEqual(tree(box.root), before);
+  childFailsWith(box, empty, "kit timeline: ffmpeg: not found on PATH\n");
+});
+
+// A directory holding an `ffmpeg` that runs `sabotage` when its arguments
+// contain `match` and the real ffmpeg otherwise; the kit is not changed.
+function fakeFfmpeg(box, match, sabotage) {
+  const found = spawnSync("sh", ["-c", "command -v ffmpeg"], { encoding: "utf8" });
+  const real = found.stdout.trim();
+  assert.ok(real.startsWith("/"), "ffmpeg: not found on PATH; the timeline tests need it");
+  const dir = join(box.base, "fake-bin");
+  mkdirSync(dir);
+  const script = `#!/bin/sh\ncase "$*" in\n  *${match}*) ${sabotage.replaceAll("REAL", `'${real}'`)} ;;\nesac\nexec '${real}' "$@"\n`;
+  writeFileSync(join(dir, "ffmpeg"), script, { mode: 0o755 });
+  return `${dir}:${process.env.PATH}`;
+}
+
+// A project whose first timeline run succeeded (giving totalFrames), with
+// timeline.json and narration.wav then replaced by old bytes that a re-run
+// cannot reproduce, so a replacement shows.
+async function timedProject(t) {
+  const box = await project(t, minimal(), IN_WINDOW);
+  const first = await box.timeline();
+  assert.equal(first.code, 0, first.err);
+  const { totalFrames } = JSON.parse(readFileSync(join(box.root, "timeline.json"), "utf8"));
+  writeFileSync(join(box.root, "timeline.json"), "old timeline\n");
+  writeFileSync(join(box.root, "public", "narration.wav"), "old narration");
+  return { ...box, totalFrames };
+}
+
+test("a narration failing the loudness gate fails and replaces nothing", async (t) => {
+  const box = await timedProject(t);
+  const summary =
+    "[Parsed_ebur128_0 @ 0x1] Summary:\\n\\n  Integrated loudness:\\n    I:         -20.0 LUFS\\n" +
+    "    Threshold: -30.0 LUFS\\n\\n  True peak:\\n    Peak:       -5.0 dBFS\\n";
+  const path = fakeFfmpeg(box, "ebur128=peak=true", `printf '${summary}' >&2; exit 0`);
+  childFailsWith(
+    box,
+    path,
+    "kit timeline: narration measures -20.0 LUFS, -5.0 dBTP; needs -16 ± 1 LUFS and at most -1.0 dBTP\n",
+  );
+});
+
+test("a normalized narration of the wrong length fails and replaces nothing", async (t) => {
+  const box = await timedProject(t);
+  const path = fakeFfmpeg(box, "linear=true", "REAL \"$@\" | head -c 32000; exit 0");
+  childFailsWith(box, path, `kit timeline: narration has 16000 samples, expected ${box.totalFrames * 1600}\n`);
+});
+
+test("the length window takes 1800 and 5400 frames and names 1799 and 5401, rounded outward", () => {
+  assert.equal(lengthError(1800), null);
+  assert.equal(lengthError(5400), null);
+  assert.equal(lengthError(1799), "total 59.9 s (1799 frames) is outside 60–180 s");
+  assert.equal(lengthError(5401), "total 180.1 s (5401 frames) is outside 60–180 s");
 });
 
 test("timeline refuses at the template root with the hint, and takes no argument", async (t) => {

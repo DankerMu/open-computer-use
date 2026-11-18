@@ -100,13 +100,14 @@ async function readBlock(dir, names, stem) {
 // tenths of a second, as `<s>.<d>`.
 const seconds = (tenths) => `${Math.floor(tenths / 10)}.${tenths % 10}`;
 
-function checkWindow(totalFrames) {
-  if (totalFrames > LENGTH_WINDOW.maxFrames) {
-    throw new Refusal(`total ${seconds(Math.ceil(totalFrames / 3))} s (${totalFrames} frames) is outside 60–180 s`);
-  }
-  if (totalFrames < LENGTH_WINDOW.minFrames) {
-    throw new Refusal(`total ${seconds(Math.floor(totalFrames / 3))} s (${totalFrames} frames) is outside 60–180 s`);
-  }
+// null inside the 60–180 s window, else the failure text: seconds rounded
+// up above the window and down below it, so neither bound reads as inside.
+export function lengthError(totalFrames) {
+  let tenths;
+  if (totalFrames > LENGTH_WINDOW.maxFrames) tenths = Math.ceil(totalFrames / 3);
+  else if (totalFrames < LENGTH_WINDOW.minFrames) tenths = Math.floor(totalFrames / 3);
+  else return null;
+  return `total ${seconds(tenths)} s (${totalFrames} frames) is outside 60–180 s`;
 }
 
 // Every block's trimmed PCM at its startSample in one silent buffer.
@@ -216,7 +217,8 @@ export async function timeline(ctx) {
     script,
     stems.map((entry) => ({ ...entry, samples: audio.get(entry.stem).pcm.length / BYTES_PER_SAMPLE })),
   );
-  checkWindow(laid.totalFrames);
+  const outside = lengthError(laid.totalFrames);
+  if (outside !== null) throw new Refusal(outside);
   const pcm = await normalize(mix(laid, audio));
   const expected = laid.totalFrames * SAMPLES_PER_FRAME;
   if (pcm.length !== expected * BYTES_PER_SAMPLE) {
