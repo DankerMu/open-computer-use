@@ -410,6 +410,18 @@ test("the vertical tolerance scales with the record's rendered scale", () => {
     });
     assert.deepEqual(brief(violations(resultOf(frame), theme)), expected, JSON.stringify(clipBox));
   }
+  // Unrevealed below a mask: overlapping by the scaled 2 px counts as
+  // outside it, 2.01 px as cutting the glyph box.
+  for (const [clipBox, expected] of [
+    [box(200, 332.4, 384, 100), []],
+    [box(200, 332.39, 384, 100), clips],
+  ]) {
+    const frame = frameOf({
+      texts: [record({ glyphBox, scale: 2, clippedBy: [P1] })],
+      masks: [{ path: P1, clipPath: "none", clipBox }],
+    });
+    assert.deepEqual(brief(violations(resultOf(frame), theme)), expected, JSON.stringify(clipBox));
+  }
   // A scale below 1 keeps the 1 px floor.
   assert.deepEqual(violations(resultOf(frameOf({ texts: [record({ glyphBox: box(200, 53, 100, 50), scale: 0.5 })] })), theme), []);
 });

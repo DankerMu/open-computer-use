@@ -7,10 +7,8 @@
 // client rects, which are canvas pixels when the root lies at the canvas
 // origin at scale 1 (the probe composition waits for that).
 //
-// Known limits: an absolutely positioned descendant whose containing block
-// lies outside a non-positioned clipping ancestor is judged against that
-// ancestor although the browser does not clip it. Rendered scale reads only
-// the `transform` property, not `scale`, `rotate`, `translate` or `zoom`.
+// Known limit: rendered scale reads only the `transform` property, not
+// `scale`, `rotate`, `translate` or `zoom`.
 
 type Box = {x: number; y: number; width: number; height: number};
 type Edges = {left: number; top: number; right: number; bottom: number};
@@ -132,6 +130,44 @@ function blockOf(el: Element, root: Element): Element {
 	return root;
 }
 
+// Whether el is the containing block of an absolutely (or, with `fixed`,
+// a fixed) positioned descendant: a positioned element for `absolute`, and
+// for both an element with a transform, perspective, filter, paint or
+// layout containment, or `will-change: transform`.
+function containsPositioned(el: Element, fixed: boolean): boolean {
+	const style = getComputedStyle(el);
+	if (!fixed && style.position !== 'static') return true;
+	return (
+		style.transform !== 'none' ||
+		style.perspective !== 'none' ||
+		style.filter !== 'none' ||
+		/\b(paint|layout|strict|content)\b/.test(style.contain) ||
+		/\btransform\b/.test(style.willChange)
+	);
+}
+
+// The record element's clipping ancestors, nearest first: the element
+// itself and those of its ancestors up to root that clip and hold the
+// containing block of every absolutely or fixed positioned element between
+// them and the record. Overflow does not clip a positioned descendant whose
+// containing block lies outside it (CSS 2.1 §11.1.1); a fixed element with
+// no transformed ancestor belongs to the viewport, which no element clips.
+function clippingAncestors(el: Element, root: Element): Element[] {
+	const clipping: Element[] = [];
+	const pending: boolean[] = [];
+	for (const e of chain(el, root)) {
+		if (e !== el) {
+			for (let k = pending.length - 1; k >= 0; k -= 1) {
+				if (containsPositioned(e, pending[k])) pending.splice(k, 1);
+			}
+		}
+		if (pending.length === 0 && isClipping(e)) clipping.push(e);
+		const position = getComputedStyle(e).position;
+		if (position === 'absolute' || position === 'fixed') pending.push(position === 'fixed');
+	}
+	return clipping;
+}
+
 function isClipping(el: Element): boolean {
 	const style = getComputedStyle(el);
 	return CLIPPING_OVERFLOW.has(style.overflowX) || CLIPPING_OVERFLOW.has(style.overflowY) || style.clipPath !== 'none';
@@ -249,7 +285,7 @@ function measureRecord(el: Element, nodes: Text[], root: Element): TextRecord {
 		minFontSizePx: round(minFontSize),
 		scale: round(maxScale),
 		lines,
-		clippedBy: chain(el, root).filter(isClipping).map((e) => pathOf(e, root)),
+		clippedBy: clippingAncestors(el, root).map((e) => pathOf(e, root)),
 	};
 }
 
@@ -304,7 +340,7 @@ export function measureFrame(root: Element): Measurement {
 	const masks: Measurement['masks'] = [];
 	const seen = new Set<string>();
 	for (const el of elements) {
-		for (const e of chain(el, root).filter(isClipping)) {
+		for (const e of clippingAncestors(el, root)) {
 			const path = pathOf(e, root);
 			if (seen.has(path)) continue;
 			seen.add(path);

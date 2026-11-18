@@ -47,6 +47,10 @@ const CASES = [
   ["fits-entrance-mid", "fits", 60, 30, [30, 30, 59], []],
   ["font-absent", "font-absent", 10, 0, [0, 5, 9], []],
   ["camera", "camera", 60, 10, F60, []],
+  ["clipped-abs", "clipped-abs", 60, 10, F60, []],
+  ["fixed-clipped", "fixed-clipped", 60, 10, F60, []],
+  // Only the safe-area rule: the static wrapper is no clipping ancestor.
+  ["escaped-abs", "escaped-abs", 60, 10, F60, [["outside safe area", `${P1}>div:nth-child(1)`]]],
   ["clip-negative", "clip-negative", 60, 10, F60, []],
   ["edge-over", "edge-over", 60, 10, F60, [["outside safe area", P1]]],
   ["small-font", "small-font", 60, 10, F60, [["font size", P1]]],
@@ -163,11 +167,13 @@ test("the result has version 1, the canvas, and three frames per target in order
     first.frames.map(({ target: id, role }) => [id, role]),
     TARGETS.flatMap(({ id }) => ROLES.map((role) => [id, role])),
   );
+  const keys = ["fontPresent", "frame", "hidden", "marked", "masks", "role", "scrolls", "target", "texts"];
+  for (const frame of first.frames) assert.deepEqual(Object.keys(frame).sort(), keys, `${frame.target} ${frame.role}`);
 });
 
 test("fits and the other clean scenes break no rule at any probe frame", () => {
   const clean = first.frames.filter((frame) => CLEAN.includes(frame.target));
-  assert.deepEqual(CLEAN, ["fits", "fits-entrance-mid", "font-absent", "camera", "clip-negative"]);
+  assert.deepEqual(CLEAN, ["fits", "fits-entrance-mid", "font-absent", "camera", "clipped-abs", "fixed-clipped", "clip-negative"]);
   assert.deepEqual(violations({ ...first, frames: clean }, theme), []);
   assert.deepEqual(
     framesOf(first, "fits").map((frame) => frame.frame),
@@ -198,6 +204,8 @@ test("fits records every text with its rendered lines", () => {
     assert.equal(line1.scale, 1, label);
     assert.equal(scaledMaskText.scale, 2, label);
     assert.equal(scaledMaskText.minFontSizePx, 96, label);
+    // The glyph box is trimmed to the scaled line box, 67.2 px × 2.
+    near(scaledMaskText.glyphBox.height, 134.4, `${label} scaled glyph height`);
 
     assert.deepEqual(maskText.clippedBy, ["div:nth-child(4)"], label);
     assert.deepEqual(reveal.clippedBy, ["div:nth-child(5)"], label);
@@ -285,6 +293,17 @@ test("clipped overflow, negative insets and inline sizes are recorded as rendere
     assert.equal(record.text, "镜头外文字", frame.role);
     // Past the safe area's right edge, wholly outside its 200–600 viewport.
     assert.ok(record.glyphBox.x > 1824, `${frame.role}: x ${record.glyphBox.x}`);
+  }
+  for (const frame of framesOf(first, "escaped-abs")) {
+    const [record] = frame.texts;
+    assert.deepEqual(record.clippedBy, [], `${frame.role}: the static wrapper does not clip`);
+    near(record.glyphBox.x, 10, `${frame.role} escaped x`);
+  }
+  for (const frame of framesOf(first, "clipped-abs")) {
+    assert.deepEqual(frame.texts[0].clippedBy, [P1], frame.role);
+  }
+  for (const frame of framesOf(first, "fixed-clipped")) {
+    assert.deepEqual(frame.texts[0].clippedBy, [P1], frame.role);
   }
   for (const frame of framesOf(first, "clip-negative")) {
     const [{ clipBox }] = frame.masks;

@@ -125,6 +125,31 @@ const Camera = () => (
 	</div>
 );
 
+// Absolutely positioned text inside a static overflow: hidden wrapper: its
+// containing block is the scene root, outside the wrapper, so the wrapper
+// does not clip it and it shows past the safe area's left edge.
+const EscapedAbs = () => (
+	<div style={{marginLeft: 600, marginTop: 400, width: 300, height: 100, overflow: 'hidden'}}>
+		<div style={{...line, left: 10, top: 600}}>逃出遮罩</div>
+	</div>
+);
+
+// The same wrapper, positioned: it is the text's containing block and
+// clips it; the text lies wholly outside it, past the safe area's bottom.
+const ClippedAbs = () => (
+	<div style={{position: 'relative', marginLeft: 600, marginTop: 400, width: 300, height: 100, overflow: 'hidden'}}>
+		<div style={{...line, left: 10, top: 600}}>困在遮罩</div>
+	</div>
+);
+
+// Fixed text inside a transformed overflow: hidden wrapper: the transform
+// makes the wrapper its containing block, so the wrapper clips it.
+const FixedClipped = () => (
+	<div style={{position: 'absolute', left: 200, top: 300, width: 300, height: 100, overflow: 'hidden', transform: 'translateX(0)'}}>
+		<div style={{...line, position: 'fixed', left: 1700, top: 0}}>固定文字</div>
+	</div>
+);
+
 // Negative insets reach past the 96 px border box around the 240 px text.
 const ClipNegative = () => (
 	<div style={{...line, left: 200, top: 200, width: 96, clipPath: 'inset(-10px -200px -10px -10px)'}}>负值裁剪框</div>
@@ -227,6 +252,9 @@ export const scenes = {
 	'scaled-font': ScaledFont,
 	'mask-small': MaskSmall,
 	camera: Camera,
+	'escaped-abs': EscapedAbs,
+	'clipped-abs': ClippedAbs,
+	'fixed-clipped': FixedClipped,
 	'clip-negative': ClipNegative,
 	'inline-small': InlineSmall,
 	'wrap-start-spaces': WrapStartSpaces,
