@@ -17,6 +17,7 @@ import {
   LIMITS,
   VIDEO,
   scriptJsonSchema,
+  scriptSchema,
   validateScript,
 } from "../bin/script-schema.mjs";
 
@@ -35,6 +36,7 @@ const CANDIDATE_KINDS = [
 ];
 const ALLOWED_KINDS = [...CANDIDATE_KINDS, "custom"].join(" | ");
 const IMAGE_LIMIT = "plain image name (.png, .jpg, .jpeg or .webp)";
+const MUSIC_LIMIT = "none or a track id: a-z or 0-9 first, then a-z, 0-9 or -, at most 40 characters";
 const MESSAGE = /^(script|hook|summary|end-card|chapter [^,]+(, scene \d+ \([^)]+\))?): \S+ .+ \(limit .+\)$/;
 
 // n Han characters, each one code point and one UTF-16 unit.
@@ -129,6 +131,7 @@ test("a minimal script passes and its end card narration comes back as []", () =
   assert.equal(result.ok, true, JSON.stringify(result.errors));
   const expected = minimal();
   expected.endCard.narration = [];
+  expected.voice = { id: "", instructions: "" };
   assert.deepEqual(result.script, expected);
 });
 
@@ -138,7 +141,7 @@ test("a maximal script passes: 5×4 scenes, every body kind, one custom, 4×4 bl
   assert.deepEqual([...kinds].sort(), [...CANDIDATE_KINDS, "custom"].sort());
   const result = validate(script);
   assert.equal(result.ok, true, JSON.stringify(result.errors));
-  assert.deepEqual(result.script, script);
+  assert.deepEqual(result.script, { ...script, voice: { id: "", instructions: "" } });
 });
 
 test("VIDEO is 1920×1080 at 30 fps", () => {
@@ -177,6 +180,19 @@ test("text that is not JSON gives one JSON error", () => {
   assert.match(result.errors[0].message, /^script: script\.json is not valid JSON \(.+\) \(limit JSON\)$/);
 });
 
+test("a JSON parse message is cut to 40 code points and escaped onto one line", () => {
+  const result = validate('{"a": [1,\n]}');
+  assert.deepEqual(located(result), [top("script.json", "JSON")]);
+  const { message } = result.errors[0];
+  assert.doesNotMatch(message, /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+  const inner = message.match(/^script: script\.json is not valid JSON \((.+)\) \(limit JSON\)$/)[1];
+  // V8 quotes the input, so its message exceeds 40 code points; each escape
+  // stands for one original code point.
+  assert.ok(inner.endsWith("…"), inner);
+  assert.equal([...inner.replace(/\\(?:[ntr]|u[0-9a-f]{4})/g, "x")].length, 41, inner);
+  assert.match(inner, /\\n/);
+});
+
 test("a root that is not an object gives one object error", () => {
   for (const text of ["[]", "null", "1", '"x"']) rejects(text, [top("script.json", "object")]);
 });
@@ -209,7 +225,7 @@ test("top-level fields: version, title, music", () => {
   rejects({ ...minimal(), title: han(25) }, [top("title", "24 characters")]);
   rejects({ ...minimal(), title: "" }, [top("title", "non-empty")]);
   rejects({ ...minimal(), title: 7 }, [top("title", "string")]);
-  rejects({ ...minimal(), music: "Calm Piano" }, [top("music", "none or a track id of a-z, 0-9 and -")]);
+  rejects({ ...minimal(), music: "Calm Piano" }, [top("music", MUSIC_LIMIT)]);
   const missing = minimal();
   delete missing.music;
   rejects(missing, [top("music", "required")]);
@@ -463,4 +479,216 @@ test("the JSON Schema states the skeleton, the block limit and the custom rule",
   assert.ok(schema.properties.endCard.required.includes("content"));
   assert.ok(!schema.properties.endCard.required.includes("narration"));
   assert.match(schema.description, /at most one `custom` scene/);
+});
+
+// --- voice (task 3.5) -----------------------------------------------------
+
+test("voice is optional, and a missing id or instructions comes back as an empty string", () => {
+  const cases = [
+    [undefined, { id: "", instructions: "" }],
+    [{}, { id: "", instructions: "" }],
+    [{ id: "alloy" }, { id: "alloy", instructions: "" }],
+    [{ instructions: "语速放慢" }, { id: "", instructions: "语速放慢" }],
+    [{ id: `v_1.${"x".repeat(60)}`, instructions: "慢".repeat(200) }, { id: `v_1.${"x".repeat(60)}`, instructions: "慢".repeat(200) }],
+  ];
+  for (const [voice, expected] of cases) {
+    const script = minimal();
+    if (voice !== undefined) script.voice = voice;
+    const result = validate(script);
+    assert.equal(result.ok, true, JSON.stringify(result.errors));
+    assert.deepEqual(result.script.voice, expected);
+    assert.deepEqual(Object.keys(result.script.voice), ["id", "instructions"]);
+  }
+});
+
+test("an invalid voice fails at the top level", () => {
+  rejects({ ...minimal(), voice: { id: "a".repeat(65) } }, [top("voice.id", "64 characters")]);
+  rejects({ ...minimal(), voice: { id: "alloy voice" } }, [top("voice.id", "letters, digits, . _ or -")]);
+  rejects({ ...minimal(), voice: { instructions: "慢".repeat(201) } }, [top("voice.instructions", "200 characters")]);
+  rejects({ ...minimal(), voice: { speed: 1 } }, [top("voice.speed", "unknown key")]);
+  const result = validate({ ...minimal(), voice: { id: "a".repeat(65) } });
+  assert.equal(result.errors[0].message, "script: voice.id is too long (limit 64 characters)");
+});
+
+// --- music id (#826 finding) ----------------------------------------------
+
+test("music is none or a track id of at most 40 characters that starts with a letter or digit", () => {
+  for (const music of ["-x", "a".repeat(41), "Calm", "a_b", ""]) rejects({ ...minimal(), music }, [top("music", MUSIC_LIMIT)]);
+  for (const music of ["none", "0", "a".repeat(40), "calm-piano-02", "x-"]) {
+    assert.equal(validate({ ...minimal(), music }).ok, true, music);
+  }
+});
+
+// --- size (#826 finding) --------------------------------------------------
+
+const SIZE = top("script.json", "size");
+const SIZE_MESSAGE = "script: script.json is too large to validate (limit size)";
+
+test("a text over 1 MiB in UTF-8 is refused before parsing", () => {
+  const big = JSON.stringify({ ...minimal(), title: "x".repeat(2 * 1024 * 1024) });
+  const result = validate(big);
+  assert.deepEqual(located(result), [SIZE]);
+  assert.equal(result.errors[0].message, SIZE_MESSAGE);
+  // 350,000 Han characters are under 1 MiB in UTF-16 units but over it in UTF-8.
+  const han3 = `{"x": "${"水".repeat(350000)}"}`;
+  assert.ok(han3.length < 1024 * 1024);
+  assert.deepEqual(located(validate(han3)), [SIZE]);
+  // Exactly 1 MiB (the script plus trailing spaces) is still validated; one byte more is not.
+  const json = JSON.stringify(minimal());
+  const exact = json + " ".repeat(1024 * 1024 - Buffer.byteLength(json));
+  assert.equal(Buffer.byteLength(exact), 1024 * 1024);
+  assert.equal(validate(exact).ok, true);
+  assert.deepEqual(located(validate(`${exact} `)), [SIZE]);
+});
+
+test("a RangeError inside validation becomes one size error", () => {
+  const script = minimal();
+  script.hook.narration = [Array(500000).fill(1)];
+  const text = JSON.stringify(script);
+  assert.ok(Buffer.byteLength(text) < 1024 * 1024);
+  const result = validate(text);
+  assert.deepEqual(located(result), [SIZE]);
+  assert.equal(result.errors[0].message, SIZE_MESSAGE);
+});
+
+test("only a RangeError is caught; any other exception propagates", (t) => {
+  t.mock.method(scriptSchema, "safeParse", () => {
+    throw new RangeError("Maximum call stack size exceeded");
+  });
+  assert.deepEqual(located(validate(minimal())), [SIZE]);
+  t.mock.restoreAll();
+  t.mock.method(scriptSchema, "safeParse", () => {
+    throw new TypeError("not a size problem");
+  });
+  assert.throws(() => validate(minimal()), { name: "TypeError", message: "not a size problem" });
+});
+
+// --- echo bounds (#826 finding) -------------------------------------------
+
+test("a chapter name over 40 code points is cut with …", () => {
+  const script = minimal();
+  script.chapters[0].name = han(100);
+  const result = validate(script);
+  const label = `1 ${han(40)}…`;
+  assert.deepEqual(located(result), [{ chapter: label, scene: null, field: "name", limit: "6 characters" }]);
+  assert.equal(result.errors[0].message, `chapter ${label}: name is too long (limit 6 characters)`);
+  const emoji = minimal();
+  emoji.chapters[0].name = "😀".repeat(41);
+  assert.equal(validate(emoji).errors[0].chapter, `1 ${"😀".repeat(40)}…`);
+  const forty = minimal();
+  forty.chapters[0].name = han(40);
+  assert.equal(validate(forty).errors[0].chapter, `1 ${han(40)}`);
+});
+
+test("control characters in a chapter name are escaped, after the cut", () => {
+  const script = minimal();
+  script.chapters[1].name = "a\tb\nc\rd\u0000e\u001ff\u007fg\u009fh i j\"k\\l";
+  script.chapters[1].scenes[0].narration = [[]];
+  const label = '2 a\\tb\\nc\\rd\\u0000e\\u001ff\\u007fg\\u009fh\\u2028i\\u2029j"k\\l';
+  const result = validate(script);
+  assert.deepEqual(located(result), [
+    { chapter: label, scene: null, field: "name", limit: "6 characters" },
+    { chapter: label, scene: 1, field: "narration[0]", limit: "1–4 blocks" },
+  ]);
+  assert.equal(result.errors[1].message, `chapter ${label}, scene 1 (question): narration[0] has too few entries (limit 1–4 blocks)`);
+  const cut = minimal();
+  cut.chapters[0].name = `${han(40)}\n`;
+  assert.equal(validate(cut).errors[0].chapter, `1 ${han(40)}…`);
+});
+
+test("an unknown key is cut and escaped in field and message", () => {
+  const key = "a\nb c\u0008\"\\";
+  const result = validate({ ...minimal(), [key]: 1 });
+  assert.deepEqual(located(result), [top('a\\nb\\u2028c\\u0008"\\', "unknown key")]);
+  assert.equal(result.errors[0].message, 'script: a\\nb\\u2028c\\u0008"\\ is not allowed (limit unknown key)');
+  const long = validate(withScene(minimal(), 0, 0, (s) => (s.content[`${"k".repeat(40)}\n${"z".repeat(10)}`] = 1)));
+  assert.deepEqual(located(long), [{ chapter: "1 现象", scene: 1, field: `content.${"k".repeat(40)}…`, limit: "unknown key" }]);
+});
+
+// --- nested strict objects and per-kind limits (#826 finding) ---------------
+
+// The first scene of each kind in maximal(): body index i sits in chapter
+// floor(i / 4) + 1, scene i % 4 + 1.
+function inMaximal(kind, edit) {
+  const script = maximal();
+  const slot = { hook: "hook", summary: "summary", "end-card": "endCard" }[kind];
+  if (slot) {
+    edit(script[slot]);
+    return { script, where: { chapter: null, scene: kind } };
+  }
+  for (const [c, chapter] of script.chapters.entries()) {
+    const s = chapter.scenes.findIndex((scene) => scene.kind === kind);
+    if (s >= 0) {
+      edit(chapter.scenes[s]);
+      return { script, where: { chapter: `${c + 1} ${han(6)}`, scene: s + 1 } };
+    }
+  }
+  throw new Error(`maximal() has no ${kind} scene`);
+}
+
+function rejectsIn(kind, edit, field, limit) {
+  const { script, where } = inMaximal(kind, edit);
+  rejects(script, [{ ...where, field, limit }]);
+}
+
+const extra = (value) => ({ ...value, extra: 1 });
+
+test("every nested strict object refuses an unknown key", () => {
+  rejectsIn("comparison", (s) => (s.content.left = extra(s.content.left)), "content.left.extra", "unknown key");
+  rejectsIn("process-steps", (s) => (s.content.steps[0] = extra(s.content.steps[0])), "content.steps[0].extra", "unknown key");
+  rejectsIn("timeline", (s) => (s.content.events[1] = extra(s.content.events[1])), "content.events[1].extra", "unknown key");
+  rejectsIn("chart", (s) => (s.content.points[0] = extra(s.content.points[0])), "content.points[0].extra", "unknown key");
+  rejectsIn("image-callouts", (s) => (s.content.callouts[2] = extra(s.content.callouts[2])), "content.callouts[2].extra", "unknown key");
+  rejectsIn("custom", (s) => (s.extra = 1), "extra", "unknown key");
+});
+
+const more = (list, n = 1) => [...list, ...Array(n).fill(list[0])];
+const setAt = (list, index, patch) => list.map((item, i) => (i === index ? { ...item, ...patch } : item));
+
+test("every per-kind content field refuses its limit plus one", () => {
+  const cases = [
+    ["hook", (s) => (s.content.title = han(17)), "content.title", "16 characters"],
+    ["hook", (s) => (s.content.subtitle = han(25)), "content.subtitle", "24 characters"],
+    ["question", (s) => (s.content.question = han(25)), "content.question", "24 characters"],
+    ["concept-card", (s) => (s.content.kicker = han(9)), "content.kicker", "8 characters"],
+    ["concept-card", (s) => (s.content.title = han(13)), "content.title", "12 characters"],
+    ["concept-card", (s) => (s.content.points = more(s.content.points)), "content.points", "1–4 points"],
+    ["concept-card", (s) => (s.content.points[3] = han(17)), "content.points[3]", "16 characters"],
+    ["concept-card", (s) => (s.content.conclusion = han(21)), "content.conclusion", "20 characters"],
+    ["process-steps", (s) => (s.content.steps = more(s.content.steps)), "content.steps", "2–5 steps"],
+    ["process-steps", (s) => (s.content.steps = setAt(s.content.steps, 0, { label: han(9) })), "content.steps[0].label", "8 characters"],
+    ["process-steps", (s) => (s.content.steps = setAt(s.content.steps, 4, { detail: han(17) })), "content.steps[4].detail", "16 characters"],
+    ["cause-effect", (s) => (s.content.cause = han(17)), "content.cause", "16 characters"],
+    ["cause-effect", (s) => (s.content.effect = han(17)), "content.effect", "16 characters"],
+    ["cause-effect", (s) => (s.content.link = han(9)), "content.link", "8 characters"],
+    ["comparison", (s) => (s.content.left = { ...s.content.left, title: han(9) }), "content.left.title", "8 characters"],
+    ["comparison", (s) => (s.content.right = { ...s.content.right, points: more(s.content.right.points) }), "content.right.points", "1–4 points"],
+    ["comparison", (s) => (s.content.right = { ...s.content.right, points: [han(13)] }), "content.right.points[0]", "12 characters"],
+    ["timeline", (s) => (s.content.events = more(s.content.events)), "content.events", "2–6 events"],
+    ["timeline", (s) => (s.content.events = setAt(s.content.events, 0, { year: han(9) })), "content.events[0].year", "8 characters"],
+    ["timeline", (s) => (s.content.events = setAt(s.content.events, 1, { label: han(13) })), "content.events[1].label", "12 characters"],
+    ["timeline", (s) => (s.content.events = setAt(s.content.events, 5, { detail: han(17) })), "content.events[5].detail", "16 characters"],
+    ["key-number", (s) => (s.content.unit = han(5)), "content.unit", "4 characters"],
+    ["key-number", (s) => (s.content.label = han(13)), "content.label", "12 characters"],
+    ["chart", (s) => (s.content.title = han(13)), "content.title", "12 characters"],
+    ["chart", (s) => (s.content.unit = han(5)), "content.unit", "4 characters"],
+    ["chart", (s) => (s.content.points = more(s.content.points)), "content.points", "2–8 points"],
+    ["chart", (s) => (s.content.points = setAt(s.content.points, 7, { label: han(7) })), "content.points[7].label", "6 characters"],
+    ["image-callouts", (s) => (s.content.callouts = more(s.content.callouts)), "content.callouts", "1–3 callouts"],
+    ["image-callouts", (s) => (s.content.callouts = setAt(s.content.callouts, 0, { label: han(11) })), "content.callouts[0].label", "10 characters"],
+    ["image-callouts", (s) => (s.content.callouts = setAt(s.content.callouts, 1, { x: 1.01 })), "content.callouts[1].x", "0–1"],
+    ["definition-quote", (s) => (s.content.term = han(11)), "content.term", "10 characters"],
+    ["definition-quote", (s) => (s.content.text = han(41)), "content.text", "40 characters"],
+    ["definition-quote", (s) => (s.content.source = han(17)), "content.source", "16 characters"],
+    ["custom", (s) => (s.component = `B${"a".repeat(40)}`), "component", "PascalCase name of up to 40 characters"],
+    ["summary", (s) => (s.content.points = more(s.content.points)), "content.points", "1–4 points"],
+    ["summary", (s) => (s.content.points[0] = han(17)), "content.points[0]", "16 characters"],
+    ["end-card", (s) => (s.content.title = han(17)), "content.title", "16 characters"],
+    ["end-card", (s) => (s.content.subtitle = han(25)), "content.subtitle", "24 characters"],
+    ["question", (s) => (s.narration = more(s.narration)), "narration", "1–4 sentences"],
+    ["question", (s) => (s.narration[0] = more(s.narration[0])), "narration[0]", "1–4 blocks"],
+    ["end-card", (s) => (s.narration = more(s.narration)), "narration", "0–4 sentences"],
+    ["question", (s) => (s.image = `${"a".repeat(65)}.png`), "image", IMAGE_LIMIT],
+  ];
+  for (const [kind, edit, field, limit] of cases) rejectsIn(kind, edit, field, limit);
 });
