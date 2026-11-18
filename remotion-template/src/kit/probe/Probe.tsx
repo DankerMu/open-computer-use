@@ -27,9 +27,10 @@ const WIDTH = 1920;
 const HEIGHT = 1080;
 const FPS = 30;
 // Remotion mounts a page's first frame in an off-screen portal and moves it
-// onto the canvas a moment later; measured there, text sits at y ≈ -999900
-// and wraps in a 96 px wide box. Measurement waits until the scene root
-// covers the canvas, for at most this many animation frames.
+// onto the canvas a moment later. Measured after one animation frame, text
+// in the image's shell lay at y = -999899 in a 96 px wide layout. So the
+// measurement waits until the scene root covers the canvas, for at most
+// this many animation frames.
 const ATTACH_FRAMES = 120;
 
 function sceneFor(scenes: Scenes, key: string) {

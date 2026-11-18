@@ -16,10 +16,11 @@ const theme = themes.light;
 const BODY = theme.type.sizes.body;
 const PARAGRAPH = '光线从空气斜射入水中时，传播方向发生改变。';
 const PARAGRAPH_WIDTH = 12;
-// The two masks hold 50 px text, whose 70 px line box is whole pixels.
-// Chrome puts a text's baseline on a whole pixel, so at 48 px (67.2 px line)
-// the trimmed glyph box sits 0.6 px above the line box, past the 0.5 px
-// tolerance, and a mask exactly the size of its line is reported.
+// The two masks hold 50 px text, whose line box (70 px) is whole pixels.
+// Measured in the image at 48 px: a code point's rect spans y 98–168 on a
+// line box of 100–167.2, so the rect trimmed about its centre spans
+// 99.4–166.6. It crosses a mask exactly the size of its line by 0.6 px,
+// past the 0.5 px tolerance, and is reported.
 const MASKED = {fontSize: 50} as const;
 
 // One line of body text, never wrapped by CSS.

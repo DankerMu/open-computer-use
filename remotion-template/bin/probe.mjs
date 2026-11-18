@@ -121,7 +121,12 @@ export async function probe({ entryPoint, targets } = {}) {
   const inputProps = {
     targets: placed.map(({ scene, props, durationInFrames }) => ({ scene, props, durationInFrames })),
   };
-  const dir = await mkdtemp(join(tmpdir(), "kit-probe-"));
+  let dir;
+  try {
+    dir = await mkdtemp(join(tmpdir(), "kit-probe-"));
+  } catch (error) {
+    fail(`cannot create a temporary directory (${error.message})`);
+  }
   try {
     const lines = [];
     let composition;
@@ -137,9 +142,10 @@ export async function probe({ entryPoint, targets } = {}) {
         frames: indexes,
         imageFormat: "none",
         outputDir: null,
-        // One page renders every frame in order. Each extra page would first
-        // mount at its own initial frame and log a record for it, then seek
-        // to whichever frame the pool hands it: a duplicate record.
+        // One page renders every frame in order. An extra page first mounts
+        // at its own initial frame, where it can log a record, and then
+        // seeks to whichever frame the pool hands it, which can duplicate
+        // another page's record.
         concurrency: 1,
         onStart: () => {},
         onFrameUpdate: () => {},

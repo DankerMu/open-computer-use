@@ -414,6 +414,21 @@ test("invalid targets reject with a named error before anything is bundled", asy
   }
 });
 
+test("a temporary directory that cannot be created rejects with a named error", async () => {
+  const saved = process.env.TMPDIR;
+  process.env.TMPDIR = join(tmpdir(), "probe-test-missing", "nested");
+  const target = { id: "a", scene: "fits", props: {}, durationInFrames: 10, entranceFrames: 0, exitFrame: 10 };
+  try {
+    await assert.rejects(
+      probe({ entryPoint: "/nonexistent/entry.tsx", targets: [target] }),
+      /^Error: kit probe: cannot create a temporary directory \(ENOENT/,
+    );
+  } finally {
+    if (saved === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = saved;
+  }
+});
+
 // --- dependencies -------------------------------------------------------------------
 
 test("the bundler and renderer resolve to Remotion 4.0.537", () => {
