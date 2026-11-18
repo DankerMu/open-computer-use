@@ -528,14 +528,16 @@ test("ffmpeg absent from PATH fails, naming it", async (t) => {
 });
 
 // A directory holding an `ffmpeg` that runs `sabotage` when its arguments
-// contain `match` and the real ffmpeg otherwise; the kit is not changed.
-function fakeFfmpeg(box, match, sabotage) {
+// contain `match`, for each [match, sabotage] pair in order, and the real
+// ffmpeg otherwise; the kit is not changed.
+function fakeFfmpeg(box, ...cases) {
   const found = spawnSync("sh", ["-c", "command -v ffmpeg"], { encoding: "utf8" });
   const real = found.stdout.trim();
   assert.ok(real.startsWith("/"), "ffmpeg: not found on PATH; the timeline tests need it");
   const dir = join(box.base, "fake-bin");
   mkdirSync(dir);
-  const script = `#!/bin/sh\ncase "$*" in\n  *${match}*) ${sabotage.replaceAll("REAL", `'${real}'`)} ;;\nesac\nexec '${real}' "$@"\n`;
+  const arms = cases.map(([match, sabotage]) => `  *${match}*) ${sabotage.replaceAll("REAL", `'${real}'`)} ;;\n`).join("");
+  const script = `#!/bin/sh\ncase "$*" in\n${arms}esac\nexec '${real}' "$@"\n`;
   writeFileSync(join(dir, "ffmpeg"), script, { mode: 0o755 });
   return `${dir}:${process.env.PATH}`;
 }
@@ -558,7 +560,7 @@ test("a narration failing the loudness gate fails and replaces nothing", async (
   const summary =
     "[Parsed_ebur128_0 @ 0x1] Summary:\\n\\n  Integrated loudness:\\n    I:         -20.0 LUFS\\n" +
     "    Threshold: -30.0 LUFS\\n\\n  True peak:\\n    Peak:       -5.0 dBFS\\n";
-  const path = fakeFfmpeg(box, "ebur128=peak=true", `printf '${summary}' >&2; exit 0`);
+  const path = fakeFfmpeg(box, ["ebur128=peak=true", `printf '${summary}' >&2; exit 0`]);
   childFailsWith(
     box,
     path,
@@ -568,7 +570,7 @@ test("a narration failing the loudness gate fails and replaces nothing", async (
 
 test("a normalized narration of the wrong length fails and replaces nothing", async (t) => {
   const box = await timedProject(t);
-  const path = fakeFfmpeg(box, "linear=true", "REAL \"$@\" | head -c 32000; exit 0");
+  const path = fakeFfmpeg(box, ["linear=true", "REAL \"$@\" | head -c 32000; exit 0"]);
   childFailsWith(box, path, `kit timeline: narration has 16000 samples, expected ${box.totalFrames * 1600}\n`);
 });
 
@@ -577,7 +579,7 @@ test("a narration whose true peak exceeds -1.0 dBTP fails the gate and replaces 
   const summary =
     "[Parsed_ebur128_0 @ 0x1] Summary:\\n\\n  Integrated loudness:\\n    I:         -16.0 LUFS\\n" +
     "    Threshold: -26.0 LUFS\\n\\n  True peak:\\n    Peak:       -0.5 dBFS\\n";
-  const path = fakeFfmpeg(box, "ebur128=peak=true", `printf '${summary}' >&2; exit 0`);
+  const path = fakeFfmpeg(box, ["ebur128=peak=true", `printf '${summary}' >&2; exit 0`]);
   childFailsWith(
     box,
     path,
@@ -585,12 +587,18 @@ test("a narration whose true peak exceeds -1.0 dBTP fails the gate and replaces 
   );
 });
 
-test("an ffmpeg killed by a signal while decoding is named by its signal", async (t) => {
+test("a decode ended by a signal, or failing silently, is named by how ffmpeg exited", async (t) => {
   const box = await project(t);
   writeFileSync(join(box.root, "timeline.json"), "old timeline\n");
   writeFileSync(join(box.root, "public", "narration.wav"), "old narration");
-  const path = fakeFfmpeg(box, box.stems[0], "kill -KILL $$");
-  childFailsWith(box, path, `kit timeline: hook, sentence 1 block 1: cannot be decoded: ffmpeg exited with SIGKILL\n${RUN_HINT}`);
+  const path = fakeFfmpeg(box, [box.stems[0], "echo 'partial line' >&2; kill -KILL $$"], [box.stems[3], "exit 3"]);
+  childFailsWith(
+    box,
+    path,
+    "kit timeline: hook, sentence 1 block 1: cannot be decoded: ffmpeg exited with SIGKILL\n" +
+      "kit timeline: chapter 2 原理, scene 1 (question), sentence 1 block 1: cannot be decoded: ffmpeg exited with 3\n" +
+      RUN_HINT,
+  );
 });
 
 test("the summary line gives seconds and LUFS to one decimal", () => {
