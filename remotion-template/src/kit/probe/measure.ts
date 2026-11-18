@@ -130,47 +130,64 @@ function blockOf(el: Element, root: Element): Element {
 	return root;
 }
 
+const CONTAINING_WILL_CHANGE = /\b(transform|translate|rotate|scale|perspective|filter|backdrop-filter)\b/;
+
 // Whether el is the containing block of an absolutely (or, with `fixed`,
 // a fixed) positioned descendant: a positioned element for `absolute`, and
-// for both an element with a transform, perspective, filter, paint or
-// layout containment, or `will-change: transform`.
-function containsPositioned(el: Element, fixed: boolean): boolean {
-	const style = getComputedStyle(el);
+// for both an element with a transform (also the individual translate,
+// rotate and scale properties, or preserve-3d), perspective, filter,
+// backdrop-filter, paint or layout containment (content-visibility: auto
+// implies paint), or will-change naming one of those. `container-type` is
+// left out: Chrome 157 does not clip there.
+function containsPositioned(style: CSSStyleDeclaration, fixed: boolean): boolean {
 	if (!fixed && style.position !== 'static') return true;
+	const value = (property: string) => style.getPropertyValue(property);
 	return (
-		style.transform !== 'none' ||
-		style.perspective !== 'none' ||
-		style.filter !== 'none' ||
-		/\b(paint|layout|strict|content)\b/.test(style.contain) ||
-		/\btransform\b/.test(style.willChange)
+		value('transform') !== 'none' ||
+		value('translate') !== 'none' ||
+		value('rotate') !== 'none' ||
+		value('scale') !== 'none' ||
+		value('transform-style') === 'preserve-3d' ||
+		value('perspective') !== 'none' ||
+		value('filter') !== 'none' ||
+		value('backdrop-filter') !== 'none' ||
+		/\b(paint|layout|strict|content)\b/.test(value('contain')) ||
+		value('content-visibility') === 'auto' ||
+		CONTAINING_WILL_CHANGE.test(value('will-change'))
 	);
 }
 
-// The record element's clipping ancestors, nearest first: the element
-// itself and those of its ancestors up to root that clip and hold the
-// containing block of every absolutely or fixed positioned element between
-// them and the record. Overflow does not clip a positioned descendant whose
-// containing block lies outside it (CSS 2.1 §11.1.1); a fixed element with
-// no transformed ancestor belongs to the viewport, which no element clips.
-function clippingAncestors(el: Element, root: Element): Element[] {
-	const clipping: Element[] = [];
-	const pending: boolean[] = [];
-	for (const e of chain(el, root)) {
-		if (e !== el) {
-			for (let k = pending.length - 1; k >= 0; k -= 1) {
-				if (containsPositioned(e, pending[k])) pending.splice(k, 1);
-			}
-		}
-		if (pending.length === 0 && isClipping(e)) clipping.push(e);
-		const position = getComputedStyle(e).position;
-		if (position === 'absolute' || position === 'fixed') pending.push(position === 'fixed');
-	}
-	return clipping;
+type Clipping = {el: Element; overflow: boolean};
+
+function clipsByOverflow(style: CSSStyleDeclaration): boolean {
+	return CLIPPING_OVERFLOW.has(style.overflowX) || CLIPPING_OVERFLOW.has(style.overflowY);
 }
 
-function isClipping(el: Element): boolean {
-	const style = getComputedStyle(el);
-	return CLIPPING_OVERFLOW.has(style.overflowX) || CLIPPING_OVERFLOW.has(style.overflowY) || style.clipPath !== 'none';
+// The record element's clipping ancestors, nearest first: the element
+// itself and those of its ancestors up to root that clip it. A clip-path
+// clips the whole painted subtree. Overflow does not clip a positioned
+// descendant whose containing block lies outside it (CSS 2.1 §11.1.1), so
+// it counts only when every absolutely or fixed positioned element between
+// the ancestor and the record has its containing block at or inside that
+// ancestor; a fixed element with none belongs to the viewport. `overflow`
+// tells whether the ancestor's overflow part applies. An element with
+// display: contents has no box: it neither clips nor contains.
+function clippingAncestors(el: Element, root: Element): Clipping[] {
+	const clipping: Clipping[] = [];
+	const pending: boolean[] = [];
+	for (const e of chain(el, root)) {
+		const style = getComputedStyle(e);
+		if (style.display === 'contents') continue;
+		if (e !== el) {
+			for (let k = pending.length - 1; k >= 0; k -= 1) {
+				if (containsPositioned(style, pending[k])) pending.splice(k, 1);
+			}
+		}
+		const overflow = pending.length === 0 && clipsByOverflow(style);
+		if (overflow || style.clipPath !== 'none') clipping.push({el: e, overflow});
+		if (style.position === 'absolute' || style.position === 'fixed') pending.push(style.position === 'fixed');
+	}
+	return clipping;
 }
 
 // `inset()` with one to four px or % lengths and no `round`, as
@@ -199,15 +216,16 @@ function insetOf(clipPath: string, border: Edges, scale: number): Edges | null {
 	};
 }
 
-// Overflow clips to the padding box; an inset() clip-path to that inset of
-// the border box, which negative insets extend beyond the border box; both
-// to their intersection; any other clip-path is not measurable.
-function clipBoxOf(el: Element, root: Element): Box | null {
+// Overflow, when it applies, clips to the padding box; an inset()
+// clip-path to that inset of the border box, which negative insets extend
+// beyond the border box; both to their intersection; any other clip-path
+// is not measurable.
+function clipBoxOf(el: Element, root: Element, overflow: boolean): Box | null {
 	const style = getComputedStyle(el);
 	const scale = renderedScale(el, root);
 	const border = edgesOf(el.getBoundingClientRect());
 	let clip: Edges | null = null;
-	if (CLIPPING_OVERFLOW.has(style.overflowX) || CLIPPING_OVERFLOW.has(style.overflowY)) {
+	if (overflow && clipsByOverflow(style)) {
 		clip = {
 			left: border.left + parseFloat(style.borderLeftWidth) * scale,
 			top: border.top + parseFloat(style.borderTopWidth) * scale,
@@ -285,7 +303,7 @@ function measureRecord(el: Element, nodes: Text[], root: Element): TextRecord {
 		minFontSizePx: round(minFontSize),
 		scale: round(maxScale),
 		lines,
-		clippedBy: clippingAncestors(el, root).map((e) => pathOf(e, root)),
+		clippedBy: clippingAncestors(el, root).map(({el: e}) => pathOf(e, root)),
 	};
 }
 
@@ -337,16 +355,20 @@ export function measureFrame(root: Element): Measurement {
 		.filter((el) => SCROLLING_OVERFLOW.has(getComputedStyle(el).overflowX) && el.clientWidth > 0 && el.scrollWidth > el.clientWidth)
 		.map((el) => ({path: pathOf(el, root), scrollWidth: el.scrollWidth, clientWidth: el.clientWidth}));
 
-	const masks: Measurement['masks'] = [];
-	const seen = new Set<string>();
+	// One mask per clipping element. Its overflow part applies when it
+	// clips any of its records; a record whose positioned element escapes
+	// that overflow is then judged against the smaller box.
+	const overflowOf = new Map<Element, boolean>();
 	for (const el of elements) {
-		for (const e of clippingAncestors(el, root)) {
-			const path = pathOf(e, root);
-			if (seen.has(path)) continue;
-			seen.add(path);
-			masks.push({path, clipPath: getComputedStyle(e).clipPath, clipBox: clipBoxOf(e, root)});
+		for (const {el: e, overflow} of clippingAncestors(el, root)) {
+			overflowOf.set(e, (overflowOf.get(e) ?? false) || overflow);
 		}
 	}
+	const masks = Array.from(overflowOf, ([e, overflow]) => ({
+		path: pathOf(e, root),
+		clipPath: getComputedStyle(e).clipPath,
+		clipBox: clipBoxOf(e, root, overflow),
+	}));
 
 	return {fontPresent: fontPresent(KIT_FONT), texts, hidden, marked, scrolls, masks};
 }

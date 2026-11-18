@@ -150,6 +150,38 @@ const FixedClipped = () => (
 	</div>
 );
 
+// A clip-path clips positioned descendants too, whatever their containing
+// block: the absolute text at x 300–684 is cut at x 500.
+const ClipPathNonCb = () => (
+	<div style={{width: 1000, height: 400, clipPath: 'inset(0 50% 0 0)'}}>
+		<div style={{...line, left: 300, top: 200}}>裁剪路径不是容器</div>
+	</div>
+);
+
+// A static element with a backdrop-filter (or an individual rotate) is the
+// containing block of the absolute text, so the overflow: hidden wrapper
+// around it clips the text, which crosses the wrapper's right edge.
+const ContainedBy = ({style}: {style: React.CSSProperties}) => (
+	<div style={{marginLeft: 600, marginTop: 400, width: 300, height: 100, overflow: 'hidden'}}>
+		<div style={style}>
+			<div style={{...line, left: 200, top: 20}}>越过边缘</div>
+		</div>
+	</div>
+);
+const Backdrop = () => <ContainedBy style={{backdropFilter: 'blur(2px)'}} />;
+const Rotate = () => <ContainedBy style={{rotate: '0deg'}} />;
+
+// display: contents has no box: the positioned element is no containing
+// block, so the wrapper does not clip the text, which shows past the safe
+// area's left edge.
+const Contents = () => (
+	<div style={{marginLeft: 600, marginTop: 400, width: 300, height: 100, overflow: 'hidden'}}>
+		<div style={{display: 'contents', position: 'relative'}}>
+			<div style={{...line, left: 10, top: 600}}>无盒子</div>
+		</div>
+	</div>
+);
+
 // Negative insets reach past the 96 px border box around the 240 px text.
 const ClipNegative = () => (
 	<div style={{...line, left: 200, top: 200, width: 96, clipPath: 'inset(-10px -200px -10px -10px)'}}>负值裁剪框</div>
@@ -255,6 +287,10 @@ export const scenes = {
 	'escaped-abs': EscapedAbs,
 	'clipped-abs': ClippedAbs,
 	'fixed-clipped': FixedClipped,
+	'clip-path-noncb': ClipPathNonCb,
+	backdrop: Backdrop,
+	rotate: Rotate,
+	contents: Contents,
 	'clip-negative': ClipNegative,
 	'inline-small': InlineSmall,
 	'wrap-start-spaces': WrapStartSpaces,

@@ -51,6 +51,12 @@ const CASES = [
   ["fixed-clipped", "fixed-clipped", 60, 10, F60, []],
   // Only the safe-area rule: the static wrapper is no clipping ancestor.
   ["escaped-abs", "escaped-abs", 60, 10, F60, [["outside safe area", `${P1}>div:nth-child(1)`]]],
+  // A clip-path clips whatever the containing block.
+  ["clip-path-noncb", "clip-path-noncb", 60, 10, F60, [["mask clips", `${P1}>div:nth-child(1)`]]],
+  ["backdrop", "backdrop", 60, 10, F60, [["mask clips", `${P1}>div:nth-child(1)>div:nth-child(1)`]]],
+  ["rotate", "rotate", 60, 10, F60, [["mask clips", `${P1}>div:nth-child(1)>div:nth-child(1)`]]],
+  // display: contents contains nothing, so the wrapper does not clip.
+  ["contents", "contents", 60, 10, F60, [["outside safe area", `${P1}>div:nth-child(1)>div:nth-child(1)`]]],
   ["clip-negative", "clip-negative", 60, 10, F60, []],
   ["edge-over", "edge-over", 60, 10, F60, [["outside safe area", P1]]],
   ["small-font", "small-font", 60, 10, F60, [["font size", P1]]],
@@ -298,6 +304,15 @@ test("clipped overflow, negative insets and inline sizes are recorded as rendere
     const [record] = frame.texts;
     assert.deepEqual(record.clippedBy, [], `${frame.role}: the static wrapper does not clip`);
     near(record.glyphBox.x, 10, `${frame.role} escaped x`);
+  }
+  for (const frame of framesOf(first, "clip-path-noncb")) {
+    // Only the clip-path part: x 0–500 of the 1000 x 400 wrapper.
+    const [{ clipBox }] = frame.masks;
+    const expected = { x: 0, y: 0, width: 500, height: 400 };
+    for (const key of Object.keys(expected)) near(clipBox[key], expected[key], `${frame.role} clip-path ${key}`);
+  }
+  for (const frame of framesOf(first, "contents")) {
+    assert.deepEqual(frame.texts[0].clippedBy, [], `${frame.role}: display: contents contains nothing`);
   }
   for (const frame of framesOf(first, "clipped-abs")) {
     assert.deepEqual(frame.texts[0].clippedBy, [P1], frame.role);
