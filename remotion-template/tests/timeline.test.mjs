@@ -34,11 +34,15 @@ import { validateScript } from "../bin/script-schema.mjs";
 import { blockStems } from "../bin/voice-stem.mjs";
 import { layout } from "../bin/scene-timing.mjs";
 import { run } from "../bin/kit.mjs";
-import { lengthError } from "../bin/timeline.mjs";
+import { lengthError, summaryLine } from "../bin/timeline.mjs";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const RUN_HINT = "kit timeline: run node bin/kit.mjs voice, then voice-import\n";
-const ZERO_BYTE = "cannot be decoded: Error opening input: Invalid data found when processing input";
+// A voice file is read with the WAV demuxer only; ffmpeg 6.1.1 and 9.0.1
+// give the same first line for each of these.
+const ZERO_BYTE = "cannot be decoded: invalid start code [0][0][0][0] in RIFF header";
+const CONCAT_LIST = "cannot be decoded: invalid start code ffco in RIFF header";
+const FLAC_FILE = "cannot be decoded: invalid start code fLaC in RIFF header";
 // -40 dBFS: well above the zeros between blocks, well below every tone.
 const AUDIBLE = 328;
 // Inside a tone the audible samples are never this far apart; between two
@@ -80,11 +84,13 @@ function ffmpeg(args) {
   return result.stdout;
 }
 
-function tone(path, seconds, frequency = 440) {
-  const pad = "anullsrc=r=48000:cl=mono:d=0.3";
+function tone(path, seconds, { rate = 48000, channels = 1 } = {}) {
+  const pad = `anullsrc=r=${rate}:cl=mono:d=0.3`;
   ffmpeg([
     "-filter_complex",
-    `${pad}[a];sine=f=${frequency}:r=48000:d=${seconds}[b];${pad}[c];[a][b][c]concat=n=3:v=0:a=1`,
+    `${pad}[a];sine=f=440:r=${rate}:d=${seconds}[b];${pad}[c];[a][b][c]concat=n=3:v=0:a=1`,
+    "-ac",
+    String(channels),
     "-c:a",
     "pcm_s16le",
     path,
@@ -254,6 +260,8 @@ test("timeline places every block on its audio and writes a -16 LUFS narration o
   assert.equal(chunks["fmt "].readUInt16LE(0), 1);
   assert.equal(chunks["fmt "].readUInt16LE(2), 1);
   assert.equal(chunks["fmt "].readUInt32LE(4), 48000);
+  assert.equal(chunks["fmt "].readUInt32LE(8), 96000);
+  assert.equal(chunks["fmt "].readUInt16LE(12), 2);
   assert.equal(chunks["fmt "].readUInt16LE(14), 16);
   assert.equal(chunks.data.length, timeline.totalFrames * 1600 * 2);
   const samples = samplesOf(join(box.root, "public", "narration.wav"));
@@ -405,6 +413,33 @@ test("a 0-byte voice file cannot be decoded, with ffmpeg's reason", async (t) =>
   await failsWith(box, `kit timeline: chapter 1 现象, scene 1 (question), sentence 1 block 1: ${ZERO_BYTE}\n${RUN_HINT}`);
 });
 
+test("a concat list or a FLAC file under a .wav name cannot be decoded", async (t) => {
+  const box = await project(t);
+  copyFileSync(box.wav(box.stems[1]), join(box.voice, "seg.wav"));
+  writeFileSync(box.wav(box.stems[0]), "ffconcat version 1.0\nfile seg.wav\n");
+  unlinkSync(box.wav(box.stems[3]));
+  ffmpeg(["-i", box.wav(box.stems[1]), "-f", "flac", box.wav(box.stems[3])]);
+  await failsWith(
+    box,
+    `kit timeline: hook, sentence 1 block 1: ${CONCAT_LIST}\n` +
+      `kit timeline: chapter 2 原理, scene 1 (question), sentence 1 block 1: ${FLAC_FILE}\n` +
+      RUN_HINT,
+  );
+});
+
+test("a 24 kHz stereo voice file decodes to its 48 kHz mono trimmed length", async (t) => {
+  const box = await project(t, minimal(), IN_WINDOW);
+  unlinkSync(box.wav(box.stems[0]));
+  tone(box.wav(box.stems[0]), 9.02, { rate: 24000, channels: 2 });
+  const result = await box.timeline();
+  assert.equal(result.code, 0, result.err);
+  const hook = JSON.parse(readFileSync(join(box.root, "timeline.json"), "utf8")).scenes[0].sentences[0].blocks[0];
+  // 9.02 s of tone at 48 kHz, plus at most 0.02 s kept at each end and a
+  // little resampling slack.
+  const samples = hook.endSample - hook.startSample;
+  assert.ok(samples >= 432960 && samples <= 432960 + 1920 + 100, `${samples} samples`);
+});
+
 test("a symlinked voice file or a directory at a voice name counts as missing", async (t) => {
   const box = await project(t);
   const outside = join(box.base, "outside.wav");
@@ -535,6 +570,32 @@ test("a normalized narration of the wrong length fails and replaces nothing", as
   const box = await timedProject(t);
   const path = fakeFfmpeg(box, "linear=true", "REAL \"$@\" | head -c 32000; exit 0");
   childFailsWith(box, path, `kit timeline: narration has 16000 samples, expected ${box.totalFrames * 1600}\n`);
+});
+
+test("a narration whose true peak exceeds -1.0 dBTP fails the gate and replaces nothing", async (t) => {
+  const box = await timedProject(t);
+  const summary =
+    "[Parsed_ebur128_0 @ 0x1] Summary:\\n\\n  Integrated loudness:\\n    I:         -16.0 LUFS\\n" +
+    "    Threshold: -26.0 LUFS\\n\\n  True peak:\\n    Peak:       -0.5 dBFS\\n";
+  const path = fakeFfmpeg(box, "ebur128=peak=true", `printf '${summary}' >&2; exit 0`);
+  childFailsWith(
+    box,
+    path,
+    "kit timeline: narration measures -16.0 LUFS, -0.5 dBTP; needs -16 ± 1 LUFS and at most -1.0 dBTP\n",
+  );
+});
+
+test("an ffmpeg killed by a signal while decoding is named by its signal", async (t) => {
+  const box = await project(t);
+  writeFileSync(join(box.root, "timeline.json"), "old timeline\n");
+  writeFileSync(join(box.root, "public", "narration.wav"), "old narration");
+  const path = fakeFfmpeg(box, box.stems[0], "kill -KILL $$");
+  childFailsWith(box, path, `kit timeline: hook, sentence 1 block 1: cannot be decoded: ffmpeg exited with SIGKILL\n${RUN_HINT}`);
+});
+
+test("the summary line gives seconds and LUFS to one decimal", () => {
+  assert.equal(summaryLine(26, 8, 2030, -16), "26 blocks, 8 scenes, 67.7 s (2030 frames), -16.0 LUFS");
+  assert.equal(summaryLine(6, 6, 1908, -15.96), "6 blocks, 6 scenes, 63.6 s (1908 frames), -16.0 LUFS");
 });
 
 test("the length window takes 1800 and 5400 frames and names 1799 and 5401, rounded outward", () => {

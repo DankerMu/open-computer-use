@@ -17,7 +17,9 @@ permissions:
 
 jobs:
   template-tests:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, whose ffmpeg is 8.0.1, not the
+    # image's 6.1.1.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:

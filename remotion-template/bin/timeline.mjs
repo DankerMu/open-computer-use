@@ -21,6 +21,10 @@ import { blockStems } from "./voice-stem.mjs";
 const MAX_BUFFER = 32 * 1024 * 1024;
 const SAMPLES_PER_FRAME = SAMPLE_RATE / FPS;
 const BYTES_PER_SAMPLE = 2;
+// A voice file is read as WAV only (no concat list or other demuxer behind a
+// .wav name) and for at most 181 s, beyond the whole 60–180 s window, so its
+// decoded PCM stays near 17.4 MB, under MAX_BUFFER.
+const DECODE_INPUT = ["-f", "wav", "-t", "181"];
 const KEEP = "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.02";
 const TRIM = `${KEEP},areverse,${KEEP},areverse`;
 const LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11";
@@ -35,7 +39,8 @@ const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 // writeAtomic names its own.
 const partialPath = (dir, name) => join(dir, `.${name}.${randomBytes(6).toString("hex")}.partial`);
 
-// Runs ffmpeg; resolves {failed, stdout, stderr} for any exit status. A
+// Runs ffmpeg; resolves {failed, stdout, stderr, exit} for any exit status,
+// exit being the signal name or the exit code. A
 // missing binary is a refusal; any other spawn or buffer error rejects as
 // itself, which kit.mjs reports as a failed step.
 function ffmpeg(args, input) {
@@ -43,7 +48,7 @@ function ffmpeg(args, input) {
     const child = execFile("ffmpeg", args, { encoding: "buffer", maxBuffer: MAX_BUFFER }, (error, stdout, stderr) => {
       if (error?.code === "ENOENT") reject(new Refusal("ffmpeg: not found on PATH"));
       else if (typeof error?.code === "string") reject(error);
-      else resolve({ failed: error !== null, stdout, stderr: stderr.toString("utf8") });
+      else resolve({ failed: error !== null, stdout, stderr: stderr.toString("utf8"), exit: error?.signal ?? error?.code ?? 0 });
     });
     // An ffmpeg that exits before reading all its input closes the pipe; the
     // EPIPE carries nothing the exit status in the callback does not.
@@ -52,8 +57,13 @@ function ffmpeg(args, input) {
   });
 }
 
-// ffmpeg's first stderr line without its `[<name> @ 0x<hex>] ` prefix, on one line.
-const reason = (stderr) => escapeLine(stderr.split("\n")[0].replace(/^\[[^\]]* @ 0x[0-9a-f]+\] /, ""));
+// Why a run failed, on one line: ffmpeg's first stderr line without its
+// `[<name> @ 0x<hex>] ` prefix, or, after a signal or with nothing on
+// stderr, how ffmpeg exited.
+function reason({ stderr, exit }) {
+  const first = stderr.split("\n")[0].replace(/^\[[^\]]* @ 0x[0-9a-f]+\] /, "");
+  return escapeLine(typeof exit === "string" || first === "" ? `ffmpeg exited with ${exit}` : first);
+}
 
 // --- inputs -----------------------------------------------------------------
 
@@ -89,8 +99,8 @@ async function readBlock(dir, names, stem) {
     }
     return { problem: `missing ${stem}.wav` };
   }
-  const decoded = await ffmpeg(["-nostdin", "-v", "error", "-i", path, "-ac", "1", "-ar", String(SAMPLE_RATE), "-af", TRIM, "-f", "s16le", "-"]);
-  if (decoded.failed) return { problem: `cannot be decoded: ${reason(decoded.stderr)}` };
+  const decoded = await ffmpeg(["-nostdin", "-v", "error", ...DECODE_INPUT, "-i", path, "-ac", "1", "-ar", String(SAMPLE_RATE), "-af", TRIM, "-f", "s16le", "-"]);
+  if (decoded.failed) return { problem: `cannot be decoded: ${reason(decoded)}` };
   if (decoded.stdout.length === 0) return { problem: "silent after trimming" };
   return { pcm: decoded.stdout, sha256: sha256(await readFile(path)) };
 }
@@ -134,7 +144,7 @@ function loudnormSummary(stderr) {
 // Two-pass loudnorm of the raw buffer, both passes reading it on stdin.
 async function normalize(raw) {
   const measured = await ffmpeg(["-nostdin", "-hide_banner", "-nostats", ...RAW_INPUT, "-af", `${LOUDNORM}:print_format=json`, "-f", "null", "-"], raw);
-  if (measured.failed) throw new Refusal(`narration cannot be normalized: ${reason(measured.stderr)}`);
+  if (measured.failed) throw new Refusal(`narration cannot be normalized: ${reason(measured)}`);
   const m = loudnormSummary(measured.stderr);
   const second =
     `${LOUDNORM}:linear=true:measured_I=${m.input_i}:measured_TP=${m.input_tp}` +
@@ -143,7 +153,7 @@ async function normalize(raw) {
     ["-nostdin", "-v", "error", ...RAW_INPUT, "-af", second, "-ar", String(SAMPLE_RATE), "-ac", "1", "-f", "s16le", "-"],
     raw,
   );
-  if (applied.failed) throw new Refusal(`narration cannot be normalized: ${reason(applied.stderr)}`);
+  if (applied.failed) throw new Refusal(`narration cannot be normalized: ${reason(applied)}`);
   return applied.stdout;
 }
 
@@ -168,13 +178,19 @@ function wav(pcm) {
 // Integrated loudness and true peak from ebur128's Summary, to one decimal.
 async function measure(path) {
   const result = await ffmpeg(["-nostdin", "-hide_banner", "-nostats", "-i", path, "-af", "ebur128=peak=true", "-f", "null", "-"]);
-  if (result.failed) throw new Refusal(`narration cannot be measured: ${reason(result.stderr)}`);
+  if (result.failed) throw new Refusal(`narration cannot be measured: ${reason(result)}`);
   const summary = result.stderr.slice(result.stderr.lastIndexOf("Summary:"));
   const integrated = summary.match(/\n\s+I:\s+(-?\d+(?:\.\d+)?) LUFS/);
   const peak = summary.match(/\n\s+Peak:\s+(-?\d+(?:\.\d+)?) dBFS/);
   if (integrated === null || peak === null) throw new Refusal("narration cannot be measured: no ebur128 summary");
   const tenth = (match) => Math.round(Number(match[1]) * 10) / 10;
   return { integratedLufs: tenth(integrated), truePeakDbtp: tenth(peak) };
+}
+
+// The closing stderr line after `kit timeline: `, seconds and LUFS to one
+// decimal.
+export function summaryLine(blocks, scenes, totalFrames, integratedLufs) {
+  return `${blocks} blocks, ${scenes} scenes, ${seconds(Math.round(totalFrames / 3))} s (${totalFrames} frames), ${integratedLufs.toFixed(1)} LUFS`;
 }
 
 // --- the command ----------------------------------------------------------------
@@ -246,9 +262,6 @@ export async function timeline(ctx) {
     await rm(narrationTemp, { force: true });
     await rm(timelineTemp, { force: true });
   }
-  const { totalFrames } = laid;
-  ctx.say(
-    `${stems.length} blocks, ${laid.scenes.length} scenes, ${seconds(Math.round(totalFrames / 3))} s (${totalFrames} frames), ${loudness.integratedLufs.toFixed(1)} LUFS`,
-  );
+  ctx.say(summaryLine(stems.length, laid.scenes.length, laid.totalFrames, loudness.integratedLufs));
   return 0;
 }

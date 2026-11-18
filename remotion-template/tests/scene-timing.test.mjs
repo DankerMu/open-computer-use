@@ -50,7 +50,10 @@ function script(endCardNarration) {
   return result.script;
 }
 
-const SAMPLES = { 甲: 48000, 乙: 24000, 丙: 16000, 丁: 32000, 戊: 48000, 己: 48000, 庚: 40000, 辛: 33600, 壬: 80000, 癸: 1601, 子: 48000 };
+// 甲 and 戊 end mid-frame, so a sentence's second block starts 2880 samples
+// after the first's end, not after its frame. 丁 is long enough that its
+// in-chapter scene end (narration plus 20) exceeds the 60-frame minimum.
+const SAMPLES = { 甲: 47000, 乙: 24000, 丙: 16000, 丁: 68000, 戊: 47000, 己: 48000, 庚: 40000, 辛: 33600, 壬: 80000, 癸: 1601, 子: 48000 };
 
 function timed(endCardNarration) {
   const s = script(endCardNarration);
@@ -95,14 +98,14 @@ test("a 3-chapter script lays out at the hand-computed frames", () => {
   ]);
   assert.deepEqual(summary, [
     [1, "hook", null, null, "hook", 0, 152, 107, 60],
-    [2, "chapter", 1, 1, "question", 152, 212, 172, 60],
-    [3, "chapter", 1, 2, "concept-card", 212, 319, 274, 60],
-    [4, "chapter", 2, 1, "custom", 319, 420, 375, 60],
-    [5, "chapter", 3, 1, "question", 420, 490, 470, 60],
-    [6, "summary", null, null, "summary", 490, 550, 492, 60],
-    [7, "end-card", null, null, "end-card", 550, 640, 550, 90],
+    [2, "chapter", 1, 1, "question", 152, 215, 195, 60],
+    [3, "chapter", 1, 2, "concept-card", 215, 322, 277, 60],
+    [4, "chapter", 2, 1, "custom", 322, 423, 378, 60],
+    [5, "chapter", 3, 1, "question", 423, 493, 473, 60],
+    [6, "summary", null, null, "summary", 493, 553, 495, 60],
+    [7, "end-card", null, null, "end-card", 553, 643, 553, 90],
   ]);
-  assert.equal(timeline.totalFrames, 640);
+  assert.equal(timeline.totalFrames, 643);
   const blocks = Object.fromEntries(
     Object.keys(SAMPLES)
       .filter((text) => text !== "子")
@@ -114,16 +117,16 @@ test("a 3-chapter script lays out at the hand-computed frames", () => {
       }),
   );
   assert.deepEqual(blocks, {
-    甲: [64000, 112000, 40, 70],
-    乙: [114880, 138880, 71, 87],
+    甲: [64000, 111000, 40, 70],
+    乙: [113880, 137880, 71, 87],
     丙: [155200, 171200, 97, 107],
-    丁: [243200, 275200, 152, 172],
-    戊: [339200, 387200, 212, 242],
-    己: [390080, 438080, 243, 274],
-    庚: [510400, 550400, 319, 344],
-    辛: [566400, 600000, 354, 375],
-    壬: [672000, 752000, 420, 470],
-    癸: [784000, 785601, 490, 492],
+    丁: [243200, 311200, 152, 195],
+    戊: [344000, 391000, 215, 245],
+    己: [393880, 441880, 246, 277],
+    庚: [515200, 555200, 322, 347],
+    辛: [571200, 604800, 357, 378],
+    壬: [676800, 756800, 423, 473],
+    癸: [788800, 790401, 493, 495],
   });
 });
 
@@ -138,9 +141,11 @@ test("the gaps: lead-in 40, 0.06 s in a sentence, 10 between sentences, 45 befor
     const scene = timeline.scenes[index - 1];
     return scene.endFrame - scene.narrationEndFrame;
   };
-  // Scenes 1, 3 and 4 precede a chapter's first scene; scene 5 precedes the
-  // summary. Scenes 2 and 6 are extended to their minimum instead.
+  // Scenes 1, 3 and 4 precede a chapter's first scene; scene 2 precedes the
+  // next scene of its chapter and scene 5 the summary. Scene 6 is extended
+  // to its minimum instead.
   assert.equal(gap(1), 45);
+  assert.equal(gap(2), 20);
   assert.equal(gap(3), 45);
   assert.equal(gap(4), 45);
   assert.equal(gap(5), 20);
@@ -156,11 +161,9 @@ test("the gaps: lead-in 40, 0.06 s in a sentence, 10 between sentences, 45 befor
 
 test("a scene shorter than its minimum is extended to it", () => {
   const { timeline } = timed(false);
-  const question = timeline.scenes[1];
-  // 172 + 20 = 192 is shorter than 152 + 60.
-  assert.equal(question.narrationEndFrame + 20, 192);
-  assert.equal(question.endFrame - question.startFrame, 60);
   const summary = timeline.scenes[5];
+  // 495 + 20 = 515 is shorter than 493 + 60.
+  assert.equal(summary.narrationEndFrame + 20, 515);
   assert.equal(summary.endFrame - summary.startFrame, 60);
 });
 
@@ -171,9 +174,9 @@ test("an end card lasts 90 frames without narration, and its narration plus 90 w
   assert.equal(silent.narrationEndFrame, silent.startFrame);
   const { timeline } = timed(true);
   const card = timeline.scenes.at(-1);
-  assert.deepEqual([card.startFrame, card.narrationEndFrame, card.endFrame], [550, 580, 670]);
-  assert.deepEqual(block(timeline, "子").startFrame, 550);
-  assert.equal(timeline.totalFrames, 670);
+  assert.deepEqual([card.startFrame, card.narrationEndFrame, card.endFrame], [553, 583, 673]);
+  assert.deepEqual(block(timeline, "子").startFrame, 553);
+  assert.equal(timeline.totalFrames, 673);
 });
 
 test("every transition lies after its scene's narration and ends with the scene", () => {
