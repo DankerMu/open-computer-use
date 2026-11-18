@@ -356,7 +356,7 @@ test("an invalid target rejects before any bundle is written", async () => {
   }
 });
 
-test("SIGTERM during a probe ends node within 10 s and leaves no headless shell", async (t) => {
+test("SIGTERM during a probe ends node within 20 s and leaves no headless shell", async (t) => {
   assert.deepEqual(headlessShells(), [], "no shell before the run");
   // Five scenes that each hold the render for about 1 s keep it busy.
   const targets = [1, 2, 3, 4, 5].map((n) => target(`move-${n}`, "delayed-move", 10, 0));
@@ -372,8 +372,11 @@ test("SIGTERM during a probe ends node within 10 s and leaves no headless shell"
     await new Promise((done) => setTimeout(done, 3000));
     const sent = Date.now();
     child.kill("SIGTERM");
-    const ended = await Promise.race([exited, new Promise((done) => setTimeout(() => done(null), 10000))]);
-    assert.notEqual(ended, null, "node exited within 10 s of SIGTERM");
+    // Measured under amd64 emulation: 7.2–8.0 s when Remotion's own SIGTERM
+    // handler kills the browser and the probe rejects (code 1), or a few ms
+    // when the signal ends node directly. 20 s leaves margin over that.
+    const ended = await Promise.race([exited, new Promise((done) => setTimeout(() => done(null), 20000))]);
+    assert.notEqual(ended, null, "node exited within 20 s of SIGTERM");
     t.diagnostic(`node exited ${Date.now() - sent} ms after SIGTERM with ${JSON.stringify(ended)}`);
     assert.ok(await until(() => headlessShells().length === 0, 2000), `shells left: ${headlessShells().join(", ")}`);
   } finally {
