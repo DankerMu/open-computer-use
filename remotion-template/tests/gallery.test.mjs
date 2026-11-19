@@ -9,7 +9,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -273,4 +284,32 @@ test("a relative --out resolves from the working directory", (t) => {
   const result = runGallery(["--out", "taken"], parent);
   assert.equal(result.status, 1);
   assert.equal(result.stderr, `kit gallery: ${join(parent, "taken")}: already exists\n`);
+});
+
+test("an invalid catalog exits 1 with its rule's message before any bundle, leaving nothing", (t) => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "gallery-invalid-")));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const project = join(base, "project");
+  for (const part of ["bin", "src"]) cpSync(join(TEMPLATE, part), join(project, part), { recursive: true });
+  copyFileSync(join(TEMPLATE, "package.json"), join(project, "package.json"));
+  symlinkSync(realpathSync(join(TEMPLATE, "node_modules")), join(project, "node_modules"));
+  const sample = { id: "max", content: { question: "光" }, image: null, timing: timing() };
+  const twin = { id: "dup", kind: "question", source: "written for the test", minFrames: 60, entranceFrames: 10, samples: [sample] };
+  writeFileSync(
+    join(project, "src", "kit", "gallery", "catalog.ts"),
+    [
+      "export {validateCatalog} from './catalog-rules.ts';",
+      `export const candidates = ${JSON.stringify([twin, twin])};`,
+      "",
+    ].join("\n"),
+  );
+  const parent = join(base, "runs");
+  mkdirSync(parent);
+  const result = spawnSync(process.execPath, ["bin/gallery.mjs", "--out", join(parent, "gallery")], { cwd: project, encoding: "utf8" });
+  assert.equal(result.status, 1, result.stderr);
+  // Node's MODULE_TYPELESS_PACKAGE_JSON warning precedes the CLI's own line.
+  const own = result.stderr.split("\n").filter((line) => line.startsWith("kit gallery: "));
+  assert.deepEqual(own, ["kit gallery: dup: id is invalid, reserved or repeated"]);
+  assert.equal(result.stdout, "");
+  assert.deepEqual(readdirSync(parent), []);
 });
