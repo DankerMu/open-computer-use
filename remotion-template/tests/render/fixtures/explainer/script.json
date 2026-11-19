@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "title": "光的折射",
+  "music": "none",
+  "hook": {
+    "kind": "hook",
+    "narration": [["光为什么", "会弯折", "在水里"]],
+    "content": { "title": "光的折射" }
+  },
+  "chapters": [
+    {
+      "name": "现象",
+      "scenes": [
+        {
+          "kind": "question",
+          "narration": [["筷子看起来折断"]],
+          "content": { "question": "筷子为何看起来折断" }
+        }
+      ]
+    },
+    {
+      "name": "原理",
+      "scenes": [{ "kind": "custom", "narration": [["速度变了", "方向就变"]], "component": "Orbit" }]
+    },
+    {
+      "name": "应用",
+      "scenes": [
+        {
+          "kind": "concept-card",
+          "narration": [["透镜利用折射"]],
+          "content": { "title": "透镜", "points": ["放大镜"] }
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "kind": "summary",
+    "narration": [["记住这一点"]],
+    "content": { "points": ["折射改变方向"] }
+  },
+  "endCard": {
+    "kind": "end-card",
+    "content": { "title": "谢谢观看" }
+  }
+}
