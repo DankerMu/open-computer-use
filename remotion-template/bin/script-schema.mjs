@@ -221,7 +221,7 @@ function isMissing(root, path) {
   return parent === null || typeof parent !== "object" || !Object.hasOwn(parent, path.at(-1));
 }
 
-function fieldPath(path) {
+export function fieldPath(path) {
   return path.map((key, i) => (typeof key === "number" ? `[${key}]` : i === 0 ? key : `.${key}`)).join("");
 }
 
