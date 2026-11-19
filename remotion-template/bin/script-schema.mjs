@@ -141,12 +141,18 @@ const CONTENT = {
   "end-card": { title: chars(C["end-card"].title), subtitle: optional(C["end-card"].subtitle) },
 };
 
+// The content object of a scene kind, as the script's scene schema holds it.
+export function contentSchema(kind) {
+  if (!Object.hasOwn(CONTENT, kind)) throw new RangeError(`no content schema for kind ${JSON.stringify(kind)}`);
+  return z.strictObject(CONTENT[kind]);
+}
+
 function scene(kind, sceneNarration = narration) {
   return z.strictObject({
     kind: z.literal(kind),
     narration: sceneNarration,
     image: kind === "image-callouts" ? image : image.optional(),
-    content: z.strictObject(CONTENT[kind]),
+    content: contentSchema(kind),
   });
 }
 
