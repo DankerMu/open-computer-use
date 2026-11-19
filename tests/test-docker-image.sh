@@ -371,7 +371,7 @@ echo ""
 # the existing grep-based pass/fail accounting handle the failure naturally.
 
 # 1. Runtime versions and executable Node tools
-echo "[1/14] Runtime versions and Node tools"
+echo "[1/16] Runtime versions and Node tools"
 NODE_PROBE=$(cat <<'PROBE'
 node <<'JS'
 const assert = require("node:assert/strict");
@@ -500,7 +500,7 @@ echo "$VERSIONS" | grep -q "Python 3" && pass "Python 3" || fail "Python version
 
 # 2. CommonJS require()
 echo ""
-echo "[2/14] CommonJS require()"
+echo "[2/16] CommonJS require()"
 for pkg in react pptxgenjs pdf-lib docx sharp react-dom/server react-icons/fa; do
     RESULT=$(run_in_container "node -e \"try { require('$pkg'); console.log('OK') } catch(e) { console.log('FAIL: ' + e.code) }\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "require('$pkg')" || fail "require('$pkg'): $RESULT"
@@ -519,7 +519,7 @@ echo "$RESULT" | grep -q "OK" && pass "marked renders a heading" || fail "marked
 
 # 3. ES Modules import
 echo ""
-echo "[3/14] ES Modules import"
+echo "[3/16] ES Modules import"
 for pkg in react pptxgenjs pdf-lib; do
     RESULT=$(run_in_container "node --input-type=module -e \"import '$pkg'; console.log('OK')\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "import '$pkg'" || fail "import '$pkg'"
@@ -527,7 +527,7 @@ done
 
 # 4. html2pptx import (full path)
 echo ""
-echo "[4/14] html2pptx import"
+echo "[4/16] html2pptx import"
 RESULT=$(run_in_container "node --input-type=module -e \"import { html2pptx } from '/usr/local/lib/node_modules_global/lib/node_modules/@anthropic-ai/html2pptx/dist/html2pptx.mjs'; console.log('OK')\"" 2>/dev/null || echo "SKIP")
 if echo "$RESULT" | grep -q "OK"; then
     pass "html2pptx ESM import"
@@ -539,7 +539,7 @@ fi
 
 # 5. CLI tools (Phase 6 — extended to include codex + opencode + --version smoke)
 echo ""
-echo "[5/14] CLI tools"
+echo "[5/16] CLI tools"
 for tool in mmdc tsc tsx claude codex opencode; do
     RESULT=$(run_in_container "which $tool >/dev/null 2>&1 && echo OK || echo MISSING") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "$tool in PATH" || fail "$tool not found in PATH"
@@ -600,7 +600,7 @@ fi
 
 # 6. Python packages
 echo ""
-echo "[6/14] Python packages"
+echo "[6/16] Python packages"
 for pkg in docx pptx openpyxl; do
     RESULT=$(run_in_container "python3 -c \"import $pkg; print('OK')\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "python import $pkg" || fail "python import $pkg"
@@ -628,7 +628,7 @@ echo "$RESULT" | grep -q "OK" && pass "python playwright" || fail "python playwr
 
 # 7. User npm install (lodash)
 echo ""
-echo "[7/14] User npm install"
+echo "[7/16] User npm install"
 RESULT=$(run_in_container 'cd /home/assistant && npm install lodash >/dev/null 2>&1 && if [ -d /home/assistant/node_modules/lodash ]; then echo "user=YES"; else echo "user=NO"; fi && SYS_COUNT=$(ls /home/node_modules/ 2>/dev/null | wc -l) && echo "system=$SYS_COUNT"') || RESULT=""
 echo "$RESULT" | grep -q "user=YES" && pass "lodash in /home/assistant/node_modules" || fail "lodash not in user dir"
 SYS=$(echo "$RESULT" | awk -F= '/^system=/{print $2}')
@@ -636,7 +636,7 @@ SYS=$(echo "$RESULT" | awk -F= '/^system=/{print $2}')
 
 # 8. npm prefix check
 echo ""
-echo "[8/14] npm configuration"
+echo "[8/16] npm configuration"
 RESULT=$(run_in_container 'npm config get prefix 2>/dev/null || echo "undefined"') || RESULT=""
 # Trim trailing whitespace/newlines so the anchored regex below can match
 # against a clean single-line value.
@@ -658,7 +658,7 @@ fi
 
 # 9. Volume size
 echo ""
-echo "[9/14] Volume size"
+echo "[9/16] Volume size"
 SIZE_KB=$(run_in_container "du -sk /home/assistant/ | cut -f1") || SIZE_KB=""
 if [ "${SIZE_KB:-999999}" -lt 1024 ]; then
     pass "/home/assistant < 1MB (${SIZE_KB}KB)"
@@ -668,7 +668,7 @@ fi
 
 # 10. Permissions and guard files
 echo ""
-echo "[10/14] Permissions and guard files"
+echo "[10/16] Permissions and guard files"
 RESULT=$(run_in_container '
 [ -x /home/assistant/.entrypoint.sh ] && echo "entrypoint=OK" || echo "entrypoint=FAIL"
 [ -f /home/assistant/.gitconfig ] && echo "gitconfig=OK" || echo "gitconfig=FAIL"
@@ -692,7 +692,7 @@ echo "$RESULT" | grep -q "owner=assistant" && pass "files owned by assistant" ||
 # root here matches production parity. /tmp is world-readable so the marker
 # check works regardless.
 echo ""
-echo "[11/14] Per-CLI dispatch smoke + marker gating"
+echo "[11/16] Per-CLI dispatch smoke + marker gating"
 for cli in claude codex opencode; do
     SMOKE_CONTAINER="ocu-smoke-${cli}-$$"
     # Start a long-running container (so we can exec the entrypoint twice).
@@ -782,7 +782,7 @@ done
 # (the [ -n "$PS1" ] guard would otherwise short-circuit and falsely pass).
 # Two variants: env var NO_AUTOSTART=1 and sentinel file /tmp/.no_autostart.
 echo ""
-echo "[12/14] NO_AUTOSTART escape hatch"
+echo "[12/16] NO_AUTOSTART escape hatch"
 NOAUTOSTART_OUT=$(docker run --rm --platform linux/amd64 \
     -e SUBAGENT_CLI=claude \
     -e NO_AUTOSTART=1 \
@@ -809,7 +809,7 @@ fi
 
 # 13. cli-defaults/ canonical configs present and parseable (Phase 2 D-09).
 echo ""
-echo "[13/14] cli-defaults/ canonical configs present and parseable"
+echo "[13/16] cli-defaults/ canonical configs present and parseable"
 for f in opencode.json codex.json README.md; do
     if docker run --rm --platform linux/amd64 "$IMAGE" sh -c "test -f /opt/cli-defaults/$f" 2>/dev/null; then
         pass "/opt/cli-defaults/$f exists in image"
@@ -838,7 +838,7 @@ fi
 # the image with its declared entrypoint and checks that (a) the process
 # exits 0, and (b) the expected status banner is printed.
 echo ""
-echo "[14/14] Entrypoint execution"
+echo "[14/16] Entrypoint execution"
 # Wrap the command substitution in `if` so `set -e` does not abort the
 # whole test script on a non-zero docker exit — we need to reach fail()
 # with the captured output for structured reporting.
@@ -865,7 +865,7 @@ fi
 # 15. Offline Remotion template, started the way skills/public/remotion/SKILL.md
 # says: copy without node_modules, symlink the root-owned node_modules, no network.
 echo ""
-echo "[15/15] Offline Remotion template"
+echo "[15/16] Offline Remotion template"
 if REMOTION_OUT=$(run_in_container_verbose '
 [ "$(stat -c %U /opt/remotion-template/node_modules)" = root ] && echo "owner=OK"
 [ ! -w /opt/remotion-template/node_modules ] && echo "readonly=OK"
@@ -913,6 +913,192 @@ echo "$REMOTION_OUT" | grep -q "readonly=OK" && pass "template node_modules read
 echo "$REMOTION_OUT" | grep -q "still=OK" && pass "Remotion still written without network" || fail "Remotion still missing: $REMOTION_OUT"
 echo "$REMOTION_OUT" | grep -q "config3d=OK" && pass "ThreeCanvas smoke sets swangle in remotion.config.ts" || fail "swangle config line missing: $REMOTION_OUT"
 echo "$REMOTION_OUT" | grep -q "still3d=OK" && pass "ThreeCanvas still with --gl=swangle is not uniform" || fail "ThreeCanvas still blank or missing: $REMOTION_OUT"
+
+# 16. CC0 music library installed by the Dockerfile's music step. The expected
+# ids and approvals digest come from the repository; the in-image checker uses
+# only the standard library and the image's ffmpeg, not music_library.py.
+echo ""
+echo "[16/16] Music library"
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+MUSIC_EXPECTED=$(python3 -I -B - "$REPO_ROOT" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+music = root / "deploy" / "music"
+sys.path.insert(0, str(music))
+import music_library
+
+tracks, _approvals, _excluded = music_library.approved_library(
+    music / "candidates.json", music / "approvals.json", music / "library-excluded.json", root)
+print(",".join(item["id"] for item in tracks))
+print(hashlib.sha256((music / "approvals.json").read_bytes()).hexdigest())
+PY
+) || MUSIC_EXPECTED=""
+MUSIC_IDS=$(printf '%s\n' "$MUSIC_EXPECTED" | sed -n 1p)
+MUSIC_APPROVALS=$(printf '%s\n' "$MUSIC_EXPECTED" | sed -n 2p)
+MUSIC_PROBE=$(cat <<'PROBE'
+python3 -I - "$1" "$2" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+LIBRARY = Path("/opt/video-music")
+EXPECTED_IDS = [name for name in sys.argv[1].split(",") if name]
+EXPECTED_APPROVALS = sys.argv[2]
+state = {}
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def tracks():
+    if "manifest" not in state:
+        raise AssertionError("no readable manifest")
+    listed = state["manifest"].get("tracks")
+    if not isinstance(listed, list) or not listed:
+        raise AssertionError("manifest lists no tracks")
+    return listed
+
+
+def summary_values(label, path):
+    result = subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-i", str(path),
+         "-af", "ebur128=peak=true", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=600)
+    if result.returncode != 0 or "Summary:" not in result.stderr:
+        raise AssertionError(f"{label}: ffmpeg exited {result.returncode} without an ebur128 summary")
+    values = {}
+    for line in result.stderr.rsplit("Summary:", 1)[1].splitlines():
+        key, _, rest = line.strip().partition(":")
+        if key in ("I", "Peak") and rest.split():
+            values[key] = float(rest.split()[0])
+    if set(values) != {"I", "Peak"}:
+        raise AssertionError(f"{label}: no I or true peak in the ebur128 summary")
+    return values["I"], values["Peak"]
+
+
+def check_manifest():
+    data = json.loads((LIBRARY / "manifest.json").read_text(encoding="utf-8"))
+    if data.get("version") != 1:
+        raise AssertionError(f"version {data.get('version')!r}")
+    state["manifest"] = data
+    return "version 1"
+
+
+def check_ids():
+    if not EXPECTED_IDS:
+        raise AssertionError("no expected ids from the repository")
+    actual = [item.get("id") for item in tracks()]
+    if actual != EXPECTED_IDS:
+        raise AssertionError(f"{actual} != {EXPECTED_IDS}")
+    return f"{len(actual)} tracks"
+
+
+def check_approvals():
+    if len(EXPECTED_APPROVALS) != 64:
+        raise AssertionError("no expected approvals digest from the repository")
+    block = state["manifest"]["approvals"] if "manifest" in state else {}
+    installed = sha256(LIBRARY / "approvals.json")
+    if not block.get("sha256") == installed == EXPECTED_APPROVALS:
+        raise AssertionError(f"manifest {block.get('sha256')}, installed {installed}, repository {EXPECTED_APPROVALS}")
+    wrong = [item.get("id") for item in tracks()
+             if item.get("approver") != block["reviewer"] or item.get("approval_date") != block["date"]]
+    if wrong:
+        raise AssertionError(f"approver fields differ from {block['reviewer']} {block['date']}: {wrong}")
+    return f"{block['reviewer']} {block['date']}"
+
+
+def check_files():
+    wrong = []
+    for item in tracks():
+        path, evidence = LIBRARY / item["file"], LIBRARY / item["evidence"]
+        if not path.is_file() or not evidence.is_file():
+            wrong.append(f"{item['id']} missing file or evidence")
+        elif sha256(path) != item["shipped_sha256"]:
+            wrong.append(f"{item['id']} differs from shipped_sha256")
+    if wrong:
+        raise AssertionError("; ".join(wrong))
+    return f"{len(tracks())} files"
+
+
+def check_audio_set():
+    listed = sorted(item["file"] for item in tracks())
+    on_disk = sorted(str(path.relative_to(LIBRARY)) for path in LIBRARY.rglob("*")
+                     if path.suffix in (".mp3", ".wav") and not path.is_dir())
+    if on_disk != listed:
+        raise AssertionError(f"on disk {on_disk}, manifest {listed}")
+    return f"{len(on_disk)} audio files"
+
+
+def check_loudness():
+    measured, wrong = [], []
+    for item in tracks():
+        loudness, peak = summary_values(item["id"], LIBRARY / item["file"])
+        measured.append(f"{item['id']} I {loudness} TP {peak}")
+        if not (abs(loudness + 16) <= 0.5 and peak <= -1.5):
+            wrong.append(f"{item['id']} I {loudness} LUFS TP {peak} dBTP")
+    if wrong:
+        raise AssertionError("out of tolerance: " + "; ".join(wrong))
+    return ", ".join(measured)
+
+
+def check_ownership():
+    if os.geteuid() == 0:
+        raise AssertionError("the checker must run as assistant, not root")
+    if not LIBRARY.is_dir():
+        raise AssertionError(f"{LIBRARY} is not a directory")
+    paths = [LIBRARY, *LIBRARY.rglob("*")]
+    wrong = [f"{path} owner {path.lstat().st_uid}" for path in paths if path.lstat().st_uid != 0]
+    wrong += [f"{path} writable" for path in paths if os.access(path, os.W_OK)]
+    wrong += [f"{path} unreadable" for path in paths if not os.access(path, os.R_OK)]
+    if wrong:
+        raise AssertionError("; ".join(wrong))
+    return f"{len(paths)} paths"
+
+
+def check_scratch_removed():
+    if os.path.lexists("/tmp/ocu-music"):
+        raise AssertionError("/tmp/ocu-music exists")
+    return "absent"
+
+
+for number, check in enumerate((check_manifest, check_ids, check_approvals, check_files, check_audio_set,
+                                check_loudness, check_ownership, check_scratch_removed), 1):
+    try:
+        print(f"music{number}=OK: {check()}")
+    except Exception as exc:  # Each check reports its own failure so the later checks still run.
+        print(f"music{number}=FAIL: {type(exc).__name__}: {exc}")
+PY
+PROBE
+)
+MUSIC_OUT=$(run_in_container "set -- $(printf '%q ' "$MUSIC_IDS" "$MUSIC_APPROVALS"); $MUSIC_PROBE") || MUSIC_OUT=""
+MUSIC_CHECKS=(
+    "/opt/video-music/manifest.json readable by assistant, version 1"
+    "music track ids equal the repository's approved, non-excluded ids"
+    "music approvals digest and approver fields match deploy/music/approvals.json"
+    "every music file and its evidence exist, files match shipped_sha256"
+    "music audio files are exactly the manifest's files"
+    "every music track measures -16 LUFS +/- 0.5 LU, true peak <= -1.5 dBTP"
+    "/opt/video-music root-owned, readable and not writable by assistant"
+    "/tmp/ocu-music build inputs removed"
+)
+for number in 1 2 3 4 5 6 7 8; do
+    line=$(printf '%s\n' "$MUSIC_OUT" | grep -m1 "^music$number=" || true)
+    case "$line" in
+        "music$number=OK: "*) pass "${MUSIC_CHECKS[$((number - 1))]} (${line#*=OK: })" ;;
+        *) line=${line#"music$number=FAIL: "}; fail "${MUSIC_CHECKS[$((number - 1))]}: ${line:-no checker output}" ;;
+    esac
+done
 
 test_browser_cli_config
 test_browser_relay
