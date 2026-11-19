@@ -321,6 +321,16 @@ RUN chmod -R a+r /opt/cli-defaults
 COPY --chown=root:root computer-use-server/bin/list-subagent-models /usr/local/bin/list-subagent-models
 RUN chmod +x /usr/local/bin/list-subagent-models
 
+# CC0 music library for the explainer kit (deploy/music/README.md): download
+# each approved source, verify its pin, normalize with this image's ffmpeg,
+# and install the library and manifest. A changed or vanished source fails
+# the build naming the track. Root-owned, readable by assistant.
+COPY --chown=root:root deploy/music/ /tmp/ocu-music/deploy/music/
+RUN python3 -B /tmp/ocu-music/deploy/music/music_library.py fetch --out /tmp/ocu-music/sources && \
+    python3 -B /tmp/ocu-music/deploy/music/music_library.py build --sources /tmp/ocu-music/sources --out /opt/video-music && \
+    rm -rf /tmp/ocu-music && \
+    chmod -R a+rX,go-w /opt/video-music
+
 # Remotion template for skills/public/remotion: projects copy it and symlink its
 # node_modules, so rendering needs no network. `remotion browser ensure` fetches
 # Chrome Headless Shell 157.0.8080.0 (Remotion 4.0.537's tested version) into

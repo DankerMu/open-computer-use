@@ -11,7 +11,7 @@ This directory holds the CC0 background-music candidates for the explainer kit, 
 - `music_library.py` fetches and normalizes the approved tracks and writes the library manifest (see Library).
 - `library-excluded.json` lists approved tracks the user excluded after their loudness was measured (see Library).
 
-Nothing here enters the workspace image yet. The image install comes later (task 6.4).
+The workspace image's `Dockerfile` downloads, normalizes and installs the library at `/opt/video-music/`, with its `manifest.json` there, in the step that runs `music_library.py fetch` and `build`.
 
 ## Evidence rule
 
