@@ -131,6 +131,11 @@ function assertColour(actual, hex, label) {
   }
 }
 
+// The CLI's own lines. Importing catalog.ts makes Node print its
+// MODULE_TYPELESS_PACKAGE_JSON warning first (the template's package.json
+// declares no module type); that block is Node's, not the CLI's.
+const galleryLines = (stderr) => stderr.split("\n").filter((line) => line.startsWith("kit gallery: "));
+
 const escapeHtml = (text) =>
   text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
@@ -203,14 +208,15 @@ test("an existing --out is refused and left untouched", () => {
 test("components without a catalog entry exit 1 naming the id", () => {
   const run = outcomes.mismatch;
   assert.equal(run.code, 1, run.stderr);
-  assert.equal(run.stderr, 'kit gallery: components has "extra", the catalog does not\n');
+  assert.deepEqual(galleryLines(run.stderr), ['kit gallery: components has "extra", the catalog does not']);
 });
 
 test("a render that throws exits 1 with the item id and the component's message", () => {
   const run = outcomes.throws;
   assert.equal(run.code, 1, run.stderr);
-  assert.match(run.stderr, /^kit gallery: /);
-  assert.ok(run.stderr.includes("placeholder--max--light"), run.stderr);
+  const [line, ...rest] = galleryLines(run.stderr);
+  assert.deepEqual(rest, [], run.stderr);
+  assert.ok(line.startsWith("kit gallery: placeholder--max--light: "), run.stderr);
   assert.ok(run.stderr.includes("placeholder throws at frame 30"), run.stderr);
 });
 

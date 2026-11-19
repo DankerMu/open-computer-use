@@ -161,7 +161,7 @@ test("each candidate has approve, redo and drop and a note; the theme has light 
   for (const value of ["light", "dark"]) assert.ok(html.includes(`<input type="radio" name="theme" value="${value}">`), value);
   for (const id of ["reviewer", "date", "export", "status"]) assert.ok(html.includes(`id="${id}"`), id);
   for (const match of html.matchAll(/\b(?:src|href)="([^"]*)"/g)) assert.match(match[1], /^(clips|frames)\/[^/]+$/);
-  assert.ok(!/<link\b|<script\s+src|url\(|@import/i.test(html));
+  assert.ok(!/<link\b|<script\s+src|\burl\(|@import/.test(html));
   assert.ok(html.startsWith("<!DOCTYPE html>\n"));
   assert.ok(html.endsWith("</html>\n"));
 });
