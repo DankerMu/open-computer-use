@@ -175,6 +175,30 @@ def test_dockerfile_installs_template_before_skills() -> None:
     assert "chmod -R a+rX /opt/remotion-template" in run
 
 
+def test_dockerfile_installs_music_library_before_template() -> None:
+    instructions = _dockerfile_instructions()
+    models = "RUN chmod +x /usr/local/bin/list-subagent-models"
+    copy = "COPY --chown=root:root deploy/music/ /tmp/ocu-music/deploy/music/"
+    template = "COPY --chown=root:root remotion-template/ /opt/remotion-template/"
+    fetch = "python3 -B /tmp/ocu-music/deploy/music/music_library.py fetch --out /tmp/ocu-music/sources"
+    build = (
+        "python3 -B /tmp/ocu-music/deploy/music/music_library.py build"
+        " --sources /tmp/ocu-music/sources --out /opt/video-music"
+    )
+    commands = [fetch, build, "rm -rf /tmp/ocu-music", "chmod -R a+rX,go-w /opt/video-music"]
+    for line in (models, copy, template):
+        assert line in instructions, line
+    step = instructions.index(copy)
+    run = instructions[step + 1]
+    assert run.startswith("RUN "), run
+    assert [part.strip() for part in run[len("RUN "):].split("&&")] == commands, run
+    assert instructions[step - 1] == models
+    assert instructions[step + 2] == template
+    assert run.index(fetch) < run.index(build)
+    assert run.split("&&")[1].strip().endswith(" --out /opt/video-music"), run
+    assert "rm -rf /tmp/ocu-music" in run
+
+
 def test_dockerfile_pins_headless_shell_version_and_sha256() -> None:
     run = _template_run()
     assert f'= "{HEADLESS_SHELL_VERSION}"' in run
