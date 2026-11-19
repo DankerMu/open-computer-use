@@ -18,7 +18,7 @@ import { timeline } from "./timeline.mjs";
 import { blockStems } from "./voice-stem.mjs";
 
 const PROJECT_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
-const NOT_COPIED = new Set(["node_modules", "tests", "out"]);
+const NOT_COPIED = new Set(["node_modules", "tests", "out", "gallery"]);
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp"]);
 const IMAGE_STEM = 60;
 
