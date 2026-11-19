@@ -59,11 +59,20 @@ function scripts(html) {
   return { data: data[1], code: code[0][1] };
 }
 
+// The theme radio the page checks before any click.
+function defaultTheme(html) {
+  const checked = [...html.matchAll(/<input type="radio" name="theme" value="([a-z]+)" checked>/g)];
+  assert.ok(checked.length <= 1, "more than one theme radio checked");
+  return checked[0]?.[1];
+}
+
 // Runs the page script against a stub DOM holding only the page's own
-// controls; `form` sets the reviewer, date, decisions, notes and theme
-// before the export button is clicked.
+// controls; `form` sets the reviewer, date, decisions and notes, and clicks
+// the theme radios in `form.themePicks` order, before the export button is
+// clicked. The theme group starts at the page's own checked radio.
 async function exportPage(html, form) {
   const { data, code } = scripts(html);
+  const theme = form.themePicks === undefined ? defaultTheme(html) : form.themePicks.at(-1);
   const { ids } = JSON.parse(data);
   const elements = {};
   const element = (id) => {
@@ -93,7 +102,7 @@ async function exportPage(html, form) {
         const value = form.decisions?.[decision[1]];
         return value === undefined ? null : { value };
       }
-      if (selector === 'input[name="theme"]:checked') return form.theme === undefined ? null : { value: form.theme };
+      if (selector === 'input[name="theme"]:checked') return theme === undefined ? null : { value: theme };
       throw new Error(`unexpected selector ${selector}`);
     },
     createElement(tag) {
@@ -132,7 +141,7 @@ const COMPLETE = {
   date: "2026-11-19",
   decisions: { alpha: "redo", "zeta-card": "approve" },
   notes: { "zeta-card": "  keep the pacing  ", alpha: "   " },
-  theme: "dark",
+  themePicks: ["dark"],
 };
 
 // --- the page ---------------------------------------------------------------
@@ -220,7 +229,7 @@ test("a missing decision, reviewer or date downloads nothing and says what is mi
     [{ ...COMPLETE, date: "2026-11-31" }, "Nothing exported: missing a date in YYYY-MM-DD form."],
     [{ ...COMPLETE, date: "2026-1-19" }, "Nothing exported: missing a date in YYYY-MM-DD form."],
     [
-      { theme: "light" },
+      { themePicks: ["light"] },
       "Nothing exported: missing a reviewer, a date in YYYY-MM-DD form, a decision for zeta-card, alpha.",
     ],
   ];
@@ -234,14 +243,25 @@ test("a missing decision, reviewer or date downloads nothing and says what is mi
 });
 
 test("an unset theme exports theme null", async () => {
-  const { theme, ...form } = COMPLETE;
-  assert.equal(theme, "dark");
+  const { themePicks, ...form } = COMPLETE;
+  assert.deepEqual(themePicks, ["dark"]);
   const result = await exportPage(renderPage(gallery(), PAGE_SHA), form);
   assert.equal(JSON.parse(result.body).theme, null);
 });
 
+test("the theme pick starts at no pick, and picking light then no pick exports theme null", async () => {
+  const html = renderPage(gallery(), PAGE_SHA);
+  assert.equal(defaultTheme(html), "none");
+  assert.ok(html.includes('<label><input type="radio" name="theme" value="none" checked> no pick</label>'));
+  const light = await exportPage(html, { ...COMPLETE, themePicks: ["light"] });
+  assert.equal(JSON.parse(light.body).theme, "light");
+  const result = await exportPage(html, { ...COMPLETE, themePicks: ["light", "none"] });
+  assert.equal(result.body, light.body.replace('"theme": "light"', '"theme": null'));
+  assert.equal(JSON.parse(result.body).theme, null);
+});
+
 test("a page without candidates exports decisions []", async () => {
-  const result = await exportPage(renderPage(gallery([]), PAGE_SHA), { reviewer: "R", date: "2026-11-19", theme: "light" });
+  const result = await exportPage(renderPage(gallery([]), PAGE_SHA), { reviewer: "R", date: "2026-11-19", themePicks: ["light"] });
   assert.equal(result.body, `${JSON.stringify({ version: 1, page: PAGE_SHA, reviewer: "R", date: "2026-11-19", decisions: [], theme: "light" }, null, 2)}\n`);
   assert.equal(result.status, "Exported gallery-decisions.json with 0 decisions.");
 });

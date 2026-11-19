@@ -5,7 +5,8 @@
 // pure: it returns index.html for a gallery.json object and the SHA-256 of
 // that file's bytes. The page loads nothing remote. A file:// page cannot
 // fetch gallery.json, so the candidate ids and the digest are embedded as
-// JSON. Its export button downloads gallery-decisions.json, version 1, only
+// JSON. The theme pick starts at `none` (no pick), which exports theme null.
+// Its export button downloads gallery-decisions.json, version 1, only
 // when a reviewer, a valid YYYY-MM-DD date and a decision for every
 // candidate are set; otherwise the status line says what is missing.
 
@@ -42,7 +43,7 @@ document.getElementById("export").addEventListener("click", () => {
     return;
   }
   const picked = document.querySelector('input[name="theme"]:checked');
-  const theme = picked ? picked.value : null;
+  const theme = picked && picked.value !== "none" ? picked.value : null;
   const body = JSON.stringify({version: 1, page, reviewer, date, decisions, theme}, null, 2) + "\\n";
   const link = document.createElement("a");
   link.href = URL.createObjectURL(new Blob([body], {type: "application/json"}));
@@ -121,6 +122,8 @@ export function renderPage(gallery, pageSha256) {
     '<section class="theme">',
     "<h2>Theme</h2>",
     ...gallery.themes.map((theme) => `<label><input type="radio" name="theme" value="${esc(theme)}"> ${esc(theme)}</label>`),
+    // Checked at first, and the way back to no pick once a theme was chosen.
+    '<label><input type="radio" name="theme" value="none" checked> no pick</label>',
     ...itemsOf(gallery, "theme"),
     "</section>",
   ];
