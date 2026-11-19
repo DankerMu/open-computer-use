@@ -15,6 +15,11 @@
 // (its question line is the KitFrame's second child's first line), and
 // themes.{light,dark}.brand.accent against Onda's #D96B82.
 //
+// Then the other two KitFrame roots: 3.8's explainer fixture with its
+// custom scene replaced by Accent.tsx, stilled inside that scene (light), and
+// the real kit root's KitProbe over the same custom scene with
+// themes.dark in its props.
+//
 // Each CLI run gets its own empty parent directory, which is polled while
 // the run lasts, so a run that wrote straight into --out is caught even when
 // its cleanup removes it.
@@ -28,7 +33,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bundle } from "@remotion/bundler";
 import { openBrowser, renderStill, selectComposition } from "@remotion/renderer";
+import { writeCustomIndex } from "../../bin/custom-index.mjs";
+import { explainerScenes } from "../../bin/explainer-scenes.mjs";
 import { themes } from "../../src/kit/theme.ts";
+import { fixtureScript, fixtureTimeline } from "./fixtures/explainer/fixture.mjs";
 
 const TEMPLATE = fileURLToPath(new URL("../..", import.meta.url));
 const FIXTURES = join(TEMPLATE, "tests", "render", "fixtures", "gallery");
@@ -46,6 +54,15 @@ const PIXEL = { x: 196, y: 104 };
 const ONDA_ACCENT = "#D96B82";
 const CHANNEL_TOLERANCE = 2;
 const POLL_MS = 50;
+// 3.8's fixture script and timeline, its custom scene renamed Accent: the
+// custom scene plays 194–271 of 481 frames.
+const ACCENT_SCRIPT = fixtureScript((raw) => {
+  raw.chapters[1].scenes[0].component = "Accent";
+});
+const ACCENT_TIMELINE = fixtureTimeline(ACCENT_SCRIPT);
+const EXPLAINER_FRAMES = 481;
+const CUSTOM_FRAME = 200;
+const PROBE_FRAME = 10;
 
 const timings = {};
 const outcomes = {};
@@ -167,7 +184,43 @@ before(async () => {
   } else {
     outcomes.unframed = serveUrl;
   }
+  await stillKitRoots();
 });
+
+// The two other KitFrame roots: the explainer body (through 3.8's fixture
+// entry, whose real CustomScene loads Accent) and the real kit root's
+// framed KitProbe, each stilled inside the Accent scene.
+async function stillKitRoots() {
+  copyFileSync(join(FIXTURES, "Accent.tsx"), join(root, "src", "custom", "Accent.tsx"));
+  await writeCustomIndex(root, ACCENT_SCRIPT);
+  const publicDir = join(root, "public");
+  mkdirSync(publicDir);
+  execFileSync("ffmpeg", [
+    "-nostdin", "-v", "error",
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+    "-af", `atrim=end_sample=${EXPLAINER_FRAMES * 1600}`,
+    "-ac", "1", "-c:a", "pcm_s16le",
+    join(publicDir, "narration.wav"),
+  ]);
+  const still = (name, entryPoint, id, inputProps, frame) =>
+    step(`still ${name}`, async () => {
+      const serveUrl = await bundle({ entryPoint, outDir: join(root, "bundles", name), enableCaching: false, publicDir, symlinkPublicDir: true });
+      const composition = await selectComposition({ serveUrl, id, inputProps, puppeteerInstance: browser });
+      const output = join(root, `${name}.png`);
+      await renderStill({ composition, serveUrl, output, frame, inputProps, puppeteerInstance: browser });
+      return output;
+    });
+  outcomes.explainer = await still(
+    "explainer",
+    join(root, "tests", "render", "fixtures", "explainer", "entry.tsx"),
+    "Explainer",
+    { script: ACCENT_SCRIPT, timeline: ACCENT_TIMELINE },
+    CUSTOM_FRAME,
+  );
+  const custom = explainerScenes(ACCENT_SCRIPT, ACCENT_TIMELINE)[2];
+  const targets = [{ scene: "custom", props: { ...custom.props, theme: themes.dark }, durationInFrames: custom.durationInFrames }];
+  outcomes.kitProbe = await still("kit-probe", join(root, "src", "kit", "index.ts"), "KitProbe", { targets }, PROBE_FRAME);
+}
 
 after(async () => {
   try {
@@ -216,8 +269,9 @@ test("a render that throws exits 1 with the item id and the component's message"
   assert.equal(run.code, 1, run.stderr);
   const [line, ...rest] = galleryLines(run.stderr);
   assert.deepEqual(rest, [], run.stderr);
+  // The CLI's own line, not Remotion's forwarded console output, carries both.
   assert.ok(line.startsWith("kit gallery: placeholder--max--light: "), run.stderr);
-  assert.ok(run.stderr.includes("placeholder throws at frame 30"), run.stderr);
+  assert.ok(line.includes("placeholder throws at frame 30"), run.stderr);
 });
 
 test("each rejected run worked in one temporary sibling and left neither it nor --out", () => {
@@ -307,4 +361,13 @@ test("KitFrame applies the brand at the root: the accent box is the theme's acce
   }
   if (outcomes.unframed.error) throw outcomes.unframed.error;
   assertColour(pixel(outcomes.unframed.value), ONDA_ACCENT, "Unframed");
+});
+
+test("the explainer's and the kit probe's KitFrame apply their theme's brand", () => {
+  const explainer = outcomes.explainer;
+  if (explainer.error) throw explainer.error;
+  assertColour(pixel(explainer.value), themes.light.brand.accent, "Explainer (light)");
+  const kitProbe = outcomes.kitProbe;
+  if (kitProbe.error) throw kitProbe.error;
+  assertColour(pixel(kitProbe.value), themes.dark.brand.accent, "KitProbe (dark)");
 });
