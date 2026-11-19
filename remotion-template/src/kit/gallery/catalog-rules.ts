@@ -52,6 +52,10 @@ const isInteger = (value: unknown): value is number => Number.isInteger(value);
 const validId = (value: unknown, length: number): value is string =>
 	typeof value === 'string' && value.length <= length && ID.test(value);
 
+// A candidate id: lowercase words joined by single hyphens, at most 40
+// characters. The reserved `theme` is each caller's own case.
+export const isCandidateId = (value: unknown): value is string => validId(value, ID_LENGTH);
+
 function checkContent(where: string, kind: string, content: unknown) {
 	const parsed = contentSchema(kind).safeParse(content) as {success: boolean; error?: {issues: ZodIssue[]}};
 	if (parsed.success) return;
@@ -116,7 +120,7 @@ export function validateCatalog(candidates: unknown): void {
 	const seen = new Set<string>();
 	for (const value of candidates) {
 		const {id, kind, source, minFrames, entranceFrames, samples} = asObject(value);
-		if (!validId(id, ID_LENGTH) || id === THEME_ID || seen.has(id)) fail(label(id), 'id is invalid, reserved or repeated');
+		if (!isCandidateId(id) || id === THEME_ID || seen.has(id)) fail(label(id), 'id is invalid, reserved or repeated');
 		seen.add(id);
 		if (typeof kind !== 'string' || !KINDS.has(kind)) fail(id, 'kind is not a scene kind');
 		if (typeof source !== 'string' || source.trim() === '' || LINE_BREAK.test(source)) {

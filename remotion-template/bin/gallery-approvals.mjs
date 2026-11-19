@@ -14,12 +14,11 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isCandidateId } from "../src/kit/gallery/catalog-rules.ts";
 
 const APPROVALS = "gallery/approvals.json";
 const EXPORT_SOURCE = "^gallery/exports/[A-Za-z0-9._-]+\\.json$";
 const EXPORT_PATTERN = new RegExp(EXPORT_SOURCE);
-const ID = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-const ID_LENGTH = 40;
 const THEME = "theme";
 const DECISIONS = ["approve", "redo", "drop"];
 const THEMES = ["light", "dark"];
@@ -30,7 +29,6 @@ const EXPORT_FIELDS = ["version", "page", "reviewer", "date", "decisions", "them
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const isText = (value) => typeof value === "string" && value.trim() !== "";
-const isId = (value) => typeof value === "string" && value.length <= ID_LENGTH && ID.test(value);
 
 function isDate(value) {
   const match = typeof value === "string" ? DATE.exec(value) : null;
@@ -76,7 +74,7 @@ function checkVersion(value, file) {
 
 function checkEntry(entry, path) {
   checkFields(entry, APPROVALS, path, ENTRY_FIELDS);
-  check(entry.id === THEME || isId(entry.id), APPROVALS, field(path, "id"));
+  check(entry.id === THEME || isCandidateId(entry.id), APPROVALS, field(path, "id"));
   check((entry.id === THEME ? THEMES : DECISIONS).includes(entry.decision), APPROVALS, field(path, "decision"));
   check(isText(entry.reviewer), APPROVALS, field(path, "reviewer"));
   check(isDate(entry.date), APPROVALS, field(path, "date"));
@@ -96,7 +94,7 @@ function checkExport(value, file) {
   value.decisions.forEach((decision, i) => {
     const path = `decisions[${i}]`;
     checkFields(decision, file, path, ["id", "decision"], ["note"]);
-    check(isId(decision.id), file, `${path}.id`);
+    check(isCandidateId(decision.id), file, `${path}.id`);
     check(DECISIONS.includes(decision.decision), file, `${path}.decision`);
     if (Object.hasOwn(decision, "note")) check(isText(decision.note), file, `${path}.note`);
   });
