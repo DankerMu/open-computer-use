@@ -164,7 +164,7 @@ test("new creates the project from the template sources with a node_modules link
   assert.deepEqual(result, { code: 0, out: `${target}\n`, err: "" });
   assert.deepEqual(readdirSync(box.videos), ["water-cycle"]);
   const expected = readdirSync(box.template)
-    .filter((name) => !["node_modules", "tests", "out"].includes(name))
+    .filter((name) => !["node_modules", "tests", "out", "gallery"].includes(name))
     .sort();
   assert.deepEqual(readdirSync(target).sort(), [...expected, "node_modules"].sort());
   for (const name of expected) assert.deepEqual(tree(join(target, name)), tree(join(box.template, name)), name);
@@ -184,6 +184,16 @@ test("new creates the project from the template sources with a node_modules link
   assert.equal(lstatSync(target).mode & 0o777, 0o755);
   const script = validateScript(readFileSync(join(target, "script.json"), "utf8"));
   assert.equal(script.ok, true, JSON.stringify(script.errors));
+});
+
+test("new leaves out the gallery: the template has gallery/approvals.json, the project no gallery/", async (t) => {
+  const box = sandbox(t);
+  assert.ok(lstatSync(join(box.template, "gallery", "approvals.json")).isFile());
+  const result = await kit(["new", "no-gallery"], box.template, box);
+  assert.equal(result.code, 0, result.err);
+  const target = join(box.videos, "no-gallery");
+  assert.ok(existsSync(join(target, "script.json")));
+  assert.equal(existsSync(join(target, "gallery")), false);
 });
 
 test("new accepts an existing empty target directory", async (t) => {
