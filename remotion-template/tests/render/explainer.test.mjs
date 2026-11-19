@@ -111,9 +111,10 @@ function bundled(name, entryName) {
   );
 }
 
-function select(serveUrl, id, inputProps) {
+// Selects composition `id` from a settled bundle; `name` labels the timing.
+function select(name, serveUrl, id, inputProps) {
   if (serveUrl.error) return Promise.resolve(serveUrl);
-  return step(`select ${id}`, () => selectComposition({ serveUrl: serveUrl.value, id, inputProps, puppeteerInstance: browser }));
+  return step(`select ${name}`, () => selectComposition({ serveUrl: serveUrl.value, id, inputProps, puppeteerInstance: browser }));
 }
 
 // The custom entry's scene props, as a kit-check probe target would pass them.
@@ -128,9 +129,9 @@ before(async () => {
 
   // A fresh project: the tracked null src/custom/index.ts.
   const freshKit = await bundled("fresh kit", "kit");
-  outcomes.freshKitProbe = await select(freshKit, "KitProbe", customTarget());
+  outcomes.freshKitProbe = await select("freshKitProbe", freshKit, "KitProbe", customTarget());
   const freshFixture = await bundled("fresh fixture", "fixture");
-  outcomes.freshOrbit = await select(freshFixture, "Explainer", { script, timeline });
+  outcomes.freshOrbit = await select("freshOrbit", freshFixture, "Explainer", { script, timeline });
 
   // Orbit's index.
   copyFileSync(join(TEMPLATE, "tests", "render", "fixtures", "explainer", "Orbit.tsx"), join(root, "src", "custom", "Orbit.tsx"));
@@ -141,7 +142,7 @@ before(async () => {
   );
 
   const fixture = await bundled("fixture", "fixture");
-  outcomes.explainer = await select(fixture, "Explainer", { script, timeline });
+  outcomes.explainer = await select("explainer", fixture, "Explainer", { script, timeline });
   if (outcomes.explainer.value) {
     const output = join(root, "out", "explainer.mp4");
     outcomes.render = await step("render", async () => {
@@ -169,22 +170,22 @@ before(async () => {
   const comet = fixtureScript((raw) => {
     raw.chapters[1].scenes[0].component = "Comet";
   });
-  outcomes.comet = await select(fixture, "Explainer", { script: comet, timeline: fixtureTimeline(comet) });
+  outcomes.comet = await select("comet", fixture, "Explainer", { script: comet, timeline: fixtureTimeline(comet) });
   const turned = structuredClone(timeline);
   turned.scenes[0].sentences[0].blocks[1].text = "会转弯";
-  outcomes.textDiffers = await select(fixture, "Explainer", { script, timeline: turned });
-  outcomes.nullProps = await select(fixture, "Explainer", { script: null, timeline: null });
+  outcomes.textDiffers = await select("textDiffers", fixture, "Explainer", { script, timeline: turned });
+  outcomes.nullProps = await select("nullProps", fixture, "Explainer", { script: null, timeline: null });
   const tooLong = structuredClone(script);
   tooLong.title = "光".repeat(25);
   tooLong.hook.narration[0][0] = "光".repeat(17);
-  outcomes.tooLong = await select(fixture, "Explainer", { script: tooLong, timeline });
+  outcomes.tooLong = await select("tooLong", fixture, "Explainer", { script: tooLong, timeline });
 
   const kit = await bundled("kit", "kit");
-  outcomes.kitProbe = await select(kit, "KitProbe", customTarget());
-  outcomes.kitExplainer = await select(kit, "Explainer", { script, timeline });
+  outcomes.kitProbe = await select("kitProbe", kit, "KitProbe", customTarget());
+  outcomes.kitExplainer = await select("kitExplainer", kit, "Explainer", { script, timeline });
 
   const main = await bundled("main", "main");
-  outcomes.main = await select(main, "Main", {});
+  outcomes.main = await select("main", main, "Main", {});
 
   // Blank's index: a custom file without a component.
   const blank = fixtureScript((raw) => {
@@ -193,7 +194,7 @@ before(async () => {
   writeFileSync(join(root, "src", "custom", "Blank.tsx"), "export default null;\n");
   await writeCustomIndex(root, blank);
   const blankFixture = await bundled("blank fixture", "fixture");
-  outcomes.blank = await select(blankFixture, "Explainer", { script: blank, timeline: fixtureTimeline(blank) });
+  outcomes.blank = await select("blank", blankFixture, "Explainer", { script: blank, timeline: fixtureTimeline(blank) });
 });
 
 after(async () => {
