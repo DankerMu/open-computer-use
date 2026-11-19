@@ -195,7 +195,7 @@ def test_dockerfile_installs_music_library_before_template() -> None:
     assert instructions[step - 1] == models
     assert instructions[step + 2] == template
     assert run.index(fetch) < run.index(build)
-    assert build.endswith(" --out /opt/video-music")
+    assert run.split("&&")[1].strip().endswith(" --out /opt/video-music"), run
     assert "rm -rf /tmp/ocu-music" in run
 
 
