@@ -58,11 +58,13 @@ async function readState(path) {
 }
 
 // True when pid is alive and its arguments hold the token. ps exits 1 for a
-// pid with no process.
+// pid with no process. procps cuts args= at COLUMNS even into a pipe, and
+// the token is the last argument, so ps runs without COLUMNS.
 function isThisJob(pid, token) {
   if (!Number.isInteger(pid) || pid <= 0 || typeof token !== "string" || token === "") return Promise.resolve(false);
+  const { COLUMNS: _, ...env } = process.env;
   return new Promise((resolve, reject) => {
-    execFile("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8" }, (error, stdout) => {
+    execFile("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8", env }, (error, stdout) => {
       if (typeof error?.code === "string") reject(error);
       else resolve(error === null && stdout.includes(token));
     });
