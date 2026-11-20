@@ -175,6 +175,11 @@ before(async () => {
   turned.scenes[0].sentences[0].blocks[1].text = "会转弯";
   outcomes.textDiffers = await select("textDiffers", fixture, "Explainer", { script, timeline: turned });
   outcomes.nullProps = await select("nullProps", fixture, "Explainer", { script: null, timeline: null });
+  // Task 6.5: the music input prop, absent (outcomes.explainer), true, false
+  // and anything else.
+  outcomes.musicTrue = await select("musicTrue", fixture, "Explainer", { script, timeline, music: true });
+  outcomes.musicFalse = await select("musicFalse", fixture, "Explainer", { script, timeline, music: false });
+  outcomes.musicYes = await select("musicYes", fixture, "Explainer", { script, timeline, music: "yes" });
   const tooLong = structuredClone(script);
   tooLong.title = "光".repeat(25);
   tooLong.hook.narration[0][0] = "光".repeat(17);
@@ -305,4 +310,14 @@ test("the real kit entry bundles and selects KitProbe with a custom target", () 
 
 test("Main over src/index.ts is unchanged at 150 frames", () => {
   assert.equal(value(outcomes.main, "Main").durationInFrames, 150);
+});
+
+test("the music input prop: absent, true and false select and return it; any other value is refused", () => {
+  assert.equal(value(outcomes.explainer, "music absent").durationInFrames, TOTAL);
+  assert.equal(value(outcomes.explainer, "music absent").props.music, undefined);
+  assert.equal(value(outcomes.musicTrue, "music true").durationInFrames, TOTAL);
+  assert.equal(value(outcomes.musicTrue, "music true").props.music, true);
+  assert.equal(value(outcomes.musicFalse, "music false").durationInFrames, TOTAL);
+  assert.equal(value(outcomes.musicFalse, "music false").props.music, false);
+  rejectsWith(outcomes.musicYes, "kit render: input props: music must be true or false");
 });

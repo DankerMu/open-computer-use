@@ -57,7 +57,7 @@ function project(t, { image = false } = {}) {
 }
 
 // projectHash over the texts on disk now; texts.read replaces the file
-// reader.
+// reader, texts.musicDir the music library.
 async function hashNow({ root, script, timeline }, texts = {}) {
   const { projectHash } = await hashing();
   return projectHash(root, {
@@ -66,12 +66,15 @@ async function hashNow({ root, script, timeline }, texts = {}) {
     scriptText: texts.scriptText ?? readFileSync(join(root, "script.json"), "utf8"),
     timelineText: texts.timelineText ?? readFileSync(join(root, "timeline.json"), "utf8"),
     ...(texts.read ? { read: texts.read } : {}),
+    ...(texts.musicDir ? { musicDir: texts.musicDir } : {}),
   });
 }
 
-// The fixture's rule, computed by hand over the given paths.
-function expectedHash(root, paths, absent = []) {
+// The fixture's rule, computed by hand over the given paths, plus any
+// extra [name, sha256 | null] pairs.
+function expectedHash(root, paths, absent = [], extra = []) {
   const entries = paths.map((path) => [path, absent.includes(path) ? null : sha256(readFileSync(join(root, path)))]);
+  entries.push(...extra);
   entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   return sha256(JSON.stringify(entries));
 }
@@ -286,6 +289,7 @@ test("project-hash.mjs imports only node: built-ins and Remotion-free kit module
     "node:path",
     "./explainer-scenes.mjs",
     "./kit-io.mjs",
+    "./music.mjs",
   ]);
   const bare = new Set();
   const seen = new Set();
@@ -299,4 +303,93 @@ test("project-hash.mjs imports only node: built-ins and Remotion-free kit module
   };
   visit(join(BIN, "project-hash.mjs"));
   assert.deepEqual([...bare].filter((specifier) => !specifier.startsWith("node:")), ["zod"]);
+});
+
+// --- task 6.5: the music pair ---------------------------------------------------------
+
+// A library whose manifest lists fixture-bar (bar.wav) and fixture-other;
+// bar.wav holds `bytes`.
+function musicLibrary(t, bytes = "bar audio") {
+  const dir = mkdtempSync(join(tmpdir(), "project-hash-music-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const tracks = [
+    { id: "fixture-other", loop: false, file: "other.mp3", duration_seconds: 200 },
+    { id: "fixture-bar", loop: true, file: "bar.wav", duration_seconds: 2.01 },
+  ];
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify({ version: 1, tracks }));
+  writeFileSync(join(dir, "bar.wav"), bytes);
+  writeFileSync(join(dir, "other.mp3"), "other audio");
+  return dir;
+}
+
+// The fixture project with script.json naming `music`.
+function musicProject(t, music) {
+  const p = project(t);
+  const raw = JSON.parse(readFileSync(join(p.root, "script.json"), "utf8"));
+  raw.music = music;
+  writeFileSync(join(p.root, "script.json"), JSON.stringify(raw));
+  return { ...p, script: { ...p.script, music } };
+}
+
+const PLAIN_PATHS = (stems) => ["script.json", "timeline.json", "src/custom/Orbit.tsx", "src/kit/theme.ts", "public/narration.wav", ...voicePaths(stems)];
+
+test("a none project's pairs have no music entry, with or without a musicDir that does not exist", async (t) => {
+  const p = project(t);
+  const expected = { hash: expectedHash(p.root, PLAIN_PATHS(p.stems)) };
+  assert.deepEqual(await hashNow(p), expected);
+  assert.deepEqual(await hashNow(p, { musicDir: join(p.root, "no-library") }), expected);
+});
+
+test("a named track adds the pair music:<id> with the SHA-256 of the library file's bytes", async (t) => {
+  const p = musicProject(t, "fixture-bar");
+  const musicDir = musicLibrary(t);
+  assert.deepEqual(await hashNow(p, { musicDir }), {
+    hash: expectedHash(p.root, PLAIN_PATHS(p.stems), [], [["music:fixture-bar", sha256("bar audio")]]),
+  });
+});
+
+test("changing one byte of the library file changes the hash", async (t) => {
+  const p = musicProject(t, "fixture-bar");
+  const before = (await hashNow(p, { musicDir: musicLibrary(t, "bar audio") })).hash;
+  const after = (await hashNow(p, { musicDir: musicLibrary(t, "bar audiO") })).hash;
+  assert.match(before, /^[0-9a-f]{64}$/);
+  assert.notEqual(after, before);
+});
+
+test("a missing library, an unknown id or a non-regular track file gives a null pair, not a throw", async (t) => {
+  const p = musicProject(t, "fixture-bar");
+  const nullPair = { hash: expectedHash(p.root, PLAIN_PATHS(p.stems), [], [["music:fixture-bar", null]]) };
+  assert.deepEqual(await hashNow(p, { musicDir: join(p.root, "no-library") }), nullPair, "missing library");
+  const bad = musicLibrary(t);
+  writeFileSync(join(bad, "manifest.json"), "{");
+  assert.deepEqual(await hashNow(p, { musicDir: bad }), nullPair, "unparsable manifest");
+  const linked = musicLibrary(t);
+  rmSync(join(linked, "bar.wav"));
+  symlinkSync(join(linked, "other.mp3"), join(linked, "bar.wav"));
+  assert.deepEqual(await hashNow(p, { musicDir: linked }), nullPair, "symlinked track");
+  const fifo = musicLibrary(t);
+  rmSync(join(fifo, "bar.wav"));
+  execFileSync("mkfifo", [join(fifo, "bar.wav")]);
+  assert.deepEqual(await hashNow(p, { musicDir: fifo }), nullPair, "FIFO track");
+  const q = musicProject(t, "fixture-gone");
+  assert.deepEqual(
+    await hashNow(q, { musicDir: musicLibrary(t) }),
+    { hash: expectedHash(q.root, PLAIN_PATHS(q.stems), [], [["music:fixture-gone", null]]) },
+    "unknown id",
+  );
+});
+
+test("the track is read without the injectable reader", async (t) => {
+  const { readHashed } = await hashing();
+  const p = musicProject(t, "fixture-bar");
+  const musicDir = musicLibrary(t);
+  const seen = [];
+  const read = async (path) => {
+    seen.push(path);
+    return readHashed(path);
+  };
+  const recorded = await hashNow(p, { musicDir, read });
+  assert.deepEqual(recorded, await hashNow(p, { musicDir }));
+  assert.ok(seen.length > 0);
+  assert.deepEqual(seen.filter((path) => path.startsWith(musicDir)), []);
 });

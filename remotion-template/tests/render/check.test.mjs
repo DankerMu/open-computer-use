@@ -241,8 +241,8 @@ test("1, 2, 5: check returns at once, a second check is refused, and the run pas
   const seen = new Map();
   const done = await settled(passing, CHECK_LIMIT_MS, seen);
   t.diagnostic(`passing check took ${done.ms + elapsed} ms`);
-  const sheetStage = seen.get("check: stage 8 hash") - seen.get("check: stage 7 contact-sheet");
-  t.diagnostic(`sheet stage (stage 7 line to stage 8 line, 100 ms polls) took ${sheetStage} ms`);
+  const sheetStage = seen.get("check: stage 9 hash") - seen.get("check: stage 8 contact-sheet");
+  t.diagnostic(`sheet stage (stage 8 line to stage 9 line, 100 ms polls) took ${sheetStage} ms`);
   assert.deepEqual([done.code, done.out], [0, await passedOutput(passing)], log(passing));
   const lines = log(passing).split("\n");
   for (const line of [
@@ -252,9 +252,10 @@ test("1, 2, 5: check returns at once, a second check is refused, and the run pas
     "check: stage 3 assets",
     "check: stage 4 unnarrated",
     "check: stage 5 rest",
-    "check: stage 6 probe",
-    "check: stage 7 contact-sheet",
-    "check: stage 8 hash",
+    "check: stage 6 music",
+    "check: stage 7 probe",
+    "check: stage 8 contact-sheet",
+    "check: stage 9 hash",
     "check: done passed",
   ]) {
     assert.ok(lines.includes(line), `${line} not in the log`);
@@ -338,7 +339,7 @@ test("9: after a pass, a new check killed before it finishes reports died, never
   const { pid } = startCheck(passing);
   process.kill(pid, "SIGKILL");
   await ended(pid);
-  // 5.2 evidence 4: the killed run before its stage 7 leaves no sheet.
+  // 5.2 evidence 4: the killed run before its stage 8 leaves no sheet.
   assert.equal(existsSync(sheetPath(passing)), false, "the old sheet survived the new start");
   assert.deepEqual(kit(passing, "status"), {
     code: 1,
@@ -391,7 +392,7 @@ async function signalDuringProbe(t, name, signal) {
   const root = variant(name);
   const { pid } = startCheck(root);
   assert.ok(
-    await until(() => log(root).includes("check: stage 6 probe\n") && headlessShells().length > 0, CHECK_LIMIT_MS - 60000),
+    await until(() => log(root).includes("check: stage 7 probe\n") && headlessShells().length > 0, CHECK_LIMIT_MS - 60000),
     "the probe opened a shell",
   );
   const before = headlessShells().length;
@@ -423,7 +424,7 @@ test("7: SIGKILL during the probe leaves no shell within 10 s, and status says d
 async function signalDuringSheet(t, name, signal) {
   const root = variant(name);
   const { pid } = startCheck(root);
-  await reaches(root, "check: stage 7 contact-sheet", true);
+  await reaches(root, "check: stage 8 contact-sheet", true);
   const before = headlessShells().length;
   const sent = Date.now();
   process.kill(pid, signal);
@@ -445,7 +446,7 @@ async function signalDuringSheet(t, name, signal) {
     // Nothing ran the stage's finally, so its work directory is still there.
     assert.ok(left.includes("sheet"), "the killed stage's work directory");
   } else if (existsSync(sheetPath(root))) {
-    t.diagnostic("SIGTERM landed after stage 8's rename; status says died and does not report the sheet");
+    t.diagnostic("SIGTERM landed after stage 9's rename; status says died and does not report the sheet");
   }
   const next = startCheck(root);
   const swept = readdirSync(dir);
@@ -465,7 +466,7 @@ test("5.2 evidence 5: SIGKILL during the sheet leaves no shell within 10 s, stat
 test("5.2 evidence 6: a src/ file edited during the probe fails the check with the changed-project reason and no sheet", { timeout: CHECK_LIMIT_MS }, async () => {
   const root = variant("edited");
   const { pid } = startCheck(root);
-  await reaches(root, "check: stage 6 probe", false);
+  await reaches(root, "check: stage 7 probe", false);
   appendFileSync(join(root, "src", "custom", "Orbit.tsx"), "// edited while the check ran\n");
   const done = await settled(root);
   assert.deepEqual([done.code, done.out], [1, `kit status: check failed (1 reasons)\n  ${CHANGED}\n`], log(root));
