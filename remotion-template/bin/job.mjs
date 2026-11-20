@@ -77,11 +77,14 @@ export async function jobState(root, name) {
   if (job === undefined) return { state: "none" };
   if (job === null) return { state: "died", pid: null };
   const pid = Number.isInteger(job.pid) ? job.pid : null;
+  // Liveness first: the worker writes its result before it exits, so a
+  // result read after the worker is seen gone is never missed.
+  const live = await isThisJob(pid, job.token);
   const result = await readState(join(dir, RESULT));
   if (isObject(result) && typeof job.token === "string" && result.token === job.token && ["passed", "failed"].includes(result.outcome)) {
     return { state: result.outcome, result };
   }
-  if (await isThisJob(pid, job.token)) return { state: "running", pid, startedAt: job.startedAt };
+  if (live) return { state: "running", pid, startedAt: job.startedAt };
   return { state: "died", pid };
 }
 
