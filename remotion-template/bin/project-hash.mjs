@@ -4,7 +4,8 @@
 // The passing-check hash: what a passing kit check vouches for, and what
 // kit render compares before it starts. It covers the texts of script.json
 // and timeline.json that the check judged, every regular file under src/,
-// and the public/ files the check's assets stage reads. It depends on paths
+// the public/ files the check's assets stage reads, and, for a project that
+// names a music track, that track's library file. It depends on paths
 // and contents only, never on mtime or mode, and follows no symlink: every
 // file is opened with O_NOFOLLOW | O_NONBLOCK and judged by fstat. Imports
 // only node: built-ins and the kit's own Remotion-free modules, so render's
@@ -14,7 +15,8 @@ import { createHash } from "node:crypto";
 import { constants, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { explainerScenes } from "./explainer-scenes.mjs";
-import { lstatOrNull, notFound } from "./kit-io.mjs";
+import { Refusal, lstatOrNull, notFound } from "./kit-io.mjs";
+import { MUSIC_DIR, readLibrary } from "./music.mjs";
 
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -77,11 +79,29 @@ async function walk(root, rel, entries, reasons, read) {
   }
 }
 
+// The SHA-256 of the library file of the track the script names, or null
+// when the manifest, the entry or the file cannot be read: the check's
+// music stage reports why. Read through readHashed, never the injectable
+// reader, so a symlink or non-regular file is null.
+async function trackHash(id, musicDir) {
+  try {
+    const track = (await readLibrary(musicDir)).tracks.find((entry) => entry.id === id);
+    if (track === undefined) return null;
+    const file = await readHashed(join(musicDir, track.file));
+    return file.kind === "file" ? sha256(file.bytes) : null;
+  } catch (thrown) {
+    if (thrown instanceof Refusal || typeof thrown?.code === "string") return null;
+    throw thrown;
+  }
+}
+
 // Resolves to {hash} or {reasons}. A referenced file that is absent, gone
 // before it is read, or not a regular file is a null entry: the assets
 // stage reports it. A system error from a read propagates. read replaces
-// readHashed (tests interleave a removal).
-export async function projectHash(root, { script, timeline, scriptText, timelineText, read = readHashed }) {
+// readHashed (tests interleave a removal). A project that names a music
+// track adds ["music:<id>", sha256 | null]; a "none" project reads nothing
+// under musicDir.
+export async function projectHash(root, { script, timeline, scriptText, timelineText, read = readHashed, musicDir = MUSIC_DIR }) {
   const src = await lstatOrNull(join(root, "src"));
   if (src === null) return { reasons: ["src: is missing"] };
   if (src.isSymbolicLink()) return { reasons: ["src: is a symlink"] };
@@ -97,6 +117,7 @@ export async function projectHash(root, { script, timeline, scriptText, timeline
     const file = await read(join(root, path));
     entries.push([path, file.kind === "file" ? sha256(file.bytes) : null]);
   }
+  if (script.music !== "none") entries.push([`music:${script.music}`, await trackHash(script.music, musicDir)]);
   entries.sort((a, b) => byCodeUnit(a[0], b[0]));
   return { hash: sha256(JSON.stringify(entries)) };
 }

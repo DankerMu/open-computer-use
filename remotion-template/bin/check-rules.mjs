@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// kit check: eight ordered stages, each a rule with its own messages. Every
+// kit check: nine ordered stages, each a rule with its own messages. Every
 // rule in a stage runs and collects its reasons. A failing stage 1 (schema)
 // or 2 (timeline) stops the run. After stage 2 passes, the snapshot writes
 // src/custom/index.ts and takes the passing-check hash
 // (bin/project-hash.mjs) before any later stage reads the project. Stages
-// 3–5 (assets, unnarrated stretches, rest after reveals) all run; stages 6
-// (the probe), 7 (the contact sheet) and 8 (the hash again) run only when
-// every earlier stage passed. Stage 8 moves the sheet into place only when
-// the project still hashes as at the snapshot, so a pass vouches for what
-// was checked. Each rule is exported on its own and takes its inputs as
+// 3–6 (assets, unnarrated stretches, rest after reveals, music) all run;
+// stages 7 (the probe), 8 (the contact sheet) and 9 (the hash again) run
+// only when every earlier stage passed. Stage 9 moves the sheet into place
+// only when the project still hashes as at the snapshot, so a pass vouches
+// for what was checked. Each rule is exported on its own and takes its inputs as
 // arguments, so tests call it with hand-written timelines, reveals and a
 // stub file reader. Pure apart from the reads through that reader, the
 // hash, the custom index and the sheet's files under .kit/check/. Only the
@@ -25,6 +25,7 @@ import { contactSheet, sheetTiles } from "./contact-sheet.mjs";
 import { writeCustomIndex } from "./custom-index.mjs";
 import { explainerScenes } from "./explainer-scenes.mjs";
 import { Refusal, lstatOrNull, notFound } from "./kit-io.mjs";
+import { MUSIC_DIR, musicReasons } from "./music.mjs";
 import { formatViolation, probe as kitProbe, violations } from "./probe.mjs";
 import { projectHash } from "./project-hash.mjs";
 import { ENTRANCE_FRAMES, REST_FRAMES, REVEALS, layout, revealsOf } from "./scene-timing.mjs";
@@ -235,7 +236,7 @@ export function restRule(script, timeline, reveals = REVEALS) {
   return reasons;
 }
 
-// --- 6. probe ---------------------------------------------------------------
+// --- 7. probe ---------------------------------------------------------------
 
 // Writes src/custom/index.ts, then probes every scene through the kit's own
 // KitProbe at its entrance end, midpoint and pre-exit frames.
@@ -287,13 +288,14 @@ async function snapshot(state) {
     timeline: state.timeline,
     scriptText: state.scriptText,
     timelineText: state.timelineText,
+    musicDir: state.musicDir,
   });
   if (taken.reasons) return taken.reasons;
   state.snapshot = taken.hash;
   return [];
 }
 
-// --- 7. contact sheet --------------------------------------------------------------
+// --- 8. contact sheet --------------------------------------------------------------
 
 // Renders the sheet to contact.next.png; a thrown error is the reason, and
 // leaves no next sheet.
@@ -317,7 +319,7 @@ async function sheetRule(state) {
   return [];
 }
 
-// --- 8. hash -------------------------------------------------------------------
+// --- 9. hash -------------------------------------------------------------------
 
 // Hashes the project again with the texts as they are now. Only when it
 // matches the snapshot does the sheet move into place and the run carry its
@@ -329,7 +331,13 @@ async function hashRule(state) {
     const scriptText = await state.files.text("script.json");
     const timelineText = await state.files.text("timeline.json");
     if (state.snapshot === null || scriptText === null || timelineText === null) return [CHANGED];
-    const again = await projectHash(state.root, { script: state.script, timeline: state.timeline, scriptText, timelineText });
+    const again = await projectHash(state.root, {
+      script: state.script,
+      timeline: state.timeline,
+      scriptText,
+      timelineText,
+      musicDir: state.musicDir,
+    });
     if (again.reasons || again.hash !== state.snapshot) return [CHANGED];
     await rename(next, join(state.root, SHEET));
     moved = true;
@@ -390,6 +398,7 @@ export const RULES = [
   { name: "assets", run: (state) => assetsRule(state.script, state.timeline, state.files) },
   { name: "unnarrated", run: (state) => unnarratedRule(state.script, state.timeline) },
   { name: "rest", run: (state) => restRule(state.script, state.timeline, state.reveals) },
+  { name: "music", run: (state) => musicReasons(state.script, state.timeline, state.musicDir) },
   { name: "probe", needsPass: true, run: (state) => probeRule(state.root, state.script, state.timeline, state) },
   { name: "contact-sheet", needsPass: true, run: sheetRule },
   { name: "hash", needsPass: true, run: hashRule },
@@ -399,13 +408,22 @@ export const RULES = [
 // pass is {hash, sheet, tiles} when the reasons are empty, null otherwise.
 // log receives `check: stage <n> <name>` before each stage and `check:
 // snapshot` before the snapshot. sheet renders the contact sheet (tests
-// inject a stub). A system error from a read, the hash or the custom index
-// propagates.
+// inject a stub). musicDir is the music library that the music stage and
+// both hashes read. A system error from a read, the hash or the custom
+// index propagates.
 export async function runChecks(
   root,
-  { probe = kitProbe, reveals = REVEALS, theme = KIT_THEME, files = projectFiles(root), log = () => {}, sheet = contactSheet } = {},
+  {
+    probe = kitProbe,
+    reveals = REVEALS,
+    theme = KIT_THEME,
+    files = projectFiles(root),
+    log = () => {},
+    sheet = contactSheet,
+    musicDir = MUSIC_DIR,
+  } = {},
 ) {
-  const state = { root, probe, reveals, theme, files, sheet, script: null, timeline: null, snapshot: null, tiles: null, pass: null };
+  const state = { root, probe, reveals, theme, files, sheet, musicDir, script: null, timeline: null, snapshot: null, tiles: null, pass: null };
   const reasons = [];
   for (const [i, rule] of RULES.entries()) {
     if (rule.needsPass && reasons.length) break;

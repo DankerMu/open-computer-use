@@ -64,7 +64,7 @@ export const IMAGE_NAME = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(png|jpg|
 
 const CUSTOM = "custom";
 const CHAPTER_KINDS = [...BODY_KINDS, CUSTOM];
-const MUSIC_ID = new RegExp(`^[a-z0-9][a-z0-9-]{0,${LIMITS.musicId - 1}}$`);
+export const MUSIC_ID = new RegExp(`^[a-z0-9][a-z0-9-]{0,${LIMITS.musicId - 1}}$`);
 const VOICE_ID = /^[A-Za-z0-9._-]*$/;
 const COMPONENT = /^[A-Z][A-Za-z0-9]{0,39}$/;
 const NON_EMPTY = "non-empty";

@@ -21,10 +21,11 @@ const COMPOSITION = "Explainer";
 // reports the host's CPUs inside a --cpus=2 container (14, measured).
 const CONCURRENCY = 2;
 
-// script and timeline: the parsed files. output: the video's path. log
-// receives `render: frames 0/<total>` once the composition is selected, then
-// `render: frames <done>/<total>` at most once per tenth of the frames.
-export async function renderVideo({ root, script, timeline, output, log }) {
+// script and timeline: the parsed files. music: true when the worker wrote
+// public/music.wav. output: the video's path. log receives `render: frames
+// 0/<total>` once the composition is selected, then `render: frames
+// <done>/<total>` at most once per tenth of the frames.
+export async function renderVideo({ root, script, timeline, music, output, log }) {
   const outDir = join(root, BUNDLE_DIR);
   let browser = null;
   try {
@@ -39,7 +40,7 @@ export async function renderVideo({ root, script, timeline, output, log }) {
       symlinkPublicDir: true,
     });
     browser = await openBrowser("chrome");
-    const inputProps = { script, timeline };
+    const inputProps = music === true ? { script, timeline, music: true } : { script, timeline };
     const composition = await selectComposition({ serveUrl, id: COMPOSITION, inputProps, puppeteerInstance: browser });
     const total = composition.durationInFrames;
     log(`render: frames 0/${total}`);
