@@ -8,13 +8,16 @@
 // one whose src/ holds an unreadable directory; and the static import lists
 // that keep @remotion/* off every start path. Expected states, messages and
 // bounds come from the task 5.1 and 5.2 fixtures (5.2: the cleared job
-// directory, `count` and the passed result's fields).
+// directory, `count` and the passed result's fields), and from task 5.3's:
+// the succeeded state, the start lock, the spawn error, TMPDIR, racing
+// starts, and the import pins of render.mjs and status.mjs. 5.3's new
+// exports are imported inside the tests that use them.
 // Every worker a test starts is waited for or killed before the test ends.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -202,6 +205,9 @@ test("a new start removes the whole job directory: a sheet, a work directory, th
   for (const name of ["contact.png", "contact.next.png", "sheet", "result.json"]) {
     assert.equal(existsSync(join(dir(root), name)), false, `${name} survived the start`);
   }
+  // 5.3: the start recreates the directory with an empty tmp/ inside.
+  assert.deepEqual(readdirSync(dir(root)).sort(), ["job.json", "log", "tmp"]);
+  assert.deepEqual(readdirSync(join(dir(root), "tmp")), []);
   writeFileSync(join(root, "release"), "die");
   assert.ok(await until(() => !alive(pid)));
 });
@@ -212,6 +218,192 @@ test("a dead worker's state never blocks a new start", async (t) => {
   writeFileSync(join(dir(root), "job.json"), JSON.stringify({ version: 1, name: NAME, token: "12".repeat(16), pid: process.pid, startedAt: 0 }));
   await start(t, root, "pass");
   assert.equal((await settled(root)).state, "passed");
+});
+
+// --- task 5.3: the succeeded state, the start lock, the spawn, TMPDIR ---------------
+
+const kitDir = (root) => join(root, ".kit");
+const lockPath = (root) => join(kitDir(root), "start.lock");
+const LOCK_HELD = (pid) => `another kit command is starting a job (pid ${pid}); try again, or remove .kit/start.lock if none is`;
+
+function plantLock(root, text) {
+  mkdirSync(kitDir(root), { recursive: true });
+  writeFileSync(lockPath(root), text);
+}
+
+// Nothing of the lock is left in .kit/: neither start.lock nor a temporary
+// start.lock.<random>.
+const lockFiles = (root) => readdirSync(kitDir(root)).filter((name) => name.startsWith("start.lock"));
+
+test("a render result with outcome succeeded and this run's token reads as succeeded after the worker exits", async (t) => {
+  const root = project(t);
+  const pid = await startJob(root, "render", [WORKER, "render", "succeed"]);
+  t.after(() => {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ESRCH: the worker has already exited.
+    }
+  });
+  assert.ok(await until(() => !alive(pid)));
+  const result = readJson(join(root, ".kit", "render", "result.json"));
+  assert.equal(result.token, readJson(join(root, ".kit", "render", "job.json")).token);
+  assert.deepEqual(await jobState(root, "render"), { state: "succeeded", result });
+  assert.equal(result.exitCode, 0);
+});
+
+test("jobStartedAt is job.json's startedAt, or null without one", async (t) => {
+  const { jobStartedAt } = await import("../bin/job.mjs");
+  const root = project(t);
+  assert.equal(await jobStartedAt(root, NAME), null);
+  mkdirSync(dir(root), { recursive: true });
+  writeFileSync(join(dir(root), "job.json"), "not json");
+  assert.equal(await jobStartedAt(root, NAME), null);
+  writeFileSync(join(dir(root), "job.json"), JSON.stringify({ version: 1, name: NAME, token: "ab".repeat(16), pid: null, startedAt: 1234 }));
+  assert.equal(await jobStartedAt(root, NAME), 1234);
+});
+
+test("a held start lock with a live pid that started before it refuses, and the lock stays", async (t) => {
+  const root = project(t);
+  // This test process is alive and started before the lock.
+  const text = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
+  plantLock(root, text);
+  await assert.rejects(
+    startJob(root, NAME, [WORKER, NAME, "pass"]),
+    (error) => error instanceof Refusal && error.exitCode === 1 && error.message === LOCK_HELD(process.pid),
+  );
+  assert.equal(readFileSync(lockPath(root), "utf8"), text);
+  assert.deepEqual(lockFiles(root), ["start.lock"]);
+  assert.equal(existsSync(dir(root)), false, "a refused start created the job directory");
+});
+
+test("an unparsable start lock is held and never taken over", async (t) => {
+  const root = project(t);
+  plantLock(root, "{half a lock");
+  await assert.rejects(
+    startJob(root, NAME, [WORKER, NAME, "pass"]),
+    (error) => error instanceof Refusal && error.message === LOCK_HELD("unknown"),
+  );
+  assert.equal(readFileSync(lockPath(root), "utf8"), "{half a lock");
+});
+
+test("a start lock naming a dead pid is taken over, and the start removes it", async (t) => {
+  const root = project(t);
+  const gone = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
+  plantLock(root, JSON.stringify({ pid: Number(gone.stdout), startedAt: Date.now() }));
+  await start(t, root, "pass");
+  assert.equal((await settled(root)).state, "passed");
+  assert.deepEqual(lockFiles(root), []);
+});
+
+test("a start lock naming a live, unrelated pid that started after the lock is taken over", async (t) => {
+  const root = project(t);
+  // This test process started well after an hour-old lock: a reused pid.
+  plantLock(root, JSON.stringify({ pid: process.pid, startedAt: Date.now() - 3600000 }));
+  await start(t, root, "pass");
+  assert.equal((await settled(root)).state, "passed");
+  assert.deepEqual(lockFiles(root), []);
+});
+
+test("a spawn with a non-executable execPath rejects with its system error, 20 times, with no unhandled error", async (t) => {
+  const root = project(t);
+  const notExecutable = join(root, "not-node");
+  writeFileSync(notExecutable, "#!/bin/sh\n", { mode: 0o644 });
+  for (let i = 0; i < 20; i++) {
+    await assert.rejects(
+      startJob(root, NAME, [WORKER, NAME, "pass"], { execPath: notExecutable }),
+      (error) => !(error instanceof Refusal) && error.code === "EACCES",
+    );
+    assert.deepEqual(lockFiles(root), [], `run ${i + 1} left its lock`);
+  }
+});
+
+test("the worker's environment has TMPDIR at .kit/<name>/tmp, which exists", async (t) => {
+  const root = project(t);
+  await start(t, root, "tmpdir");
+  assert.equal((await settled(root)).state, "passed");
+  const { token } = readJson(join(dir(root), "job.json"));
+  assert.equal(readFileSync(join(dir(root), "log"), "utf8"), `worker ${token}\ntmpdir ${join(root, ".kit", NAME, "tmp")}\n`);
+  assert.ok(existsSync(join(dir(root), "tmp")));
+});
+
+test("two startJob calls racing in one process give exactly one start and one refusal", async (t) => {
+  const root = project(t);
+  const settledStarts = await Promise.allSettled([
+    startJob(root, NAME, [WORKER, NAME, "block"]),
+    startJob(root, NAME, [WORKER, NAME, "block"]),
+  ]);
+  for (const { status, value } of settledStarts) {
+    if (status === "fulfilled") {
+      t.after(() => {
+        try {
+          process.kill(value, "SIGKILL");
+        } catch {
+          // ESRCH: the worker has already exited.
+        }
+      });
+    }
+  }
+  const started = settledStarts.filter(({ status }) => status === "fulfilled");
+  const refused = settledStarts.filter(({ status }) => status === "rejected");
+  assert.equal(started.length, 1, JSON.stringify(settledStarts));
+  assert.equal(refused.length, 1);
+  assert.ok(refused[0].reason instanceof Refusal, String(refused[0].reason));
+  assert.ok(
+    [LOCK_HELD(process.pid), `a check is already running (pid ${started[0].value}); run node bin/kit.mjs status`].includes(refused[0].reason.message),
+    refused[0].reason.message,
+  );
+  assert.equal(readJson(join(dir(root), "job.json")).pid, started[0].value);
+  assert.deepEqual(lockFiles(root), []);
+  writeFileSync(join(root, "release"), "pass");
+  assert.equal((await settled(root)).state, "passed");
+});
+
+test("a check start is refused while a render runs, under the one-job rule", async (t) => {
+  const root = project(t);
+  const pid = await startJob(root, "render", [WORKER, "render", "block"]);
+  t.after(() => {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ESRCH: the worker has already exited.
+    }
+  });
+  await assert.rejects(
+    startJob(root, NAME, [WORKER, NAME, "pass"]),
+    (error) => error instanceof Refusal && error.message === `a render is already running (pid ${pid}); run node bin/kit.mjs status`,
+  );
+  assert.equal(existsSync(dir(root)), false);
+  writeFileSync(join(root, "release"), "die");
+  assert.ok(await until(() => !alive(pid)));
+});
+
+test("a symlinked or non-directory .kit, and a symlinked .kit/<name>, are refused", async (t) => {
+  const linked = project(t);
+  const elsewhere = project(t);
+  symlinkSync(elsewhere, kitDir(linked));
+  await assert.rejects(startJob(linked, NAME, [WORKER, NAME, "pass"]), (error) => error instanceof Refusal && error.message === ".kit: is a symlink");
+  assert.deepEqual(readdirSync(elsewhere), []);
+
+  const file = project(t);
+  writeFileSync(kitDir(file), "not a directory");
+  await assert.rejects(startJob(file, NAME, [WORKER, NAME, "pass"]), (error) => error instanceof Refusal && error.message === ".kit: is not a directory");
+
+  const inner = project(t);
+  mkdirSync(kitDir(inner));
+  symlinkSync(elsewhere, dir(inner));
+  await assert.rejects(startJob(inner, NAME, [WORKER, NAME, "pass"]), (error) => error instanceof Refusal && error.message === ".kit/check: is a symlink");
+  assert.deepEqual(readdirSync(elsewhere), []);
+
+  const notDir = project(t);
+  mkdirSync(kitDir(notDir));
+  writeFileSync(dir(notDir), "x");
+  await assert.rejects(startJob(notDir, NAME, [WORKER, NAME, "pass"]), (error) => error instanceof Refusal && error.message === ".kit/check: is not a directory");
+});
+
+test("stopRequested is false until a stop signal arrives", async () => {
+  const { stopRequested } = await import("../bin/job.mjs");
+  assert.equal(stopRequested(), false);
 });
 
 // --- writeResult --------------------------------------------------------------
@@ -356,12 +548,39 @@ function imports(path) {
 
 const bin = (name) => join(TEMPLATE, "bin", name);
 
-test("kit.mjs, check.mjs and job.mjs import only node: built-ins and the kit's own modules", () => {
+test("kit.mjs, check.mjs, status.mjs, render.mjs and job.mjs import only node: built-ins and the kit's own modules", () => {
   assert.deepEqual(imports(bin("kit.mjs")), {
-    static: ["node:crypto", "node:fs", "node:fs/promises", "node:path", "node:url", "./check.mjs", "./kit-io.mjs", "./timeline.mjs", "./voice-stem.mjs"],
+    static: [
+      "node:crypto",
+      "node:fs",
+      "node:fs/promises",
+      "node:path",
+      "node:url",
+      "./check.mjs",
+      "./kit-io.mjs",
+      "./render.mjs",
+      "./status.mjs",
+      "./timeline.mjs",
+      "./voice-stem.mjs",
+    ],
     dynamic: [],
   });
-  assert.deepEqual(imports(bin("check.mjs")), { static: ["node:path", "./checklist.mjs", "./job.mjs"], dynamic: ["./check-rules.mjs"] });
+  assert.deepEqual(imports(bin("check.mjs")), { static: ["./job.mjs"], dynamic: ["./check-rules.mjs"] });
+  assert.deepEqual(imports(bin("status.mjs")), { static: ["node:path", "./checklist.mjs", "./job.mjs"], dynamic: [] });
+  assert.deepEqual(imports(bin("render.mjs")), {
+    static: [
+      "node:child_process",
+      "node:fs/promises",
+      "node:path",
+      "./custom-index.mjs",
+      "./explainer-scenes.mjs",
+      "./job.mjs",
+      "./kit-io.mjs",
+      "./project-hash.mjs",
+      "./script-schema.mjs",
+    ],
+    dynamic: ["./render-video.mjs"],
+  });
   assert.deepEqual(imports(bin("job.mjs")), {
     static: ["node:child_process", "node:crypto", "node:fs/promises", "node:path", "./kit-io.mjs", "./script-schema.mjs"],
     dynamic: [],
@@ -381,6 +600,9 @@ test("no @remotion/* module is reachable from kit.mjs through static imports", (
   };
   visit(bin("kit.mjs"));
   assert.ok(seen.has(bin("job.mjs")));
+  assert.ok(seen.has(bin("render.mjs")));
+  assert.ok(seen.has(bin("status.mjs")));
   assert.ok(!seen.has(bin("check-rules.mjs")));
+  assert.ok(!seen.has(bin("render-video.mjs")));
   assert.deepEqual([...bare].filter((specifier) => !specifier.startsWith("node:")), ["zod"]);
 });

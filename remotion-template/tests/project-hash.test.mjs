@@ -7,7 +7,10 @@
 // SHA-256 of JSON.stringify of the [path, sha256 | null] pairs, sorted by
 // path, over script.json, timeline.json, every regular file under src/ and
 // the referenced public/ files. The module is imported inside each test, so
-// a missing module fails every test on its own.
+// a missing module fails every test on its own. Task 5.3 hardens the reads:
+// every file is opened with O_NONBLOCK | O_NOFOLLOW and judged by fstat, and
+// a file that vanishes after the listing is skipped (src/) or null
+// (referenced), so the next hash differs instead of the read failing.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -53,7 +56,8 @@ function project(t, { image = false } = {}) {
   return { root, script, timeline, locked, stems: blockStems(script).map((entry) => entry.stem) };
 }
 
-// projectHash over the texts on disk now.
+// projectHash over the texts on disk now; texts.read replaces the file
+// reader.
 async function hashNow({ root, script, timeline }, texts = {}) {
   const { projectHash } = await hashing();
   return projectHash(root, {
@@ -61,6 +65,7 @@ async function hashNow({ root, script, timeline }, texts = {}) {
     timeline,
     scriptText: texts.scriptText ?? readFileSync(join(root, "script.json"), "utf8"),
     timelineText: texts.timelineText ?? readFileSync(join(root, "timeline.json"), "utf8"),
+    ...(texts.read ? { read: texts.read } : {}),
   });
 }
 
@@ -200,6 +205,72 @@ test("a system error from the walk propagates", { skip: process.getuid?.() === 0
   p.locked.push(locked);
   chmodSync(locked, 0o000);
   await assert.rejects(hashNow(p), (error) => error.code === "EACCES");
+});
+
+// --- task 5.3: O_NONBLOCK | O_NOFOLLOW reads, vanished files ------------------------
+
+test("the read helper: a regular file gives its bytes; a FIFO and a symlink are non-regular, without blocking; a missing path vanished", async (t) => {
+  const { readHashed } = await hashing();
+  const p = project(t);
+  const file = join(p.root, "src", "custom", "Orbit.tsx");
+  assert.deepEqual(await readHashed(file), { kind: "file", bytes: readFileSync(file) });
+  const fifo = join(p.root, "pipe");
+  execFileSync("mkfifo", [fifo]);
+  // With no writer, a blocking open of the FIFO would never return.
+  assert.deepEqual(await readHashed(fifo), { kind: "other" });
+  const link = join(p.root, "link");
+  symlinkSync(file, link);
+  assert.deepEqual(await readHashed(link), { kind: "other" });
+  assert.deepEqual(await readHashed(join(p.root, "src")), { kind: "other" });
+  assert.deepEqual(await readHashed(join(p.root, "absent")), { kind: "vanished" });
+  assert.deepEqual(await readHashed(join(p.root, "script.json", "below")), { kind: "vanished" });
+});
+
+test("a src/ file removed between the listing and the read is skipped, and the hash differs", async (t) => {
+  const { readHashed } = await hashing();
+  const p = project(t);
+  const before = (await hashNow(p)).hash;
+  const orbit = join(p.root, "src", "custom", "Orbit.tsx");
+  const read = async (path) => {
+    if (path === orbit) rmSync(orbit);
+    return readHashed(path);
+  };
+  const raced = await hashNow(p, { read });
+  const paths = ["script.json", "timeline.json", "src/kit/theme.ts", "public/narration.wav", ...voicePaths(p.stems)];
+  assert.deepEqual(raced, { hash: expectedHash(p.root, paths) });
+  assert.notEqual(raced.hash, before);
+});
+
+test("a referenced file removed between the listing and the read is a null entry", async (t) => {
+  const { readHashed } = await hashing();
+  const p = project(t);
+  const wav = `public/voice/${p.stems[0]}.wav`;
+  const read = async (path) => {
+    if (path === join(p.root, wav)) rmSync(path, { force: true });
+    return readHashed(path);
+  };
+  const before = (await hashNow(p)).hash;
+  const paths = ["script.json", "timeline.json", "src/custom/Orbit.tsx", "src/kit/theme.ts", "public/narration.wav", ...voicePaths(p.stems)];
+  const raced = await hashNow(p, { read });
+  // The vanished WAV is [path, null]; the others hash as on disk.
+  assert.deepEqual(raced, { hash: expectedHash(p.root, paths, [wav]) });
+  assert.notEqual(raced.hash, before);
+});
+
+test("a src/ entry swapped for a FIFO after the listing is a reason, read without blocking", async (t) => {
+  const { readHashed } = await hashing();
+  const p = project(t);
+  const orbit = join(p.root, "src", "custom", "Orbit.tsx");
+  const read = async (path) => {
+    if (path === orbit) {
+      rmSync(orbit);
+      execFileSync("mkfifo", [orbit]);
+    }
+    return readHashed(path);
+  };
+  assert.deepEqual(await hashNow(p, { read }), {
+    reasons: ["src/custom/Orbit.tsx: is not a regular file or directory; the check hashes regular files only"],
+  });
 });
 
 // The specifiers of a module's static imports and re-exports.

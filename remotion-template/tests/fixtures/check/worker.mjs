@@ -9,7 +9,9 @@
 //               directory, then writes a pass when it holds `pass`, or exits
 //               1 without a result when it holds `die`;
 //   signal      installs the stop-signal handler, sends itself SIGTERM, then
-//               tries to write a pass and prints whether it was written.
+//               tries to write a pass and prints whether it was written;
+//   succeed     writes a render's succeeded result at once (task 5.3);
+//   tmpdir      prints `tmpdir <TMPDIR>`, then writes a pass (task 5.3).
 
 import { existsSync, readFileSync } from "node:fs";
 import { handleStopSignals, writeResult } from "../../../bin/job.mjs";
@@ -32,6 +34,11 @@ if (mode === "pass") {
   process.kill(process.pid, "SIGTERM");
   await pause(20);
   process.stdout.write(`written ${await writeResult(root, name, token, "passed", [])}\n`);
+} else if (mode === "succeed") {
+  await writeResult(root, name, token, "succeeded", [], { exitCode: 0, target: "/files/demo.mp4", frames: 1991 });
+} else if (mode === "tmpdir") {
+  process.stdout.write(`tmpdir ${process.env.TMPDIR}\n`);
+  await writeResult(root, name, token, "passed", []);
 } else {
   throw new Error(`unknown mode ${mode}`);
 }

@@ -135,9 +135,10 @@ test("no subcommand and an unknown subcommand are usage errors", async (t) => {
   assert.equal(none.code, 2);
   assert.equal(none.out, "");
   for (const line of lines(none.err)) assert.match(line, /^kit: /);
-  const unknown = await kit(["render"], box.template, box);
+  // 5.3: render is a subcommand now, so publish stands in as unknown.
+  const unknown = await kit(["publish"], box.template, box);
   assert.equal(unknown.code, 2);
-  assert.match(unknown.err, /^kit: unknown subcommand "render"\n/);
+  assert.match(unknown.err, /^kit: unknown subcommand "publish"\n/);
 });
 
 test("executed directly, kit.mjs sets the exit code and uses its own directory as root", async (t) => {
@@ -693,11 +694,13 @@ test("1,000 random names always sanitize to a name matching IMAGE_NAME", async (
 
 // --- check and status (task 5.1) ---------------------------------------------
 
-test("the usage list holds check and status, and package.json is an ES module package", async (t) => {
+test("the usage list holds check, render and status, and package.json is an ES module package", async (t) => {
   const box = sandbox(t);
   const none = await kit([], box.template, box);
   assert.equal(none.code, 2);
   assert.ok(lines(none.err).includes("kit: usage: node bin/kit.mjs check"), none.err);
+  // 5.3: render joins the list.
+  assert.ok(lines(none.err).includes("kit: usage: node bin/kit.mjs render"), none.err);
   assert.ok(lines(none.err).includes("kit: usage: node bin/kit.mjs status"), none.err);
   assert.equal(JSON.parse(readFileSync(join(TEMPLATE, "package.json"), "utf8")).type, "module");
 });
@@ -713,16 +716,16 @@ test("new leaves out .kit: a template with .kit/check/ gives a project without .
   assert.equal(existsSync(join(target, ".kit")), false);
 });
 
-test("check and status refuse at the template root and take no argument", async (t) => {
+test("check, render and status refuse at the template root and take no argument", async (t) => {
   const box = sandbox(t);
-  for (const name of ["check", "status"]) {
+  for (const name of ["check", "render", "status"]) {
     const atTemplate = await kit([name], box.template, box);
     assert.equal(atTemplate.code, 2);
     assert.ok(atTemplate.err.includes(`cd ${box.videos}/<name> && node bin/kit.mjs ${name}`), atTemplate.err);
     assert.equal(existsSync(join(box.template, ".kit")), false);
   }
   const p = await project(t);
-  for (const name of ["check", "status"]) {
+  for (const name of ["check", "render", "status"]) {
     const extra = await kit([name, "x"], p.root, p);
     assert.deepEqual(extra, { code: 2, out: "", err: `kit ${name}: usage: node bin/kit.mjs ${name}\n` });
   }
