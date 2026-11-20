@@ -37,6 +37,7 @@ const CANDIDATE_KINDS = [
 ];
 const ALLOWED_KINDS = [...CANDIDATE_KINDS, "custom"].join(" | ");
 const IMAGE_LIMIT = "plain image name (.png, .jpg, .jpeg or .webp)";
+const CONTROL_LIMIT = "no control characters";
 const MUSIC_LIMIT = "none or a track id: a-z or 0-9 first, then a-z, 0-9 or -, at most 40 characters";
 const MESSAGE = /^(script|hook|summary|end-card|chapter [^,]+(, scene \d+ \([^)]+\))?): \S+ .+ \(limit .+\)$/;
 
@@ -595,11 +596,13 @@ test("control characters in a chapter name are escaped, after the cut", () => {
   script.chapters[1].scenes[0].narration = [[]];
   const label = '2 a\\tb\\nc\\rd\\u0000e\\u001ff\\u007fg\\u009fh\\u2028i\\u2029j"k\\l';
   const result = validate(script);
+  // The name now also fails the control-character rule (task 5.1).
   assert.deepEqual(located(result), [
     { chapter: label, scene: null, field: "name", limit: "6 characters" },
+    { chapter: label, scene: null, field: "name", limit: CONTROL_LIMIT },
     { chapter: label, scene: 1, field: "narration[0]", limit: "1–4 blocks" },
   ]);
-  assert.equal(result.errors[1].message, `chapter ${label}, scene 1 (question): narration[0] has too few entries (limit 1–4 blocks)`);
+  assert.equal(result.errors[2].message, `chapter ${label}, scene 1 (question): narration[0] has too few entries (limit 1–4 blocks)`);
   const cut = minimal();
   cut.chapters[0].name = `${han(40)}\n`;
   assert.equal(validate(cut).errors[0].chapter, `1 ${han(40)}…`);
@@ -742,4 +745,69 @@ test("every per-kind content field refuses its limit plus one", () => {
     ["question", (s) => (s.image = `${"a".repeat(65)}.png`), "image", IMAGE_LIMIT],
   ];
   for (const [kind, edit, field, limit] of cases) rejectsIn(kind, edit, field, limit);
+});
+
+// --- control characters (task 5.1) --------------------------------------------
+
+// Every string leaf of a script with its path, skipping the fields limited
+// by a pattern or an enum of their own (kind, chart type, image, component,
+// music, voice id).
+function textFields(value, path = []) {
+  if (typeof value === "string") {
+    return ["kind", "type", "image", "component", "music", "id"].includes(path.at(-1)) ? [] : [path];
+  }
+  if (value === null || typeof value !== "object") return [];
+  return Object.entries(value).flatMap(([key, child]) => textFields(child, [...path, Array.isArray(value) ? Number(key) : key]));
+}
+
+// The location 3.4's mapping gives a path: the chapter and scene, and the
+// field relative to its place.
+function placeOf(path) {
+  const [top, c, key, s, ...inner] = path;
+  if (top === "chapters" && key === "scenes") return { chapter: `${c + 1} ${han(6)}`, scene: s + 1, field: inner };
+  if (top === "chapters") return { chapter: `${c + 1} ${han(6)}`, scene: null, field: path.slice(2) };
+  if (["hook", "summary", "endCard"].includes(top)) {
+    return { chapter: null, scene: { hook: "hook", summary: "summary", endCard: "end-card" }[top], field: path.slice(1) };
+  }
+  return { chapter: null, scene: null, field: path };
+}
+
+const fieldText = (path) => path.map((key, i) => (typeof key === "number" ? `[${key}]` : i === 0 ? key : `.${key}`)).join("");
+
+test("a control character in any text field, or in voice.instructions, is rejected with its own limit", () => {
+  const base = { ...maximal(), voice: { id: "alloy", instructions: "语速放慢" } };
+  const paths = textFields(base);
+  // Every kind's content fields, the names, the blocks, the title and the
+  // voice instructions are among them.
+  assert.ok(paths.length > 200, `${paths.length}`);
+  for (const wanted of [["title"], ["voice", "instructions"], ["chapters", 0, "name"], ["hook", "content", "subtitle"]]) {
+    assert.ok(paths.some((p) => fieldText(p) === fieldText(wanted)), fieldText(wanted));
+  }
+  for (const path of paths) {
+    for (const control of ["\u0000", "\n", "\t", "\u007f", "\u009f"]) {
+      const script = structuredClone(base);
+      let parent = script;
+      for (const key of path.slice(0, -1)) parent = parent[key];
+      parent[path.at(-1)] = `一${control}二`;
+      const { chapter, scene, field } = placeOf(path);
+      const result = validate(script);
+      assert.deepEqual(located(result), [{ chapter, scene, field: fieldText(field), limit: CONTROL_LIMIT }], fieldText(path));
+      assert.ok(result.errors[0].message.endsWith(`: ${fieldText(field)} does not match (limit ${CONTROL_LIMIT})`), result.errors[0].message);
+    }
+  }
+});
+
+test("text outside the control class, such as U+2028 and an emoji, passes", () => {
+  const script = minimal();
+  script.title = "一\u2028二😀";
+  script.hook.narration[0][0] = "光\u00a0速";
+  assert.equal(validate(script).ok, true);
+});
+
+test("the JSON Schema carries the control-character pattern on every text field", () => {
+  const schema = JSON.parse(readFileSync(SCHEMA_FILE, "utf8"));
+  assert.equal(schema.properties.title.pattern, "^\\P{Cc}*$");
+  assert.equal(schema.properties.hook.properties.narration.items.items.pattern, "^\\P{Cc}*$");
+  assert.equal(schema.properties.voice.properties.instructions.pattern, "^\\P{Cc}*$");
+  assert.equal(schema.properties.voice.properties.id.pattern, "^[A-Za-z0-9._-]*$");
 });

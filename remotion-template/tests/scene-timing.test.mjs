@@ -5,21 +5,26 @@
 // sample counts given directly. Every expected frame below was worked out by
 // hand from the task 3.6 rules (1600 samples per frame, 2880-sample block
 // gap, 10/20/45-frame gaps, 40-frame lead-in, 90-frame tail, 60-frame
-// minimum), not by running the module.
+// minimum), not by running the module. The entrance, reveal and rest tables
+// of task 5.1 are checked against that fixture's numbers.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { BODY_KINDS, VIDEO, validateScript } from "../bin/script-schema.mjs";
 import { blockStems } from "../bin/voice-stem.mjs";
 import {
+  ENTRANCE_FRAMES,
   FPS,
   GAPS,
   LENGTH_WINDOW,
   MIN_SCENE_FRAMES,
+  REST_FRAMES,
+  REVEALS,
   SAMPLE_RATE,
   TRANSITION_FRAMES,
   layout,
   loudnessOk,
+  revealsOf,
 } from "../bin/scene-timing.mjs";
 
 // Hook (2 sentences), chapter 1 with two scenes, chapter 2 with one custom
@@ -220,4 +225,25 @@ test("loudnessOk accepts -16 ± 1 LUFS at -1.0 dBTP or below", () => {
   assert.equal(loudnessOk(-14.9, -1.0), false);
   assert.equal(loudnessOk(-17.1, -1.0), false);
   assert.equal(loudnessOk(-16.0, -0.9), false);
+});
+
+// --- entrances, reveals and rest (task 5.1) -----------------------------------
+
+test("ENTRANCE_FRAMES has one entry per MIN_SCENE_FRAMES kind, each the kit-wide 15", () => {
+  assert.deepEqual(Object.keys(ENTRANCE_FRAMES).sort(), Object.keys(MIN_SCENE_FRAMES).sort());
+  for (const [kind, frames] of Object.entries(ENTRANCE_FRAMES)) assert.equal(frames, 15, kind);
+});
+
+test("REVEALS is empty, REST_FRAMES is 30 for a key reveal and 15 for a batch", () => {
+  assert.deepEqual(REVEALS, {});
+  assert.deepEqual(REST_FRAMES, { key: 30, batch: 15 });
+});
+
+test("revealsOf: one key reveal over the entrance by default, else the declared list", () => {
+  const timing = { durationInFrames: 60, narrationEndFrame: 15, sentences: [] };
+  assert.deepEqual(revealsOf("question", timing), [{ type: "key", startFrame: 0, endFrame: 15 }]);
+  assert.deepEqual(revealsOf("end-card", timing, {}), [{ type: "key", startFrame: 0, endFrame: 15 }]);
+  const declared = { question: (t) => [{ type: "batch", startFrame: 2, endFrame: t.durationInFrames - 20 }] };
+  assert.deepEqual(revealsOf("question", timing, declared), [{ type: "batch", startFrame: 2, endFrame: 40 }]);
+  assert.deepEqual(revealsOf("hook", timing, declared), [{ type: "key", startFrame: 0, endFrame: 15 }]);
 });
