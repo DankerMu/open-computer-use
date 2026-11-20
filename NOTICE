@@ -82,6 +82,15 @@ This product uses a multi-license model:
      content of each scene kind in remotion-template/bin/script-schema.mjs.
      Required Notice: Copyright (c) 2026 Vincent Wei (https://github.com/Vincentwei1021/video-talkcraft)
 
+   - video-shotcraft: Vincentwei1021/video-shotcraft, commit
+     42f922fe076f6428814d10f6184caf22a8b2adc2, licensed under Apache-2.0,
+     with the license text shipping as this repository's LICENSE-APACHE.
+     Copyright 2026 Wei Yihao
+     Adapted text: the yes/no questions of remotion-template/bin/checklist.mjs
+     are rewritten from the self-check questions of
+     references/aesthetic-rules.md (translated to English and reduced to what
+     four still frames can answer); no code is copied.
+
 Attribution required: include "Open Computer Use" and a link to
 https://github.com/Wide-Moat/open-computer-use in any copies or
 substantial portions of the Licensed Work.

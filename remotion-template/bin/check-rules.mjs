@@ -1,25 +1,32 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The mechanical stage of kit check: six ordered stages, each a rule with
-// its own messages. Every rule in a stage runs and collects its reasons. A
-// failing stage 1 (schema) or 2 (timeline) stops the run; stages 3–5
-// (assets, unnarrated stretches, rest after reveals) all run; stage 6 (the
-// probe) runs only when 1–5 passed. Each rule is exported on its own and
-// takes its inputs as arguments, so tests call it with hand-written
-// timelines, reveals and a stub file reader. Pure apart from the reads
-// through that reader and the probe stage's writeCustomIndex. Only the check
-// worker (bin/check.mjs) loads this module, by dynamic import: it imports
-// the probe, and through it Remotion.
+// kit check: eight ordered stages, each a rule with its own messages. Every
+// rule in a stage runs and collects its reasons. A failing stage 1 (schema)
+// or 2 (timeline) stops the run. After stage 2 passes, the snapshot writes
+// src/custom/index.ts and takes the passing-check hash
+// (bin/project-hash.mjs) before any later stage reads the project. Stages
+// 3–5 (assets, unnarrated stretches, rest after reveals) all run; stages 6
+// (the probe), 7 (the contact sheet) and 8 (the hash again) run only when
+// every earlier stage passed. Stage 8 moves the sheet into place only when
+// the project still hashes as at the snapshot, so a pass vouches for what
+// was checked. Each rule is exported on its own and takes its inputs as
+// arguments, so tests call it with hand-written timelines, reveals and a
+// stub file reader. Pure apart from the reads through that reader, the
+// hash, the custom index and the sheet's files under .kit/check/. Only the
+// check worker (bin/check.mjs) loads this module, by dynamic import: it
+// imports the probe and the contact sheet, and through them Remotion.
 
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { KIT_THEME } from "../src/kit/theme.ts";
+import { contactSheet, sheetTiles } from "./contact-sheet.mjs";
 import { writeCustomIndex } from "./custom-index.mjs";
 import { explainerScenes } from "./explainer-scenes.mjs";
 import { Refusal, lstatOrNull, notFound } from "./kit-io.mjs";
 import { formatViolation, probe as kitProbe, violations } from "./probe.mjs";
+import { projectHash } from "./project-hash.mjs";
 import { ENTRANCE_FRAMES, REST_FRAMES, REVEALS, layout, revealsOf } from "./scene-timing.mjs";
 import { fieldPath, playbackWhere, validateScript } from "./script-schema.mjs";
 import { lengthError } from "./timeline.mjs";
@@ -31,6 +38,10 @@ const MAX_UNNARRATED = 90;
 const ENTRY_POINT = "src/kit/index.ts";
 const PUBLIC_DIR = "public";
 const FONT = "Noto Sans CJK SC";
+const SHEET = ".kit/check/contact.png";
+const SHEET_NEXT = ".kit/check/contact.next.png";
+const SHEET_WORK = ".kit/check/sheet";
+const CHANGED = "the project changed while the check ran; run node bin/kit.mjs check again";
 
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -259,6 +270,76 @@ export async function probeRule(root, script, timeline, { probe, theme }) {
   return reasons;
 }
 
+// --- the snapshot ---------------------------------------------------------------
+
+// After stage 2: writes src/custom/index.ts, then hashes the project with
+// the texts stages 1 and 2 judged. A writeCustomIndex refusal records no
+// snapshot and no reason: the probe stage's own call reports it.
+async function snapshot(state) {
+  try {
+    await writeCustomIndex(state.root, state.script);
+  } catch (thrown) {
+    if (thrown instanceof Refusal) return [];
+    throw thrown;
+  }
+  const taken = await projectHash(state.root, {
+    script: state.script,
+    timeline: state.timeline,
+    scriptText: state.scriptText,
+    timelineText: state.timelineText,
+  });
+  if (taken.reasons) return taken.reasons;
+  state.snapshot = taken.hash;
+  return [];
+}
+
+// --- 7. contact sheet --------------------------------------------------------------
+
+// Renders the sheet to contact.next.png; a thrown error is the reason, and
+// leaves no next sheet.
+async function sheetRule(state) {
+  const tiles = sheetTiles(explainerScenes(state.script, state.timeline));
+  const output = join(state.root, SHEET_NEXT);
+  try {
+    // The Explainer's input props are the parsed files, as kit render passes them.
+    await state.sheet(state.root, {
+      script: JSON.parse(state.scriptText),
+      timeline: JSON.parse(state.timelineText),
+      tiles,
+      workDir: join(state.root, SHEET_WORK),
+      output,
+    });
+  } catch (thrown) {
+    await rm(output, { force: true });
+    return [`contact sheet: ${thrown instanceof Error ? thrown.message : String(thrown)}`];
+  }
+  state.tiles = tiles;
+  return [];
+}
+
+// --- 8. hash -------------------------------------------------------------------
+
+// Hashes the project again with the texts as they are now. Only when it
+// matches the snapshot does the sheet move into place and the run carry its
+// pass; otherwise, or when this throws, the next sheet is removed.
+async function hashRule(state) {
+  const next = join(state.root, SHEET_NEXT);
+  let moved = false;
+  try {
+    const scriptText = await state.files.text("script.json");
+    const timelineText = await state.files.text("timeline.json");
+    if (state.snapshot === null || scriptText === null || timelineText === null) return [CHANGED];
+    const again = await projectHash(state.root, { script: state.script, timeline: state.timeline, scriptText, timelineText });
+    if (again.reasons || again.hash !== state.snapshot) return [CHANGED];
+    await rename(next, join(state.root, SHEET));
+    moved = true;
+    state.pass = { hash: again.hash, sheet: SHEET, tiles: state.tiles };
+    return [];
+  } finally {
+    if (!moved) await rm(next, { force: true });
+  }
+}
+
 // --- the stages ---------------------------------------------------------------
 
 // The project's files, read from root: text() follows symlinks and gives
@@ -281,14 +362,16 @@ function projectFiles(root) {
   };
 }
 
-// The stages in order. stops: a failure ends the run; needsPass: runs only
-// when every earlier stage passed.
+// The stages in order. stops: a failure ends the run; snapshot: the
+// snapshot follows a pass; needsPass: runs only when every earlier stage
+// passed.
 export const RULES = [
   {
     name: "schema",
     stops: true,
     async run(state) {
-      const { reasons, script } = schemaRule(await state.files.text("script.json"));
+      state.scriptText = await state.files.text("script.json");
+      const { reasons, script } = schemaRule(state.scriptText);
       state.script = script;
       return reasons;
     },
@@ -296,8 +379,10 @@ export const RULES = [
   {
     name: "timeline",
     stops: true,
+    snapshot: true,
     async run(state) {
-      const { reasons, timeline } = timelineRule(state.script, await state.files.text("timeline.json"));
+      state.timelineText = await state.files.text("timeline.json");
+      const { reasons, timeline } = timelineRule(state.script, state.timelineText);
       state.timeline = timeline;
       return reasons;
     },
@@ -306,19 +391,31 @@ export const RULES = [
   { name: "unnarrated", run: (state) => unnarratedRule(state.script, state.timeline) },
   { name: "rest", run: (state) => restRule(state.script, state.timeline, state.reveals) },
   { name: "probe", needsPass: true, run: (state) => probeRule(state.root, state.script, state.timeline, state) },
+  { name: "contact-sheet", needsPass: true, run: sheetRule },
+  { name: "hash", needsPass: true, run: hashRule },
 ];
 
-// Runs the stages over the project at root and resolves to the reasons, an
-// empty list for a pass. log receives `check: stage <n> <name>` before each
-// stage. A system error from a read or from the custom index propagates.
-export async function runChecks(root, { probe = kitProbe, reveals = REVEALS, theme = KIT_THEME, files = projectFiles(root), log = () => {} } = {}) {
-  const state = { root, probe, reveals, theme, files, script: null, timeline: null };
+// Runs the stages over the project at root and resolves to {reasons, pass}:
+// pass is {hash, sheet, tiles} when the reasons are empty, null otherwise.
+// log receives `check: stage <n> <name>` before each stage and `check:
+// snapshot` before the snapshot. sheet renders the contact sheet (tests
+// inject a stub). A system error from a read, the hash or the custom index
+// propagates.
+export async function runChecks(
+  root,
+  { probe = kitProbe, reveals = REVEALS, theme = KIT_THEME, files = projectFiles(root), log = () => {}, sheet = contactSheet } = {},
+) {
+  const state = { root, probe, reveals, theme, files, sheet, script: null, timeline: null, snapshot: null, tiles: null, pass: null };
   const reasons = [];
   for (const [i, rule] of RULES.entries()) {
     if (rule.needsPass && reasons.length) break;
     log(`check: stage ${i + 1} ${rule.name}`);
     reasons.push(...(await rule.run(state)));
     if (rule.stops && reasons.length) break;
+    if (rule.snapshot) {
+      log("check: snapshot");
+      reasons.push(...(await snapshot(state)));
+    }
   }
-  return reasons;
+  return { reasons, pass: reasons.length ? null : state.pass };
 }
