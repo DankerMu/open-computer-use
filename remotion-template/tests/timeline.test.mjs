@@ -499,6 +499,13 @@ test("a script under 60 s fails, stating its length rounded down", async (t) => 
   assert.equal(seconds, (Math.floor(Number(frames) / 3) / 10).toFixed(1));
 });
 
+test("a voice file is decoded for at most 181 s: a 200 s block reads like a 181 s one", async (t) => {
+  const outside = /^kit timeline: total \d+\.\d s \(\d+ frames\) is outside 60–180 s\n$/;
+  const long = await failsWith(await project(t, minimal(), [200, 1, 1, 1, 1, 1]), outside);
+  const capped = await failsWith(await project(t, minimal(), [181, 1, 1, 1, 1, 1]), outside);
+  assert.equal(long.err, capped.err);
+});
+
 // --- ffmpeg and the CLI ------------------------------------------------------------
 
 // Runs `process.execPath bin/kit.mjs timeline` in the project with the
