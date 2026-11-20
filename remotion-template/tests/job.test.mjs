@@ -4,28 +4,36 @@
 // The background job model of kit check (task 5.1): startJob, jobState and
 // writeResult over a temporary project, with the tiny worker from
 // tests/fixtures/check/worker.mjs; the stop-signal handler through a real
-// SIGTERM; the check worker itself on a project without script.json; and
-// the static import lists that keep @remotion/* off every start path.
-// Expected states, messages and bounds come from the task 5.1 fixture.
+// SIGTERM; the check worker itself on a project without script.json, and on
+// one whose src/ holds an unreadable directory; and the static import lists
+// that keep @remotion/* off every start path. Expected states, messages and
+// bounds come from the task 5.1 and 5.2 fixtures (5.2: the cleared job
+// directory, `count` and the passed result's fields).
 // Every worker a test starts is waited for or killed before the test ends.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { jobState, startJob, writeResult } from "../bin/job.mjs";
 import { Refusal } from "../bin/kit-io.mjs";
+import { checkFiles } from "./fixtures/check/fixture.mjs";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const WORKER = join(TEMPLATE, "tests", "fixtures", "check", "worker.mjs");
 const NAME = "check";
 
-function project(t) {
+// locked: directories whose mode a test takes away, restored before the
+// removal.
+function project(t, locked = []) {
   const root = mkdtempSync(join(tmpdir(), "job-test-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.after(() => {
+    for (const path of locked) chmodSync(path, 0o755);
+    rmSync(root, { recursive: true, force: true });
+  });
   return root;
 }
 
@@ -87,7 +95,8 @@ test("a blocked worker is running, in its own process group, until it passes", a
   writeFileSync(join(root, "release"), "pass");
   const state = await settled(root);
   assert.deepEqual(state, { state: "passed", result: readJson(join(dir(root), "result.json")) });
-  assert.deepEqual(Object.keys(state.result), ["version", "token", "outcome", "reasons", "finishedAt"]);
+  assert.deepEqual(Object.keys(state.result), ["version", "token", "outcome", "reasons", "finishedAt", "count"]);
+  assert.equal(state.result.count, 0);
   assert.equal(state.result.version, 1);
   assert.equal(state.result.token, job.token);
   assert.deepEqual(state.result.reasons, []);
@@ -179,6 +188,24 @@ test("a new start removes the old result and log before its worker runs, so a de
   assert.deepEqual(await jobState(root, NAME), { state: "died", pid });
 });
 
+test("a new start removes the whole job directory: a sheet, a work directory, the old result and log", async (t) => {
+  const root = project(t);
+  await start(t, root, "pass");
+  assert.equal((await settled(root)).state, "passed");
+  writeFileSync(join(dir(root), "contact.png"), "old sheet");
+  writeFileSync(join(dir(root), "contact.next.png"), "old next sheet");
+  mkdirSync(join(dir(root), "sheet", "bundle"), { recursive: true });
+  writeFileSync(join(dir(root), "sheet", "bundle", "index.html"), "old bundle");
+  const pid = await start(t, root, "block");
+  const token = readJson(join(dir(root), "job.json")).token;
+  assert.ok(await until(() => readFileSync(join(dir(root), "log"), "utf8") === `worker ${token}\n`));
+  for (const name of ["contact.png", "contact.next.png", "sheet", "result.json"]) {
+    assert.equal(existsSync(join(dir(root), name)), false, `${name} survived the start`);
+  }
+  writeFileSync(join(root, "release"), "die");
+  assert.ok(await until(() => !alive(pid)));
+});
+
 test("a dead worker's state never blocks a new start", async (t) => {
   const root = project(t);
   mkdirSync(dir(root), { recursive: true });
@@ -222,12 +249,32 @@ test("on SIGTERM the stop handler sets stopping, writeResult writes nothing, and
   assert.equal(existsSync(join(dir(root), "result.json")), false);
 });
 
+test("writeResult records count, the number of reasons before the bound, and extra's fields", async (t) => {
+  const root = project(t);
+  mkdirSync(dir(root), { recursive: true });
+  const token = "ba".repeat(16);
+  await writeResult(root, NAME, token, "failed", Array.from({ length: 45 }, (_, i) => `reason ${i + 1}`));
+  const failed = readJson(join(dir(root), "result.json"));
+  assert.deepEqual(Object.keys(failed), ["version", "token", "outcome", "reasons", "finishedAt", "count"]);
+  assert.equal(failed.count, 45);
+  assert.equal(failed.reasons.length, 41);
+  const tiles = [
+    { where: "hook", frame: 703 },
+    { where: "summary", frame: 1885 },
+  ];
+  const extra = { hash: "c0".repeat(32), sheet: ".kit/check/contact.png", tiles };
+  await writeResult(root, NAME, token, "passed", [], extra);
+  const passed = readJson(join(dir(root), "result.json"));
+  assert.deepEqual(Object.keys(passed), ["version", "token", "outcome", "reasons", "finishedAt", "count", "hash", "sheet", "tiles"]);
+  assert.deepEqual({ ...passed, finishedAt: 0 }, { version: 1, token, outcome: "passed", reasons: [], finishedAt: 0, count: 0, ...extra });
+});
+
 // --- the check worker -----------------------------------------------------------
 
 // A project holding the kit's bin/ and src/, with node_modules linked to the
 // template's, and no script.json.
-function checkProject(t) {
-  const root = project(t);
+function checkProject(t, locked) {
+  const root = project(t, locked);
   for (const part of ["bin", "src"]) cpSync(join(TEMPLATE, part), join(root, part), { recursive: true });
   cpSync(join(TEMPLATE, "package.json"), join(root, "package.json"));
   symlinkSync(realpathSync(join(TEMPLATE, "node_modules")), join(root, "node_modules"));
@@ -254,6 +301,43 @@ test("the check worker logs its stages and records a schema failure as failed", 
   assert.equal(readFileSync(join(dir(root), "log"), "utf8"), "check: stage 1 schema\ncheck: done failed\n");
 });
 
+test(
+  "the check worker reports a system error from the snapshot's walk as check: <message>",
+  { skip: process.getuid?.() === 0 && "root reads a mode-000 directory" },
+  async (t) => {
+    const locked = [];
+    const root = checkProject(t, locked);
+    for (const [path, bytes] of checkFiles()) {
+      mkdirSync(dirname(join(root, path)), { recursive: true });
+      writeFileSync(join(root, path), bytes);
+    }
+    const unreadable = join(root, "src", "locked");
+    mkdirSync(unreadable);
+    locked.push(unreadable);
+    chmodSync(unreadable, 0o000);
+    const pid = await startJob(root, NAME, [join("bin", "check.mjs"), "--worker"]);
+    t.after(() => {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // ESRCH: the worker has already exited.
+      }
+    });
+    const state = await until(async () => {
+      const s = await jobState(root, NAME);
+      return s.state === "running" ? null : s;
+    }, 60000);
+    assert.equal(state?.state, "failed", JSON.stringify(state));
+    // The worker's working directory is the real path of the project.
+    assert.deepEqual(state.result.reasons, [`check: EACCES: permission denied, scandir '${join(realpathSync(root), "src", "locked")}'`]);
+    assert.ok(await until(() => !alive(pid)));
+    assert.equal(
+      readFileSync(join(dir(root), "log"), "utf8"),
+      "check: stage 1 schema\ncheck: stage 2 timeline\ncheck: snapshot\ncheck: done failed\n",
+    );
+  },
+);
+
 // --- the start path imports ------------------------------------------------------
 
 // The specifiers of a module's static imports and re-exports, and of its
@@ -277,7 +361,7 @@ test("kit.mjs, check.mjs and job.mjs import only node: built-ins and the kit's o
     static: ["node:crypto", "node:fs", "node:fs/promises", "node:path", "node:url", "./check.mjs", "./kit-io.mjs", "./timeline.mjs", "./voice-stem.mjs"],
     dynamic: [],
   });
-  assert.deepEqual(imports(bin("check.mjs")), { static: ["./job.mjs"], dynamic: ["./check-rules.mjs"] });
+  assert.deepEqual(imports(bin("check.mjs")), { static: ["node:path", "./checklist.mjs", "./job.mjs"], dynamic: ["./check-rules.mjs"] });
   assert.deepEqual(imports(bin("job.mjs")), {
     static: ["node:child_process", "node:crypto", "node:fs/promises", "node:path", "./kit-io.mjs", "./script-schema.mjs"],
     dynamic: [],

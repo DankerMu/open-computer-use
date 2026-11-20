@@ -3,8 +3,9 @@
 //
 // The kit's background jobs (kit check; kit render reuses it). A job's state
 // lives in <project>/.kit/<name>/: job.json names the run and its worker,
-// result.json is the worker's outcome, and log takes the worker's stdout and
-// stderr. A job is
+// result.json is the worker's outcome, log takes the worker's stdout and
+// stderr, and the worker may keep other files there (kit check's contact
+// sheet and its work directory). A job is
 //   - passed or failed only from a result.json carrying this run's token,
 //   - running while its pid is alive and `ps -o args=` shows the token, which
 //     survives pid reuse,
@@ -91,17 +92,18 @@ export async function jobState(root, name) {
 }
 
 // Starts `node <workerArgv...> <token>` in root as a detached worker and
-// returns its pid. Refuses while this job runs.
+// returns its pid. Refuses while this job runs. Every file an earlier run
+// left in the job's directory goes first, so nothing of it outlives the
+// start: its result and log, a sheet, a killed run's work directory.
 export async function startJob(root, name, workerArgv) {
   const current = await jobState(root, name);
   if (current.state === "running") {
     throw new Refusal(`a ${name} is already running (pid ${current.pid}); run node bin/kit.mjs status`);
   }
   const dir = jobDir(root, name);
+  await rm(dir, { recursive: true, force: true });
   // writeAtomic creates no directory.
   await mkdir(dir, { recursive: true });
-  await rm(join(dir, RESULT), { force: true });
-  await rm(join(dir, LOG), { force: true });
   const job = { version: VERSION, name, token: randomBytes(16).toString("hex"), pid: null, startedAt: Date.now() };
   await writeAtomic(dir, JOB, serialized(job));
   const log = await open(join(dir, LOG), "w");
@@ -127,13 +129,15 @@ function bounded(reason) {
 }
 
 // Writes result.json with at most MAX_REASONS bounded reasons, followed by
-// `… and <n> more` when there are others. Writes nothing once a stop signal
-// arrived; returns whether it wrote.
-export async function writeResult(root, name, token, outcome, reasons) {
+// `… and <n> more` when there are others, then count (every reason) and
+// extra's fields (a passed check's hash, sheet and tiles). Writes nothing
+// once a stop signal arrived; returns whether it wrote.
+export async function writeResult(root, name, token, outcome, reasons, extra = {}) {
   if (stopping) return false;
   const shown = reasons.slice(0, MAX_REASONS).map(bounded);
   if (reasons.length > MAX_REASONS) shown.push(`… and ${reasons.length - MAX_REASONS} more`);
-  await writeAtomic(jobDir(root, name), RESULT, serialized({ version: VERSION, token, outcome, reasons: shown, finishedAt: Date.now() }));
+  const result = { version: VERSION, token, outcome, reasons: shown, finishedAt: Date.now(), count: reasons.length, ...extra };
+  await writeAtomic(jobDir(root, name), RESULT, serialized(result));
   return true;
 }
 
