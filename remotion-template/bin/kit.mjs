@@ -4,11 +4,10 @@
 // The explainer kit's one command. `node /opt/remotion-template/bin/kit.mjs
 // new <name>` creates a project; inside it, `node bin/kit.mjs <subcommand>`
 // runs every other step. stdout carries only data (a project path, speech
-// calls, an image name, a status report); everything else goes to stderr,
-// prefixed with the subcommand. Exit codes: 0 success, 1 a refused or failed
-// step, 2 a usage error; `status` also exits 3 while a check runs and 4 when
-// none has run. Imports only node: built-ins and the kit's own modules; no
-// network.
+// calls, an image name); everything else goes to stderr, prefixed with the
+// subcommand. Exit codes: 0 success, 1 a refused or failed step, 2 a usage
+// error; `status` also exits 3 while a check runs and 4 when none has run.
+// Imports only node: built-ins and the kit's own modules; no network.
 
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
