@@ -40,6 +40,7 @@ import { projectHash } from "../bin/project-hash.mjs";
 import { validateScript } from "../bin/script-schema.mjs";
 import { blockStems } from "../bin/voice-stem.mjs";
 import { checkFiles, checkScript, checkTimeline } from "./fixtures/check/fixture.mjs";
+import { makeLibrary } from "./fixtures/music/library.mjs";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const rendering = () => import("../bin/render.mjs");
@@ -99,11 +100,12 @@ after(() => rmSync(videos, { recursive: true, force: true }));
 // written and a passed check result whose hash is projectHash's. With
 // `worker`, it also holds bin/ and a node_modules that links only zod, so a
 // real worker starts and then fails to load Remotion.
-async function fixtureProject(t, { name = "demo", worker = false } = {}) {
+async function fixtureProject(t, { name = "demo", worker = false, music = "none", musicDir } = {}) {
   const base = mkdtempSync(join(tmpdir(), "render-job-"));
   t.after(() => rmSync(base, { recursive: true, force: true }));
   const root = join(base, name);
-  for (const [path, bytes] of checkFiles()) {
+  const script = checkScript((raw) => (raw.music = music));
+  for (const [path, bytes] of checkFiles(script, checkTimeline(script))) {
     mkdirSync(dirname(join(root, path)), { recursive: true });
     writeFileSync(join(root, path), bytes);
   }
@@ -118,17 +120,17 @@ async function fixtureProject(t, { name = "demo", worker = false } = {}) {
   const files = join(base, "files");
   mkdirSync(files);
   const p = { base, root, files, videos: join(base, "videos"), target: join(files, `${name}.mp4`) };
-  p.hash = await currentHash(root);
+  p.hash = await currentHash(root, musicDir);
   plantCheck(root, { outcome: "passed", reasons: [], count: 0, hash: p.hash, sheet: ".kit/check/contact.png", tiles: [] });
   return p;
 }
 
-async function currentHash(root) {
+async function currentHash(root, musicDir) {
   const scriptText = readFileSync(join(root, "script.json"), "utf8");
   const timelineText = readFileSync(join(root, "timeline.json"), "utf8");
   const { script } = validateScript(scriptText);
   await writeCustomIndex(root, script);
-  const taken = await projectHash(root, { script, timeline: JSON.parse(timelineText), scriptText, timelineText });
+  const taken = await projectHash(root, { script, timeline: JSON.parse(timelineText), scriptText, timelineText, ...(musicDir ? { musicDir } : {}) });
   assert.ok(taken.hash, JSON.stringify(taken));
   return taken.hash;
 }
@@ -313,13 +315,13 @@ test("render takes over a dead pid's lock, returns at once, and a worker that ca
 
 // The worker's inputs over a fixture project; .kit/render/ exists as
 // startJob leaves it. stub: the variant the stub render copies.
-async function worker(t, { stub = "good", edit = null, ...options } = {}) {
-  const p = await fixtureProject(t);
+async function worker(t, { stub = "good", edit = null, music = "none", ...options } = {}) {
+  const p = await fixtureProject(t, { music, musicDir: options.musicDir });
   mkdirSync(join(p.root, ".kit", "render", "tmp"), { recursive: true });
   const lines = [];
   const calls = [];
   const render = async (args) => {
-    calls.push(args);
+    calls.push({ ...args, stemAtCall: existsSync(join(p.root, "public", "music.wav")) });
     copyFileSync(video(stub), args.output);
     if (edit !== null) edit(p.root);
   };
@@ -612,4 +614,113 @@ test("the usage list holds render", async (t) => {
   const none = await kit([], p);
   assert.equal(none.code, 2);
   assert.ok(none.err.split("\n").includes("kit: usage: node bin/kit.mjs render"), none.err);
+});
+
+// --- task 6.5: the music step --------------------------------------------------------
+
+const MUSIC_WAV = (root) => join(root, "public", "music.wav");
+let generated = null;
+
+// The fixture library, generated once, copied per test so a test may edit it.
+function musicLibrary(t) {
+  if (generated === null) {
+    generated = mkdtempSync(join(tmpdir(), "render-job-music-"));
+    makeLibrary(generated);
+  }
+  const copy = mkdtempSync(join(tmpdir(), "render-job-library-"));
+  t.after(() => rmSync(copy, { recursive: true, force: true }));
+  for (const name of readdirSync(generated)) copyFileSync(join(generated, name), join(copy, name));
+  return copy;
+}
+
+after(() => {
+  if (generated !== null) rmSync(generated, { recursive: true, force: true });
+});
+
+test("a music project writes public/music.wav before the stub runs, and the stub's arguments carry music: true", async (t) => {
+  const musicDir = musicLibrary(t);
+  const w = await worker(t, { music: "fixture-loop", musicDir });
+  assert.equal(await w.go(), 0);
+  assert.equal(w.calls.length, 1);
+  assert.equal(w.calls[0].stemAtCall, true);
+  assert.equal(w.calls[0].music, true);
+  assert.deepEqual(Object.keys(w.calls[0]).filter((key) => key !== "stemAtCall").sort(), ["log", "music", "output", "root", "script", "timeline"]);
+  const stem = readFileSync(MUSIC_WAV(w.p.root));
+  assert.equal(stem.readUInt32LE(40), TOTAL * 1600 * 4);
+  assert.deepEqual(w.lines, ["render: start", "render: music", "render: verify", "render: publish", "render: done succeeded"]);
+  assert.deepEqual(readdirSync(join(w.p.root, "public")).filter((name) => name.endsWith(".partial")), []);
+});
+
+test("a none project's stub arguments have exactly root, script, timeline, output and log; music.wav is neither written nor removed", async (t) => {
+  const w = await worker(t);
+  assert.equal(await w.go(), 0);
+  assert.deepEqual(Object.keys(w.calls[0]).filter((key) => key !== "stemAtCall").sort(), ["log", "output", "root", "script", "timeline"]);
+  assert.equal(existsSync(MUSIC_WAV(w.p.root)), false);
+  const v = await worker(t);
+  writeFileSync(MUSIC_WAV(v.p.root), "a stem left from an earlier render");
+  assert.equal(await v.go(), 0);
+  assert.equal(readFileSync(MUSIC_WAV(v.p.root), "utf8"), "a stem left from an earlier render");
+  assert.deepEqual(v.lines, ["render: start", "render: verify", "render: publish", "render: done succeeded"]);
+});
+
+test("a symlink or a directory at public/music.wav gives its reason and is left as it was", async (t) => {
+  const musicDir = musicLibrary(t);
+  const w = await worker(t, { music: "fixture-loop", musicDir });
+  writeFileSync(join(w.p.base, "elsewhere.wav"), "kept");
+  symlinkSync(join(w.p.base, "elsewhere.wav"), MUSIC_WAV(w.p.root));
+  writeFileSync(w.p.target, PREVIOUS);
+  assert.equal(await w.go(), 1);
+  expectFailed(w, ["music: public/music.wav is a symlink; not replaced"]);
+  assert.equal(readlinkSync(MUSIC_WAV(w.p.root)), join(w.p.base, "elsewhere.wav"));
+  assert.equal(readFileSync(join(w.p.base, "elsewhere.wav"), "utf8"), "kept");
+  assert.equal(w.calls.length, 0);
+  assert.deepEqual(readFileSync(w.p.target), PREVIOUS);
+
+  const v = await worker(t, { music: "fixture-loop", musicDir });
+  mkdirSync(MUSIC_WAV(v.p.root));
+  assert.equal(await v.go(), 1);
+  expectFailed(v, ["music: public/music.wav is not a regular file; not replaced"]);
+  assert.ok(lstatSync(MUSIC_WAV(v.p.root)).isDirectory());
+  assert.equal(v.calls.length, 0);
+});
+
+test("an unknown id at render time gives its reason, the stub never runs, and the target is unchanged", async (t) => {
+  // The pass's hash is taken against this musicDir, where the id is absent
+  // and its pair null, so step 2 passes and the music step refuses.
+  const musicDir = musicLibrary(t);
+  const w = await worker(t, { music: "fixture-gone", musicDir });
+  writeFileSync(w.p.target, PREVIOUS);
+  assert.equal(await w.go(), 1);
+  expectFailed(w, ['music: unknown track "fixture-gone"; choose "none" or one of: fixture-loop, fixture-short, fixture-long']);
+  assert.equal(w.calls.length, 0);
+  assert.deepEqual(readFileSync(w.p.target), PREVIOUS);
+  assert.equal(existsSync(MUSIC_WAV(w.p.root)), false);
+  assert.deepEqual(w.lines, ["render: start", "render: music", "render: done failed"]);
+});
+
+test("a library file changed by one byte after the check refuses at step 2, and the stub never runs", async (t) => {
+  const musicDir = musicLibrary(t);
+  const w = await worker(t, { music: "fixture-loop", musicDir });
+  const file = join(musicDir, "fixture-loop.wav");
+  const bytes = readFileSync(file);
+  bytes[bytes.length - 1] ^= 1;
+  writeFileSync(file, bytes);
+  assert.equal(await w.go(), 1);
+  expectFailed(w, [CHANGED_SINCE]);
+  assert.equal(w.calls.length, 0);
+  assert.equal(existsSync(MUSIC_WAV(w.p.root)), false);
+});
+
+test("a stem that ffmpeg cannot build is music: <message>", async (t) => {
+  const musicDir = mkdtempSync(join(tmpdir(), "render-job-broken-"));
+  t.after(() => rmSync(musicDir, { recursive: true, force: true }));
+  writeFileSync(join(musicDir, "manifest.json"), JSON.stringify({ version: 1, tracks: [{ id: "fixture-broken", loop: true, file: "broken.wav", duration_seconds: 1 }] }));
+  writeFileSync(join(musicDir, "broken.wav"), "not audio at all");
+  const w = await worker(t, { music: "fixture-broken", musicDir });
+  assert.equal(await w.go(), 1);
+  const { reasons } = resultOf(w.p.root);
+  assert.equal(reasons.length, 1, JSON.stringify(reasons));
+  assert.match(reasons[0], /^music: ffmpeg exited with \d+: \S/);
+  assert.equal(w.calls.length, 0);
+  assert.equal(existsSync(MUSIC_WAV(w.p.root)), false);
 });

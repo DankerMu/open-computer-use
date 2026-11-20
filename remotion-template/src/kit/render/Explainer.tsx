@@ -8,9 +8,11 @@
 // scene but the last fades out in its timeline transition window through
 // SceneExit, which wraps the scene alone, never the captions. Before
 // any frame renders, calculateMetadata refuses input props that are not
-// objects, a script that fails validateScript, a timeline that disagrees
-// with it, a kind without a component, and a custom index that does not
-// match the script.
+// objects, a music prop that is not a boolean, a script that fails
+// validateScript, a timeline that disagrees with it, a kind without a
+// component, and a custom index that does not match the script. With music
+// true, the render worker's public/music.wav (bin/music.mjs: looped, ducked
+// and faded at its final level) plays at volume 1 beside the narration.
 
 import React, {useMemo} from 'react';
 import {Audio, Composition, Sequence, staticFile} from 'remotion';
@@ -26,7 +28,7 @@ import {SceneExit, type Exit} from './SceneExit.tsx';
 
 type Theme = (typeof themes)['light'];
 type Input = Record<string, unknown>;
-type ExplainerProps = {script: Input | null; timeline: Input | null};
+type ExplainerProps = {script: Input | null; timeline: Input | null; music?: unknown};
 type SceneEntry = {
 	index: number;
 	where: string;
@@ -84,8 +86,9 @@ export const ExplainerBody = ({
 
 // The checks of calculateMetadata, in order; returns the composition's
 // length and the validated props.
-function explainerMetadata({script, timeline}: ExplainerProps, registry: Registry) {
+function explainerMetadata({script, timeline, music}: ExplainerProps, registry: Registry) {
 	if (!isObject(script) || !isObject(timeline)) fail('input props need script and timeline objects');
+	if (music !== undefined && typeof music !== 'boolean') fail('input props: music must be true or false');
 	const result = validateScript(JSON.stringify(script)) as {ok: true; script: Input} | {ok: false; errors: Problem[]};
 	if (!result.ok) {
 		const [first, ...rest] = result.errors;
@@ -105,16 +108,18 @@ function explainerMetadata({script, timeline}: ExplainerProps, registry: Registr
 		const problem = customProblem(entry.component);
 		if (problem !== null) fail(`${entry.where}: ${problem}`);
 	}
-	return {durationInFrames: timeline.totalFrames as number, props: {script: result.script, timeline}};
+	const props = {script: result.script, timeline};
+	return {durationInFrames: timeline.totalFrames as number, props: music === undefined ? props : {...props, music}};
 }
 
 export const ExplainerComposition = ({registry, theme}: {registry: Registry; theme: Theme}) => {
 	const component = useMemo(
 		() =>
-			({script, timeline}: ExplainerProps) => (
+			({script, timeline, music}: ExplainerProps) => (
 				<>
 					<ExplainerBody script={script as Input} timeline={timeline as Input} registry={registry} theme={theme} />
 					<Audio src={staticFile('narration.wav')} />
+					{music === true ? <Audio src={staticFile('music.wav')} /> : null}
 				</>
 			),
 		[registry, theme],

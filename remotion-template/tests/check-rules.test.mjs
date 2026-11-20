@@ -469,7 +469,7 @@ test("probe: a custom index refusal is the reason, and nothing is probed", async
 
 // --- runChecks ---------------------------------------------------------------
 
-const STAGES = ["schema", "timeline", "assets", "unnarrated", "rest", "probe", "contact-sheet", "hash"];
+const STAGES = ["schema", "timeline", "assets", "unnarrated", "rest", "music", "probe", "contact-sheet", "hash"];
 // The log of the first n stages: the snapshot line follows stage 2 when a
 // later stage runs.
 const stageLines = (n) => {
@@ -479,7 +479,7 @@ const stageLines = (n) => {
 };
 
 // A stub contact sheet that records its argument, creates .kit/check/ and
-// writes `output`, so stage 8's rename has a file; `edit` then runs.
+// writes `output`, so stage 9's rename has a file; `edit` then runs.
 function stubSheet(edit = () => {}) {
   const calls = [];
   const sheet = async (root, options) => {
@@ -491,20 +491,20 @@ function stubSheet(edit = () => {}) {
   return { sheet, calls };
 }
 
-test("the rule list is the eight stages in order", () => {
+test("the rule list is the nine stages in order", () => {
   assert.deepEqual(
     RULES.map((rule) => rule.name),
     STAGES,
   );
 });
 
-test("runChecks: the passing project runs the snapshot and all eight stages and passes", async (t) => {
+test("runChecks: the passing project runs the snapshot and all nine stages and passes", async (t) => {
   const log = [];
   const { probe, calls } = stubProbe();
   const { sheet } = stubSheet();
   const { reasons } = await runChecks(customRoot(t), { probe, sheet, files: stubFiles(checkFiles()), log: (line) => log.push(line) });
   assert.deepEqual(reasons, []);
-  assert.deepEqual(log, stageLines(8));
+  assert.deepEqual(log, stageLines(9));
   assert.equal(calls.length, 1);
   assert.equal(calls[0].targets[0].props.theme, KIT_THEME);
 });
@@ -540,7 +540,7 @@ test("runChecks: a timeline failure runs no later stage", async (t) => {
   assert.deepEqual(log, stageLines(2));
 });
 
-test("runChecks: stages 3–5 all run, and a failure in them skips the probe", async (t) => {
+test("runChecks: stages 3–6 all run, and a failure in them skips the probe", async (t) => {
   const log = [];
   const files = checkFiles();
   files.delete(`public/voice/${stems[3]}.wav`);
@@ -550,7 +550,7 @@ test("runChecks: stages 3–5 all run, and a failure in them skips the probe", a
     `${QUESTION}, sentence 1 block 1: ${stems[3]}.wav is missing`,
     "summary: key reveal ending at frame 200 rests 15 frames before the exit at frame 215; needs 30",
   ]);
-  assert.deepEqual(log, stageLines(5));
+  assert.deepEqual(log, stageLines(6));
 });
 
 test("runChecks: a system error from a read propagates", async (t) => {
@@ -657,14 +657,14 @@ const checkDir = (root) => {
   return existsSync(dir) ? readdirSync(dir).sort() : [];
 };
 
-test("runChecks: a pass gives the hash, the sheet and the tiles, logs the snapshot and stages 1–8, and leaves only contact.png", async (t) => {
+test("runChecks: a pass gives the hash, the sheet and the tiles, logs the snapshot and stages 1–9, and leaves only contact.png", async (t) => {
   const { projectHash } = await import("../bin/project-hash.mjs");
   const root = onDisk(t);
   const log = [];
   const { probe } = stubProbe();
   const { sheet, calls } = stubSheet();
   const result = await runChecks(root, { probe, sheet, log: (line) => log.push(line) });
-  assert.deepEqual(log, stageLines(8));
+  assert.deepEqual(log, stageLines(9));
   const tiles = [
     { where: "hook", frame: 703 },
     { where: QUESTION, frame: 958 },
@@ -723,14 +723,14 @@ test("runChecks: a sheet that throws is the contact sheet reason, and no sheet i
   assert.deepEqual(checkDir(root), []);
 });
 
-test("runChecks: a symlinked src is its reason, runs stages 3–5 and skips stages 6–8", async (t) => {
+test("runChecks: a symlinked src is its reason, runs stages 3–6 and skips stages 7–9", async (t) => {
   const root = onDisk(t);
   renameSync(join(root, "src"), join(root, "src-real"));
   symlinkSync(join(root, "src-real"), join(root, "src"));
   const log = [];
   const result = await runChecks(root, { probe: neverProbe, sheet: neverSheet, log: (line) => log.push(line) });
   assert.deepEqual(result, { reasons: ["src: is a symlink"], pass: null });
-  assert.deepEqual(log, stageLines(5));
+  assert.deepEqual(log, stageLines(6));
 });
 
 test("runChecks: a project missing its custom file gives only the assets reason", async (t) => {
@@ -739,5 +739,50 @@ test("runChecks: a project missing its custom file gives only the assets reason"
   const log = [];
   const result = await runChecks(root, { probe: neverProbe, sheet: neverSheet, log: (line) => log.push(line) });
   assert.deepEqual(result, { reasons: [`${CUSTOM}: src/custom/Orbit.tsx is missing`], pass: null });
-  assert.deepEqual(log, stageLines(5));
+  assert.deepEqual(log, stageLines(6));
+});
+
+// --- task 6.5: the music stage --------------------------------------------------
+
+// A library of one loop track, "fixture-bar", holding `bytes`.
+function musicLibrary(t, bytes = "bar audio") {
+  const dir = mkdtempSync(join(tmpdir(), "check-rules-music-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const tracks = [{ id: "fixture-bar", loop: true, file: "fixture-bar.wav", duration_seconds: 2.01 }];
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify({ version: 1, tracks }));
+  writeFileSync(join(dir, "fixture-bar.wav"), bytes);
+  return dir;
+}
+
+test("runChecks: a music reason, like a stage 3–5 reason, runs stages 3–6 and skips stages 7–9", async (t) => {
+  const s = checkScript((raw) => (raw.music = "fixture-gone"));
+  const log = [];
+  const absent = join(tmpdir(), "check-rules-no-library", "absent");
+  const files = stubFiles(checkFiles(s, checkTimeline(s)));
+  const result = await runChecks(customRoot(t), { probe: neverProbe, sheet: neverSheet, files, musicDir: absent, log: (line) => log.push(line) });
+  assert.deepEqual(result, { reasons: ['music: this image has no music library; set "music" to "none"'], pass: null });
+  assert.deepEqual(log, stageLines(6));
+  const named = await runChecks(customRoot(t), { probe: neverProbe, sheet: neverSheet, files, musicDir: musicLibrary(t), log: () => {} });
+  assert.deepEqual(named.reasons, ['music: unknown track "fixture-gone"; choose "none" or one of: fixture-bar']);
+});
+
+test("runChecks: a music project passes against musicDir, and its hash carries the track", async (t) => {
+  const { projectHash } = await import("../bin/project-hash.mjs");
+  const s = checkScript((raw) => (raw.music = "fixture-bar"));
+  const root = mkdtempSync(join(tmpdir(), "check-rules-disk-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const [path, bytes] of checkFiles(s, checkTimeline(s))) {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), bytes);
+  }
+  const musicDir = musicLibrary(t);
+  const log = [];
+  const result = await runChecks(root, { probe: stubProbe().probe, sheet: stubSheet().sheet, musicDir, log: (line) => log.push(line) });
+  assert.deepEqual(log, stageLines(9));
+  const texts = { scriptText: readFileSync(join(root, "script.json"), "utf8"), timelineText: readFileSync(join(root, "timeline.json"), "utf8") };
+  const timelineOnDisk = JSON.parse(texts.timelineText);
+  const withTrack = await projectHash(root, { script: s, timeline: timelineOnDisk, ...texts, musicDir });
+  const without = await projectHash(root, { script: s, timeline: timelineOnDisk, ...texts, musicDir: join(root, "absent") });
+  assert.equal(result.pass?.hash, withTrack.hash);
+  assert.notEqual(withTrack.hash, without.hash);
 });

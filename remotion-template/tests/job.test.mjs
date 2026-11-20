@@ -576,6 +576,7 @@ test("kit.mjs, check.mjs, status.mjs, render.mjs and job.mjs import only node: b
       "./explainer-scenes.mjs",
       "./job.mjs",
       "./kit-io.mjs",
+      "./music.mjs",
       "./project-hash.mjs",
       "./script-schema.mjs",
     ],

@@ -7,7 +7,9 @@
 // render as a background job (bin/job.mjs) and returns at once. Run as
 // `node bin/render.mjs --worker <token>` from the project root, this file is
 // the job's worker: it checks the pass again, renders to
-// .kit/render/<token>.mp4, verifies the video with ffprobe, hashes the
+// .kit/render/<token>.mp4 (after writing public/music.wav, the music stem
+// of bin/music.mjs, for a project that names a track), verifies the video
+// with ffprobe, hashes the
 // project again, and only then copies the video beside the target as
 // .<name>.mp4.<token>.partial and renames it over the target, so the
 // target is complete or untouched. The files directory is another
@@ -23,6 +25,7 @@ import { writeCustomIndex } from "./custom-index.mjs";
 import { explainerScenes } from "./explainer-scenes.mjs";
 import { handleStopSignals, jobState, startJob, stopRequested as jobStopRequested, writeResult } from "./job.mjs";
 import { PROJECT_NAME, Refusal, lstatOrNull, notFound } from "./kit-io.mjs";
+import { MUSIC_DIR, buildStem, musicReasons, readLibrary } from "./music.mjs";
 import { projectHash } from "./project-hash.mjs";
 import { VIDEO, validateScript } from "./script-schema.mjs";
 
@@ -75,30 +78,30 @@ async function readProject(root) {
 
 // The project the last passing check vouched for, with its hash. Refuses
 // without a pass carrying a hash, and when the project no longer hashes
-// as it did. A system error propagates.
-async function checkedProject(root) {
+// as it did against musicDir. A system error propagates.
+async function checkedProject(root, musicDir) {
   const check = await jobState(root, "check");
   if (check.state !== "passed" || typeof check.result.hash !== "string") throw new Refusal(NO_PASS);
   const project = await readProject(root);
   if (project === null) throw new Refusal(CHANGED_SINCE);
-  const taken = await projectHash(root, project);
+  const taken = await projectHash(root, { ...project, musicDir });
   if (taken.hash !== check.result.hash) throw new Refusal(CHANGED_SINCE);
   return { ...project, hash: taken.hash };
 }
 
 // True when the project still hashes as checked, with the texts as they
 // are now.
-async function stillChecked(root, project) {
+async function stillChecked(root, project, musicDir) {
   const scriptText = await readText(root, "script.json");
   const timelineText = await readText(root, "timeline.json");
   if (scriptText === null || timelineText === null) return false;
-  const again = await projectHash(root, { script: project.script, timeline: project.timeline, scriptText, timelineText });
+  const again = await projectHash(root, { script: project.script, timeline: project.timeline, scriptText, timelineText, musicDir });
   return again.hash === project.hash;
 }
 
 export async function render(ctx) {
   if (!PROJECT_NAME.test(basename(ctx.root))) throw new Refusal(`${ctx.root}: not a kit project; run kit new`);
-  const precondition = () => checkedProject(ctx.root);
+  const precondition = () => checkedProject(ctx.root, MUSIC_DIR);
   const pid = await startJob(ctx.root, NAME, ["bin/render.mjs", "--worker"], { precondition });
   ctx.say(`started (pid ${pid}); ${STATUS_HINT}`);
   return 0;
@@ -194,27 +197,53 @@ async function publish({ source, filesRoot, name, token, copy, stopRequested }) 
   }
 }
 
+// The music step, for a project that names a track: the check's music
+// rules again, then the stem written as public/music.wav, never through a
+// symlink or over anything but a regular file. Resolves to the reasons.
+async function musicStep(root, project, musicDir, log) {
+  log("render: music");
+  const reasons = await musicReasons(project.script, project.timeline, musicDir);
+  if (reasons.length) return reasons;
+  const output = join(root, "public", "music.wav");
+  const existing = await lstatOrNull(output);
+  if (existing?.isSymbolicLink()) return ["music: public/music.wav is a symlink; not replaced"];
+  if (existing !== null && !existing.isFile()) return ["music: public/music.wav is not a regular file; not replaced"];
+  try {
+    const track = (await readLibrary(musicDir)).tracks.find((entry) => entry.id === project.script.music);
+    await buildStem({ dir: musicDir, track, timeline: project.timeline, output });
+  } catch (thrown) {
+    return [`music: ${messageOf(thrown)}`];
+  }
+  return [];
+}
+
 // Steps 2–7: resolves to {reasons}, {reasons: [], target, frames}, or null
 // when a stop arrived before publishing.
-async function attempt(root, { token, filesRoot, render: renderVideo, log, copy, stopRequested }) {
+async function attempt(root, { token, filesRoot, render: renderVideo, log, copy, stopRequested, musicDir }) {
   let project;
   try {
-    project = await checkedProject(root);
+    project = await checkedProject(root, musicDir);
   } catch (thrown) {
     if (thrown instanceof Refusal) return { reasons: [thrown.message] };
     throw thrown;
   }
+  const music = project.script.music !== "none";
+  if (music) {
+    const reasons = await musicStep(root, project, musicDir, log);
+    if (reasons.length) return { reasons };
+  }
   const source = join(root, ".kit", NAME, `${token}.mp4`);
   try {
     // The parsed files, never validateScript's output, as the check's sheet.
-    await renderVideo({ root, script: JSON.parse(project.scriptText), timeline: JSON.parse(project.timelineText), output: source, log });
+    const args = { root, script: JSON.parse(project.scriptText), timeline: JSON.parse(project.timelineText), output: source, log };
+    await renderVideo(music ? { ...args, music: true } : args);
   } catch (thrown) {
     return { reasons: [`render: ${messageOf(thrown)}`] };
   }
   log("render: verify");
   const { reasons, frames } = await verify(source, project.timeline.totalFrames);
   if (reasons.length) return { reasons };
-  if (!(await stillChecked(root, project))) return { reasons: [CHANGED_DURING] };
+  if (!(await stillChecked(root, project, musicDir))) return { reasons: [CHANGED_DURING] };
   if (stopRequested()) return null;
   log("render: publish");
   const name = basename(root);
@@ -238,15 +267,15 @@ const loadRender = async (args) => (await import("./render-video.mjs")).renderVi
 // written with the result (0 succeeded, 1 failed), or null when a stop
 // arrived and nothing was written. A system error outside the render and
 // the publish is the reason `render: <message>`; anything else is a bug,
-// which ends the worker without a result.
+// which ends the worker without a result. musicDir is the music library.
 export async function runRender(
   root,
-  { token, filesRoot = FILES_ROOT, render: renderVideo = loadRender, log, copy = copyPartial, stopRequested = jobStopRequested },
+  { token, filesRoot = FILES_ROOT, render: renderVideo = loadRender, log, copy = copyPartial, stopRequested = jobStopRequested, musicDir = MUSIC_DIR },
 ) {
   log("render: start");
   let outcome;
   try {
-    outcome = await attempt(root, { token, filesRoot, render: renderVideo, log, copy, stopRequested });
+    outcome = await attempt(root, { token, filesRoot, render: renderVideo, log, copy, stopRequested, musicDir });
   } catch (thrown) {
     if (typeof thrown?.code !== "string") throw thrown;
     outcome = { reasons: [`render: ${thrown.message}`] };
