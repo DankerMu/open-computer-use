@@ -761,11 +761,13 @@ function textFields(value, path = []) {
 }
 
 // The location 3.4's mapping gives a path: the chapter and scene, and the
-// field relative to its place.
-function placeOf(path) {
+// field relative to its place. A chapter is labelled by its name, which is
+// `named` when the path is that name.
+function placeOf(path, named) {
   const [top, c, key, s, ...inner] = path;
-  if (top === "chapters" && key === "scenes") return { chapter: `${c + 1} ${han(6)}`, scene: s + 1, field: inner };
-  if (top === "chapters") return { chapter: `${c + 1} ${han(6)}`, scene: null, field: path.slice(2) };
+  const label = `${c + 1} ${key === "name" ? named : han(6)}`;
+  if (top === "chapters" && key === "scenes") return { chapter: label, scene: s + 1, field: inner };
+  if (top === "chapters") return { chapter: label, scene: null, field: path.slice(2) };
   if (["hook", "summary", "endCard"].includes(top)) {
     return { chapter: null, scene: { hook: "hook", summary: "summary", endCard: "end-card" }[top], field: path.slice(1) };
   }
@@ -784,12 +786,12 @@ test("a control character in any text field, or in voice.instructions, is reject
     assert.ok(paths.some((p) => fieldText(p) === fieldText(wanted)), fieldText(wanted));
   }
   for (const path of paths) {
-    for (const control of ["\u0000", "\n", "\t", "\u007f", "\u009f"]) {
+    for (const [control, escaped] of [["\u0000", "\\u0000"], ["\n", "\\n"], ["\t", "\\t"], ["\u007f", "\\u007f"], ["\u009f", "\\u009f"]]) {
       const script = structuredClone(base);
       let parent = script;
       for (const key of path.slice(0, -1)) parent = parent[key];
       parent[path.at(-1)] = `一${control}二`;
-      const { chapter, scene, field } = placeOf(path);
+      const { chapter, scene, field } = placeOf(path, `一${escaped}二`);
       const result = validate(script);
       assert.deepEqual(located(result), [{ chapter, scene, field: fieldText(field), limit: CONTROL_LIMIT }], fieldText(path));
       assert.ok(result.errors[0].message.endsWith(`: ${fieldText(field)} does not match (limit ${CONTROL_LIMIT})`), result.errors[0].message);

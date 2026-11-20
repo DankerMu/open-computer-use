@@ -768,7 +768,7 @@ test("status reports a live job as running with its whole seconds", async (t) =>
   const token = "7e".repeat(16);
   const live = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)", token], { stdio: "ignore" });
   t.after(() => live.kill("SIGKILL"));
-  jobFiles(box.root, { token, pid: live.pid, startedAt: Date.now() - 5999 });
+  jobFiles(box.root, { token, pid: live.pid, startedAt: Date.now() - 5500 });
   assert.deepEqual(await kit(["status"], box.root, box), {
     code: 3,
     out: `kit status: check running (pid ${live.pid}, 5 s)\n`,
