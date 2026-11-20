@@ -23,10 +23,15 @@ const SAMPLES_PER_FRAME = SAMPLE_RATE / FPS;
 const BYTES_PER_SAMPLE = 2;
 // A voice file is read as WAV only (no concat list or other demuxer behind a
 // .wav name) and for at most 181 s, beyond the whole 60–180 s window, so its
-// decoded PCM stays near 17.4 MB, under MAX_BUFFER.
+// decoded PCM stays near 17.4 MB, under MAX_BUFFER. areverse holds the whole
+// block, so TRIM bounds it first: aformat makes every sample mono 48 kHz, and
+// asetnsamples makes every frame 4800 samples, at most about 1,810 frames.
+// Measured in the image's ffmpeg 6.1.1, a 181 s 8-channel 384 kHz FLAC-in-WAV
+// peaks at about 109 MB, and a 181 s mono 384 kHz one with 16-sample FLAC
+// frames at about 164 MB (#872).
 const DECODE_INPUT = ["-f", "wav", "-t", "181"];
 const KEEP = "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.02";
-const TRIM = `${KEEP},areverse,${KEEP},areverse`;
+const TRIM = `aformat=sample_rates=${SAMPLE_RATE}:channel_layouts=mono,asetnsamples=n=4800:p=0,${KEEP},areverse,${KEEP},areverse`;
 const LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11";
 const RAW_INPUT = ["-f", "s16le", "-ar", String(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0"];
 const NARRATION = "narration.wav";

@@ -56,9 +56,11 @@ function script(endCardNarration) {
 }
 
 // 甲 and 戊 end mid-frame, so a sentence's second block starts 2880 samples
-// after the first's end, not after its frame. 丁 is long enough that its
+// after the first's end, not after its frame. 乙 then starts at sample
+// 114680, frame 71.675: its fractional part is above one half, so
+// Math.round and Math.floor disagree there. 丁 is long enough that its
 // in-chapter scene end (narration plus 20) exceeds the 60-frame minimum.
-const SAMPLES = { 甲: 47000, 乙: 24000, 丙: 16000, 丁: 68000, 戊: 47000, 己: 48000, 庚: 40000, 辛: 33600, 壬: 80000, 癸: 1601, 子: 48000 };
+const SAMPLES = { 甲: 47800, 乙: 24000, 丙: 16000, 丁: 68000, 戊: 47000, 己: 48000, 庚: 40000, 辛: 33600, 壬: 80000, 癸: 1601, 子: 48000 };
 
 function timed(endCardNarration) {
   const s = script(endCardNarration);
@@ -122,8 +124,8 @@ test("a 3-chapter script lays out at the hand-computed frames", () => {
       }),
   );
   assert.deepEqual(blocks, {
-    甲: [64000, 111000, 40, 70],
-    乙: [113880, 137880, 71, 87],
+    甲: [64000, 111800, 40, 70],
+    乙: [114680, 138680, 71, 87],
     丙: [155200, 171200, 97, 107],
     丁: [243200, 311200, 152, 195],
     戊: [344000, 391000, 215, 245],
