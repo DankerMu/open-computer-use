@@ -777,7 +777,9 @@ function placeOf(path, named) {
 const fieldText = (path) => path.map((key, i) => (typeof key === "number" ? `[${key}]` : i === 0 ? key : `.${key}`)).join("");
 
 test("a control character in any text field, or in voice.instructions, is rejected with its own limit", () => {
-  const base = { ...maximal(), voice: { id: "alloy", instructions: "语速放慢" } };
+  // Through JSON, so the entries maximal() fills from one object are each
+  // their own.
+  const base = JSON.parse(JSON.stringify({ ...maximal(), voice: { id: "alloy", instructions: "语速放慢" } }));
   const paths = textFields(base);
   // Every kind's content fields, the names, the blocks, the title and the
   // voice instructions are among them.
@@ -787,7 +789,7 @@ test("a control character in any text field, or in voice.instructions, is reject
   }
   for (const path of paths) {
     for (const [control, escaped] of [["\u0000", "\\u0000"], ["\n", "\\n"], ["\t", "\\t"], ["\u007f", "\\u007f"], ["\u009f", "\\u009f"]]) {
-      const script = structuredClone(base);
+      const script = JSON.parse(JSON.stringify(base));
       let parent = script;
       for (const key of path.slice(0, -1)) parent = parent[key];
       parent[path.at(-1)] = `一${control}二`;
