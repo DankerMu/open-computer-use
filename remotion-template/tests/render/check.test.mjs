@@ -263,7 +263,8 @@ test("1, 2, 5: check returns at once, a second check is refused, and the run pas
 });
 
 test("5.2 evidence 1: the pass leaves one 1920×1080 sheet whose quadrants are the tiles' stills in order", { timeout: CHECK_LIMIT_MS }, async (t) => {
-  assert.deepEqual(readdirSync(join(passing, ".kit", "check")).sort(), ["contact.png", "job.json", "log", "result.json"]);
+  // tmp/: the worker's TMPDIR, which task 5.3's startJob creates.
+  assert.deepEqual(readdirSync(join(passing, ".kit", "check")).sort(), ["contact.png", "job.json", "log", "result.json", "tmp"]);
   const probed = JSON.parse(
     execFileSync("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height", "-of", "json", sheetPath(passing)], {
       encoding: "utf8",
