@@ -93,6 +93,24 @@ test("a blocked worker is running, in its own process group, until it passes", a
   assert.deepEqual(state.result.reasons, []);
 });
 
+test("a running job is seen whole under a narrow COLUMNS, as procps would cut its arguments", async (t) => {
+  const root = project(t);
+  const saved = process.env.COLUMNS;
+  process.env.COLUMNS = "80";
+  t.after(() => {
+    if (saved === undefined) delete process.env.COLUMNS;
+    else process.env.COLUMNS = saved;
+  });
+  const pid = await start(t, root, "block");
+  const { token } = readJson(join(dir(root), "job.json"));
+  // The token is the last argument, past column 80.
+  const args = spawnSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, COLUMNS: "1000" } }).stdout.trim();
+  assert.ok(args.endsWith(token) && args.length > 80, args);
+  assert.equal((await jobState(root, NAME)).state, "running");
+  writeFileSync(join(root, "release"), "pass");
+  assert.equal((await settled(root)).state, "passed");
+});
+
 test("a failing worker is failed with its reasons", async (t) => {
   const root = project(t);
   await start(t, root, "fail");
