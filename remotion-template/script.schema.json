@@ -9,7 +9,8 @@
     "title": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 24
+      "maxLength": 24,
+      "pattern": "^\\P{Cc}*$"
     },
     "music": {
       "type": "string",
@@ -34,7 +35,8 @@
             "items": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 16
+              "maxLength": 16,
+              "pattern": "^\\P{Cc}*$"
             }
           }
         },
@@ -48,12 +50,14 @@
             "title": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 16
+              "maxLength": 16,
+              "pattern": "^\\P{Cc}*$"
             },
             "subtitle": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 24
+              "maxLength": 24,
+              "pattern": "^\\P{Cc}*$"
             }
           },
           "required": [
@@ -79,7 +83,8 @@
           "name": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 6
+            "maxLength": 6,
+            "pattern": "^\\P{Cc}*$"
           },
           "scenes": {
             "minItems": 1,
@@ -105,7 +110,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -119,7 +125,8 @@
                         "question": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 24
+                          "maxLength": 24,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       },
                       "required": [
@@ -153,7 +160,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -167,12 +175,14 @@
                         "kicker": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 8
+                          "maxLength": 8,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "title": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 12
+                          "maxLength": 12,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "points": {
                           "minItems": 1,
@@ -181,13 +191,15 @@
                           "items": {
                             "type": "string",
                             "minLength": 1,
-                            "maxLength": 16
+                            "maxLength": 16,
+                            "pattern": "^\\P{Cc}*$"
                           }
                         },
                         "conclusion": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 20
+                          "maxLength": 20,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       },
                       "required": [
@@ -222,7 +234,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -243,12 +256,14 @@
                               "label": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 8
+                                "maxLength": 8,
+                                "pattern": "^\\P{Cc}*$"
                               },
                               "detail": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 16
+                                "maxLength": 16,
+                                "pattern": "^\\P{Cc}*$"
                               }
                             },
                             "required": [
@@ -289,7 +304,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -303,17 +319,20 @@
                         "cause": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "effect": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "link": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 8
+                          "maxLength": 8,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       },
                       "required": [
@@ -348,7 +367,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -365,7 +385,8 @@
                             "title": {
                               "type": "string",
                               "minLength": 1,
-                              "maxLength": 8
+                              "maxLength": 8,
+                              "pattern": "^\\P{Cc}*$"
                             },
                             "points": {
                               "minItems": 1,
@@ -374,7 +395,8 @@
                               "items": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 12
+                                "maxLength": 12,
+                                "pattern": "^\\P{Cc}*$"
                               }
                             }
                           },
@@ -390,7 +412,8 @@
                             "title": {
                               "type": "string",
                               "minLength": 1,
-                              "maxLength": 8
+                              "maxLength": 8,
+                              "pattern": "^\\P{Cc}*$"
                             },
                             "points": {
                               "minItems": 1,
@@ -399,7 +422,8 @@
                               "items": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 12
+                                "maxLength": 12,
+                                "pattern": "^\\P{Cc}*$"
                               }
                             }
                           },
@@ -442,7 +466,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -463,17 +488,20 @@
                               "year": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 8
+                                "maxLength": 8,
+                                "pattern": "^\\P{Cc}*$"
                               },
                               "label": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 12
+                                "maxLength": 12,
+                                "pattern": "^\\P{Cc}*$"
                               },
                               "detail": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 16
+                                "maxLength": 16,
+                                "pattern": "^\\P{Cc}*$"
                               }
                             },
                             "required": [
@@ -515,7 +543,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -532,12 +561,14 @@
                         "unit": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 4
+                          "maxLength": 4,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "label": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 12
+                          "maxLength": 12,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       },
                       "required": [
@@ -572,7 +603,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -593,12 +625,14 @@
                         "title": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 12
+                          "maxLength": 12,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "unit": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 4
+                          "maxLength": 4,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "points": {
                           "minItems": 2,
@@ -610,7 +644,8 @@
                               "label": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 6
+                                "maxLength": 6,
+                                "pattern": "^\\P{Cc}*$"
                               },
                               "value": {
                                 "type": "number"
@@ -657,7 +692,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -688,7 +724,8 @@
                               "label": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": 10
+                                "maxLength": 10,
+                                "pattern": "^\\P{Cc}*$"
                               }
                             },
                             "required": [
@@ -732,7 +769,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -746,17 +784,20 @@
                         "term": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 10
+                          "maxLength": 10,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "text": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 40
+                          "maxLength": 40,
+                          "pattern": "^\\P{Cc}*$"
                         },
                         "source": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       },
                       "required": [
@@ -791,7 +832,8 @@
                         "items": {
                           "type": "string",
                           "minLength": 1,
-                          "maxLength": 16
+                          "maxLength": 16,
+                          "pattern": "^\\P{Cc}*$"
                         }
                       }
                     },
@@ -841,7 +883,8 @@
             "items": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 16
+              "maxLength": 16,
+              "pattern": "^\\P{Cc}*$"
             }
           }
         },
@@ -859,7 +902,8 @@
               "items": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 16
+                "maxLength": 16,
+                "pattern": "^\\P{Cc}*$"
               }
             }
           },
@@ -894,7 +938,8 @@
             "items": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 16
+              "maxLength": 16,
+              "pattern": "^\\P{Cc}*$"
             }
           }
         },
@@ -908,12 +953,14 @@
             "title": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 16
+              "maxLength": 16,
+              "pattern": "^\\P{Cc}*$"
             },
             "subtitle": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 24
+              "maxLength": 24,
+              "pattern": "^\\P{Cc}*$"
             }
           },
           "required": [
@@ -940,7 +987,8 @@
         "instructions": {
           "description": "generate_speech instructions, the same for every block.",
           "type": "string",
-          "maxLength": 200
+          "maxLength": 200,
+          "pattern": "^\\P{Cc}*$"
         }
       },
       "additionalProperties": false

@@ -70,7 +70,12 @@ const COMPONENT = /^[A-Z][A-Za-z0-9]{0,39}$/;
 const NON_EMPTY = "non-empty";
 const SLOTS = { hook: "hook", summary: "summary", endCard: "end-card" };
 
-const chars = (max) => z.string().min(1, NON_EMPTY).max(max, `${max} characters`);
+// No control character in any text: the class src/kit/text.ts's units()
+// refuses.
+const NO_CONTROL = /^\P{Cc}*$/u;
+const NO_CONTROL_LIMIT = "no control characters";
+
+const chars = (max) => z.string().min(1, NON_EMPTY).max(max, `${max} characters`).regex(NO_CONTROL, NO_CONTROL_LIMIT);
 const list = (item, { min, max }, noun) => {
   const limit = `${min}–${max} ${noun}`;
   return z.array(item).min(min, limit).max(max, limit);
@@ -194,6 +199,7 @@ export const scriptSchema = z
         instructions: z
           .string()
           .max(LIMITS.voice.instructions, `${LIMITS.voice.instructions} characters`)
+          .regex(NO_CONTROL, NO_CONTROL_LIMIT)
           .optional()
           .describe("generate_speech instructions, the same for every block."),
       })

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The kit command entry: `new`, `voice`, `voice-import` and `image`, driven
-// through run(argv, io) with temporary directories for videosRoot, filesRoot
+// The kit command entry: `new`, `voice`, `voice-import`, `image`, and the
+// `check` and `status` entries of task 5.1, driven through run(argv, io) with temporary directories for videosRoot, filesRoot
 // and a copy of the template. Expected exit codes, stream contents and file
 // names come from the task 3.5 fixture; the first hook block's stem
 // (s1-0-0-4a7b077a) was computed outside the module with shasum.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -689,4 +689,117 @@ test("1,000 random names always sanitize to a name matching IMAGE_NAME", async (
   }
   assert.equal(ran, 1000);
   assert.ok(seenLongDot >= 200);
+});
+
+// --- check and status (task 5.1) ---------------------------------------------
+
+test("the usage list holds check and status, and package.json is an ES module package", async (t) => {
+  const box = sandbox(t);
+  const none = await kit([], box.template, box);
+  assert.equal(none.code, 2);
+  assert.ok(lines(none.err).includes("kit: usage: node bin/kit.mjs check"), none.err);
+  assert.ok(lines(none.err).includes("kit: usage: node bin/kit.mjs status"), none.err);
+  assert.equal(JSON.parse(readFileSync(join(TEMPLATE, "package.json"), "utf8")).type, "module");
+});
+
+test("new leaves out .kit: a template with .kit/check/ gives a project without .kit", async (t) => {
+  const box = sandbox(t);
+  mkdirSync(join(box.template, ".kit", "check"), { recursive: true });
+  writeFileSync(join(box.template, ".kit", "check", "job.json"), "{}");
+  const result = await kit(["new", "no-kit"], box.template, box);
+  assert.equal(result.code, 0, result.err);
+  const target = join(box.videos, "no-kit");
+  assert.ok(existsSync(join(target, "script.json")));
+  assert.equal(existsSync(join(target, ".kit")), false);
+});
+
+test("check and status refuse at the template root and take no argument", async (t) => {
+  const box = sandbox(t);
+  for (const name of ["check", "status"]) {
+    const atTemplate = await kit([name], box.template, box);
+    assert.equal(atTemplate.code, 2);
+    assert.ok(atTemplate.err.includes(`cd ${box.videos}/<name> && node bin/kit.mjs ${name}`), atTemplate.err);
+    assert.equal(existsSync(join(box.template, ".kit")), false);
+  }
+  const p = await project(t);
+  for (const name of ["check", "status"]) {
+    const extra = await kit([name, "x"], p.root, p);
+    assert.deepEqual(extra, { code: 2, out: "", err: `kit ${name}: usage: node bin/kit.mjs ${name}\n` });
+  }
+  assert.equal(existsSync(join(p.root, ".kit")), false);
+});
+
+// Writes .kit/check/job.json (and result.json when given) by hand.
+function jobFiles(root, job, result) {
+  mkdirSync(join(root, ".kit", "check"), { recursive: true });
+  writeFileSync(join(root, ".kit", "check", "job.json"), JSON.stringify({ version: 1, name: "check", ...job }));
+  if (result) writeFileSync(join(root, ".kit", "check", "result.json"), JSON.stringify({ version: 1, finishedAt: 0, ...result }));
+}
+
+test("status reports none, passed, failed and died on stdout with their exit codes", async (t) => {
+  const box = await project(t);
+  const token = "9f".repeat(16);
+  assert.deepEqual(await kit(["status"], box.root, box), {
+    code: 4,
+    out: "kit status: no check has run; run node bin/kit.mjs check\n",
+    err: "",
+  });
+  jobFiles(box.root, { token, pid: 4242, startedAt: 0 }, { token, outcome: "passed", reasons: [] });
+  assert.deepEqual(await kit(["status"], box.root, box), { code: 0, out: "kit status: check passed\n", err: "" });
+  jobFiles(box.root, { token, pid: 4242, startedAt: 0 }, { token, outcome: "failed", reasons: ["hook: one", "summary: two"] });
+  assert.deepEqual(await kit(["status"], box.root, box), {
+    code: 1,
+    out: "kit status: check failed (2 reasons)\n  hook: one\n  summary: two\n",
+    err: "",
+  });
+  // A process that has exited, so its pid names no live job.
+  const gone = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
+  jobFiles(box.root, { token, pid: Number(gone.stdout), startedAt: 0 });
+  rmSync(join(box.root, ".kit", "check", "result.json"));
+  assert.deepEqual(await kit(["status"], box.root, box), {
+    code: 1,
+    out: `kit status: check died without an exit (pid ${gone.stdout}); see .kit/check/log\n`,
+    err: "",
+  });
+});
+
+test("status reports a live job as running with its whole seconds", async (t) => {
+  const box = await project(t);
+  const token = "7e".repeat(16);
+  const live = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)", token], { stdio: "ignore" });
+  t.after(() => live.kill("SIGKILL"));
+  jobFiles(box.root, { token, pid: live.pid, startedAt: Date.now() - 5500 });
+  assert.deepEqual(await kit(["status"], box.root, box), {
+    code: 3,
+    out: `kit status: check running (pid ${live.pid}, 5 s)\n`,
+    err: "",
+  });
+});
+
+test("check returns at once; a worker that cannot load the probe ends failed with a check: reason", async (t) => {
+  const box = await project(t);
+  const started = Date.now();
+  const result = await kit(["check"], box.root, box);
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(result.code, 0);
+  assert.equal(result.out, "");
+  const pid = Number(/^kit check: started \(pid (\d+)\); run node bin\/kit\.mjs status\n$/.exec(result.err)?.[1]);
+  assert.ok(pid > 0, result.err);
+  t.after(() => {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ESRCH: the worker has already exited.
+    }
+  });
+  // The project links only zod, so the worker's dynamic import of the
+  // probe's Remotion packages fails: a system error, reported as one reason.
+  let status;
+  for (const begun = Date.now(); Date.now() - begun < 30000; await new Promise((done) => setTimeout(done, 50))) {
+    status = await kit(["status"], box.root, box);
+    if (status.code !== 3) break;
+  }
+  assert.equal(status.code, 1, status.out);
+  assert.match(status.out, /^kit status: check failed \(1 reasons\)\n {2}check: Cannot find (package|module) '[^']+'/);
+  assert.equal(lines(status.out).length, 2);
 });

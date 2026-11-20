@@ -42,6 +42,41 @@ export const MIN_SCENE_FRAMES = {
   "end-card": 90,
 };
 
+// Each kind's entrance in frames: the kit-wide 15 until tasks 4.2–4.4 set a
+// kind's value from its approved component. A custom scene must settle
+// within it. kit check's probe targets and its rest rule both read it.
+export const ENTRANCE_FRAMES = {
+  hook: 15,
+  question: 15,
+  "concept-card": 15,
+  "process-steps": 15,
+  "cause-effect": 15,
+  comparison: 15,
+  timeline: 15,
+  "key-number": 15,
+  chart: 15,
+  "image-callouts": 15,
+  "definition-quote": 15,
+  custom: 15,
+  summary: 15,
+  "end-card": 15,
+};
+
+// Each kind's declared reveals: (timing) => [{type: "key" | "batch",
+// startFrame, endFrame}], frames relative to the scene. Empty until tasks
+// 4.2–4.4 declare them from the approved components.
+export const REVEALS = {};
+
+// The rest a reveal needs before the next reveal or the scene's exit.
+export const REST_FRAMES = { key: 30, batch: 15 };
+
+// The reveals of a scene of `kind`: the declared list, or one key reveal
+// over its entrance.
+export function revealsOf(kind, timing, reveals = REVEALS) {
+  if (Object.hasOwn(reveals, kind)) return reveals[kind](timing);
+  return [{ type: "key", startFrame: 0, endFrame: ENTRANCE_FRAMES[kind] }];
+}
+
 const LOUDNESS = { target: -16, range: 1, maxTruePeak: -1.0 };
 
 const ceilFrame = (sample) => Math.ceil(sample / SAMPLES_PER_FRAME);
