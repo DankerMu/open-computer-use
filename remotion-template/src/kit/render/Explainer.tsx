@@ -4,7 +4,9 @@
 // The explainer renderer: a validated script.json and its timeline.json
 // composed into the video. The timeline decides time: every scene plays in
 // a Sequence on its timeline frames, every caption page shows during its
-// block's frames, and the composition lasts timeline.totalFrames. Before
+// block's frames, and the composition lasts timeline.totalFrames. Each
+// scene but the last fades out in its timeline transition window through
+// SceneExit, which wraps the scene alone, never the captions. Before
 // any frame renders, calculateMetadata refuses input props that are not
 // objects, a script that fails validateScript, a timeline that disagrees
 // with it, a kind without a component, and a custom index that does not
@@ -20,6 +22,7 @@ import {captionPages} from './captions.ts';
 import {customProblem} from './CustomScene.tsx';
 import {KitFrame} from './KitFrame.tsx';
 import type {Registry} from './registry.ts';
+import {SceneExit, type Exit} from './SceneExit.tsx';
 
 type Theme = (typeof themes)['light'];
 type Input = Record<string, unknown>;
@@ -31,6 +34,7 @@ type SceneEntry = {
 	component: string | null;
 	startFrame: number;
 	durationInFrames: number;
+	exit: Exit;
 	props: Record<string, unknown>;
 };
 type Problem = {message: string};
@@ -67,7 +71,9 @@ export const ExplainerBody = ({
 				const Scene = registry[entry.kind];
 				return (
 					<Sequence key={entry.index} name={entry.where} from={entry.startFrame} durationInFrames={entry.durationInFrames}>
-						<Scene {...entry.props} theme={theme} />
+						<SceneExit exit={entry.exit}>
+							<Scene {...entry.props} theme={theme} />
+						</SceneExit>
 					</Sequence>
 				);
 			})}

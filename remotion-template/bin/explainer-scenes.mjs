@@ -6,8 +6,14 @@
 // explainerScenes is the one agreement check of script.json and
 // timeline.json; the renderer and kit check both call it. Pure, and imports
 // no node: built-in, because the Remotion bundle imports it.
+//
+// Every scene but the last carries a transition window, its transitionOut
+// (task 4.5): it is TRANSITION_FRAMES long, ends at the scene's end and
+// starts no earlier than the scene's last caption block ends. The renderer
+// reads the window from here, as each entry's exit, and never recomputes it.
 
 import { escapeLine, fieldPath, playbackWhere } from "./script-schema.mjs";
+import { TRANSITION_FRAMES } from "./scene-timing.mjs";
 
 const VERSION = 1;
 const FPS = 30;
@@ -15,6 +21,7 @@ const NARRATION_FILE = "public/narration.wav";
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const isString = (value) => typeof value === "string";
+const isWindow = (value) => value === null || isObject(value);
 const shown = (value) => escapeLine(JSON.stringify(value));
 
 class Problem extends Error {
@@ -48,6 +55,10 @@ function checkShape(timeline) {
     need(scene, isObject, at);
     field(scene, "kind", isString, at);
     for (const key of ["startFrame", "endFrame", "narrationEndFrame"]) field(scene, key, Number.isInteger, at);
+    const transition = field(scene, "transitionOut", isWindow, at);
+    if (transition !== null) {
+      for (const key of ["startFrame", "frames"]) field(transition, key, Number.isInteger, [...at, "transitionOut"]);
+    }
     field(scene, "sentences", Array.isArray, at).forEach((sentence, s) => {
       const sentenceAt = [...at, "sentences", s];
       need(sentence, isObject, sentenceAt);
@@ -129,14 +140,53 @@ function checkAgreement(script, timeline) {
   });
   const lastEnd = timeline.scenes.at(-1).endFrame;
   if (timeline.totalFrames !== lastEnd) throw new Problem("script", `totalFrames ${timeline.totalFrames} is not the last scene's end ${lastEnd}`);
+  checkTransitions(pairs);
   return pairs;
+}
+
+// The end of a scene's last caption block, or its startFrame when it has
+// none.
+function lastBlockEnd(scene) {
+  const last = scene.sentences.at(-1)?.blocks.at(-1);
+  return last === undefined ? scene.startFrame : last.endFrame;
+}
+
+// The transition windows, one pass per check; checkShape has made each
+// transitionOut null or {startFrame, frames} of integers.
+function checkTransitions(pairs) {
+  const last = pairs.length - 1;
+  pairs.forEach(([scene, { where }], i) => {
+    if (i === last && scene.transitionOut !== null) throw new Problem(where, "the last scene has a transition");
+  });
+  pairs.forEach(([scene, { where }], i) => {
+    if (i !== last && scene.transitionOut === null) throw new Problem(where, "scene has no transition");
+  });
+  const windows = pairs.filter(([scene]) => scene.transitionOut !== null);
+  for (const [{ transitionOut }, { where }] of windows) {
+    if (transitionOut.frames !== TRANSITION_FRAMES) {
+      throw new Problem(where, `transition is ${transitionOut.frames} frames, expected ${TRANSITION_FRAMES}`);
+    }
+  }
+  for (const [{ transitionOut, endFrame }, { where }] of windows) {
+    const end = transitionOut.startFrame + transitionOut.frames;
+    if (end !== endFrame) throw new Problem(where, `transition ends at ${end}, not at the scene's end ${endFrame}`);
+  }
+  for (const [scene, { where }] of windows) {
+    const blocksEnd = lastBlockEnd(scene);
+    if (scene.transitionOut.startFrame < blocksEnd) {
+      throw new Problem(where, `transition starts at ${scene.transitionOut.startFrame}, before the last block ends at ${blocksEnd}`);
+    }
+  }
 }
 
 // script: as validateScript returns it. timeline: parsed from timeline.json.
 // Returns {index, where, kind, component, startFrame, durationInFrames,
-// props} per scene, props holding the scene's content (absent for a custom
-// scene), its image name or null, and its timing with every frame relative
-// to the scene's start. Throws an Error naming where the two disagree.
+// exit, props} per scene. exit is the scene's transition window,
+// {startFrame, frames} with startFrame relative to the scene's start, or
+// null for the last scene. props holds the scene's content (absent for a
+// custom scene), its image name or null, and its timing with every frame
+// relative to the scene's start. Throws an Error naming where the two
+// disagree.
 export function explainerScenes(script, timeline) {
   return checkAgreement(script, timeline).map(([scene, { scene: source, index, where }]) => {
     const start = scene.startFrame;
@@ -148,8 +198,9 @@ export function explainerScenes(script, timeline) {
         blocks: sentence.blocks.map(({ text, startFrame, endFrame }) => ({ text, startFrame: startFrame - start, endFrame: endFrame - start })),
       })),
     };
+    const exit = scene.transitionOut === null ? null : { startFrame: scene.transitionOut.startFrame - start, frames: scene.transitionOut.frames };
     const custom = source.kind === "custom";
     const props = custom ? { image: source.image ?? null, timing } : { content: source.content, image: source.image ?? null, timing };
-    return { index, where, kind: source.kind, component: custom ? source.component : null, startFrame: start, durationInFrames, props };
+    return { index, where, kind: source.kind, component: custom ? source.component : null, startFrame: start, durationInFrames, exit, props };
   });
 }
