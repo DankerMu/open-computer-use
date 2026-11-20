@@ -11,13 +11,14 @@
 // match the script.
 
 import React, {useMemo} from 'react';
-import {AbsoluteFill, Audio, Composition, Sequence, staticFile} from 'remotion';
+import {Audio, Composition, Sequence, staticFile} from 'remotion';
 import {explainerScenes} from '../../../bin/explainer-scenes.mjs';
 import {validateScript} from '../../../bin/script-schema.mjs';
 import type {themes} from '../theme.ts';
 import {Captions} from './Captions.tsx';
 import {captionPages} from './captions.ts';
 import {customProblem} from './CustomScene.tsx';
+import {KitFrame} from './KitFrame.tsx';
 import type {Registry} from './registry.ts';
 
 type Theme = (typeof themes)['light'];
@@ -60,8 +61,7 @@ export const ExplainerBody = ({
 	const scenes = useMemo(() => scenesOf(script, timeline), [script, timeline]);
 	const pages = useMemo(() => captionPages(timeline as Parameters<typeof captionPages>[0]), [timeline]);
 	return (
-		<>
-			<AbsoluteFill style={{backgroundColor: theme.brand.bg}} />
+		<KitFrame theme={theme}>
 			{scenes.map((entry) => {
 				if (!hasKind(registry, entry.kind)) fail(`${entry.where}: no component for kind "${entry.kind}"`);
 				const Scene = registry[entry.kind];
@@ -72,7 +72,7 @@ export const ExplainerBody = ({
 				);
 			})}
 			<Captions pages={pages} theme={theme} />
-		</>
+		</KitFrame>
 	);
 };
 
