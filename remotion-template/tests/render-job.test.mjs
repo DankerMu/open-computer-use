@@ -356,9 +356,18 @@ test("success: the target holds the render, no partial, the source is gone, and 
 
 test("the stub's input props are JSON.parse of the hashed texts, not validateScript's output", async (t) => {
   const w = await worker(t);
+  // A raw script.json without the end card's narration and the voice, which
+  // validateScript fills in; checked again, so the pass covers this text.
+  const raw = JSON.parse(readFileSync(join(w.p.root, "script.json"), "utf8"));
+  delete raw.endCard.narration;
+  delete raw.voice;
+  const text = JSON.stringify(raw);
+  writeFileSync(join(w.p.root, "script.json"), text);
+  plantCheck(w.p.root, { outcome: "passed", reasons: [], count: 0, hash: await currentHash(w.p.root), sheet: ".kit/check/contact.png", tiles: [] });
   assert.equal(await w.go(), 0);
   const { script, timeline } = w.calls[0];
-  assert.deepEqual(script, JSON.parse(readFileSync(join(w.p.root, "script.json"), "utf8")));
+  assert.deepEqual(script, JSON.parse(text));
+  assert.notDeepEqual(script, validateScript(text).script);
   assert.deepEqual(timeline, JSON.parse(readFileSync(join(w.p.root, "timeline.json"), "utf8")));
 });
 
