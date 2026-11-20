@@ -8,12 +8,16 @@
 // question 134–194, custom 194–271 with blocks [194, 209) and [210, 226),
 // concept card 271–331, summary 331–391, end card 391–481), and every
 // problem has its own message, ending `; run node bin/kit.mjs timeline`.
+// Every scene but the last carries its exit, the transition window
+// relative to the scene's start (task 4.5): the windows start at 119, 179,
+// 256, 316 and 376.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { explainerScenes } from "../bin/explainer-scenes.mjs";
 import { fixtureScript, fixtureTimeline } from "./render/fixtures/explainer/fixture.mjs";
+import { coverage, transitionsScript, transitionsTimeline } from "./render/fixtures/transitions/fixture.mjs";
 
 const HINT = "; run node bin/kit.mjs timeline";
 const QUESTION = "chapter 1 现象, scene 1 (question)";
@@ -34,6 +38,7 @@ const EXPECTED = [
     component: null,
     startFrame: 0,
     durationInFrames: 134,
+    exit: { startFrame: 119, frames: 15 },
     props: {
       content: { title: "光的折射" },
       image: null,
@@ -47,6 +52,7 @@ const EXPECTED = [
     component: null,
     startFrame: 134,
     durationInFrames: 60,
+    exit: { startFrame: 45, frames: 15 },
     props: { content: { question: "筷子为何看起来折断" }, image: null, timing: timing(60, 15, [[block("筷子看起来折断", 0, 15)]]) },
   },
   {
@@ -56,6 +62,7 @@ const EXPECTED = [
     component: "Orbit",
     startFrame: 194,
     durationInFrames: 77,
+    exit: { startFrame: 62, frames: 15 },
     props: { image: null, timing: timing(77, 32, [[block("速度变了", 0, 15), block("方向就变", 16, 32)]]) },
   },
   {
@@ -65,6 +72,7 @@ const EXPECTED = [
     component: null,
     startFrame: 271,
     durationInFrames: 60,
+    exit: { startFrame: 45, frames: 15 },
     props: {
       content: { title: "透镜", points: ["放大镜"] },
       image: null,
@@ -78,6 +86,7 @@ const EXPECTED = [
     component: null,
     startFrame: 331,
     durationInFrames: 60,
+    exit: { startFrame: 45, frames: 15 },
     props: { content: { points: ["折射改变方向"] }, image: null, timing: timing(60, 15, [[block("记住这一点", 0, 15)]]) },
   },
   {
@@ -87,6 +96,7 @@ const EXPECTED = [
     component: null,
     startFrame: 391,
     durationInFrames: 90,
+    exit: null,
     props: { content: { title: "谢谢观看" }, image: null, timing: timing(90, 0, []) },
   },
 ];
@@ -180,6 +190,38 @@ const PROBLEMS = [
     `${CUSTOM}, sentence 1 block 2: timeline.json block 210–272 lies outside the scene 194–271`,
   ],
   ["another totalFrames", (t) => (t.totalFrames = 480), "script: timeline.json totalFrames 480 is not the last scene's end 481"],
+  // The transition checks (task 4.5), each case breaking only its own check.
+  [
+    "a missing transition",
+    (t) => delete t.scenes[2].transitionOut,
+    "script: timeline.json scenes[2].transitionOut is missing or has the wrong type",
+  ],
+  [
+    "a transition length of the wrong type",
+    (t) => (t.scenes[2].transitionOut.frames = "15"),
+    "script: timeline.json scenes[2].transitionOut.frames is missing or has the wrong type",
+  ],
+  [
+    "a transition on the last scene",
+    (t) => (t.scenes[5].transitionOut = { startFrame: 466, frames: 15 }),
+    "end-card: timeline.json the last scene has a transition",
+  ],
+  ["no transition on a scene before the last", (t) => (t.scenes[1].transitionOut = null), `${QUESTION}: timeline.json scene has no transition`],
+  [
+    "a transition of another length",
+    (t) => (t.scenes[1].transitionOut = { startFrame: 178, frames: 16 }),
+    `${QUESTION}: timeline.json transition is 16 frames, expected 15`,
+  ],
+  [
+    "a transition ending before its scene's end",
+    (t) => (t.scenes[1].transitionOut = { startFrame: 178, frames: 15 }),
+    `${QUESTION}: timeline.json transition ends at 193, not at the scene's end 194`,
+  ],
+  [
+    "a transition starting before the last block ends",
+    (t) => (t.scenes[1].sentences[0].blocks[0].endFrame = 180),
+    `${QUESTION}: timeline.json transition starts at 179, before the last block ends at 180`,
+  ],
 ];
 
 for (const [name, edit, message] of PROBLEMS) {
@@ -193,6 +235,30 @@ for (const [name, edit, message] of PROBLEMS) {
     );
   });
 }
+
+test("a transition is measured from the last block, not from narrationEndFrame", () => {
+  const script = fixtureScript();
+  const timeline = fixtureTimeline(script);
+  timeline.scenes[1].narrationEndFrame = 190;
+  assert.deepEqual(explainerScenes(script, timeline)[1].exit, { startFrame: 45, frames: 15 });
+});
+
+test("the transitions fixture covers the three gap cases and passes, every exit its transitionOut", () => {
+  const script = transitionsScript();
+  const timeline = transitionsTimeline(script);
+  assert.equal(timeline.totalFrames, 550);
+  assert.deepEqual(coverage(timeline), { sceneEnd: 1, chapterStart: 0, stretched: 4 });
+  const entries = explainerScenes(script, timeline);
+  assert.equal(entries.length, 7);
+  for (const fixture of [[script, timeline], [fixtureScript(), fixtureTimeline(fixtureScript())]]) {
+    const [s, t] = fixture;
+    explainerScenes(s, t).forEach((entry, i) => {
+      const scene = t.scenes[i];
+      const expected = i === t.scenes.length - 1 ? null : { startFrame: scene.transitionOut.startFrame - scene.startFrame, frames: 15 };
+      assert.deepEqual(entry.exit, expected, entry.where);
+    });
+  }
+});
 
 test("a timeline that is not an object names its first field", () => {
   assert.throws(() => explainerScenes(fixtureScript(), null), { message: `script: timeline.json version is missing or has the wrong type${HINT}` });
@@ -218,7 +284,8 @@ function specifiers(path) {
 }
 
 test("the modules the bundle imports from bin/ and captions.ts import no node: built-in", () => {
-  assert.deepEqual(specifiers("../bin/explainer-scenes.mjs"), ["./script-schema.mjs"]);
+  assert.deepEqual(specifiers("../bin/explainer-scenes.mjs"), ["./script-schema.mjs", "./scene-timing.mjs"]);
+  assert.deepEqual(specifiers("../bin/scene-timing.mjs"), []);
   assert.deepEqual(specifiers("../bin/script-schema.mjs"), ["zod"]);
   assert.deepEqual(specifiers("../src/kit/render/captions.ts"), ["@remotion/captions"]);
 });
