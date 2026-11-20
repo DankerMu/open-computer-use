@@ -4,21 +4,24 @@
 // The explainer kit's one command. `node /opt/remotion-template/bin/kit.mjs
 // new <name>` creates a project; inside it, `node bin/kit.mjs <subcommand>`
 // runs every other step. stdout carries only data (a project path, speech
-// calls, an image name); everything else goes to stderr, prefixed with the
-// subcommand. Exit codes: 0 success, 1 a refused or failed step, 2 a usage
-// error. Imports only node: built-ins and the kit's own modules; no network.
+// calls, an image name, a status report); everything else goes to stderr,
+// prefixed with the subcommand. Exit codes: 0 success, 1 a refused or failed
+// step, 2 a usage error; `status` also exits 3 while a check runs and 4 when
+// none has run. Imports only node: built-ins and the kit's own modules; no
+// network.
 
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, rmdir, symlink } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { check, status } from "./check.mjs";
 import { Refusal, lstatOrNull, notFound, publicDir, readScript, sayer, writeAtomic } from "./kit-io.mjs";
 import { timeline } from "./timeline.mjs";
 import { blockStems } from "./voice-stem.mjs";
 
 const PROJECT_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
-const NOT_COPIED = new Set(["node_modules", "tests", "out", "gallery"]);
+const NOT_COPIED = new Set(["node_modules", "tests", "out", "gallery", ".kit"]);
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp"]);
 const IMAGE_STEM = 60;
 
@@ -227,6 +230,8 @@ const COMMANDS = {
   "voice-import": { usage: "node bin/kit.mjs voice-import", args: 0, fromTemplate: false, run: voiceImport },
   image: { usage: 'node bin/kit.mjs image "<path>"', args: 1, fromTemplate: false, run: image },
   timeline: { usage: "node bin/kit.mjs timeline", args: 0, fromTemplate: false, run: timeline },
+  check: { usage: "node bin/kit.mjs check", args: 0, fromTemplate: false, run: check },
+  status: { usage: "node bin/kit.mjs status", args: 0, fromTemplate: false, run: status },
 };
 
 // io: {root, videosRoot, filesRoot, stdout, stderr}; resolves to the exit code.

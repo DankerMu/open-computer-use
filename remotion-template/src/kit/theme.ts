@@ -73,3 +73,7 @@ export const themes = {
 		motion,
 	},
 };
+
+// The one theme of the explainer: kit check judges with the theme Explainer
+// renders with. Task 4.6 changes it to the user's pick.
+export const KIT_THEME = themes.light;
