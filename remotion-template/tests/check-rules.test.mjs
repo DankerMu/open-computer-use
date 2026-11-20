@@ -4,14 +4,16 @@
 // The mechanical stage of kit check (task 5.1), pure: each rule of
 // bin/check-rules.mjs called on its own with the script, a timeline, a
 // reveals table and a stub file reader, and runChecks' stage order with a
-// stub probe. Expected messages are the fixture's exact texts; the frames in
+// stub probe and a stub contact sheet (task 5.2), so CI never bundles
+// Remotion. Expected messages are the fixture's exact texts; the frames in
 // them come from tests/fixtures/check/fixture.mjs's timeline (worked out from
 // the 3.6 layout rules and listed in its header) or from the hand-written
-// timelines below, never from the module under test.
+// timelines below, never from the module under test. Task 5.2's modules are
+// imported inside their tests, so a missing one fails only those.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -37,6 +39,7 @@ const CUSTOM = "chapter 2 原理, scene 1 (custom)";
 const CONCEPT = "chapter 3 应用, scene 1 (concept-card)";
 const WHERES = ["hook", QUESTION, CUSTOM, CONCEPT, "summary", "end-card"];
 const STALE = "timeline.json is stale (its text, voice or instructions changed); run node bin/kit.mjs voice, voice-import, then timeline";
+const CHANGED = "the project changed while the check ran; run node bin/kit.mjs check again";
 
 const script = checkScript();
 const timeline = checkTimeline(script);
@@ -87,6 +90,10 @@ function stubProbe(make = (targets) => cleanResult(targets)) {
 
 const neverProbe = async () => {
   throw new Error("the probe must not run");
+};
+
+const neverSheet = async () => {
+  throw new Error("the contact sheet must not run");
 };
 
 // --- rule 1: schema ---------------------------------------------------------------
@@ -462,22 +469,42 @@ test("probe: a custom index refusal is the reason, and nothing is probed", async
 
 // --- runChecks ---------------------------------------------------------------
 
-const STAGES = ["schema", "timeline", "assets", "unnarrated", "rest", "probe"];
-const stageLines = (n) => STAGES.slice(0, n).map((name, i) => `check: stage ${i + 1} ${name}`);
+const STAGES = ["schema", "timeline", "assets", "unnarrated", "rest", "probe", "contact-sheet", "hash"];
+// The log of the first n stages: the snapshot line follows stage 2 when a
+// later stage runs.
+const stageLines = (n) => {
+  const lines = STAGES.slice(0, n).map((name, i) => `check: stage ${i + 1} ${name}`);
+  if (n > 2) lines.splice(2, 0, "check: snapshot");
+  return lines;
+};
 
-test("the rule list is the six stages in order", () => {
+// A stub contact sheet that records its argument, creates .kit/check/ and
+// writes `output`, so stage 8's rename has a file; `edit` then runs.
+function stubSheet(edit = () => {}) {
+  const calls = [];
+  const sheet = async (root, options) => {
+    calls.push({ root, ...options });
+    mkdirSync(dirname(options.output), { recursive: true });
+    writeFileSync(options.output, "stub sheet");
+    await edit(root, options);
+  };
+  return { sheet, calls };
+}
+
+test("the rule list is the eight stages in order", () => {
   assert.deepEqual(
     RULES.map((rule) => rule.name),
     STAGES,
   );
 });
 
-test("runChecks: the passing project runs all six stages and passes", async (t) => {
+test("runChecks: the passing project runs the snapshot and all eight stages and passes", async (t) => {
   const log = [];
   const { probe, calls } = stubProbe();
-  const reasons = await runChecks(customRoot(t), { probe, files: stubFiles(checkFiles()), log: (line) => log.push(line) });
+  const { sheet } = stubSheet();
+  const { reasons } = await runChecks(customRoot(t), { probe, sheet, files: stubFiles(checkFiles()), log: (line) => log.push(line) });
   assert.deepEqual(reasons, []);
-  assert.deepEqual(log, stageLines(6));
+  assert.deepEqual(log, stageLines(8));
   assert.equal(calls.length, 1);
   assert.equal(calls[0].targets[0].props.theme, KIT_THEME);
 });
@@ -493,7 +520,7 @@ test("runChecks: a schema failure runs no later stage", async (t) => {
       throw new Error(`${path} must not be read`);
     },
   };
-  const reasons = await runChecks(customRoot(t), { probe: neverProbe, files, log: (line) => log.push(line) });
+  const { reasons } = await runChecks(customRoot(t), { probe: neverProbe, files, log: (line) => log.push(line) });
   assert.deepEqual(reasons, ["script.json: not found"]);
   assert.deepEqual(log, stageLines(1));
 });
@@ -508,7 +535,7 @@ test("runChecks: a timeline failure runs no later stage", async (t) => {
       throw new Error(`${path} must not be read`);
     },
   };
-  const reasons = await runChecks(customRoot(t), { probe: neverProbe, files, log: (line) => log.push(line) });
+  const { reasons } = await runChecks(customRoot(t), { probe: neverProbe, files, log: (line) => log.push(line) });
   assert.deepEqual(reasons, [`timeline.json: missing or not JSON${HINT}`]);
   assert.deepEqual(log, stageLines(2));
 });
@@ -518,7 +545,7 @@ test("runChecks: stages 3–5 all run, and a failure in them skips the probe", a
   const files = checkFiles();
   files.delete(`public/voice/${stems[3]}.wav`);
   const reveals = { summary: () => [{ type: "key", startFrame: 0, endFrame: 200 }] };
-  const reasons = await runChecks(customRoot(t), { probe: neverProbe, files: stubFiles(files), reveals, log: (line) => log.push(line) });
+  const { reasons } = await runChecks(customRoot(t), { probe: neverProbe, files: stubFiles(files), reveals, log: (line) => log.push(line) });
   assert.deepEqual(reasons, [
     `${QUESTION}, sentence 1 block 1: ${stems[3]}.wav is missing`,
     "summary: key reveal ending at frame 200 rests 15 frames before the exit at frame 215; needs 30",
@@ -552,10 +579,165 @@ function onDisk(t) {
 test("runChecks: the default reader passes the project on disk and counts a symlinked WAV missing", async (t) => {
   const root = onDisk(t);
   const { probe } = stubProbe();
-  assert.deepEqual(await runChecks(root, { probe }), []);
+  const { sheet } = stubSheet();
+  assert.deepEqual((await runChecks(root, { probe, sheet })).reasons, []);
   const wav = join(root, "public", "voice", `${stems[0]}.wav`);
   rmSync(wav);
   writeFileSync(join(root, "elsewhere.wav"), voiceBytes(stems[0]));
   symlinkSync(join(root, "elsewhere.wav"), wav);
-  assert.deepEqual(await runChecks(root, { probe: neverProbe }), [`hook, sentence 1 block 1: ${stems[0]}.wav is missing`]);
+  assert.deepEqual((await runChecks(root, { probe: neverProbe, sheet: neverSheet })).reasons, [`hook, sentence 1 block 1: ${stems[0]}.wav is missing`]);
+});
+
+// --- task 5.2: referenced files, tiles, the snapshot, the sheet and the hash ---
+
+test("assets: the rule reads exactly the public/ paths that referencedPublicFiles returns", async () => {
+  const { referencedPublicFiles } = await import("../bin/project-hash.mjs");
+  for (const s of [script, checkScript((raw) => (raw.hook.image = "light.webp"))]) {
+    const t = checkTimeline(s);
+    const files = checkFiles(s, t);
+    files.set("public/images/light.webp", Buffer.from("webp"));
+    const stub = stubFiles(files);
+    const read = [];
+    const recording = {
+      ...stub,
+      regular: async (path) => {
+        read.push(path);
+        return stub.regular(path);
+      },
+    };
+    assert.deepEqual(await assetsRule(s, t, recording), []);
+    const publicReads = [...new Set(read.filter((path) => path.startsWith("public/")))].sort();
+    assert.deepEqual(publicReads, referencedPublicFiles(s, t));
+  }
+});
+
+test("sheetTiles: at m = 5 the hook, the question, the concept card and the summary at their pre-exit frames", async () => {
+  const { sheetTiles } = await import("../bin/contact-sheet.mjs");
+  // The fixture header's windows: hook 704, question 959, concept card 1656,
+  // summary 1886; the pre-exit frame is one before.
+  assert.deepEqual(sheetTiles(explainerScenes(script, timeline)), [
+    { where: "hook", frame: 703 },
+    { where: QUESTION, frame: 958 },
+    { where: CONCEPT, frame: 1655 },
+    { where: "summary", frame: 1885 },
+  ]);
+});
+
+test("sheetTiles: at m = 22 candidates 0, 7, 14 and 21; the end card is never picked", async () => {
+  const { sheetTiles } = await import("../bin/contact-sheet.mjs");
+  // 22 candidates of 100 frames, each exiting at its frame 85, then an end
+  // card of 90 frames without an exit.
+  const entries = Array.from({ length: 22 }, (_, k) => ({
+    where: `scene ${k}`,
+    kind: k === 0 ? "hook" : k === 21 ? "summary" : "question",
+    startFrame: 100 * k,
+    durationInFrames: 100,
+    exit: { startFrame: 85, frames: 15 },
+  }));
+  entries.push({ where: "end-card", kind: "end-card", startFrame: 2200, durationInFrames: 90, exit: null });
+  assert.deepEqual(sheetTiles(entries), [
+    { where: "scene 0", frame: 84 },
+    { where: "scene 7", frame: 784 },
+    { where: "scene 14", frame: 1484 },
+    { where: "scene 21", frame: 2184 },
+  ]);
+  // Without an exit a candidate's pre-exit frame is its last frame.
+  const five = entries.slice(0, 4).concat(entries[21], entries[22]).map((entry, k) => ({ ...entry, startFrame: 100 * k }));
+  five[4] = { ...five[4], exit: null };
+  assert.deepEqual(
+    sheetTiles(five).map((tile) => tile.frame),
+    [84, 184, 384, 499],
+  );
+  assert.ok(sheetTiles(five).every((tile) => tile.where !== "end-card"));
+});
+
+// .kit/check/'s entries, sorted; [] when it is absent.
+const checkDir = (root) => {
+  const dir = join(root, ".kit", "check");
+  return existsSync(dir) ? readdirSync(dir).sort() : [];
+};
+
+test("runChecks: a pass gives the hash, the sheet and the tiles, logs the snapshot and stages 1–8, and leaves only contact.png", async (t) => {
+  const { projectHash } = await import("../bin/project-hash.mjs");
+  const root = onDisk(t);
+  const log = [];
+  const { probe } = stubProbe();
+  const { sheet, calls } = stubSheet();
+  const result = await runChecks(root, { probe, sheet, log: (line) => log.push(line) });
+  assert.deepEqual(log, stageLines(8));
+  const tiles = [
+    { where: "hook", frame: 703 },
+    { where: QUESTION, frame: 958 },
+    { where: CONCEPT, frame: 1655 },
+    { where: "summary", frame: 1885 },
+  ];
+  const texts = { scriptText: readFileSync(join(root, "script.json"), "utf8"), timelineText: readFileSync(join(root, "timeline.json"), "utf8") };
+  const { hash } = await projectHash(root, { script, timeline, ...texts });
+  assert.match(hash, /^[0-9a-f]{64}$/);
+  assert.deepEqual(result, { reasons: [], pass: { hash, sheet: ".kit/check/contact.png", tiles } });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    root,
+    script: JSON.parse(texts.scriptText),
+    timeline: JSON.parse(texts.timelineText),
+    tiles,
+    workDir: join(root, ".kit", "check", "sheet"),
+    output: join(root, ".kit", "check", "contact.next.png"),
+  });
+  assert.deepEqual(checkDir(root), ["contact.png"]);
+  assert.equal(readFileSync(join(root, ".kit", "check", "contact.png"), "utf8"), "stub sheet");
+  // The custom index the snapshot wrote is the generated one.
+  assert.equal(readFileSync(join(root, "src", "custom", "index.ts"), "utf8"), customIndexSource(script));
+});
+
+test("runChecks: a project changed while the check runs fails with the one changed-project reason and no sheet", async (t) => {
+  const changed = { reasons: [CHANGED], pass: null };
+  const editSrc = onDisk(t);
+  const srcProbe = stubProbe((targets) => {
+    appendFileSync(join(editSrc, "src", "custom", "Orbit.tsx"), "// edited\n");
+    return cleanResult(targets);
+  });
+  assert.deepEqual(await runChecks(editSrc, { probe: srcProbe.probe, sheet: stubSheet().sheet }), changed, "a probe that edits src/");
+  assert.deepEqual(checkDir(editSrc), []);
+
+  const editWav = onDisk(t);
+  const wavSheet = stubSheet((root) => appendFileSync(join(root, "public", "voice", `${stems[0]}.wav`), "x"));
+  assert.deepEqual(await runChecks(editWav, { probe: stubProbe().probe, sheet: wavSheet.sheet }), changed, "a sheet that edits a voice WAV");
+  assert.deepEqual(checkDir(editWav), []);
+
+  const deleted = onDisk(t);
+  const deleting = stubProbe((targets) => {
+    rmSync(join(deleted, "script.json"));
+    return cleanResult(targets);
+  });
+  assert.deepEqual(await runChecks(deleted, { probe: deleting.probe, sheet: stubSheet().sheet }), changed, "a probe that deletes script.json");
+  assert.deepEqual(checkDir(deleted), []);
+});
+
+test("runChecks: a sheet that throws is the contact sheet reason, and no sheet is left", async (t) => {
+  const root = onDisk(t);
+  const { sheet } = stubSheet(() => {
+    throw new Error("ffmpeg exited with 1");
+  });
+  assert.deepEqual(await runChecks(root, { probe: stubProbe().probe, sheet }), { reasons: ["contact sheet: ffmpeg exited with 1"], pass: null });
+  assert.deepEqual(checkDir(root), []);
+});
+
+test("runChecks: a symlinked src is its reason, runs stages 3–5 and skips stages 6–8", async (t) => {
+  const root = onDisk(t);
+  renameSync(join(root, "src"), join(root, "src-real"));
+  symlinkSync(join(root, "src-real"), join(root, "src"));
+  const log = [];
+  const result = await runChecks(root, { probe: neverProbe, sheet: neverSheet, log: (line) => log.push(line) });
+  assert.deepEqual(result, { reasons: ["src: is a symlink"], pass: null });
+  assert.deepEqual(log, stageLines(5));
+});
+
+test("runChecks: a project missing its custom file gives only the assets reason", async (t) => {
+  const root = onDisk(t);
+  rmSync(join(root, "src", "custom", "Orbit.tsx"));
+  const log = [];
+  const result = await runChecks(root, { probe: neverProbe, sheet: neverSheet, log: (line) => log.push(line) });
+  assert.deepEqual(result, { reasons: [`${CUSTOM}: src/custom/Orbit.tsx is missing`], pass: null });
+  assert.deepEqual(log, stageLines(5));
 });

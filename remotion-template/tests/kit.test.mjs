@@ -2,7 +2,7 @@
 // Copyright (c) 2025 Open Computer Use Contributors
 //
 // The kit command entry: `new`, `voice`, `voice-import`, `image`, and the
-// `check` and `status` entries of task 5.1, driven through run(argv, io) with temporary directories for videosRoot, filesRoot
+// `check` and `status` entries of task 5.1 (with task 5.2's passed output and reason count), driven through run(argv, io) with temporary directories for videosRoot, filesRoot
 // and a copy of the template. Expected exit codes, stream contents and file
 // names come from the task 3.5 fixture; the first hook block's stem
 // (s1-0-0-4a7b077a) was computed outside the module with shasum.
@@ -729,6 +729,42 @@ test("check and status refuse at the template root and take no argument", async 
   assert.equal(existsSync(join(p.root, ".kit")), false);
 });
 
+// A passed result's fields of task 5.2, and the output status prints for it
+// at root, both from the task 5.2 fixture.
+const PASS = {
+  hash: "a1".repeat(32),
+  sheet: ".kit/check/contact.png",
+  tiles: [
+    { where: "hook", frame: 703 },
+    { where: "chapter 1 现象, scene 1 (question)", frame: 958 },
+    { where: "chapter 3 应用, scene 1 (concept-card)", frame: 1655 },
+    { where: "summary", frame: 1885 },
+  ],
+};
+
+const passedOutput = (root) =>
+  [
+    "kit status: check passed",
+    `contact sheet: ${join(root, ".kit", "check", "contact.png")}`,
+    "  tile 1 (top left): hook, frame 703",
+    "  tile 2 (top right): chapter 1 现象, scene 1 (question), frame 958",
+    "  tile 3 (bottom left): chapter 3 应用, scene 1 (concept-card), frame 1655",
+    "  tile 4 (bottom right): summary, frame 1885",
+    "view the contact sheet and answer each question yes or no; on any no, fix the project and run node bin/kit.mjs check again:",
+    "  1. Does each tile have one main subject that the eye goes to first? (Q5)",
+    "  2. Is all text meant to be read complete and easy to read at this size, with nothing cut off, overlapping or too small? (Q11)",
+    "  3. Is any small decorative text clearly decorative, so that no tile has text a viewer would try and fail to read? (Q11)",
+    "  4. Does each tile show what its scene's narration in script.json says? (C1)",
+    "  5. Does each tile add something new, with no two tiles showing the same picture or making the same point? (P4)",
+    "  6. Does every element sit in its place in the layout, with nothing floating over or covering another element by accident? (Q9)",
+    "  7. Are glows and highlights, if any, on the main subject only, at most one per tile, and kept inside its edges? (Q4)",
+    "  8. Do the illustrations and any mock content look finished and credible, with no placeholder, watermark or stray text? (Q1, Q10)",
+    "  9. Is the text in every tile seen straight on, not tilted at an angle that makes it hard to read? (Q6)",
+    "  10. Is every tile free of blank, black or unfinished-looking areas? (P1)",
+  ]
+    .map((line) => `${line}\n`)
+    .join("");
+
 // Writes .kit/check/job.json (and result.json when given) by hand.
 function jobFiles(root, job, result) {
   mkdirSync(join(root, ".kit", "check"), { recursive: true });
@@ -744,8 +780,8 @@ test("status reports none, passed, failed and died on stdout with their exit cod
     out: "kit status: no check has run; run node bin/kit.mjs check\n",
     err: "",
   });
-  jobFiles(box.root, { token, pid: 4242, startedAt: 0 }, { token, outcome: "passed", reasons: [] });
-  assert.deepEqual(await kit(["status"], box.root, box), { code: 0, out: "kit status: check passed\n", err: "" });
+  jobFiles(box.root, { token, pid: 4242, startedAt: 0 }, { token, outcome: "passed", reasons: [], count: 0, ...PASS });
+  assert.deepEqual(await kit(["status"], box.root, box), { code: 0, out: passedOutput(box.root), err: "" });
   jobFiles(box.root, { token, pid: 4242, startedAt: 0 }, { token, outcome: "failed", reasons: ["hook: one", "summary: two"] });
   assert.deepEqual(await kit(["status"], box.root, box), {
     code: 1,
@@ -759,6 +795,38 @@ test("status reports none, passed, failed and died on stdout with their exit cod
   assert.deepEqual(await kit(["status"], box.root, box), {
     code: 1,
     out: `kit status: check died without an exit (pid ${gone.stdout}); see .kit/check/log\n`,
+    err: "",
+  });
+});
+
+test("status prints the passed output: the sheet's absolute path, the four tiles and the ten questions", async (t) => {
+  const box = await project(t);
+  const token = "8d".repeat(16);
+  jobFiles(box.root, { token, pid: 4242, startedAt: 0 }, { token, outcome: "passed", reasons: [], count: 0, ...PASS });
+  const shown = await kit(["status"], box.root, box);
+  assert.deepEqual(shown, { code: 0, out: passedOutput(box.root), err: "" });
+  assert.equal(lines(shown.out).length, 17);
+});
+
+test("status on a passed result without a sheet or tiles (a 5.1 result) asks for a new check and exits 1", async (t) => {
+  const box = await project(t);
+  const token = "6c".repeat(16);
+  jobFiles(box.root, { token, pid: 4242, startedAt: 0 }, { token, outcome: "passed", reasons: [] });
+  assert.deepEqual(await kit(["status"], box.root, box), {
+    code: 1,
+    out: "kit status: check passed\nno contact sheet from this run; run node bin/kit.mjs check again\n",
+    err: "",
+  });
+});
+
+test("status on a failed result counts the reasons from count, not from the lines", async (t) => {
+  const box = await project(t);
+  const token = "5b".repeat(16);
+  const shown = [...Array.from({ length: 40 }, (_, i) => `reason ${i + 1}`), "… and 5 more"];
+  jobFiles(box.root, { token, pid: 4242, startedAt: 0 }, { token, outcome: "failed", reasons: shown, count: 45 });
+  assert.deepEqual(await kit(["status"], box.root, box), {
+    code: 1,
+    out: `kit status: check failed (45 reasons)\n${shown.map((reason) => `  ${reason}\n`).join("")}`,
     err: "",
   });
 });
