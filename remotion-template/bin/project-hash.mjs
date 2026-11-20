@@ -5,18 +5,20 @@
 // kit render compares before it starts. It covers the texts of script.json
 // and timeline.json that the check judged, every regular file under src/,
 // and the public/ files the check's assets stage reads. It depends on paths
-// and contents only, never on mtime or mode, and follows no symlink. Imports
+// and contents only, never on mtime or mode, and follows no symlink: every
+// file is opened with O_NOFOLLOW | O_NONBLOCK and judged by fstat. Imports
 // only node: built-ins and the kit's own Remotion-free modules, so render's
 // start path can load it.
 
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
+import { constants, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { explainerScenes } from "./explainer-scenes.mjs";
-import { lstatOrNull } from "./kit-io.mjs";
+import { lstatOrNull, notFound } from "./kit-io.mjs";
 
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const NON_REGULAR = "is not a regular file or directory; the check hashes regular files only";
 
 // script: validated; timeline: one that passed the check's stage 2. The
 // sorted, de-duplicated project-relative paths of each scene's image, each
@@ -33,25 +35,53 @@ export function referencedPublicFiles(script, timeline) {
   return [...paths].sort(byCodeUnit);
 }
 
-// Every regular file under dir (project-relative path rel), as [path,
-// sha256]; anything but a directory or a regular file is a reason. Every
-// entry is classified by lstat before it is read, so a FIFO is never opened.
-async function walk(root, rel, entries, reasons) {
-  for (const name of (await readdir(join(root, rel))).sort(byCodeUnit)) {
-    const path = `${rel}/${name}`;
-    const stat = await lstatOrNull(join(root, path));
-    // Removed between readdir and lstat: the second hash read sees the change.
-    if (stat === null) continue;
-    if (stat.isDirectory()) await walk(root, path, entries, reasons);
-    else if (stat.isFile()) entries.push([path, sha256(await readFile(join(root, path)))]);
-    else reasons.push(`${path}: is not a regular file or directory; the check hashes regular files only`);
+// Reads one file to hash: opened with O_NONBLOCK | O_NOFOLLOW, so neither a
+// FIFO nor a final symlink is followed or waited on, then judged by fstat
+// on the handle. Resolves to {kind: "file", bytes}, {kind: "other"} (a
+// symlink, FIFO, directory or device), or {kind: "vanished"} when the path
+// is gone. Any other system error propagates.
+export async function readHashed(path) {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  } catch (thrown) {
+    if (thrown?.code === "ELOOP") return { kind: "other" };
+    if (notFound(thrown)) return { kind: "vanished" };
+    throw thrown;
+  }
+  try {
+    if (!(await handle.stat()).isFile()) return { kind: "other" };
+    return { kind: "file", bytes: await handle.readFile() };
+  } finally {
+    await handle.close();
   }
 }
 
-// Resolves to {hash} or {reasons}. A referenced file that is absent or not
-// a regular file is a null entry: the assets stage reports it. A system
-// error from a read propagates.
-export async function projectHash(root, { script, timeline, scriptText, timelineText }) {
+// Every regular file under dir (project-relative path rel), as [path,
+// sha256]; anything but a directory or a regular file is a reason. A
+// directory is found by lstat; every other entry is read through read(),
+// so a FIFO is never waited on. An entry gone before it is read is skipped:
+// the second hash read sees the change.
+async function walk(root, rel, entries, reasons, read) {
+  for (const name of (await readdir(join(root, rel))).sort(byCodeUnit)) {
+    const path = `${rel}/${name}`;
+    const stat = await lstatOrNull(join(root, path));
+    if (stat === null) continue;
+    if (stat.isDirectory()) {
+      await walk(root, path, entries, reasons, read);
+      continue;
+    }
+    const file = await read(join(root, path));
+    if (file.kind === "file") entries.push([path, sha256(file.bytes)]);
+    else if (file.kind === "other") reasons.push(`${path}: ${NON_REGULAR}`);
+  }
+}
+
+// Resolves to {hash} or {reasons}. A referenced file that is absent, gone
+// before it is read, or not a regular file is a null entry: the assets
+// stage reports it. A system error from a read propagates. read replaces
+// readHashed (tests interleave a removal).
+export async function projectHash(root, { script, timeline, scriptText, timelineText, read = readHashed }) {
   const src = await lstatOrNull(join(root, "src"));
   if (src === null) return { reasons: ["src: is missing"] };
   if (src.isSymbolicLink()) return { reasons: ["src: is a symlink"] };
@@ -61,11 +91,11 @@ export async function projectHash(root, { script, timeline, scriptText, timeline
     ["timeline.json", sha256(timelineText)],
   ];
   const reasons = [];
-  await walk(root, "src", entries, reasons);
+  await walk(root, "src", entries, reasons, read);
   if (reasons.length) return { reasons };
   for (const path of referencedPublicFiles(script, timeline)) {
-    const stat = await lstatOrNull(join(root, path));
-    entries.push([path, stat?.isFile() ? sha256(await readFile(join(root, path))) : null]);
+    const file = await read(join(root, path));
+    entries.push([path, file.kind === "file" ? sha256(file.bytes) : null]);
   }
   entries.sort((a, b) => byCodeUnit(a[0], b[0]));
   return { hash: sha256(JSON.stringify(entries)) };

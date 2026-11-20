@@ -77,12 +77,14 @@ before(() => {
   for (const [name, { frames, audio, args }] of Object.entries(VARIANTS)) {
     const sine = audio === null ? [] : ["-f", "lavfi", "-i", `sine=frequency=440:sample_rate=48000:duration=${audio}`];
     const maps = audio === null ? ["-map", "0:v"] : ["-map", "0:v", "-map", "1:a", "-c:a", "aac"];
+    // testsrc emits the frames whose time is below its duration: exactly
+    // `frames` of them. Each input ends on its own, so neither stream is cut
+    // to the other's length.
     execFileSync("ffmpeg", [
       "-nostdin", "-v", "error",
-      "-f", "lavfi", "-i", "testsrc=size=64x36:rate=30",
+      "-f", "lavfi", "-i", `testsrc=size=64x36:rate=30:duration=${(frames - 0.5) / 30}`,
       ...sine,
       ...maps,
-      "-frames:v", String(frames),
       ...args,
       "-y", video(name),
     ]);
@@ -108,8 +110,10 @@ async function fixtureProject(t, { name = "demo", worker = false } = {}) {
   if (worker) {
     execFileSync("cp", ["-R", join(TEMPLATE, "bin"), join(root, "bin")]);
     writeFileSync(join(root, "package.json"), readFileSync(join(TEMPLATE, "package.json")));
-    mkdirSync(join(root, "node_modules"));
-    symlinkSync(realpathSync(join(TEMPLATE, "node_modules", "zod")), join(root, "node_modules", "zod"));
+    // A project's node_modules is a link, as kit new makes it.
+    mkdirSync(join(base, "modules"));
+    symlinkSync(realpathSync(join(TEMPLATE, "node_modules", "zod")), join(base, "modules", "zod"));
+    symlinkSync(join(base, "modules"), join(root, "node_modules"));
   }
   const files = join(base, "files");
   mkdirSync(files);

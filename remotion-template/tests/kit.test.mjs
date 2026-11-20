@@ -135,9 +135,10 @@ test("no subcommand and an unknown subcommand are usage errors", async (t) => {
   assert.equal(none.code, 2);
   assert.equal(none.out, "");
   for (const line of lines(none.err)) assert.match(line, /^kit: /);
-  const unknown = await kit(["render"], box.template, box);
+  // 5.3: render is a subcommand now, so publish stands in as unknown.
+  const unknown = await kit(["publish"], box.template, box);
   assert.equal(unknown.code, 2);
-  assert.match(unknown.err, /^kit: unknown subcommand "render"\n/);
+  assert.match(unknown.err, /^kit: unknown subcommand "publish"\n/);
 });
 
 test("executed directly, kit.mjs sets the exit code and uses its own directory as root", async (t) => {

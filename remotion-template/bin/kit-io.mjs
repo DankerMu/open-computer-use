@@ -14,6 +14,10 @@ import { validateScript } from "./script-schema.mjs";
 
 const SHOWN_ERRORS = 20;
 
+// A project's name: kit new's argument, and the directory kit render
+// publishes under.
+export const PROJECT_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
+
 // A refused step: printed as `kit <subcommand>: <message>`, then any detail
 // lines as they are.
 export class Refusal extends Error {
