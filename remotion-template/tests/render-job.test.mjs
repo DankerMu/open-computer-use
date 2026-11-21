@@ -711,6 +711,27 @@ test("a library file changed by one byte after the check refuses at step 2, and 
   assert.equal(existsSync(MUSIC_WAV(w.p.root)), false);
 });
 
+test("the music step removes stale .music.wav.<12 hex>.partial files, never .music.wav.notes.partial or a matching symlink", async (t) => {
+  const musicDir = musicLibrary(t);
+  let listing = null;
+  const w = await worker(t, { music: "fixture-loop", musicDir, edit: (root) => (listing = readdirSync(join(root, "public"))) });
+  const pub = join(w.p.root, "public");
+  const stale = [`.music.wav.${"0123456789ab"}.partial`, `.music.wav.${"f".repeat(12)}.partial`];
+  for (const name of stale) writeFileSync(join(pub, name), "a stem left by a stopped render");
+  writeFileSync(join(pub, ".music.wav.notes.partial"), "notes");
+  writeFileSync(join(w.p.base, "linked.bin"), "kept");
+  const link = `.music.wav.${"a".repeat(12)}.partial`;
+  symlinkSync(join(w.p.base, "linked.bin"), join(pub, link));
+  assert.equal(await w.go(), 0);
+  assert.equal(w.calls.length, 1);
+  const leftovers = (names) => names.filter((name) => name.startsWith(".music.wav.")).sort();
+  assert.deepEqual(leftovers(listing), [".music.wav.notes.partial", link].sort());
+  assert.deepEqual(leftovers(readdirSync(pub)), [".music.wav.notes.partial", link].sort());
+  assert.equal(readFileSync(join(pub, ".music.wav.notes.partial"), "utf8"), "notes");
+  assert.equal(readlinkSync(join(pub, link)), join(w.p.base, "linked.bin"));
+  assert.equal(readFileSync(join(w.p.base, "linked.bin"), "utf8"), "kept");
+});
+
 test("a stem that ffmpeg cannot build is music: <message>", async (t) => {
   const musicDir = mkdtempSync(join(tmpdir(), "render-job-broken-"));
   t.after(() => rmSync(musicDir, { recursive: true, force: true }));
