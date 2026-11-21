@@ -14,8 +14,8 @@
 
 import { before, after, test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, closeSync, constants, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOP_SAMPLES, makeLibrary } from "./fixtures/music/library.mjs";
@@ -390,6 +390,10 @@ test("stem: totalFrames 5400 from the loop track has exactly 8,640,000 samples p
   const wav = readWav(output);
   assert.equal(wav.dataBytes, 8640000 * 4);
   assert.equal(wav.samples.length / 2, 8640000);
+  // The sample count holds by construction; the loop must also fill the
+  // stem up to the fade-out, [N - 3R, N - 2R).
+  const N = 8640000;
+  assert.ok(wav.samples.subarray(2 * (N - 3 * R), 2 * (N - 2 * R)).some((sample) => sample !== 0), "the loop plays to the fade-out");
   assert.deepEqual(readdirSync(dir), ["music.wav"]);
 });
 
@@ -414,4 +418,101 @@ test("stem: an ffmpeg failure throws ffmpeg exited with …, and leaves no file"
     (error) => /^ffmpeg exited with \d+: \S/.test(error.message) && !error.message.includes("\n"),
   );
   assert.deepEqual(readdirSync(dir), []);
+});
+
+// --- the decode's timeout and exit-time kill (issue #883) ---------------------------
+
+// A library whose only track's file is a FIFO with no writer, so ffmpeg
+// blocks opening it.
+function fifoLibrary(t) {
+  const entry = track("fixture-fifo", { file: "fifo.wav" });
+  const dir = library(t, manifestOf(entry));
+  const fifo = join(dir, "fifo.wav");
+  execFileSync("mkfifo", [fifo]);
+  return { dir, fifo, entry };
+}
+
+// The ffmpeg lines of `ps -eo args`, run as job.mjs's psField runs ps
+// (no COLUMNS, LC_ALL=C), whose first word is ffmpeg and that hold path.
+function ffmpegLines(path) {
+  const { COLUMNS: _, ...env } = process.env;
+  const out = execFileSync("ps", ["-eo", "args"], { encoding: "utf8", env: { ...env, LC_ALL: "C" }, maxBuffer: 64 * 1024 * 1024 });
+  return out.split("\n").filter((line) => line.trimStart().split(/\s+/)[0] === "ffmpeg" && line.includes(path));
+}
+
+// Polls the scan every 100 ms for up to ms until done(lines) holds;
+// resolves to the last lines seen.
+async function pollScan(path, ms, done) {
+  const until = Date.now() + ms;
+  for (;;) {
+    const lines = ffmpegLines(path);
+    if (done(lines) || Date.now() >= until) return lines;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+// Opens the FIFO for writing without blocking (ENXIO: no reader left) and
+// closes it, so an ffmpeg still blocked opening it reads EOF and exits.
+function releaseFifo(fifo) {
+  try {
+    closeSync(openSync(fifo, constants.O_WRONLY | constants.O_NONBLOCK));
+  } catch (thrown) {
+    if (thrown.code !== "ENXIO") throw thrown;
+  }
+}
+
+test("stem: a decode that does not finish within timeoutMs is killed and rejects with ffmpeg did not finish within 2 s", async (t) => {
+  const { buildStem } = await music();
+  const { dir, fifo, entry } = fifoLibrary(t);
+  const out = stemDir(t);
+  try {
+    const started = Date.now();
+    const bound = new Promise((resolve) => setTimeout(() => resolve("unsettled"), 10000).unref());
+    const settled = buildStem({ dir, track: entry, timeline: timelineOf(100, [[64000, 100000]]), output: join(out, "music.wav"), timeoutMs: 2000 }).then(
+      () => "resolved",
+      (error) => error,
+    );
+    const outcome = await Promise.race([settled, bound]);
+    const elapsed = Date.now() - started;
+    t.diagnostic(`rejected after ${elapsed} ms`);
+    assert.ok(outcome instanceof Error, `buildStem ${outcome} within 10 s`);
+    assert.equal(outcome.message, "ffmpeg did not finish within 2 s");
+    assert.ok(elapsed < 10000, `${elapsed} ms`);
+    const left = await pollScan(fifo, 5000, (lines) => lines.length === 0);
+    assert.deepEqual(left, [], "an ffmpeg child is left running");
+    assert.deepEqual(readdirSync(out), []);
+  } finally {
+    releaseFifo(fifo);
+  }
+});
+
+test("stem: a stop signal to the worker takes the decode's ffmpeg child with it", async (t) => {
+  const { dir, fifo, entry } = fifoLibrary(t);
+  const out = stemDir(t);
+  const bin = (name) => new URL(`../bin/${name}`, import.meta.url).href;
+  const program =
+    `import { handleStopSignals } from ${JSON.stringify(bin("job.mjs"))};\n` +
+    `import { buildStem } from ${JSON.stringify(bin("music.mjs"))};\n` +
+    "handleStopSignals();\n" +
+    `await buildStem(${JSON.stringify({ dir, track: entry, timeline: timelineOf(100, [[64000, 100000]]), output: join(out, "music.wav") })});\n`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", program], { stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal, at: Date.now() })));
+  try {
+    const seen = await pollScan(fifo, 10000, (lines) => lines.length > 0);
+    t.diagnostic(`positive control: the scan saw ${seen.length} ffmpeg line(s)`);
+    assert.ok(seen.length > 0, `the scan never saw the decode's ffmpeg; ${stderr}`);
+    const sent = Date.now();
+    process.kill(child.pid, "SIGTERM");
+    const { code, signal, at } = await exited;
+    t.diagnostic(`the node child exited ${code ?? signal} ${at - sent} ms after SIGTERM`);
+    assert.deepEqual({ code, signal }, { code: 143, signal: null }, stderr);
+    const left = await pollScan(fifo, 5000, (lines) => lines.length === 0);
+    t.diagnostic(`the scan was clear ${Date.now() - at} ms after the exit`);
+    assert.deepEqual(left, [], "the stopped worker left its ffmpeg child running");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    releaseFifo(fifo);
+  }
 });

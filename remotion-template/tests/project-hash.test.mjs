@@ -379,6 +379,13 @@ test("a missing library, an unknown id or a non-regular track file gives a null 
   );
 });
 
+test("a track file that cannot be read (mode 000) gives a null pair, not a throw", { skip: process.getuid?.() === 0 && "root reads a mode-000 file" }, async (t) => {
+  const p = musicProject(t, "fixture-bar");
+  const musicDir = musicLibrary(t);
+  chmodSync(join(musicDir, "bar.wav"), 0o000);
+  assert.deepEqual(await hashNow(p, { musicDir }), { hash: expectedHash(p.root, PLAIN_PATHS(p.stems), [], [["music:fixture-bar", null]]) });
+});
+
 test("the track is read without the injectable reader", async (t) => {
   const { readHashed } = await hashing();
   const p = musicProject(t, "fixture-bar");
