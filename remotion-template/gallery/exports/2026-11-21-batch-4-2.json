@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "page": "d14e6c99385a193c2828d2b7857d742d73ef7821107e691ebbeaf1520c2d96a5",
+  "reviewer": "Danker",
+  "date": "2026-11-21",
+  "decisions": [
+    {
+      "id": "hook",
+      "decision": "approve"
+    },
+    {
+      "id": "question",
+      "decision": "approve"
+    },
+    {
+      "id": "concept-card",
+      "decision": "approve"
+    },
+    {
+      "id": "definition-quote",
+      "decision": "approve"
+    },
+    {
+      "id": "summary",
+      "decision": "approve"
+    },
+    {
+      "id": "end-card",
+      "decision": "approve"
+    }
+  ],
+  "theme": "light"
+}

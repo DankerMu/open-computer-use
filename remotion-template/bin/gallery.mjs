@@ -134,10 +134,10 @@ async function probeItems({ THEME_NAMES }, themes, items, publicDir) {
 
 async function build(kit, candidates, out, work) {
   const items = itemsOf(kit.rules, candidates);
-  // public/ when the project has one, else a fresh empty directory.
+  // public/ when the project has one, else the tracked gallery/public, so the
+  // catalog's samples can name an image.
   const projectPublic = join(ROOT, "public");
-  const publicDir = (await lstatOrNull(projectPublic)) === null ? join(work, "public") : projectPublic;
-  if (publicDir !== projectPublic) await mkdir(publicDir);
+  const publicDir = (await lstatOrNull(projectPublic)) === null ? join(ROOT, "gallery", "public") : projectPublic;
   await mkdir(join(out, "clips"));
   await mkdir(join(out, "frames"));
   const serveUrl = await bundle({
