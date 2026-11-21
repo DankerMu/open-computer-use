@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import stat
@@ -25,6 +26,11 @@ from tests.orchestrator._http_origin import HttpOriginLifetime, OriginRequestHan
 WRAPPER = ROOT / "deploy" / "production-like-test" / "init" / "run-init.sh"
 SOURCE = ROOT / "openwebui"
 SENTINEL = "sentinel-admin-password-9f3c"
+MCP_KEY = "synthetic-mcp"
+FAKE_TOKEN = "admin-token"
+# The only requests init.sh sends before it has the admin token (#855).
+UNAUTHENTICATED_CALLS = {"GET /api/version", "POST /api/v1/auths/signin", "POST /api/v1/auths/signup"}
+TOOL_LOOKUP = "GET /api/v1/tools/id/ai_computer_use"
 PRIMARY_MODEL = "qwen3.8-27b"
 MARKER_NAME = ".computer-use-initialized"
 DEFAULT_MODELS_LINE = "cfg.setdefault('DEFAULT_MODELS', cfg.get('DEFAULT_MODELS') or '')"
@@ -125,6 +131,45 @@ def leftover_init(root: Path) -> list[Path]:
     ]
 
 
+def leftover_auth(root: Path) -> list[Path]:
+    return [
+        path
+        for path in root.glob("ocu-init-auth.*")
+        if path.is_dir() and path.name.startswith("ocu-init-auth.")
+    ]
+
+
+def install_curl_shim(root: Path) -> Path:
+    """Put a curl first on PATH that logs every argv, NUL-separated, then runs the real one."""
+    real_curl = shutil.which("curl")
+    if real_curl is None:
+        raise RuntimeError("curl is required for the init wrapper tests")
+    shim_dir = root / "curl-shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "curl"
+    shim.write_text(
+        "#!/bin/bash\n"
+        "printf '%s\\0' \"$#\" \"$@\" >> \"$OCU_TEST_CURL_LOG\"\n"
+        f"exec {shlex.quote(real_curl)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim_dir
+
+
+def curl_argv_records(log: Path) -> list[list[str]]:
+    """Parse the shim log: per call the argument count, then each argument."""
+    fields = log.read_bytes().decode("utf-8").split("\0") if log.exists() else [""]
+    if fields.pop() != "":
+        raise AssertionError("curl argv log does not end in a NUL")
+    records = []
+    while fields:
+        count = int(fields.pop(0))
+        records.append(fields[:count])
+        del fields[:count]
+    return records
+
+
 def leftover_model_files(root: Path) -> list[Path]:
     return [
         path
@@ -137,6 +182,7 @@ class FakeWebUI:
     def __init__(self):
         self.mode = "unavailable"
         self.calls: list[str] = []
+        self.call_authorization: list[tuple[str, str | None]] = []
         self.bodies: dict[str, object] = {}
         self.unexpected: list[str] = []
         self.hold_path = ""
@@ -180,6 +226,7 @@ class FakeWebUI:
                 key = f"{method} {self.path}"
                 with owner.lock:
                     owner.calls.append(key)
+                    owner.call_authorization.append((key, self.headers.get("Authorization")))
                     if payload is not None:
                         owner.bodies[key] = payload
 
@@ -263,10 +310,15 @@ class FakeWebUI:
                     self.send_error(404)
                     return
                 if path in {"/api/v1/auths/signin", "/api/v1/auths/signup"}:
+                    if owner.mode == "signup-success":
+                        if path.endswith("signup"):
+                            return self._json(200, {"token": FAKE_TOKEN})
+                        self.send_error(401)
+                        return
                     if owner.mode == "auth-failure":
                         return self._json(401, {"detail": "invalid"})
                     if owner.mode != "unavailable" and path.endswith("signin"):
-                        return self._json(200, {"token": "admin-token"})
+                        return self._json(200, {"token": FAKE_TOKEN})
                     self.send_error(401)
                     return
                 if owner.mode == "unavailable":
@@ -367,7 +419,8 @@ class InitWrapperTests(unittest.TestCase):
         self.webui = FakeWebUI()
         self.addCleanup(self.webui.stop)
         self.webui.start()
-
+        self.curl_shim = install_curl_shim(self.root)
+        self.curl_log = self.root / "curl-argv.log"
 
     def wrapper_env(self, extra_env=None):
         env = os.environ.copy()
@@ -386,6 +439,8 @@ class InitWrapperTests(unittest.TestCase):
             "OCU_INIT_READY_SLEEP": "0",
             # Set by the production-like overlay, which mounts the prompt file.
             "OCU_ORG_PROMPT_FILTER": "install",
+            "PATH": f"{self.curl_shim}{os.pathsep}{env.get('PATH', os.defpath)}",
+            "OCU_TEST_CURL_LOG": str(self.curl_log),
         })
         for name, value in (extra_env or {}).items():
             if value is None:
@@ -526,6 +581,7 @@ class InitWrapperTests(unittest.TestCase):
         self.assertIn("POST /api/v1/auths/signin", self.webui.calls)
         self.assertIn("POST /api/v1/auths/signup", self.webui.calls)
         self.assertFalse(any("tools" in call or "functions" in call or "configs" in call for call in self.webui.calls))
+        self.assertEqual(leftover_auth(self.root), [])
 
     def test_required_config_post_failure_preserves_existing_and_retries(self):
         self.webui.mode = "config-post-failure"
@@ -539,12 +595,14 @@ class InitWrapperTests(unittest.TestCase):
         self.assertIn("POST /api/v1/configs/models", self.webui.calls)
         self.assertTrue(self.webui.tools)
         self.assertTrue(self.webui.functions)
+        self.assertEqual(leftover_auth(self.root), [])
         self.webui.mode = "success"
         succeeded = self.run_wrapper()
         self.assertEqual(succeeded.returncode, 0, self.combined(succeeded))
         self.assertTrue((self.data / MARKER_NAME).is_file())
         self.assert_no_secret(succeeded)
         self.assert_required_setup()
+        self.assertEqual(leftover_auth(self.root), [])
         skipped = self.run_wrapper()
         self.assertEqual(skipped.returncode, 0, self.combined(skipped))
         self.assertIn("Already initialized", skipped.stdout)
@@ -843,6 +901,7 @@ class InitWrapperTests(unittest.TestCase):
             text=True,
             env=env,
             start_new_session=True,
+            umask=0o022,
         )
         children: set[int] = set()
         try:
@@ -853,6 +912,7 @@ class InitWrapperTests(unittest.TestCase):
             self.assertEqual(leftover_model_files(self.root), [])
             children = descendant_pids(process.pid)
             self.assertTrue(children, "held initializer child was not recorded")
+            self.assert_auth_dir_while_held(hold_request)
             process.send_signal(sig)
             self.assertTrue(
                 wait_for(lambda: process.poll() is not None, timeout=8),
@@ -865,6 +925,7 @@ class InitWrapperTests(unittest.TestCase):
             self.assertFalse((self.data / MARKER_NAME).exists())
             self.assertEqual(leftover_init(self.root), [])
             self.assertEqual(leftover_model_files(self.root), [])
+            self.assertEqual(leftover_auth(self.root), [])
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGKILL)
@@ -877,6 +938,19 @@ class InitWrapperTests(unittest.TestCase):
             process.communicate(timeout=10)
         self.assertNotEqual(process.returncode, 0)
 
+    def assert_auth_dir_while_held(self, hold_request):
+        auth_dirs = leftover_auth(self.root)
+        if not hold_request:
+            # Held at GET /api/version, before signin: no token, no directory.
+            self.assertEqual(auth_dirs, [])
+            return
+        self.assertEqual(len(auth_dirs), 1, auth_dirs)
+        self.assertEqual(stat.S_IMODE(auth_dirs[0].stat().st_mode), 0o700)
+        self.assertEqual([entry.name for entry in auth_dirs[0].iterdir()], ["auth"])
+        auth_file = auth_dirs[0] / "auth"
+        self.assertEqual(stat.S_IMODE(auth_file.stat().st_mode), 0o600)
+        self.assertEqual(auth_file.read_text(encoding="utf-8"), f"Authorization: Bearer {FAKE_TOKEN}\n")
+
     def test_term_during_held_http_removes_owned_tmp_and_children(self):
         self._signal_during_held_http(signal.SIGTERM)
 
@@ -887,6 +961,107 @@ class InitWrapperTests(unittest.TestCase):
         self._signal_during_held_http(
             signal.SIGTERM,
             hold_request="GET /api/models",
+        )
+
+    def test_term_during_held_tool_lookup_removes_the_auth_dir(self):
+        self._signal_during_held_http(signal.SIGTERM, hold_request=TOOL_LOOKUP)
+
+    def test_hup_during_held_tool_lookup_removes_the_auth_dir(self):
+        self._signal_during_held_http(signal.SIGHUP, hold_request=TOOL_LOOKUP)
+
+    def test_int_during_held_tool_lookup_removes_the_auth_dir(self):
+        self._signal_during_held_http(signal.SIGINT, hold_request=TOOL_LOOKUP)
+
+    def test_direct_run_signals_exit_with_the_signal_status_and_remove_the_auth_dir(self):
+        hold = self.root / "http-hold"
+        self.webui.mode = "success"
+        self.webui.hold_path = str(hold)
+        self.webui.hold_request = TOOL_LOOKUP
+        for sig, expected in ((signal.SIGTERM, 143), (signal.SIGINT, 130), (signal.SIGHUP, 129)):
+            with self.subTest(signal=sig.name):
+                self.webui.entered.clear()
+                hold.write_text("1", encoding="utf-8")
+                process = subprocess.Popen(
+                    ["bash", str(self.source / "init.sh")],
+                    cwd=str(self.root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=self.wrapper_env(),
+                    start_new_session=True,
+                )
+                try:
+                    self.assertTrue(self.webui.entered.wait(5), "init.sh never reached the held tool lookup")
+                    os.killpg(process.pid, sig)
+                    self.assertTrue(
+                        wait_for(lambda: process.poll() is not None, timeout=8),
+                        "init.sh did not exit after signal",
+                    )
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    hold.unlink(missing_ok=True)
+                    stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, expected, stdout + stderr)
+                self.assertEqual(leftover_auth(self.root), [])
+                self.assertFalse((self.data / MARKER_NAME).exists())
+        self.webui.hold_path = ""
+        self.webui.hold_request = ""
+
+    def assert_first_boot_keeps_secrets_out_of_argv(self, mode):
+        self.webui.mode = mode
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, self.combined(result))
+        self.assertTrue((self.data / MARKER_NAME).is_file())
+        self.assert_no_secret(result)
+        self.assert_required_setup()
+        self.assertEqual(
+            self.webui.bodies["POST /api/v1/auths/signin"],
+            {"email": "admin@example.test", "password": SENTINEL},
+        )
+        if mode == "signup-success":
+            self.assertEqual(
+                self.webui.bodies["POST /api/v1/auths/signup"],
+                {"email": "admin@example.test", "password": SENTINEL, "name": "Test Admin"},
+            )
+        else:
+            self.assertNotIn("POST /api/v1/auths/signup", self.webui.calls)
+        self.assertEqual(
+            self.webui.call_authorization,
+            [
+                (call, None if call in UNAUTHENTICATED_CALLS else f"Bearer {FAKE_TOKEN}")
+                for call in self.webui.calls
+            ],
+        )
+        self.assertEqual(leftover_auth(self.root), [])
+        records = curl_argv_records(self.curl_log)
+        self.assertEqual(len(records), len(self.webui.calls))
+        self.assertTrue(any(arg.endswith("/api/models") for record in records for arg in record))
+        leaked = [
+            secret
+            for secret in (SENTINEL, MCP_KEY, FAKE_TOKEN)
+            if any(secret in arg for record in records for arg in record)
+        ]
+        self.assertEqual(leaked, [], "secrets found in curl argv")
+        self.assertTrue(
+            any(arg.startswith("@") and arg.endswith("/auth") for record in records for arg in record),
+            "no curl call read its header from the auth file",
+        )
+
+    def test_signup_path_keeps_secrets_out_of_curl_argv(self):
+        self.assert_first_boot_keeps_secrets_out_of_argv("signup-success")
+
+    def test_signin_path_keeps_secrets_out_of_curl_argv(self):
+        self.assert_first_boot_keeps_secrets_out_of_argv("success")
+
+    def test_signup_body_carries_json_metacharacters_exactly(self):
+        password = 'pa"ss\\word-9f3c'
+        self.webui.mode = "signup-success"
+        result = self.run_wrapper({"ADMIN_PASSWORD": password})
+        self.assertEqual(result.returncode, 0, self.combined(result))
+        self.assertEqual(
+            self.webui.bodies["POST /api/v1/auths/signup"],
+            {"email": "admin@example.test", "password": password, "name": "Test Admin"},
         )
 
 
