@@ -6,11 +6,13 @@
 // the gallery renders every sample in both theme candidates. Imports only
 // .mjs and .ts files, so Node and the bundle both import it.
 //
-// Batch 4.2: one candidate per kind, its id the kind and its source the
-// scene file. Its minimum length and entrance are read from
+// Batches 4.2 and 4.3 (process steps, cause and effect, comparison and
+// timeline, appended after 4.2's six): one candidate per kind, its id the
+// kind and its source the scene file. Its minimum length and entrance are read from
 // bin/scene-timing.mjs, their one home. Each candidate has three samples:
 //   - max: every content field at its LIMITS.content length, in Han text
-//     ending in a full-width closing mark, every list at its maximum, over a
+//     ending in a full-width closing mark, every list at its maximum (the
+//     fields of the objects in batch 4.3's lists and sides included), over a
 //     150-frame timing whose narration (one sentence, blocks [0, 60) and
 //     [62, 130)) ends at 130;
 //   - image: max with the image sample.png;
@@ -126,5 +128,55 @@ export const candidates: Candidate[] = [
 		'EndCard',
 		{title: '感谢观看我们下期再一起探索光学！', subtitle: '关注我们获取更多有趣的科学知识和精彩的实验视频。'},
 		{title: '再见'},
+	),
+	candidate(
+		'process-steps',
+		'ProcessSteps',
+		{
+			steps: [
+				{label: '光线照射到水面，', detail: '光从空气中斜着射向平静的水面上，'},
+				{label: '一部分光被反射，', detail: '按照反射定律这部分光返回到空气，'},
+				{label: '其余的光进入水，', detail: '另一部分光穿过界面进入到水中去，'},
+				{label: '光速变慢方向偏，', detail: '水中光速较慢使传播方向靠近法线，'},
+				{label: '人眼看到了虚像。', detail: '人眼沿折射光的反向延长线看到像。'},
+			],
+		},
+		{steps: [{label: '入射'}, {label: '折射'}]},
+	),
+	candidate(
+		'cause-effect',
+		'CauseEffect',
+		{cause: '光从空气斜射进入水中时速度变慢，', effect: '光的传播方向偏折使筷子看似折断。', link: '于是改变了方向，'},
+		{cause: '减速', effect: '偏折'},
+	),
+	candidate(
+		'comparison',
+		'Comparison',
+		{
+			left: {
+				title: '光在空气中传播，',
+				points: ['光速接近每秒三十万千米，', '介质稀疏对光的阻碍较小，', '光线沿着直线前进不偏折，', '折射率约等于一作为参照，'],
+			},
+			right: {
+				title: '光在水中传播时，',
+				points: ['光速约为空气的四分之三，', '介质致密对光的阻碍较大，', '斜射时光线向法线方向偏，', '折射率约为一点三三左右，'],
+			},
+		},
+		{left: {title: '空气', points: ['较快']}, right: {title: '水中', points: ['较慢']}},
+	),
+	candidate(
+		'timeline',
+		'Timeline',
+		{
+			events: [
+				{year: '公元前三世纪时，', label: '欧几里得研究光沿直线走，', detail: '他在光学一书中提出了光线的概念，'},
+				{year: '公元二世纪前后，', label: '托勒密测量入射与折射角，', detail: '他列表记录了光从空气射入水的角，'},
+				{year: '公元九八四年时，', label: '伊本萨赫勒写出折射规律，', detail: '他的论文用几何方法描述透镜聚光，'},
+				{year: '公元一六二一年，', label: '斯涅尔总结出了折射定律，', detail: '他发现入射角与折射角的正弦成比，'},
+				{year: '公元一六三七年，', label: '笛卡尔发表折射正弦定律，', detail: '他在屈光学中独立发表了这一定律，'},
+				{year: '公元一六六二年，', label: '费马提出了最短时间原理。', detail: '他用最短时间原理推导出折射定律。'},
+			],
+		},
+		{events: [{year: '古代', label: '观察'}, {year: '近代', label: '定律'}]},
 	),
 ];

@@ -21,4 +21,8 @@ export const registry: Registry = {
 	'definition-quote': components['definition-quote'],
 	'summary': components['summary'],
 	'end-card': components['end-card'],
+	'process-steps': components['process-steps'],
+	'cause-effect': components['cause-effect'],
+	'comparison': components['comparison'],
+	'timeline': components['timeline'],
 };
