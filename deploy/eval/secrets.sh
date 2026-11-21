@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
 # Generate the ocu-eval stack secrets into ${EVAL_ROOT}/stack.env (mode 0600).
-# Values use [A-Za-z0-9] only: POSTGRES_PASSWORD is embedded in DATABASE_URL and
-# ADMIN_PASSWORD in shell-built JSON in openwebui/init.sh. An existing value is
-# never changed, so MCP_API_KEY stays stable across restarts: on an existing
-# stack.env, init only appends the names it lacks (such as ADAPTER_TOKEN, added
-# after the first six), and with none missing it changes nothing. No value is
-# printed.
+# Values use [A-Za-z0-9] only: POSTGRES_PASSWORD is embedded in DATABASE_URL
+# without URL encoding. An existing value is never changed, so MCP_API_KEY
+# stays stable across restarts: on an existing stack.env, init only appends
+# the names it lacks (such as ADAPTER_TOKEN, added after the first six), and
+# with none missing it changes nothing. No value is printed.
 set -euo pipefail
 umask 077
 
