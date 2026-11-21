@@ -24,8 +24,8 @@ const KIND = 'timeline';
 const YEAR = 10;
 const LABEL = 14;
 
-type Event = {year: string; label: string; detail?: string};
-type Content = {events: Event[]};
+type Moment = {year: string; label: string; detail?: string};
+type Content = {events: Moment[]};
 type Look = {year: Size; label: Size; gap: number};
 
 // Event i's axis piece draws on, then its marker lands, then its text.
@@ -47,7 +47,7 @@ const Piece = ({on, beat, theme}: {on: boolean; beat: number; theme: Theme}) =>
 		<div style={{flex: 1}} />
 	);
 
-const Row = ({event, i, count, look, theme}: {event: Event; i: number; count: number; look: Look; theme: Theme}) => {
+const Row = ({event, i, count, look, theme}: {event: Moment; i: number; count: number; look: Look; theme: Theme}) => {
 	const {brand, spacing} = theme;
 	const {sizes} = theme.type;
 	const marker = spacing[2];
@@ -55,6 +55,7 @@ const Row = ({event, i, count, look, theme}: {event: Event; i: number; count: nu
 	const gap = spacing[2];
 	const last = i === count - 1;
 	const year = YEAR * sizes[look.year];
+	const label = LABEL * sizes[look.label];
 	const markerColumn: React.CSSProperties = {width: marker, flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center'};
 	return (
 		<div style={{display: 'flex', flexDirection: 'column'}}>
@@ -77,8 +78,8 @@ const Row = ({event, i, count, look, theme}: {event: Event; i: number; count: nu
 					<Piece on={!last} beat={beatOf(i) + 1 / 5} theme={theme} />
 				</div>
 				<Enter kind={KIND} beat={beatOf(i) + 2 / 5} theme={theme} style={{display: 'flex', alignItems: 'center', gap}}>
-					<Lines text={event.year} maxWidth={YEAR - 2} size={look.year} weight="bold" color={brand.accent} theme={theme} />
-					<Lines text={event.label} maxWidth={LABEL - 2} size={look.label} weight="bold" color={brand.text} theme={theme} />
+					<Lines text={event.year} maxWidth={fit(year, look.year, theme)} size={look.year} weight="bold" color={brand.accent} theme={theme} />
+					<Lines text={event.label} maxWidth={fit(label, look.label, theme)} size={look.label} weight="bold" color={brand.text} theme={theme} />
 				</Enter>
 			</div>
 			{last && event.detail === undefined ? null : (
@@ -91,7 +92,7 @@ const Row = ({event, i, count, look, theme}: {event: Event; i: number; count: nu
 							<Enter kind={KIND} beat={beatOf(i) + 2 / 5} theme={theme}>
 								<Lines
 									text={event.detail}
-									maxWidth={fit(year + gap + LABEL * sizes[look.label], 'caption', theme)}
+									maxWidth={fit(year + gap + label, 'caption', theme)}
 									size="caption"
 									color={brand.dim}
 									theme={theme}

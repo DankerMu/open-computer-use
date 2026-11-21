@@ -27,7 +27,7 @@ type Content = {steps: Step[]};
 // Step i lands half a beat after step i − 1; its arrow and text follow.
 const beatOf = (i: number) => i / 2;
 
-const Node = ({n, size, theme}: {n: number; size: number; theme: Theme}) => (
+const Badge = ({n, size, theme}: {n: number; size: number; theme: Theme}) => (
 	<Pop
 		kind={KIND}
 		beat={beatOf(n - 1)}
@@ -57,7 +57,7 @@ const Across = ({steps, theme}: {steps: Step[]; theme: Theme}) => {
 		<div style={{display: 'flex', alignItems: 'flex-start'}}>
 			{steps.map((step, i) => (
 				<div key={i} style={{position: 'relative', width, display: 'flex', flexDirection: 'column', alignItems: 'center'}}>
-					<Node n={i + 1} size={node} theme={theme} />
+					<Badge n={i + 1} size={node} theme={theme} />
 					{i === steps.length - 1 ? null : (
 						<div
 							style={{
@@ -120,7 +120,7 @@ const Down = ({steps, width, theme}: {steps: Step[]; width: number; theme: Theme
 				return (
 					<div key={i} style={{display: 'flex', flexDirection: 'column'}}>
 						<div style={{display: 'flex', alignItems: 'center', gap}}>
-							<Node n={i + 1} size={node} theme={theme} />
+							<Badge n={i + 1} size={node} theme={theme} />
 							<Enter kind={KIND} beat={beatOf(i) + 1 / 4} theme={theme}>
 								<Lines
 									text={step.label}
