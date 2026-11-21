@@ -178,6 +178,7 @@ const rgb = (path, crop = null) =>
   });
 
 const stills = once("settled stills", async () => {
+  assert.ok(SAMPLES.length > 0, "the catalog lists no candidate");
   const serveUrl = await bundle({ entryPoint: ENTRY(), outDir: join(root, "bundles", "settled"), enableCaching: false, publicDir: GALLERY_PUBLIC(), symlinkPublicDir: true });
   const out = join(root, "stills");
   mkdirSync(out);
@@ -231,6 +232,7 @@ test("gallery: the tracked catalog gives 38 clips, 114 key frames and no violati
 });
 
 test("gallery: each candidate's image sample shows sample.png's centre at the panel's centre, and its max sample does not", async () => {
+  assert.ok(candidates.length > 0, "the catalog lists no candidate");
   const { out } = await galleryRun();
   const expected = pixel(SAMPLE_IMAGE.path, SAMPLE_IMAGE.x, SAMPLE_IMAGE.y);
   const near = (actual) => actual.every((channel, i) => Math.abs(channel - expected[i]) <= CHANNEL_TOLERANCE);
