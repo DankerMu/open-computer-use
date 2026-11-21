@@ -2,7 +2,9 @@
 // Copyright (c) 2025 Open Computer Use Contributors
 //
 // gallery/approvals.json, version 1, and its loader (task 4.1): the tracked
-// file starts empty, a later entry replaces an earlier one, and every
+// file loads and names only catalog candidates and a kit theme, empty or
+// after the user's exports land (task 4.2); a later entry replaces an
+// earlier one, and every
 // refusal of the fixture gives its own message, one case each. Each case
 // builds a temporary tree with gallery/approvals.json and the exports it
 // links; digests are computed here with node:crypto over the bytes written.
@@ -10,11 +12,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadApprovals } from "../bin/gallery-approvals.mjs";
+import { candidates } from "../src/kit/gallery/catalog.ts";
+import { themes } from "../src/kit/theme.ts";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url));
 const APPROVALS = "gallery/approvals.json";
@@ -80,12 +84,12 @@ function refused(root, problem) {
 
 const one = (overrides) => (digests) => [entry(digests, typeof overrides === "function" ? overrides(digests) : overrides)];
 
-test("the tracked approvals file has no entries: no decisions and no theme", () => {
-  assert.equal(readFileSync(join(TEMPLATE, APPROVALS), "utf8"), '{\n  "version": 1,\n  "entries": []\n}\n');
+test("the tracked approvals file loads: every decision names a catalog candidate, the theme is null or a kit theme", () => {
   const loaded = loadApprovals(TEMPLATE);
   assert.ok(loaded.decisions instanceof Map);
-  assert.equal(loaded.decisions.size, 0);
-  assert.equal(loaded.theme, null);
+  const ids = new Set(candidates.map(({ id }) => id));
+  for (const id of loaded.decisions.keys()) assert.ok(ids.has(id), `${APPROVALS} decides ${JSON.stringify(id)}, which the catalog lacks`);
+  assert.ok(loaded.theme === null || Object.keys(themes).includes(loaded.theme), `${APPROVALS} picks theme ${JSON.stringify(loaded.theme)}`);
 });
 
 test("entries load as decisions and the theme; a later entry replaces an earlier one; redo is not approve", (t) => {
