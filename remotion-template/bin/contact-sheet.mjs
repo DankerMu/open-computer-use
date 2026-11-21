@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The contact sheet of kit check's stage 7: four key frames of the
+// The contact sheet of kit check's stage 8: four key frames of the
 // explainer tiled 2×2 into one 1920×1080 PNG, which the model views to
 // answer the checklist (bin/checklist.mjs). sheetTiles picks the frames;
 // contactSheet bundles the kit's entry, renders each frame as a still at

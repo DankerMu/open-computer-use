@@ -14,6 +14,7 @@
 import { spawn } from "node:child_process";
 import { lstat, open, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { tenthsText, wavHeader } from "./audio.mjs";
 import { Refusal, writeAtomic } from "./kit-io.mjs";
 import { MUSIC_ID, escapeLine } from "./script-schema.mjs";
 
@@ -78,9 +79,6 @@ export async function readLibrary(dir) {
   return { tracks: manifest.tracks };
 }
 
-// Tenths of a second as `<s>.<d>`.
-const tenths = (count) => `${Math.floor(count / 10)}.${count % 10}`;
-
 // Why the track's file cannot be read, or null. A symlink is not followed.
 async function fileProblem(path) {
   let stat;
@@ -118,8 +116,8 @@ export async function musicReasons(script, timeline, dir) {
   if (problem !== null) return [`music: the library file for "${id}" cannot be read: ${problem}`];
   if (!track.loop && track.duration_seconds < timeline.totalFrames / 30) {
     // The track's length floored, the video's ceiled, so neither reads as long enough.
-    const d = tenths(Math.floor(track.duration_seconds * 10 + 1e-9));
-    const v = tenths(Math.ceil(timeline.totalFrames / 3));
+    const d = tenthsText(Math.floor(track.duration_seconds * 10 + 1e-9));
+    const v = tenthsText(Math.ceil(timeline.totalFrames / 3));
     const loops = tracks.filter((entry) => entry.loop).map((entry) => entry.id);
     const way = loops.length
       ? `choose a loop track (${loops.join(", ")}) or a track at least ${v} s long`
@@ -181,30 +179,26 @@ export function musicGainDb(t, { spans, total }) {
 
 // --- the stem ----------------------------------------------------------------------
 
-// A 44-byte PCM WAV header: 48 kHz, 16-bit, stereo, `bytes` of samples.
-function wavHeader(bytes) {
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0, "latin1");
-  header.writeUInt32LE(36 + bytes, 4);
-  header.write("WAVEfmt ", 8, "latin1");
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(CHANNELS, 22);
-  header.writeUInt32LE(SAMPLE_RATE, 24);
-  header.writeUInt32LE(SAMPLE_RATE * BYTES_PER_FRAME, 28);
-  header.writeUInt16LE(BYTES_PER_FRAME, 32);
-  header.writeUInt16LE(16, 34);
-  header.write("data", 36, "latin1");
-  header.writeUInt32LE(bytes, 40);
-  return header;
-}
-
 // Decodes the track into `samples` (N stereo int16 frames, zeroed beyond
 // what ffmpeg gives), streaming stdout so the decoded audio is never held
-// twice. Rejects naming how ffmpeg failed.
-function decode(args, samples) {
+// twice. Rejects naming how ffmpeg failed, or, after killing it, that it
+// did not finish within timeoutMs. While the child is alive an exit
+// listener kills it, so the stop handler's process.exit takes it along.
+function decode(args, samples, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const kill = () => child.kill("SIGKILL");
+    process.on("exit", kill);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
+      reject(new Error(`ffmpeg did not finish within ${timeoutMs / 1000} s`));
+    }, timeoutMs);
+    const done = () => {
+      clearTimeout(timer);
+      process.removeListener("exit", kill);
+    };
     const room = samples.length;
     let filled = 0;
     let stderr = "";
@@ -216,8 +210,13 @@ function decode(args, samples) {
     child.stderr.on("data", (chunk) => {
       if (stderr.length < 4096) stderr += chunk.toString("utf8");
     });
-    child.once("error", reject);
+    child.once("error", (thrown) => {
+      done();
+      reject(thrown);
+    });
     child.once("close", (code, signal) => {
+      done();
+      if (timedOut) return;
       if (code === 0) return resolve();
       const first = stderr.split("\n").find((line) => line.trim() !== "");
       reject(new Error(escapeLine(`ffmpeg exited with ${signal ?? code}${first === undefined ? "" : `: ${first.trim()}`}`)));
@@ -227,17 +226,18 @@ function decode(args, samples) {
 
 // Writes the stem for `track` (a readLibrary entry in dir) over the
 // timeline to `output`, through a temporary .<name>.<hex>.partial beside
-// it and one rename.
-export async function buildStem({ dir, track, timeline, output }) {
+// it and one rename. A decode that runs past timeoutMs is killed.
+export async function buildStem({ dir, track, timeline, output, timeoutMs = 120000 }) {
   const windows = musicWindows(timeline);
   const total = windows.total;
   const stem = Buffer.alloc(44 + total * BYTES_PER_FRAME);
-  wavHeader(total * BYTES_PER_FRAME).copy(stem, 0);
+  wavHeader(total * BYTES_PER_FRAME, CHANNELS).copy(stem, 0);
   const samples = stem.subarray(44);
   const loop = track.loop ? ["-stream_loop", "-1"] : [];
   await decode(
     ["-nostdin", "-v", "error", ...loop, "-i", join(dir, track.file), "-af", `aresample=${SAMPLE_RATE},atrim=end_sample=${total}`, "-ac", String(CHANNELS), "-f", "s16le", "-"],
     samples,
+    timeoutMs,
   );
   for (let t = 0; t < total; t++) {
     const gain = 10 ** (musicGainDb(t, windows) / 20);

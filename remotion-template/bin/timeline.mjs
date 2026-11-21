@@ -12,6 +12,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { tenthsText, wavHeader } from "./audio.mjs";
 import { Refusal, lstatOrNull, readScript } from "./kit-io.mjs";
 import { FPS, LENGTH_WINDOW, SAMPLE_RATE, layout, loudnessOk } from "./scene-timing.mjs";
 import { escapeLine, playbackWhere } from "./script-schema.mjs";
@@ -112,9 +113,6 @@ async function readBlock(dir, names, stem) {
 
 // --- narration ----------------------------------------------------------------
 
-// tenths of a second, as `<s>.<d>`.
-const seconds = (tenths) => `${Math.floor(tenths / 10)}.${tenths % 10}`;
-
 // null inside the 60–180 s window, else the failure text: seconds rounded
 // up above the window and down below it, so neither bound reads as inside.
 export function lengthError(totalFrames) {
@@ -122,7 +120,7 @@ export function lengthError(totalFrames) {
   if (totalFrames > LENGTH_WINDOW.maxFrames) tenths = Math.ceil(totalFrames / 3);
   else if (totalFrames < LENGTH_WINDOW.minFrames) tenths = Math.floor(totalFrames / 3);
   else return null;
-  return `total ${seconds(tenths)} s (${totalFrames} frames) is outside 60–180 s`;
+  return `total ${tenthsText(tenths)} s (${totalFrames} frames) is outside 60–180 s`;
 }
 
 // Every block's trimmed PCM at its startSample in one silent buffer.
@@ -162,24 +160,6 @@ async function normalize(raw) {
   return applied.stdout;
 }
 
-// A 44-byte PCM WAV header (48 kHz, 16-bit, mono) before the samples.
-function wav(pcm) {
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0, "latin1");
-  header.writeUInt32LE(36 + pcm.length, 4);
-  header.write("WAVEfmt ", 8, "latin1");
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);
-  header.writeUInt32LE(SAMPLE_RATE, 24);
-  header.writeUInt32LE(SAMPLE_RATE * BYTES_PER_SAMPLE, 28);
-  header.writeUInt16LE(BYTES_PER_SAMPLE, 32);
-  header.writeUInt16LE(8 * BYTES_PER_SAMPLE, 34);
-  header.write("data", 36, "latin1");
-  header.writeUInt32LE(pcm.length, 40);
-  return Buffer.concat([header, pcm]);
-}
-
 // Integrated loudness and true peak from ebur128's Summary, to one decimal.
 async function measure(path) {
   const result = await ffmpeg(["-nostdin", "-hide_banner", "-nostats", "-i", path, "-af", "ebur128=peak=true", "-f", "null", "-"]);
@@ -195,7 +175,7 @@ async function measure(path) {
 // The closing stderr line after `kit timeline: `, seconds and LUFS to one
 // decimal.
 export function summaryLine(blocks, scenes, totalFrames, integratedLufs) {
-  return `${blocks} blocks, ${scenes} scenes, ${seconds(Math.round(totalFrames / 3))} s (${totalFrames} frames), ${integratedLufs.toFixed(1)} LUFS`;
+  return `${blocks} blocks, ${scenes} scenes, ${tenthsText(Math.round(totalFrames / 3))} s (${totalFrames} frames), ${integratedLufs.toFixed(1)} LUFS`;
 }
 
 // --- the command ----------------------------------------------------------------
@@ -245,7 +225,8 @@ export async function timeline(ctx) {
   if (pcm.length !== expected * BYTES_PER_SAMPLE) {
     throw new Refusal(`narration has ${pcm.length / BYTES_PER_SAMPLE} samples, expected ${expected}`);
   }
-  const track = wav(pcm);
+  // A 44-byte PCM WAV header (48 kHz, 16-bit, mono) before the samples.
+  const track = Buffer.concat([wavHeader(pcm.length, 1), pcm]);
   const publicPath = join(ctx.root, "public");
   const narrationTemp = partialPath(publicPath, NARRATION);
   const timelineTemp = partialPath(ctx.root, TIMELINE);

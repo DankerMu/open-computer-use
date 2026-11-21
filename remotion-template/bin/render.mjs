@@ -35,6 +35,8 @@ const STATUS_HINT = "run node bin/kit.mjs status";
 const NO_PASS = "no passing check; run node bin/kit.mjs check";
 const CHANGED_SINCE = "the project changed since the last passing check; run node bin/kit.mjs check, then render";
 const CHANGED_DURING = "the project changed while the render ran; run node bin/kit.mjs check, then render";
+// writeAtomic's temporary for public/music.wav.
+const STALE_STEM = /^\.music\.wav\.[0-9a-f]{12}\.partial$/;
 
 const messageOf = (thrown) => (thrown instanceof Error ? thrown.message : String(thrown));
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -156,6 +158,14 @@ async function verify(path, totalFrames) {
   return { reasons, frames };
 }
 
+// Removes every entry of dir whose name matches stale and that lstat shows
+// to be a regular file: a symlink, a directory or any other name is left.
+async function removeStale(dir, stale) {
+  for (const entry of await readdir(dir)) {
+    if (stale.test(entry) && (await lstatOrNull(join(dir, entry)))?.isFile()) await rm(join(dir, entry), { force: true });
+  }
+}
+
 // The step 7.3 copy: an exclusive copy, flushed to disk.
 async function copyPartial(source, partial) {
   await copyFile(source, partial, constants.COPYFILE_EXCL);
@@ -171,10 +181,7 @@ async function copyPartial(source, partial) {
 // target, false when a stop arrived before the rename. Before the rename
 // any error removes the partial and propagates.
 async function publish({ source, filesRoot, name, token, copy, stopRequested }) {
-  const stale = new RegExp(`^\\.${escapeRegExp(name)}\\.mp4\\.[0-9a-f]{32}\\.partial$`);
-  for (const entry of await readdir(filesRoot)) {
-    if (stale.test(entry) && (await lstatOrNull(join(filesRoot, entry)))?.isFile()) await rm(join(filesRoot, entry), { force: true });
-  }
+  await removeStale(filesRoot, new RegExp(`^\\.${escapeRegExp(name)}\\.mp4\\.[0-9a-f]{32}\\.partial$`));
   const target = join(filesRoot, `${name}.mp4`);
   const existing = await lstatOrNull(target);
   if (existing?.isSymbolicLink()) throw new Error(`${target} is a symlink; not replaced`);
@@ -199,7 +206,8 @@ async function publish({ source, filesRoot, name, token, copy, stopRequested }) 
 
 // The music step, for a project that names a track: the check's music
 // rules again, then the stem written as public/music.wav, never through a
-// symlink or over anything but a regular file. Resolves to the reasons.
+// symlink or over anything but a regular file, after removing the stale
+// stem partials a stopped or killed worker left. Resolves to the reasons.
 async function musicStep(root, project, musicDir, log) {
   log("render: music");
   const reasons = await musicReasons(project.script, project.timeline, musicDir);
@@ -209,6 +217,7 @@ async function musicStep(root, project, musicDir, log) {
   if (existing?.isSymbolicLink()) return ["music: public/music.wav is a symlink; not replaced"];
   if (existing !== null && !existing.isFile()) return ["music: public/music.wav is not a regular file; not replaced"];
   try {
+    await removeStale(join(root, "public"), STALE_STEM);
     const track = (await readLibrary(musicDir)).tracks.find((entry) => entry.id === project.script.music);
     await buildStem({ dir: musicDir, track, timeline: project.timeline, output });
   } catch (thrown) {
