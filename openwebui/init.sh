@@ -85,19 +85,41 @@ if [ "$ready" != "1" ]; then
     exit 1
 fi
 
+# Keep the admin password, MCP key and admin token out of every curl argv,
+# which any host account can read from /proc (#855): secret bodies go to curl on
+# stdin, and the Authorization header is read from a private file named by
+# AUTH (-H @file, curl 7.55 or later). The EXIT trap removes the directory on
+# success and failure; the signal traps exit through it.
+AUTH_DIR=""
+trap '[ -n "${AUTH_DIR:-}" ] && rm -rf "$AUTH_DIR"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+AUTH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ocu-init-auth.XXXXXX")
+
 # Check if any users exist
-USERS=$(curl -sf "$WEBUI_URL/api/v1/auths/signin" \
+USERS=$(ADMIN_EMAIL="$ADMIN_EMAIL" ADMIN_PASSWORD="$ADMIN_PASSWORD" python3 -c '
+import json, os, sys
+sys.stdout.write(json.dumps({"email": os.environ["ADMIN_EMAIL"], "password": os.environ["ADMIN_PASSWORD"]}))
+' | curl -sf "$WEBUI_URL/api/v1/auths/signin" \
     -H "Content-Type: application/json" \
-    -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}" 2>/dev/null || echo "")
+    --data-binary @- 2>/dev/null || echo "")
 
 if echo "$USERS" | python3 -c "import sys,json; json.load(sys.stdin)['token']" 2>/dev/null; then
     TOKEN=$(echo "$USERS" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
     echo "[init] Logged in as existing admin."
 else
     # Try to create first user (becomes admin automatically)
-    SIGNUP=$(curl -sf "$WEBUI_URL/api/v1/auths/signup" \
+    SIGNUP=$(ADMIN_EMAIL="$ADMIN_EMAIL" ADMIN_PASSWORD="$ADMIN_PASSWORD" ADMIN_NAME="$ADMIN_NAME" python3 -c '
+import json, os, sys
+sys.stdout.write(json.dumps({
+    "email": os.environ["ADMIN_EMAIL"],
+    "password": os.environ["ADMIN_PASSWORD"],
+    "name": os.environ["ADMIN_NAME"],
+}))
+' | curl -sf "$WEBUI_URL/api/v1/auths/signup" \
         -H "Content-Type: application/json" \
-        -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\",\"name\":\"$ADMIN_NAME\"}" 2>/dev/null || echo "")
+        --data-binary @- 2>/dev/null || echo "")
 
     if echo "$SIGNUP" | python3 -c "import sys,json; json.load(sys.stdin)['token']" 2>/dev/null; then
         TOKEN=$(echo "$SIGNUP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
@@ -108,7 +130,8 @@ else
     fi
 fi
 
-AUTH="Authorization: Bearer $TOKEN"
+(umask 077; printf 'Authorization: Bearer %s\n' "$TOKEN" > "$AUTH_DIR/auth")
+AUTH="@$AUTH_DIR/auth"
 
 # install_function ID NAME SOURCE DESCRIPTION: create the Open WebUI function,
 # or update it when it exists, from a shipped source file. A failed write stops
@@ -213,9 +236,16 @@ fi
 
 # Set tool valves
 echo "[init] Configuring tool valves..."
-curl -sf -X POST "$WEBUI_URL/api/v1/tools/id/ai_computer_use/valves/update" \
+ORCHESTRATOR_URL="$ORCHESTRATOR_URL" MCP_API_KEY="$MCP_API_KEY" python3 -c '
+import json, os, sys
+sys.stdout.write(json.dumps({
+    "ORCHESTRATOR_URL": os.environ["ORCHESTRATOR_URL"],
+    "MCP_API_KEY": os.environ["MCP_API_KEY"],
+    "DEBUG_LOGGING": False,
+}))
+' | curl -sf -X POST "$WEBUI_URL/api/v1/tools/id/ai_computer_use/valves/update" \
     -H "$AUTH" -H "Content-Type: application/json" \
-    -d "{\"ORCHESTRATOR_URL\": \"$ORCHESTRATOR_URL\", \"MCP_API_KEY\": \"$MCP_API_KEY\", \"DEBUG_LOGGING\": false}" >/dev/null
+    --data-binary @- >/dev/null
 echo "[init] Tool valves set: ORCHESTRATOR_URL=$ORCHESTRATOR_URL"
 
 # Make tool public-read so non-admin users can see & call it.
