@@ -4,8 +4,22 @@
 // The gallery's candidate components, keyed by catalog id (task 4.1). An
 // approved candidate enters src/kit/render/registry.ts by importing the
 // same component from here. The gallery refuses a key the catalog lacks,
-// and a catalog id without a key. Empty until tasks 4.2–4.4.
+// and a catalog id without a key. Batch 4.2 adds the six scenes of
+// src/kit/scenes/, in catalog order.
 
 import type React from 'react';
+import {ConceptCard} from '../scenes/ConceptCard.tsx';
+import {DefinitionQuote} from '../scenes/DefinitionQuote.tsx';
+import {EndCard} from '../scenes/EndCard.tsx';
+import {Hook} from '../scenes/Hook.tsx';
+import {Question} from '../scenes/Question.tsx';
+import {Summary} from '../scenes/Summary.tsx';
 
-export const components: Record<string, React.ComponentType<any>> = {};
+export const components: Record<string, React.ComponentType<any>> = {
+	hook: Hook,
+	question: Question,
+	'concept-card': ConceptCard,
+	'definition-quote': DefinitionQuote,
+	summary: Summary,
+	'end-card': EndCard,
+};
