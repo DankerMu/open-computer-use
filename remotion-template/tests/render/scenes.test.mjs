@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The six scene components of task 4.2 in a real headless shell. Runs only
+// The scene components of tasks 4.2 and 4.3 in a real headless shell. Runs only
 // inside the workspace image, from a project root whose node_modules link
 // reaches /opt/remotion-template/node_modules, one test file after another:
 //   node --test --test-concurrency=1 "tests/render/*.test.mjs"
@@ -17,8 +17,8 @@
 //     last frame;
 //   - gallery: gallery({out}) on the tracked catalog.
 // Expected values come from the fixture: the caption band's top (930), the
-// boxes of src/kit/scenes/boxes.ts, the samples' text fields, 38 clips and
-// 114 key frames, and the centre colour of gallery/public/images/sample.png
+// boxes of src/kit/scenes/boxes.ts, the samples' text fields, 62 clips and
+// 186 key frames, and the centre colour of gallery/public/images/sample.png
 // within ±6 per channel.
 
 import { after, before, test } from "node:test";
@@ -43,8 +43,8 @@ const BAND_TOP = captionBand(themes.light).top;
 // The probe's own box tolerances (task 3.7, amended): 0.5 px across, 1 px down.
 const TOLERANCE = { x: 0.5, y: 1 };
 const CHANNEL_TOLERANCE = 6;
-const CLIPS = 38;
-const KEY_FRAMES = 114;
+const CLIPS = 62;
+const KEY_FRAMES = 186;
 const SAMPLE_IMAGE = { path: join(TEMPLATE, "gallery", "public", "images", "sample.png"), x: 640, y: 480 };
 const PANEL_CENTRE = { x: IMAGE_BOX.panel.left + IMAGE_BOX.panel.width / 2, y: IMAGE_BOX.panel.top + IMAGE_BOX.panel.height / 2 };
 
@@ -109,8 +109,10 @@ const probed = once("probe", () => {
   return probe({ entryPoint: ENTRY(), targets, publicDir: GALLERY_PUBLIC() });
 });
 
-// The text fields of a sample's content: its strings and its lists' strings.
-const fieldValues = (content) => Object.values(content).flatMap((value) => (Array.isArray(value) ? value : [value]));
+// The text fields of a sample's content: every string under it, depth-first
+// through lists and objects (batch 4.3's steps, events and sides nest).
+const fieldValues = (value) =>
+  typeof value === "string" ? [value] : (Array.isArray(value) ? value : Object.values(value)).flatMap(fieldValues);
 
 const isInside = (path, ancestor) => path === ancestor || path.startsWith(`${ancestor}>`);
 
@@ -221,7 +223,7 @@ const galleryRun = once("gallery", async () => {
 
 const pixel = (path, x, y) => [...rgb(path, `1:1:${x}:${y}`)];
 
-test("gallery: the tracked catalog gives 38 clips, 114 key frames and no violation on any item", async () => {
+test("gallery: the tracked catalog gives 62 clips, 186 key frames and no violation on any item", async () => {
   const { out, items } = await galleryRun();
   assert.equal(items, CLIPS);
   assert.equal(readdirSync(join(out, "clips")).length, CLIPS);

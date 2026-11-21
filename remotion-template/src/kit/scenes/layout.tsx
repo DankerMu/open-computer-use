@@ -217,3 +217,104 @@ export const Picture = ({kind, beat, image, theme}: {kind: string; beat: number;
 			<ImagePanel image={image} theme={theme} />
 		</Enter>
 	);
+
+// Task 4.3's helpers, appended so that the text above, which batch 4.2's
+// approval covers, stays a byte-exact prefix.
+
+// A block that fades in and slides by the theme's second spacing step from
+// the side `from`, as Onda's split screen brings its panes in from their
+// outer edges.
+export const Slide = ({
+	kind,
+	beat,
+	theme,
+	from,
+	style,
+	children,
+}: {
+	kind: string;
+	beat: number;
+	theme: Theme;
+	from: 'left' | 'right' | 'top' | 'bottom';
+	style?: React.CSSProperties;
+	children?: React.ReactNode;
+}) => {
+	const progress = useEntrance(kind, beat, theme);
+	const shift = (1 - progress) * theme.spacing[1] * (from === 'left' || from === 'top' ? -1 : 1);
+	const transform = from === 'left' || from === 'right' ? `translateX(${shift}px)` : `translateY(${shift}px)`;
+	return <div style={{...style, opacity: progress, transform}}>{children}</div>;
+};
+
+// A block that fades in while it scales up from half its size about its
+// centre, as a marker lands.
+export const Pop = ({
+	kind,
+	beat,
+	theme,
+	style,
+	children,
+}: {
+	kind: string;
+	beat: number;
+	theme: Theme;
+	style?: React.CSSProperties;
+	children?: React.ReactNode;
+}) => {
+	const progress = useEntrance(kind, beat, theme);
+	return <div style={{...style, flexShrink: 0, opacity: progress, transform: `scale(${(1 + progress) / 2})`}}>{children}</div>;
+};
+
+// The breadth of an Arrow across its axis: the width of its head.
+export const arrowBreadth = (theme: Theme) => theme.spacing[1] * 1.5;
+
+// An arrow without text, pointing right or down: a bar and a head made from
+// borders, from plain blocks, so the probe judges it like any box. It fills
+// the main axis that `style` gives it (a width or height, or flex in its
+// parent) and draws in from its tail.
+export const Arrow = ({
+	kind,
+	beat,
+	theme,
+	direction,
+	color,
+	style,
+}: {
+	kind: string;
+	beat: number;
+	theme: Theme;
+	direction: 'right' | 'down';
+	color: string;
+	style?: React.CSSProperties;
+}) => {
+	const progress = useEntrance(kind, beat, theme);
+	const {spacing} = theme;
+	const bar = spacing[0] / 2;
+	const head = {long: spacing[2], half: arrowBreadth(theme) / 2};
+	const right = direction === 'right';
+	const edge = `${head.half}px solid transparent`;
+	const tip = `${head.long}px solid ${color}`;
+	return (
+		<div
+			style={{
+				...style,
+				display: 'flex',
+				flexDirection: right ? 'row' : 'column',
+				alignItems: 'center',
+				flexShrink: 0,
+				[right ? 'height' : 'width']: 2 * head.half,
+				opacity: progress,
+				transform: right ? `scaleX(${progress})` : `scaleY(${progress})`,
+				transformOrigin: right ? 'left' : 'top',
+			}}
+		>
+			<div style={{flex: 1, [right ? 'height' : 'width']: bar, borderRadius: bar / 2, backgroundColor: color}} />
+			<div
+				style={
+					right
+						? {width: 0, height: 0, flexShrink: 0, borderTop: edge, borderBottom: edge, borderLeft: tip}
+						: {width: 0, height: 0, flexShrink: 0, borderLeft: edge, borderRight: edge, borderTop: tip}
+				}
+			/>
+		</div>
+	);
+};
