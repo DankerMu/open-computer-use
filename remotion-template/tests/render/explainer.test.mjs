@@ -18,7 +18,7 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -294,7 +294,6 @@ test("a fresh project bundles with the tracked null index and rejects the Orbit 
 
 test("each bad input rejects through selectComposition with its message", () => {
   rejectsWith(outcomes.comet, `kit render: ${CUSTOM}: src/custom/index.ts is for "Orbit", not "Comet"`);
-  rejectsWith(outcomes.kitExplainer, 'kit render: hook: no component for kind "hook"');
   rejectsWith(
     outcomes.textDiffers,
     "kit render: hook, sentence 1 block 2: timeline.json text differs from script.json; run node bin/kit.mjs timeline",
@@ -302,6 +301,33 @@ test("each bad input rejects through selectComposition with its message", () => 
   rejectsWith(outcomes.nullProps, "kit render: input props need script and timeline objects");
   rejectsWith(outcomes.tooLong, "kit render: script: title is too long (limit 24 characters) (and 1 more)");
   rejectsWith(outcomes.blank, `kit render: ${CUSTOM}: src/custom/Blank.tsx does not default-export a component`);
+});
+
+// The kinds the tracked registry lists, read from its text: one
+// `'<kind>': components['<id>']` line each (task 4.2).
+const trackedKinds = () =>
+  new Set(
+    [...readFileSync(join(TEMPLATE, "src", "kit", "render", "registry.ts"), "utf8").matchAll(/^\s*'([a-z-]+)': components\['[a-z0-9-]+'\],?$/gm)].map(
+      (m) => m[1],
+    ),
+  );
+// The fixture script's non-custom scenes in playback order, each with its place.
+const PLAYBACK_KINDS = [
+  ["hook", "hook"],
+  ["question", "chapter 1 现象, scene 1 (question)"],
+  ["concept-card", "chapter 3 应用, scene 1 (concept-card)"],
+  ["summary", "summary"],
+  ["end-card", "end-card"],
+];
+
+test("the real kit entry's Explainer selects 481 frames when the script's kinds are registered, else names the first missing one", (t) => {
+  const missing = PLAYBACK_KINDS.find(([kind]) => !trackedKinds().has(kind));
+  t.diagnostic(missing === undefined ? "every kind of the script is registered" : `first unregistered kind: ${missing[0]}`);
+  if (missing === undefined) {
+    assert.equal(value(outcomes.kitExplainer, "kit Explainer").durationInFrames, TOTAL);
+  } else {
+    rejectsWith(outcomes.kitExplainer, `kit render: ${missing[1]}: no component for kind "${missing[0]}"`);
+  }
 });
 
 test("the real kit entry bundles and selects KitProbe with a custom target", () => {

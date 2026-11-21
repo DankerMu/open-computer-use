@@ -80,8 +80,7 @@ const withTiming = (change) => withSample((s) => change(s.timing));
 
 // --- validateCatalog ----------------------------------------------------------
 
-test("the tracked catalog is empty and passes", () => {
-  assert.deepEqual(candidates, []);
+test("the tracked catalog passes validateCatalog", () => {
   assert.equal(validateCatalog(candidates), undefined);
 });
 

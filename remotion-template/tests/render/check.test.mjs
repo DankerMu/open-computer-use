@@ -378,11 +378,36 @@ test("5.2 evidence 4: in one root, a pass, then the overflowing custom scene: th
   await ended(second.pid);
 });
 
-test("4: on the tracked registry the passing script fails with no component for the hook", { timeout: CHECK_LIMIT_MS }, async () => {
+// The kinds the tracked registry lists, read from its text: one
+// `'<kind>': components['<id>']` line each (task 4.2).
+const trackedKinds = () =>
+  new Set(
+    [...readFileSync(join(TEMPLATE, "src", "kit", "render", "registry.ts"), "utf8").matchAll(/^\s*'([a-z-]+)': components\['[a-z0-9-]+'\],?$/gm)].map(
+      (m) => m[1],
+    ),
+  );
+// The passing script's non-custom scenes in playback order, each with the
+// place kit check names.
+const PLAYBACK_KINDS = [
+  ["hook", "hook"],
+  ["question", QUESTION],
+  ["concept-card", CONCEPT],
+  ["summary", "summary"],
+  ["end-card", "end-card"],
+];
+
+test("4: on the tracked registry the passing script passes every stage, or fails naming its first unregistered kind", { timeout: CHECK_LIMIT_MS }, async (t) => {
   const root = variant("tracked", (dir) => copyFileSync(join(TEMPLATE, "src", "kit", "render", "registry.ts"), join(dir, "src", "kit", "render", "registry.ts")));
+  const missing = PLAYBACK_KINDS.find(([kind]) => !trackedKinds().has(kind));
+  t.diagnostic(missing === undefined ? "every kind of the script is registered" : `first unregistered kind: ${missing[0]}`);
   const { pid } = startCheck(root);
   const done = await settled(root);
-  assert.deepEqual([done.code, done.out], [1, 'kit status: check failed (1 reasons)\n  hook: no component for kind "hook"\n'], log(root));
+  if (missing === undefined) {
+    assert.deepEqual([done.code, done.out], [0, await passedOutput(root)], log(root));
+  } else {
+    const [kind, where] = missing;
+    assert.deepEqual([done.code, done.out], [1, `kit status: check failed (1 reasons)\n  ${where}: no component for kind "${kind}"\n`], log(root));
+  }
   await ended(pid);
 });
 
