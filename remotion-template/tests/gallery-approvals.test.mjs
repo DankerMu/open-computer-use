@@ -2,9 +2,9 @@
 // Copyright (c) 2025 Open Computer Use Contributors
 //
 // gallery/approvals.json, version 1, and its loader (task 4.1): the tracked
-// file loads and names only catalog candidates and a kit theme, empty or
-// after the user's exports land (task 4.2); a later entry replaces an
-// earlier one, and every
+// file loads, its decisions name script kinds, its approvals catalog
+// candidates and its theme a kit theme, empty or after the user's exports
+// land (task 4.2); a later entry replaces an earlier one, and every
 // refusal of the fixture gives its own message, one case each. Each case
 // builds a temporary tree with gallery/approvals.json and the exports it
 // links; digests are computed here with node:crypto over the bytes written.
@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadApprovals } from "../bin/gallery-approvals.mjs";
+import { LIMITS } from "../bin/script-schema.mjs";
 import { candidates } from "../src/kit/gallery/catalog.ts";
 import { themes } from "../src/kit/theme.ts";
 
@@ -84,11 +85,18 @@ function refused(root, problem) {
 
 const one = (overrides) => (digests) => [entry(digests, typeof overrides === "function" ? overrides(digests) : overrides)];
 
-test("the tracked approvals file loads: every decision names a catalog candidate, the theme is null or a kit theme", () => {
+// A redo or drop entry outlives its candidate, which step 7 of a batch
+// removes from the catalog; an approve names one that ships. Candidate ids
+// equal their kinds in batch 4.2.
+test("the tracked approvals file loads: every decision names a script kind, every approve names a catalog candidate, the theme is null or a kit theme", () => {
   const loaded = loadApprovals(TEMPLATE);
   assert.ok(loaded.decisions instanceof Map);
+  const kinds = new Set(Object.keys(LIMITS.content));
   const ids = new Set(candidates.map(({ id }) => id));
-  for (const id of loaded.decisions.keys()) assert.ok(ids.has(id), `${APPROVALS} decides ${JSON.stringify(id)}, which the catalog lacks`);
+  for (const [id, decision] of loaded.decisions) {
+    assert.ok(kinds.has(id), `${APPROVALS} decides ${JSON.stringify(id)}, which is not a script kind`);
+    if (decision === "approve") assert.ok(ids.has(id), `${APPROVALS} approves ${JSON.stringify(id)}, which the catalog lacks`);
+  }
   assert.ok(loaded.theme === null || Object.keys(themes).includes(loaded.theme), `${APPROVALS} picks theme ${JSON.stringify(loaded.theme)}`);
 });
 
