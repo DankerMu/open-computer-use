@@ -1,4 +1,53 @@
 {
   "version": 1,
-  "entries": []
+  "entries": [
+    {
+      "id": "hook",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-21",
+      "export": "gallery/exports/2026-11-21-batch-4-2.json",
+      "export_sha256": "737bd08e97058c14a086537ae8c4caac7abf436b166fbd81039b8d300aef8ea2"
+    },
+    {
+      "id": "question",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-21",
+      "export": "gallery/exports/2026-11-21-batch-4-2.json",
+      "export_sha256": "737bd08e97058c14a086537ae8c4caac7abf436b166fbd81039b8d300aef8ea2"
+    },
+    {
+      "id": "concept-card",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-21",
+      "export": "gallery/exports/2026-11-21-batch-4-2.json",
+      "export_sha256": "737bd08e97058c14a086537ae8c4caac7abf436b166fbd81039b8d300aef8ea2"
+    },
+    {
+      "id": "definition-quote",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-21",
+      "export": "gallery/exports/2026-11-21-batch-4-2.json",
+      "export_sha256": "737bd08e97058c14a086537ae8c4caac7abf436b166fbd81039b8d300aef8ea2"
+    },
+    {
+      "id": "summary",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-21",
+      "export": "gallery/exports/2026-11-21-batch-4-2.json",
+      "export_sha256": "737bd08e97058c14a086537ae8c4caac7abf436b166fbd81039b8d300aef8ea2"
+    },
+    {
+      "id": "end-card",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-21",
+      "export": "gallery/exports/2026-11-21-batch-4-2.json",
+      "export_sha256": "737bd08e97058c14a086537ae8c4caac7abf436b166fbd81039b8d300aef8ea2"
+    }
+  ]
 }
