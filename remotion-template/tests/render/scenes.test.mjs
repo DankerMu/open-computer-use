@@ -11,14 +11,14 @@
 // samples' image comes from the tracked gallery/public. Three independent
 // steps, each started by the first test that needs it, so one can run alone
 // through --test-name-pattern:
-//   - probe: one probe() over every catalog sample in both themes, through
-//     the gallery entry's KitProbe;
+//   - probe: one probe() over every catalog sample in the kit's one theme,
+//     light (task 4.6), through the gallery entry's KitProbe;
 //   - settled: in light, each sample stilled at its entrance end and on its
 //     last frame;
 //   - gallery: gallery({out}) on the tracked catalog.
 // Expected values come from the fixture: the caption band's top (930), the
 // boxes of src/kit/scenes/boxes.ts, the samples' text fields (a number as
-// formatCount of src/kit/text.ts gives it), 90 clips and 270 key frames, the
+// formatCount of src/kit/text.ts gives it), 45 clips and 135 key frames, the
 // centre colour of gallery/public/images/sample.png within ±6 per channel,
 // and, for image-callouts, the geometry of src/kit/scenes/callout-zoom.ts
 // with sample.png's natural 1280×960.
@@ -41,14 +41,14 @@ import { formatCount } from "../../src/kit/text.ts";
 import { themes } from "../../src/kit/theme.ts";
 
 const TEMPLATE = fileURLToPath(new URL("../..", import.meta.url));
-const THEMES = ["light", "dark"];
+const THEMES = ["light"];
 const ROLES = ["entrance-end", "midpoint", "pre-exit"];
 const BAND_TOP = captionBand(themes.light).top;
 // The probe's own box tolerances (task 3.7, amended): 0.5 px across, 1 px down.
 const TOLERANCE = { x: 0.5, y: 1 };
 const CHANNEL_TOLERANCE = 6;
-const CLIPS = 90;
-const KEY_FRAMES = 270;
+const CLIPS = 45;
+const KEY_FRAMES = 135;
 const SAMPLE_IMAGE = { path: join(TEMPLATE, "gallery", "public", "images", "sample.png"), x: 640, y: 480, width: 1280, height: 960 };
 // The image-callouts kind: its image panel zooms across the whole scene and
 // its markers track the zoom.
@@ -192,7 +192,7 @@ test("probe: at the entrance end the marked inputs are exactly the sample's text
   }
 });
 
-test("probe: the spec's number scenario at the entrance end, key-number wan, yi and min marking 1.2万, 1.2亿 and 9999 in both themes", async () => {
+test("probe: the spec's number scenario at the entrance end, key-number wan, yi and min marking 1.2万, 1.2亿 and 9999", async () => {
   const frames = (await probed()).frames.filter((frame) => frame.role === "entrance-end");
   for (const theme of THEMES) {
     for (const [sample, shown] of [["wan", "1.2万"], ["yi", "1.2亿"], ["min", "9999"]]) {
@@ -220,7 +220,7 @@ const zoomOf = (item) => calloutZoom({ width: SAMPLE_IMAGE.width, height: SAMPLE
 
 test("probe: in every image-callouts frame, marker i + 1 is unmarked, unscaled and unclipped text in the panel, centred within 2 px of F + s(f)·(P_i − F)", async () => {
   const frames = (await probed()).frames.filter((frame) => byId.get(frame.target).kind === CALLOUTS);
-  assert.equal(frames.length, ROLES.length * THEMES.length * candidates.find((c) => c.kind === CALLOUTS).samples.length);
+  assert.equal(frames.length, ROLES.length * candidates.find((c) => c.kind === CALLOUTS).samples.length);
   for (const frame of frames) {
     const item = byId.get(frame.target);
     const { focus, points, end } = zoomOf(item);
@@ -311,7 +311,7 @@ const galleryRun = once("gallery", async () => {
 
 const pixel = (path, x, y) => [...rgb(path, `1:1:${x}:${y}`)];
 
-test("gallery: the tracked catalog gives 90 clips, 270 key frames and no violation on any item", async () => {
+test("gallery: the tracked catalog gives 45 clips, 135 key frames and no violation on any item", async () => {
   const { out, items } = await galleryRun();
   assert.equal(items, CLIPS);
   assert.equal(readdirSync(join(out, "clips")).length, CLIPS);

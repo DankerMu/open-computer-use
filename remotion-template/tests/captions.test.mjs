@@ -95,7 +95,6 @@ test("every frame from 0 to 5400 round-trips exactly", () => {
 
 test("the caption band is the bottom 96 px of the safe area", () => {
   assert.deepEqual(captionBand(themes.light), { top: 930, bottom: 1026 });
-  assert.deepEqual(captionBand(themes.dark), { top: 930, bottom: 1026 });
 });
 
 test("@remotion/captions resolves to 4.0.537", () => {

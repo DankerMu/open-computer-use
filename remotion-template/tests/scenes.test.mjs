@@ -3,7 +3,7 @@
 //
 // The scene components of tasks 4.2–4.4: their catalog entries and
 // samples, the layout boxes, a source scan of src/kit/scenes/, and the
-// preservation of what the approvals of batches 4.2 and 4.3 cover. Pure: the catalog, the
+// preservation of what the approvals of batches 4.2–4.4 cover. Pure: the catalog, the
 // boxes, the theme and the timing tables are imported through Node's type
 // stripping; the scene files are read as text, because Node cannot import
 // TSX. Expected kinds, numbers, lengths, required fields and digests are the
@@ -108,7 +108,6 @@ const SAMPLE_IDS = {
   chart: ["max", "image", "min", "line-max", "line-image", "line-min"],
 };
 const sampleIds = (kind) => SAMPLE_IDS[kind] ?? ["max", "image", "min"];
-const MAX_TIMED = new Set(["max", "image", "line-max", "line-image"]);
 // The kind whose every sample carries the image, because the kind requires one.
 const IMAGE_KIND = "image-callouts";
 const SAMPLE_PNG = { width: 1280, height: 960 };
@@ -376,7 +375,7 @@ const bottom = (box) => box.top + box.height;
 test("TEXT_BOX, IMAGE_BOX.text and IMAGE_BOX.panel lie in the safe area and end at or above the caption band", () => {
   const band = captionBand(themes.light);
   assert.equal(band.top, 930);
-  for (const name of ["light", "dark"]) {
+  for (const name of Object.keys(themes)) {
     const { canvas, safeArea } = themes[name];
     for (const [label, box] of [["TEXT_BOX", TEXT_BOX], ["IMAGE_BOX.text", IMAGE_BOX.text], ["IMAGE_BOX.panel", IMAGE_BOX.panel]]) {
       assert.deepEqual(Object.keys(box).sort(), ["height", "left", "top", "width"], label);
@@ -413,8 +412,7 @@ const CHOREOGRAPHY = {
 };
 const ONLY_CHOREOGRAPHY = "Only the choreography comes from the source above, no code";
 // What batch 4.2's approval covers, at origin/main 911e89a: the sha256 of
-// its six scene files and boxes.ts, and the length in bytes and sha256 of
-// layout.tsx, which later batches may only append to.
+// its six scene files and boxes.ts.
 const PRESERVED = {
   "Hook.tsx": "e9981f69f8e373b2dc45934a6024c24c637048722987a1cd4660b72c95fb06d7",
   "Question.tsx": "f2f43887818a95683c3a4455c3ffc620c048d46fb1e67ce39b82a0b8f844ccec",
@@ -424,16 +422,27 @@ const PRESERVED = {
   "EndCard.tsx": "45b444ff45eeef00202f28985597bb5d60ab249b6b2baec06aab53abe66bfdc1",
 };
 const PRESERVED_BOXES = "6da0ba2af4be9a7c8af1f4428988211392bb65be4c994e332e44289def4270f4";
-const LAYOUT_PREFIX = { bytes: 7006, sha256: "edc72567409ef87ecb0e72981dfdd4cdefe6ba6a36e5df8ba6bbde22f5a38782" };
 // What batch 4.3's approval covers, at origin/main 49d562f: the sha256 of
-// its four scene files, and the length in bytes and sha256 of layout.tsx.
+// its four scene files.
 const PRESERVED_4_3 = {
   "ProcessSteps.tsx": "516b64a80c84355b0e16933821891ee121fc6ddb06783bcdf5ac681675e68a2c",
   "CauseEffect.tsx": "964091eae6b54f8688b8c7074b98613f320f5a4b8c7bddee41c06016d4c2835d",
   "Comparison.tsx": "681b6695fb01330574a71cda76949f1d90e7b5c991ca851289b1eabc51e7cf2c",
   "Timeline.tsx": "ced7b51c6e1b2a4c8e83656b4e8e779e32764e661521a60205683610a4cf9461",
 };
-const LAYOUT_PREFIX_4_3 = { bytes: 9968, sha256: "8025c13e2886e97aca621d83f651a080f3b6902daa779729bcf523e1b97e6e07" };
+// What batch 4.4's approval covers, at origin/main 5f702f2: the sha256 of
+// its three scene files and callout-zoom.ts.
+const PRESERVED_4_4 = {
+  "KeyNumber.tsx": "5dddc6bb4bba4d94362987f5d547f9177c20689acc1e202ef1501242c5945003", // gitleaks:allow a file's sha256 pin, not a credential
+  "Chart.tsx": "39c40733899f2726f19c83c39fd23f1b3b3a01adeb856fc19875d3ae4010aac5",
+  "ImageCallouts.tsx": "ca868b87d11dbf1635d817b3e583d1c9907b76305243eb597d09cc7d2cc3e8c1",
+  "callout-zoom.ts": "f50de22b54ac1abb584d43ce71fb8051b0f9b154c578b38098e260555ccba79b",
+};
+// layout.tsx, which no later batch appends to (task 4.6): the bytes after
+// its leading run of `//` lines, the code batches 4.2–4.4 approved, the same
+// as at 5f702f2; and the whole file with its corrected header.
+const LAYOUT_CODE = { bytes: 8986, sha256: "dc77d191f9f2ef21103937f733c31e76c255aa18c7d188dd9d4c7b859f9e4cf5" };
+const LAYOUT_FILE = "f5a441f28ed189e707800b5fc94f43544e22936a1ae738c4891a23a1ca99b8bc";
 const FORBIDDEN = [
   "nowrap",
   "toUpperCase",
@@ -603,12 +612,6 @@ test("batch 4.2's scene files and boxes.ts hash to their sha256 at 911e89a (a fi
   assert.equal(sha256(readFileSync(join(SCENES, "boxes.ts"))), PRESERVED_BOXES, "boxes.ts");
 });
 
-test("layout.tsx at 911e89a is a byte-exact prefix of layout.tsx", () => {
-  const bytes = readFileSync(join(SCENES, "layout.tsx"));
-  assert.ok(bytes.length >= LAYOUT_PREFIX.bytes, `layout.tsx has ${bytes.length} bytes`);
-  assert.equal(sha256(bytes.subarray(0, LAYOUT_PREFIX.bytes)), LAYOUT_PREFIX.sha256);
-});
-
 test("batch 4.3's scene files hash to their sha256 at 49d562f (a file removed in step 7 is skipped)", () => {
   for (const [name, digest] of Object.entries(PRESERVED_4_3)) {
     const path = join(SCENES, name);
@@ -617,8 +620,27 @@ test("batch 4.3's scene files hash to their sha256 at 49d562f (a file removed in
   }
 });
 
-test("layout.tsx at 49d562f is a byte-exact prefix of layout.tsx", () => {
-  const bytes = readFileSync(join(SCENES, "layout.tsx"));
-  assert.ok(bytes.length >= LAYOUT_PREFIX_4_3.bytes, `layout.tsx has ${bytes.length} bytes`);
-  assert.equal(sha256(bytes.subarray(0, LAYOUT_PREFIX_4_3.bytes)), LAYOUT_PREFIX_4_3.sha256);
+test("batch 4.4's scene files and callout-zoom.ts hash to their sha256 at 5f702f2", () => {
+  for (const [name, digest] of Object.entries(PRESERVED_4_4)) {
+    assert.equal(sha256(readFileSync(join(SCENES, name))), digest, name);
+  }
+});
+
+// The bytes of `text` after its leading run of lines that start with `//`,
+// each with its newline.
+function afterLeadingComments(text) {
+  const lines = text.split(/(?<=\n)/);
+  let i = 0;
+  while (i < lines.length && lines[i].startsWith("//")) i += 1;
+  return Buffer.from(lines.slice(i).join(""), "utf8");
+}
+
+test("layout.tsx after its leading comment lines is the 8986 bytes at 5f702f2", () => {
+  const code = afterLeadingComments(readFileSync(join(SCENES, "layout.tsx"), "utf8"));
+  assert.equal(code.length, LAYOUT_CODE.bytes);
+  assert.equal(sha256(code), LAYOUT_CODE.sha256);
+});
+
+test("layout.tsx as a whole hashes to its sha256 with the corrected header", () => {
+  assert.equal(sha256(readFileSync(join(SCENES, "layout.tsx"))), LAYOUT_FILE);
 });

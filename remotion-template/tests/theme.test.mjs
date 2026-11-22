@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The explainer kit's theme tokens: two candidates with one shape, Onda's 12
-// brand slots, the installed CJK font only, readable type, and WCAG contrast
-// computed here from the colours themselves.
+// The explainer kit's theme tokens: one theme, `light`, the user's pick
+// (task 4.6), Onda's 12 brand slots, the installed CJK font only, readable
+// type, and WCAG contrast computed here from the colours themselves.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -61,9 +61,8 @@ function contrast(foreground, background) {
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 }
 
-test("exactly two candidates, light and dark, with the same keys", () => {
-  assert.deepEqual(Object.keys(themes).sort(), ["dark", "light"]);
-  assert.deepEqual(Object.keys(themes.light).sort(), Object.keys(themes.dark).sort());
+test("exactly one theme, light, with the token keys and the 12 brand slots", () => {
+  assert.deepEqual(Object.keys(themes), ["light"]);
   assert.deepEqual(Object.keys(themes.light).sort(), ["brand", "canvas", "motion", "safeArea", "spacing", "type"]);
   for (const [name, theme] of CANDIDATES) {
     assert.deepEqual(Object.keys(theme.brand).sort(), [...BRAND_SLOTS].sort(), name);
@@ -118,9 +117,8 @@ test("spacing is strictly increasing", () => {
   }
 });
 
-test("motion uses 15 transition frames and Onda's own springs", () => {
+test("motion uses Onda's own springs", () => {
   for (const [name, { motion }] of CANDIDATES) {
-    assert.equal(motion.transitionFrames, 15, name);
     assert.equal(motion.springs.smooth, SPRING_SMOOTH, name);
     assert.equal(motion.springs.snappy, SPRING_SNAPPY, name);
   }
