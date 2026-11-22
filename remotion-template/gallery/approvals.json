@@ -128,6 +128,110 @@
       "date": "2026-11-22",
       "export": "gallery/exports/2026-11-22-batch-4-3.json",
       "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "hook",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "question",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "concept-card",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "definition-quote",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "summary",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "end-card",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "process-steps",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "cause-effect",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "comparison",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "timeline",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "key-number",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "chart",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "image-callouts",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
     }
   ]
 }
