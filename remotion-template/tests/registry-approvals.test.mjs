@@ -88,6 +88,10 @@ function differences(surface, actual, expected) {
   ];
 }
 
+// One line per kind a surface lists more than once.
+const repeats = (surface, kinds) =>
+  [...new Set(kinds.filter((kind, i) => kinds.indexOf(kind) !== i))].sort().map((kind) => `${surface} lists ${kind} more than once`);
+
 test("registry.ts imports components from the gallery and lists custom plus each catalog kind as components[id], in catalog order", () => {
   const source = readFileSync(REGISTRY, "utf8");
   assert.match(source, /^import \{components\} from '\.\.\/gallery\/components\.tsx';$/m);
@@ -128,7 +132,7 @@ test("the approved set: the schema's kinds, the registry's kinds, the JSON Schem
     ["the catalog", candidates.map(({ id }) => id)],
   ];
   assert.deepEqual(
-    surfaces.flatMap(([surface, kinds]) => differences(surface, kinds, approved)),
+    surfaces.flatMap(([surface, kinds]) => [...differences(surface, kinds, approved), ...repeats(surface, kinds)]),
     [],
   );
 });

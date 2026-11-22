@@ -101,8 +101,7 @@ const REQUIRED = {
 };
 const LISTS = new Set(["points", "steps", "events", "callouts"]);
 // Each candidate's sample ids, in order: max, image and min, except where
-// batch 4.4's catalog lists more. The samples on the 150-frame timing; every
-// other sample is as long as minFrames.
+// batch 4.4's catalog lists more.
 const SAMPLE_IDS = {
   "key-number": ["max", "image", "min", "wan", "yi"],
   chart: ["max", "image", "min", "line-max", "line-image", "line-min"],
