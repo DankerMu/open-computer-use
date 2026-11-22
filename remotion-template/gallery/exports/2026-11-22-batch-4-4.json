@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "page": "3f1ecddfa8220b19a821778aed1871c837b6d3557b36304e8e8d3bc7878d827e",
+  "reviewer": "Danker",
+  "date": "2026-11-22",
+  "decisions": [
+    {
+      "id": "hook",
+      "decision": "approve"
+    },
+    {
+      "id": "question",
+      "decision": "approve"
+    },
+    {
+      "id": "concept-card",
+      "decision": "approve"
+    },
+    {
+      "id": "definition-quote",
+      "decision": "approve"
+    },
+    {
+      "id": "summary",
+      "decision": "approve"
+    },
+    {
+      "id": "end-card",
+      "decision": "approve"
+    },
+    {
+      "id": "process-steps",
+      "decision": "approve"
+    },
+    {
+      "id": "cause-effect",
+      "decision": "approve"
+    },
+    {
+      "id": "comparison",
+      "decision": "approve"
+    },
+    {
+      "id": "timeline",
+      "decision": "approve"
+    },
+    {
+      "id": "key-number",
+      "decision": "approve"
+    },
+    {
+      "id": "chart",
+      "decision": "approve"
+    },
+    {
+      "id": "image-callouts",
+      "decision": "approve"
+    }
+  ],
+  "theme": "light"
+}

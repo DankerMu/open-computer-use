@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The scene components of tasks 4.2 and 4.3 in a real headless shell. Runs only
+// The scene components of tasks 4.2–4.4 in a real headless shell. Runs only
 // inside the workspace image, from a project root whose node_modules link
 // reaches /opt/remotion-template/node_modules, one test file after another:
 //   node --test --test-concurrency=1 "tests/render/*.test.mjs"
@@ -17,9 +17,11 @@
 //     last frame;
 //   - gallery: gallery({out}) on the tracked catalog.
 // Expected values come from the fixture: the caption band's top (930), the
-// boxes of src/kit/scenes/boxes.ts, the samples' text fields, 62 clips and
-// 186 key frames, and the centre colour of gallery/public/images/sample.png
-// within ±6 per channel.
+// boxes of src/kit/scenes/boxes.ts, the samples' text fields (a number as
+// formatCount of src/kit/text.ts gives it), 90 clips and 270 key frames, the
+// centre colour of gallery/public/images/sample.png within ±6 per channel,
+// and, for image-callouts, the geometry of src/kit/scenes/callout-zoom.ts
+// with sample.png's natural 1280×960.
 
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
@@ -30,10 +32,12 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { bundle } from "@remotion/bundler";
 import { openBrowser, renderStill, selectComposition } from "@remotion/renderer";
-import { probe, violations } from "../../bin/probe.mjs";
+import { probe, probeFrames, violations } from "../../bin/probe.mjs";
 import { candidates } from "../../src/kit/gallery/catalog.ts";
 import { captionBand } from "../../src/kit/render/captions.ts";
 import { IMAGE_BOX, TEXT_BOX } from "../../src/kit/scenes/boxes.ts";
+import { calloutZoom, project, scaleAt } from "../../src/kit/scenes/callout-zoom.ts";
+import { formatCount } from "../../src/kit/text.ts";
 import { themes } from "../../src/kit/theme.ts";
 
 const TEMPLATE = fileURLToPath(new URL("../..", import.meta.url));
@@ -43,14 +47,19 @@ const BAND_TOP = captionBand(themes.light).top;
 // The probe's own box tolerances (task 3.7, amended): 0.5 px across, 1 px down.
 const TOLERANCE = { x: 0.5, y: 1 };
 const CHANNEL_TOLERANCE = 6;
-const CLIPS = 62;
-const KEY_FRAMES = 186;
-const SAMPLE_IMAGE = { path: join(TEMPLATE, "gallery", "public", "images", "sample.png"), x: 640, y: 480 };
+const CLIPS = 90;
+const KEY_FRAMES = 270;
+const SAMPLE_IMAGE = { path: join(TEMPLATE, "gallery", "public", "images", "sample.png"), x: 640, y: 480, width: 1280, height: 960 };
+// The image-callouts kind: its image panel zooms across the whole scene and
+// its markers track the zoom.
+const CALLOUTS = "image-callouts";
+// A marker's glyph box centre may lie this far from its expected point.
+const MARKER_TOLERANCE = 2;
 const PANEL_CENTRE = { x: IMAGE_BOX.panel.left + IMAGE_BOX.panel.width / 2, y: IMAGE_BOX.panel.top + IMAGE_BOX.panel.height / 2 };
 
 // Every (candidate, sample) of the tracked catalog, with its probe facts.
 const SAMPLES = candidates.flatMap((c) =>
-  c.samples.map((s) => ({ candidate: c.id, sample: s.id, entranceFrames: c.entranceFrames, durationInFrames: s.timing.durationInFrames, content: s.content, image: s.image })),
+  c.samples.map((s) => ({ candidate: c.id, kind: c.kind, sample: s.id, entranceFrames: c.entranceFrames, durationInFrames: s.timing.durationInFrames, content: s.content, image: s.image })),
 );
 const itemId = (s, theme) => `${s.candidate}--${s.sample}--${theme}`;
 const ITEMS = THEMES.flatMap((theme) => SAMPLES.map((s) => ({ ...s, theme, id: itemId(s, theme) })));
@@ -111,8 +120,19 @@ const probed = once("probe", () => {
 
 // The text fields of a sample's content: every string under it, depth-first
 // through lists and objects (batch 4.3's steps, events and sides nest).
-const fieldValues = (value) =>
-  typeof value === "string" ? [value] : (Array.isArray(value) ? value : Object.values(value)).flatMap(fieldValues);
+const stringsOf = (value) =>
+  typeof value === "string" ? [value] : (Array.isArray(value) ? value : Object.values(value)).flatMap(stringsOf);
+
+// The marked values of a sample of `kind`: the depth-first walk for the ten
+// earlier kinds; for batch 4.4's, each drawn field, a number as formatCount
+// gives it. Nothing for a chart's type or a callout's x and y.
+const present = (value) => (value === undefined ? [] : [value]);
+const fieldValues = (kind, content) => {
+  if (kind === "key-number") return [formatCount(content.value), ...present(content.unit), content.label];
+  if (kind === "chart") return [content.title, ...present(content.unit), ...content.points.flatMap((p) => [p.label, formatCount(p.value)])];
+  if (kind === CALLOUTS) return content.callouts.map((c) => c.label);
+  return stringsOf(content);
+};
 
 const isInside = (path, ancestor) => path === ancestor || path.startsWith(`${ancestor}>`);
 
@@ -166,13 +186,72 @@ test("probe: at the entrance end the marked inputs are exactly the sample's text
     assert.equal(frame.frame, item.entranceFrames, `${frame.target}: entrance-end frame`);
     assert.deepEqual(
       frame.marked.map(({ input }) => input).sort(),
-      fieldValues(item.content).sort(),
+      fieldValues(item.kind, item.content).sort(),
       frame.target,
     );
   }
 });
 
+test("probe: the spec's number scenario at the entrance end, key-number wan, yi and min marking 1.2万, 1.2亿 and 9999 in both themes", async () => {
+  const frames = (await probed()).frames.filter((frame) => frame.role === "entrance-end");
+  for (const theme of THEMES) {
+    for (const [sample, shown] of [["wan", "1.2万"], ["yi", "1.2亿"], ["min", "9999"]]) {
+      const id = itemId({ candidate: "key-number", sample }, theme);
+      const frame = frames.find((f) => f.target === id);
+      assert.ok(frame, `${id}: no entrance-end frame`);
+      const inputs = frame.marked.map(({ input }) => input);
+      assert.ok(inputs.includes(shown), `${id}: ${JSON.stringify(inputs)} lacks ${shown}`);
+    }
+  }
+});
+
+test("probe: no text record of any chart frame lies inside an svg element", async () => {
+  const frames = (await probed()).frames.filter((frame) => byId.get(frame.target).kind === "chart");
+  assert.ok(frames.length > 0, "no chart frame");
+  for (const frame of frames) {
+    for (const record of frame.texts) {
+      assert.ok(!/(^|>)svg:/.test(record.path), `${frame.target} ${frame.role}: "${record.text}" at ${record.path} is inside an svg`);
+    }
+  }
+});
+
+// The callout zoom of an image-callouts item, with sample.png's natural size.
+const zoomOf = (item) => calloutZoom({ width: SAMPLE_IMAGE.width, height: SAMPLE_IMAGE.height }, item.content.callouts);
+
+test("probe: in every image-callouts frame, marker i + 1 is unmarked, unscaled and unclipped text in the panel, centred within 2 px of F + s(f)·(P_i − F)", async () => {
+  const frames = (await probed()).frames.filter((frame) => byId.get(frame.target).kind === CALLOUTS);
+  assert.equal(frames.length, ROLES.length * THEMES.length * candidates.find((c) => c.kind === CALLOUTS).samples.length);
+  for (const frame of frames) {
+    const item = byId.get(frame.target);
+    const { focus, points, end } = zoomOf(item);
+    const s = scaleAt(end, frame.frame, item.durationInFrames);
+    const unmarked = frame.texts.filter((record) => !frame.marked.some((mark) => isInside(record.path, mark.path)));
+    for (const [i, p] of points.entries()) {
+      const at = project(focus, p, s);
+      const label = `${frame.target} ${frame.role} frame ${frame.frame} marker ${i + 1}`;
+      const found = unmarked.filter((record) => {
+        const g = record.glyphBox;
+        const centre = { x: g.x + g.width / 2, y: g.y + g.height / 2 };
+        return record.text === String(i + 1) && inside(g, IMAGE_BOX.panel) && Math.hypot(centre.x - at.x, centre.y - at.y) <= MARKER_TOLERANCE;
+      });
+      assert.equal(found.length, 1, `${label}: no unmarked "${i + 1}" in the panel within ${MARKER_TOLERANCE} px of ${JSON.stringify(at)}`);
+      assert.equal(found[0].scale, 1, `${label}: scale ${found[0].scale}`);
+      assert.deepEqual(found[0].clippedBy, [], `${label}: clipped`);
+    }
+  }
+});
+
 // --- settled ------------------------------------------------------------------
+
+// Outside IMAGE_BOX.panel: the four strips around it, as ffmpeg crops
+// (width:height:x:y).
+const PANEL = IMAGE_BOX.panel;
+const AROUND_PANEL = [
+  `1920:${PANEL.top}:0:0`,
+  `1920:${1080 - PANEL.top - PANEL.height}:0:${PANEL.top + PANEL.height}`,
+  `${PANEL.left}:${PANEL.height}:0:${PANEL.top}`,
+  `${1920 - PANEL.left - PANEL.width}:${PANEL.height}:${PANEL.left + PANEL.width}:${PANEL.top}`,
+];
 
 const rgb = (path, crop = null) =>
   execFileSync("ffmpeg", ["-nostdin", "-v", "error", "-i", path, ...(crop === null ? [] : ["-vf", `crop=${crop}`]), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], {
@@ -196,7 +275,7 @@ const stills = once("settled stills", async () => {
         await renderStill({ composition, serveUrl, output, frame, inputProps, puppeteerInstance: browser, logLevel: "error" });
         paths.push(output);
       }
-      pairs.push({ id: itemId(s, "light"), paths });
+      pairs.push({ id: itemId(s, "light"), kind: s.kind, paths });
     }
     return pairs;
   } finally {
@@ -204,10 +283,19 @@ const stills = once("settled stills", async () => {
   }
 });
 
-test("settled: in light, every sample's still at its entrance end equals its last frame byte for byte", async () => {
+test("settled: in light, every sample's still at its entrance end equals its last frame byte for byte (image-callouts outside its zooming panel)", async () => {
   const pairs = await stills();
   assert.equal(pairs.length, SAMPLES.length);
-  for (const { id, paths } of pairs) {
+  for (const { id, kind, paths } of pairs) {
+    if (kind === CALLOUTS) {
+      for (const crop of AROUND_PANEL) {
+        const [entranceEnd, last] = paths.map((path) => rgb(path, crop));
+        const [w, h] = crop.split(":").map(Number);
+        assert.equal(entranceEnd.length, w * h * 3, `${id} ${crop}`);
+        assert.ok(entranceEnd.equals(last), `${id}: outside the panel (${crop}) the entrance-end still differs from the last frame`);
+      }
+      continue;
+    }
     const [entranceEnd, last] = paths.map((path) => rgb(path));
     assert.equal(entranceEnd.length, 1920 * 1080 * 3, id);
     assert.ok(entranceEnd.equals(last), `${id}: the entrance-end still differs from the last frame`);
@@ -223,7 +311,7 @@ const galleryRun = once("gallery", async () => {
 
 const pixel = (path, x, y) => [...rgb(path, `1:1:${x}:${y}`)];
 
-test("gallery: the tracked catalog gives 62 clips, 186 key frames and no violation on any item", async () => {
+test("gallery: the tracked catalog gives 90 clips, 270 key frames and no violation on any item", async () => {
   const { out, items } = await galleryRun();
   assert.equal(items, CLIPS);
   assert.equal(readdirSync(join(out, "clips")).length, CLIPS);
@@ -233,16 +321,41 @@ test("gallery: the tracked catalog gives 62 clips, 186 key frames and no violati
   for (const item of data.items) assert.deepEqual(item.violations, [], item.id);
 });
 
-test("gallery: each candidate's image sample shows sample.png's centre at the panel's centre, and its max sample does not", async () => {
+// The sample pairs whose image sample shows sample.png at the panel's centre
+// and whose plain sample does not: image against max, and for the chart
+// also line-image against line-max. image-callouts has its own check.
+const imagePairs = (c) => (c.kind === "chart" ? [["image", "max"], ["line-image", "line-max"]] : [["image", "max"]]);
+
+test("gallery: each candidate's image sample shows sample.png's centre at the panel's centre, and its max sample does not (the chart's line samples too)", async () => {
   assert.ok(candidates.length > 0, "the catalog lists no candidate");
   const { out } = await galleryRun();
   const expected = pixel(SAMPLE_IMAGE.path, SAMPLE_IMAGE.x, SAMPLE_IMAGE.y);
   const near = (actual) => actual.every((channel, i) => Math.abs(channel - expected[i]) <= CHANNEL_TOLERANCE);
-  for (const { id } of candidates) {
-    const shown = pixel(join(out, "frames", `${id}--image--light--entrance-end.png`), PANEL_CENTRE.x, PANEL_CENTRE.y);
-    assert.ok(near(shown), `${id} image: ${JSON.stringify(shown)} is not sample.png's ${JSON.stringify(expected)}`);
-    const plain = pixel(join(out, "frames", `${id}--max--light--entrance-end.png`), PANEL_CENTRE.x, PANEL_CENTRE.y);
-    assert.ok(!near(plain), `${id} max: ${JSON.stringify(plain)} matches sample.png's ${JSON.stringify(expected)}`);
+  for (const c of candidates.filter((c) => c.kind !== CALLOUTS)) {
+    for (const [withImage, plain] of imagePairs(c)) {
+      const shown = pixel(join(out, "frames", `${c.id}--${withImage}--light--entrance-end.png`), PANEL_CENTRE.x, PANEL_CENTRE.y);
+      assert.ok(near(shown), `${c.id} ${withImage}: ${JSON.stringify(shown)} is not sample.png's ${JSON.stringify(expected)}`);
+      const other = pixel(join(out, "frames", `${c.id}--${plain}--light--entrance-end.png`), PANEL_CENTRE.x, PANEL_CENTRE.y);
+      assert.ok(!near(other), `${c.id} ${plain}: ${JSON.stringify(other)} matches sample.png's ${JSON.stringify(expected)}`);
+    }
+  }
+});
+
+test("gallery: in each image-callouts key frame (light), sample.png's centre shows at the projected image centre F + s(f)·(C − F)", async () => {
+  const c = candidates.find((c) => c.kind === CALLOUTS);
+  assert.ok(c, "the catalog has no image-callouts candidate");
+  const { out } = await galleryRun();
+  const expected = pixel(SAMPLE_IMAGE.path, SAMPLE_IMAGE.x, SAMPLE_IMAGE.y);
+  const near = (actual) => actual.every((channel, i) => Math.abs(channel - expected[i]) <= CHANNEL_TOLERANCE);
+  for (const s of c.samples) {
+    const item = byId.get(itemId({ candidate: c.id, sample: s.id }, "light"));
+    const { picture, focus, end } = zoomOf(item);
+    const centre = { x: picture.left + picture.width / 2, y: picture.top + picture.height / 2 };
+    for (const { role, frame } of probeFrames({ durationInFrames: item.durationInFrames, entranceFrames: item.entranceFrames, exitFrame: item.durationInFrames })) {
+      const at = project(focus, centre, scaleAt(end, frame, item.durationInFrames));
+      const shown = pixel(join(out, "frames", `${item.id}--${role}.png`), Math.round(at.x), Math.round(at.y));
+      assert.ok(near(shown), `${item.id} ${role} (frame ${frame}) at ${JSON.stringify(at)}: ${JSON.stringify(shown)} is not sample.png's ${JSON.stringify(expected)}`);
+    }
   }
 });
 

@@ -25,4 +25,7 @@ export const registry: Registry = {
 	'cause-effect': components['cause-effect'],
 	'comparison': components['comparison'],
 	'timeline': components['timeline'],
+	'key-number': components['key-number'],
+	'chart': components['chart'],
+	'image-callouts': components['image-callouts'],
 };

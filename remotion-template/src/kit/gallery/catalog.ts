@@ -6,9 +6,10 @@
 // the gallery renders every sample in both theme candidates. Imports only
 // .mjs and .ts files, so Node and the bundle both import it.
 //
-// Batches 4.2 and 4.3 (process steps, cause and effect, comparison and
-// timeline, appended after 4.2's six): one candidate per kind, its id the
-// kind and its source the scene file. Its minimum length and entrance are read from
+// Batches 4.2, 4.3 (process steps, cause and effect, comparison and
+// timeline, appended after 4.2's six) and 4.4 (key number, chart and image
+// with callouts, appended after 4.3's four): one candidate per kind, its id
+// the kind and its source the scene file. Its minimum length and entrance are read from
 // bin/scene-timing.mjs, their one home. Each candidate has three samples:
 //   - max: every content field at its LIMITS.content length, in Han text
 //     ending in a full-width closing mark, every list at its maximum (the
@@ -19,9 +20,23 @@
 //   - min: the required fields only, two Han characters each, every list at
 //     its minimum, as long as the minimum, narrated in one block up to
 //     minFrames − 20 (the end card's has no narration).
+// Batch 4.4's numbers are not text: `value` takes the widest number the
+// kit formats in 8 code points, -99999999 (-9999.9万), in max. Its extra
+// samples, after these three:
+//   - key-number: wan and yi, min at 12345 and 123456789, the spec's number
+//     scenario (1.2万 and 1.2亿, beside min's unchanged 9999);
+//   - chart: line-max, line-image and line-min, the three bar samples drawn
+//     as a line, so one decision covers both types.
+// image-callouts requires an image, so all three of its samples carry
+// sample.png: max holds three callouts at the corners (0, 0), (1, 0) and
+// (1, 1), where the zoom cannot grow (S = 1); image the same labels inside
+// the picture, spread so the zoom reaches S_MAX and every marker visibly
+// tracks it; min one callout at the corner (0, 0), the zoom's focus. No
+// callout lies within 0.15 of the image's centre on both axes, so no marker
+// covers the centre patch.
 
 import {ENTRANCE_FRAMES, MIN_SCENE_FRAMES} from '../../../bin/scene-timing.mjs';
-import type {Candidate, Timing} from './catalog-rules.ts';
+import type {Candidate, Sample, Timing} from './catalog-rules.ts';
 
 export type {Candidate} from './catalog-rules.ts';
 export {validateCatalog} from './catalog-rules.ts';
@@ -60,7 +75,11 @@ function minTiming(minFrames: number, narrated: boolean): Timing {
 	return {durationInFrames: minFrames, narrationEndFrame: end, sentences: [{blocks: [{text: '简短的一句旁白', startFrame: 0, endFrame: end}]}]};
 }
 
-function candidate(kind: string, file: string, max: Record<string, unknown>, min: Record<string, unknown>): Candidate {
+type Content = Record<string, unknown>;
+
+// A candidate of `kind` with the samples that `samples` builds from the
+// max and min timings of its kind.
+function entry(kind: string, file: string, samples: (timing: {max: Timing; min: Timing}) => Sample[]): Candidate {
 	const minFrames = MIN_FRAMES[kind];
 	return {
 		id: kind,
@@ -68,12 +87,28 @@ function candidate(kind: string, file: string, max: Record<string, unknown>, min
 		source: `src/kit/scenes/${file}.tsx`,
 		minFrames,
 		entranceFrames: ENTRANCE[kind],
-		samples: [
-			{id: 'max', content: max, image: null, timing: MAX_TIMING},
-			{id: 'image', content: max, image: SAMPLE_IMAGE, timing: MAX_TIMING},
-			{id: 'min', content: min, image: null, timing: minTiming(minFrames, kind !== 'end-card')},
-		],
+		samples: samples({max: MAX_TIMING, min: minTiming(minFrames, kind !== 'end-card')}),
 	};
+}
+
+// The three samples of batches 4.2 and 4.3, and `extra` after them.
+function candidate(kind: string, file: string, max: Content, min: Content, extra: (min: Sample) => Sample[] = () => []): Candidate {
+	return entry(kind, file, (timing) => {
+		const minSample: Sample = {id: 'min', content: min, image: null, timing: timing.min};
+		return [
+			{id: 'max', content: max, image: null, timing: timing.max},
+			{id: 'image', content: max, image: SAMPLE_IMAGE, timing: timing.max},
+			minSample,
+			...extra(minSample),
+		];
+	});
+}
+
+// Batch 4.4's chart: the bar samples, then each drawn as a line.
+function chart(max: Content, min: Content): Candidate {
+	const base = candidate('chart', 'Chart', max, min);
+	const asLine = (s: Sample): Sample => ({...s, id: `line-${s.id}`, content: {...s.content, type: 'line'}});
+	return {...base, samples: [...base.samples, ...base.samples.map(asLine)]};
 }
 
 export const candidates: Candidate[] = [
@@ -179,4 +214,41 @@ export const candidates: Candidate[] = [
 		},
 		{events: [{year: '古代', label: '观察'}, {year: '近代', label: '定律'}]},
 	),
+	candidate(
+		'key-number',
+		'KeyNumber',
+		{value: -99999999, unit: '千焦耳，', label: '这一化学反应过程的焓变。'},
+		{value: 9999, label: '人数'},
+		(min) => [
+			{...min, id: 'wan', content: {...min.content, value: 12345}},
+			{...min, id: 'yi', content: {...min.content, value: 123456789}},
+		],
+	),
+	chart(
+		{
+			type: 'bar',
+			title: '各地区年度能量收支变化，',
+			unit: '千瓦时，',
+			points: [
+				{label: '东部沿海区，', value: 87654321},
+				{label: '西部高原区，', value: -99999999},
+				{label: '南方丘陵区，', value: 45000000},
+				{label: '北方平原区，', value: 0},
+				{label: '中部盆地区，', value: -23000000},
+				{label: '东北林业区，', value: 61234567},
+				{label: '西南山地区，', value: 123456},
+				{label: '西北荒漠区。', value: 30000000},
+			],
+		},
+		{type: 'bar', title: '对比', points: [{label: '甲地', value: 36}, {label: '乙地', value: 64}]},
+	),
+	entry('image-callouts', 'ImageCallouts', (timing) => {
+		const labels = ['入射光线照到水面上，', '折射光线进入水中去，', '水中的筷子看似折断。'];
+		const at = (points: Array<[number, number]>) => ({callouts: points.map(([x, y], i) => ({x, y, label: labels[i]}))});
+		return [
+			{id: 'max', content: at([[0, 0], [1, 0], [1, 1]]), image: SAMPLE_IMAGE, timing: timing.max},
+			{id: 'image', content: at([[0.2, 0.25], [0.8, 0.3], [0.3, 0.9]]), image: SAMPLE_IMAGE, timing: timing.max},
+			{id: 'min', content: {callouts: [{x: 0, y: 0, label: '水面'}]}, image: SAMPLE_IMAGE, timing: timing.min},
+		];
+	}),
 ];

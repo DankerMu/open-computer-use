@@ -23,12 +23,12 @@ export const TRANSITION_FRAMES = 15;
 export const LENGTH_WINDOW = { minFrames: 1800, maxFrames: 5400 };
 
 // Each kind's declared minimum length in frames. For hook, question, concept
-// card, definition/quote, summary and end card (task 4.2) and for process
-// steps, cause and effect, comparison and timeline (task 4.3) the values are
-// their components' own: the 15-frame entrance, 30 frames of rest and the
-// 15-frame exit make 60, and the end card's 90 is the tail. The others stay
-// conservative floors until task 4.4 sets them from their components. The
-// end card's stays at most the 90-frame tail.
+// card, definition/quote, summary and end card (task 4.2), for process
+// steps, cause and effect, comparison and timeline (task 4.3) and for key
+// number, chart and image with callouts (task 4.4) the values are their
+// components' own: the 15-frame entrance, 30 frames of rest and the 15-frame
+// exit make 60, and the end card's 90 is the tail. Custom stays a
+// conservative floor. The end card's stays at most the 90-frame tail.
 export const MIN_SCENE_FRAMES = {
   hook: 60,
   question: 60,
@@ -46,10 +46,11 @@ export const MIN_SCENE_FRAMES = {
   "end-card": 90,
 };
 
-// Each kind's entrance in frames. The six task 4.2 components and the four
-// task 4.3 components settle within the kit-wide 15, so theirs are their
-// components' own; the other kinds keep it until task 4.4 sets theirs from
-// its approved components. A custom
+// Each kind's entrance in frames. The six task 4.2 components, the four task
+// 4.3 components and the three task 4.4 components settle within the
+// kit-wide 15, so theirs are their components' own; image with callouts
+// settles everything but its image panel, whose zoom runs across the whole
+// scene and is not a reveal. A custom
 // scene must settle within it. kit check's probe targets, its rest rule and
 // the scene components all read it.
 export const ENTRANCE_FRAMES = {
@@ -70,8 +71,8 @@ export const ENTRANCE_FRAMES = {
 };
 
 // Each kind's declared reveals: (timing) => [{type: "key" | "batch",
-// startFrame, endFrame}], frames relative to the scene. Empty until tasks
-// 4.2–4.4 declare them from the approved components.
+// startFrame, endFrame}], frames relative to the scene. Empty: no component
+// of tasks 4.2–4.4 reveals anything after its entrance.
 export const REVEALS = {};
 
 // The rest a reveal needs before the next reveal or the scene's exit.
