@@ -48,14 +48,16 @@ const workers = new Set();
 let totalFrames;
 let pass;
 
-const kit = (...args) => {
-  const run = spawnSync(process.execPath, ["bin/kit.mjs", ...args], { cwd: root, encoding: "utf8" });
+// kit in dir, by default the shared project.
+const kitIn = (dir, ...args) => {
+  const run = spawnSync(process.execPath, ["bin/kit.mjs", ...args], { cwd: dir, encoding: "utf8" });
   return { code: run.status, out: run.stdout, err: run.stderr };
 };
+const kit = (...args) => kitIn(root, ...args);
 
-const readLog = () => {
+const readLog = (dir = root) => {
   try {
-    return readFileSync(join(root, ".kit", "render", "log"), "utf8");
+    return readFileSync(join(dir, ".kit", "render", "log"), "utf8");
   } catch {
     return ""; // before startJob has opened the log
   }
@@ -93,15 +95,17 @@ async function until(check, timeoutMs, everyMs = 100) {
   return true;
 }
 
-// Polls status until it stops reporting running; seen maps each log line to
-// the ms since the call it was first seen.
-async function settled(limitMs, seen = null) {
+// Polls status in dir (by default the shared project) until it stops
+// reporting running, reading the log after each status call so a line
+// written as the job ends is seen; seen maps each log line to the ms since
+// the call it was first seen.
+async function settled(limitMs, seen = null, dir = root) {
   const started = Date.now();
   for (;;) {
-    if (seen !== null) for (const line of readLog().split("\n")) if (line !== "" && !seen.has(line)) seen.set(line, Date.now() - started);
-    const status = kit("status");
+    const status = kitIn(dir, "status");
+    if (seen !== null) for (const line of readLog(dir).split("\n")) if (line !== "" && !seen.has(line)) seen.set(line, Date.now() - started);
     if (status.code !== 3) return { ...status, ms: Date.now() - started };
-    assert.ok(Date.now() - started < limitMs, `still running after ${limitMs} ms\n${readLog()}`);
+    assert.ok(Date.now() - started < limitMs, `still running after ${limitMs} ms\n${readLog(dir)}`);
     await pause(seen === null ? 500 : 100);
   }
 }
@@ -248,4 +252,25 @@ test("4: a relaunch reuses the check and the render succeeds, verified by ffprob
   assert.equal(checkResult(), pass);
   assert.ok(await until(() => !alive(pid), 20000), `worker ${pid} still alive`);
   assert.ok(await until(() => scan().length === 0, SCAN_LIMIT_MS), `left after the render: ${shown(scan())}`);
+});
+
+test("5.4: settled reads the log after each status call, so a line written as the job ends is seen", async () => {
+  // A stub root whose status appends a last log line, then exits 0.
+  const stub = join(scratch, "stub-settled");
+  const line = "stub: the job's last line";
+  mkdirSync(join(stub, "bin"), { recursive: true });
+  writeFileSync(
+    join(stub, "bin", "kit.mjs"),
+    [
+      'import { appendFileSync, mkdirSync } from "node:fs";',
+      'if (process.argv[2] !== "status") process.exit(2);',
+      'mkdirSync(".kit/render", { recursive: true });',
+      `appendFileSync(".kit/render/log", ${JSON.stringify(`${line}\n`)});`,
+      "",
+    ].join("\n"),
+  );
+  const seen = new Map();
+  const done = await settled(10000, seen, stub);
+  assert.equal(done.code, 0, done.err);
+  assert.deepEqual([...seen.keys()], [line]);
 });
