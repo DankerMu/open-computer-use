@@ -18,6 +18,11 @@
 // one thing. Every worker a test starts has ended, and no headless shell is
 // left, when the test ends: tests/render/probe.test.mjs counts every shell
 // on the machine.
+//
+// Task 5.4's two timing tests, the maximum-size script's kit check and then
+// its kit render, run only with KIT_TIMING=1, under --cpus=2 --memory=4g
+// --memory-swap=4g and the /mnt/user-data/files tmpfs, and are skipped when
+// KIT_TIMING is unset.
 
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
@@ -41,8 +46,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { sheetTiles } from "../../bin/contact-sheet.mjs";
+import { explainerScenes } from "../../bin/explainer-scenes.mjs";
+import { validateScript } from "../../bin/script-schema.mjs";
 import { blockStems } from "../../bin/voice-stem.mjs";
-import { checkScript } from "../fixtures/check/fixture.mjs";
+import { TONE_SECONDS, checkScript, checkTimeline, maxScript } from "../fixtures/check/fixture.mjs";
 
 const TEMPLATE = fileURLToPath(new URL("../..", import.meta.url));
 const FIXTURES = join(TEMPLATE, "tests", "render", "fixtures");
@@ -60,6 +68,22 @@ const BLOCK_SECONDS = 7;
 const CHECK_LIMIT_MS = 900000;
 const SHELL_LIMIT_MS = 10000;
 const STARTED = /^kit check: started \(pid (\d+)\); run node bin\/kit\.mjs status\n$/;
+const RENDER_STARTED = /^kit render: started \(pid (\d+)\); run node bin\/kit\.mjs status\n$/;
+
+// Task 5.4: the timing tests' gate, limits and bounds.
+const KIT_TIMING = process.env.KIT_TIMING;
+if (KIT_TIMING !== undefined && KIT_TIMING !== "1") throw new Error("KIT_TIMING must be unset or 1");
+const TIMING_SKIP = KIT_TIMING === "1" ? false : "5.4 timing: set KIT_TIMING=1 and run under --cpus=2 --memory=4g --memory-swap=4g";
+const MAX_CHECK_LIMIT_MS = 1800000;
+const MAX_RENDER_LIMIT_MS = 3600000;
+const POLL_MS = 1000;
+const STATUS_BOUND_MS = 5000;
+const FILES = "/mnt/user-data/files";
+const CGROUP = "/sys/fs/cgroup";
+// The stage a log line names, or null: the check's stage lines and its
+// snapshot; the render's start, frames (any count), verify and publish.
+const checkStage = (line) => /^check: (stage \d+ \S+|snapshot)$/.exec(line)?.[1] ?? null;
+const renderStage = (line) => /^render: (start|frames|verify|publish)(?: |$)/.exec(line)?.[1] ?? null;
 
 const pause = (ms) => new Promise((done) => setTimeout(done, ms));
 const scratch = mkdtempSync(join(tmpdir(), "check-render-"));
@@ -103,32 +127,49 @@ const kit = (root, ...args) => {
   return { code: run.status, out: run.stdout, err: run.stderr };
 };
 
-// Starts a check; returns the worker's pid, recorded for the final cleanup.
-function startCheck(root) {
+// Starts a check, or with job "render" a render; returns the worker's pid,
+// recorded for the final cleanup.
+function startCheck(root, job = "check") {
   const started = Date.now();
-  const run = kit(root, "check");
+  const run = kit(root, job);
   const elapsed = Date.now() - started;
   assert.equal(run.code, 0, run.err);
   assert.equal(run.out, "");
-  const match = STARTED.exec(run.err);
+  const match = (job === "render" ? RENDER_STARTED : STARTED).exec(run.err);
   assert.ok(match, run.err);
   const pid = Number(match[1]);
   workers.add(pid);
   return { pid, elapsed };
 }
 
-// Polls status until it reports anything but running. seen, when given,
-// maps each log line to the ms (since the call) it was first seen.
-async function settled(root, timeoutMs = CHECK_LIMIT_MS, seen = null) {
+// Polls status until it reports anything but running, reading the log of
+// `job` after each status call. seen, when given, maps each log line to the
+// ms (since `since`, by default the call) it was first seen. everyMs is the
+// pause between polls. calls, when given, receives every status call as
+// {stage, at, ms, code, out}: the stage last seen in the log before the
+// call (stageOf names a line's stage, or null), the ms since `since` at
+// which it returned, and its latency. onPoll runs after each running poll.
+async function settled(
+  root,
+  timeoutMs = CHECK_LIMIT_MS,
+  seen = null,
+  { job = "check", everyMs = seen === null ? 500 : 100, since = Date.now(), calls = null, stageOf = () => null, onPoll = () => {} } = {},
+) {
   const started = Date.now();
+  let stage = "before any stage";
   for (;;) {
     if (seen !== null) {
-      for (const line of readLog(root).split("\n")) if (line !== "" && !seen.has(line)) seen.set(line, Date.now() - started);
+      for (const line of readLog(root, job).split("\n")) if (line !== "" && !seen.has(line)) seen.set(line, Date.now() - since);
     }
+    const called = Date.now();
     const status = kit(root, "status");
+    const returned = Date.now();
+    calls?.push({ stage, at: returned - since, ms: returned - called, code: status.code, out: status.out });
+    if (calls !== null) for (const line of readLog(root, job).split("\n")) stage = stageOf(line) ?? stage;
     if (status.code !== 3) return { ...status, ms: Date.now() - started };
+    onPoll();
     assert.ok(Date.now() - started < timeoutMs, `still running after ${timeoutMs} ms`);
-    await pause(seen === null ? 500 : 100);
+    await pause(everyMs);
   }
 }
 
@@ -140,9 +181,9 @@ async function reaches(root, line, shell) {
   assert.ok(ok(), `never reached ${line}${shell ? " with a shell" : ""}: ${kit(root, "status").out}\n${readLog(root)}`);
 }
 
-const readLog = (root) => {
+const readLog = (root, job = "check") => {
   try {
-    return readFileSync(join(root, ".kit", "check", "log"), "utf8");
+    return readFileSync(join(root, ".kit", job, "log"), "utf8");
   } catch {
     return ""; // before startJob has opened the log
   }
@@ -150,15 +191,17 @@ const readLog = (root) => {
 
 const sheetPath = (root) => join(root, ".kit", "check", "contact.png");
 
-// status's passed output at root, from timeline.json's transition windows:
-// a tile's frame is the frame before its scene's exit.
-async function passedOutput(root) {
+// status's passed output at root. tiles: [{where, frame}], by default the
+// passing script's, from timeline.json's transition windows: a tile's frame
+// is the frame before its scene's exit.
+async function passedOutput(root, tiles = null) {
   const { CHECKLIST } = await import("../../bin/checklist.mjs");
   const timeline = JSON.parse(readFileSync(join(root, "timeline.json"), "utf8"));
+  const shown = tiles ?? TILE_SCENES.map((k, i) => ({ where: TILE_WHERES[i], frame: timeline.scenes[k].transitionOut.startFrame - 1 }));
   return [
     "kit status: check passed",
     `contact sheet: ${sheetPath(root)}`,
-    ...TILE_SCENES.map((k, i) => `  tile ${i + 1} (${CORNERS[i]}): ${TILE_WHERES[i]}, frame ${timeline.scenes[k].transitionOut.startFrame - 1}`),
+    ...shown.map(({ where, frame }, i) => `  tile ${i + 1} (${CORNERS[i]}): ${where}, frame ${frame}`),
     "view the contact sheet and answer each question yes or no; on any no, fix the project and run node bin/kit.mjs check again:",
     ...CHECKLIST.map((question, n) => `  ${n + 1}. ${question}`),
   ]
@@ -517,4 +560,193 @@ test("8: killing the caller's process group as check returns leaves the check ru
   t.diagnostic(`check after the caller's group was killed: ${done.out.trim()} in ${done.ms} ms`);
   assert.deepEqual([done.code, done.out], [0, await passedOutput(root)], log(root));
   await ended(pid);
+});
+
+// --- task 5.4 -------------------------------------------------------------------
+
+const STUB_LINE = "stub: the job's last line";
+
+test("5.4: settled reads the log after each status call, so a line written as the job ends is seen", async () => {
+  // A stub root whose status appends a last log line, then exits 0.
+  const root = join(scratch, "stub-settled");
+  mkdirSync(join(root, "bin"), { recursive: true });
+  writeFileSync(
+    join(root, "bin", "kit.mjs"),
+    [
+      'import { appendFileSync, mkdirSync } from "node:fs";',
+      'if (process.argv[2] !== "status") process.exit(2);',
+      'mkdirSync(".kit/check", { recursive: true });',
+      `appendFileSync(".kit/check/log", ${JSON.stringify(`${STUB_LINE}\n`)});`,
+      "",
+    ].join("\n"),
+  );
+  const seen = new Map();
+  const done = await settled(root, 10000, seen);
+  assert.equal(done.code, 0, done.err);
+  assert.deepEqual([...seen.keys()], [STUB_LINE]);
+});
+
+// The container's cgroup v2 file `name`, trimmed; a missing file throws.
+const cgroup = (name) => readFileSync(join(CGROUP, name), "utf8").trim();
+// A flat-keyed cgroup file (cpu.stat, memory.events) as {key: number}.
+const keyed = (name) => Object.fromEntries(cgroup(name).split("\n").map((line) => [line.split(" ")[0], Number(line.split(" ")[1])]));
+
+// The precondition of both timing tests: --cpus=2 --memory=4g
+// --memory-swap=4g, so no swap distorts a time.
+function assertLimits() {
+  assert.deepEqual(
+    { "memory.max": cgroup("memory.max"), "memory.swap.max": cgroup("memory.swap.max"), "cpu.max": cgroup("cpu.max") },
+    { "memory.max": "4294967296", "memory.swap.max": "0", "cpu.max": "200000 100000" },
+    "run under --cpus=2 --memory=4g --memory-swap=4g",
+  );
+}
+
+function usage() {
+  const cpu = keyed("cpu.stat");
+  for (const key of ["nr_throttled", "throttled_usec"]) assert.ok(Number.isInteger(cpu[key]), `cpu.stat has no ${key}`);
+  return { nr_throttled: cpu.nr_throttled, throttled_usec: cpu.throttled_usec, events: keyed("memory.events") };
+}
+
+const median = (values) => {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
+// The diagnostics both timing tests record, before any of their end
+// assertions, so a failing run still shows them.
+function timingDiagnostics(t, { job, root, calledAt, calls, seen, stageOf, before }) {
+  const dir = join(root, ".kit", job);
+  const { startedAt } = JSON.parse(readFileSync(join(dir, "job.json"), "utf8"));
+  let result = null;
+  try {
+    result = JSON.parse(readFileSync(join(dir, "result.json"), "utf8"));
+  } catch {
+    // no result.json: the job died, which the end assertions report
+  }
+  t.diagnostic(`${job} total (result.json finishedAt − job.json startedAt): ${result === null ? "no result.json" : `${result.finishedAt - startedAt} ms`}`);
+  t.diagnostic(`${job}: kit ${job} call to the first non-running status: ${calls.at(-1).at} ms; job.json startedAt ${startedAt - calledAt} ms after the call`);
+  const firstSeen = new Map();
+  for (const [line, ms] of seen) {
+    const stage = stageOf(line);
+    if (stage !== null && !firstSeen.has(stage)) firstSeen.set(stage, ms);
+  }
+  for (const [stage, ms] of firstSeen) t.diagnostic(`${job} stage ${stage}: first seen ${ms} ms after the call`);
+  const latencies = calls.map(({ ms }) => ms);
+  t.diagnostic(`${job} status: ${calls.length} calls, median ${median(latencies)} ms, max ${Math.max(...latencies)} ms`);
+  const perStage = new Map();
+  for (const { stage, ms } of calls) perStage.set(stage, [...(perStage.get(stage) ?? []), ms]);
+  for (const [stage, values] of perStage) t.diagnostic(`${job} status during ${stage}: ${values.length} calls, max ${Math.max(...values)} ms`);
+  const after = usage();
+  t.diagnostic(
+    `${job} cpu.stat deltas: nr_throttled ${after.nr_throttled - before.nr_throttled}, throttled_usec ${after.throttled_usec - before.throttled_usec}`,
+  );
+  t.diagnostic(
+    `${job} memory.events deltas: ${Object.keys(after.events)
+      .map((key) => `${key} ${after.events[key] - (before.events[key] ?? 0)}`)
+      .join(", ")}`,
+  );
+  t.diagnostic(`${job} memory.peak ${cgroup("memory.peak")} bytes, memory.swap.peak ${cgroup("memory.swap.peak")} bytes (the container's peaks so far)`);
+  const retries = readLog(root, job)
+    .split("\n")
+    .filter((line) => /retry|retried|handle/i.test(line));
+  if (retries.length === 0) t.diagnostic(`${job} log: no line matches /retry|retried|handle/i (at the default log level)`);
+  for (const line of retries) t.diagnostic(`${job} log: ${line}`);
+}
+
+// Every status call while the job ran exits 3 with `running`, and every
+// call answers within the bound.
+function assertAnswered(calls, job) {
+  for (const [i, call] of calls.entries()) {
+    if (i < calls.length - 1) {
+      assert.equal(call.code, 3, call.out);
+      assert.ok(call.out.startsWith(`kit status: ${job} running (`), call.out);
+    }
+    assert.ok(call.ms <= STATUS_BOUND_MS, `status call ${i + 1} during ${call.stage} took ${call.ms} ms`);
+  }
+}
+
+// Test A's root once its check has passed; test B renders it.
+let maxRoot = null;
+
+test("5.4: on the tracked registry the maximum-size script passes, and status answers throughout", { skip: TIMING_SKIP, timeout: MAX_CHECK_LIMIT_MS }, async (t) => {
+  assertLimits();
+  const raw = maxScript();
+  const { script } = validateScript(JSON.stringify(raw));
+  const tone = join(scratch, "tone.wav");
+  execFileSync("ffmpeg", [
+    "-nostdin", "-v", "error",
+    "-f", "lavfi", "-i", `sine=frequency=440:sample_rate=48000:duration=${TONE_SECONDS}`,
+    "-ac", "1", "-c:a", "pcm_s16le",
+    tone,
+  ]);
+  const root = variant("max", (dir) => {
+    copyFileSync(join(TEMPLATE, "src", "kit", "render", "registry.ts"), join(dir, "src", "kit", "render", "registry.ts"));
+    writeFileSync(join(dir, "script.json"), `${JSON.stringify(raw, null, 2)}\n`);
+    for (const name of ["timeline.json", join("public", "narration.wav"), join("public", "voice")]) rmSync(join(dir, name), { recursive: true });
+    mkdirSync(join(dir, "public", "voice"));
+    for (const { stem } of blockStems(script)) copyFileSync(tone, join(dir, "public", "voice", `${stem}.wav`));
+    mkdirSync(join(dir, "public", "images"));
+    copyFileSync(join(TEMPLATE, "gallery", "public", "images", "sample.png"), join(dir, "public", "images", "sample.png"));
+  });
+  const laid = kit(root, "timeline");
+  assert.equal(laid.code, 0, laid.err);
+  t.diagnostic(laid.err.trim());
+  const timeline = JSON.parse(readFileSync(join(root, "timeline.json"), "utf8"));
+  assert.equal(timeline.totalFrames, checkTimeline(script, () => Math.round(TONE_SECONDS * 48000)).totalFrames);
+  const before = usage();
+  const calledAt = Date.now();
+  const { pid, elapsed } = startCheck(root);
+  t.diagnostic(`check returned in ${elapsed} ms`);
+  assert.ok(elapsed < 5000, `${elapsed} ms`);
+  const seen = new Map();
+  const calls = [];
+  const done = await settled(root, MAX_CHECK_LIMIT_MS - 120000, seen, { everyMs: POLL_MS, since: calledAt, calls, stageOf: checkStage });
+  timingDiagnostics(t, { job: "check", root, calledAt, calls, seen, stageOf: checkStage, before });
+  await ended(pid);
+  const tiles = sheetTiles(explainerScenes(script, timeline));
+  assert.deepEqual([done.code, done.out], [0, await passedOutput(root, tiles)], log(root));
+  assert.ok(existsSync(sheetPath(root)), "the pass wrote its sheet");
+  // B needs a passed check, not the latency bound below.
+  maxRoot = root;
+  assertAnswered(calls, "check");
+});
+
+test("5.4: kit render of the maximum-size script completes, and status answers throughout", { skip: TIMING_SKIP, timeout: MAX_RENDER_LIMIT_MS }, async (t) => {
+  assert.ok(maxRoot !== null, "5.4 test A's check did not pass; B renders its checked root");
+  const root = maxRoot;
+  assertLimits();
+  const { totalFrames } = JSON.parse(readFileSync(join(root, "timeline.json"), "utf8"));
+  const target = join(FILES, "max.mp4");
+  const tmp = join(root, ".kit", "render", "tmp");
+  let tmpSeen = null;
+  const onPoll = () => {
+    if (tmpSeen === null && existsSync(tmp) && readdirSync(tmp).length > 0) tmpSeen = readdirSync(tmp);
+  };
+  const before = usage();
+  const calledAt = Date.now();
+  const { pid, elapsed } = startCheck(root, "render");
+  t.diagnostic(`render returned in ${elapsed} ms`);
+  assert.ok(elapsed < 5000, `${elapsed} ms`);
+  const seen = new Map();
+  const calls = [];
+  const done = await settled(root, MAX_RENDER_LIMIT_MS - 120000, seen, { job: "render", everyMs: POLL_MS, since: calledAt, calls, stageOf: renderStage, onPoll });
+  timingDiagnostics(t, { job: "render", root, calledAt, calls, seen, stageOf: renderStage, before });
+  t.diagnostic(`.kit/render/tmp while the render ran: ${tmpSeen === null ? "never seen non-empty" : `${tmpSeen.length} entries, first ${tmpSeen.slice(0, 5).join(", ")}`}`);
+  await ended(pid);
+  assert.deepEqual([done.code, done.out], [0, `kit status: render succeeded: ${target}\n`], readLog(root, "render"));
+  const probed = JSON.parse(
+    execFileSync("ffprobe", ["-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt,nb_frames,duration", "-of", "json", target], {
+      encoding: "utf8",
+    }),
+  ).streams;
+  t.diagnostic(`ffprobe: ${JSON.stringify(probed)}`);
+  const video = probed.find((stream) => stream.codec_type === "video");
+  assert.equal(video.codec_name, "h264");
+  assert.equal(video.pix_fmt, "yuv420p");
+  assert.ok(probed.some((stream) => stream.codec_type === "audio" && stream.codec_name === "aac"), "no AAC stream");
+  assert.equal(Number(video.nb_frames), totalFrames);
+  assert.ok(Math.abs(Number(video.duration) - totalFrames / 30) <= 1 / 60, video.duration);
+  assert.ok(tmpSeen !== null, "no poll saw a non-empty .kit/render/tmp");
+  assertAnswered(calls, "render");
 });

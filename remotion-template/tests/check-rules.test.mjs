@@ -30,7 +30,9 @@ import { customIndexSource } from "../bin/custom-index.mjs";
 import { explainerScenes } from "../bin/explainer-scenes.mjs";
 import { blockStems } from "../bin/voice-stem.mjs";
 import { KIT_THEME, themes } from "../src/kit/theme.ts";
-import { checkFiles, checkScript, checkTimeline, stubFiles, voiceBytes } from "./fixtures/check/fixture.mjs";
+import { BODY_KINDS, validateScript } from "../bin/script-schema.mjs";
+import { candidates } from "../src/kit/gallery/catalog.ts";
+import { TONE_SECONDS, checkFiles, checkScript, checkTimeline, maxScript, stubFiles, voiceBytes } from "./fixtures/check/fixture.mjs";
 import { fixtureTimeline } from "./render/fixtures/explainer/fixture.mjs";
 
 const HINT = "; run node bin/kit.mjs timeline";
@@ -785,4 +787,41 @@ test("runChecks: a music project passes against musicDir, and its hash carries t
   const without = await projectHash(root, { script: s, timeline: timelineOnDisk, ...texts, musicDir: join(root, "absent") });
   assert.equal(result.pass?.hash, withTrack.hash);
   assert.notEqual(withTrack.hash, without.hash);
+});
+
+// --- task 5.4: the maximum-size script ----------------------------------------------
+
+test("5.4: maxScript is the largest valid script", () => {
+  const s = validateScript(JSON.stringify(maxScript()));
+  assert.equal(s.ok, true, s.errors?.map((e) => e.message).join("\n"));
+  const { script: max } = s;
+  assert.deepEqual(
+    max.chapters.map((chapter) => chapter.scenes.length),
+    [4, 4, 4, 4, 4],
+  );
+  const body = max.chapters.flatMap((chapter) => chapter.scenes);
+  assert.deepEqual(
+    body.map((scene) => scene.kind),
+    [...BODY_KINDS, ...BODY_KINDS],
+  );
+  assert.deepEqual([max.hook.kind, max.summary.kind, max.endCard.kind], ["hook", "summary", "end-card"]);
+  // Playback order, each scene with the catalog sample it takes.
+  const scenes = [max.hook, ...body, max.summary, max.endCard];
+  const sampleIds = ["image", ...BODY_KINDS.map(() => "image"), ...BODY_KINDS.map(() => "max"), "image", "image"];
+  for (const [i, scene] of scenes.entries()) {
+    assert.equal(scene.narration.length, 4, `scene ${i + 1}: sentences`);
+    for (const sentence of scene.narration) {
+      assert.equal(sentence.length, 4, `scene ${i + 1}: blocks`);
+      for (const block of sentence) assert.equal([...block].length, 16, `scene ${i + 1}: block ${JSON.stringify(block)}`);
+    }
+    const sample = candidates.find((entry) => entry.kind === scene.kind).samples.find((entry) => entry.id === sampleIds[i]);
+    assert.deepEqual(scene.content, sample.content, `scene ${i + 1} (${scene.kind}) content`);
+    assert.equal(Object.hasOwn(scene, "image") ? scene.image : null, sample.image, `scene ${i + 1} (${scene.kind}) image`);
+  }
+  // totalFrames in (5300, 5400], the 180 s maximum, and over it one
+  // millisecond longer; every tone a whole number of samples.
+  const frames = (seconds) => checkTimeline(max, () => Math.round(seconds * 48000)).totalFrames;
+  const longest = frames(TONE_SECONDS);
+  assert.ok(longest > 5300 && longest <= 5400, `${longest} frames at ${TONE_SECONDS} s`);
+  assert.ok(frames(TONE_SECONDS + 0.001) > 5400, `${frames(TONE_SECONDS + 0.001)} frames one millisecond longer`);
 });
