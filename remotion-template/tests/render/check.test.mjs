@@ -43,7 +43,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { release, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sheetTiles } from "../../bin/contact-sheet.mjs";
@@ -148,7 +148,8 @@ function startCheck(root, job = "check") {
 // pause between polls. calls, when given, receives every status call as
 // {stage, at, ms, code, out}: the stage last seen in the log before the
 // call (stageOf names a line's stage, or null), the ms since `since` at
-// which it returned, and its latency. onPoll runs after each running poll.
+// which it returned, and its latency. onPoll(stage) runs after each running
+// poll, with the stage last seen in the log.
 async function settled(
   root,
   timeoutMs = CHECK_LIMIT_MS,
@@ -170,7 +171,7 @@ async function settled(
       }
     }
     if (status.code !== 3) return { ...status, ms: Date.now() - started };
-    onPoll();
+    onPoll(stage);
     assert.ok(Date.now() - started < timeoutMs, `still running after ${timeoutMs} ms`);
     await pause(everyMs);
   }
@@ -589,10 +590,73 @@ test("5.4: settled reads the log after each status call, so a line written as th
   assert.deepEqual([...seen.keys()], [STUB_LINE]);
 });
 
-// The container's cgroup v2 file `name`, trimmed; a missing file throws.
-const cgroup = (name) => readFileSync(join(CGROUP, name), "utf8").trim();
+test("5.4: without memory.peak and memory.swap.peak, the peaks are the maxima of memory.current and memory.swap.current", () => {
+  const dir = mkdtempSync(join(scratch, "cgroup-"));
+  const write = (name, bytes) => writeFileSync(join(dir, name), `${bytes}\n`);
+  write("memory.current", 1000);
+  write("memory.swap.current", 0);
+  const memory = memoryPeaks(dir);
+  write("memory.current", 5000);
+  memory.sample();
+  write("memory.current", 3000);
+  write("memory.swap.current", 7);
+  assert.deepEqual(memory.read(), {
+    memory: { source: "max of memory.current over 3 samples; kernel has no memory.peak", bytes: 5000 },
+    swap: { source: "max of memory.swap.current over 3 samples; kernel has no memory.swap.peak", bytes: 7 },
+  });
+  write("memory.peak", 9000);
+  write("memory.swap.peak", 11);
+  assert.deepEqual(memoryPeaks(dir).read(), { memory: { source: "memory.peak", bytes: 9000 }, swap: { source: "memory.swap.peak", bytes: 11 } });
+  for (const name of ["memory.peak", "memory.swap.peak", "memory.current"]) rmSync(join(dir, name));
+  assert.throws(() => memoryPeaks(dir), { code: "ENOENT", path: join(dir, "memory.current") });
+});
+
+// The cgroup v2 file `name` in dir (by default the container's own),
+// trimmed; a missing file throws.
+const cgroup = (name, dir = CGROUP) => readFileSync(join(dir, name), "utf8").trim();
 // A flat-keyed cgroup file (cpu.stat, memory.events) as {key: number}.
 const keyed = (name) => Object.fromEntries(cgroup(name).split("\n").map((line) => [line.split(" ")[0], Number(line.split(" ")[1])]));
+
+// The memory and swap peaks of the cgroup at dir. memory.peak (kernel
+// 5.19) and memory.swap.peak (kernel 6.5) are read when present. When one
+// is absent (ENOENT only), its peak is the maximum of memory.current (or
+// memory.swap.current) over every sample: one now, one per sample() call
+// (each poll while a job runs) and one per read(). read() gives
+// {memory, swap}, each {source, bytes}. Every other read error throws, and
+// so does a missing current file.
+function memoryPeaks(dir = CGROUP) {
+  const kinds = [
+    { label: "memory", peakFile: "memory.peak", currentFile: "memory.current" },
+    { label: "swap", peakFile: "memory.swap.peak", currentFile: "memory.swap.current" },
+  ].map((kind) => {
+    try {
+      cgroup(kind.peakFile, dir);
+      return { ...kind, direct: true };
+    } catch (thrown) {
+      if (thrown?.code !== "ENOENT") throw thrown;
+      return { ...kind, direct: false, max: 0, samples: 0 };
+    }
+  });
+  const sample = () => {
+    for (const kind of kinds.filter(({ direct }) => !direct)) {
+      kind.max = Math.max(kind.max, Number(cgroup(kind.currentFile, dir)));
+      kind.samples++;
+    }
+  };
+  const read = () => {
+    sample();
+    return Object.fromEntries(
+      kinds.map((kind) => [
+        kind.label,
+        kind.direct
+          ? { source: kind.peakFile, bytes: Number(cgroup(kind.peakFile, dir)) }
+          : { source: `max of ${kind.currentFile} over ${kind.samples} samples; kernel has no ${kind.peakFile}`, bytes: kind.max },
+      ]),
+    );
+  };
+  sample();
+  return { sample, read };
+}
 
 // The precondition of both timing tests: --cpus=2 --memory=4g
 // --memory-swap=4g, so no swap distorts a time.
@@ -611,8 +675,6 @@ function usage() {
     nr_throttled: cpu.nr_throttled,
     throttled_usec: cpu.throttled_usec,
     events: keyed("memory.events"),
-    peak: Number(cgroup("memory.peak")),
-    swapPeak: Number(cgroup("memory.swap.peak")),
   };
 }
 
@@ -624,8 +686,9 @@ const median = (values) => {
 
 // The diagnostics both timing tests record, before any of their end
 // assertions, so a failing run still shows them.
-function timingDiagnostics(t, { job, root, calledAt, calls, seen, stageOf, before }) {
+function timingDiagnostics(t, { job, root, calledAt, calls, seen, stageOf, before, memory }) {
   const dir = join(root, ".kit", job);
+  t.diagnostic(`${job} kernel ${release()}`);
   const { startedAt } = JSON.parse(readFileSync(join(dir, "job.json"), "utf8"));
   let result = null;
   try {
@@ -655,9 +718,12 @@ function timingDiagnostics(t, { job, root, calledAt, calls, seen, stageOf, befor
       .map((key) => `${key} ${after.events[key] - (before.events[key] ?? 0)}`)
       .join(", ")}`,
   );
-  // The container's peaks since it started: the value before shows whether
-  // this job raised it.
-  t.diagnostic(`${job} memory.peak before ${before.peak} bytes, after ${after.peak} bytes; memory.swap.peak before ${before.swapPeak}, after ${after.swapPeak} bytes`);
+  // memory.peak and memory.swap.peak are the container's peaks since it
+  // started: the value before shows whether this job raised it.
+  const peaks = memory.read();
+  for (const label of ["memory", "swap"]) {
+    t.diagnostic(`${job} ${label} peak (${peaks[label].source}): before ${before.memory[label].bytes} bytes, after ${peaks[label].bytes} bytes`);
+  }
   const retries = readLog(root, job)
     .split("\n")
     .filter((line) => /retry|retried|handle/i.test(line));
@@ -705,15 +771,16 @@ test("5.4: on the tracked registry the maximum-size script passes, and status an
   t.diagnostic(laid.err.trim());
   const timeline = JSON.parse(readFileSync(join(root, "timeline.json"), "utf8"));
   assert.equal(timeline.totalFrames, checkTimeline(script, () => Math.round(TONE_SECONDS * 48000)).totalFrames);
-  const before = usage();
+  const memory = memoryPeaks();
+  const before = { ...usage(), memory: memory.read() };
   const calledAt = Date.now();
   const { pid, elapsed } = startCheck(root);
   t.diagnostic(`check returned in ${elapsed} ms`);
   assert.ok(elapsed < 5000, `${elapsed} ms`);
   const seen = new Map();
   const calls = [];
-  const done = await settled(root, MAX_CHECK_LIMIT_MS - 120000, seen, { everyMs: POLL_MS, since: calledAt, calls, stageOf: checkStage });
-  timingDiagnostics(t, { job: "check", root, calledAt, calls, seen, stageOf: checkStage, before });
+  const done = await settled(root, MAX_CHECK_LIMIT_MS - 120000, seen, { everyMs: POLL_MS, since: calledAt, calls, stageOf: checkStage, onPoll: memory.sample });
+  timingDiagnostics(t, { job: "check", root, calledAt, calls, seen, stageOf: checkStage, before, memory });
   await ended(pid);
   const tiles = sheetTiles(explainerScenes(script, timeline));
   assert.deepEqual([done.code, done.out], [0, await passedOutput(root, tiles)], log(root));
@@ -730,11 +797,24 @@ test("5.4: kit render of the maximum-size script completes, and status answers t
   const { totalFrames } = JSON.parse(readFileSync(join(root, "timeline.json"), "utf8"));
   const target = join(FILES, "max.mp4");
   const tmp = join(root, ".kit", "render", "tmp");
-  let tmpSeen = null;
-  const onPoll = () => {
-    if (tmpSeen === null && existsSync(tmp) && readdirSync(tmp).length > 0) tmpSeen = readdirSync(tmp);
+  // Every name .kit/render/tmp held at any poll, with the stage in which
+  // it first appeared: one read of the directory per poll.
+  const tmpNames = new Map();
+  let tmpPolls = 0;
+  const memory = memoryPeaks();
+  const onPoll = (stage) => {
+    memory.sample();
+    tmpPolls++;
+    let names;
+    try {
+      names = readdirSync(tmp);
+    } catch (thrown) {
+      if (thrown?.code !== "ENOENT") throw thrown;
+      names = []; // the worker removed tmp/ as it ended, before status saw it end
+    }
+    for (const name of names) if (!tmpNames.has(name)) tmpNames.set(name, stage);
   };
-  const before = usage();
+  const before = { ...usage(), memory: memory.read() };
   const calledAt = Date.now();
   const { pid, elapsed } = startCheck(root, "render");
   t.diagnostic(`render returned in ${elapsed} ms`);
@@ -742,8 +822,9 @@ test("5.4: kit render of the maximum-size script completes, and status answers t
   const seen = new Map();
   const calls = [];
   const done = await settled(root, MAX_RENDER_LIMIT_MS - 120000, seen, { job: "render", everyMs: POLL_MS, since: calledAt, calls, stageOf: renderStage, onPoll });
-  timingDiagnostics(t, { job: "render", root, calledAt, calls, seen, stageOf: renderStage, before });
-  t.diagnostic(`.kit/render/tmp while the render ran: ${tmpSeen === null ? "never seen non-empty" : `${tmpSeen.length} entries, first ${tmpSeen.slice(0, 5).join(", ")}`}`);
+  timingDiagnostics(t, { job: "render", root, calledAt, calls, seen, stageOf: renderStage, before, memory });
+  t.diagnostic(`.kit/render/tmp over ${tmpPolls} polls: ${tmpNames.size} names`);
+  for (const [name, stage] of tmpNames) t.diagnostic(`.kit/render/tmp: ${name} (first seen during ${stage})`);
   await ended(pid);
   assert.deepEqual([done.code, done.out], [0, `kit status: render succeeded: ${target}\n`], readLog(root, "render"));
   const probed = JSON.parse(
@@ -758,6 +839,6 @@ test("5.4: kit render of the maximum-size script completes, and status answers t
   assert.ok(probed.some((stream) => stream.codec_type === "audio" && stream.codec_name === "aac"), "no AAC stream");
   assert.equal(Number(video.nb_frames), totalFrames);
   assert.ok(Math.abs(Number(video.duration) - totalFrames / 30) <= 1 / 60, video.duration);
-  assert.ok(tmpSeen !== null, "no poll saw a non-empty .kit/render/tmp");
+  assert.ok(tmpNames.size > 0, "no poll saw a non-empty .kit/render/tmp");
   assertAnswered(calls, "render");
 });
