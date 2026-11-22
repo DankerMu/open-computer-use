@@ -23,11 +23,12 @@ export const TRANSITION_FRAMES = 15;
 export const LENGTH_WINDOW = { minFrames: 1800, maxFrames: 5400 };
 
 // Each kind's declared minimum length in frames. For hook, question, concept
-// card, definition/quote, summary and end card the values are their task 4.2
-// components' own: the 15-frame entrance, 30 frames of rest and the 15-frame
-// exit make 60, and the end card's 90 is the tail. The others stay
-// conservative floors until tasks 4.3–4.4 set them from their components.
-// The end card's stays at most the 90-frame tail.
+// card, definition/quote, summary and end card (task 4.2) and for process
+// steps, cause and effect, comparison and timeline (task 4.3) the values are
+// their components' own: the 15-frame entrance, 30 frames of rest and the
+// 15-frame exit make 60, and the end card's 90 is the tail. The others stay
+// conservative floors until task 4.4 sets them from their components. The
+// end card's stays at most the 90-frame tail.
 export const MIN_SCENE_FRAMES = {
   hook: 60,
   question: 60,
@@ -45,9 +46,10 @@ export const MIN_SCENE_FRAMES = {
   "end-card": 90,
 };
 
-// Each kind's entrance in frames. The six task 4.2 components settle within
-// the kit-wide 15, so theirs are their components' own; the other kinds keep
-// it until tasks 4.3–4.4 set theirs from their approved components. A custom
+// Each kind's entrance in frames. The six task 4.2 components and the four
+// task 4.3 components settle within the kit-wide 15, so theirs are their
+// components' own; the other kinds keep it until task 4.4 sets theirs from
+// its approved components. A custom
 // scene must settle within it. kit check's probe targets, its rest rule and
 // the scene components all read it.
 export const ENTRANCE_FRAMES = {

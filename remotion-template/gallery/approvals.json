@@ -48,6 +48,86 @@
       "date": "2026-11-21",
       "export": "gallery/exports/2026-11-21-batch-4-2.json",
       "export_sha256": "737bd08e97058c14a086537ae8c4caac7abf436b166fbd81039b8d300aef8ea2"
+    },
+    {
+      "id": "hook",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "question",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "concept-card",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "definition-quote",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "summary",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "end-card",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "process-steps",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "cause-effect",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "comparison",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
+    },
+    {
+      "id": "timeline",
+      "decision": "approve",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-3.json",
+      "export_sha256": "06cbd4f9649c6527f0f40f8dbdfd3c30888a0906ec40c5a78d15f82a20b18599"
     }
   ]
 }
