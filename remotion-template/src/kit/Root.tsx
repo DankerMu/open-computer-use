@@ -5,7 +5,7 @@
 // components and the probe over the same components, each in KitFrame. Kit
 // commands bundle src/kit/index.ts; Studio and `npx remotion render
 // src/index.ts Main` never load it. The theme is KIT_THEME, the one kit
-// check judges with; task 4.6 changes it to the picked theme.
+// check judges with: the user's pick (task 4.6).
 
 import React from 'react';
 import {ProbeComposition} from './probe/Probe.tsx';

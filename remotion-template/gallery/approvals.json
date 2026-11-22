@@ -232,6 +232,14 @@
       "date": "2026-11-22",
       "export": "gallery/exports/2026-11-22-batch-4-4.json",
       "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
+    },
+    {
+      "id": "theme",
+      "decision": "light",
+      "reviewer": "Danker",
+      "date": "2026-11-22",
+      "export": "gallery/exports/2026-11-22-batch-4-4.json",
+      "export_sha256": "13bf4abae9f3d6e8fdc474711585a9ab0ffaa62268dd65937463a62dd375b3cc"
     }
   ]
 }

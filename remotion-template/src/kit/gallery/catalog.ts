@@ -49,7 +49,7 @@ export {validateCatalog} from './catalog-rules.ts';
 //     -f lavfi -i "gradients=s=1280x960:c0=0x123B5E:c1=0x3E8E9E:x0=0:y0=0:x1=1280:y1=960:n=2:d=1:r=1" \
 //     -f lavfi -i "color=c=0xFF8C1A:s=192x192:d=1:r=1" \
 //     -filter_complex "[0][1]overlay=(W-w)/2:(H-h)/2,format=rgb24" -frames:v 1 sample.png
-// Its centre differs from every brand slot of both themes; its 4:3 shape
+// Its centre differs from every brand slot of the kit's theme; its 4:3 shape
 // shows how `contain` letterboxes it in the square panel.
 const SAMPLE_IMAGE = 'sample.png';
 

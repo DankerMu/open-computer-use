@@ -113,7 +113,7 @@ export function renderPage(gallery, pageSha256) {
     "<body>",
     "<h1>Explainer kit gallery</h1>",
     `<p>Node ${esc(gallery.node)}. Page <code>${esc(pageSha256)}</code>.</p>`,
-    "<p>Watch each sample in both themes and read its probe result. Choose approve, redo or drop for every candidate," +
+    "<p>Watch each sample in the kit's theme and read its probe result. Choose approve, redo or drop for every candidate," +
       " pick a theme or leave it unset, then export the decisions.</p>",
     '<p><label>Reviewer <input id="reviewer" type="text"></label>' +
       ' <label>Date <input id="date" type="date"></label>' +
