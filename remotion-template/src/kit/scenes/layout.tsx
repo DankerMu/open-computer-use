@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// What the six scene components of task 4.2 share.
+// What the thirteen scene components of tasks 4.2–4.4 share: Hook,
+// Question, ConceptCard, DefinitionQuote, Summary and EndCard (4.2);
+// ProcessSteps, CauseEffect, Comparison and Timeline (4.3), for which Slide,
+// Pop and Arrow were appended; KeyNumber, Chart and ImageCallouts (4.4),
+// which appended nothing. Their approvals cover the code below this comment,
+// which tests/scenes.test.mjs pins by sha256.
 //
 // Lines is the one element that marks a text field for the probe: a block
 // holding the field's wrapLines lines, each its own block, in a box of
@@ -15,7 +20,9 @@
 // stretched to end on the entrance's last frame. From that frame on the
 // value is exactly 1, so every later frame is the same picture: nothing
 // moves with the narration, and the default single key reveal [0, 15)
-// describes the scene.
+// describes the scene. ImageCallouts alone keeps moving after it: its
+// picture zooms across the whole scene (callout-zoom.ts), never following
+// the narration.
 
 import React from 'react';
 import {Img, spring, staticFile, useCurrentFrame, useVideoConfig} from 'remotion';

@@ -21,7 +21,7 @@ import { renderPage } from "../bin/gallery-page.mjs";
 
 const PAGE_SHA = "ab".repeat(32);
 const ROLES = ["entrance-end", "midpoint", "pre-exit"];
-const VIOLATION = "alpha--s1--dark pre-exit frame 59: outside safe area: div:nth-child(1)>div:nth-child(2) right 12 px";
+const VIOLATION = "alpha--s1--light pre-exit frame 59: outside safe area: div:nth-child(1)>div:nth-child(2) right 12 px";
 
 function item(candidate, sample, theme, violations = []) {
   const id = `${candidate}--${sample}--${theme}`;
@@ -42,10 +42,8 @@ function gallery(candidates = [
   { id: "alpha", kind: "question", source: "written for the kit" },
 ]) {
   const pairs = [["theme", "sample"], ...candidates.map(({ id }) => [id, "s1"])];
-  const items = ["light", "dark"].flatMap((theme) =>
-    pairs.map(([c, s]) => item(c, s, theme, c === "alpha" && theme === "dark" ? [VIOLATION] : [])),
-  );
-  return { version: 1, node: "v22.23.2", themes: ["light", "dark"], candidates, items };
+  const items = pairs.map(([c, s]) => item(c, s, "light", c === "alpha" ? [VIOLATION] : []));
+  return { version: 1, node: "v22.23.2", themes: ["light"], candidates, items };
 }
 
 const escapeHtml = (text) =>
@@ -141,7 +139,7 @@ const COMPLETE = {
   date: "2026-11-19",
   decisions: { alpha: "redo", "zeta-card": "approve" },
   notes: { "zeta-card": "  keep the pacing  ", alpha: "   " },
-  themePicks: ["dark"],
+  themePicks: ["light"],
 };
 
 // --- the page ---------------------------------------------------------------
@@ -159,7 +157,7 @@ test("each item shows its clip, three key frames and its probe result", () => {
   assert.ok(!html.includes("onda <Card>"));
 });
 
-test("each candidate has approve, redo and drop and a note; the theme has light and dark; no remote resource", () => {
+test("each candidate has approve, redo and drop and a note; the theme has light; no remote resource", () => {
   const html = renderPage(gallery(), PAGE_SHA);
   for (const id of ["zeta-card", "alpha"]) {
     for (const value of ["approve", "redo", "drop"]) {
@@ -167,7 +165,7 @@ test("each candidate has approve, redo and drop and a note; the theme has light 
     }
     assert.ok(html.includes(`id="note-${id}"`), id);
   }
-  for (const value of ["light", "dark"]) assert.ok(html.includes(`<input type="radio" name="theme" value="${value}">`), value);
+  assert.ok(html.includes('<input type="radio" name="theme" value="light">'));
   for (const id of ["reviewer", "date", "export", "status"]) assert.ok(html.includes(`id="${id}"`), id);
   for (const match of html.matchAll(/\b(?:src|href)="([^"]*)"/g)) assert.match(match[1], /^(clips|frames)\/[^/]+$/);
   assert.ok(!/<link\b|<script\s+src|\burl\(|@import/.test(html));
@@ -210,7 +208,7 @@ test("a complete selection downloads gallery-decisions.json with the exact body"
       '      "decision": "redo"',
       "    }",
       "  ],",
-      '  "theme": "dark"',
+      '  "theme": "light"',
       "}",
       "",
     ].join("\n"),
@@ -244,7 +242,7 @@ test("a missing decision, reviewer or date downloads nothing and says what is mi
 
 test("an unset theme exports theme null", async () => {
   const { themePicks, ...form } = COMPLETE;
-  assert.deepEqual(themePicks, ["dark"]);
+  assert.deepEqual(themePicks, ["light"]);
   const result = await exportPage(renderPage(gallery(), PAGE_SHA), form);
   assert.equal(JSON.parse(result.body).theme, null);
 });
@@ -277,9 +275,9 @@ test("a page export committed with matching entries loads as those decisions and
   writeFileSync(join(root, exportPath), body);
   const digest = createHash("sha256").update(body).digest("hex");
   const entry = (id, decision) => ({ id, decision, reviewer: "Fixture Reviewer", date: "2026-11-19", export: exportPath, export_sha256: digest });
-  const approvals = { version: 1, entries: [entry("zeta-card", "approve"), entry("alpha", "redo"), entry("theme", "dark")] };
+  const approvals = { version: 1, entries: [entry("zeta-card", "approve"), entry("alpha", "redo"), entry("theme", "light")] };
   writeFileSync(join(root, "gallery", "approvals.json"), `${JSON.stringify(approvals, null, 2)}\n`);
   const loaded = loadApprovals(root);
   assert.deepEqual([...loaded.decisions], [["zeta-card", "approve"], ["alpha", "redo"]]);
-  assert.equal(loaded.theme, "dark");
+  assert.equal(loaded.theme, "light");
 });

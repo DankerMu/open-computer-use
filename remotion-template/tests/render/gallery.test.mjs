@@ -9,16 +9,17 @@
 // another:
 //   node --test --test-concurrency=1 "tests/render/*.test.mjs"
 // CI's tests/*.test.mjs glob does not match this file. Expected counts,
-// frames, paths and colours come from the fixture: 6 clips and 18 key
-// frames over the theme sample and two 60-frame placeholder samples in two
-// themes, probe frames 10, 30 and 59 (entrance 10), the placeholder's DOM
-// (its question line is the KitFrame's second child's first line), and
-// themes.{light,dark}.brand.accent against Onda's #D96B82.
+// frames, paths and colours come from the fixture: 3 clips and 9 key
+// frames over the theme sample and two 60-frame placeholder samples in the
+// kit's one theme, light (task 4.6), probe frames 10, 30 and 59 (entrance
+// 10), the placeholder's DOM (its question line is the KitFrame's second
+// child's first line), and themes.light.brand.accent against Onda's #D96B82.
 //
 // Then the other two KitFrame roots: 3.8's explainer fixture with its
 // custom scene replaced by Accent.tsx, stilled inside that scene (light), and
 // the real kit root's KitProbe over the same custom scene with
-// themes.dark in its props.
+// themes.light in its props. With one theme, that check can no longer tell
+// the target's own theme from the default KIT_THEME.
 //
 // Each CLI run gets its own empty parent directory, which is polled while
 // the run lasts, so a run that wrote straight into --out is caught even when
@@ -42,7 +43,7 @@ const TEMPLATE = fileURLToPath(new URL("../..", import.meta.url));
 const FIXTURES = join(TEMPLATE, "tests", "render", "fixtures", "gallery");
 const USAGE = "kit gallery: usage: node bin/gallery.mjs --out <dir>\n";
 const ROLES = ["entrance-end", "midpoint", "pre-exit"];
-const THEMES = ["light", "dark"];
+const THEMES = ["light"];
 const PAIRS = [["theme", "sample"], ["placeholder", "max"], ["placeholder", "overflow"]];
 const ITEM_IDS = THEMES.flatMap((theme) => PAIRS.map(([c, s]) => `${c}--${s}--${theme}`));
 const FRAMES = { theme: [15, 45, 89], placeholder: [10, 30, 59] };
@@ -218,7 +219,7 @@ async function stillKitRoots() {
     CUSTOM_FRAME,
   );
   const custom = explainerScenes(ACCENT_SCRIPT, ACCENT_TIMELINE)[2];
-  const targets = [{ scene: "custom", props: { ...custom.props, theme: themes.dark }, durationInFrames: custom.durationInFrames }];
+  const targets = [{ scene: "custom", props: { ...custom.props, theme: themes.light }, durationInFrames: custom.durationInFrames }];
   outcomes.kitProbe = await still("kit-probe", join(root, "src", "kit", "index.ts"), "KitProbe", { targets }, PROBE_FRAME);
 }
 
@@ -284,7 +285,7 @@ test("each rejected run worked in one temporary sibling and left neither it nor 
   }
 });
 
-test("the ok run writes index.html, gallery.json, 6 clips and 18 key frames through one sibling", () => {
+test("the ok run writes index.html, gallery.json, 3 clips and 9 key frames through one sibling", () => {
   const run = okRun();
   assert.equal(run.stdout, `${run.out}\n`);
   assert.deepEqual(run.after, ["gallery"]);
@@ -351,7 +352,7 @@ test("the theme sample and max probe clean; overflow is outside the safe area on
       assert.ok(html.includes(escapeHtml(line)), `the page lacks ${line}`);
     });
   }
-  assert.equal(html.split("probe: clean").length - 1, 4);
+  assert.equal(html.split("probe: clean").length - 1, 2);
 });
 
 test("KitFrame applies the brand at the root: the accent box is the theme's accent, Onda's own without the frame", () => {
@@ -369,5 +370,5 @@ test("the explainer's and the kit probe's KitFrame apply their theme's brand", (
   assertColour(pixel(explainer.value), themes.light.brand.accent, "Explainer (light)");
   const kitProbe = outcomes.kitProbe;
   if (kitProbe.error) throw kitProbe.error;
-  assertColour(pixel(kitProbe.value), themes.dark.brand.accent, "KitProbe (dark)");
+  assertColour(pixel(kitProbe.value), themes.light.brand.accent, "KitProbe (light)");
 });

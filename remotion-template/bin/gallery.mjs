@@ -3,9 +3,10 @@
 //
 // The gallery generator (task 4.1): `node bin/gallery.mjs --out <dir>`, run
 // from a project root. It renders every catalog sample and the theme sample
-// in both theme candidates, each as a clip and its three probe frames,
-// probes every item with bin/probe.mjs, and writes gallery.json and a
-// static index.html whose export button gives the user's decisions.
+// in each of the kit's themes (since task 4.6 only the user's pick), each as
+// a clip and its three probe frames, probes every item with bin/probe.mjs,
+// and writes gallery.json and a static index.html whose export button gives
+// the user's decisions.
 //
 // An existing --out is refused before any work. Everything is written into
 // a temporary sibling of --out, renamed to --out only after every item
@@ -63,7 +64,7 @@ function renderFailure(error, id) {
 }
 
 // The theme sample first, then each candidate's samples in catalog order;
-// the whole list once per theme, light then dark.
+// the whole list once per theme, in THEME_NAMES order.
 function itemsOf({ THEME_ID, THEME_NAMES, THEME_SAMPLE }, candidates) {
   const samples = [
     { candidate: THEME_ID, sample: THEME_SAMPLE.id, durationInFrames: THEME_SAMPLE.durationInFrames, entranceFrames: THEME_SAMPLE.entranceFrames },

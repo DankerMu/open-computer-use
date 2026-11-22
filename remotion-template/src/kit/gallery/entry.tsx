@@ -44,7 +44,9 @@ function checkComponents() {
 // The component, its props and its length for one sample.
 function resolveSample({candidate, sample, theme}: SampleProps) {
 	checkComponents();
-	if (!THEME_NAMES.includes(theme)) fail(`theme ${JSON.stringify(theme)} is not "light" or "dark"`);
+	if (!THEME_NAMES.includes(theme)) {
+		fail(`theme ${JSON.stringify(theme)} is not ${THEME_NAMES.map((name) => JSON.stringify(name)).join(' or ')}`);
+	}
 	const kitTheme = themes[theme as keyof typeof themes];
 	if (candidate === THEME_ID) {
 		if (sample !== THEME_SAMPLE.id) fail(`${THEME_ID}/${sample}: not in the catalog`);

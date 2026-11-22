@@ -9,6 +9,7 @@
 // `kit gallery: <where>: <problem>`.
 
 import {BODY_KINDS, IMAGE_NAME, contentSchema, escapeLine, fieldPath} from '../../../bin/script-schema.mjs';
+import {themes} from '../theme.ts';
 
 export type Block = {text: string; startFrame: number; endFrame: number};
 // The shape of a scene's props.timing (task 3.8), frames relative to the scene.
@@ -24,10 +25,11 @@ export type Candidate = {
 };
 
 // The theme sample: candidate id `theme`, sample id `sample`, 90 frames
-// with a 15-frame entrance.
+// with a 15-frame entrance. The theme names are the kit's themes, so no
+// second list can disagree with theme.ts.
 export const THEME_ID = 'theme';
 export const THEME_SAMPLE = {id: 'sample', durationInFrames: 90, entranceFrames: 15};
-export const THEME_NAMES = ['light', 'dark'];
+export const THEME_NAMES = Object.keys(themes);
 
 const ID = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const ID_LENGTH = 40;

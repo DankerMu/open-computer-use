@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// Theme tokens of the explainer kit. Two candidates share one shape; task 4.6
-// keeps one. The kit's colours live only here, in Onda's 12 `Brand` slots, so
-// `brandToCssVars` re-skins the Onda primitives from them. Fonts name only the
-// family the workspace image installs. Springs are Onda's own objects.
+// Theme tokens of the explainer kit: one theme, `light`, the user's pick
+// recorded in gallery/approvals.json (task 4.6). The kit's colours live only
+// here, in Onda's 12 `Brand` slots, so `brandToCssVars` re-skins the Onda
+// primitives from them. Fonts name only the family the workspace image
+// installs. Springs are Onda's own objects.
 
 import {SPRING_SMOOTH, SPRING_SNAPPY} from './onda/motion.ts';
 
@@ -25,7 +26,6 @@ const type = {
 const spacing = [8, 16, 24, 32, 48, 64, 96, 128];
 
 const motion = {
-	transitionFrames: 15,
 	springs: {smooth: SPRING_SMOOTH, snappy: SPRING_SNAPPY},
 };
 
@@ -51,29 +51,9 @@ export const themes = {
 		spacing,
 		motion,
 	},
-	dark: {
-		canvas,
-		safeArea,
-		brand: {
-			bg: '#0B0E14',
-			surface: '#151A23',
-			surface2: '#1F2633',
-			border: '#2A3241',
-			borderLit: '#3D4759',
-			text: '#F3F5F8',
-			dim: '#AEB7C6',
-			faint: '#7D8799',
-			accent: '#4C9AFF',
-			accentSoft: 'rgba(76, 154, 255, 0.18)',
-			fontDisplay: FONT,
-			fontBody: FONT,
-		},
-		type,
-		spacing,
-		motion,
-	},
 };
 
-// The one theme of the explainer: kit check judges with the theme Explainer
-// renders with. Task 4.6 changes it to the user's pick.
+// The one theme of the explainer, the user's pick recorded in
+// gallery/approvals.json: kit check judges with the theme Explainer renders
+// with.
 export const KIT_THEME = themes.light;

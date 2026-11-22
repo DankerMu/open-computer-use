@@ -14,14 +14,15 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { isCandidateId } from "../src/kit/gallery/catalog-rules.ts";
+import { THEME_NAMES, isCandidateId } from "../src/kit/gallery/catalog-rules.ts";
 
 const APPROVALS = "gallery/approvals.json";
 const EXPORT_SOURCE = "^gallery/exports/[A-Za-z0-9._-]+\\.json$";
 const EXPORT_PATTERN = new RegExp(EXPORT_SOURCE);
 const THEME = "theme";
 const DECISIONS = ["approve", "redo", "drop"];
-const THEMES = ["light", "dark"];
+// The kit's themes: an entry or export naming any other theme is refused.
+const THEMES = THEME_NAMES;
 const SHA256 = /^[0-9a-f]{64}$/;
 const DATE = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/;
 const ENTRY_FIELDS = ["id", "decision", "reviewer", "date", "export", "export_sha256"];

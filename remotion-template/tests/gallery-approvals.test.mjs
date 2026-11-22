@@ -104,20 +104,19 @@ test("entries load as decisions and the theme; a later entry replaces an earlier
   const root = tree(t, {
     exports: {
       [A]: exportBody(),
-      [B]: exportBody({ date: "2026-11-20", decisions: [{ id: "quiz", decision: "redo" }], theme: "dark" }),
+      [B]: exportBody({ date: "2026-11-20", decisions: [{ id: "quiz", decision: "redo" }], theme: null }),
     },
     entries: (d) => [
       entry(d),
       entry(d, { id: "chart-a", decision: "redo" }),
       entry(d, { id: "theme", decision: "light" }),
       entry(d, { decision: "redo", date: "2026-11-20", export: B, export_sha256: d[B] }),
-      entry(d, { id: "theme", decision: "dark", date: "2026-11-20", export: B, export_sha256: d[B] }),
     ],
   });
   const loaded = loadApprovals(root);
   assert.deepEqual([...loaded.decisions], [["quiz", "redo"], ["chart-a", "redo"]]);
   assert.notEqual(loaded.decisions.get("quiz"), "approve");
-  assert.equal(loaded.theme, "dark");
+  assert.equal(loaded.theme, "light");
 });
 
 test("a drop decision and a theme-only export load", (t) => {
@@ -217,8 +216,8 @@ test("a candidate entry not in its export, or with another decision, is refused"
   refused(tree(t, { entries: one({ decision: "drop" }) }), `${APPROVALS}: entries[0].decision differs from ${A}`);
 });
 
-test("a theme entry whose decision differs from the export's theme, or whose export has theme null, is refused", (t) => {
-  refused(tree(t, { entries: one({ id: "theme", decision: "dark" }) }), `${APPROVALS}: entries[0].decision differs from ${A}'s theme`);
+test("a theme entry with the unknown theme dark, or whose export has theme null, is refused", (t) => {
+  refused(tree(t, { entries: one({ id: "theme", decision: "dark" }) }), `${APPROVALS}: entries[0].decision is invalid`);
   const unset = tree(t, { exports: { [A]: exportBody({ theme: null }) }, entries: one({ id: "theme", decision: "light" }) });
   refused(unset, `${APPROVALS}: entries[0]: ${A} has theme null`);
 });

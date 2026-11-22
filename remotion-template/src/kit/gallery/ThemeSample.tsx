@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The gallery's theme sample (task 4.1): the theme as the user approves it.
+// The gallery's theme sample (task 4.1): the theme as the user approved it.
 // It shows the four type sizes, each as one fixed Chinese line through
 // wrapLines; the 12 brand slots as labelled swatches; and a caption page in
 // the caption band, drawn by the real Captions layer. Everything sits inside
 // the safe area and above the band, at or above the minimum size, so it
-// probes clean in both themes. It lasts 90 frames and fades in over 15
+// probes clean in the kit's theme. It lasts 90 frames and fades in over 15
 // (THEME_SAMPLE).
 
 import React from 'react';
