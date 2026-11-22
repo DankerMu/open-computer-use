@@ -158,14 +158,17 @@ async function settled(
   const started = Date.now();
   let stage = "before any stage";
   for (;;) {
-    if (seen !== null) {
-      for (const line of readLog(root, job).split("\n")) if (line !== "" && !seen.has(line)) seen.set(line, Date.now() - since);
-    }
     const called = Date.now();
     const status = kit(root, "status");
     const returned = Date.now();
     calls?.push({ stage, at: returned - since, ms: returned - called, code: status.code, out: status.out });
-    if (calls !== null) for (const line of readLog(root, job).split("\n")) stage = stageOf(line) ?? stage;
+    if (seen !== null || calls !== null) {
+      for (const line of readLog(root, job).split("\n")) {
+        if (line === "") continue;
+        if (seen !== null && !seen.has(line)) seen.set(line, Date.now() - since);
+        stage = stageOf(line) ?? stage;
+      }
+    }
     if (status.code !== 3) return { ...status, ms: Date.now() - started };
     onPoll();
     assert.ok(Date.now() - started < timeoutMs, `still running after ${timeoutMs} ms`);

@@ -96,13 +96,14 @@ async function until(check, timeoutMs, everyMs = 100) {
 }
 
 // Polls status in dir (by default the shared project) until it stops
-// reporting running; seen maps each log line to the ms since the call it was
-// first seen.
+// reporting running, reading the log after each status call so a line
+// written as the job ends is seen; seen maps each log line to the ms since
+// the call it was first seen.
 async function settled(limitMs, seen = null, dir = root) {
   const started = Date.now();
   for (;;) {
-    if (seen !== null) for (const line of readLog(dir).split("\n")) if (line !== "" && !seen.has(line)) seen.set(line, Date.now() - started);
     const status = kitIn(dir, "status");
+    if (seen !== null) for (const line of readLog(dir).split("\n")) if (line !== "" && !seen.has(line)) seen.set(line, Date.now() - started);
     if (status.code !== 3) return { ...status, ms: Date.now() - started };
     assert.ok(Date.now() - started < limitMs, `still running after ${limitMs} ms\n${readLog(dir)}`);
     await pause(seen === null ? 500 : 100);
