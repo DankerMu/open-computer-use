@@ -311,7 +311,7 @@ const galleryRun = once("gallery", async () => {
 
 const pixel = (path, x, y) => [...rgb(path, `1:1:${x}:${y}`)];
 
-test("gallery: the tracked catalog gives 62 clips, 186 key frames and no violation on any item", async () => {
+test("gallery: the tracked catalog gives 90 clips, 270 key frames and no violation on any item", async () => {
   const { out, items } = await galleryRun();
   assert.equal(items, CLIPS);
   assert.equal(readdirSync(join(out, "clips")).length, CLIPS);
