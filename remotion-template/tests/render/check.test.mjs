@@ -607,7 +607,13 @@ function assertLimits() {
 function usage() {
   const cpu = keyed("cpu.stat");
   for (const key of ["nr_throttled", "throttled_usec"]) assert.ok(Number.isInteger(cpu[key]), `cpu.stat has no ${key}`);
-  return { nr_throttled: cpu.nr_throttled, throttled_usec: cpu.throttled_usec, events: keyed("memory.events") };
+  return {
+    nr_throttled: cpu.nr_throttled,
+    throttled_usec: cpu.throttled_usec,
+    events: keyed("memory.events"),
+    peak: Number(cgroup("memory.peak")),
+    swapPeak: Number(cgroup("memory.swap.peak")),
+  };
 }
 
 const median = (values) => {
@@ -649,7 +655,9 @@ function timingDiagnostics(t, { job, root, calledAt, calls, seen, stageOf, befor
       .map((key) => `${key} ${after.events[key] - (before.events[key] ?? 0)}`)
       .join(", ")}`,
   );
-  t.diagnostic(`${job} memory.peak ${cgroup("memory.peak")} bytes, memory.swap.peak ${cgroup("memory.swap.peak")} bytes (the container's peaks so far)`);
+  // The container's peaks since it started: the value before shows whether
+  // this job raised it.
+  t.diagnostic(`${job} memory.peak before ${before.peak} bytes, after ${after.peak} bytes; memory.swap.peak before ${before.swapPeak}, after ${after.swapPeak} bytes`);
   const retries = readLog(root, job)
     .split("\n")
     .filter((line) => /retry|retried|handle/i.test(line));
