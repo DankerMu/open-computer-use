@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The scene components of tasks 4.2 and 4.3: their catalog entries and
+// The scene components of tasks 4.2–4.4: their catalog entries and
 // samples, the layout boxes, a source scan of src/kit/scenes/, and the
-// preservation of what batch 4.2's approval covers. Pure: the catalog, the
+// preservation of what the approvals of batches 4.2 and 4.3 cover. Pure: the catalog, the
 // boxes, the theme and the timing tables are imported through Node's type
 // stripping; the scene files are read as text, because Node cannot import
 // TSX. Expected kinds, numbers, lengths, required fields and digests are the
 // fixtures' literals; field lengths are computed against LIMITS.content.
 // Batch 4.3's kinds nest (steps[] and events[] are objects, and comparison's
 // left and right hold points[]), so the sample checks walk every content
-// value depth-first.
+// value depth-first. Batch 4.4 adds scalars that are not text (a number's
+// `value`, a chart's `type`, a callout's `x` and `y`), checked by their
+// schema and never as Han; its image-callouts samples all carry the image,
+// and its callout geometry comes from src/kit/scenes/callout-zoom.ts.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -23,6 +26,8 @@ import { LIMITS, contentSchema } from "../bin/script-schema.mjs";
 import { candidates, validateCatalog } from "../src/kit/gallery/catalog.ts";
 import { captionBand } from "../src/kit/render/captions.ts";
 import { IMAGE_BOX, TEXT_BOX } from "../src/kit/scenes/boxes.ts";
+import { S_MAX, calloutZoom } from "../src/kit/scenes/callout-zoom.ts";
+import { formatCount } from "../src/kit/text.ts";
 import { themes } from "../src/kit/theme.ts";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url));
@@ -40,6 +45,9 @@ const KINDS = [
   "cause-effect",
   "comparison",
   "timeline",
+  "key-number",
+  "chart",
+  "image-callouts",
 ];
 const FILES = {
   hook: "Hook",
@@ -52,6 +60,9 @@ const FILES = {
   "cause-effect": "CauseEffect",
   comparison: "Comparison",
   timeline: "Timeline",
+  "key-number": "KeyNumber",
+  chart: "Chart",
+  "image-callouts": "ImageCallouts",
 };
 // Entrance 15 for every kind; minimum 60, and 90 for the end card.
 const ENTRANCE = 15;
@@ -66,6 +77,9 @@ const MINIMUM = {
   "cause-effect": 60,
   comparison: 60,
   timeline: 60,
+  "key-number": 60,
+  chart: 60,
+  "image-callouts": 60,
 };
 // The required content fields of each kind (bin/script-schema.mjs CONTENT),
 // as paths: `a.b` is field b of object a, `a[].b` field b of each item of
@@ -81,8 +95,23 @@ const REQUIRED = {
   "cause-effect": ["cause", "effect"],
   comparison: ["left", "left.title", "left.points", "right", "right.title", "right.points"],
   timeline: ["events", "events[].year", "events[].label"],
+  "key-number": ["value", "label"],
+  chart: ["type", "title", "points", "points[].label", "points[].value"],
+  "image-callouts": ["callouts", "callouts[].x", "callouts[].y", "callouts[].label"],
 };
-const LISTS = new Set(["points", "steps", "events"]);
+const LISTS = new Set(["points", "steps", "events", "callouts"]);
+// Each candidate's sample ids, in order: max, image and min, except where
+// batch 4.4's catalog lists more. The samples on the 150-frame timing; every
+// other sample is as long as minFrames.
+const SAMPLE_IDS = {
+  "key-number": ["max", "image", "min", "wan", "yi"],
+  chart: ["max", "image", "min", "line-max", "line-image", "line-min"],
+};
+const sampleIds = (kind) => SAMPLE_IDS[kind] ?? ["max", "image", "min"];
+const MAX_TIMED = new Set(["max", "image", "line-max", "line-image"]);
+// The kind whose every sample carries the image, because the kind requires one.
+const IMAGE_KIND = "image-callouts";
+const SAMPLE_PNG = { width: 1280, height: 960 };
 const FULL_WIDTH_CLOSING = new Set([..."，。！？、；：）」』”’》】…"]);
 const HAN = /^\p{Script=Han}+$/u;
 const MAX_TIMING = { durationInFrames: 150, narrationEndFrame: 130, frames: [[[0, 60], [62, 130]]] };
@@ -110,12 +139,28 @@ function assertTwoHan(text, label) {
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
 // Every value under a content object, depth-first, as {path, field, value,
-// schema}. `path` names it (`steps[1].label`), `shape` drops the indices
-// (`steps[].label`), and `field` is the LIMITS.content key of its limit: its
-// own key, or `point` for an item of a points list. `schema` is its zod
-// schema, optional wrappers removed.
+// schema, text}. `path` names it (`steps[1].label`), `shape` drops the
+// indices (`steps[].label`), and `field` is the LIMITS.content key of its
+// limit: its own key, or `point` for an item of a points list. `schema` is
+// its zod schema, optional wrappers removed. A scalar that is not text (a
+// number, or an enum such as a chart's `type`) is checked here against its
+// schema, `x` and `y` within 0–1, and carries `text: false`, so it never
+// reaches a Han check.
 function* walk(value, schema, path = "", shape = "", field = null) {
-  if (path !== "") yield { path, shape, field, value, schema };
+  if (path !== "" && !Array.isArray(value) && !isObject(value)) {
+    const type = schema.def.type;
+    if (type === "number") {
+      assert.ok(typeof value === "number" && Number.isFinite(value), `${path}: ${value} is not a finite number`);
+      if (field === "x" || field === "y") assert.ok(value >= 0 && value <= 1, `${path}: ${value} is outside 0–1`);
+    } else if (type === "enum") {
+      assert.ok(schema.options.includes(value), `${path}: ${JSON.stringify(value)} is not one of ${schema.options}`);
+    } else {
+      assert.equal(type, "string", `${path}: unexpected ${type}`);
+    }
+    yield { path, shape, field, value, schema, text: type === "string" };
+    return;
+  }
+  if (path !== "") yield { path, shape, field, value, schema, text: false };
   if (Array.isArray(value)) {
     for (const [i, item] of value.entries()) {
       yield* walk(item, schema.element, `${path}[${i}]`, `${shape}[]`, field === "points" ? "point" : null);
@@ -132,7 +177,7 @@ function* walk(value, schema, path = "", shape = "", field = null) {
 
 // --- catalog ------------------------------------------------------------------
 
-test("the tracked catalog validates and lists exactly the ten kinds, one candidate each, id equal to kind", () => {
+test("the tracked catalog validates and lists exactly the thirteen kinds, one candidate each, id equal to kind", () => {
   assert.equal(validateCatalog(candidates), undefined);
   assert.deepEqual(
     candidates.map(({ id, kind }) => [id, kind]),
@@ -154,8 +199,8 @@ test("each candidate's source is its scene file, and its frames are the timing t
 
 // --- samples ------------------------------------------------------------------
 
-test("every candidate has the samples max, image and min, in that order", () => {
-  for (const kind of KINDS) assert.deepEqual(byKind(kind).samples.map((s) => s.id), ["max", "image", "min"], kind);
+test("every candidate has the samples max, image and min, in that order, and batch 4.4's listed extras after them", () => {
+  for (const kind of KINDS) assert.deepEqual(byKind(kind).samples.map((s) => s.id), sampleIds(kind), kind);
 });
 
 test("max: every content field at its LIMITS.content length in Han ending in a full-width closing mark, every list at its maximum", () => {
@@ -164,17 +209,17 @@ test("max: every content field at its LIMITS.content length in Han ending in a f
     const limits = LIMITS.content[kind];
     const schema = contentSchema(kind);
     assert.deepEqual(Object.keys(content).sort(), Object.keys(schema.shape).sort(), `${kind}: every field present`);
-    for (const { path, field, value, schema: own } of walk(content, schema)) {
+    for (const { path, field, value, schema: own, text } of walk(content, schema)) {
       if (Array.isArray(value)) {
         assert.ok(LISTS.has(field), `${kind}.${path} is a list`);
         assert.equal(value.length, limits[field].max, `${kind}.${path} count`);
       } else if (isObject(value)) {
         assert.deepEqual(Object.keys(value).sort(), Object.keys(own.shape).sort(), `${kind}.${path}: every field present`);
-      } else {
+      } else if (text) {
         assertMaxHan(value, limits[field], `${kind}.${path}`);
       }
     }
-    assert.equal(image, null, kind);
+    assert.equal(image, kind === IMAGE_KIND ? "sample.png" : null, kind);
   }
 });
 
@@ -189,8 +234,8 @@ test("max and image: a 150-frame timing, narration ending at 130, one sentence o
   }
 });
 
-test("image: max's content and timing, with image sample.png", () => {
-  for (const kind of KINDS) {
+test("image: max's content and timing, with image sample.png (image-callouts aside)", () => {
+  for (const kind of KINDS.filter((kind) => kind !== IMAGE_KIND)) {
     const max = sample(kind, "max");
     const withImage = sample(kind, "image");
     assert.deepEqual(withImage.content, max.content, kind);
@@ -205,15 +250,15 @@ test("min: required fields only, two Han characters each, lists at their minimum
     const found = [...walk(content, contentSchema(kind))];
     const fields = new Set(found.filter(({ field }) => field !== null && field !== "point").map(({ shape }) => shape));
     assert.deepEqual([...fields].sort(), [...REQUIRED[kind]].sort(), kind);
-    for (const { path, field, value } of found) {
+    for (const { path, field, value, text } of found) {
       if (Array.isArray(value)) {
         assert.ok(LISTS.has(field), `${kind}.${path} is a list`);
         assert.equal(value.length, LIMITS.content[kind][field].min, `${kind}.${path} count`);
-      } else if (!isObject(value)) {
+      } else if (text) {
         assertTwoHan(value, `${kind}.${path}`);
       }
     }
-    assert.equal(image, null, kind);
+    assert.equal(image, kind === IMAGE_KIND ? "sample.png" : null, kind);
   }
 });
 
@@ -230,6 +275,88 @@ test("min: as long as minFrames, narration in one block from 0 to minFrames − 
       assert.deepEqual(frames(timing), [[[0, minFrames - 20]]], kind);
     }
   }
+});
+
+// --- batch 4.4's sample rules ----------------------------------------------------
+
+const codePointCount = (text) => codePoints(text).length;
+const sameExcept = (a, b, label) => {
+  assert.deepEqual(a.image, b.image, `${label}: image`);
+  assert.deepEqual(a.timing, b.timing, `${label}: timing`);
+};
+
+test("key-number: max's value is -99999999 (8 code points as -9999.9万); min is 9999 without a unit; wan and yi are min at 12345 and 123456789", () => {
+  const max = sample("key-number", "max");
+  assert.equal(max.content.value, -99999999);
+  assert.equal(formatCount(max.content.value), "-9999.9万");
+  assert.equal(codePointCount(formatCount(max.content.value)), 8);
+  const min = sample("key-number", "min");
+  assert.equal(min.content.value, 9999);
+  assert.equal(Object.hasOwn(min.content, "unit"), false);
+  for (const [id, value] of [["wan", 12345], ["yi", 123456789]]) {
+    const extra = sample("key-number", id);
+    assert.deepEqual(extra.content, { ...min.content, value }, id);
+    sameExcept(extra, min, id);
+  }
+  assert.deepEqual(["min", "wan", "yi"].map((id) => formatCount(sample("key-number", id).content.value)), ["9999", "1.2万", "1.2亿"]);
+});
+
+test("chart: max is a bar chart whose values hold -99999999, another of magnitude ≥ 1e4, another negative and 0; min is a two-point bar chart; each line sample equals its bar sample but for type", () => {
+  const max = sample("chart", "max");
+  assert.equal(max.content.type, "bar");
+  const values = max.content.points.map((p) => p.value);
+  const at = values.indexOf(-99999999);
+  assert.ok(at >= 0, `${values} lacks -99999999`);
+  assert.equal(formatCount(values[at]), "-9999.9万");
+  const others = values.filter((_, i) => i !== at);
+  assert.ok(others.some((v) => Math.abs(v) >= 1e4), `${values}: no other value of magnitude ≥ 1e4`);
+  assert.ok(others.some((v) => v < 0), `${values}: no other negative value`);
+  assert.ok(values.includes(0), `${values}: no 0`);
+  for (const v of values) assert.ok(codePointCount(formatCount(v)) <= 8, `${v} formats to ${formatCount(v)}`);
+  const min = sample("chart", "min");
+  assert.equal(min.content.type, "bar");
+  assert.equal(min.content.points.length, 2);
+  for (const id of ["max", "image", "min"]) {
+    const bar = sample("chart", id);
+    const line = sample("chart", `line-${id}`);
+    assert.equal(line.content.type, "line", `line-${id}`);
+    assert.deepEqual({ ...line.content, type: "bar" }, bar.content, `line-${id}`);
+    sameExcept(line, bar, `line-${id}`);
+  }
+});
+
+test("image-callouts: every sample has sample.png and no callout near the centre; max holds the three corners, image the same labels inside, min one callout at (0, 0)", () => {
+  const c = byKind("image-callouts");
+  for (const s of c.samples) {
+    assert.equal(s.image, "sample.png", s.id);
+    for (const { x, y } of s.content.callouts) {
+      assert.ok(!(Math.abs(x - 0.5) < 0.15 && Math.abs(y - 0.5) < 0.15), `${s.id}: (${x}, ${y}) covers the image's centre`);
+    }
+  }
+  const max = sample("image-callouts", "max");
+  const image = sample("image-callouts", "image");
+  const min = sample("image-callouts", "min");
+  assert.deepEqual(max.content.callouts.map(({ x, y }) => [x, y]), [[0, 0], [1, 0], [1, 1]]);
+  assert.deepEqual(image.content.callouts.map((c) => c.label), max.content.callouts.map((c) => c.label));
+  for (const { x, y } of image.content.callouts) assert.ok(x > 0 && x < 1 && y > 0 && y < 1, `image: (${x}, ${y}) is not inside`);
+  assert.deepEqual(image.timing, max.timing);
+  assert.deepEqual(min.content.callouts.map(({ x, y }) => [x, y]), [[0, 0]]);
+});
+
+test("image-callouts through callout-zoom.ts with sample.png's 1280×960: max gives S = 1, image and min S = S_MAX, image's points lie ≥ 160 px from F, and min's image centre moves ≥ 0.15 of R across and down", () => {
+  const zoomOf = (id) => calloutZoom(SAMPLE_PNG, sample("image-callouts", id).content.callouts);
+  assert.equal(zoomOf("max").end, 1);
+  assert.equal(zoomOf("image").end, S_MAX);
+  assert.equal(zoomOf("min").end, S_MAX);
+  const { focus, points } = zoomOf("image");
+  for (const [i, p] of points.entries()) {
+    const distance = Math.hypot(p.x - focus.x, p.y - focus.y);
+    assert.ok(distance >= 160, `image: P${i + 1} lies ${distance} px from F`);
+  }
+  const { picture, focus: corner, end } = zoomOf("min");
+  const centre = { x: picture.left + picture.width / 2, y: picture.top + picture.height / 2 };
+  assert.ok((end - 1) * (centre.x - corner.x) >= 0.15 * picture.width, "min: the centre moves less than 0.15 of R across");
+  assert.ok((end - 1) * (centre.y - corner.y) >= 0.15 * picture.height, "min: the centre moves less than 0.15 of R down");
 });
 
 test("the samples' image is a 1280×960 PNG of at most 300 KB in gallery/public/images/", () => {
@@ -272,13 +399,17 @@ test("the image layout's text column and panel do not overlap", () => {
 // --- source scan --------------------------------------------------------------
 
 const SCENE_FILES = KINDS.map((kind) => `${FILES[kind]}.tsx`);
-// Batch 4.3's choreography sources, by scene file; CauseEffect has none.
+// Batch 4.3's and 4.4's choreography sources, by scene file; CauseEffect
+// has none. Chart's header also names line-chart/LineChart.tsx in prose.
 const ONDA = "// Source: degueba/onda 3c814051269597b31fee1603bef7ccfb93d091b6 registry/components/";
 const CHOREOGRAPHY = {
   "ProcessSteps.tsx": "progress-steps/ProgressSteps.tsx",
   "Timeline.tsx": "timeline/Timeline.tsx",
   "Comparison.tsx": "split-screen/SplitScreen.tsx",
   "CauseEffect.tsx": null,
+  "KeyNumber.tsx": "count-up/CountUp.tsx",
+  "Chart.tsx": "bar-chart/BarChart.tsx",
+  "ImageCallouts.tsx": "ken-burns/KenBurns.tsx",
 };
 const ONLY_CHOREOGRAPHY = "Only the choreography comes from the source above, no code";
 // What batch 4.2's approval covers, at origin/main 911e89a: the sha256 of
@@ -294,6 +425,15 @@ const PRESERVED = {
 };
 const PRESERVED_BOXES = "6da0ba2af4be9a7c8af1f4428988211392bb65be4c994e332e44289def4270f4";
 const LAYOUT_PREFIX = { bytes: 7006, sha256: "edc72567409ef87ecb0e72981dfdd4cdefe6ba6a36e5df8ba6bbde22f5a38782" };
+// What batch 4.3's approval covers, at origin/main 49d562f: the sha256 of
+// its four scene files, and the length in bytes and sha256 of layout.tsx.
+const PRESERVED_4_3 = {
+  "ProcessSteps.tsx": "516b64a80c84355b0e16933821891ee121fc6ddb06783bcdf5ac681675e68a2c",
+  "CauseEffect.tsx": "964091eae6b54f8688b8c7074b98613f320f5a4b8c7bddee41c06016d4c2835d",
+  "Comparison.tsx": "681b6695fb01330574a71cda76949f1d90e7b5c991ca851289b1eabc51e7cf2c",
+  "Timeline.tsx": "ced7b51c6e1b2a4c8e83656b4e8e779e32764e661521a60205683610a4cf9461",
+};
+const LAYOUT_PREFIX_4_3 = { bytes: 9968, sha256: "8025c13e2886e97aca621d83f651a080f3b6902daa779729bcf523e1b97e6e07" };
 const FORBIDDEN = [
   "nowrap",
   "toUpperCase",
@@ -307,7 +447,6 @@ const FORBIDDEN = [
   "overflowX",
   "overflowY",
   "clipPath",
-  "<svg",
   "foreignObject",
   "<span",
   "fetch(",
@@ -316,6 +455,12 @@ const FORBIDDEN = [
   "lineHeight",
   "letterSpacing",
 ];
+// Batch 4.4 lifts the <svg ban in Chart.tsx alone, for the line and its
+// dots: there it appears exactly once, and every file keeps these out, so no
+// text, clip, mask, image or reference sits in an svg.
+const SVG = "<svg";
+const SVG_FILE = "Chart.tsx";
+const SVG_FORBIDDEN = ["<text", "<tspan", "<textPath", "foreignObject", "<clipPath", "<mask", "<image", "<use"];
 const FORBIDDEN_PATTERNS = [
   ["a string-literal fontFamily", /fontFamily\s*:\s*['"`]/],
   ["a numeric literal fontSize", /fontSize\s*:\s*[-+]?[\d.]/],
@@ -345,9 +490,9 @@ function block(source, open) {
   throw new Error(`unbalanced braces from ${open}`);
 }
 
-test("src/kit/scenes holds the ten scene files, boxes.ts and layout.tsx, each with the FSL header", () => {
+test("src/kit/scenes holds the thirteen scene files, boxes.ts, callout-zoom.ts and layout.tsx, each with the FSL header", () => {
   const files = sources();
-  assert.deepEqual(Object.keys(files), [...SCENE_FILES, "boxes.ts", "layout.tsx"].sort());
+  assert.deepEqual(Object.keys(files), [...SCENE_FILES, "boxes.ts", "callout-zoom.ts", "layout.tsx"].sort());
   for (const [name, source] of Object.entries(files)) {
     const [first, second] = source.split("\n");
     assert.equal(first, "// SPDX-License-Identifier: FSL-1.1-Apache-2.0", name);
@@ -377,6 +522,16 @@ test("no scene file uses a construct the probe cannot judge or a value the theme
       const found = pattern.exec(source);
       assert.equal(found, null, `${name} has ${label}: ${found?.[0]}`);
     }
+  }
+});
+
+test("<svg appears exactly once in Chart.tsx and in no other file, and no file holds svg text, clips, masks, images or references", () => {
+  const files = sources();
+  assert.equal(typeof files[SVG_FILE], "string", `${SVG_FILE} is missing`);
+  for (const [name, source] of Object.entries(files)) {
+    const count = source.split(SVG).length - 1;
+    assert.equal(count, name === SVG_FILE ? 1 : 0, `${name} contains ${JSON.stringify(SVG)} ${count} times`);
+    for (const token of SVG_FORBIDDEN) assert.ok(!source.includes(token), `${name} contains ${JSON.stringify(token)}`);
   }
 });
 
@@ -410,7 +565,7 @@ test("data-kit-text appears once, inside layout.tsx's Lines", () => {
   assert.ok(lines.includes("data-kit-text={text}"), "Lines marks its element with its text");
 });
 
-test("batch 4.3's scene files name their choreography source on line 3, and CauseEffect names none", () => {
+test("batch 4.3's and 4.4's scene files name their choreography source on line 3, and CauseEffect names none", () => {
   const files = sources();
   for (const [name, path] of Object.entries(CHOREOGRAPHY)) {
     const source = files[name];
@@ -427,6 +582,12 @@ test("batch 4.3's scene files name their choreography source on line 3, and Caus
       assert.ok(header.includes(ONLY_CHOREOGRAPHY), `${name}'s header lacks "${ONLY_CHOREOGRAPHY}"`);
     }
   }
+});
+
+test("Chart.tsx's header also names Onda's line-chart/LineChart.tsx, the choreography of its line", () => {
+  const lines = sources()["Chart.tsx"].split("\n");
+  const header = lines.slice(0, lines.findIndex((line) => !line.startsWith("//"))).join("\n");
+  assert.ok(header.includes("registry/components/line-chart/LineChart.tsx"), "Chart.tsx's header does not name line-chart/LineChart.tsx");
 });
 
 // --- preservation -------------------------------------------------------------
@@ -446,4 +607,18 @@ test("layout.tsx at 911e89a is a byte-exact prefix of layout.tsx", () => {
   const bytes = readFileSync(join(SCENES, "layout.tsx"));
   assert.ok(bytes.length >= LAYOUT_PREFIX.bytes, `layout.tsx has ${bytes.length} bytes`);
   assert.equal(sha256(bytes.subarray(0, LAYOUT_PREFIX.bytes)), LAYOUT_PREFIX.sha256);
+});
+
+test("batch 4.3's scene files hash to their sha256 at 49d562f (a file removed in step 7 is skipped)", () => {
+  for (const [name, digest] of Object.entries(PRESERVED_4_3)) {
+    const path = join(SCENES, name);
+    if (!existsSync(path)) continue;
+    assert.equal(sha256(readFileSync(path)), digest, name);
+  }
+});
+
+test("layout.tsx at 49d562f is a byte-exact prefix of layout.tsx", () => {
+  const bytes = readFileSync(join(SCENES, "layout.tsx"));
+  assert.ok(bytes.length >= LAYOUT_PREFIX_4_3.bytes, `layout.tsx has ${bytes.length} bytes`);
+  assert.equal(sha256(bytes.subarray(0, LAYOUT_PREFIX_4_3.bytes)), LAYOUT_PREFIX_4_3.sha256);
 });
