@@ -77,12 +77,13 @@ function schemaScenes() {
 // The ids whose latest decision is approve.
 const approvedSet = () => [...loadApprovals(TEMPLATE).decisions].filter(([, decision]) => decision === "approve").map(([id]) => id);
 
-// One line per kind a surface has but `expected` lacks, and per kind it lacks.
+// One line per kind a surface has but `expected` lacks (extra), and per kind
+// of `expected` it lacks.
 function differences(surface, actual, expected) {
   const have = new Set(actual);
   const want = new Set(expected);
   return [
-    ...[...have].filter((kind) => !want.has(kind)).sort().map((kind) => `${surface} has ${kind}, which is not approved`),
+    ...[...have].filter((kind) => !want.has(kind)).sort().map((kind) => `${surface} has extra ${kind}`),
     ...[...want].filter((kind) => !have.has(kind)).sort().map((kind) => `${surface} lacks ${kind}`),
   ];
 }
