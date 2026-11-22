@@ -634,7 +634,7 @@ function timingDiagnostics(t, { job, root, calledAt, calls, seen, stageOf, befor
     const stage = stageOf(line);
     if (stage !== null && !firstSeen.has(stage)) firstSeen.set(stage, ms);
   }
-  for (const [stage, ms] of firstSeen) t.diagnostic(`${job} stage ${stage}: first seen ${ms} ms after the call`);
+  for (const [stage, ms] of firstSeen) t.diagnostic(`${job} ${stage}: first seen ${ms} ms after the call (${POLL_MS} ms polls)`);
   const latencies = calls.map(({ ms }) => ms);
   t.diagnostic(`${job} status: ${calls.length} calls, median ${median(latencies)} ms, max ${Math.max(...latencies)} ms`);
   const perStage = new Map();
