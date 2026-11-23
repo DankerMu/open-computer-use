@@ -30,11 +30,11 @@ Do these steps in this order:
 5. Run `node bin/kit.mjs timeline`.
 6. Run `node bin/kit.mjs check`, then run `node bin/kit.mjs status` until it no longer reports `running`.
 7. `view` the contact sheet that `status` names and answer every checklist question yes or no; on any "no", fix the script (or the image or voice it names), redo the steps it affects, and check again.
-8. Run `node bin/kit.mjs render`, then run `node bin/kit.mjs status` until it reports `render succeeded`, then tell the user the published path.
+8. Run `node bin/kit.mjs render`; only if it prints `started`, run `node bin/kit.mjs status` until it reports `render succeeded`, then tell the user the published path.
 
 Rules for explainers:
 
 - Skip step 3 when no scene has an image.
-- If `status` reports `failed` or `died`, follow "Failures" in `explainer-kit.md`. Never go on to step 8 before `status` reports `check passed`.
+- If `kit check` or `kit render` prints no `started` line, it refused: do not poll. On a refusal, or when `status` reports `failed` or `died`, follow "Failures" in `explainer-kit.md`. Never go on to step 8 before `status` reports `check passed`.
 - Read the official Remotion guidance, `/mnt/skills/public/remotion/remotion-best-practices/SKILL.md`, only to write a `custom` scene.
 - Render mechanics, polling and failure handling are in `explainer-kit.md`.

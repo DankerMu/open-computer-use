@@ -101,10 +101,12 @@ A scene of kind `custom` is the one scene you draw yourself. See "Custom scenes"
 - `generate_speech` may return the file under a numbered suffix, such as `<stem> (2).wav`. `kit voice-import` still imports it. It prints `imported <k> of <n>` and one `missing <stem>.wav` line per block without audio; then run `kit voice` again and make the missing calls.
 - A block's file name depends on its text, its place in the script and `voice`. After you change any of them, run step 4 again: only the changed blocks need speech.
 - If `generate_speech` is not available, or it returns `speech synthesis is not configured`, an explainer cannot be made. Tell the user so, and stop.
+- If `generate_speech` returns any other `Error:`, for example `speech synthesis failed: HTTP <code>`, `timed out after`, `request failed` or `returned no audio`, make the same call once more. If the same block fails twice, tell the user the error, and stop.
 
 ## Check and status
 
-- `kit check` and `kit render` start a background job and return at once. Only one job runs at a time.
+- `kit check` and `kit render` start a background job and return at once, printing `kit check: started (pid <pid>)` or `kit render: started (pid <pid>)`. Only one job runs at a time.
+- Poll only after a `started` line. If `kit check` or `kit render` prints no `started` line, it refused and started nothing: do not poll, because `status` still reports the earlier job. Follow the refusal instead.
 - `kit status` reports the job started last, with these lines and exit codes:
 
 | Exit | What `status` prints |
@@ -121,13 +123,15 @@ A scene of kind `custom` is the one scene you draw yourself. See "Custom scenes"
 
 ## Render
 
-- `kit render` needs a passing check, and the project must be unchanged since it passed. Otherwise it refuses with `no passing check` or `the project changed since the last passing check`: run step 6 again.
+- `kit render` needs a passing check, and the project must be unchanged since it passed. Otherwise it refuses with `no passing check` or `the project changed since the last passing check` and exits 1. Do not poll then: run step 6 again.
 - It renders into the project and publishes `/mnt/user-data/files/<name>.mp4` only when the file is complete. A failed render leaves any earlier file of that name as it was.
 - After `render succeeded`, tell the user that `/mnt/user-data/files/<name>.mp4` is in the Files tab.
 
 ## Failures
 
-- A command that refuses prints `kit <command>: <reason>` and exits 1. `script.json is invalid` is followed by one line per problem, naming the chapter, scene, field and limit. Fix each, then run the command again.
+- A command that refuses prints `kit <command>: <reason>`. It exits 2 for a usage error (an invalid project name, a wrong number of arguments, or a command run in the wrong directory) and 1 otherwise. `script.json is invalid` is followed by one line per problem, naming the chapter, scene, field and limit. Fix each, then run the command again.
 - `kit timeline` refuses a video `outside 60–180 s`. Add or remove narration, then redo steps 4 and 5.
+- `kit timeline` reports a block as `cannot be decoded` or `silent after trimming`. Running `kit voice` and `kit voice-import` again does not help: both keep the block's existing `public/voice/<stem>.wav`. Reword that block's text in `script.json`, which gives it a new file name, then redo steps 4 and 5.
+- After any fix: if you changed any `narration`, the `voice`, or added, removed or moved a scene, redo steps 4, 5 and 6. Otherwise redo step 6.
 - `check failed` or `render failed`: read every reason `status` prints and fix what it names. When a reason ends with `run node bin/kit.mjs <command>`, redo the steps from the one that runs that command. Otherwise redo step 6.
-- `died without an exit`: the job was killed, for example by an idle stop. Start the same job again with `kit check` or `kit render`.
+- `died without an exit`: the job was killed, for example by an idle stop. Read the end of its log with `tail -n 30 .kit/check/log` or `tail -n 30 .kit/render/log`, then start the same job again with `kit check` or `kit render`. If the same job dies twice, tell the user what the log says, and stop.
