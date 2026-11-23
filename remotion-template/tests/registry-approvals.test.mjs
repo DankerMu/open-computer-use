@@ -20,7 +20,9 @@
 // Schema scene object does not require `image`; hook, summary and end-card
 // are approved. The theme is the user's pick, `light`, and the kit holds only
 // that theme. A failure names each surface and each kind it has too many or
-// lacks.
+// lacks. The skill is a surface too (task 7.2): the kinds of the kind table
+// in skills/public/remotion/explainer-kit.md, read under its section heading
+// only, equal A, each listed once and `custom` not at all.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -36,6 +38,8 @@ import { THEME_NAMES } from "../src/kit/gallery/catalog-rules.ts";
 import { KIT_THEME, themes } from "../src/kit/theme.ts";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url));
+const KIT_REFERENCE = fileURLToPath(new URL("../../skills/public/remotion/explainer-kit.md", import.meta.url));
+const KIND_HEADING = "## Scene kinds";
 const REGISTRY = join(TEMPLATE, "src", "kit", "render", "registry.ts");
 const EXPORTS = join(TEMPLATE, "gallery", "exports");
 const JSON_SCHEMA = join(TEMPLATE, "script.schema.json");
@@ -72,6 +76,17 @@ function schemaScenes() {
   };
   walk(JSON.parse(readFileSync(JSON_SCHEMA, "utf8")));
   return scenes;
+}
+
+// The first cell of each row of the kind table: the rows under
+// KIND_HEADING, up to the next heading, whose first cell is one code span.
+function skillKinds() {
+  const lines = readFileSync(KIT_REFERENCE, "utf8").split("\n");
+  const start = lines.indexOf(KIND_HEADING);
+  assert.ok(start !== -1, `explainer-kit.md has no ${KIND_HEADING} line`);
+  const end = lines.findIndex((line, i) => i > start && line.startsWith("#"));
+  const section = lines.slice(start + 1, end === -1 ? undefined : end);
+  return section.map((line) => /^\| `([^`]+)` \|/.exec(line)).filter(Boolean).map((match) => match[1]);
 }
 
 // The ids whose latest decision is approve.
@@ -133,6 +148,18 @@ test("the approved set: the schema's kinds, the registry's kinds, the JSON Schem
   ];
   assert.deepEqual(
     surfaces.flatMap(([surface, kinds]) => [...differences(surface, kinds, approved), ...repeats(surface, kinds)]),
+    [],
+  );
+});
+
+test("the approved set: the kinds of explainer-kit.md's kind table equal A, each once, without custom", () => {
+  const kinds = skillKinds();
+  assert.deepEqual(
+    [
+      ...differences("explainer-kit.md's kind table", kinds, approvedSet()),
+      ...repeats("explainer-kit.md's kind table", kinds),
+      ...(kinds.includes(CUSTOM) ? [`explainer-kit.md's kind table lists ${CUSTOM}`] : []),
+    ],
     [],
   );
 });

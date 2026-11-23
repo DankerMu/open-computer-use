@@ -20,6 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "remotion-template"
 SKILL_DIR = ROOT / "skills" / "public" / "remotion"
 VENDORED = SKILL_DIR / "remotion-best-practices"
+ROUTER = SKILL_DIR / "SKILL.md"
+KIT_REFERENCE = SKILL_DIR / "explainer-kit.md"
+FREE_FORM = SKILL_DIR / "free-form.md"
+SKILL_FILES = (ROUTER, KIT_REFERENCE, FREE_FORM)
+KIT_CLI = TEMPLATE / "bin" / "kit.mjs"
 MANIFEST = ROOT / "tests" / "fixtures" / "remotion-best-practices.sha256"
 
 REMOTION_VERSION = "4.0.537"
@@ -79,10 +84,46 @@ LICENSE_TIERS = (
     "Company License",
 )
 SKILL_ROUTE = "/mnt/skills/public/remotion/remotion-best-practices/SKILL.md"
+ROUTER_MAX_LINES = 80
+# The router's eight explainer steps (spec "The video skill routes explainers
+# to the kit"): each step's line holds every needle, a command needle matched
+# so that no [a-z-] follows it.
+ROUTER_STEPS = (
+    ("node /opt/remotion-template/bin/kit.mjs new <name>", "cd /home/assistant/videos/<name>"),
+    ("script.json", "explainer-kit.md"),
+    ('node bin/kit.mjs image "<path>"',),
+    ("node bin/kit.mjs voice", "generate_speech", "node bin/kit.mjs voice-import"),
+    ("node bin/kit.mjs timeline",),
+    ("node bin/kit.mjs check", "node bin/kit.mjs status"),
+    ("`view`", "no", "check again"),
+    ("node bin/kit.mjs render", "node bin/kit.mjs status"),
+)
 
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _bounded(needle: str) -> re.Pattern[str]:
+    """The needle, as a word: no [a-z-] follows it, and a word needle has no
+    word character before it."""
+    before = r"(?<![\w-])" if needle[0].isalnum() else ""
+    return re.compile(before + re.escape(needle) + r"(?![a-z-])")
+
+
+def _kit_usages() -> dict[str, str]:
+    """COMMANDS in bin/kit.mjs, parsed from its text: name -> usage."""
+    source = _read(KIT_CLI)
+    block = re.search(r"^const COMMANDS = \{\n(.*?)^\};$", source, re.DOTALL | re.MULTILINE)
+    assert block, "bin/kit.mjs has no `const COMMANDS = {...};` literal"
+    entries = re.findall(
+        r"""^  (?:"([a-z-]+)"|([a-z-]+)): \{ usage: (?:"([^"]*)"|'([^']*)'),""",
+        block.group(1),
+        re.MULTILINE,
+    )
+    usages = {quoted or bare: double or single for quoted, bare, double, single in entries}
+    assert len(usages) == len(block.group(1).strip().splitlines()) == 8, usages
+    return usages
 
 
 def _words(path: Path) -> str:
@@ -249,17 +290,18 @@ def test_claude_md_lists_skill_md_as_mit() -> None:
         line for line in _read(ROOT / "CLAUDE.md").splitlines()
         if "SPDX-License-Identifier: MIT" in line
     )
-    assert "`skills/public/remotion/SKILL.md`" in rule
+    for path in SKILL_FILES:
+        assert f"`{path.relative_to(ROOT)}`" in rule, path.name
 
 
 def test_skill_md_is_ours_and_mit() -> None:
-    skill = _read(SKILL_DIR / "SKILL.md")
-    assert skill.startswith("---\nname: remotion\n")
-    assert "SPDX-License-Identifier: MIT" in skill
+    assert _read(ROUTER).startswith("---\nname: remotion\n")
+    for path in SKILL_FILES:
+        assert "SPDX-License-Identifier: MIT" in _read(path), path.name
 
 
 def test_skill_md_states_the_sandbox_rules() -> None:
-    skill = _read(SKILL_DIR / "SKILL.md")
+    skill = _read(FREE_FORM)
     for needle in (
         "/opt/remotion-template",
         "/home/assistant/videos/",
@@ -293,7 +335,7 @@ def test_skill_md_states_the_sandbox_rules() -> None:
 
 
 def test_skill_md_overrides_vendored_conflicts() -> None:
-    skill = _read(SKILL_DIR / "SKILL.md")
+    skill = _read(FREE_FORM)
     for needle in (
         "--gl=angle",
         "Config.setChromiumOpenGlRenderer('swangle')",
@@ -310,7 +352,7 @@ def test_skill_md_overrides_vendored_conflicts() -> None:
 
 
 def test_skill_md_check_frames_go_to_project_out() -> None:
-    skill = _read(SKILL_DIR / "SKILL.md")
+    skill = _read(FREE_FORM)
     assert (
         "npx --no-install remotion render src/index.ts Main out/frames --sequence"
         in skill
@@ -322,7 +364,7 @@ def test_skill_md_check_frames_go_to_project_out() -> None:
 
 
 def test_skill_md_background_render_reports_its_exit() -> None:
-    skill = _read(SKILL_DIR / "SKILL.md")
+    skill = _read(FREE_FORM)
     for needle in (
         "rm -f /mnt/user-data/files/<name>.mp4",
         "setsid nohup bash -c 'npx --no-install remotion render src/index.ts Main",
@@ -340,13 +382,73 @@ def test_skill_md_background_render_reports_its_exit() -> None:
     assert "pgrep" not in skill
 
 
+# --- router and kit reference ----------------------------------------------
+
+
+def test_router_lists_the_kit_steps_in_order() -> None:
+    router = _read(ROUTER)
+    lines = router.splitlines()
+    assert len(lines) <= ROUTER_MAX_LINES, f"SKILL.md has {len(lines)} lines, at most {ROUTER_MAX_LINES}"
+    steps = [(int(m.group(1)), line) for line in lines if (m := re.match(r"(\d+)\. ", line))]
+    assert [number for number, _ in steps] == list(range(1, len(ROUTER_STEPS) + 1)), steps
+    for (number, line), needles in zip(steps, ROUTER_STEPS):
+        for needle in needles:
+            assert _bounded(needle).search(line), f"step {number} lacks {needle!r}: {line}"
+    assert "sandbox has no internet access" in router
+    assert "/mnt/user-data/files/" in router
+
+
+def test_router_names_the_workflows_and_ties_the_vendored_guidance_to_custom() -> None:
+    router = _read(ROUTER)
+    for needle in ("free-form.md", "explainer-kit.md", "course", "promo", "report"):
+        assert _bounded(needle).search(router), needle
+    vendored = [line for line in router.splitlines() if "remotion-best-practices" in line]
+    assert len(vendored) == 1 and router.count("remotion-best-practices") == 1, vendored
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", vendored[0]) if "remotion-best-practices" in s]
+    assert len(sentences) == 1 and "`custom`" in sentences[0], vendored
+
+
+def test_skill_names_every_kit_command_and_no_other() -> None:
+    usages = _kit_usages()
+    text = {path.name: _read(path) for path in (ROUTER, KIT_REFERENCE)}
+    missing = [usage for usage in usages.values() if not any(_bounded(usage).search(t) for t in text.values())]
+    assert missing == []
+    unknown = [
+        f"{name}: node bin/kit.mjs {word}"
+        for name, t in text.items()
+        for word in re.findall(r"node bin/kit\.mjs ([a-z-]+)", t)
+        if word not in usages
+    ]
+    assert unknown == []
+
+
+def test_kit_reference_states_the_facts_the_kit_enforces() -> None:
+    reference = _read(KIT_REFERENCE)
+    lines = reference.splitlines()
+    for code, states in (("0", ("passed", "succeeded")), ("1", ("failed", "died")), ("3", ("running",)), ("4", ("no check has run",))):
+        assert any(
+            re.search(rf"`{code}`", line) and all(state in line for state in states) for line in lines
+        ), f"no line gives exit {code} with {states}"
+    for needle in (
+        "COMMAND_TIMEOUT",
+        "`formatCount`",
+        "at most 8 code points",
+        "src/custom/",
+        "default export",
+        "/opt/video-music/manifest.json",
+        "Synced image:",
+    ):
+        assert needle in reference, needle
+    assert "ENTRANCE_FRAMES" in reference or "15-frame entrance" in reference
+
+
 # --- notices ----------------------------------------------------------------
 
 
 def test_notice_names_remotion_and_license_tiers() -> None:
     notice = _words(ROOT / "NOTICE")
     for needle in (
-        "skills/public/remotion/SKILL.md",
+        *(str(path.relative_to(ROOT)) for path in SKILL_FILES),
         "skills/public/remotion/remotion-best-practices/",
         "Remotion 4.0.537",
         "Chrome Headless Shell",
@@ -376,4 +478,5 @@ def test_skills_readme_has_remotion_licensing_row() -> None:
     ]
     assert len(rows) == 1
     assert "Remotion License" in rows[0]
-    assert "public/remotion/SKILL.md" in rows[0]
+    for path in SKILL_FILES:
+        assert f"public/remotion/{path.name}" in rows[0], path.name

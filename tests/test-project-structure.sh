@@ -191,6 +191,8 @@ for f in remotion-template/package.json remotion-template/package-lock.json \
          remotion-template/remotion.config.ts remotion-template/tsconfig.json \
          remotion-template/src/index.ts remotion-template/src/Root.tsx \
          skills/public/remotion/SKILL.md \
+         skills/public/remotion/explainer-kit.md \
+         skills/public/remotion/free-form.md \
          skills/public/remotion/remotion-best-practices/SKILL.md \
          skills/public/remotion/remotion-best-practices/SOURCE.md; do
     if [ -f "$ROOT/$f" ]; then
