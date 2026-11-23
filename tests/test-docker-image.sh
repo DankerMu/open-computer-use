@@ -41,11 +41,12 @@ run_in_container() {
 }
 
 # Offline, bounded tool probes retain diagnostics and the container's exit status.
+# $2 is the time limit, 240s unless given.
 run_in_container_verbose() {
     # Kill stalled compilers/browser children before Docker removes the owned container.
     docker run --rm --platform linux/amd64 --network=none \
         --entrypoint=timeout --user=assistant "$IMAGE" \
-        --kill-after=10s 240s bash -euo pipefail -c "$1" 2>&1
+        --kill-after=10s "${2:-240s}" bash -euo pipefail -c "$1" 2>&1
 }
 
 # Host Python bounds Docker calls, including startup and cleanup.
@@ -371,7 +372,7 @@ echo ""
 # the existing grep-based pass/fail accounting handle the failure naturally.
 
 # 1. Runtime versions and executable Node tools
-echo "[1/16] Runtime versions and Node tools"
+echo "[1/17] Runtime versions and Node tools"
 NODE_PROBE=$(cat <<'PROBE'
 node <<'JS'
 const assert = require("node:assert/strict");
@@ -500,7 +501,7 @@ echo "$VERSIONS" | grep -q "Python 3" && pass "Python 3" || fail "Python version
 
 # 2. CommonJS require()
 echo ""
-echo "[2/16] CommonJS require()"
+echo "[2/17] CommonJS require()"
 for pkg in react pptxgenjs pdf-lib docx sharp react-dom/server react-icons/fa; do
     RESULT=$(run_in_container "node -e \"try { require('$pkg'); console.log('OK') } catch(e) { console.log('FAIL: ' + e.code) }\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "require('$pkg')" || fail "require('$pkg'): $RESULT"
@@ -519,7 +520,7 @@ echo "$RESULT" | grep -q "OK" && pass "marked renders a heading" || fail "marked
 
 # 3. ES Modules import
 echo ""
-echo "[3/16] ES Modules import"
+echo "[3/17] ES Modules import"
 for pkg in react pptxgenjs pdf-lib; do
     RESULT=$(run_in_container "node --input-type=module -e \"import '$pkg'; console.log('OK')\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "import '$pkg'" || fail "import '$pkg'"
@@ -527,7 +528,7 @@ done
 
 # 4. html2pptx import (full path)
 echo ""
-echo "[4/16] html2pptx import"
+echo "[4/17] html2pptx import"
 RESULT=$(run_in_container "node --input-type=module -e \"import { html2pptx } from '/usr/local/lib/node_modules_global/lib/node_modules/@anthropic-ai/html2pptx/dist/html2pptx.mjs'; console.log('OK')\"" 2>/dev/null || echo "SKIP")
 if echo "$RESULT" | grep -q "OK"; then
     pass "html2pptx ESM import"
@@ -539,7 +540,7 @@ fi
 
 # 5. CLI tools (Phase 6 — extended to include codex + opencode + --version smoke)
 echo ""
-echo "[5/16] CLI tools"
+echo "[5/17] CLI tools"
 for tool in mmdc tsc tsx claude codex opencode; do
     RESULT=$(run_in_container "which $tool >/dev/null 2>&1 && echo OK || echo MISSING") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "$tool in PATH" || fail "$tool not found in PATH"
@@ -600,7 +601,7 @@ fi
 
 # 6. Python packages
 echo ""
-echo "[6/16] Python packages"
+echo "[6/17] Python packages"
 for pkg in docx pptx openpyxl; do
     RESULT=$(run_in_container "python3 -c \"import $pkg; print('OK')\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "python import $pkg" || fail "python import $pkg"
@@ -628,7 +629,7 @@ echo "$RESULT" | grep -q "OK" && pass "python playwright" || fail "python playwr
 
 # 7. User npm install (lodash)
 echo ""
-echo "[7/16] User npm install"
+echo "[7/17] User npm install"
 RESULT=$(run_in_container 'cd /home/assistant && npm install lodash >/dev/null 2>&1 && if [ -d /home/assistant/node_modules/lodash ]; then echo "user=YES"; else echo "user=NO"; fi && SYS_COUNT=$(ls /home/node_modules/ 2>/dev/null | wc -l) && echo "system=$SYS_COUNT"') || RESULT=""
 echo "$RESULT" | grep -q "user=YES" && pass "lodash in /home/assistant/node_modules" || fail "lodash not in user dir"
 SYS=$(echo "$RESULT" | awk -F= '/^system=/{print $2}')
@@ -636,7 +637,7 @@ SYS=$(echo "$RESULT" | awk -F= '/^system=/{print $2}')
 
 # 8. npm prefix check
 echo ""
-echo "[8/16] npm configuration"
+echo "[8/17] npm configuration"
 RESULT=$(run_in_container 'npm config get prefix 2>/dev/null || echo "undefined"') || RESULT=""
 # Trim trailing whitespace/newlines so the anchored regex below can match
 # against a clean single-line value.
@@ -658,7 +659,7 @@ fi
 
 # 9. Volume size
 echo ""
-echo "[9/16] Volume size"
+echo "[9/17] Volume size"
 SIZE_KB=$(run_in_container "du -sk /home/assistant/ | cut -f1") || SIZE_KB=""
 if [ "${SIZE_KB:-999999}" -lt 1024 ]; then
     pass "/home/assistant < 1MB (${SIZE_KB}KB)"
@@ -668,7 +669,7 @@ fi
 
 # 10. Permissions and guard files
 echo ""
-echo "[10/16] Permissions and guard files"
+echo "[10/17] Permissions and guard files"
 RESULT=$(run_in_container '
 [ -x /home/assistant/.entrypoint.sh ] && echo "entrypoint=OK" || echo "entrypoint=FAIL"
 [ -f /home/assistant/.gitconfig ] && echo "gitconfig=OK" || echo "gitconfig=FAIL"
@@ -692,7 +693,7 @@ echo "$RESULT" | grep -q "owner=assistant" && pass "files owned by assistant" ||
 # root here matches production parity. /tmp is world-readable so the marker
 # check works regardless.
 echo ""
-echo "[11/16] Per-CLI dispatch smoke + marker gating"
+echo "[11/17] Per-CLI dispatch smoke + marker gating"
 for cli in claude codex opencode; do
     SMOKE_CONTAINER="ocu-smoke-${cli}-$$"
     # Start a long-running container (so we can exec the entrypoint twice).
@@ -782,7 +783,7 @@ done
 # (the [ -n "$PS1" ] guard would otherwise short-circuit and falsely pass).
 # Two variants: env var NO_AUTOSTART=1 and sentinel file /tmp/.no_autostart.
 echo ""
-echo "[12/16] NO_AUTOSTART escape hatch"
+echo "[12/17] NO_AUTOSTART escape hatch"
 NOAUTOSTART_OUT=$(docker run --rm --platform linux/amd64 \
     -e SUBAGENT_CLI=claude \
     -e NO_AUTOSTART=1 \
@@ -809,7 +810,7 @@ fi
 
 # 13. cli-defaults/ canonical configs present and parseable (Phase 2 D-09).
 echo ""
-echo "[13/16] cli-defaults/ canonical configs present and parseable"
+echo "[13/17] cli-defaults/ canonical configs present and parseable"
 for f in opencode.json codex.json README.md; do
     if docker run --rm --platform linux/amd64 "$IMAGE" sh -c "test -f /opt/cli-defaults/$f" 2>/dev/null; then
         pass "/opt/cli-defaults/$f exists in image"
@@ -838,7 +839,7 @@ fi
 # the image with its declared entrypoint and checks that (a) the process
 # exits 0, and (b) the expected status banner is printed.
 echo ""
-echo "[14/16] Entrypoint execution"
+echo "[14/17] Entrypoint execution"
 # Wrap the command substitution in `if` so `set -e` does not abort the
 # whole test script on a non-zero docker exit — we need to reach fail()
 # with the captured output for structured reporting.
@@ -865,7 +866,7 @@ fi
 # 15. Offline Remotion template, started the way skills/public/remotion/SKILL.md
 # says: copy without node_modules, symlink the root-owned node_modules, no network.
 echo ""
-echo "[15/16] Offline Remotion template"
+echo "[15/17] Offline Remotion template"
 if REMOTION_OUT=$(run_in_container_verbose '
 [ "$(stat -c %U /opt/remotion-template/node_modules)" = root ] && echo "owner=OK"
 [ ! -w /opt/remotion-template/node_modules ] && echo "readonly=OK"
@@ -918,7 +919,7 @@ echo "$REMOTION_OUT" | grep -q "still3d=OK" && pass "ThreeCanvas still with --gl
 # ids and approvals digest come from the repository; the in-image checker uses
 # only the standard library and the image's ffmpeg, not music_library.py.
 echo ""
-echo "[16/16] Music library"
+echo "[16/17] Music library"
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MUSIC_EXPECTED=$(python3 -I -B - "$REPO_ROOT" <<'PY'
 import hashlib
@@ -1097,6 +1098,242 @@ for number in 1 2 3 4 5 6 7 8; do
     case "$line" in
         "music$number=OK: "*) pass "${MUSIC_CHECKS[$((number - 1))]} (${line#*=OK: })" ;;
         *) line=${line#"music$number=FAIL: "}; fail "${MUSIC_CHECKS[$((number - 1))]}: ${line:-no checker output}" ;;
+    esac
+done
+
+# 17. The explainer kit's offline path, as remotion-template/bin/kit.mjs
+# documents it: new, voice-import of sine-tone fixture audio, timeline,
+# check, status and render of the tracked script.json, in one container
+# without network. The container prints one kitN=OK or kitN=FAIL line per
+# step, each detail ending with the step's wall time; after the first FAIL
+# it prints nothing more, so later steps report no checker output.
+echo ""
+echo "[17/17] Offline kit path"
+KIT_PROBE=$(cat <<'PROBE'
+# The shortest whole millisecond at which kit timeline accepts the tracked
+# script.json: 0.887 s gives 1804 frames, 0.886 s gives 1782 and is refused
+# as outside 60-180 s.
+TONE_SECONDS=0.887
+# Inside the 40-frame lead-in, which ends at 1.333 s with the first tone:
+# the music has faded in by 0.5 s, and the window stops short of the first
+# tone and its AAC frame. Measured max_volume in this window: -12.3 dB with
+# snowfall-loop, -91.0 dB with music none.
+MUSIC_WINDOW="atrim=start=0.5:end=1.2"
+MUSIC_THRESHOLD=-40
+PROJECT=/home/assistant/videos/kit-smoke
+FILES=/mnt/user-data/files
+OUT=/tmp/kit-out
+BLOCKS=0
+FRAMES=0
+DETAIL=""
+
+# A command output file on one line: its first six lines joined with " | ".
+flat() {
+    awk 'NR <= 6 { printf "%s%s", (NR > 1 ? " | " : ""), $0 } END { if (NR > 6) printf " | ... %d more lines", NR - 6 }' "${1:-$OUT}"
+}
+
+# Polls kit status every 2 s while it exits 3; returns its last exit code
+# with its output in OUT.
+poll() {
+    local rc
+    while :; do
+        rc=0
+        node bin/kit.mjs status > "$OUT" 2>&1 || rc=$?
+        [ "$rc" -eq 3 ] || return "$rc"
+        sleep 2
+    done
+}
+
+step1() {
+    local rc=0
+    node /opt/remotion-template/bin/kit.mjs new kit-smoke > "$OUT" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$(cat "$OUT")" != "$PROJECT" ]; then
+        DETAIL="kit new exited $rc: $(flat)"; return 1
+    fi
+    cd "$PROJECT" || { DETAIL="cannot enter $PROJECT"; return 1; }
+    DETAIL="$PROJECT"
+}
+
+step2() {
+    local rc=0 before after
+    before=$(sha256sum script.json | cut -c1-64)
+    node /opt/remotion-template/bin/kit.mjs new kit-smoke > "$OUT" 2>&1 || rc=$?
+    after=$(sha256sum script.json | cut -c1-64)
+    if [ "$rc" -ne 1 ] || ! grep -qF "$PROJECT" "$OUT"; then
+        DETAIL="second kit new exited $rc, expected 1 naming $PROJECT: $(flat)"; return 1
+    fi
+    if [ "$before" != "$after" ]; then DETAIL="script.json sha256 changed from $before to $after"; return 1; fi
+    DETAIL="exit 1: $(flat); script.json sha256 ${after:0:12} unchanged"
+}
+
+step3() {
+    local music
+    music=$(python3 -I -c 'import json; tracks = json.load(open("/opt/video-music/manifest.json", encoding="utf-8"))["tracks"]; print(next((t["id"] for t in tracks if t.get("loop") is True), ""))' 2>&1) || {
+        DETAIL="cannot read /opt/video-music/manifest.json: $music"; return 1; }
+    [ -n "$music" ] || { DETAIL="no loop: true entry in /opt/video-music/manifest.json"; return 1; }
+    python3 -I -c 'import json, sys; script = json.load(open("script.json", encoding="utf-8")); script["music"] = sys.argv[1]; open("script.json", "w", encoding="utf-8").write(json.dumps(script, ensure_ascii=False, indent=2) + "\n")' "$music" > "$OUT" 2>&1 || {
+        DETAIL="cannot set music in script.json: $(flat)"; return 1; }
+    DETAIL="music $music"
+}
+
+step4() {
+    local rc=0
+    node bin/kit.mjs status > "$OUT" 2>&1 || rc=$?
+    if [ "$rc" -ne 4 ] || ! grep -qF "kit status: no check has run" "$OUT"; then
+        DETAIL="status exited $rc, expected 4: $(flat)"; return 1
+    fi
+    DETAIL="exit 4: $(flat)"
+}
+
+step5() {
+    local rc=0 name
+    node bin/kit.mjs voice > /tmp/kit-voice 2> "$OUT" || rc=$?
+    [ "$rc" -eq 0 ] || { DETAIL="kit voice exited $rc: $(flat)"; return 1; }
+    python3 -I -c 'import json, sys; [print(json.loads(line)["filename"]) for line in open(sys.argv[1], encoding="utf-8")]' /tmp/kit-voice > /tmp/kit-names 2> "$OUT" || {
+        DETAIL="kit voice printed a line that is not a speech call: $(flat)"; return 1; }
+    while IFS= read -r name; do
+        ffmpeg -nostdin -v error -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=$TONE_SECONDS" -ac 1 -c:a pcm_s16le "$FILES/$name" > "$OUT" 2>&1 || {
+            DETAIL="ffmpeg for $name: $(flat)"; return 1; }
+        BLOCKS=$((BLOCKS + 1))
+    done < /tmp/kit-names
+    [ "$BLOCKS" -gt 0 ] || { DETAIL="kit voice printed no blocks"; return 1; }
+    DETAIL="$BLOCKS blocks, $TONE_SECONDS s tones"
+}
+
+step6() {
+    local rc=0
+    node bin/kit.mjs voice-import > "$OUT" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] || ! grep -qF "imported $BLOCKS of $BLOCKS" "$OUT"; then
+        DETAIL="voice-import exited $rc, expected imported $BLOCKS of $BLOCKS: $(flat)"; return 1
+    fi
+    DETAIL="$(flat)"
+}
+
+step7() {
+    local rc=0 summary
+    node bin/kit.mjs timeline > "$OUT" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] || { DETAIL="timeline exited $rc: $(flat)"; return 1; }
+    summary=$(grep -m1 "^kit timeline: $BLOCKS blocks, " "$OUT") || { DETAIL="no summary line: $(flat)"; return 1; }
+    FRAMES=$(python3 -I -c 'import json; print(json.load(open("timeline.json", encoding="utf-8"))["totalFrames"])' 2>&1) || {
+        DETAIL="cannot read timeline.json: $FRAMES"; return 1; }
+    if ! [[ $FRAMES =~ ^[0-9]+$ ]] || [ "$FRAMES" -lt 1800 ] || [ "$FRAMES" -gt 1830 ]; then
+        DETAIL="totalFrames $FRAMES is outside 1800-1830"; return 1
+    fi
+    DETAIL="$summary; totalFrames $FRAMES"
+}
+
+step8() {
+    local rc=0 sheet tiles
+    node bin/kit.mjs check > "$OUT" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] || ! grep -qF "started" "$OUT"; then DETAIL="check exited $rc: $(flat)"; return 1; fi
+    rc=0
+    poll || rc=$?
+    if [ "$rc" -ne 0 ] || ! grep -qxF "kit status: check passed" "$OUT"; then
+        DETAIL="status exited $rc: $(flat)"; return 1
+    fi
+    sheet=$(sed -n "s/^contact sheet: //p" "$OUT")
+    [ -n "$sheet" ] && [ -s "$sheet" ] || { DETAIL="contact sheet ${sheet:-not named} is missing or empty"; return 1; }
+    tiles=$(grep -c "^  tile [0-9]" "$OUT" || true)
+    [ "$tiles" = 4 ] || { DETAIL="$tiles tile lines, expected 4: $(flat)"; return 1; }
+    DETAIL="check passed, contact sheet $sheet ($(stat -c %s "$sheet") bytes), $tiles tiles"
+}
+
+step9() {
+    local rc=0
+    node bin/kit.mjs render > "$OUT" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] || ! grep -qF "started" "$OUT"; then DETAIL="render exited $rc: $(flat)"; return 1; fi
+    rc=0
+    poll || rc=$?
+    if [ "$rc" -ne 0 ] || ! grep -qxF "kit status: render succeeded: $FILES/kit-smoke.mp4" "$OUT"; then
+        DETAIL="status exited $rc: $(flat)"; return 1
+    fi
+    grep -qxF "render: music" .kit/render/log || { DETAIL="no render: music line in .kit/render/log"; return 1; }
+    DETAIL="$(flat); .kit/render/log has render: music"
+}
+
+step10() {
+    local streams partials volume
+    ffprobe -v error -show_entries stream=codec_type,codec_name,pix_fmt,nb_frames -of json "$FILES/kit-smoke.mp4" > /tmp/kit-probe 2> "$OUT" || {
+        DETAIL="ffprobe: $(flat)"; return 1; }
+    streams=$(python3 -I -c '
+import json
+import sys
+
+streams = json.load(open(sys.argv[1], encoding="utf-8")).get("streams", [])
+frames = sys.argv[2]
+video = [s for s in streams if s.get("codec_type") == "video"]
+audio = [s for s in streams if s.get("codec_type") == "audio"]
+wrong = []
+if len(video) != 1 or [video[0].get(k) for k in ("codec_name", "pix_fmt", "nb_frames")] != ["h264", "yuv420p", frames]:
+    wrong.append(f"video streams {video}, expected one h264 yuv420p stream of {frames} frames")
+if len(audio) != 1 or audio[0].get("codec_name") != "aac":
+    wrong.append(f"audio streams {audio}, expected one aac stream")
+print("; ".join(wrong) or f"h264 yuv420p {frames} frames, aac")
+sys.exit(1 if wrong else 0)
+' /tmp/kit-probe "$FRAMES" 2>&1) || { DETAIL="$streams"; return 1; }
+    partials=$(find "$FILES" -name "*.partial" | paste -sd " " -)
+    [ -z "$partials" ] || { DETAIL="partial files left: $partials"; return 1; }
+    volume=$(ffmpeg -nostdin -hide_banner -nostats -i "$FILES/kit-smoke.mp4" -vn -af "$MUSIC_WINDOW,volumedetect" -f null - 2>&1 |
+        sed -n "s/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p" || true)
+    if ! [[ $volume =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || ! awk -v v="$volume" -v t="$MUSIC_THRESHOLD" 'BEGIN { exit !(v + 0 > t + 0) }'; then
+        DETAIL="lead-in max_volume ${volume:-unreadable} dB is not above $MUSIC_THRESHOLD dB"; return 1
+    fi
+    DETAIL="$streams; no partial file; lead-in max_volume $volume dB > $MUSIC_THRESHOLD dB"
+}
+
+# Runs one step and prints its line; the first failure ends the container.
+run_step() {
+    local number=$1 started=$EPOCHREALTIME rc=0 wall
+    DETAIL=""
+    "step$number" || rc=$?
+    wall=$(awk -v a="$started" -v b="$EPOCHREALTIME" 'BEGIN { printf "%.1f", b - a }')
+    if [ "$rc" -ne 0 ]; then
+        echo "kit$number=FAIL: $DETAIL ($wall s)"
+        exit 1
+    fi
+    echo "kit$number=OK: $DETAIL ($wall s)"
+}
+
+run_step 1
+run_step 2
+run_step 3
+run_step 4
+run_step 5
+run_step 6
+run_step 7
+run_step 8
+run_step 9
+run_step 10
+PROBE
+)
+KIT_STARTED=$SECONDS
+KIT_STATUS=0
+KIT_OUT=$(run_in_container_verbose "$KIT_PROBE" 1500s) || KIT_STATUS=$?
+KIT_SECONDS=$((SECONDS - KIT_STARTED))
+# Anything the container printed besides its kitN lines: Docker or timeout.
+KIT_OTHER=$(printf '%s\n' "$KIT_OUT" | grep -v '^kit[0-9]*=' | tail -n 5 || true)
+if [ "$KIT_STATUS" -eq 0 ]; then
+    pass "offline kit path exits 0 (${KIT_SECONDS} s)"
+else
+    fail "offline kit path exited $KIT_STATUS after ${KIT_SECONDS} s${KIT_OTHER:+: $KIT_OTHER}"
+fi
+KIT_CHECKS=(
+    "kit new creates /home/assistant/videos/kit-smoke"
+    "kit new again exits 1, script.json unchanged"
+    "script.json music set to the first loop track of /opt/video-music/manifest.json"
+    "kit status exits 4 before any job"
+    "sine-tone fixture audio written for every kit voice call"
+    "kit voice-import imports every block"
+    "kit timeline accepts the tracked script.json at 1800-1830 frames"
+    "kit check passes with a contact sheet and four tiles"
+    "kit render succeeds through the music step"
+    "published kit-smoke.mp4: h264 yuv420p at totalFrames, aac, no partial, music in the lead-in"
+)
+for number in 1 2 3 4 5 6 7 8 9 10; do
+    line=$(printf '%s\n' "$KIT_OUT" | grep -m1 "^kit$number=" || true)
+    case "$line" in
+        "kit$number=OK: "*) pass "${KIT_CHECKS[$((number - 1))]} (${line#*=OK: })" ;;
+        *) line=${line#"kit$number=FAIL: "}; fail "${KIT_CHECKS[$((number - 1))]}: ${line:-no checker output}" ;;
     esac
 done
 
