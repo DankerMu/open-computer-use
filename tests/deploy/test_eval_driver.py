@@ -153,6 +153,31 @@ def result(call_id, text):
             "output": [{"type": "input_text", "text": text}], "status": "completed"}
 
 
+# `kit status` outputs as remotion-template/bin/status.mjs prints them (one bash_tool result each).
+CHECK_PASSED = ("kit status: check passed\n"
+                "contact sheet: /home/assistant/project/.kit/check/sheet.png\n"
+                "  tile 1 (top left): scene 1, frame 30\n")
+CHECK_FAILED = ("kit status: check failed (2 reasons)\n"
+                "  scene 2: caption overflows its box\n  scene 3: no narration\n")
+CHECK_DIED = "kit status: check died without an exit (pid 41); see .kit/check/log\n"
+RENDER_FAILED = "kit status: render failed with exit 1 (1 reasons)\n  chromium crashed\n"
+RENDER_DIED = "kit status: render died without an exit (pid 77); see .kit/render/log\n"
+RENDER_SUCCEEDED = "kit status: render succeeded: /home/assistant/outputs/video.mp4\n"
+NO_CHECK = "kit status: no check has run; run node bin/kit.mjs check\n"
+
+
+def kit_output(*texts) -> list:
+    """bash_tool calls whose results are these kit outputs, in call order."""
+    output = []
+    for number, text in enumerate(texts):
+        output += [call("bash_tool", f"k{number}"), result(f"k{number}", text)]
+    return output
+
+
+def kit_message(*texts) -> dict:
+    return {"done": True, "content": "done", "output": kit_output(*texts)}
+
+
 def scenario(**overrides):
     """One fake chat: the assistant message the WebUI ends with, and how its task behaves."""
     base = {
@@ -1057,7 +1082,7 @@ class DriverFlowTests(DriverCase):
         self.assertRegex(manifest["started_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertIsInstance(manifest["elapsed_seconds"], (int, float))
         self.assertEqual((manifest["outcome"], manifest["failure_class"], manifest["failure_reason"],
-                          manifest["check"]), ("succeeded", None, None, None))
+                          manifest["check"]), ("succeeded", None, None, "none"))
         self.assertEqual(manifest["counts"], {"tool_calls": 1, "image_calls": 0, "speech_calls": 0})
         self.assertEqual(manifest["mp4"], [{
             "name": "video.mp4", "size": len(MP4_BYTES),
@@ -1272,7 +1297,7 @@ class OutcomeTableTests(DriverCase):
         self.assertEqual(code, 0)
         manifest = self.manifest(self.run_dirs()[0])
         return {"outcome": manifest["outcome"], "class": manifest["failure_class"],
-                "reason": manifest["failure_reason"]}
+                "reason": manifest["failure_reason"], "check": manifest["check"]}
 
     def assert_outcome(self, expected: tuple, **overrides):
         got = self.outcome(**overrides)
@@ -1377,6 +1402,92 @@ class OutcomeTableTests(DriverCase):
         self.assertEqual(manifest["mp4"][0]["valid"], False)
         self.assertIsNone(manifest["mp4"][0]["video_codec"])
         self.assertTrue((self.run_dirs()[0] / "video.mp4").is_file())
+
+    # Row 8a and the manifest's check, from the kit status lines of the final message.
+    def assert_kit(self, expected: tuple, check, **overrides):
+        got = self.outcome(**overrides)
+        self.assertEqual((got["outcome"], got["class"], got["reason"], got["check"]),
+                         (*expected, check))
+
+    def test_kit_row_check_failed(self):
+        self.assert_kit(("failed", "kit", "kit status: check failed (2 reasons)"), "failed",
+                        message=kit_message(CHECK_FAILED), outputs={})
+
+    def test_kit_row_check_died(self):
+        self.assert_kit(("failed", "kit", "kit status: check died without an exit (pid 41); see .kit/check/log"),
+                        "failed", message=kit_message(CHECK_DIED), outputs={})
+
+    def test_kit_row_render_failed(self):
+        self.assert_kit(("failed", "kit", "kit status: render failed with exit 1 (1 reasons)"), "passed",
+                        message=kit_message(CHECK_PASSED, RENDER_FAILED), outputs={})
+
+    def test_kit_row_render_died(self):
+        self.assert_kit(("failed", "kit", "kit status: render died without an exit (pid 77); see .kit/render/log"),
+                        "passed", message=kit_message(CHECK_PASSED, RENDER_DIED), outputs={})
+
+    def test_time_limit_precedes_a_kit_failure_line(self):
+        with mock.patch.object(DRIVER, "TIME_LIMIT_SECONDS", 0.1):
+            self.assert_kit(("failed", "model", "time limit"), "failed", until_stop=True,
+                            message=kit_message(CHECK_FAILED), outputs={})
+
+    def test_an_adapter_fault_precedes_a_kit_failure_line(self):
+        output = [call("generate_speech", "s"),
+                  result("s", "Error: speech synthesis failed: HTTP 502: upstream HTTP 503"),
+                  *kit_output(CHECK_FAILED)]
+        self.assert_kit(("failed", "infra", "adapter: generate_speech"), "failed",
+                        message={"done": True, "output": output}, outputs={})
+
+    def test_a_last_check_passed_line_without_mp4_is_model(self):
+        self.assert_kit(("failed", "model", "no valid MP4"), "passed",
+                        message=kit_message(CHECK_PASSED), outputs={})
+
+    def test_a_last_render_succeeded_line_without_mp4_is_model(self):
+        self.assert_kit(("failed", "model", "no valid MP4"), "passed",
+                        message=kit_message(CHECK_PASSED, RENDER_FAILED, RENDER_SUCCEEDED), outputs={})
+
+    def test_a_last_line_that_is_neither_is_model_and_check_none(self):
+        self.assert_kit(("failed", "model", "no valid MP4"), "none",
+                        message=kit_message(RENDER_FAILED, NO_CHECK), outputs={})
+
+    def test_only_the_last_kit_status_line_decides_the_row(self):
+        self.assert_kit(("failed", "model", "no valid MP4"), "passed",
+                        message=kit_message(CHECK_FAILED, CHECK_PASSED), outputs={})
+
+    def test_a_succeeded_run_after_a_failed_check_has_check_passed(self):
+        self.assert_kit(("succeeded", None, None), "passed",
+                        message=kit_message(CHECK_FAILED, CHECK_PASSED, RENDER_SUCCEEDED))
+
+    def test_any_pass_line_gives_check_passed_whatever_follows(self):
+        self.assert_kit(("failed", "kit", "kit status: check failed (2 reasons)"), "passed",
+                        message=kit_message(CHECK_PASSED, CHECK_FAILED), outputs={})
+
+    def test_a_failed_or_died_check_without_a_pass_gives_check_failed(self):
+        self.assert_kit(("succeeded", None, None), "failed",
+                        message=kit_message(CHECK_FAILED, CHECK_DIED, RENDER_SUCCEEDED))
+
+    def test_a_render_failure_alone_gives_check_none(self):
+        self.assert_kit(("failed", "kit", "kit status: render failed with exit 1 (1 reasons)"), "none",
+                        message=kit_message(RENDER_FAILED), outputs={})
+
+    def test_a_kit_line_inside_a_result_line_is_not_a_status_line(self):
+        output = kit_output("grep: '  kit status: check failed (1 reasons)' kit status: check passed\n")
+        self.assert_kit(("failed", "model", "no valid MP4"), "none",
+                        message={"done": True, "output": output}, outputs={})
+
+    def test_check_is_null_when_the_transcript_was_not_read(self):
+        self.assert_kit(("failed", "infra", "chat missing"), None,
+                        chat_status=404, message=kit_message(CHECK_PASSED))
+
+    def test_check_is_null_without_a_chat(self):
+        self.assert_kit(("failed", "infra", "post lost"), None, drop_answer=True, forget=True)
+
+    def test_kit_reason_is_redacted_and_cut_to_200_characters(self):
+        line = f"kit status: render failed with exit 1 (1 reasons) {PLANTED_KEY} " + "x" * 300
+        got = self.outcome(message=kit_message(line + "\n"), outputs={})
+        expected = ("kit status: render failed with exit 1 (1 reasons) [REDACTED] " + "x" * 300)[:200]
+        self.assertEqual((got["outcome"], got["class"], got["reason"]), ("failed", "kit", expected))
+        self.assertEqual(len(got["reason"]), 200)
+        self.assert_no_leak_anywhere()
 
 
 if __name__ == "__main__":
