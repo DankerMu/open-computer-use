@@ -95,7 +95,7 @@ ROUTER_STEPS = (
     ("node bin/kit.mjs voice", "generate_speech", "node bin/kit.mjs voice-import"),
     ("node bin/kit.mjs timeline",),
     ("node bin/kit.mjs check", "node bin/kit.mjs status"),
-    ("`view`", "no", "check again"),
+    ("`view`", 'on any "no"', "check again"),
     ("node bin/kit.mjs render", "node bin/kit.mjs status"),
 )
 
@@ -124,6 +124,11 @@ def _kit_usages() -> dict[str, str]:
     usages = {quoted or bare: double or single for quoted, bare, double, single in entries}
     assert len(usages) == len(block.group(1).strip().splitlines()) == 8, usages
     return usages
+
+
+def _code_spans(text: str) -> list[str]:
+    """The contents of the Markdown code spans in text, any fence length."""
+    return [m.group(2) for m in re.finditer(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", text)]
 
 
 def _words(path: Path) -> str:
@@ -417,6 +422,15 @@ def test_skill_names_every_kit_command_and_no_other() -> None:
         f"{name}: node bin/kit.mjs {word}"
         for name, t in text.items()
         for word in re.findall(r"node bin/kit\.mjs ([a-z-]+)", t)
+        if word not in usages
+    ]
+    # The shorthand `kit <command>`, read inside code spans only, so prose
+    # such as "the kit" is not a command.
+    unknown += [
+        f"{name}: kit {word}"
+        for name, t in text.items()
+        for span in _code_spans(t)
+        for word in re.findall(r"(?<![\w/.-])kit ([a-z-]+)", span)
         if word not in usages
     ]
     assert unknown == []

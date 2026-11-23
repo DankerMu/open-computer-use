@@ -78,15 +78,21 @@ function schemaScenes() {
   return scenes;
 }
 
-// The first cell of each row of the kind table: the rows under
-// KIND_HEADING, up to the next heading, whose first cell is one code span.
+// The first cell of every body row of the kind table: the table rows under
+// KIND_HEADING, up to the next heading, after its header and separator
+// rows. A cell that is one code span gives its content, any other cell its
+// text, so a row without a code span still counts.
 function skillKinds() {
   const lines = readFileSync(KIT_REFERENCE, "utf8").split("\n");
   const start = lines.indexOf(KIND_HEADING);
   assert.ok(start !== -1, `explainer-kit.md has no ${KIND_HEADING} line`);
   const end = lines.findIndex((line, i) => i > start && line.startsWith("#"));
-  const section = lines.slice(start + 1, end === -1 ? undefined : end);
-  return section.map((line) => /^\| `([^`]+)` \|/.exec(line)).filter(Boolean).map((match) => match[1]);
+  const rows = lines.slice(start + 1, end === -1 ? undefined : end).filter((line) => line.startsWith("|"));
+  assert.ok(rows.length >= 2 && /^\|(\s*:?-+:?\s*\|)+$/.test(rows[1]), `the table under ${KIND_HEADING} has no header and separator rows`);
+  return rows.slice(2).map((row) => {
+    const cell = row.split("|")[1].trim();
+    return /^`[^`]+`$/.test(cell) ? cell.slice(1, -1) : cell;
+  });
 }
 
 // The ids whose latest decision is approve.
