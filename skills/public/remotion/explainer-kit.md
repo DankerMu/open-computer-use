@@ -83,7 +83,7 @@ A scene of kind `custom` is the one scene you draw yourself. See "Custom scenes"
 
 ## Custom scenes
 
-- Use a `custom` scene only when no kind above can show the idea. A script holds at most one.
+- A script holds at most one `custom` scene.
 - In a chapter, write `{ "kind": "custom", "narration": [...], "component": "<Component>" }`, with an optional `image`. `<Component>` is a PascalCase name of up to 40 characters.
 - Write the component in `src/custom/<Component>.tsx` as its default export. `kit check` and `kit render` write `src/custom/index.ts`, which re-exports that `default`; do not edit `index.ts`.
 - The component receives these props, as `src/kit/render/CustomScene.tsx` defines them:
@@ -91,7 +91,7 @@ A scene of kind `custom` is the one scene you draw yourself. See "Custom scenes"
   - `theme`: the kit theme, with colours in `theme.brand`, sizes in `theme.type.sizes` and margins in `theme.safeArea`;
   - `image`: the scene's image name or `null`. Draw it with ``<Img src={staticFile(`images/${image}`)} />``.
 - Every element must reach its final place within the 15-frame entrance (`ENTRANCE_FRAMES`), by frame 15 of the scene.
-- Keep all text inside `theme.safeArea` and at least `theme.type.sizes.minimum` (32 px). `kit check` fails text that leaves the safe area, overflows its box or is smaller.
+- Keep all text inside `theme.safeArea` and at least `theme.type.sizes.minimum` (32 px). `kit check` fails text that leaves the safe area, is smaller, scrolls or is clipped.
 - Only for this component, read `/mnt/skills/public/remotion/remotion-best-practices/SKILL.md` for how to write Remotion code. Where it conflicts with the sandbox, the table at the top of `free-form.md` wins.
 
 ## Voice
