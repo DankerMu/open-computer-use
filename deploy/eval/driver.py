@@ -73,6 +73,11 @@ WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", 
 # The OCU tool wrapper's own transport faults (openwebui/tools/computer_use_tools.py).
 WRAPPER_PREFIXES = ("[CONFIG ERROR]", "[NETWORK ERROR]", "[MCP TRANSPORT ERROR]",
                     "[UNEXPECTED ERROR]", "[Timeout")
+# The kit's status lines (remotion-template/bin/status.mjs): every one starts KIT_STATUS.
+KIT_STATUS = "kit status: "
+CHECK_PASSED = "kit status: check passed"
+CHECK_FAILURES = ("kit status: check failed", "kit status: check died")
+KIT_FAILURES = (*CHECK_FAILURES, "kit status: render failed", "kit status: render died")
 IMAGE_TOOLS = ("generate_image", "edit_image")
 SPEECH_TOOL = "generate_speech"
 CHAT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -316,6 +321,22 @@ def infrastructure_fault(calls) -> str | None:
     return None
 
 
+def kit_lines(calls) -> list[str]:
+    """Every kit status line of the tool results, in call order."""
+    return [line for _name, _status, text in calls for line in text.splitlines()
+            if line.startswith(KIT_STATUS)]
+
+
+def kit_check(message: dict) -> str:
+    """The manifest's check: passed on any pass line, else failed on a failed or died check."""
+    lines = kit_lines(tool_calls(message))
+    if CHECK_PASSED in lines:
+        return "passed"
+    if any(line.startswith(CHECK_FAILURES) for line in lines):
+        return "failed"
+    return "none"
+
+
 def classify(stopped: bool, message: dict | None, call_failure: str | None, valid_mp4: bool,
              skipped: list):
     """The outcome table: (outcome, class, reason); the first matching row wins."""
@@ -344,6 +365,9 @@ def classify(stopped: bool, message: dict | None, call_failure: str | None, vali
     fault = None if valid_mp4 else infrastructure_fault(calls)
     if fault:
         return "failed", "infra", fault
+    kit = [] if valid_mp4 else kit_lines(calls)
+    if kit and kit[-1].startswith(KIT_FAILURES):
+        return "failed", "kit", kit[-1]
     return "failed", "model", "no valid MP4"
 
 
@@ -815,7 +839,7 @@ class Driver:
             run_dir, request["id"], repetition, number, chat_id=chat_id, started_at=pending["started_at"],
             elapsed_seconds=round(time.monotonic() - started, 3), outcome=outcome,
             failure_class=failure_class, failure_reason=reason, counts=counts(message), mp4=mp4,
-            skipped_outputs=skipped, **self.context)
+            skipped_outputs=skipped, check=None if message is None else kit_check(message), **self.context)
         line = f"eval: {run_dir.relative_to(self.root)} {outcome}"
         if failure_class:
             line += f" {failure_class}: " + re.sub(r"[\r\n]+", " ", manifest["failure_reason"])
