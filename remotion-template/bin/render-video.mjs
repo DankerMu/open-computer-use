@@ -12,6 +12,7 @@ import { bundle } from "@remotion/bundler";
 import { openBrowser, renderMedia, selectComposition } from "@remotion/renderer";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
+import { installLoopbackLookup } from "./loopback.mjs";
 
 const ENTRY_POINT = "src/kit/index.ts";
 const PUBLIC_DIR = "public";
@@ -26,6 +27,8 @@ const CONCURRENCY = 2;
 // 0/<total>` once the composition is selected, then `render: frames
 // <done>/<total>` at most once per tenth of the frames.
 export async function renderVideo({ root, script, timeline, music, output, log }) {
+  // The sandbox's empty /etc/hosts cannot resolve Remotion's serve URL (loopback.mjs).
+  installLoopbackLookup();
   const outDir = join(root, BUNDLE_DIR);
   let browser = null;
   try {
