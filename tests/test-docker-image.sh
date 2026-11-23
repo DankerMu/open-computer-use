@@ -41,10 +41,10 @@ run_in_container() {
 }
 
 # Offline, bounded tool probes retain diagnostics and the container's exit status.
-# $2 is the time limit, 240s unless given.
+# $2 is the time limit, 240s unless given; any further arguments go to docker run.
 run_in_container_verbose() {
     # Kill stalled compilers/browser children before Docker removes the owned container.
-    docker run --rm --platform linux/amd64 --network=none \
+    docker run --rm --platform linux/amd64 --network=none "${@:3}" \
         --entrypoint=timeout --user=assistant "$IMAGE" \
         --kill-after=10s "${2:-240s}" bash -euo pipefail -c "$1" 2>&1
 }
@@ -1104,9 +1104,12 @@ done
 # 17. The explainer kit's offline path, as remotion-template/bin/kit.mjs
 # documents it: new, voice-import of sine-tone fixture audio, timeline,
 # check, status and render of the tracked script.json, in one container
-# without network. The container prints one kitN=OK or kitN=FAIL line per
-# step, each detail ending with the step's wall time; after the first FAIL
-# it prints nothing more, so later steps report no checker output.
+# without network. Empty files mounted at /etc/hosts and /etc/resolv.conf
+# give the container the name service of a sandbox created with networking
+# disabled, where Docker writes neither file. The container prints one
+# kitN=OK or kitN=FAIL line per step, each detail ending with the step's
+# wall time; after the first FAIL it prints nothing more, so later steps
+# report no checker output.
 echo ""
 echo "[17/17] Offline kit path"
 KIT_PROBE=$(cat <<'PROBE'
@@ -1142,6 +1145,17 @@ poll() {
         [ "$rc" -eq 3 ] || return "$rc"
         sleep 2
     done
+}
+
+step0() {
+    local hosts resolv rc=0
+    hosts=$(stat -c %s /etc/hosts 2>&1) || { DETAIL="stat /etc/hosts: $hosts"; return 1; }
+    resolv=$(stat -c %s /etc/resolv.conf 2>&1) || { DETAIL="stat /etc/resolv.conf: $resolv"; return 1; }
+    getent hosts localhost > "$OUT" 2>&1 || rc=$?
+    if [ "$hosts" != 0 ] || [ "$resolv" != 0 ] || [ "$rc" -eq 0 ]; then
+        DETAIL="/etc/hosts $hosts bytes, /etc/resolv.conf $resolv bytes, getent hosts localhost exited $rc: $(flat)"; return 1
+    fi
+    DETAIL="/etc/hosts 0 bytes, /etc/resolv.conf 0 bytes, getent hosts localhost exited $rc"
 }
 
 step1() {
@@ -1294,6 +1308,7 @@ run_step() {
     echo "kit$number=OK: $DETAIL ($wall s)"
 }
 
+run_step 0
 run_step 1
 run_step 2
 run_step 3
@@ -1306,10 +1321,16 @@ run_step 9
 run_step 10
 PROBE
 )
+KIT_ETC=$(mktemp -d)
+: > "$KIT_ETC/hosts"
+: > "$KIT_ETC/resolv.conf"
+chmod 644 "$KIT_ETC/hosts" "$KIT_ETC/resolv.conf"
 KIT_STARTED=$SECONDS
 KIT_STATUS=0
-KIT_OUT=$(run_in_container_verbose "$KIT_PROBE" 1500s) || KIT_STATUS=$?
+KIT_OUT=$(run_in_container_verbose "$KIT_PROBE" 1500s \
+    -v "$KIT_ETC/hosts:/etc/hosts:ro" -v "$KIT_ETC/resolv.conf:/etc/resolv.conf:ro") || KIT_STATUS=$?
 KIT_SECONDS=$((SECONDS - KIT_STARTED))
+rm -rf "$KIT_ETC"
 # Anything the container printed besides its kitN lines: Docker or timeout.
 KIT_OTHER=$(printf '%s\n' "$KIT_OUT" | grep -v '^kit[0-9]*=' | tail -n 5 || true)
 if [ "$KIT_STATUS" -eq 0 ]; then
@@ -1318,6 +1339,7 @@ else
     fail "offline kit path exited $KIT_STATUS after ${KIT_SECONDS} s${KIT_OTHER:+: $KIT_OTHER}"
 fi
 KIT_CHECKS=(
+    "empty /etc/hosts and /etc/resolv.conf, getent hosts localhost fails"
     "kit new creates /home/assistant/videos/kit-smoke"
     "kit new again exits 1, script.json unchanged"
     "script.json music set to the first loop track of /opt/video-music/manifest.json"
@@ -1329,11 +1351,11 @@ KIT_CHECKS=(
     "kit render succeeds through the music step"
     "published kit-smoke.mp4: h264 yuv420p at totalFrames, aac, no partial, music in the lead-in"
 )
-for number in 1 2 3 4 5 6 7 8 9 10; do
+for number in 0 1 2 3 4 5 6 7 8 9 10; do
     line=$(printf '%s\n' "$KIT_OUT" | grep -m1 "^kit$number=" || true)
     case "$line" in
-        "kit$number=OK: "*) pass "${KIT_CHECKS[$((number - 1))]} (${line#*=OK: })" ;;
-        *) line=${line#"kit$number=FAIL: "}; fail "${KIT_CHECKS[$((number - 1))]}: ${line:-no checker output}" ;;
+        "kit$number=OK: "*) pass "${KIT_CHECKS[$number]} (${line#*=OK: })" ;;
+        *) line=${line#"kit$number=FAIL: "}; fail "${KIT_CHECKS[$number]}: ${line:-no checker output}" ;;
     esac
 done
 
