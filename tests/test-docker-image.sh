@@ -863,7 +863,7 @@ else
     fail "entrypoint missing escape-hint line (NO_AUTOSTART=1 bash / touch /tmp/.no_autostart): $ENTRYPOINT_OUT"
 fi
 
-# 15. Offline Remotion template, started the way skills/public/remotion/SKILL.md
+# 15. Offline Remotion template, started the way skills/public/remotion/free-form.md
 # says: copy without node_modules, symlink the root-owned node_modules, no network.
 echo ""
 echo "[15/17] Offline Remotion template"

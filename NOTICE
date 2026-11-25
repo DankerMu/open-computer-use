@@ -19,7 +19,8 @@ This product uses a multi-license model:
    competition.
 
 2. OUR SKILLS (skills/public/describe-image/, skills/public/sub-agent/,
-   skills/public/remotion/SKILL.md):
+   skills/public/remotion/SKILL.md, skills/public/remotion/explainer-kit.md,
+   skills/public/remotion/free-form.md):
    Licensed under the MIT License (LICENSE-MIT).
 
 3. THIRD-PARTY SKILLS (other directories under skills/):
