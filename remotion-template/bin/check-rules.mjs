@@ -29,7 +29,7 @@ import { MUSIC_DIR, musicReasons } from "./music.mjs";
 import { formatViolation, probe as kitProbe, violations } from "./probe.mjs";
 import { projectHash } from "./project-hash.mjs";
 import { ENTRANCE_FRAMES, REST_FRAMES, REVEALS, layout, revealsOf } from "./scene-timing.mjs";
-import { fieldPath, playbackWhere, validateScript } from "./script-schema.mjs";
+import { escapeLine, fieldPath, playbackWhere, validateScript } from "./script-schema.mjs";
 import { lengthError } from "./timeline.mjs";
 import { blockStems } from "./voice-stem.mjs";
 
@@ -238,6 +238,51 @@ export function restRule(script, timeline, reveals = REVEALS) {
 
 // --- 7. probe ---------------------------------------------------------------
 
+// wrapLines' two throws (src/kit/text.ts) and probe()'s target, each quoted
+// by JSON.stringify.
+const UNWRAPPABLE = [
+  [/opening marks of ("(?:[^"\\]|\\.)*") fill maxWidth (\d+)/, "its leading opening marks or spaces fill the line"],
+  [/piece ("(?:[^"\\]|\\.)*") is wider than maxWidth (\d+)/, "one character with its punctuation marks is wider than the line"],
+];
+const TARGET = /target ("(?:[^"\\]|\\.)*") frame/;
+
+// The string leaves of value in field order, each with its path.
+function* stringLeaves(value, path = []) {
+  if (typeof value === "string") yield { path, value };
+  else if (isObject(value) || Array.isArray(value)) {
+    for (const [key, inner] of Object.entries(value)) yield* stringLeaves(inner, [...path, Array.isArray(value) ? Number(key) : key]);
+  }
+}
+
+// The reason naming the field that holds the text of a wrapLines throw in
+// message: in the target's scene, or in every scene when message names no
+// target. Null when message holds no such throw, a quoted part does not
+// parse, or no field holds the text.
+function unwrappableReason(scenes, message) {
+  const found = UNWRAPPABLE.map(([pattern, cause]) => ({ match: pattern.exec(message), cause })).find(({ match }) => match !== null);
+  if (found === undefined) return null;
+  const [, quoted, width] = found.match;
+  const target = TARGET.exec(message)?.[1];
+  let text, where;
+  try {
+    text = JSON.parse(quoted);
+    where = target === undefined ? null : JSON.parse(target);
+  } catch (thrown) {
+    if (thrown instanceof SyntaxError) return null;
+    throw thrown;
+  }
+  for (const scene of scenes.filter((entry) => where === null || entry.where === where)) {
+    if (!isObject(scene.props.content)) continue;
+    for (const leaf of stringLeaves(scene.props.content)) {
+      if (leaf.value.includes(text)) {
+        const field = fieldPath(["content", ...leaf.path]);
+        return `${scene.where}: ${field} "${escapeLine(leaf.value)}" cannot be wrapped in ${width} characters: ${found.cause}; shorten that run`;
+      }
+    }
+  }
+  return null;
+}
+
 // Writes src/custom/index.ts, then probes every scene through the kit's own
 // KitProbe at its entrance end, midpoint and pre-exit frames.
 export async function probeRule(root, script, timeline, { probe, theme }) {
@@ -264,7 +309,9 @@ export async function probeRule(root, script, timeline, { probe, theme }) {
     // probe() wraps the scene's own message, so it is matched as a substring.
     const kind = /unknown scene "([^"]*)"/.exec(message)?.[1];
     const first = scenes.find((scene) => scene.kind === kind);
-    return [first === undefined ? `probe: ${message}` : `${first.where}: no component for kind "${kind}"`];
+    if (first !== undefined) return [`${first.where}: no component for kind "${kind}"`];
+    // A wrapLines throw names its scene and field; any other error is the message.
+    return [unwrappableReason(scenes, message) ?? `probe: ${message}`];
   }
   const reasons = violations(result, theme).map(formatViolation);
   if (result.frames.some((frame) => frame.fontPresent === false)) reasons.push(`font "${FONT}" is not installed`);
