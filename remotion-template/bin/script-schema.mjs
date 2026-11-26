@@ -6,11 +6,12 @@
 // scenes, a summary and an end card, with narration in caption blocks. Only
 // the narration shape is borrowed from the source above, no code.
 // validateScript is the one entry point for checking a script: it adds the
-// one-custom rule that JSON Schema cannot express and maps every problem to
-// the chapter, scene, field and limit. Each check's message is its limit, so
-// the limit text sits beside the number it describes. String lengths use
-// zod's .min()/.max(), which count code points and survive into the JSON
-// Schema as minLength/maxLength.
+// rules that JSON Schema cannot express, the one-custom rule and the number
+// rule (drawableNumber, a .refine that z.toJSONSchema leaves out), and maps
+// every problem to the chapter, scene, field and limit. Each check's message
+// is its limit, so the limit text sits beside the number it describes.
+// String lengths use zod's .min()/.max(), which count code points and
+// survive into the JSON Schema as minLength/maxLength.
 
 import { z } from "zod";
 
@@ -81,6 +82,25 @@ const list = (item, { min, max }, noun) => {
   return z.array(item).min(min, limit).max(max, limit);
 };
 const ratio = z.number().min(0, "0–1").max(1, "0–1");
+
+// A key-number value or chart point fits the 8 code points its line holds
+// (-9999.9万), and so does every count-up step towards it. Below 10000,
+// formatCount draws String(value), and a step cut toward zero to the value's
+// decimals is never longer. From 10000 the text is X.X万 or X.X亿, at most 8
+// up to -9999.9亿, so below 1e12; with at most 2 decimals, the steps below
+// 10000 draw at most sign, 4 digits, point and 2 decimals. Conservative:
+// ±1e12, and a positive value from 10000 with 3 decimals, would fit but are
+// refused; the limit text states the bounds, so the model rounds.
+const NUMBER_POINTS = 8;
+export function drawableNumber(value) {
+  const size = Math.abs(value);
+  // String(value) is ASCII, so its length counts code points.
+  if (size < 1e4) return String(value).length <= NUMBER_POINTS;
+  return size < 1e12 && Number(value.toFixed(2)) === value;
+}
+const NUMBER_LIMIT =
+  `drawn in at most ${NUMBER_POINTS} characters: below 10000 in size, at most ${NUMBER_POINTS} characters as written, ` +
+  "sign and point included; from 10000, below 1e12 with at most 2 decimals; round the number";
 const optional = (max) => chars(max).optional();
 
 const C = LIMITS.content;
@@ -123,12 +143,16 @@ const CONTENT = {
       "events",
     ),
   },
-  "key-number": { value: z.number(), unit: optional(C["key-number"].unit), label: chars(C["key-number"].label) },
+  "key-number": { value: z.number().refine(drawableNumber, NUMBER_LIMIT), unit: optional(C["key-number"].unit), label: chars(C["key-number"].label) },
   chart: {
     type: z.enum(["bar", "line"]),
     title: chars(C.chart.title),
     unit: optional(C.chart.unit),
-    points: list(z.strictObject({ label: chars(C.chart.label), value: z.number() }), C.chart.points, "points"),
+    points: list(
+      z.strictObject({ label: chars(C.chart.label), value: z.number().refine(drawableNumber, NUMBER_LIMIT) }),
+      C.chart.points,
+      "points",
+    ),
   },
   "image-callouts": {
     callouts: list(

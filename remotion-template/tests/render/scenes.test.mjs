@@ -8,11 +8,14 @@
 // CI's tests/*.test.mjs glob does not match this file.
 //
 // Everything runs in a scratch copy of the template with no public/, so the
-// samples' image comes from the tracked gallery/public. Three independent
+// samples' image comes from the tracked gallery/public. Four independent
 // steps, each started by the first test that needs it, so one can run alone
 // through --test-name-pattern:
 //   - probe: one probe() over every catalog sample in the kit's one theme,
 //     light (task 4.6), through the gallery entry's KitProbe;
+//   - eight-point probe: one probe() through the kit entry, as kit check's
+//     probe stage runs it, of a line chart with 8 points and the label
+//     甲ABCD乙 (task 4.7);
 //   - settled: in light, each sample stilled at its entrance end and on its
 //     last frame;
 //   - gallery: gallery({out}) on the tracked catalog.
@@ -33,11 +36,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { bundle } from "@remotion/bundler";
 import { openBrowser, renderStill, selectComposition } from "@remotion/renderer";
 import { probe, probeFrames, violations } from "../../bin/probe.mjs";
+import { ENTRANCE_FRAMES } from "../../bin/scene-timing.mjs";
+import { contentSchema } from "../../bin/script-schema.mjs";
 import { candidates } from "../../src/kit/gallery/catalog.ts";
 import { captionBand } from "../../src/kit/render/captions.ts";
 import { IMAGE_BOX, TEXT_BOX } from "../../src/kit/scenes/boxes.ts";
 import { calloutZoom, project, scaleAt } from "../../src/kit/scenes/callout-zoom.ts";
-import { formatCount } from "../../src/kit/text.ts";
+import { formatCount, wrapLines } from "../../src/kit/text.ts";
 import { themes } from "../../src/kit/theme.ts";
 
 const TEMPLATE = fileURLToPath(new URL("../..", import.meta.url));
@@ -238,6 +243,78 @@ test("probe: in every image-callouts frame, marker i + 1 is unmarked, unscaled a
       assert.equal(found[0].scale, 1, `${label}: scale ${found[0].scale}`);
       assert.deepEqual(found[0].clippedBy, [], `${label}: clipped`);
     }
+  }
+});
+
+// --- the eight-point line chart -----------------------------------------------
+
+// The line-max sample with the label 甲ABCD乙 on its first point, the other
+// labels and values unchanged. At 8 points a line label has maxWidth 4, so
+// it wraps to three lines.
+const EIGHT_LABEL = "甲ABCD乙";
+const EIGHT_LINES = ["甲", "ABCD", "乙"];
+const LINE_MAX = candidates.find((c) => c.kind === "chart").samples.find((s) => s.id === "line-max");
+const EIGHT = {
+  ...LINE_MAX.content,
+  points: LINE_MAX.content.points.map((point, i) => (i === 0 ? { ...point, label: EIGHT_LABEL } : point)),
+};
+const EIGHT_ID = "chart-line-8-points";
+
+const eightProbed = once("eight-point probe", () => {
+  assert.equal(EIGHT.type, "line");
+  assert.equal(EIGHT.points.length, 8);
+  assert.equal(contentSchema("chart").safeParse(EIGHT).success, true, "the eight-point content is schema-valid");
+  const target = {
+    id: EIGHT_ID,
+    scene: "chart",
+    props: { content: EIGHT, image: null, timing: LINE_MAX.timing, theme: themes.light },
+    durationInFrames: LINE_MAX.timing.durationInFrames,
+    entranceFrames: ENTRANCE_FRAMES.chart,
+    exitFrame: LINE_MAX.timing.durationInFrames,
+  };
+  return probe({ entryPoint: join(root, "src", "kit", "index.ts"), targets: [target], publicDir: GALLERY_PUBLIC() });
+});
+
+test("eight-point probe: the 甲ABCD乙 line chart keeps every probe rule", async (t) => {
+  const result = await eightProbed();
+  assert.deepEqual(result.frames.map((frame) => frame.role), ROLES);
+  const found = violations(result, themes.light);
+  t.diagnostic(`violations: ${JSON.stringify(found)}`);
+  assert.deepEqual(found, []);
+});
+
+test("eight-point probe: every text ends at or above the caption band and every marked text lies inside TEXT_BOX", async (t) => {
+  for (const frame of (await eightProbed()).frames) {
+    assert.ok(frame.texts.length > 0, `${frame.role}: no text`);
+    const lowest = Math.max(...frame.texts.map((record) => record.glyphBox.y + record.glyphBox.height));
+    t.diagnostic(`${frame.role} (frame ${frame.frame}): lowest text end ${lowest}, band top ${BAND_TOP}`);
+    assert.ok(lowest <= BAND_TOP, `${frame.role}: a text ends at ${lowest}, below the band's top ${BAND_TOP}`);
+    assert.ok(frame.marked.length > 0, `${frame.role}: no marked text`);
+    const boxes = [];
+    for (const mark of frame.marked) {
+      const records = frame.texts.filter((record) => isInside(record.path, mark.path));
+      assert.ok(records.length > 0, `${frame.role}: "${mark.input}" has no text record`);
+      for (const record of records) {
+        boxes.push(record.glyphBox);
+        assert.ok(inside(record.glyphBox, TEXT_BOX), `${frame.role}: "${record.text}" at ${JSON.stringify(record.glyphBox)} is outside ${JSON.stringify(TEXT_BOX)}`);
+      }
+    }
+    const left = Math.min(...boxes.map((b) => b.x));
+    const top = Math.min(...boxes.map((b) => b.y));
+    const right = Math.max(...boxes.map((b) => b.x + b.width));
+    const bottom = Math.max(...boxes.map((b) => b.y + b.height));
+    t.diagnostic(`${frame.role}: ${boxes.length} marked records span x ${left}–${right}, y ${top}–${bottom}; TEXT_BOX ${JSON.stringify(TEXT_BOX)}`);
+  }
+});
+
+test("eight-point probe: the 甲ABCD乙 label is drawn on 3 lines in every probed frame", async (t) => {
+  assert.deepEqual(wrapLines(EIGHT_LABEL, 4), EIGHT_LINES);
+  for (const frame of (await eightProbed()).frames) {
+    const marks = frame.marked.filter((mark) => mark.input === EIGHT_LABEL);
+    assert.equal(marks.length, 1, `${frame.role}: ${marks.length} marks for ${EIGHT_LABEL}`);
+    const lines = frame.texts.filter((record) => isInside(record.path, marks[0].path)).flatMap((record) => record.lines);
+    t.diagnostic(`${frame.role} (frame ${frame.frame}): ${JSON.stringify(lines)}`);
+    assert.deepEqual(lines, EIGHT_LINES, frame.role);
   }
 });
 

@@ -9,13 +9,16 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   BODY_KINDS,
   IMAGE_NAME,
   LIMITS,
   VIDEO,
+  drawableNumber,
   playbackWhere,
   scriptJsonSchema,
   scriptSchema,
@@ -814,4 +817,129 @@ test("the JSON Schema carries the control-character pattern on every text field"
   assert.equal(schema.properties.hook.properties.narration.items.items.pattern, "^\\P{Cc}*$");
   assert.equal(schema.properties.voice.properties.instructions.pattern, "^\\P{Cc}*$");
   assert.equal(schema.properties.voice.properties.id.pattern, "^[A-Za-z0-9._-]*$");
+});
+
+// --- numbers (task 4.7) ---------------------------------------------------
+//
+// Every number a number scene draws, and every count-up step towards it,
+// fits the 8 code points its line holds. Values and the limit text come from
+// the task 4.7 fixture.
+
+const NUMBER_LIMIT =
+  "drawn in at most 8 characters: below 10000 in size, at most 8 characters as written, sign and point included; " +
+  "from 10000, below 1e12 with at most 2 decimals; round the number";
+const REJECTED_NUMBERS = [0.123456789, -1234.5678, -10000.123, 1e12, -1e12, 123456789.123, 9999.9999, -999.9999];
+const ACCEPTED_NUMBERS = [-99999000, -99999999, -9999.9, 12345.67, -12345.67, 999999999999, 0, -0.5];
+
+const numberAt = (field) => ({ chapter: "1 现象", scene: 1, field, limit: NUMBER_LIMIT });
+const keyNumber = (value) => withScene(minimal(), 0, 0, (s) => Object.assign(s, { kind: "key-number", content: { value, label: "人数" } }));
+const chartPoint = (value) =>
+  withScene(minimal(), 0, 0, (s) =>
+    Object.assign(s, { kind: "chart", content: { type: "line", title: "对比", points: [{ label: "甲地", value: 36 }, { label: "乙地", value }] } }),
+  );
+
+// One row per value, so a failure names it. Object.is keeps -0 apart from 0.
+const shownNumber = (value) => (Object.is(value, -0) ? "-0" : String(value));
+
+test("drawableNumber accepts and rejects the fixture's values", async (t) => {
+  for (const value of ACCEPTED_NUMBERS) await t.test(`accepts ${shownNumber(value)}`, () => assert.equal(drawableNumber(value), true));
+  for (const value of REJECTED_NUMBERS) await t.test(`rejects ${shownNumber(value)}`, () => assert.equal(drawableNumber(value), false));
+});
+
+for (const [field, script, at] of [
+  ["key-number value", keyNumber, "content.value"],
+  ["chart point", chartPoint, "content.points[1].value"],
+]) {
+  test(`a ${field} that cannot be drawn in 8 characters is rejected with the rounding limit`, async (t) => {
+    for (const value of REJECTED_NUMBERS) {
+      await t.test(`rejects ${shownNumber(value)}`, () => rejects(script(value), [numberAt(at)]));
+    }
+    for (const value of ACCEPTED_NUMBERS) {
+      await t.test(`accepts ${shownNumber(value)}`, () => {
+        const result = validate(script(value));
+        assert.equal(result.ok, true, JSON.stringify(result.errors));
+      });
+    }
+  });
+}
+
+test("the full errors for #893's three inputs name the field and tell the model to round", () => {
+  const where = "chapter 1 现象, scene 1";
+  const cases = [
+    [keyNumber(0.123456789), `${where} (key-number): content.value is invalid (limit ${NUMBER_LIMIT})`],
+    [chartPoint(-1234.5678), `${where} (chart): content.points[1].value is invalid (limit ${NUMBER_LIMIT})`],
+    [keyNumber(-10000.123), `${where} (key-number): content.value is invalid (limit ${NUMBER_LIMIT})`],
+  ];
+  for (const [script, message] of cases) {
+    assert.deepEqual(
+      validate(script).errors?.map((error) => error.message),
+      [message],
+    );
+  }
+});
+
+// KeyNumber.tsx's count-up, copied as TypeScript text. The test asserts the
+// copy is verbatim in the scene, then runs it: Node cannot import .tsx, so the
+// copy goes to a temporary .ts file with formatCount imported from the kit.
+const KEY_NUMBER_FILE = fileURLToPath(new URL("../src/kit/scenes/KeyNumber.tsx", import.meta.url));
+const TEXT_FILE = fileURLToPath(new URL("../src/kit/text.ts", import.meta.url));
+const MOST_DECIMALS_TS = "const MOST_DECIMALS = 20;";
+const COUNTED_TS = [
+  "// The decimals `value` has: the fewest that read back as the same number.",
+  "function decimalsOf(value: number): number {",
+  "\tfor (let d = 0; d < MOST_DECIMALS; d++) if (Number(value.toFixed(d)) === value) return d;",
+  "\treturn MOST_DECIMALS;",
+  "}",
+  "",
+  "// The number drawn at entrance `progress`: the value reached so far, cut",
+  "// toward zero to the value's own decimals, then formatted.",
+  "function counted(value: number, progress: number): string {",
+  "\tif (progress >= 1) return formatCount(value);",
+  "\tconst step = 10 ** decimalsOf(value);",
+  "\treturn formatCount(Math.trunc(value * progress * step) / step);",
+  "}",
+].join("\n");
+
+async function keyNumberCounted() {
+  const scene = readFileSync(KEY_NUMBER_FILE, "utf8");
+  assert.ok(scene.includes(`\n${MOST_DECIMALS_TS}\n`), "KeyNumber.tsx no longer holds the copied MOST_DECIMALS");
+  assert.ok(scene.includes(`\n${COUNTED_TS}\n`), "KeyNumber.tsx no longer holds the copied decimalsOf and counted");
+  const dir = mkdtempSync(join(tmpdir(), "key-number-counted-"));
+  try {
+    const file = join(dir, "counted.ts");
+    const source = [`import {formatCount} from ${JSON.stringify(pathToFileURL(TEXT_FILE).href)};`, MOST_DECIMALS_TS, COUNTED_TS, "export {counted};", ""];
+    writeFileSync(file, source.join("\n"));
+    return (await import(pathToFileURL(file).href)).counted;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Progress 0 to 1 in steps of 1/3000, then 1 − 2^-k for k up to 60.
+const PROGRESS = [...Array.from({ length: 3001 }, (_, i) => i / 3000), ...Array.from({ length: 60 }, (_, k) => 1 - 2 ** -(k + 1))];
+
+// The candidates: the fixture's values, the boundary values a looser rule
+// would let through, the edges of each range, and a fixed grid of signed
+// mantissas over every decade, each rounded to 0–3 decimals.
+const RANGE_EDGES = [
+  -10000.123, -1.00001e12, 9999.9999, -999.9999, -0, 1e-7, -1.5e-7, 9999.99, -9999.99, 9999.999, -999.999, 10000, -10000, 10000.01,
+  -10000.01, 99999999.99, -99999999.99, 1e8, -1e8, 123456789.12, -999999999999.99, 999999999999.99, -999999999999,
+];
+const GRID = Array.from({ length: 20 }, (_, e) => e - 8).flatMap((exponent) =>
+  [1, 1.5, 9.99, 9.999999, 1.23456789].flatMap((mantissa) =>
+    [1, -1].flatMap((sign) => [0, 1, 2, 3].map((decimals) => Number((sign * mantissa * 10 ** exponent).toFixed(decimals)))),
+  ),
+);
+const NUMBER_POOL = [...ACCEPTED_NUMBERS, ...REJECTED_NUMBERS, ...RANGE_EDGES, ...GRID];
+
+test("every value drawableNumber accepts draws at most 8 code points at every count-up step", async () => {
+  const counted = await keyNumberCounted();
+  const accepted = NUMBER_POOL.filter(drawableNumber);
+  for (const value of ACCEPTED_NUMBERS) assert.ok(accepted.includes(value), `the pool lost ${value}`);
+  for (const value of accepted) {
+    for (const progress of PROGRESS) {
+      const text = counted(value, progress);
+      assert.ok(Array.from(text).length <= 8, `${value} at progress ${progress} draws "${text}"`);
+    }
+  }
 });
