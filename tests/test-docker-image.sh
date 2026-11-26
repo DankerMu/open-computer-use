@@ -372,7 +372,7 @@ echo ""
 # the existing grep-based pass/fail accounting handle the failure naturally.
 
 # 1. Runtime versions and executable Node tools
-echo "[1/17] Runtime versions and Node tools"
+echo "[1/18] Runtime versions and Node tools"
 NODE_PROBE=$(cat <<'PROBE'
 node <<'JS'
 const assert = require("node:assert/strict");
@@ -501,7 +501,7 @@ echo "$VERSIONS" | grep -q "Python 3" && pass "Python 3" || fail "Python version
 
 # 2. CommonJS require()
 echo ""
-echo "[2/17] CommonJS require()"
+echo "[2/18] CommonJS require()"
 for pkg in react pptxgenjs pdf-lib docx sharp react-dom/server react-icons/fa; do
     RESULT=$(run_in_container "node -e \"try { require('$pkg'); console.log('OK') } catch(e) { console.log('FAIL: ' + e.code) }\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "require('$pkg')" || fail "require('$pkg'): $RESULT"
@@ -520,7 +520,7 @@ echo "$RESULT" | grep -q "OK" && pass "marked renders a heading" || fail "marked
 
 # 3. ES Modules import
 echo ""
-echo "[3/17] ES Modules import"
+echo "[3/18] ES Modules import"
 for pkg in react pptxgenjs pdf-lib; do
     RESULT=$(run_in_container "node --input-type=module -e \"import '$pkg'; console.log('OK')\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "import '$pkg'" || fail "import '$pkg'"
@@ -528,7 +528,7 @@ done
 
 # 4. html2pptx import (full path)
 echo ""
-echo "[4/17] html2pptx import"
+echo "[4/18] html2pptx import"
 RESULT=$(run_in_container "node --input-type=module -e \"import { html2pptx } from '/usr/local/lib/node_modules_global/lib/node_modules/@anthropic-ai/html2pptx/dist/html2pptx.mjs'; console.log('OK')\"" 2>/dev/null || echo "SKIP")
 if echo "$RESULT" | grep -q "OK"; then
     pass "html2pptx ESM import"
@@ -540,7 +540,7 @@ fi
 
 # 5. CLI tools (Phase 6 — extended to include codex + opencode + --version smoke)
 echo ""
-echo "[5/17] CLI tools"
+echo "[5/18] CLI tools"
 for tool in mmdc tsc tsx claude codex opencode; do
     RESULT=$(run_in_container "which $tool >/dev/null 2>&1 && echo OK || echo MISSING") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "$tool in PATH" || fail "$tool not found in PATH"
@@ -601,7 +601,7 @@ fi
 
 # 6. Python packages
 echo ""
-echo "[6/17] Python packages"
+echo "[6/18] Python packages"
 for pkg in docx pptx openpyxl; do
     RESULT=$(run_in_container "python3 -c \"import $pkg; print('OK')\"") || RESULT=""
     echo "$RESULT" | grep -q "OK" && pass "python import $pkg" || fail "python import $pkg"
@@ -629,7 +629,7 @@ echo "$RESULT" | grep -q "OK" && pass "python playwright" || fail "python playwr
 
 # 7. User npm install (lodash)
 echo ""
-echo "[7/17] User npm install"
+echo "[7/18] User npm install"
 RESULT=$(run_in_container 'cd /home/assistant && npm install lodash >/dev/null 2>&1 && if [ -d /home/assistant/node_modules/lodash ]; then echo "user=YES"; else echo "user=NO"; fi && SYS_COUNT=$(ls /home/node_modules/ 2>/dev/null | wc -l) && echo "system=$SYS_COUNT"') || RESULT=""
 echo "$RESULT" | grep -q "user=YES" && pass "lodash in /home/assistant/node_modules" || fail "lodash not in user dir"
 SYS=$(echo "$RESULT" | awk -F= '/^system=/{print $2}')
@@ -637,7 +637,7 @@ SYS=$(echo "$RESULT" | awk -F= '/^system=/{print $2}')
 
 # 8. npm prefix check
 echo ""
-echo "[8/17] npm configuration"
+echo "[8/18] npm configuration"
 RESULT=$(run_in_container 'npm config get prefix 2>/dev/null || echo "undefined"') || RESULT=""
 # Trim trailing whitespace/newlines so the anchored regex below can match
 # against a clean single-line value.
@@ -659,7 +659,7 @@ fi
 
 # 9. Volume size
 echo ""
-echo "[9/17] Volume size"
+echo "[9/18] Volume size"
 SIZE_KB=$(run_in_container "du -sk /home/assistant/ | cut -f1") || SIZE_KB=""
 if [ "${SIZE_KB:-999999}" -lt 1024 ]; then
     pass "/home/assistant < 1MB (${SIZE_KB}KB)"
@@ -669,7 +669,7 @@ fi
 
 # 10. Permissions and guard files
 echo ""
-echo "[10/17] Permissions and guard files"
+echo "[10/18] Permissions and guard files"
 RESULT=$(run_in_container '
 [ -x /home/assistant/.entrypoint.sh ] && echo "entrypoint=OK" || echo "entrypoint=FAIL"
 [ -f /home/assistant/.gitconfig ] && echo "gitconfig=OK" || echo "gitconfig=FAIL"
@@ -693,7 +693,7 @@ echo "$RESULT" | grep -q "owner=assistant" && pass "files owned by assistant" ||
 # root here matches production parity. /tmp is world-readable so the marker
 # check works regardless.
 echo ""
-echo "[11/17] Per-CLI dispatch smoke + marker gating"
+echo "[11/18] Per-CLI dispatch smoke + marker gating"
 for cli in claude codex opencode; do
     SMOKE_CONTAINER="ocu-smoke-${cli}-$$"
     # Start a long-running container (so we can exec the entrypoint twice).
@@ -783,7 +783,7 @@ done
 # (the [ -n "$PS1" ] guard would otherwise short-circuit and falsely pass).
 # Two variants: env var NO_AUTOSTART=1 and sentinel file /tmp/.no_autostart.
 echo ""
-echo "[12/17] NO_AUTOSTART escape hatch"
+echo "[12/18] NO_AUTOSTART escape hatch"
 NOAUTOSTART_OUT=$(docker run --rm --platform linux/amd64 \
     -e SUBAGENT_CLI=claude \
     -e NO_AUTOSTART=1 \
@@ -810,7 +810,7 @@ fi
 
 # 13. cli-defaults/ canonical configs present and parseable (Phase 2 D-09).
 echo ""
-echo "[13/17] cli-defaults/ canonical configs present and parseable"
+echo "[13/18] cli-defaults/ canonical configs present and parseable"
 for f in opencode.json codex.json README.md; do
     if docker run --rm --platform linux/amd64 "$IMAGE" sh -c "test -f /opt/cli-defaults/$f" 2>/dev/null; then
         pass "/opt/cli-defaults/$f exists in image"
@@ -839,7 +839,7 @@ fi
 # the image with its declared entrypoint and checks that (a) the process
 # exits 0, and (b) the expected status banner is printed.
 echo ""
-echo "[14/17] Entrypoint execution"
+echo "[14/18] Entrypoint execution"
 # Wrap the command substitution in `if` so `set -e` does not abort the
 # whole test script on a non-zero docker exit — we need to reach fail()
 # with the captured output for structured reporting.
@@ -866,7 +866,7 @@ fi
 # 15. Offline Remotion template, started the way skills/public/remotion/free-form.md
 # says: copy without node_modules, symlink the root-owned node_modules, no network.
 echo ""
-echo "[15/17] Offline Remotion template"
+echo "[15/18] Offline Remotion template"
 if REMOTION_OUT=$(run_in_container_verbose '
 [ "$(stat -c %U /opt/remotion-template/node_modules)" = root ] && echo "owner=OK"
 [ ! -w /opt/remotion-template/node_modules ] && echo "readonly=OK"
@@ -919,7 +919,7 @@ echo "$REMOTION_OUT" | grep -q "still3d=OK" && pass "ThreeCanvas still with --gl
 # ids and approvals digest come from the repository; the in-image checker uses
 # only the standard library and the image's ffmpeg, not music_library.py.
 echo ""
-echo "[16/17] Music library"
+echo "[16/18] Music library"
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MUSIC_EXPECTED=$(python3 -I -B - "$REPO_ROOT" <<'PY'
 import hashlib
@@ -1111,7 +1111,7 @@ done
 # wall time; after the first FAIL it prints nothing more, so later steps
 # report no checker output.
 echo ""
-echo "[17/17] Offline kit path"
+echo "[17/18] Offline kit path"
 KIT_PROBE=$(cat <<'PROBE'
 # The shortest whole millisecond at which kit timeline accepts the tracked
 # script.json: 0.887 s gives 1804 frames, 0.886 s gives 1782 and is refused
@@ -1356,6 +1356,189 @@ for number in 0 1 2 3 4 5 6 7 8 9 10; do
     case "$line" in
         "kit$number=OK: "*) pass "${KIT_CHECKS[$number]} (${line#*=OK: })" ;;
         *) line=${line#"kit$number=FAIL: "}; fail "${KIT_CHECKS[$number]}: ${line:-no checker output}" ;;
+    esac
+done
+
+# 18. A free-form project, rendered as skills/public/remotion/free-form.md
+# says: its "Start a project" commands, then its check-frames and MP4 render
+# commands with their exact flags, run in the foreground. The container has
+# the empty-hosts shape of section 17. The composition plays one public/ clip
+# through Audio from remotion, whose asset Node downloads from the bundle
+# server at localhost, and one through Audio from @remotion/media. The
+# container prints one freeN=OK or freeN=FAIL line per step, each detail
+# ending with the step's wall time; after the first FAIL it prints nothing
+# more.
+echo ""
+echo "[18/18] Offline free-form render"
+FREE_PROBE=$(cat <<'PROBE'
+PROJECT=/home/assistant/videos/free-smoke
+FILES=/mnt/user-data/files
+MP4=$FILES/free-smoke.mp4
+OUT=/tmp/free-out
+FPS=30
+FRAMES=90
+DETAIL=""
+
+# One line naming why a command failed: the first download error, else the
+# first EAI_AGAIN or Error line, else the last line of its output.
+reason() {
+    local text
+    text=$(tr "\r" "\n" < "$OUT")
+    { printf "%s\n" "$text" | grep -m1 -F "Error while downloading" ||
+        printf "%s\n" "$text" | grep -m1 -E "EAI_AGAIN|Error" ||
+        printf "%s\n" "$text" | tail -n 1; } | cut -c1-600
+}
+
+step0() {
+    local hosts resolv rc=0
+    hosts=$(stat -c %s /etc/hosts 2>&1) || { DETAIL="stat /etc/hosts: $hosts"; return 1; }
+    resolv=$(stat -c %s /etc/resolv.conf 2>&1) || { DETAIL="stat /etc/resolv.conf: $resolv"; return 1; }
+    getent hosts localhost > "$OUT" 2>&1 || rc=$?
+    if [ "$hosts" != 0 ] || [ "$resolv" != 0 ] || [ "$rc" -eq 0 ]; then
+        DETAIL="/etc/hosts $hosts bytes, /etc/resolv.conf $resolv bytes, getent hosts localhost exited $rc: $(reason)"; return 1
+    fi
+    DETAIL="/etc/hosts 0 bytes, /etc/resolv.conf 0 bytes, getent hosts localhost exited $rc"
+}
+
+step1() {
+    {
+        mkdir -p "$PROJECT" && cd "$PROJECT" &&
+            tar -C /opt/remotion-template --exclude=node_modules -cf - . | tar -xf - &&
+            ln -s /opt/remotion-template/node_modules node_modules &&
+            mkdir -p public out
+    } > "$OUT" 2>&1 || { DETAIL="project setup: $(reason)"; return 1; }
+    DETAIL="$PROJECT"
+}
+
+step2() {
+    local line frequency
+    for line in 1 2; do
+        frequency=$((220 * (line + 1)))
+        ffmpeg -nostdin -v error -f lavfi -i "sine=frequency=$frequency:sample_rate=48000:duration=1.5" -ac 1 -c:a libmp3lame "public/line$line.mp3" > "$OUT" 2>&1 || {
+            DETAIL="ffmpeg for line$line.mp3: $(reason)"; return 1; }
+    done
+    DETAIL="public/line1.mp3 and public/line2.mp3, 1.5 s tones"
+}
+
+step3() {
+    cat > src/Root.tsx <<'TSX'
+import {AbsoluteFill, Audio as CoreAudio, Composition, Sequence, staticFile} from 'remotion';
+import {Audio} from '@remotion/media';
+
+const Main = () => (
+	<AbsoluteFill style={{backgroundColor: '#0b1020'}}>
+		<Sequence durationInFrames={45}>
+			<CoreAudio src={staticFile('line1.mp3')} />
+		</Sequence>
+		<Sequence from={45} durationInFrames={45}>
+			<Audio src={staticFile('line2.mp3')} />
+		</Sequence>
+	</AbsoluteFill>
+);
+
+export const RemotionRoot = () => (
+	<Composition id="Main" component={Main} durationInFrames={90} fps={30} width={1920} height={1080} />
+);
+TSX
+    grep -qF "export const RemotionRoot" src/Root.tsx || { DETAIL="src/Root.tsx not written"; return 1; }
+    DETAIL="src/Root.tsx: Main, 1920x1080, $FPS fps, $FRAMES frames"
+}
+
+step4() {
+    local rc=0 count
+    rm -rf out/frames
+    npx --no-install remotion render src/index.ts Main out/frames --sequence --frames=0,30,60,89 --image-format=png --concurrency=2 > "$OUT" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] || { DETAIL="frames render exited $rc: $(reason)"; return 1; }
+    ! grep -qF EAI_AGAIN "$OUT" || { DETAIL="frames render printed $(grep -m1 -F EAI_AGAIN "$OUT" | cut -c1-600)"; return 1; }
+    count=$(find out/frames -name "*.png" -size +0 | wc -l)
+    [ "$count" -eq 4 ] || { DETAIL="$count non-empty PNGs in out/frames, expected 4: $(ls out/frames 2>&1 | paste -sd " " -)"; return 1; }
+    DETAIL="$(ls out/frames | paste -sd " " -)"
+}
+
+step5() {
+    local rc=0
+    rm -f "$MP4"
+    npx --no-install remotion render src/index.ts Main "$MP4" --concurrency=2 --codec=h264 --pixel-format=yuv420p > "$OUT" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] || { DETAIL="MP4 render exited $rc: $(reason)"; return 1; }
+    ! grep -qF EAI_AGAIN "$OUT" || { DETAIL="MP4 render printed $(grep -m1 -F EAI_AGAIN "$OUT" | cut -c1-600)"; return 1; }
+    [ -s "$MP4" ] || { DETAIL="$MP4 is missing or empty"; return 1; }
+    DETAIL="$MP4 ($(stat -c %s "$MP4") bytes)"
+}
+
+step6() {
+    local audio
+    audio=$(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$MP4" 2>&1) || {
+        DETAIL="ffprobe: $audio"; return 1; }
+    [ -n "$audio" ] || { DETAIL="$MP4 has no audio stream"; return 1; }
+    DETAIL="audio stream $(printf "%s" "$audio" | paste -sd " " -)"
+}
+
+step7() {
+    local duration
+    duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$MP4" 2>&1) || {
+        DETAIL="ffprobe: $duration"; return 1; }
+    if ! [[ $duration =~ ^[0-9]+(\.[0-9]+)?$ ]] ||
+        ! awk -v d="$duration" -v n="$FRAMES" -v f="$FPS" 'BEGIN { e = d - n / f; exit !(e <= 1 / f && -e <= 1 / f) }'; then
+        DETAIL="duration ${duration:-unreadable} s is not 3 s within one frame"; return 1
+    fi
+    DETAIL="duration $duration s"
+}
+
+# Runs one step and prints its line; the first failure ends the container.
+run_step() {
+    local number=$1 started=$EPOCHREALTIME rc=0 wall
+    DETAIL=""
+    "step$number" || rc=$?
+    wall=$(awk -v a="$started" -v b="$EPOCHREALTIME" 'BEGIN { printf "%.1f", b - a }')
+    if [ "$rc" -ne 0 ]; then
+        echo "free$number=FAIL: $DETAIL ($wall s)"
+        exit 1
+    fi
+    echo "free$number=OK: $DETAIL ($wall s)"
+}
+
+run_step 0
+run_step 1
+run_step 2
+run_step 3
+run_step 4
+run_step 5
+run_step 6
+run_step 7
+PROBE
+)
+FREE_ETC=$(mktemp -d)
+: > "$FREE_ETC/hosts"
+: > "$FREE_ETC/resolv.conf"
+chmod 644 "$FREE_ETC/hosts" "$FREE_ETC/resolv.conf"
+FREE_STARTED=$SECONDS
+FREE_STATUS=0
+FREE_OUT=$(run_in_container_verbose "$FREE_PROBE" 900s \
+    -v "$FREE_ETC/hosts:/etc/hosts:ro" -v "$FREE_ETC/resolv.conf:/etc/resolv.conf:ro") || FREE_STATUS=$?
+FREE_SECONDS=$((SECONDS - FREE_STARTED))
+rm -rf "$FREE_ETC"
+# Anything the container printed besides its freeN lines: Docker or timeout.
+FREE_OTHER=$(printf '%s\n' "$FREE_OUT" | grep -v '^free[0-9]*=' | tail -n 5 || true)
+if [ "$FREE_STATUS" -eq 0 ]; then
+    pass "offline free-form render exits 0 (${FREE_SECONDS} s)"
+else
+    fail "offline free-form render exited $FREE_STATUS after ${FREE_SECONDS} s${FREE_OTHER:+: $FREE_OTHER}"
+fi
+FREE_CHECKS=(
+    "empty /etc/hosts and /etc/resolv.conf, getent hosts localhost fails"
+    "free-form.md's Start a project commands create /home/assistant/videos/free-smoke"
+    "two mp3 tones written to public/"
+    "src/Root.tsx plays line1.mp3 through remotion's Audio and line2.mp3 through @remotion/media's"
+    "free-form.md's check-frames render writes four PNGs without EAI_AGAIN"
+    "free-form.md's MP4 render writes free-smoke.mp4 without EAI_AGAIN"
+    "free-smoke.mp4 has an audio stream"
+    "free-smoke.mp4 lasts 3 s within one frame"
+)
+for number in 0 1 2 3 4 5 6 7; do
+    line=$(printf '%s\n' "$FREE_OUT" | grep -m1 "^free$number=" || true)
+    case "$line" in
+        "free$number=OK: "*) pass "${FREE_CHECKS[$number]} (${line#*=OK: })" ;;
+        *) line=${line#"free$number=FAIL: "}; fail "${FREE_CHECKS[$number]}: ${line:-no checker output}" ;;
     esac
 done
 
