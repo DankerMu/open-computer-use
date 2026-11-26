@@ -311,6 +311,65 @@ test("render takes over a dead pid's lock, returns at once, and a worker that ca
   assert.equal(checkResult(p.root), pass);
 });
 
+// --- task 5.5: the start path's partial sweep -------------------------------------
+
+const PARTIAL = (name, hex) => `.${name}.mp4.${hex.repeat(16)}.partial`;
+
+// kit render on p with ctx.filesRoot at filesRoot; the started worker
+// (which has no bin/ to run in a non-worker project) is killed at the end.
+async function started(t, p, filesRoot = p.files) {
+  const result = await kit(["render"], { ...p, files: filesRoot });
+  const pid = Number(STARTED.exec(result.err)?.[1]);
+  assert.ok(result.code === 0 && pid > 0, JSON.stringify(result));
+  t.after(() => {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ESRCH: the worker has already exited.
+    }
+  });
+}
+
+test("a passing render start removes a stopped render's partial copy", async (t) => {
+  const p = await fixtureProject(t);
+  const partial = join(p.files, PARTIAL("demo", "9f"));
+  writeFileSync(partial, "half a video");
+  await started(t, p);
+  assert.equal(existsSync(partial), false, "the start left the partial");
+});
+
+test("the start's sweep leaves a symlink, a directory, another project's partial and the target", async (t) => {
+  const p = await fixtureProject(t);
+  const kept = join(p.base, "kept");
+  writeFileSync(kept, "not a partial");
+  symlinkSync(kept, join(p.files, PARTIAL("demo", "1a")));
+  mkdirSync(join(p.files, PARTIAL("demo", "2b")));
+  writeFileSync(join(p.files, PARTIAL("other", "3c")), "another project's partial");
+  writeFileSync(p.target, PREVIOUS);
+  await started(t, p);
+  assert.equal(readlinkSync(join(p.files, PARTIAL("demo", "1a"))), kept);
+  assert.ok(lstatSync(join(p.files, PARTIAL("demo", "2b"))).isDirectory());
+  assert.equal(readFileSync(join(p.files, PARTIAL("other", "3c")), "utf8"), "another project's partial");
+  assert.deepEqual(readFileSync(p.target), PREVIOUS);
+  assert.equal(readFileSync(kept, "utf8"), "not a partial");
+});
+
+test("a render start refused for no passing check leaves the partial", async (t) => {
+  const p = await fixtureProject(t);
+  plantCheck(p.root, { outcome: "failed", reasons: ["hook: one"], count: 1 });
+  const partial = join(p.files, PARTIAL("demo", "9f"));
+  writeFileSync(partial, "half a video");
+  assert.deepEqual(await kit(["render"], p), refused(NO_PASS));
+  assert.equal(readFileSync(partial, "utf8"), "half a video");
+});
+
+test("a render start whose files directory does not exist starts as before", async (t) => {
+  const p = await fixtureProject(t);
+  await started(t, p, join(p.base, "no-files"));
+  assert.equal(existsSync(join(p.base, "no-files")), false);
+  assert.equal(existsSync(join(p.root, ".kit", "start.lock")), false, "the start left its lock");
+});
+
 // --- runRender with the stub render ---------------------------------------------
 
 // The worker's inputs over a fixture project; .kit/render/ exists as

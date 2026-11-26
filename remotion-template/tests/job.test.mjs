@@ -305,6 +305,39 @@ test("a start lock naming a live, unrelated pid that started after the lock is t
   assert.deepEqual(lockFiles(root), []);
 });
 
+// --- task 5.5: the lock read that finds no lock ------------------------------
+
+test("three starters: B, finding A's lock gone just as C takes it, refuses and leaves C's lock", async (t) => {
+  const { takeLock } = await import("../bin/job.mjs");
+  const root = project(t);
+  plantLock(root, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+  const cText = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
+  let first = true;
+  // One-shot: A releases, the real read finds no lock, then C links its own.
+  const holder = async (path, lockHolder) => {
+    if (!first) return lockHolder(path);
+    first = false;
+    rmSync(path);
+    const kept = await lockHolder(path);
+    writeFileSync(path, cText);
+    return kept;
+  };
+  await assert.rejects(takeLock(kitDir(root), holder), (error) => error instanceof Refusal && error.message === LOCK_HELD(process.pid));
+  assert.equal(readFileSync(lockPath(root), "utf8"), cText);
+  assert.deepEqual(lockFiles(root), ["start.lock"]);
+});
+
+test("a lock read that never finds the lock still ends: the start refuses after a bounded number of attempts", { timeout: 10000 }, async (t) => {
+  const { takeLock } = await import("../bin/job.mjs");
+  const root = project(t);
+  const text = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
+  plantLock(root, text);
+  const holder = async () => ({ held: false, pid: null });
+  await assert.rejects(takeLock(kitDir(root), holder), (error) => error instanceof Refusal && error.message === LOCK_HELD(null));
+  assert.equal(readFileSync(lockPath(root), "utf8"), text);
+  assert.deepEqual(lockFiles(root), ["start.lock"]);
+});
+
 test("a spawn with a non-executable execPath rejects with its system error, 20 times, with no unhandled error", async (t) => {
   const root = project(t);
   const notExecutable = join(root, "not-node");

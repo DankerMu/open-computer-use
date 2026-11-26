@@ -34,6 +34,12 @@ const OUTCOMES = ["passed", "failed", "succeeded"];
 // A lock's holder started at most this long after the lock's startedAt:
 // ps -o lstart= has whole seconds.
 const LOCK_SLACK_MS = 1000;
+// takeLock's link() attempts. Each read that finds no lock means its holder
+// released the lock between this start's link() and the read; with one
+// stale removal, five attempts allow three such releases in a row,
+// already more contention than one project's kit commands make. Past that
+// the start refuses with "try again" instead of spinning.
+const LOCK_ATTEMPTS = 5;
 const MAX_REASONS = 40;
 const MAX_POINTS = 300;
 // After SIGTERM or SIGINT the worker exits 143 (128 + SIGTERM) after this
@@ -153,11 +159,16 @@ async function lockHolder(path) {
 }
 
 // Publishes .kit/start.lock complete, by link() of a temporary file, and
-// resolves once this process holds it. A held lock refuses; a stale one is
-// removed and the start retries once.
-async function takeLock(kit) {
+// resolves once this process holds it. A held lock refuses. A read that
+// finds no lock removes nothing: its holder released it, and another
+// starter may already have linked its own, so the start retries link().
+// A stale lock is removed at most once. holder(path, lockHolder) replaces
+// the read in tests; startJob passes only kit.
+export async function takeLock(kit, holder = (path) => lockHolder(path)) {
   const lock = join(kit, LOCK);
-  for (let attempt = 1; ; attempt++) {
+  let found;
+  let removed = false;
+  for (let attempt = 1; attempt <= LOCK_ATTEMPTS; attempt++) {
     const temp = join(kit, `${LOCK}.${randomBytes(6).toString("hex")}`);
     try {
       await writeFile(temp, serialized({ pid: process.pid, startedAt: Date.now() }), { flag: "wx" });
@@ -168,12 +179,14 @@ async function takeLock(kit) {
     } finally {
       await rm(temp, { force: true });
     }
-    const holder = await lockHolder(lock);
-    if (holder.held || attempt > 1) {
-      throw new Refusal(`another kit command is starting a job (pid ${holder.pid}); try again, or remove .kit/start.lock if none is`);
-    }
+    found = await holder(lock, lockHolder);
+    if (found.held) break;
+    if (found.pid === null) continue;
+    if (removed) break;
     await rm(lock, { force: true });
+    removed = true;
   }
+  throw new Refusal(`another kit command is starting a job (pid ${found.pid}); try again, or remove .kit/start.lock if none is`);
 }
 
 // Starts `<execPath> <workerArgv...> <token>` in root as a detached worker

@@ -17,6 +17,8 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, chmodSync, writeFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,7 +59,7 @@ function project(t, { image = false } = {}) {
 }
 
 // projectHash over the texts on disk now; texts.read replaces the file
-// reader, texts.musicDir the music library.
+// reader, texts.list the directory lister, texts.musicDir the music library.
 async function hashNow({ root, script, timeline }, texts = {}) {
   const { projectHash } = await hashing();
   return projectHash(root, {
@@ -66,6 +68,7 @@ async function hashNow({ root, script, timeline }, texts = {}) {
     scriptText: texts.scriptText ?? readFileSync(join(root, "script.json"), "utf8"),
     timelineText: texts.timelineText ?? readFileSync(join(root, "timeline.json"), "utf8"),
     ...(texts.read ? { read: texts.read } : {}),
+    ...(texts.list ? { list: texts.list } : {}),
     ...(texts.musicDir ? { musicDir: texts.musicDir } : {}),
   });
 }
@@ -274,6 +277,43 @@ test("a src/ entry swapped for a FIFO after the listing is a reason, read withou
   assert.deepEqual(await hashNow(p, { read }), {
     reasons: ["src/custom/Orbit.tsx: is not a regular file or directory; the check hashes regular files only"],
   });
+});
+
+// --- task 5.5: a socket and a vanished subdirectory -----------------------------------
+
+test("a socket under src/ gives the non-regular reason, not a system error", async (t) => {
+  const p = project(t);
+  // The project sits directly under tmpdir(), so <root>/src/s stays below
+  // the socket path limit (104 bytes on macOS, 108 on Linux).
+  const socket = join(p.root, "src", "s");
+  assert.ok(Buffer.byteLength(socket) < 104, socket);
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socket, resolve);
+  });
+  try {
+    assert.deepEqual(await hashNow(p), { reasons: ["src/s: is not a regular file or directory; the check hashes regular files only"] });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a src/ subdirectory removed between its lstat and its listing is skipped, and the hash is the rest's", async (t) => {
+  const p = project(t);
+  const sub = join(p.root, "src", "sub");
+  mkdirSync(sub);
+  writeFileSync(join(sub, "file.ts"), "export const x = 1;\n");
+  const listed = [];
+  const list = async (path) => {
+    listed.push(path);
+    if (path === sub) rmSync(sub, { recursive: true });
+    return readdir(path);
+  };
+  const raced = await hashNow(p, { list });
+  assert.ok(listed.includes(sub), `list was not called for src/sub; it listed ${JSON.stringify(listed)}`);
+  const paths = ["script.json", "timeline.json", "src/custom/Orbit.tsx", "src/kit/theme.ts", "public/narration.wav", ...voicePaths(p.stems)];
+  assert.deepEqual(raced, { hash: expectedHash(p.root, paths) });
 });
 
 // The specifiers of a module's static imports and re-exports.
