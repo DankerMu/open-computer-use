@@ -12,7 +12,7 @@
 // start path can load it.
 
 import { createHash } from "node:crypto";
-import { constants, open, readdir } from "node:fs/promises";
+import { constants, lstat, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { explainerScenes } from "./explainer-scenes.mjs";
 import { Refusal, lstatOrNull, notFound } from "./kit-io.mjs";
@@ -37,11 +37,23 @@ export function referencedPublicFiles(script, timeline) {
   return [...paths].sort(byCodeUnit);
 }
 
+// True when lstat shows path to be a socket. Any lstat failure is false, so
+// the caller's own open() error is the one that propagates.
+async function isSocket(path) {
+  try {
+    return (await lstat(path)).isSocket();
+  } catch {
+    return false;
+  }
+}
+
 // Reads one file to hash: opened with O_NONBLOCK | O_NOFOLLOW, so neither a
 // FIFO nor a final symlink is followed or waited on, then judged by fstat
 // on the handle. Resolves to {kind: "file", bytes}, {kind: "other"} (a
-// symlink, FIFO, directory or device), or {kind: "vanished"} when the path
-// is gone. Any other system error propagates.
+// symlink, FIFO, socket, directory or device), or {kind: "vanished"} when
+// the path is gone. open() refuses a socket with a platform's own error
+// (ENXIO on Linux, -102 on macOS), so any other failed open() is judged by
+// lstat: a socket is "other". Any other system error propagates.
 export async function readHashed(path) {
   let handle;
   try {
@@ -49,6 +61,7 @@ export async function readHashed(path) {
   } catch (thrown) {
     if (thrown?.code === "ELOOP") return { kind: "other" };
     if (notFound(thrown)) return { kind: "vanished" };
+    if (await isSocket(path)) return { kind: "other" };
     throw thrown;
   }
   try {
@@ -61,16 +74,24 @@ export async function readHashed(path) {
 
 // Every regular file under dir (project-relative path rel), as [path,
 // sha256]; anything but a directory or a regular file is a reason. A
-// directory is found by lstat; every other entry is read through read(),
-// so a FIFO is never waited on. An entry gone before it is read is skipped:
-// the second hash read sees the change.
-async function walk(root, rel, entries, reasons, read) {
-  for (const name of (await readdir(join(root, rel))).sort(byCodeUnit)) {
+// directory is found by lstat and listed through list(); every other entry
+// is read through read(), so a FIFO is never waited on. An entry gone
+// before it is read, or a subdirectory gone before it is listed, is
+// skipped: the second hash read sees the change. names is rel's listing.
+async function walk(root, rel, names, entries, reasons, { read, list }) {
+  for (const name of names.sort(byCodeUnit)) {
     const path = `${rel}/${name}`;
     const stat = await lstatOrNull(join(root, path));
     if (stat === null) continue;
     if (stat.isDirectory()) {
-      await walk(root, path, entries, reasons, read);
+      let inner;
+      try {
+        inner = await list(join(root, path));
+      } catch (thrown) {
+        if (notFound(thrown)) continue;
+        throw thrown;
+      }
+      await walk(root, path, inner, entries, reasons, { read, list });
       continue;
     }
     const file = await read(join(root, path));
@@ -98,10 +119,10 @@ async function trackHash(id, musicDir) {
 // Resolves to {hash} or {reasons}. A referenced file that is absent, gone
 // before it is read, or not a regular file is a null entry: the assets
 // stage reports it. A system error from a read propagates. read replaces
-// readHashed (tests interleave a removal). A project that names a music
-// track adds ["music:<id>", sha256 | null]; a "none" project reads nothing
-// under musicDir.
-export async function projectHash(root, { script, timeline, scriptText, timelineText, read = readHashed, musicDir = MUSIC_DIR }) {
+// readHashed and list replaces readdir (tests interleave a removal). A
+// project that names a music track adds ["music:<id>", sha256 | null]; a
+// "none" project reads nothing under musicDir.
+export async function projectHash(root, { script, timeline, scriptText, timelineText, read = readHashed, list = readdir, musicDir = MUSIC_DIR }) {
   const src = await lstatOrNull(join(root, "src"));
   if (src === null) return { reasons: ["src: is missing"] };
   if (src.isSymbolicLink()) return { reasons: ["src: is a symlink"] };
@@ -111,7 +132,7 @@ export async function projectHash(root, { script, timeline, scriptText, timeline
     ["timeline.json", sha256(timelineText)],
   ];
   const reasons = [];
-  await walk(root, "src", entries, reasons, read);
+  await walk(root, "src", await list(join(root, "src")), entries, reasons, { read, list });
   if (reasons.length) return { reasons };
   for (const path of referencedPublicFiles(script, timeline)) {
     const file = await read(join(root, path));

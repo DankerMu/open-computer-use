@@ -87,7 +87,10 @@ function placeTargets(targets) {
   });
 }
 
-// One parsed record per index, in the order of `indexes`.
+// One parsed record per index, in the order of `indexes`. A record line
+// repeated byte for byte counts once: Remotion retries a frame after a
+// browser crash on a new page, and the crashed page may have logged it
+// already. A differing second record for an index fails.
 export function collectRecords(lines, indexes) {
   const expected = new Set(indexes);
   const found = new Map();
@@ -101,12 +104,15 @@ export function collectRecords(lines, indexes) {
     }
     const index = isObject(record) ? record.index : undefined;
     if (!expected.has(index)) fail(`record for unexpected frame ${shown(index)}`);
-    if (found.has(index)) fail(`duplicate record for frame ${index}`);
-    found.set(index, record);
+    if (found.has(index)) {
+      if (found.get(index).line === line) continue;
+      fail(`duplicate record for frame ${index}`);
+    }
+    found.set(index, { line, record });
   }
   return indexes.map((index) => {
     if (!found.has(index)) fail(`no record for frame ${index}`);
-    return found.get(index);
+    return found.get(index).record;
   });
 }
 

@@ -3,8 +3,9 @@
 //
 // `kit render`: publishes the checked project as /mnt/user-data/files/
 // <name>.mp4. The start path refuses unless the last check passed and the
-// project still hashes as it did (bin/project-hash.mjs), then starts the
-// render as a background job (bin/job.mjs) and returns at once. Run as
+// project still hashes as it did (bin/project-hash.mjs), removes the
+// partial copies a stopped render left, then starts the render as a
+// background job (bin/job.mjs) and returns at once. Run as
 // `node bin/render.mjs --worker <token>` from the project root, this file is
 // the job's worker: it checks the pass again, renders to
 // .kit/render/<token>.mp4 (after writing public/music.wav, the music stem
@@ -101,9 +102,25 @@ async function stillChecked(root, project, musicDir) {
   return again.hash === project.hash;
 }
 
+// The hidden partial copies of name's video that publish() leaves while it
+// copies: .<name>.mp4.<token>.partial.
+const stalePartial = (name) => new RegExp(`^\\.${escapeRegExp(name)}\\.mp4\\.[0-9a-f]{32}\\.partial$`);
+
+// Under the start lock, once the check's pass still holds: the partials a
+// stopped render left in filesRoot go, as publish() sweeps them. An absent
+// filesRoot is skipped; the worker's publish reports it.
+async function startPrecondition(root, filesRoot) {
+  await checkedProject(root, MUSIC_DIR);
+  try {
+    await removeStale(filesRoot, stalePartial(basename(root)));
+  } catch (thrown) {
+    if (!notFound(thrown)) throw thrown;
+  }
+}
+
 export async function render(ctx) {
   if (!PROJECT_NAME.test(basename(ctx.root))) throw new Refusal(`${ctx.root}: not a kit project; run kit new`);
-  const precondition = () => checkedProject(ctx.root, MUSIC_DIR);
+  const precondition = () => startPrecondition(ctx.root, ctx.filesRoot);
   const pid = await startJob(ctx.root, NAME, ["bin/render.mjs", "--worker"], { precondition });
   ctx.say(`started (pid ${pid}); ${STATUS_HINT}`);
   return 0;
@@ -181,7 +198,7 @@ async function copyPartial(source, partial) {
 // target, false when a stop arrived before the rename. Before the rename
 // any error removes the partial and propagates.
 async function publish({ source, filesRoot, name, token, copy, stopRequested }) {
-  await removeStale(filesRoot, new RegExp(`^\\.${escapeRegExp(name)}\\.mp4\\.[0-9a-f]{32}\\.partial$`));
+  await removeStale(filesRoot, stalePartial(name));
   const target = join(filesRoot, `${name}.mp4`);
   const existing = await lstatOrNull(target);
   if (existing?.isSymbolicLink()) throw new Error(`${target} is a symlink; not replaced`);

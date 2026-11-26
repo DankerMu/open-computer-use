@@ -25,6 +25,7 @@ export async function check(ctx) {
 // sheet and tiles when it passed. A thrown system error (EACCES, a module
 // that cannot load, ...) is the one reason `check: <message>`; anything else
 // is a bug, which ends the worker without a result.
+// No deadline (#897): kit status shows a hung check, and kill -KILL -<pid> ends its group.
 async function worker(token) {
   handleStopSignals();
   const root = process.cwd();

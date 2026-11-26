@@ -135,9 +135,27 @@ test("collectRecords returns one record per expected index, ignoring other log l
 test("collectRecords throws on a missing, duplicated or unexpected record", () => {
   const line = (index) => `kit-probe ${JSON.stringify({ index })}`;
   assert.throws(() => collectRecords([line(3)], [3, 7]), /^Error: kit probe: no record for frame 7$/);
-  assert.throws(() => collectRecords([line(3), line(7), line(3)], [3, 7]), /^Error: kit probe: duplicate record for frame 3$/);
+  assert.throws(
+    () => collectRecords([line(3), line(7), `kit-probe ${JSON.stringify({ index: 3, x: 1 })}`], [3, 7]),
+    /^Error: kit probe: duplicate record for frame 3$/,
+  );
   assert.throws(() => collectRecords([line(3), line(7), line(9)], [3, 7]), /^Error: kit probe: record for unexpected frame 9$/);
   assert.throws(() => collectRecords(["kit-probe {not json"], [3]), /^Error: kit probe: unreadable record/);
+});
+
+// Task 5.5: a frame Remotion retried on a new page may log its record twice.
+test("collectRecords keeps one record for two identical lines of one index", () => {
+  const three = `kit-probe ${JSON.stringify({ index: 3, fontPresent: true, texts: [] })}`;
+  const seven = `kit-probe ${JSON.stringify({ index: 7, fontPresent: false, texts: [] })}`;
+  assert.deepEqual(collectRecords([three, seven, three], [3, 7]), [
+    { index: 3, fontPresent: true, texts: [] },
+    { index: 7, fontPresent: false, texts: [] },
+  ]);
+});
+
+test("collectRecords still throws on two differing lines of one index", () => {
+  const lines = [`kit-probe ${JSON.stringify({ index: 3, fontPresent: true })}`, `kit-probe ${JSON.stringify({ index: 3, fontPresent: false })}`];
+  assert.throws(() => collectRecords(lines, [3]), /^Error: kit probe: duplicate record for frame 3$/);
 });
 
 // --- violations: text differs -------------------------------------------------
