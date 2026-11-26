@@ -36,6 +36,7 @@ mkdir -p public out
 - The template has `src/index.ts`, `src/Root.tsx` (one 1920x1080, 30 fps composition with id `Main`), `remotion.config.ts` and `tsconfig.json`. Edit `src/` and register compositions in `src/Root.tsx`.
 - `node_modules` is shared and read-only. Never run `npm install`, `npm ci`, `npx remotion add`, `npx create-video` or `npx remotion upgrade`.
 - Keep `Config.setCachingEnabled(false)` in `remotion.config.ts`; the shared `node_modules` has no writable cache directory.
+- Keep `bin/` and the `installLoopbackLookup` import and call in `remotion.config.ts`; renders in a sandbox without networking need them.
 
 ## Run Remotion
 
