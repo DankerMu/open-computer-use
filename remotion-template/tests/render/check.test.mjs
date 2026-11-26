@@ -458,6 +458,54 @@ test("4: on the tracked registry the passing script passes every stage, or fails
   await ended(pid);
 });
 
+// #924: a line chart of 8 points gives each label a line 4 characters wide,
+// which the label's four opening marks fill, so wrapLines throws in the probe.
+const UNWRAPPABLE = "（（（（甲乙";
+const CHART = "chapter 3 应用, scene 2 (chart)";
+
+test("#924: on the tracked registry a chart label wrapLines cannot wrap fails the check naming its scene and field", { timeout: CHECK_LIMIT_MS }, async (t) => {
+  const labels = ["一月", "二月", UNWRAPPABLE, "四月", "五月", "六月", "七月", "八月"];
+  const script = checkScript((raw) => {
+    raw.chapters[2].scenes.push({
+      kind: "chart",
+      narration: [["销量逐月变化"]],
+      content: { type: "line", title: "月度销量", points: labels.map((label, i) => ({ label, value: 10 + i })) },
+    });
+  });
+  // The new scene renumbers the later scenes' stems, so every block gets
+  // its tone again, as the 5.4 tests write them.
+  const tone = join(scratch, "unwrappable-tone.wav");
+  execFileSync("ffmpeg", [
+    "-nostdin", "-v", "error",
+    "-f", "lavfi", "-i", `sine=frequency=440:sample_rate=48000:duration=${BLOCK_SECONDS}`,
+    "-ac", "1", "-c:a", "pcm_s16le",
+    tone,
+  ]);
+  const root = variant("unwrappable", (dir) => {
+    copyFileSync(join(TEMPLATE, "src", "kit", "render", "registry.ts"), join(dir, "src", "kit", "render", "registry.ts"));
+    writeFileSync(join(dir, "script.json"), `${JSON.stringify(script, null, 2)}\n`);
+    for (const name of ["timeline.json", join("public", "narration.wav"), join("public", "voice")]) rmSync(join(dir, name), { recursive: true });
+    mkdirSync(join(dir, "public", "voice"));
+    for (const { stem } of blockStems(script)) copyFileSync(tone, join(dir, "public", "voice", `${stem}.wav`));
+  });
+  const laid = kit(root, "timeline");
+  assert.equal(laid.code, 0, laid.err);
+  const { pid } = startCheck(root);
+  const done = await settled(root);
+  t.diagnostic(done.out);
+  const reasons = done.out.split("\n").filter(Boolean).slice(1);
+  assert.ok(reasons.every((line) => !line.startsWith("  probe:")), done.out);
+  assert.deepEqual(
+    [done.code, done.out],
+    [
+      1,
+      `kit status: check failed (1 reasons)\n  ${CHART}: content.points[2].label "${UNWRAPPABLE}" cannot be wrapped in 4 characters: its leading opening marks or spaces fill the line; shorten that run\n`,
+    ],
+    log(root),
+  );
+  await ended(pid);
+});
+
 // Starts a check, waits for the probe stage and a shell, sends `signal`, and
 // measures until no shell is left.
 async function signalDuringProbe(t, name, signal) {

@@ -469,6 +469,148 @@ test("probe: a custom index refusal is the reason, and nothing is probed", async
   ]);
 });
 
+// --- rule 6: probe, text wrapLines cannot wrap (#924) ---------------------------
+//
+// Each message is one src/kit/text.ts wrapLines throws for the field's value
+// at that width, after the `kit probe: target "<where>" frame <n>: ` prefix
+// probe() adds; RECORDED is tests/render/check.test.mjs's #924 run on
+// bce4aef, verbatim.
+
+const CHART = "chapter 3 应用, scene 2 (chart)";
+const OPENING = "its leading opening marks or spaces fill the line";
+const PIECE = "one character with its punctuation marks is wider than the line";
+const LABELS = ["一月", "二月", "（（（（甲乙", "四月", "五月", "六月", "七月", "八月"];
+const RECORDED = 'probe: kit probe: target "chapter 3 应用, scene 2 (chart)" frame 15: opening marks of "（（（（甲乙" fill maxWidth 4';
+
+// The fixture script with a line chart as chapter 3's second scene, its
+// point 2 labelled `label`, after `edit`.
+const chartScript = ({ label = LABELS[2], title = "月度销量", edit = () => {} } = {}) =>
+  checkScript((raw) => {
+    const labels = LABELS.with(2, label);
+    raw.chapters[2].scenes.push({
+      kind: "chart",
+      narration: [["销量逐月变化"]],
+      content: { type: "line", title, points: labels.map((value, i) => ({ label: value, value: 10 + i })) },
+    });
+    edit(raw);
+  });
+
+// probeRule's reasons for `s` when the probe rejects with `message`.
+async function rejected(t, s, message) {
+  const probe = async () => {
+    throw new Error(message);
+  };
+  return probeRule(customRoot(t), s, checkTimeline(s), { probe, theme: KIT_THEME });
+}
+
+const unwrappable = (where, field, value, width, cause) =>
+  `${where}: ${field} "${value}" cannot be wrapped in ${width} characters: ${cause}; shorten that run`;
+
+test("probe: a chart label whose opening marks fill its line names the scene and field", async (t) => {
+  assert.deepEqual(await rejected(t, chartScript(), `kit probe: target "${CHART}" frame 15: opening marks of "（（（（甲乙" fill maxWidth 4`), [
+    unwrappable(CHART, "content.points[2].label", "（（（（甲乙", 4, OPENING),
+  ]);
+});
+
+test("probe: the recorded in-image probe line names the chart label", async (t) => {
+  assert.ok(RECORDED.startsWith("probe: "), RECORDED);
+  assert.deepEqual(await rejected(t, chartScript(), RECORDED.slice("probe: ".length)), [
+    unwrappable(CHART, "content.points[2].label", "（（（（甲乙", 4, OPENING),
+  ]);
+});
+
+test("probe: the hook title whose opening marks fill its line names content.title", async (t) => {
+  const s = checkScript((raw) => {
+    raw.hook.content.title = "（（（（甲乙";
+  });
+  assert.deepEqual(await rejected(t, s, 'kit probe: target "hook" frame 15: opening marks of "（（（（甲乙" fill maxWidth 4'), [
+    unwrappable("hook", "content.title", "（（（（甲乙", 4, OPENING),
+  ]);
+});
+
+test("probe: a piece wider than its line names the field that holds it", async (t) => {
+  assert.deepEqual(await rejected(t, chartScript({ label: "，（（（（甲" }), `kit probe: target "${CHART}" frame 15: piece "（（（（甲" is wider than maxWidth 4`), [
+    unwrappable(CHART, "content.points[2].label", "，（（（（甲", 4, PIECE),
+  ]);
+});
+
+test("probe: a character with ten closing marks wider than its line names its field", async (t) => {
+  const closing = checkScript((raw) => {
+    raw.chapters[2].scenes[0].content.points[0] = "甲））））））））））";
+  });
+  assert.deepEqual(await rejected(t, closing, `kit probe: target "${CONCEPT}" frame 15: piece "甲））））））））））" is wider than maxWidth 8`), [
+    unwrappable(CONCEPT, "content.points[0]", "甲））））））））））", 8, PIECE),
+  ]);
+});
+
+test("probe: a nested field of another kind is named by its full path", async (t) => {
+  const steps = "chapter 1 现象, scene 2 (process-steps)";
+  const s = checkScript((raw) => {
+    raw.chapters[0].scenes.push({
+      kind: "process-steps",
+      narration: [["分三步看"]],
+      content: { steps: [{ label: "第一步", detail: "放入水中" }, { label: "（（（（甲乙" }] },
+    });
+  });
+  assert.deepEqual(await rejected(t, s, `kit probe: target "${steps}" frame 15: opening marks of "（（（（甲乙" fill maxWidth 4`), [
+    unwrappable(steps, "content.steps[1].label", "（（（（甲乙", 4, OPENING),
+  ]);
+});
+
+test("probe: without a target every scene is searched in playback order, past the custom scene", async (t) => {
+  const s = checkScript((raw) => {
+    raw.summary.content.points[0] = "（（（（甲乙";
+  });
+  assert.equal(explainerScenes(s, checkTimeline(s))[2].props.content, undefined);
+  assert.deepEqual(await rejected(t, s, 'Error: opening marks of "（（（（甲乙" fill maxWidth 4'), [
+    unwrappable("summary", "content.points[0]", "（（（（甲乙", 4, OPENING),
+  ]);
+});
+
+test("probe: a target restricts the search to its scene, and a target without the text falls back", async (t) => {
+  const s = checkScript((raw) => {
+    raw.chapters[2].scenes[0].content.points[0] = "（（（（甲乙";
+    raw.summary.content.points[0] = "（（（（甲乙";
+  });
+  const failure = (where) => `kit probe: target "${where}" frame 15: opening marks of "（（（（甲乙" fill maxWidth 4`;
+  assert.deepEqual(await rejected(t, s, failure("summary")), [unwrappable("summary", "content.points[0]", "（（（（甲乙", 4, OPENING)]);
+  assert.deepEqual(await rejected(t, s, failure(CONCEPT)), [unwrappable(CONCEPT, "content.points[0]", "（（（（甲乙", 4, OPENING)]);
+  assert.deepEqual(await rejected(t, s, failure("hook")), [`probe: ${failure("hook")}`]);
+  assert.deepEqual(await rejected(t, s, failure("no such scene")), [`probe: ${failure("no such scene")}`]);
+});
+
+test("probe: the target and the text are decoded from their JSON quoting", async (t) => {
+  const where = 'chapter 3 应"用, scene 2 (chart)';
+  const quoted = chartScript({
+    label: '（（（（"\\',
+    edit: (raw) => {
+      raw.chapters[2].name = '应"用';
+    },
+  });
+  assert.deepEqual(await rejected(t, quoted, 'kit probe: target "chapter 3 应\\"用, scene 2 (chart)" frame 15: opening marks of "（（（（\\"" fill maxWidth 4'), [
+    unwrappable(where, "content.points[2].label", '（（（（"\\', 4, OPENING),
+  ]);
+  const backslash = chartScript({ label: "（（（（\\甲" });
+  assert.deepEqual(await rejected(t, backslash, `kit probe: target "${CHART}" frame 15: opening marks of "（（（（\\\\" fill maxWidth 4`), [
+    unwrappable(CHART, "content.points[2].label", "（（（（\\甲", 4, OPENING),
+  ]);
+  // An escape JSON.parse refuses is not decoded, and nothing is named.
+  const invalid = `kit probe: target "${CHART}" frame 15: opening marks of "（（（（\\x" fill maxWidth 4`;
+  assert.deepEqual(await rejected(t, backslash, invalid), [`probe: ${invalid}`]);
+});
+
+test("probe: when two fields of the scene hold the text, the first in field order is named (known limit)", async (t) => {
+  const s = chartScript({ title: "（（（（甲乙增长" });
+  assert.deepEqual(await rejected(t, s, `kit probe: target "${CHART}" frame 15: opening marks of "（（（（甲乙" fill maxWidth 4`), [
+    unwrappable(CHART, "content.title", "（（（（甲乙增长", 4, OPENING),
+  ]);
+});
+
+test("probe: a text no field holds stays probe: <message>", async (t) => {
+  const message = `kit probe: target "${CHART}" frame 15: opening marks of "（（（（丙丁" fill maxWidth 4`;
+  assert.deepEqual(await rejected(t, chartScript(), message), [`probe: ${message}`]);
+});
+
 // --- runChecks ---------------------------------------------------------------
 
 const STAGES = ["schema", "timeline", "assets", "unnarrated", "rest", "music", "probe", "contact-sheet", "hash"];
