@@ -77,7 +77,9 @@ A scene of kind `custom` is the one scene you draw yourself. See "Custom scenes"
 
 ## Numbers and callouts
 
-- Round every `key-number` `value` and every `chart` point `value` so its formatted form is at most 8 code points. The kit formats numbers with `formatCount`: from 10000 in 万 and from 100000000 in 亿, cut to one decimal (`12345` shows as `1.2万`); smaller numbers show as written (`1234.5678` has 9 code points, so write `1234.6`).
+- Round every `key-number` `value` and every `chart` point `value` so it draws in at most 8 code points. The kit formats numbers with `formatCount`: from 10000 in 万 and from 100000000 in 亿, cut to one decimal (`12345` shows as `1.2万`); smaller numbers show as written. `kit check` accepts a value in two cases only, and refuses any other with a reason that states both bounds:
+  - below 10000 in size, at most 8 characters as written, sign and point included (`1234.5678` has 9, so write `1234.6`);
+  - from 10000 in size, below 1e12 with at most 2 decimals (write `12345.678` as `12345.68`; the decimals do not show, since the value draws as `1.2万`).
 - Put the unit in `unit`, not in the value.
 - Space callout points well apart on the image. `kit check` does not detect overlapping markers.
 

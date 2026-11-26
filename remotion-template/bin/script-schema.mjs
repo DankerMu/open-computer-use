@@ -231,7 +231,9 @@ export const scriptSchema = z
   })
   .describe(
     "Explainer video script, version 1: a hook, 3–5 chapters, a summary and an end card. " +
-      "A script holds at most one `custom` scene; JSON Schema cannot express this rule, and validateScript enforces it.",
+      "A script holds at most one `custom` scene; JSON Schema cannot express this rule, and validateScript enforces it. " +
+      "Every `key-number` value and chart point must draw in 8 characters (below 10000 in size, at most 8 characters as written; " +
+      "from 10000 in size, below 1e12 with at most 2 decimals); JSON Schema cannot express this rule either, and validateScript enforces it.",
   );
 
 export function scriptJsonSchema() {

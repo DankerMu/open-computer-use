@@ -492,6 +492,8 @@ test("the JSON Schema states the skeleton, the block limit and the custom rule",
   assert.ok(schema.properties.endCard.required.includes("content"));
   assert.ok(!schema.properties.endCard.required.includes("narration"));
   assert.match(schema.description, /at most one `custom` scene/);
+  assert.match(schema.description, /below 1e12/);
+  assert.match(schema.description, /at most 2 decimals/);
 });
 
 // --- voice (task 3.5) -----------------------------------------------------
@@ -825,12 +827,14 @@ test("the JSON Schema carries the control-character pattern on every text field"
 // fits the 8 code points its line holds. Values and the limit text come from
 // the task 4.7 fixture; -1234.56, 9999.999 and 0.123456 are added because they
 // are below 10000 and exactly 8 code points, so they pin the bound itself.
+// 12345.68, 1234.6, 12345.678 and 1234.5678 are the examples the skill text
+// (skills/public/remotion/explainer-kit.md) gives, so they tie it to the rule.
 
 const NUMBER_LIMIT =
   "drawn in at most 8 characters: below 10000 in size, at most 8 characters as written, sign and point included; " +
   "from 10000, below 1e12 with at most 2 decimals; round the number";
-const REJECTED_NUMBERS = [0.123456789, -1234.5678, -10000.123, 1e12, -1e12, 123456789.123, 9999.9999, -999.9999];
-const ACCEPTED_NUMBERS = [-99999000, -99999999, -9999.9, 12345.67, -12345.67, 999999999999, 0, -0.5, -1234.56, 9999.999, 0.123456];
+const REJECTED_NUMBERS = [0.123456789, -1234.5678, -10000.123, 1e12, -1e12, 123456789.123, 9999.9999, -999.9999, 12345.678, 1234.5678];
+const ACCEPTED_NUMBERS = [-99999000, -99999999, -9999.9, 12345.67, -12345.67, 999999999999, 0, -0.5, -1234.56, 9999.999, 0.123456, 12345.68, 1234.6];
 
 const numberAt = (field) => ({ chapter: "1 现象", scene: 1, field, limit: NUMBER_LIMIT });
 const keyNumber = (value) => withScene(minimal(), 0, 0, (s) => Object.assign(s, { kind: "key-number", content: { value, label: "人数" } }));

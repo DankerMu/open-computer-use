@@ -447,6 +447,8 @@ def test_kit_reference_states_the_facts_the_kit_enforces() -> None:
         "COMMAND_TIMEOUT",
         "`formatCount`",
         "at most 8 code points",
+        "below 1e12",
+        "at most 2 decimals",
         "src/custom/",
         "default export",
         "/opt/video-music/manifest.json",
