@@ -122,9 +122,16 @@ def _stub_call_tool(monkeypatch, behavior, emitter=None):
     monkeypatch.setattr(computer_use_tools._MCPClient, "call_tool", call_tool)
 
 
+# A loopback port nothing listens on: a test that stubs the MCP transport and keeps
+# this URL gets a fast refusal from the outputs listing instead of a 5 s DNS failure
+# of the default computer-use-server host.
+UNREACHABLE_ORCHESTRATOR = "http://127.0.0.1:9"
+
+
 def _tools_with_token(monkeypatch):
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", INTERNAL_TOKEN)
     tools = computer_use_tools.Tools()
+    tools.valves.ORCHESTRATOR_URL = UNREACHABLE_ORCHESTRATOR
     tools.valves.MCP_API_KEY = MCP_API_KEY
     return tools
 
@@ -235,6 +242,18 @@ APP_MODULES = {
 }
 
 
+
+def _is_app_module(name):
+    # office.* binds docker_manager at import: a cached copy would keep an earlier
+    # test's BASE_DATA_DIR and fail the outputs listing's Office recovery.
+    return (
+        name in APP_MODULES
+        or name.startswith("mcp_resources")
+        or name == "office"
+        or name.startswith("office.")
+    )
+
+
 def _guard_environment(data):
     return {
         "OCU_WEBUI_ORIGIN": "https://webui.example",
@@ -255,6 +274,7 @@ class _GuardedOCU:
         tmp_path,
         *,
         imports_mode="live",
+        outputs_mode="live",
     ):
         import auth_guard
 
@@ -266,14 +286,21 @@ class _GuardedOCU:
         self.calls = []
         self.speech_calls = []
         self.imports_mode = imports_mode
+        # /api/outputs/{chat_id}: "live" serves the real broker listing; the other modes
+        # are the failures the wrapper must absorb. page_limit caps the page size, delay
+        # holds each response; queries records each request's query string.
+        self.outputs_mode = outputs_mode
+        self.outputs_page_limit = None
+        self.outputs_delay = 0.0
+        self.outputs_queries = []
+        # Called with the tool name inside each fake MCP tool, while the call runs.
+        self.during_call = None
         self.server = None
         self.thread = None
         self.data_dir = tmp_path / "ocu-data"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._snapshot = {
-            name: value
-            for name, value in sys.modules.items()
-            if name in APP_MODULES or name.startswith("mcp_resources")
+            name: value for name, value in sys.modules.items() if _is_app_module(name)
         }
         for key, value in _guard_environment(self.data_dir).items():
             monkeypatch.setenv(key, value)
@@ -297,6 +324,7 @@ class _GuardedOCU:
         async def bash_tool(command: str, description: str) -> str:
             self.commands.append({"command": command, "uploads": list(self.uploads)})
             self.calls.append(("bash_tool", command))
+            self._during_call("bash_tool")
             if self.bash_gate is not None:
                 await self.bash_gate(command)
             return f"ran:{command}"
@@ -306,11 +334,13 @@ class _GuardedOCU:
             description: str, old_str: str, path: str, new_str: str = ""
         ) -> str:
             self.calls.append(("str_replace", path))
+            self._during_call("str_replace")
             return f"edited:{path}"
 
         @self.mcp.tool()
         async def create_file(description: str, file_text: str, path: str) -> str:
             self.calls.append(("create_file", path))
+            self._during_call("create_file")
             return f"created:{path}"
 
         @self.mcp.tool(structured_output=False)
@@ -318,6 +348,7 @@ class _GuardedOCU:
             description: str, path: str, view_range: list | None = None
         ) -> str | list:
             self.calls.append(("view", path))
+            self._during_call("view")
             if path.endswith(".png"):
                 # The shape of the real MCP view for an image (mcp_tools.view, #706).
                 return [
@@ -336,6 +367,7 @@ class _GuardedOCU:
             resume_session_id: str = "",
         ) -> str:
             self.calls.append(("sub_agent", task))
+            self._during_call("sub_agent")
             return f"delegated:{task}"
 
         @self.mcp.tool()
@@ -343,6 +375,7 @@ class _GuardedOCU:
             text: str, filename: str, instructions: str = "", voice: str = ""
         ) -> str:
             self.calls.append(("generate_speech", filename))
+            self._during_call("generate_speech")
             self.speech_calls.append(
                 {"text": text, "filename": filename, "instructions": instructions, "voice": voice}
             )
@@ -370,6 +403,37 @@ class _GuardedOCU:
                 return JSONResponse({}, status_code=302, headers={"Location": "/elsewhere"})
             payload = await ocu_app.get_upload_imports(request.path_params["chat_id"])
             return JSONResponse(payload)
+
+        async def outputs_endpoint(request):
+            from fastapi import HTTPException, Response
+
+            self.outputs_queries.append(dict(request.query_params))
+            if self.outputs_delay:
+                await asyncio.sleep(self.outputs_delay)
+            mode = self.outputs_mode
+            if mode == "fail":
+                return JSONResponse({"detail": "listing failed"}, status_code=500)
+            if mode == "conflict":
+                return JSONResponse({"detail": "stale cursor"}, status_code=409)
+            if mode == "busy":
+                return JSONResponse({"detail": "busy"}, status_code=503)
+            if mode == "malformed":
+                return JSONResponse({"files": "chart.png", "next_cursor": None})
+            if mode == "not-json":
+                return PlainTextResponse("not json")
+            if mode == "redirect":
+                return JSONResponse({}, status_code=302, headers={"Location": "/elsewhere"})
+            limit = int(request.query_params.get("limit", "100"))
+            if self.outputs_page_limit is not None:
+                limit = min(limit, self.outputs_page_limit)
+            try:
+                body = await ocu_app.list_outputs(
+                    request.path_params["chat_id"], Response(),
+                    cursor=request.query_params.get("cursor"), limit=limit, if_none_match=None,
+                )
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            return JSONResponse(body)
 
         async def upload(request):
             from fastapi import HTTPException, UploadFile
@@ -403,6 +467,7 @@ class _GuardedOCU:
             routes=[
                 Route("/health", health),
                 Route("/api/uploads/{chat_id}/imports", imports_endpoint),
+                Route("/api/outputs/{chat_id}", outputs_endpoint),
                 Route(
                     "/api/uploads/{chat_id}/{filename:path}",
                     upload,
@@ -438,6 +503,10 @@ class _GuardedOCU:
 
         self.app = auth_guard.AuthGuardMiddleware(record)
 
+    def _during_call(self, tool_name):
+        if self.during_call is not None:
+            self.during_call(tool_name)
+
     def start(self):
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
@@ -458,7 +527,7 @@ class _GuardedOCU:
         self.server.should_exit = True
         self.thread.join(timeout=5)
         for name in list(sys.modules):
-            if name in APP_MODULES or name.startswith("mcp_resources"):
+            if _is_app_module(name):
                 sys.modules.pop(name, None)
         sys.modules.update(self._snapshot)
 
@@ -480,11 +549,11 @@ class _GuardedOCU:
         return f"http://127.0.0.1:{self.port}"
 
 
-def _with_guard(monkeypatch, tmp_path, imports_mode="live"):
+def _with_guard(monkeypatch, tmp_path, imports_mode="live", outputs_mode="live"):
     class GuardContext:
         def __enter__(self):
             self.server = _GuardedOCU(
-                monkeypatch, tmp_path, imports_mode=imports_mode
+                monkeypatch, tmp_path, imports_mode=imports_mode, outputs_mode=outputs_mode
             )
             self.server.start()
             return self.server
@@ -1479,7 +1548,7 @@ def test_health_preflight_rejection_is_a_configuration_error_with_hint(
     monkeypatch.setenv("OCU_INTERNAL_TOKEN", client_token)
 
     def origin_response(request):
-        if request["path"] == "/health":
+        if request["path"] == "/health" or request["path"].startswith("/api/outputs/"):
             return status, {}, b"rejected"
         raise AssertionError("MCP must not run after health rejection")
 
@@ -1495,7 +1564,10 @@ def test_health_preflight_rejection_is_a_configuration_error_with_hint(
             )
         )
 
-    assert [request["path"] for request in origin.requests] == ["/health"]
+    # The rejected "before" outputs listing leaves no snapshot, so no "after" listing runs.
+    assert [request["path"] for request in origin.requests] == [
+        "/api/outputs/chat-health-rejection?limit=1000", "/health",
+    ]
     assert result.startswith("[CONFIG ERROR]")
     assert f"HTTP {status}" in result
     assert "traceback" not in result.lower()
@@ -2813,6 +2885,229 @@ def test_copy_knowledge_file_description_carries_the_flow():
     params = {m.group(1) for m in (re.match(r":param (\w+):", line.strip()) for line in doc.splitlines()) if m}
     assert params == {"file_id", "description"}
     assert "__files__" not in inspect.signature(computer_use_tools.Tools.copy_knowledge_file).parameters
+
+
+
+# --- New images: the writing tools report the images a call created or changed (#938) ---
+
+WRITING_TOOLS = ("bash_tool", "str_replace", "create_file", "sub_agent")
+WRITING_RESULTS = {
+    "bash_tool": "ran:echo ready",
+    "str_replace": "edited:/home/assistant/a.txt",
+    "create_file": "created:/home/assistant/a.txt",
+    "sub_agent": "delegated:inspect attachment",
+}
+CHART = b"\x89PNG chart"
+
+
+def _new_image(path):
+    return f"New image: /mnt/user-data/files/{path}"
+
+
+def _write_outputs(ocu, chat_id, files):
+    root = ocu.chat_uploads(chat_id)
+    for name, content in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+
+def _writes_during_call(ocu, chat_id, files, then=None):
+    """The fake MCP tool writes files into the chat's outputs while it runs, then calls then()."""
+    def write(tool_name):
+        _write_outputs(ocu, chat_id, files)
+        if then is not None:
+            then()
+
+    ocu.during_call = write
+
+
+def _run_bash(ocu, monkeypatch, chat_id, **kwargs):
+    return asyncio.run(_invoke_public_tool(_guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, [], **kwargs))
+
+
+@pytest.mark.parametrize("method", WRITING_TOOLS)
+def test_an_image_the_call_writes_is_reported_after_its_output(monkeypatch, tmp_path, method):
+    _image_env(monkeypatch)
+    chat_id = f"new-image-{method.replace('_', '-')}"
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        _writes_during_call(ocu, chat_id, {"chart.png": CHART})
+        result = asyncio.run(_invoke_public_tool(_guarded_tools(monkeypatch, ocu), method, chat_id, []))
+        listings = _records(ocu, f"/api/outputs/{chat_id}", authorization=f"Bearer {INTERNAL_TOKEN}")
+        calls = _records(ocu, "/mcp", **{"x-chat-id": chat_id})
+
+    assert result == f"{WRITING_RESULTS[method]}\n\n{_new_image('chart.png')}"
+    assert [record["method"] for record in listings] == ["GET", "GET"]
+    assert ocu.outputs_queries == [{"limit": "1000"}] * 2
+    # Equal records are distinct requests; order them by identity.
+    order = [id(record) for record in ocu.requests]
+    assert order.index(id(listings[0])) < order.index(id(calls[0]))
+    assert order.index(id(calls[-1])) < order.index(id(listings[1]))
+
+
+def test_only_new_or_changed_images_are_reported_in_path_order(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "new-image-diff"
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        _write_outputs(ocu, chat_id, {"kept.png": b"kept", "changed.png": b"old", "notes.txt": b"n"})
+        _writes_during_call(ocu, chat_id, {
+            "zeta.png": b"new image", "changed.png": b"rewritten", "data.csv": b"a,b\n",
+            "plots/t.png": b"plot", "notes.txt": b"rewritten notes",
+        })
+        result = _run_bash(ocu, monkeypatch, chat_id)
+
+    assert result == "ran:echo ready\n\n" + "\n".join(
+        _new_image(path) for path in ("changed.png", "plots/t.png", "zeta.png")
+    )
+
+
+def test_more_than_ten_new_images_end_with_a_count_line(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "new-image-many"
+    names = [f"img{n:02d}.png" for n in range(12, 0, -1)]
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        ocu.outputs_page_limit = 5
+        _writes_during_call(ocu, chat_id, {name: name.encode() for name in names})
+        result = _run_bash(ocu, monkeypatch, chat_id)
+
+    assert result == "ran:echo ready\n\n" + "\n".join(
+        [*(_new_image(name) for name in sorted(names)[:10]), "More new images: 2"]
+    )
+    # One page before; three pages of five after, the later two by cursor.
+    assert [query["limit"] for query in ocu.outputs_queries] == ["1000"] * 4
+    assert ["cursor" in query for query in ocu.outputs_queries] == [False, False, True, True]
+
+
+@pytest.mark.parametrize(("count", "reported"), ((5, True), (6, False)), ids=("five-pages", "sixth-page"))
+def test_a_snapshot_reads_at_most_five_pages(monkeypatch, tmp_path, count, reported):
+    _image_env(monkeypatch)
+    chat_id = f"new-image-pages-{count}"
+    names = [f"img{n}.png" for n in range(1, count + 1)]
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        ocu.outputs_page_limit = 1
+        _writes_during_call(ocu, chat_id, {name: name.encode() for name in names})
+        result = _run_bash(ocu, monkeypatch, chat_id)
+
+    expected = "ran:echo ready"
+    if reported:
+        expected += "\n\n" + "\n".join(_new_image(name) for name in names)
+    assert result == expected
+    assert len(ocu.outputs_queries) == 1 + 5
+
+
+@pytest.mark.parametrize(
+    "mode", ("fail", "conflict", "busy", "malformed", "not-json", "redirect", "timeout"),
+)
+def test_a_failed_after_listing_leaves_the_output_unchanged(monkeypatch, tmp_path, mode):
+    _image_env(monkeypatch)
+    chat_id = f"new-image-after-{mode}"
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        def fail_after():
+            if mode == "timeout":
+                monkeypatch.setattr(computer_use_tools, "_IMAGE_LISTING_BUDGET_SECONDS", 0.5, raising=False)
+                ocu.outputs_delay = 1.5
+            else:
+                ocu.outputs_mode = mode
+
+        _writes_during_call(ocu, chat_id, {"chart.png": CHART}, then=fail_after)
+        result = _run_bash(ocu, monkeypatch, chat_id)
+
+    assert result == "ran:echo ready"
+    assert len(ocu.outputs_queries) == 2
+
+
+def test_the_listing_budget_covers_every_page_of_a_snapshot(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "new-image-budget"
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        ocu.outputs_page_limit = 1
+
+        def slow_after():
+            # Four pages of 0.4 s each exceed a 1 s budget, though each fits on its own.
+            monkeypatch.setattr(computer_use_tools, "_IMAGE_LISTING_BUDGET_SECONDS", 1.0, raising=False)
+            ocu.outputs_delay = 0.4
+
+        _writes_during_call(ocu, chat_id, {f"img{n}.png": b"%d" % n for n in range(4)}, then=slow_after)
+        result = _run_bash(ocu, monkeypatch, chat_id)
+
+    assert result == "ran:echo ready"
+    assert 2 <= len(ocu.outputs_queries) <= 1 + 3
+
+
+def test_a_failed_before_listing_reports_nothing(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "new-image-before-busy"
+    with _with_guard(monkeypatch, tmp_path, outputs_mode="busy") as ocu:
+        _writes_during_call(
+            ocu, chat_id, {"chart.png": CHART}, then=lambda: setattr(ocu, "outputs_mode", "live"),
+        )
+        result = _run_bash(ocu, monkeypatch, chat_id)
+
+    assert result == "ran:echo ready"
+    # Without a "before" snapshot no "after" listing runs.
+    assert len(ocu.outputs_queries) == 1
+
+
+def test_an_error_result_still_reports_the_image_it_wrote(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "new-image-error"
+    events = []
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        async def call_tool(self, *args, **kwargs):
+            _write_outputs(ocu, chat_id, {"chart.png": CHART})
+            return "Error: command exited with status 1"
+
+        monkeypatch.setattr(computer_use_tools._MCPClient, "call_tool", call_tool)
+        result = asyncio.run(_guarded_tools(monkeypatch, ocu).bash_tool(
+            "python plot.py", "plot", __metadata__={"chat_id": chat_id},
+            __event_emitter__=lambda e: _collect(events, e),
+        ))
+
+    assert result == f"Error: command exited with status 1\n\n{_new_image('chart.png')}"
+    assert _status_events(events)[-1]["data"]["status"] == "error"
+
+
+def test_a_synced_chat_image_is_not_reported_and_new_lines_precede_sync_notes(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "new-image-synced"
+    _chat_webui(
+        monkeypatch, tmp_path, chat_id, {"m1": _message(1, _image_ref(GEN_LOGO))},
+        {GEN_LOGO: _image_row("u.png", b"user image")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        _writes_during_call(ocu, chat_id, {"chart.png": CHART})
+        result = _run_bash(ocu, monkeypatch, chat_id, command="out")
+
+    assert ocu.stored_files(chat_id) == {"u.png": b"user image", "chart.png": CHART}
+    assert result == (
+        "ran:out\n\nNew image: /mnt/user-data/files/chart.png"
+        "\n\nSynced image: /mnt/user-data/files/u.png"
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "expected"),
+    (
+        ("view", "/home/assistant/notes.txt", "viewed:/home/assistant/notes.txt"),
+        ("view", "/home/assistant/frame.png", f"data:image/jpeg;base64,{VIEW_IMAGE_B64}"),
+        ("generate_speech", "line1.mp3", "spoken:line1.mp3"),
+    ),
+    ids=("view-text", "view-image", "generate-speech"),
+)
+def test_view_and_generate_speech_list_no_outputs(monkeypatch, tmp_path, method, path, expected):
+    _image_env(monkeypatch)
+    chat_id = f"new-image-{method.replace('_', '-')}"
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        _writes_during_call(ocu, chat_id, {"chart.png": CHART})
+        tools = _guarded_tools(monkeypatch, ocu)
+        common = {"__metadata__": {"chat_id": chat_id}, "__user__": OWNER}
+        if method == "view":
+            result = asyncio.run(tools.view("read", path, **common))
+        else:
+            result = asyncio.run(tools.generate_speech("narration", path, **common))
+
+    assert result == expected
+    assert ocu.outputs_queries == []
 
 
 if __name__ == "__main__":
