@@ -1154,6 +1154,8 @@ class Tools:
 
 # Upstream generate_image records each image in the message's files as
 # {"type": "image", "url": "/api/v1/files/<id>/content"} (tools/builtin.py).
+# A user-attached image carries its id and an image/* content_type instead
+# (MessageInput.svelte, Chat.svelte); _chat_image_id accepts both.
 _CHAT_IMAGE_URL = re.compile(r"^/api/v1/files/([0-9a-f-]+)/content$")
 # Bounds the per-call file lookups in a chat with many images.
 _CHAT_IMAGE_LIMIT = 20
@@ -1174,8 +1176,26 @@ def _attachment_ids(files) -> list:
     return ids
 
 
+def _chat_image_id(item: dict):
+    """The file id of a message file entry that is an image, else None.
+
+    A user-attached image names its id with an image/* content_type, whatever its
+    type; a generated image is type "image" with a file-content url. The stored
+    row decides in _readable_files; the entry only nominates the id.
+    """
+    file_id, content_type = item.get("id"), item.get("content_type")
+    if (isinstance(file_id, str) and file_id
+            and isinstance(content_type, str) and content_type.startswith("image/")):
+        return file_id
+    if item.get("type") == "image":
+        match = _CHAT_IMAGE_URL.match(str(item.get("url", "")))
+        if match:
+            return match.group(1)
+    return None
+
+
 async def _chat_image_ids(chat_id: str, user) -> list:
-    """Ids of the images in this chat's messages, newest first.
+    """Ids of the generated and user-attached images in this chat's messages, newest first.
 
     Read only when the requesting user owns the chat. Any failure is logged and
     yields no ids; it never fails the tool call.
@@ -1195,11 +1215,9 @@ async def _chat_image_ids(chat_id: str, user) -> list:
     file_ids = []
     for message in sorted(messages, key=_message_timestamp, reverse=True):
         for item in message.get("files") or []:
-            if not isinstance(item, dict) or item.get("type") != "image":
-                continue
-            match = _CHAT_IMAGE_URL.match(str(item.get("url", "")))
-            if match and match.group(1) not in file_ids:
-                file_ids.append(match.group(1))
+            file_id = _chat_image_id(item) if isinstance(item, dict) else None
+            if file_id and file_id not in file_ids:
+                file_ids.append(file_id)
     return file_ids
 
 
