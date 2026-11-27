@@ -820,6 +820,7 @@ class Tools:
         sync_warning: str = "",
         extra_headers: Optional[dict] = None,
         image: bool = False,
+        report_images: bool = False,
     ) -> str:
         """One transport-aware MCP call with consistent SSE status events.
 
@@ -833,6 +834,10 @@ class Tools:
         false-positives on "errors fixed: 0", view only matched "Error:", etc).
 
           - Every caller validates chat metadata before file synchronization.
+
+        With report_images=True the chat's outputs are listed before and after the MCP
+        call, and a "New image:" line for each image the call created or changed goes
+        between the result and sync_warning (#938).
         """
         error = self._call_error(chat_id)
         if error:
@@ -848,6 +853,7 @@ class Tools:
             await self._emit_status(emitter, description, status, done)
 
         await emit(in_progress_desc, "in_progress", False)
+        before = await self._output_images(chat_id) if report_images else None
         invoked = False
         try:
             headers = self._build_mcp_headers(chat_id, __user__, request=request)
@@ -864,14 +870,25 @@ class Tools:
         except Exception as e:
             await emit("Execution error", "error", True)
             result = f"[Error] {tool_name} wrapper crashed: {type(e).__name__}: {e}"
+        # Without a "before" snapshot nothing can be diffed, so no "after" listing runs.
+        after = await self._output_images(chat_id) if invoked and before is not None else None
         if invoked:
             await self._emit_workspace_hint(emitter, chat_id)
-        if sync_warning and _is_image_data_uri(result):
+        if _is_image_data_uri(result):
             # Open WebUI sends the whole string to the model as one image
             # (middleware.py 1124-1129); appended text would corrupt it.
-            print(f"[SYNC] Not shown with the image result: {sync_warning}")
+            if sync_warning:
+                print(f"[SYNC] Not shown with the image result: {sync_warning}")
             return result
-        return f"{result}\n\n{sync_warning}" if sync_warning else result
+        notes = [_new_image_lines(before, after) if after is not None else "", sync_warning]
+        notes = [note for note in notes if note]
+        return "\n\n".join([result, *notes]) if notes else result
+
+    async def _output_images(self, chat_id: str) -> Optional[dict]:
+        return await asyncio.to_thread(
+            _output_image_snapshot, self.valves.ORCHESTRATOR_URL, chat_id,
+            {"Authorization": f"Bearer {os.environ.get('OCU_INTERNAL_TOKEN', '')}"},
+        )
 
     # =========================================================================
     # Tool methods — delegate to computer-use-orchestrator via MCP Streamable HTTP
@@ -904,6 +921,7 @@ class Tools:
             in_progress_desc=description or "Executing bash command...",
             ok_desc="Command completed", err_desc="Command failed",
             sync_warning=sync_warning,
+            report_images=True,
         )
 
     async def str_replace(
@@ -939,6 +957,7 @@ class Tools:
             in_progress_desc=description or f"Editing {path}...",
             ok_desc="File edited", err_desc="Edit failed",
             sync_warning=sync_warning,
+            report_images=True,
         )
 
     async def create_file(
@@ -970,6 +989,7 @@ class Tools:
             in_progress_desc=description or f"Creating {path}...",
             ok_desc="File created", err_desc="Creation failed",
             sync_warning=sync_warning,
+            report_images=True,
         )
 
     async def view(
@@ -1094,6 +1114,7 @@ class Tools:
             timeout=SUB_AGENT_CLIENT_TIMEOUT,
             sync_warning=sync_warning,
             extra_headers=await _gateway_headers(__request__, __metadata__, __user__),
+            report_images=True,
         )
 
     async def copy_knowledge_file(
@@ -1353,6 +1374,72 @@ def _imported_attachment_ids(orchestrator_url, chat_id, headers):
     if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
         raise ValueError("malformed imports response")
     return set(ids)
+
+
+# Bounds of one outputs snapshot for the new-image report (#938): a listing of more
+# pages, or slower than the budget, reports nothing instead of delaying the tool result.
+_IMAGE_LISTING_PAGES = 5
+_IMAGE_LISTING_BUDGET_SECONDS = 5.0
+_IMAGE_LISTING_PAGE_SIZE = 1000  # MAX_PAGE_LIMIT of GET /api/outputs/{chat_id}
+_NEW_IMAGE_LINE_LIMIT = 10
+
+
+def _output_image_snapshot(orchestrator_url, chat_id, headers) -> Optional[dict]:
+    """{path: (revision, hash)} of the chat's linked image outputs, or None when unreadable.
+
+    Any failure (HTTP error, redirect, malformed body, more pages than the bound, the
+    budget spent) is logged and yields None; it never fails the tool call.
+    """
+    import requests
+
+    outputs_url = f"{orchestrator_url}/api/outputs/{chat_id}"
+    deadline = time.monotonic() + _IMAGE_LISTING_BUDGET_SECONDS
+    snapshot, cursor = {}, None
+    try:
+        for _ in range(_IMAGE_LISTING_PAGES):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("listing budget spent")
+            params = {"limit": _IMAGE_LISTING_PAGE_SIZE}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = requests.get(
+                outputs_url, headers=headers, params=params,
+                timeout=remaining, allow_redirects=False,
+            )
+            if 300 <= response.status_code < 400:
+                raise requests.HTTPError(f"redirect blocked (HTTP {response.status_code})")
+            response.raise_for_status()
+            payload = response.json()
+            files = payload.get("files") if isinstance(payload, dict) else None
+            cursor = payload.get("next_cursor") if isinstance(payload, dict) else None
+            if not isinstance(files, list) or not isinstance(cursor, (str, type(None))):
+                raise ValueError("malformed outputs listing")
+            for entry in files:
+                if not isinstance(entry, dict):
+                    raise ValueError("malformed outputs listing")
+                mime = entry.get("mime")
+                if not (isinstance(mime, str) and mime.startswith("image/")) or entry.get("url") is None:
+                    continue
+                path = entry.get("path")
+                if not isinstance(path, str) or not path:
+                    raise ValueError("malformed outputs listing")
+                snapshot[path] = (entry.get("revision"), entry.get("hash"))
+            if cursor is None:
+                return snapshot
+        raise ValueError(f"outputs listing exceeds {_IMAGE_LISTING_PAGES} pages")
+    except Exception as e:
+        print(f"[IMAGES] Outputs of {chat_id} not listed: {type(e).__name__}: {e}")
+        return None
+
+
+def _new_image_lines(before: dict, after: dict) -> str:
+    """One "New image:" line per image path new or changed in after, sorted, then a count line."""
+    paths = sorted(path for path, version in after.items() if before.get(path) != version)
+    lines = [f"New image: /mnt/user-data/files/{path}" for path in paths[:_NEW_IMAGE_LINE_LIMIT]]
+    if len(paths) > _NEW_IMAGE_LINE_LIMIT:
+        lines.append(f"More new images: {len(paths) - _NEW_IMAGE_LINE_LIMIT}")
+    return "\n".join(lines)
 
 
 _DISCOVERY_REASONS = frozenset({
