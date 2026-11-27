@@ -2306,6 +2306,135 @@ def test_a_chat_image_entry_naming_a_non_image_file_is_not_synced(monkeypatch, t
     assert webui.get_file_calls == []
     assert ocu.uploads == []
 
+
+# --- A user-attached chat image syncs like a generated one (#935) ---
+
+USER_PIC = "0a1b2c3d-0000-4000-8000-0000000000a1"
+
+
+def _attached_image(file_id, kind="file", content_type="image/png"):
+    """A message file entry as WebUI records a user's image: an upload is type "file"
+    (MessageInput.svelte:1009-1015), an image added by URL type "image"
+    (Chat.svelte:1843-1848); both carry the bare id as url."""
+    return {"type": kind, "id": file_id, "url": file_id, "content_type": content_type}
+
+
+def _user_message(timestamp, *files):
+    return {**_message(timestamp, *files), "role": "user"}
+
+
+@pytest.mark.parametrize(
+    "kind, content_type, filename",
+    (("file", "image/png", "photo.png"), ("image", "image/jpeg", "photo.jpg")),
+    ids=("uploaded", "added-by-url"),
+)
+def test_a_user_attached_image_syncs_once_and_is_listed(
+    monkeypatch, tmp_path, kind, content_type, filename
+):
+    _image_env(monkeypatch)
+    chat_id = f"user-image-{kind}"
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id,
+        {"m1": _user_message(1, _attached_image(USER_PIC, kind, content_type))},
+        {USER_PIC: _row(filename, b"user picture", content_type=content_type)},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        tools = _guarded_tools(monkeypatch, ocu)
+        first = asyncio.run(_invoke_public_tool(tools, "bash_tool", chat_id, []))
+        first_lookups = list(webui.lookups)
+        webui.lookups.clear()
+        second = asyncio.run(_invoke_public_tool(tools, "bash_tool", chat_id, [], "echo second"))
+
+        assert first_lookups == [USER_PIC]
+        assert first == f"ran:echo ready\n\nSynced image: /mnt/user-data/files/{filename}"
+        assert ocu.stored_files(chat_id) == {filename: b"user picture"}
+        assert second == "ran:echo second"
+        assert webui.lookups == []
+        assert ocu.uploads == [{"filename": filename, "attachment_id": USER_PIC}]
+
+
+def test_a_user_image_entry_whose_stored_row_is_not_an_image_is_not_synced(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "user-image-pdf-row"
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id, {"m1": _user_message(1, _attached_image(USER_PIC))},
+        {USER_PIC: _row("brief.pdf", b"document", content_type="application/pdf")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.lookups == [USER_PIC]
+    assert webui.get_file_calls == []
+    assert ocu.uploads == []
+
+
+def test_a_user_image_the_requester_cannot_read_is_not_synced(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "user-image-unreadable"
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id, {"m1": _user_message(1, _attached_image(USER_PIC))},
+        {USER_PIC: _image_row("photo.png", SECRET, user_id=OTHER["id"])},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.lookups == [USER_PIC]
+    assert (USER_PIC, "read", OWNER["id"]) in webui.access_checks
+    assert webui.get_file_calls == []
+    assert ocu.uploads == []
+
+
+def test_a_non_image_file_in_chat_history_is_not_a_chat_image(monkeypatch, tmp_path):
+    _image_env(monkeypatch)
+    chat_id = "user-file-pdf"
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id,
+        {"m1": _user_message(1, _attached_image(DOC_BRIEF, content_type="application/pdf"))},
+        {DOC_BRIEF: _row("brief.pdf", b"document", content_type="application/pdf")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.lookups == []
+    assert ocu.uploads == []
+
+
+_NO_ID = object()
+
+
+@pytest.mark.parametrize(
+    "file_id", (_NO_ID, None, "", 123, ["x"]),
+    ids=("missing", "none", "empty", "int", "unhashable"),
+)
+@pytest.mark.parametrize("kind", ("file", "image"))
+def test_a_user_image_entry_without_a_string_id_is_ignored(monkeypatch, tmp_path, kind, file_id):
+    _image_env(monkeypatch)
+    chat_id = f"user-image-no-id-{kind}"
+    entry = {"type": kind, "url": "photo", "content_type": "image/png"}
+    if file_id is not _NO_ID:
+        entry["id"] = file_id
+    webui = _chat_webui(
+        monkeypatch, tmp_path, chat_id, {"m1": _user_message(1, entry)},
+        {USER_PIC: _image_row("photo.png", b"user picture")},
+    )
+    with _with_guard(monkeypatch, tmp_path) as ocu:
+        result = asyncio.run(_invoke_public_tool(
+            _guarded_tools(monkeypatch, ocu), "bash_tool", chat_id, []
+        ))
+
+    assert result == "ran:echo ready"
+    assert webui.lookups == []
+    assert ocu.uploads == []
+
 # --- copy_knowledge_file: a knowledge-base file the chat owner can read (#786) ---
 
 KB_FILE = "F-kb"
