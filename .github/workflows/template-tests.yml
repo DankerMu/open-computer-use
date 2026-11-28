@@ -34,6 +34,16 @@ jobs:
       - name: Install template dependencies
         working-directory: remotion-template
         run: npm ci
+      # kit data's table reader runs on python3; 3.12 is the workspace image's Python.
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install openpyxl
+        # kit data reads .xlsx files with openpyxl; 3.1.5 is the workspace image's pin.
+        run: pip install openpyxl==3.1.5
+      - name: Check openpyxl
+        # The reader runs as python3 -I, so check the import the same way.
+        run: python3 -I -c 'import openpyxl'
       - name: Run template tests
         # Quoted: node expands the glob itself; Node 22 does not expand directories.
         run: node --test "remotion-template/tests/*.test.mjs"
