@@ -122,7 +122,7 @@ def _kit_usages() -> dict[str, str]:
         re.MULTILINE,
     )
     usages = {quoted or bare: double or single for quoted, bare, double, single in entries}
-    assert len(usages) == len(block.group(1).strip().splitlines()) == 8, usages
+    assert len(usages) == len(block.group(1).strip().splitlines()) == 9, usages
     return usages
 
 
@@ -413,10 +413,19 @@ def test_router_names_the_workflows_and_ties_the_vendored_guidance_to_custom() -
     assert len(sentences) == 1 and "`custom`" in sentences[0], vendored
 
 
+# Kit commands the skill text does not teach yet. `data` exits when task 6.2
+# (DankerMu/open-webui#975) documents it in report-kit.md.
+UNDOCUMENTED_KIT_COMMANDS = {"data"}
+
+
 def test_skill_names_every_kit_command_and_no_other() -> None:
     usages = _kit_usages()
     text = {path.name: _read(path) for path in (ROUTER, KIT_REFERENCE)}
-    missing = [usage for usage in usages.values() if not any(_bounded(usage).search(t) for t in text.values())]
+    missing = [
+        usage
+        for name, usage in usages.items()
+        if name not in UNDOCUMENTED_KIT_COMMANDS and not any(_bounded(usage).search(t) for t in text.values())
+    ]
     assert missing == []
     unknown = [
         f"{name}: node bin/kit.mjs {word}"

@@ -2,7 +2,9 @@
 // Copyright (c) 2025 Open Computer Use Contributors
 //
 // Notice coverage for third-party code in the explainer kit: every file under
-// remotion-template/src/kit/ and remotion-template/bin/ carries an SPDX header;
+// remotion-template/src/kit/ and remotion-template/bin/ carries an SPDX header
+// (a Python file in bin/ one in `#` comments, under the repository's own
+// licence);
 // a file under any other licence names its source, commit and licence in a
 // `Source:` line; NOTICE and THIRD-PARTY-LICENSES.md list each source with
 // the same licence; and the licence text ships beside the code.
@@ -17,11 +19,13 @@ import { fileURLToPath } from "node:url";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url));
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
-const SCAN_ROOTS = [join(TEMPLATE, "src", "kit"), join(TEMPLATE, "bin")];
+const BIN = join(TEMPLATE, "bin");
+const SCAN_ROOTS = [join(TEMPLATE, "src", "kit"), BIN];
 const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".mjs", ".js"]);
 const OWN_LICENCE = "FSL-1.1-Apache-2.0";
 const HEADER_LINES = 3;
 const SPDX_LINE = /^\/\/ SPDX-License-Identifier: (\S+)$/;
+const PY_SPDX_LINE = /^# SPDX-License-Identifier: (\S+)$/;
 const SOURCE_PREFIX = "// Source:";
 const SOURCE_LINE = /^\/\/ Source: ([^\s/]+\/[^\s/]+) ([0-9a-f]{40}) (\S+) (\S+)$/;
 // Required Notice lines of sources whose formats or ideas the kit borrows.
@@ -115,9 +119,19 @@ function nearestLicence(root, fileDir) {
   return null;
 }
 
+// A Python file in bin/ is the repository's own: its SPDX line, within the
+// first HEADER_LINES lines, names OWN_LICENCE. It has no Source line, so a
+// third-party licence there would escape the NOTICE checks.
+function pythonHeaderErrors(path) {
+  const lines = readFileSync(path, "utf8").split("\n").slice(0, HEADER_LINES);
+  const spdx = lines.map((line) => line.match(PY_SPDX_LINE)).find(Boolean);
+  if (!spdx) return [`${rel(path)}: no # SPDX-License-Identifier line in its first ${HEADER_LINES} lines`];
+  return spdx[1] === OWN_LICENCE ? [] : [`${rel(path)}: SPDX ${spdx[1]} is not ${OWN_LICENCE}`];
+}
+
 test("every kit and bin file carries a valid licence header", () => {
   const errors = [];
-  for (const { path } of scanned()) {
+  for (const { root, path } of scanned()) {
     if (CODE_EXTENSIONS.has(extname(path))) {
       const header = readHeader(path);
       errors.push(...header.errors);
@@ -128,8 +142,10 @@ test("every kit and bin file carries a valid licence header", () => {
           errors.push(`${rel(path)}: SPDX ${header.spdx} differs from Source licence ${header.source.licence}`);
         }
       }
+    } else if (root === BIN && extname(path) === ".py") {
+      errors.push(...pythonHeaderErrors(path));
     } else if (basename(path) !== "LICENSE") {
-      errors.push(`${rel(path)}: not a .ts, .tsx, .mjs or .js file and not a LICENSE`);
+      errors.push(`${rel(path)}: not a .ts, .tsx, .mjs or .js file, a .py file in bin/ or a LICENSE`);
     }
   }
   assert.deepEqual(errors, []);
