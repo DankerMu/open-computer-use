@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2026 Open Computer Use Contributors
 # Run evaluation requests through the running ocu-eval stack.
-# Usage: run.sh --package <dir> --phase baseline|after|smoke [--request <id>] [--repetition <n>]
+# Usage: run.sh --package <dir> --phase baseline|after|smoke|report-before|report-after
+#        [--request <id>] [--repetition <n>]
 # Requires EVAL_ROOT and EVAL_WEBUI_PORT. Exports stack.env and images.env as
 # start.sh does and starts driver.py with the host's python3 in isolated mode. The
 # provider key file ${EVAL_KEY_FILE} (default $HOME/.ocu-eval-dmxapi.key) reaches

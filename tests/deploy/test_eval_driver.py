@@ -450,8 +450,9 @@ class DriverCase(unittest.TestCase):
             environment[RUNTIME_IMAGE_VARS[role]] = DEFAULT_RELEASE_IMAGES[role]
         return environment
 
-    def drive(self, *args: str, request: str | None = FIRST["id"], **extra) -> tuple[int, str, str]:
-        argv = ["--package", str(self.package), "--phase", "smoke", *args]
+    def drive(self, *args: str, request: str | None = FIRST["id"], phase: str = "smoke",
+              **extra) -> tuple[int, str, str]:
+        argv = ["--package", str(self.package), "--phase", phase, *args]
         if request is not None:
             argv += ["--request", request]
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -1488,6 +1489,166 @@ class OutcomeTableTests(DriverCase):
         self.assertEqual((got["outcome"], got["class"], got["reason"]), ("failed", "kit", expected))
         self.assertEqual(len(got["reason"]), 200)
         self.assert_no_leak_anywhere()
+
+
+EXPLAINER_ONE = {"id": "explainer-one", "kind": "explainer", "repetitions": 2, "prompt": "Explain one."}
+REPORT_MAIN = {"id": "report-main", "kind": "report", "set": "report", "repetitions": 2,
+               "prompt": "Report main."}
+REPORT_UNCLEAR = {"id": "report-unclear", "kind": "report", "set": "report-smoke", "repetitions": 1,
+                  "prompt": "Report unclear."}
+EXPLAINER_TWO = {"id": "explainer-two", "kind": "explainer", "repetitions": 1, "prompt": "Explain two."}
+# Set and explainer entries interleaved, so file order and each repetition are both visible.
+SELECTION_REQUESTS = [EXPLAINER_ONE, REPORT_MAIN, REPORT_UNCLEAR, EXPLAINER_TWO]
+EXPLAINER_PLAN = [("explainer-one", 1), ("explainer-one", 2), ("explainer-two", 1)]
+REPORT_PLAN = [("report-main", 1), ("report-main", 2)]
+PHASES = ("baseline", "after", "smoke", "report-before", "report-after")
+
+
+class RequestSelectionTests(DriverCase):
+    """#951: each phase sends only the requests it owns and creates attempts only in its own directory."""
+
+    def setUp(self):
+        super().setUp()
+        self.requests_path = self.tmp / "requests.json"
+        patcher = mock.patch.object(DRIVER, "REQUESTS_PATH", self.requests_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def use_requests(self, *entries: dict):
+        self.requests_path.write_text(json.dumps({"version": 1, "requests": list(entries)}), encoding="utf-8")
+
+    def tree(self, phase: str) -> dict[str, bytes | None]:
+        base = self.eval_root / "runs" / phase
+        return {str(path.relative_to(base)): None if path.is_dir() else path.read_bytes()
+                for path in sorted(base.rglob("*"))}
+
+    def slots(self, phase: str) -> list[tuple[str, int]]:
+        base = self.eval_root / "runs" / phase
+        return [(run_dir.parent.name, int(run_dir.name[1:].split("-")[0]))
+                for run_dir in sorted(base.glob("*/r*-a*"))] if base.is_dir() else []
+
+    def assert_refused(self, text: str, *args: str, request: str | None, phase: str):
+        code, stdout, stderr = self.drive(*args, request=request, phase=phase)
+        self.assertEqual((code, stdout, stderr), (1, "", f"eval: refused: {text}\n"))
+        self.assertEqual(self.webui.paths, [], "the driver called WebUI before refusing")
+        self.assertFalse((self.eval_root / "runs").exists(), "the driver created a run directory")
+        self.assertFalse((self.eval_root / "eval.lock").exists(), "the driver took the lock")
+
+    def test_each_phase_without_request_runs_its_own_entries_in_file_order(self):
+        self.use_requests(*SELECTION_REQUESTS)
+        prompts = {request["id"]: request["prompt"] for request in SELECTION_REQUESTS}
+        for phase in PHASES:
+            with self.subTest(phase=phase):
+                expected = REPORT_PLAN if phase.startswith("report-") else EXPLAINER_PLAN
+                posts = len(self.webui.posts)
+                code, _, stderr = self.drive(request=None, phase=phase)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual([body["user_message"]["content"] for body in self.webui.posts[posts:]],
+                                 [prompts[request_id] for request_id, _ in expected])
+                self.assertEqual(self.slots(phase), expected)
+
+    def test_every_selection_refusal_comes_before_any_call_or_directory(self):
+        cases = [
+            ((EXPLAINER_ONE, REPORT_UNCLEAR), "report-before", None, (),
+             "no request in requests.json belongs to phase report-before"),
+            ((EXPLAINER_ONE, REPORT_UNCLEAR), "report-after", None, (),
+             "no request in requests.json belongs to phase report-after"),
+            ((REPORT_MAIN, REPORT_UNCLEAR), "baseline", None, (),
+             "no request in requests.json belongs to phase baseline"),
+            ((REPORT_MAIN, REPORT_UNCLEAR), "after", None, (),
+             "no request in requests.json belongs to phase after"),
+            ((REPORT_MAIN, REPORT_UNCLEAR), "smoke", None, (),
+             "no request in requests.json belongs to phase smoke"),
+            (SELECTION_REQUESTS, "baseline", "report-main", (),
+             "request report-main has set report; set entries run only in report phases"),
+            (SELECTION_REQUESTS, "after", "report-main", (),
+             "request report-main has set report; set entries run only in report phases"),
+            (SELECTION_REQUESTS, "smoke", "report-unclear", (),
+             "request report-unclear has set report-smoke; set entries run only in report phases"),
+            (SELECTION_REQUESTS, "report-before", "explainer-one", (),
+             "request explainer-one has no set; report phases run only set entries"),
+            (SELECTION_REQUESTS, "report-after", "explainer-two", (),
+             "request explainer-two has no set; report phases run only set entries"),
+            (SELECTION_REQUESTS, "report-before", "report-main", ("--repetition", "3"),
+             "request report-main has 2 repetitions"),
+            (SELECTION_REQUESTS, "report-after", None, ("--repetition", "1"), "--repetition needs --request"),
+        ]
+        for entries, phase, request, args, text in cases:
+            with self.subTest(phase=phase, request=request, text=text):
+                self.use_requests(*entries)
+                self.assert_refused(text, *args, request=request, phase=phase)
+
+    def test_an_unknown_set_is_refused_when_requests_json_is_loaded(self):
+        self.use_requests(EXPLAINER_ONE, dict(REPORT_MAIN, id="report-odd", set="report-final"))
+        for phase, request in (("smoke", "explainer-one"), ("report-before", None)):
+            with self.subTest(phase=phase, request=request):
+                self.assert_refused("request report-odd has unknown set report-final",
+                                    request=request, phase=phase)
+
+    def test_a_report_run_writes_only_under_its_own_phase(self):
+        self.use_requests(*SELECTION_REQUESTS)
+        # A finished attempt under every other phase, so an unchanged tree is a real check.
+        for phase, request_id in (("baseline", "explainer-one"), ("after", "explainer-two"),
+                                  ("smoke", "explainer-one"), ("report-after", "report-main")):
+            run_dir = self.eval_root / "runs" / phase / request_id / "r1-a1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "manifest.json").write_text(json.dumps({"phase": phase, "failure_class": "model"}),
+                                                   encoding="utf-8")
+            (run_dir / "transcript.json").write_text("{}", encoding="utf-8")
+        others = [phase for phase in PHASES if phase != "report-before"]
+        before = {phase: self.tree(phase) for phase in others}
+        code, _, stderr = self.drive(request=None, phase="report-before")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([body["user_message"]["content"] for body in self.webui.posts],
+                         [REPORT_MAIN["prompt"]] * 2)
+        self.assertEqual(sorted(path.name for path in (self.eval_root / "runs").iterdir()), sorted(PHASES))
+        self.assertEqual(sorted(path.name for path in (self.eval_root / "runs" / "report-before").iterdir()),
+                         ["report-main"])
+        dirs = self.run_dirs("report-main", "report-before")
+        self.assertEqual([path.name for path in dirs], ["r1-a1", "r2-a1"])
+        for repetition, run_dir in enumerate(dirs, start=1):
+            manifest = self.manifest(run_dir)
+            self.assertEqual((manifest["phase"], manifest["request_id"], manifest["kind"],
+                              manifest["repetition"], manifest["outcome"]),
+                             ("report-before", "report-main", "report", repetition, "succeeded"))
+        for phase in others:
+            self.assertEqual(self.tree(phase), before[phase], phase)
+
+    def test_a_named_report_smoke_entry_runs_in_a_report_phase_and_not_in_smoke(self):
+        self.use_requests(*SELECTION_REQUESTS)
+        code, _, stderr = self.drive(request="report-unclear", phase="report-after")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([body["user_message"]["content"] for body in self.webui.posts],
+                         [REPORT_UNCLEAR["prompt"]])
+        dirs = self.run_dirs("report-unclear", "report-after")
+        self.assertEqual([path.name for path in dirs], ["r1-a1"])
+        self.assertEqual(self.manifest(dirs[0])["phase"], "report-after")
+        paths = len(self.webui.paths)
+        code, stdout, stderr = self.drive(request="report-unclear", phase="smoke")
+        refusal = "request report-unclear has set report-smoke; set entries run only in report phases"
+        self.assertEqual((code, stdout, stderr), (1, "", f"eval: refused: {refusal}\n"))
+        self.assertEqual(self.webui.paths[paths:], [])
+        self.assertFalse((self.eval_root / "runs" / "smoke").exists())
+
+    def test_a_report_run_completes_an_interrupted_baseline_attempt_in_place(self):
+        self.use_requests(*SELECTION_REQUESTS)
+        chat_id = str(uuid.uuid4())
+        run_dir = self.eval_root / "runs" / "baseline" / "explainer-one" / "r1-a1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "pending.json").write_text(json.dumps({
+            "user_message_id": str(uuid.uuid4()), "started_at": "2026-11-17T08:00:00Z",
+            "chat_id": chat_id}), encoding="utf-8")
+        code, stdout, stderr = self.drive(request=None, phase="report-before")
+        self.assertEqual(code, 0, stderr)
+        recovered = self.manifest(run_dir)
+        self.assertEqual((recovered["phase"], recovered["request_id"], recovered["kind"],
+                          recovered["failure_class"], recovered["failure_reason"], recovered["chat_id"]),
+                         ("baseline", "explainer-one", "explainer", "infra", "driver interrupted", chat_id))
+        self.assertIn("eval: runs/baseline/explainer-one/r1-a1 failed infra: driver interrupted", stdout)
+        self.assertEqual(self.ledger()[0], chat_id)
+        self.assertEqual(self.slots("baseline"), [("explainer-one", 1)])
+        self.assertEqual(sorted(path.name for path in run_dir.parent.iterdir()), ["r1-a1"])
+        self.assertEqual(self.slots("report-before"), REPORT_PLAN)
 
 
 if __name__ == "__main__":

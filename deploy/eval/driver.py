@@ -33,6 +33,12 @@ import urllib.request
 import uuid
 
 SOURCE = Path(__file__).resolve().parents[2]
+REQUESTS_PATH = SOURCE / "deploy" / "eval" / "requests.json"
+# Explainer phases own the entries without `set`; report phases own the entries with one.
+EXPLAINER_PHASES = ("baseline", "after", "smoke")
+REPORT_PHASES = ("report-before", "report-after")
+# Without --request a report phase runs the "report" entries; "report-smoke" ones run only when named.
+REQUEST_SETS = ("report", "report-smoke")
 MODEL = "qwen3.8-27b"
 VIDEO_FILTER = "video_production_filter"
 REQUIRED_FUNCTIONS = ("computer_use_filter", VIDEO_FILTER)
@@ -404,10 +410,13 @@ class Driver:
                            redactor)
         self.context: dict = {}
         self.stopped = False
-        payload = json.loads((SOURCE / "deploy" / "eval" / "requests.json").read_text(encoding="utf-8"))
+        payload = json.loads(REQUESTS_PATH.read_text(encoding="utf-8"))
         self.requests = {request["id"]: request for request in payload["requests"]}
         if not all(REQUEST_ID.fullmatch(request_id) for request_id in self.requests):
             raise Refusal("requests.json holds an id that is not a plain directory name")
+        for request in self.requests.values():
+            if "set" in request and request["set"] not in REQUEST_SETS:
+                raise Refusal(f"request {request['id']} has unknown set {request['set']}")
 
     def docker(self, *args: str) -> tuple[int, str]:
         try:
@@ -418,14 +427,24 @@ class Driver:
         return result.returncode, result.stdout.strip()
 
     def plan(self) -> list[tuple[dict, int]]:
+        report = self.args.phase in REPORT_PHASES
         if self.args.request is None:
             if self.args.repetition is not None:
                 raise Refusal("--repetition needs --request")
-            return [(request, repetition) for request in self.requests.values()
-                    for repetition in range(1, request["repetitions"] + 1)]
+            wanted = "report" if report else None
+            selected = [(request, repetition) for request in self.requests.values()
+                        if request.get("set") == wanted
+                        for repetition in range(1, request["repetitions"] + 1)]
+            if not selected:
+                raise Refusal(f"no request in requests.json belongs to phase {self.args.phase}")
+            return selected
         request = self.requests.get(self.args.request)
         if request is None:
             raise Refusal(f"request {self.args.request} is not in requests.json")
+        if "set" in request and not report:
+            raise Refusal(f"request {request['id']} has set {request['set']}; set entries run only in report phases")
+        if "set" not in request and report:
+            raise Refusal(f"request {request['id']} has no set; report phases run only set entries")
         repetition = self.args.repetition or 1
         if not 1 <= repetition <= request["repetitions"]:
             raise Refusal(f"request {request['id']} has {request['repetitions']} repetitions")
@@ -850,8 +869,9 @@ class Driver:
 def arguments(argv: list[str]):
     parser = argparse.ArgumentParser(prog="run.sh", description="Run evaluation requests.")
     parser.add_argument("--package", required=True, help="release package directory (release.json)")
-    parser.add_argument("--phase", required=True, choices=("baseline", "after", "smoke"))
-    parser.add_argument("--request", help="one request id of requests.json; default: all")
+    parser.add_argument("--phase", required=True, choices=(*EXPLAINER_PHASES, *REPORT_PHASES))
+    parser.add_argument("--request", help="one request id of requests.json; default: the entries without set, "
+                                          "or with set report in a report phase")
     parser.add_argument("--repetition", type=int, help="repetition of --request; default 1")
     return parser.parse_args(argv)
 
