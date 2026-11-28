@@ -267,16 +267,18 @@ function tableCell(cell) {
 }
 
 // The reader's table rebuilt in the pinned key order, or null when its shape
-// is not the version 1 table format.
-function tableFrom(parsed) {
+// is not the version 1 table format; source.sheet is null for a CSV and a
+// non-empty string for an xlsx.
+function tableFrom(parsed, xlsx) {
   if (!hasKeys(parsed, ["version", "source", "label_header", "columns", "rows"]) || parsed.version !== 1) return null;
   const { source, label_header: labelHeader, columns, rows } = parsed;
-  if (!hasKeys(source, ["file", "sheet", "sha256"]) || !isString(source.file) || source.sheet !== null) return null;
+  if (!hasKeys(source, ["file", "sheet", "sha256"]) || !isString(source.file)) return null;
+  if (xlsx ? !isString(source.sheet) || source.sheet === "" : source.sheet !== null) return null;
   if (!isString(source.sha256) || !/^[0-9a-f]{64}$/.test(source.sha256) || !isString(labelHeader)) return null;
   if (!Array.isArray(columns) || columns.length === 0 || !columns.every(isString) || !Array.isArray(rows)) return null;
   const table = {
     version: 1,
-    source: { file: source.file, sheet: null, sha256: source.sha256 },
+    source: { file: source.file, sheet: source.sheet, sha256: source.sha256 },
     label_header: labelHeader,
     columns: [...columns],
     rows: [],
@@ -291,19 +293,20 @@ function tableFrom(parsed) {
   return table.rows.length === 0 ? null : table;
 }
 
-// Runs the reader on one real path, killing it after timeoutMs; resolves the
-// table, or throws a refusal: the reader's own, or
-// `the table reader failed: <reason>`.
-async function readTable(path, timeoutMs) {
+// Runs the reader on one real path and, for an xlsx, the --sheet value if
+// given, killing it after timeoutMs; resolves the table, or throws a
+// refusal: the reader's own, or `the table reader failed: <reason>`.
+async function readTable(path, xlsx, sheet, timeoutMs) {
   const failed = (reason) => new Refusal(`the table reader failed: ${escapeLine(reason)}`);
-  const { exit, stdout, stderr } = await execText("python3", ["-I", READER, path], READER_MAX_BUFFER, timeoutMs);
+  const args = ["-I", READER, path, ...(sheet === undefined ? [] : [sheet])];
+  const { exit, stdout, stderr } = await execText("python3", args, READER_MAX_BUFFER, timeoutMs);
   if (exit === "ENOENT") throw failed("python3 not found");
   if (exit === "ETIMEDOUT") throw failed(`timed out after ${timeoutMs / 1000} seconds`);
   if (exit === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") throw failed("bad output");
   if (exit === 0) {
     let table = null;
     try {
-      table = tableFrom(JSON.parse(stdout));
+      table = tableFrom(JSON.parse(stdout), xlsx);
     } catch {
       // A JSON syntax error is bad output, thrown below.
     }
@@ -323,12 +326,14 @@ const tabLine = (fields) => `${fields.map(escapeLine).join("\t")}\n`;
 async function data(ctx) {
   const [arg] = ctx.args;
   const { given, real } = await userFile(ctx, arg);
-  const extension = extname(given);
-  if (extension.toLowerCase() !== ".csv") throw new Refusal(`${arg}: is not a .csv file`);
-  if (ctx.options.sheet !== undefined) throw new Refusal("--sheet applies only to .xlsx files");
-  const name = tableName(basename(given).slice(0, -extension.length));
+  // The real path's extension picks the format; the name comes from the given path.
+  const extension = extname(real).toLowerCase();
+  if (extension !== ".csv" && extension !== ".xlsx") throw new Refusal(`${arg}: is not a .csv or .xlsx file`);
+  const xlsx = extension === ".xlsx";
+  if (!xlsx && ctx.options.sheet !== undefined) throw new Refusal("--sheet applies only to .xlsx files");
+  const name = tableName(basename(given, extname(given)));
   if (name === "") throw new Refusal(`${arg}: the file name gives an empty table name`);
-  const table = await readTable(real, ctx.readerTimeoutMs ?? READER_TIMEOUT_MS);
+  const table = await readTable(real, xlsx, ctx.options.sheet, ctx.readerTimeoutMs ?? READER_TIMEOUT_MS);
   const dir = await projectDir(ctx.root, "data");
   const file = `${name}.json`;
   const replaced = (await lstatOrNull(join(dir, file))) !== null;
