@@ -142,8 +142,11 @@ EVAL_WEBUI_PORT=<port> setsid nohup "$EVAL_ROOT/src/deploy/eval/run.sh" \
     >"$EVAL_ROOT/snap/<label>/run.log" 2>&1 &
 ```
 
-- `--phase` is `baseline`, `after` or `smoke`. Use `smoke` for any run that is neither the baseline nor the after run.
-- Without `--request`, it runs every request of `requests.json` in file order, each `repetitions` times. With `--request` and no `--repetition`, it runs repetition 1.
+- `--phase` is one of five phases. `baseline`, `after` and `smoke` are the explainer phases. Use `smoke` for any explainer run that is neither the baseline nor the after run. `report-before` and `report-after` are the report phases.
+- A request entry may carry `set`, either `report` or `report-smoke`. Explainer phases own the entries without `set`, and report phases own the entries with `set`. The driver refuses to load `requests.json` when an entry has any other `set` value.
+- Without `--request`, an explainer phase runs every entry without `set`, and a report phase runs every `set: "report"` entry. It runs them in file order, each `repetitions` times. A `report-smoke` entry runs only when named. When that selection is empty, the driver refuses.
+- With `--request` and no `--repetition`, it runs repetition 1. A named entry with `set` is refused in an explainer phase. A named entry without `set` is refused in a report phase.
+- These request refusals come before the lock, the sign-in and any chat.
 - It prints one line per attempt and always ends with `eval: done <exit status>`. It exits 0 when every attempt ended with a manifest, whatever the outcome.
 - It reads `stack.env`, `images.env` and the provider key file as `start.sh` does. The key reaches `driver.py` on stdin, never on a command line or in an environment. The driver runs with the host's `python3` (3.10 or newer, standard library only).
 
@@ -170,7 +173,7 @@ Each attempt has its own directory, `${EVAL_ROOT}/runs/<phase>/<request id>/r<re
 
 An MP4 is valid when `ffprobe` from the workspace image, run offline, reports a video stream and a duration above 0.
 
-A directory without `manifest.json` was left by a driver that died. The next driver run marks it `failed`, `infra`, `driver interrupted`. It records the chat id from `pending.json`, or finds the chat by its user message id and adds it to the ledger. That manifest has `null` release, models, counts and elapsed time. It counts as an `infra` attempt.
+A directory without `manifest.json` was left by a driver that died. The next driver run, of any phase, marks it `failed`, `infra`, `driver interrupted` in place, with the phase of its own path. This is the only write a run makes under `runs/` outside its own phase directory, and it creates no attempt. It records the chat id from `pending.json`, or finds the chat by its user message id and adds it to the ledger. That manifest has `null` release, models, counts and elapsed time. It counts as an `infra` attempt.
 
 ### Outcomes and reruns
 
