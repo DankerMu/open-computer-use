@@ -124,7 +124,12 @@ test("a drop decision and a theme-only export load", (t) => {
     exports: { [A]: exportBody({ decisions: [{ id: "quiz", decision: "drop" }] }), [B]: exportBody({ decisions: [] }) },
     entries: (d) => [entry(d, { decision: "drop" }), entry(d, { id: "theme", decision: "light", export: B, export_sha256: d[B] })],
   });
-  assert.deepEqual(loadApprovals(root), { decisions: new Map([["quiz", "drop"]]), theme: "light" });
+  const decisions = new Map([["quiz", "drop"]]);
+  assert.deepEqual(loadApprovals(root), {
+    presets: { explainer: { decisions, theme: "light" }, report: { decisions: new Map(), theme: null } },
+    decisions,
+    theme: "light",
+  });
 });
 
 // --- shape --------------------------------------------------------------------
@@ -224,4 +229,112 @@ test("a theme entry with the unknown theme dark, or whose export has theme null,
 
 test("the second entry is located as entries[1]", (t) => {
   refused(tree(t, { entries: (d) => [entry(d), entry(d, { decision: "redo" })] }), `${APPROVALS}: entries[1].decision differs from ${A}`);
+});
+
+// --- per preset (issue #962) ------------------------------------------------------
+
+// The preset table of src/kit/presets.ts as the fixture states it, its
+// report theme candidates widened to light so a report pick can load.
+const TABLE = {
+  explainer: { idPrefix: "", themeId: "theme", requiredKinds: ["hook", "summary", "end-card"], themeCandidates: ["light"] },
+  report: { idPrefix: "report:", themeId: "report:theme", requiredKinds: ["cover", "summary", "end-card"], themeCandidates: ["light"] },
+};
+const R = "gallery/exports/r.json";
+const reportExport = (overrides = {}) => exportBody({ preset: "report", decisions: [{ id: "report:cover", decision: "approve" }], ...overrides });
+const explainerEntries = (d) => [entry(d, { id: "summary" }), entry(d, { id: "theme", decision: "light" })];
+const explainerExport = () => exportBody({ decisions: [{ id: "summary", decision: "approve" }] });
+const reportEntries = (d) => [
+  entry(d, { id: "report:cover", export: R, export_sha256: d[R] }),
+  entry(d, { id: "report:theme", decision: "light", export: R, export_sha256: d[R] }),
+];
+
+test("a second preset loads its own view: report:cover and report:theme give presets.report, the explainer view is unchanged", (t) => {
+  const both = tree(t, {
+    exports: { [A]: explainerExport(), [R]: reportExport() },
+    entries: (d) => [...explainerEntries(d), ...reportEntries(d)],
+  });
+  const loaded = loadApprovals(both, TABLE);
+  assert.deepEqual(loaded.presets.report, { decisions: new Map([["cover", "approve"]]), theme: "light" });
+  assert.equal(loaded.presets.report.decisions.has("summary"), false);
+  const alone = loadApprovals(tree(t, { exports: { [A]: explainerExport() }, entries: explainerEntries }), TABLE);
+  assert.deepEqual(alone.presets.explainer, { decisions: new Map([["summary", "approve"]]), theme: "light" });
+  assert.deepEqual(loaded.presets.explainer, alone.presets.explainer);
+  assert.deepEqual(loaded.decisions, alone.decisions);
+  assert.equal(loaded.theme, alone.theme);
+  assert.equal(loaded.decisions, loaded.presets.explainer.decisions);
+});
+
+test("a later report:cover redo replaces the approve", (t) => {
+  const B2 = "gallery/exports/r2.json";
+  const root = tree(t, {
+    exports: { [R]: reportExport(), [B2]: reportExport({ date: "2026-11-20", decisions: [{ id: "report:cover", decision: "redo" }], theme: null }) },
+    entries: (d) => [
+      entry(d, { id: "report:cover", export: R, export_sha256: d[R] }),
+      entry(d, { id: "report:cover", decision: "redo", date: "2026-11-20", export: B2, export_sha256: d[B2] }),
+    ],
+  });
+  const loaded = loadApprovals(root, TABLE);
+  assert.deepEqual(loaded.presets.report, { decisions: new Map([["cover", "redo"]]), theme: null });
+  assert.deepEqual(loaded.decisions, new Map());
+});
+
+test("unknown approval ids are refused in the existing form", (t) => {
+  for (const id of ["other:cover", "report:", "Report:cover", "explainer:cover", "report:Cover"]) {
+    refused(tree(t, { entries: one({ id }) }), `${APPROVALS}: entries[0].id is invalid`);
+  }
+});
+
+test("report:theme is refused under the production table, whose report theme candidates are empty", (t) => {
+  const root = tree(t, {
+    exports: { [R]: reportExport({ theme: null }) },
+    entries: (d) => [entry(d, { id: "report:theme", decision: "light", export: R, export_sha256: d[R] })],
+  });
+  refused(root, `${APPROVALS}: entries[0].decision is invalid`);
+});
+
+test("an export's preset: explainer is implied, an unknown one is refused", (t) => {
+  refused(tree(t, { exports: { [A]: exportBody({ preset: "explainer" }) }, entries: one({}) }), `${A}: preset explainer is implied; omit it`);
+  refused(tree(t, { exports: { [A]: exportBody({ preset: "other" }) }, entries: one({}) }), `${A}: unknown preset other`);
+  refused(tree(t, { exports: { [A]: exportBody({ preset: "constructor" }) }, entries: one({}) }), `${A}: unknown preset constructor`);
+});
+
+test("an export's decision ids must be of its preset", (t) => {
+  const bare = tree(t, {
+    exports: { [R]: reportExport({ decisions: [{ id: "report:cover", decision: "approve" }, { id: "quiz", decision: "approve" }], theme: null }) },
+    entries: (d) => [entry(d, { id: "report:cover", export: R, export_sha256: d[R] })],
+  });
+  refused(bare, `${R}: decisions[1].id quiz is not of preset report`);
+  const prefixed = tree(t, { exports: { [A]: exportBody({ decisions: [{ id: "report:cover", decision: "approve" }] }) }, entries: one({}) });
+  refused(prefixed, `${A}: decisions[0].id report:cover is not of preset explainer`);
+});
+
+test("an entry whose preset differs from its export's is refused", (t) => {
+  const root = tree(t, {
+    exports: { [R]: reportExport({ theme: null }) },
+    entries: (d) => [entry(d, { id: "theme", decision: "light", export: R, export_sha256: d[R] })],
+  });
+  refused(root, `${APPROVALS}: entries[0]: preset explainer does not match its export's preset report`);
+});
+
+// The explainer view of the committed file at 935b721, before the gate
+// became per preset.
+test("today's file: the committed approvals load to the same explainer decisions and theme as before the per-preset gate", () => {
+  const kinds = [
+    "hook",
+    "question",
+    "concept-card",
+    "definition-quote",
+    "summary",
+    "end-card",
+    "process-steps",
+    "cause-effect",
+    "comparison",
+    "timeline",
+    "key-number",
+    "chart",
+    "image-callouts",
+  ];
+  const loaded = loadApprovals(TEMPLATE);
+  assert.deepEqual([...loaded.decisions], kinds.map((kind) => [kind, "approve"]));
+  assert.equal(loaded.theme, "light");
 });

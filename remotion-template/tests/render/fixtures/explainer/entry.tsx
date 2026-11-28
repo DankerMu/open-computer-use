@@ -2,9 +2,10 @@
 // Copyright (c) 2025 Open Computer Use Contributors
 //
 // Bundle entry of the renderer's browser tests: the Explainer composition
-// over the fixture components plus the real custom loader, and the probe
-// with one scene key, `explainer`, which renders the whole explainer body
-// (without audio) over a target's {script, timeline} props.
+// over the fixture components plus the real custom loader, its theme
+// resolved from the script's preset (themeFor), and the probe with one scene
+// key, `explainer`, which renders the whole explainer body (without audio)
+// in themes.light over a target's {script, timeline} props.
 
 import React from 'react';
 import {registerRoot} from 'remotion';
@@ -27,7 +28,7 @@ const scenes = {
 
 registerRoot(() => (
 	<>
-		<ExplainerComposition registry={registry} theme={theme} />
+		<ExplainerComposition registry={registry} />
 		<ProbeComposition scenes={scenes as React.ComponentProps<typeof ProbeComposition>['scenes']} />
 	</>
 ));

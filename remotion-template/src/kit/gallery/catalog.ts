@@ -252,3 +252,8 @@ export const candidates: Candidate[] = [
 		];
 	}),
 ];
+
+// Each preset's catalog, keyed as src/kit/presets.ts (issue #962). Catalog
+// ids stay bare kinds; a report page exports them as `report:<kind>`. The
+// report's candidates arrive with task 4.2.
+export const catalogs: Record<string, Candidate[]> = {explainer: candidates, report: []};

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The gallery generator (task 4.1): `node bin/gallery.mjs --out <dir>`, run
-// from a project root. It renders every catalog sample and the theme sample
-// in each of the kit's themes (since task 4.6 only the user's pick), each as
-// a clip and its three probe frames, probes every item with bin/probe.mjs,
-// and writes gallery.json and a static index.html whose export button gives
-// the user's decisions.
+// The gallery generator (task 4.1): `node bin/gallery.mjs --out <dir>
+// [--preset <name>]`, run from a project root. One run reviews one preset
+// of src/kit/presets.ts, the explainer by default (issue #962). It renders
+// every sample of that preset's catalog and the theme sample in each of the
+// preset's theme candidates (the explainer's: only the user's pick, task
+// 4.6), each as a clip and its three probe frames, probes every item with
+// bin/probe.mjs, and writes gallery.json and a static index.html, both
+// naming the preset, whose export button gives the user's decisions. A
+// preset whose catalog is empty is refused before any work.
 //
 // An existing --out is refused before any work. Everything is written into
 // a temporary sibling of --out, renamed to --out only after every item
@@ -14,7 +17,8 @@
 // src/kit/gallery/entry.tsx once and opens one browser for every clip and
 // still; probe() then bundles and opens its own. Both bundles go under
 // os.tmpdir(), and both browsers close whatever happens. Exit codes: 0
-// success (stdout: the --out path), 1 a refusal or failure, 2 a usage error.
+// success (stdout: the --out path), 1 a refusal or failure, 2 a usage error
+// or an unknown preset.
 
 import { bundle } from "@remotion/bundler";
 import { openBrowser, renderMedia, renderStill, selectComposition } from "@remotion/renderer";
@@ -23,6 +27,7 @@ import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { DEFAULT_PRESET, PRESETS } from "../src/kit/presets.ts";
 import { renderPage } from "./gallery-page.mjs";
 import { lstatOrNull } from "./kit-io.mjs";
 import { formatViolation, probe, probeFrames, violations } from "./probe.mjs";
@@ -30,16 +35,18 @@ import { formatViolation, probe, probeFrames, violations } from "./probe.mjs";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const ENTRY = join(ROOT, "src", "kit", "gallery", "entry.tsx");
 // TypeScript modules, imported through Node's type stripping only once the
-// arguments and --out passed: the template's package.json declares no
-// module type, so the first one makes Node print a
-// MODULE_TYPELESS_PACKAGE_JSON warning on stderr.
+// arguments and --out passed. src/kit/presets.ts, a leaf with no imports,
+// is imported statically: the argument check needs its table. The
+// template's package.json declares `"type": "module"`, so neither import
+// makes Node print a MODULE_TYPELESS_PACKAGE_JSON warning.
 const KIT_MODULES = {
   catalog: join(ROOT, "src", "kit", "gallery", "catalog.ts"),
   rules: join(ROOT, "src", "kit", "gallery", "catalog-rules.ts"),
   theme: join(ROOT, "src", "kit", "theme.ts"),
 };
 const PREFIX = "kit gallery: ";
-const USAGE = `${PREFIX}usage: node bin/gallery.mjs --out <dir>`;
+const USAGE = `${PREFIX}usage: node bin/gallery.mjs --out <dir> [--preset <name>]`;
+const OPTIONS = ["--out", "--preset"];
 const COMPOSITION = "KitGallerySample";
 const PROBE_SCENE = "gallery-sample";
 // A refusal thrown inside the bundle (an id the catalog lacks, components
@@ -64,15 +71,15 @@ function renderFailure(error, id) {
 }
 
 // The theme sample first, then each candidate's samples in catalog order;
-// the whole list once per theme, in THEME_NAMES order.
-function itemsOf({ THEME_ID, THEME_NAMES, THEME_SAMPLE }, candidates) {
+// the whole list once per theme, in the preset's theme candidate order.
+function itemsOf({ THEME_ID, THEME_SAMPLE }, themeNames, candidates) {
   const samples = [
     { candidate: THEME_ID, sample: THEME_SAMPLE.id, durationInFrames: THEME_SAMPLE.durationInFrames, entranceFrames: THEME_SAMPLE.entranceFrames },
     ...candidates.flatMap((c) =>
       c.samples.map((s) => ({ candidate: c.id, sample: s.id, durationInFrames: s.timing.durationInFrames, entranceFrames: c.entranceFrames })),
     ),
   ];
-  return THEME_NAMES.flatMap((theme) =>
+  return themeNames.flatMap((theme) =>
     samples.map((s) => {
       const id = `${s.candidate}--${s.sample}--${theme}`;
       const frames = probeFrames({ durationInFrames: s.durationInFrames, entranceFrames: s.entranceFrames, exitFrame: s.durationInFrames });
@@ -119,7 +126,7 @@ async function renderItems(serveUrl, items, out) {
 }
 
 // One probe over every item; each item's violations, judged in its own theme.
-async function probeItems({ THEME_NAMES }, themes, items, publicDir) {
+async function probeItems(themeNames, themes, items, publicDir) {
   const targets = items.map((item) => ({
     id: item.id,
     scene: PROBE_SCENE,
@@ -129,12 +136,13 @@ async function probeItems({ THEME_NAMES }, themes, items, publicDir) {
     exitFrame: item.durationInFrames,
   }));
   const result = await probe({ entryPoint: ENTRY, targets, publicDir });
-  const byTheme = Object.fromEntries(THEME_NAMES.map((theme) => [theme, violations(result, themes[theme])]));
+  const byTheme = Object.fromEntries(themeNames.map((theme) => [theme, violations(result, themes[theme])]));
   return new Map(items.map((item) => [item.id, byTheme[item.theme].filter((v) => v.target === item.id).map(formatViolation)]));
 }
 
-async function build(kit, candidates, out, work) {
-  const items = itemsOf(kit.rules, candidates);
+async function build(kit, preset, candidates, out, work) {
+  const themeNames = PRESETS[preset].themeCandidates;
+  const items = itemsOf(kit.rules, themeNames, candidates);
   // public/ when the project has one, else the tracked gallery/public, so the
   // catalog's samples can name an image.
   const projectPublic = join(ROOT, "public");
@@ -149,11 +157,12 @@ async function build(kit, candidates, out, work) {
     symlinkPublicDir: true,
   });
   await renderItems(serveUrl, items, out);
-  const found = await probeItems(kit.rules, kit.theme.themes, items, publicDir);
+  const found = await probeItems(themeNames, kit.theme.themes, items, publicDir);
   const data = {
     version: 1,
+    preset,
     node: process.version,
-    themes: kit.rules.THEME_NAMES,
+    themes: themeNames,
     candidates: candidates.map(({ id, kind, source }) => ({ id, kind, source })),
     items: items.map(({ id, candidate, sample, theme, clip, frames }) => ({ id, candidate, sample, theme, clip, frames, violations: found.get(id) })),
   };
@@ -163,7 +172,8 @@ async function build(kit, candidates, out, work) {
   return items.length;
 }
 
-export async function gallery({ out } = {}) {
+// preset: a name of the preset table.
+export async function gallery({ out, preset = DEFAULT_PRESET } = {}) {
   if (typeof out !== "string" || out === "") fail("out must be a non-empty path");
   const target = resolve(out);
   if ((await lstatOrNull(target)) !== null) fail(`${target}: already exists`);
@@ -173,11 +183,14 @@ export async function gallery({ out } = {}) {
     const kit = Object.fromEntries(
       await Promise.all(Object.entries(KIT_MODULES).map(async ([name, path]) => [name, await import(pathToFileURL(path).href)])),
     );
-    const { candidates, validateCatalog } = kit.catalog;
-    validateCatalog(candidates);
+    // A fixture catalog copied over catalog.ts may export only the
+    // explainer's `candidates`.
+    const candidates = preset === DEFAULT_PRESET ? kit.catalog.candidates : (kit.catalog.catalogs?.[preset] ?? []);
+    kit.catalog.validateCatalog(candidates);
+    if (candidates.length === 0) fail(`preset ${preset} has no candidates`);
     sibling = await mkdtemp(join(dirname(target), `.${basename(target)}-`));
     work = await mkdtemp(join(tmpdir(), "kit-gallery-"));
-    const items = await build(kit, candidates, sibling, work);
+    const items = await build(kit, preset, candidates, sibling, work);
     if ((await lstatOrNull(target)) !== null) fail(`${target}: already exists`);
     await rename(sibling, target);
     sibling = null;
@@ -190,13 +203,30 @@ export async function gallery({ out } = {}) {
   }
 }
 
+// `--out <dir>` and an optional `--preset <name>`, in either order, each
+// once with a non-empty value; null for any other argument list.
+function parseArgs(argv) {
+  const options = {};
+  for (let i = 0; i < argv.length; i += 2) {
+    const [name, value] = [argv[i], argv[i + 1]];
+    if (!OPTIONS.includes(name) || Object.hasOwn(options, name) || value === undefined || value === "") return null;
+    options[name] = value;
+  }
+  return Object.hasOwn(options, "--out") ? { out: options["--out"], preset: options["--preset"] ?? DEFAULT_PRESET } : null;
+}
+
 export async function main(argv, io) {
-  if (argv.length !== 2 || argv[0] !== "--out" || argv[1] === "") {
+  const args = parseArgs(argv);
+  if (args === null) {
     io.stderr.write(`${USAGE}\n`);
     return 2;
   }
+  if (!Object.hasOwn(PRESETS, args.preset)) {
+    io.stderr.write(`${PREFIX}unknown preset ${args.preset}\n`);
+    return 2;
+  }
   try {
-    const { out } = await gallery({ out: argv[1] });
+    const { out } = await gallery(args);
     io.stdout.write(`${out}\n`);
     return 0;
   } catch (error) {

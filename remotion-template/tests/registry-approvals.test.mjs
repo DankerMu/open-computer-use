@@ -23,6 +23,13 @@
 // lacks. The skill is a surface too (task 7.2): the kinds of the kind table
 // in skills/public/remotion/explainer-kit.md, read under its section heading
 // only, equal A, each listed once and `custom` not at all.
+//
+// The gate is per preset (issue #962): the tests loop over the preset table
+// of src/kit/presets.ts, one row of tests per preset. The explainer row holds
+// the assertions above over the explainer view of loadApprovals. The report
+// row, until its first approvals (task 4.2), asserts that nothing of the
+// report ships: no report entry in approvals.json, no report theme, and no
+// report-only kind in the schema, the registry or the JSON Schema.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -33,9 +40,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadApprovals } from "../bin/gallery-approvals.mjs";
 import { LIMITS } from "../bin/script-schema.mjs";
-import { candidates } from "../src/kit/gallery/catalog.ts";
+import { candidates, catalogs } from "../src/kit/gallery/catalog.ts";
 import { THEME_NAMES } from "../src/kit/gallery/catalog-rules.ts";
-import { KIT_THEME, themes } from "../src/kit/theme.ts";
+import { PRESETS } from "../src/kit/presets.ts";
+import { KIT_THEME, themeFor, themes } from "../src/kit/theme.ts";
 
 const TEMPLATE = fileURLToPath(new URL("..", import.meta.url));
 const KIT_REFERENCE = fileURLToPath(new URL("../../skills/public/remotion/explainer-kit.md", import.meta.url));
@@ -44,8 +52,8 @@ const REGISTRY = join(TEMPLATE, "src", "kit", "render", "registry.ts");
 const EXPORTS = join(TEMPLATE, "gallery", "exports");
 const JSON_SCHEMA = join(TEMPLATE, "script.schema.json");
 const EXAMPLE = join(TEMPLATE, "script.json");
+const APPROVALS = join(TEMPLATE, "gallery", "approvals.json");
 const CUSTOM = "custom";
-const REQUIRED_KINDS = ["hook", "summary", "end-card"];
 
 // The entries of the `registry` literal in registry.ts, one per kind.
 function registryEntries() {
@@ -95,8 +103,10 @@ function skillKinds() {
   });
 }
 
-// The ids whose latest decision is approve.
-const approvedSet = () => [...loadApprovals(TEMPLATE).decisions].filter(([, decision]) => decision === "approve").map(([id]) => id);
+// The kinds whose latest decision in a preset's view is approve.
+const approvedOf = (preset) =>
+  [...loadApprovals(TEMPLATE).presets[preset].decisions].filter(([, decision]) => decision === "approve").map(([kind]) => kind);
+const approvedSet = () => approvedOf("explainer");
 
 // One line per kind a surface has but `expected` lacks (extra), and per kind
 // of `expected` it lacks.
@@ -113,79 +123,6 @@ function differences(surface, actual, expected) {
 const repeats = (surface, kinds) =>
   [...new Set(kinds.filter((kind, i) => kinds.indexOf(kind) !== i))].sort().map((kind) => `${surface} lists ${kind} more than once`);
 
-test("registry.ts imports components from the gallery and lists custom plus each catalog kind as components[id], in catalog order", () => {
-  const source = readFileSync(REGISTRY, "utf8");
-  assert.match(source, /^import \{components\} from '\.\.\/gallery\/components\.tsx';$/m);
-  assert.deepEqual(registryEntries(), ["custom: CustomScene", ...candidates.map(({ id, kind }) => `'${kind}': components['${id}']`)]);
-});
-
-test("every catalog candidate has an approve entry in gallery/approvals.json", () => {
-  assert.ok(candidates.length > 0, "the catalog lists no candidate");
-  const { decisions } = loadApprovals(TEMPLATE);
-  assert.deepEqual(
-    candidates.map(({ id }) => [id, decisions.get(id) ?? null]),
-    candidates.map(({ id }) => [id, "approve"]),
-  );
-});
-
-test("the newest export binds: loadApprovals gives each of its decisions", () => {
-  const names = readdirSync(EXPORTS).sort();
-  assert.ok(names.length > 0, "gallery/exports holds no export");
-  const newest = JSON.parse(readFileSync(join(EXPORTS, names.at(-1)), "utf8"));
-  assert.ok(newest.decisions.length > 0, `${names.at(-1)} holds no decision`);
-  const { decisions } = loadApprovals(TEMPLATE);
-  assert.deepEqual(
-    newest.decisions.map(({ id }) => [id, decisions.get(id) ?? null]),
-    newest.decisions.map(({ id, decision }) => [id, decision]),
-    names.at(-1),
-  );
-});
-
-// --- the approved set (task 4.6) ----------------------------------------------
-
-test("the approved set: the schema's kinds, the registry's kinds, the JSON Schema's kinds and the catalog's ids each equal A", () => {
-  const approved = approvedSet();
-  assert.ok(approved.length > 0, "gallery/approvals.json approves nothing");
-  const surfaces = [
-    ["the schema (LIMITS.content)", Object.keys(LIMITS.content)],
-    ["the registry", registryEntries().map(entryKind).filter((kind) => kind !== CUSTOM)],
-    ["the JSON Schema", schemaScenes().map(({ kind }) => kind).filter((kind) => kind !== CUSTOM)],
-    ["the catalog", candidates.map(({ id }) => id)],
-  ];
-  assert.deepEqual(
-    surfaces.flatMap(([surface, kinds]) => [...differences(surface, kinds, approved), ...repeats(surface, kinds)]),
-    [],
-  );
-});
-
-test("the approved set: the kinds of explainer-kit.md's kind table equal A, each once, without custom", () => {
-  const kinds = skillKinds();
-  assert.deepEqual(
-    [
-      ...differences("explainer-kit.md's kind table", kinds, approvedSet()),
-      ...repeats("explainer-kit.md's kind table", kinds),
-      ...(kinds.includes(CUSTOM) ? [`explainer-kit.md's kind table lists ${CUSTOM}`] : []),
-    ],
-    [],
-  );
-});
-
-test("the example script: its kinds are A without the kinds whose JSON Schema scene object requires image", () => {
-  const withImage = new Set(schemaScenes().filter(({ required }) => required.includes("image")).map(({ kind }) => kind));
-  const expected = approvedSet().filter((kind) => !withImage.has(kind));
-  const script = JSON.parse(readFileSync(EXAMPLE, "utf8"));
-  const kinds = [script.hook, ...script.chapters.flatMap((chapter) => chapter.scenes), script.summary, script.endCard].map(({ kind }) => kind);
-  assert.deepEqual(differences("script.json", kinds, expected), []);
-});
-
-test("required kinds: hook, summary and end-card each have approve as their latest decision", () => {
-  const { decisions } = loadApprovals(TEMPLATE);
-  assert.deepEqual(
-    REQUIRED_KINDS.filter((kind) => decisions.get(kind) !== "approve").map((kind) => `${kind} is ${decisions.get(kind) ?? "undecided"}, not approve`),
-    [],
-  );
-});
-
 // A temporary root holding one export with `theme` and approvals entries
 // linking it: hook's approve, and with `pick` a theme entry.
 function pickRoot(t, theme, pick) {
@@ -201,14 +138,151 @@ function pickRoot(t, theme, pick) {
   return root;
 }
 
-test("the theme pick: approvals.json picks light, the kit holds only that theme, KIT_THEME is it, and approvals accept no other", (t) => {
-  const { theme } = loadApprovals(TEMPLATE);
-  assert.equal(theme, "light");
-  assert.deepEqual(Object.keys(themes), [theme]);
-  assert.equal(KIT_THEME, themes[theme]);
-  assert.deepEqual(THEME_NAMES, Object.keys(themes));
-  assert.throws(() => loadApprovals(pickRoot(t, "dark", false)), {
-    message: "kit gallery: approvals: gallery/exports/pick.json: theme is invalid",
+// The explainer row: every assertion of tasks 4.2–4.6 and 7.2.
+const EXPLAINER_ROW = [
+  ["registry.ts imports components from the gallery and lists custom plus each catalog kind as components[id], in catalog order", () => {
+    const source = readFileSync(REGISTRY, "utf8");
+    assert.match(source, /^import \{components\} from '\.\.\/gallery\/components\.tsx';$/m);
+    assert.deepEqual(registryEntries(), ["custom: CustomScene", ...candidates.map(({ id, kind }) => `'${kind}': components['${id}']`)]);
+  }],
+
+  ["every catalog candidate has an approve entry in gallery/approvals.json", () => {
+    assert.ok(candidates.length > 0, "the catalog lists no candidate");
+    const { decisions } = loadApprovals(TEMPLATE);
+    assert.deepEqual(
+      candidates.map(({ id }) => [id, decisions.get(id) ?? null]),
+      candidates.map(({ id }) => [id, "approve"]),
+    );
+  }],
+
+  ["the newest export binds: loadApprovals gives each of its decisions", () => {
+    const names = readdirSync(EXPORTS).sort();
+    assert.ok(names.length > 0, "gallery/exports holds no export");
+    const newest = JSON.parse(readFileSync(join(EXPORTS, names.at(-1)), "utf8"));
+    assert.ok(newest.decisions.length > 0, `${names.at(-1)} holds no decision`);
+    const { decisions } = loadApprovals(TEMPLATE);
+    assert.deepEqual(
+      newest.decisions.map(({ id }) => [id, decisions.get(id) ?? null]),
+      newest.decisions.map(({ id, decision }) => [id, decision]),
+      names.at(-1),
+    );
+  }],
+
+  // the approved set (task 4.6)
+
+  ["the approved set: the schema's kinds, the registry's kinds, the JSON Schema's kinds and the catalog's ids each equal A", () => {
+    const approved = approvedSet();
+    assert.ok(approved.length > 0, "gallery/approvals.json approves nothing");
+    const surfaces = [
+      ["the schema (LIMITS.content)", Object.keys(LIMITS.content)],
+      ["the registry", registryEntries().map(entryKind).filter((kind) => kind !== CUSTOM)],
+      ["the JSON Schema", schemaScenes().map(({ kind }) => kind).filter((kind) => kind !== CUSTOM)],
+      ["the catalog", candidates.map(({ id }) => id)],
+    ];
+    assert.deepEqual(
+      surfaces.flatMap(([surface, kinds]) => [...differences(surface, kinds, approved), ...repeats(surface, kinds)]),
+      [],
+    );
+  }],
+
+  ["the approved set: the kinds of explainer-kit.md's kind table equal A, each once, without custom", () => {
+    const kinds = skillKinds();
+    assert.deepEqual(
+      [
+        ...differences("explainer-kit.md's kind table", kinds, approvedSet()),
+        ...repeats("explainer-kit.md's kind table", kinds),
+        ...(kinds.includes(CUSTOM) ? [`explainer-kit.md's kind table lists ${CUSTOM}`] : []),
+      ],
+      [],
+    );
+  }],
+
+  ["the example script: its kinds are A without the kinds whose JSON Schema scene object requires image", () => {
+    const withImage = new Set(schemaScenes().filter(({ required }) => required.includes("image")).map(({ kind }) => kind));
+    const expected = approvedSet().filter((kind) => !withImage.has(kind));
+    const script = JSON.parse(readFileSync(EXAMPLE, "utf8"));
+    const kinds = [script.hook, ...script.chapters.flatMap((chapter) => chapter.scenes), script.summary, script.endCard].map(({ kind }) => kind);
+    assert.deepEqual(differences("script.json", kinds, expected), []);
+  }],
+
+  ["required kinds: hook, summary and end-card each have approve as their latest decision", () => {
+    const { decisions } = loadApprovals(TEMPLATE);
+    assert.deepEqual(
+      PRESETS.explainer.requiredKinds.filter((kind) => decisions.get(kind) !== "approve").map((kind) => `${kind} is ${decisions.get(kind) ?? "undecided"}, not approve`),
+      [],
+    );
+  }],
+
+  ["the theme pick: approvals.json picks light, the kit holds it as the explainer's one theme, KIT_THEME is it, and approvals accept no other", (t) => {
+    const { theme } = loadApprovals(TEMPLATE);
+    assert.equal(theme, "light");
+    assert.ok(Object.hasOwn(themes, theme));
+    assert.deepEqual(PRESETS.explainer.themeCandidates, [theme]);
+    assert.equal(themeFor("explainer"), themes[theme]);
+    assert.equal(KIT_THEME, themes[theme]);
+    assert.deepEqual(THEME_NAMES, Object.keys(themes));
+    assert.throws(() => loadApprovals(pickRoot(t, "dark", false)), {
+      message: "kit gallery: approvals: gallery/exports/pick.json: theme is invalid",
+    });
+    assert.equal(loadApprovals(pickRoot(t, "light", true)).theme, "light");
+  }],
+];
+
+// The kinds of the report's table row that are not explainer kinds: today
+// `cover`. Task 4.2 registers them with the report branch.
+const reportOnlyKinds = () => PRESETS.report.requiredKinds.filter((kind) => !Object.hasOwn(LIMITS.content, kind));
+
+// The report row before any report approval (task 4.2).
+const REPORT_ROW = [
+  ["approvals.json holds no report: entry and the report view approves no kind", () => {
+    const { entries } = JSON.parse(readFileSync(APPROVALS, "utf8"));
+    assert.deepEqual(entries.filter(({ id }) => id.startsWith("report:")).map(({ id }) => id), []);
+    assert.deepEqual(approvedOf("report"), []);
+    assert.deepEqual([...loadApprovals(TEMPLATE).presets.report.decisions], []);
+  }],
+  ["no report theme is picked and themeFor(\"report\") throws", () => {
+    assert.equal(loadApprovals(TEMPLATE).presets.report.theme, null);
+    assert.throws(() => themeFor("report"), { message: "no approved theme for preset report" });
+  }],
+  ["no report kind in the schema, the registry or the JSON Schema, and the JSON Schema has no preset key", () => {
+    const only = reportOnlyKinds();
+    assert.deepEqual(only, ["cover"]);
+    const surfaces = [
+      ["the schema (LIMITS.content)", Object.keys(LIMITS.content)],
+      ["the registry", registryEntries().map(entryKind)],
+      ["the JSON Schema", schemaScenes().map(({ kind }) => kind)],
+    ];
+    assert.deepEqual(surfaces.flatMap(([surface, kinds]) => only.filter((kind) => kinds.includes(kind)).map((kind) => `${surface} has ${kind}`)), []);
+    assert.equal(readFileSync(JSON_SCHEMA, "utf8").includes('"preset"'), false);
+  }],
+];
+
+const ROWS = { explainer: EXPLAINER_ROW, report: REPORT_ROW };
+
+test("the preset table holds exactly the explainer and the report, as the fixture states them", () => {
+  assert.deepEqual(PRESETS, {
+    explainer: { idPrefix: "", themeId: "theme", requiredKinds: ["hook", "summary", "end-card"], themeCandidates: ["light"] },
+    report: { idPrefix: "report:", themeId: "report:theme", requiredKinds: ["cover", "summary", "end-card"], themeCandidates: [] },
   });
-  assert.equal(loadApprovals(pickRoot(t, "light", true)).theme, "light");
 });
+
+test("the gate has one row per preset of the table, and the catalog one list per preset", () => {
+  assert.deepEqual(Object.keys(ROWS), Object.keys(PRESETS));
+  assert.deepEqual(Object.keys(catalogs), Object.keys(PRESETS));
+  assert.equal(catalogs.explainer, candidates);
+  assert.deepEqual(catalogs.report, []);
+});
+
+test("the kit's themes are the union, over presets, of each preset's pick, or its candidates while it has none", () => {
+  const { presets } = loadApprovals(TEMPLATE);
+  const union = [];
+  for (const [preset, { themeCandidates }] of Object.entries(PRESETS)) {
+    const pick = presets[preset].theme;
+    for (const name of pick === null ? themeCandidates : [pick]) if (!union.includes(name)) union.push(name);
+  }
+  assert.deepEqual(Object.keys(themes), union);
+});
+
+for (const preset of Object.keys(PRESETS)) {
+  for (const [title, run] of ROWS[preset] ?? []) test(`${preset}: ${title}`, run);
+}
