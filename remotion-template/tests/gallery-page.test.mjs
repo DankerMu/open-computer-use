@@ -281,3 +281,66 @@ test("a page export committed with matching entries loads as those decisions and
   assert.deepEqual([...loaded.decisions], [["zeta-card", "approve"], ["alpha", "redo"]]);
   assert.equal(loaded.theme, "light");
 });
+
+// --- per preset (issue #962) ------------------------------------------------------
+
+const REPORT_TABLE = {
+  explainer: { idPrefix: "", themeId: "theme", requiredKinds: ["hook", "summary", "end-card"], themeCandidates: ["light"] },
+  report: { idPrefix: "report:", themeId: "report:theme", requiredKinds: ["cover", "summary", "end-card"], themeCandidates: ["light"] },
+};
+
+test("a report page names its preset and exports preset report with report:<kind> ids; its controls keep the bare ids", async () => {
+  const html = renderPage({ ...gallery(), preset: "report" }, PAGE_SHA);
+  assert.ok(html.includes("<p>Preset <code>report</code>.</p>"));
+  assert.ok(html.includes('<input type="radio" name="decision-zeta-card" value="approve">'));
+  assert.deepEqual(JSON.parse(scripts(html).data), {
+    ids: ["zeta-card", "alpha"],
+    page: PAGE_SHA,
+    preset: "report",
+    exportIds: ["report:zeta-card", "report:alpha"],
+  });
+  const result = await exportPage(html, COMPLETE);
+  assert.deepEqual(JSON.parse(result.body), {
+    version: 1,
+    preset: "report",
+    page: PAGE_SHA,
+    reviewer: "Fixture Reviewer",
+    date: "2026-11-19",
+    decisions: [
+      { id: "report:zeta-card", decision: "approve", note: "keep the pacing" },
+      { id: "report:alpha", decision: "redo" },
+    ],
+    theme: "light",
+  });
+  assert.equal(result.status, "Exported gallery-decisions.json with 2 decisions.");
+  const missing = await exportPage(html, { ...COMPLETE, decisions: { "zeta-card": "approve" } });
+  assert.equal(missing.status, "Nothing exported: missing a decision for alpha.");
+});
+
+test("an explainer page, named or by default, exports neither preset nor prefixed ids", async () => {
+  const unnamed = renderPage(gallery(), PAGE_SHA);
+  const named = renderPage({ ...gallery(), preset: "explainer" }, PAGE_SHA);
+  assert.ok(named.includes("<p>Preset <code>explainer</code>.</p>"));
+  assert.deepEqual(JSON.parse(scripts(named).data), { ids: ["zeta-card", "alpha"], page: PAGE_SHA });
+  const body = (await exportPage(named, COMPLETE)).body;
+  assert.equal(body, (await exportPage(unnamed, COMPLETE)).body);
+  assert.equal(Object.hasOwn(JSON.parse(body), "preset"), false);
+  assert.deepEqual(JSON.parse(body).decisions.map(({ id }) => id), ["zeta-card", "alpha"]);
+});
+
+test("a report page export committed with report: entries loads as the report view", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gallery-round-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const { body } = await exportPage(renderPage({ ...gallery(), preset: "report" }, PAGE_SHA), COMPLETE);
+  mkdirSync(join(root, "gallery", "exports"), { recursive: true });
+  const exportPath = "gallery/exports/2026-11-19-report.json";
+  writeFileSync(join(root, exportPath), body);
+  const digest = createHash("sha256").update(body).digest("hex");
+  const entry = (id, decision) => ({ id, decision, reviewer: "Fixture Reviewer", date: "2026-11-19", export: exportPath, export_sha256: digest });
+  const entries = [entry("report:zeta-card", "approve"), entry("report:alpha", "redo"), entry("report:theme", "light")];
+  writeFileSync(join(root, "gallery", "approvals.json"), `${JSON.stringify({ version: 1, entries }, null, 2)}\n`);
+  const loaded = loadApprovals(root, REPORT_TABLE);
+  assert.deepEqual(loaded.presets.report, { decisions: new Map([["zeta-card", "approve"], ["alpha", "redo"]]), theme: "light" });
+  assert.deepEqual(loaded.decisions, new Map());
+  assert.equal(loaded.theme, null);
+});

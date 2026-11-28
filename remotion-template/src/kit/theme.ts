@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// Theme tokens of the explainer kit: one theme, `light`, the user's pick
+// Theme tokens of the kit: one theme, `light`, the explainer's pick
 // recorded in gallery/approvals.json (task 4.6). The kit's colours live only
 // here, in Onda's 12 `Brand` slots, so `brandToCssVars` re-skins the Onda
 // primitives from them. Fonts name only the family the workspace image
@@ -57,3 +57,15 @@ export const themes = {
 // gallery/approvals.json: kit check judges with the theme Explainer renders
 // with.
 export const KIT_THEME = themes.light;
+
+type Theme = (typeof themes)[keyof typeof themes];
+
+// Each preset's pick, as gallery/approvals.json records it (the gate tests
+// bind the two). The report has none until task 4.2.
+const PICKS: Record<string, Theme> = {explainer: KIT_THEME};
+
+// The theme a preset renders and is checked with.
+export function themeFor(preset: string): Theme {
+	if (!Object.prototype.hasOwnProperty.call(PICKS, preset)) throw new Error(`no approved theme for preset ${preset}`);
+	return PICKS[preset];
+}

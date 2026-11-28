@@ -20,7 +20,8 @@
 import { createHash } from "node:crypto";
 import { readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { KIT_THEME } from "../src/kit/theme.ts";
+import { DEFAULT_PRESET } from "../src/kit/presets.ts";
+import { themeFor } from "../src/kit/theme.ts";
 import { contactSheet, sheetTiles } from "./contact-sheet.mjs";
 import { writeCustomIndex } from "./custom-index.mjs";
 import { explainerScenes } from "./explainer-scenes.mjs";
@@ -428,6 +429,8 @@ export const RULES = [
       state.scriptText = await state.files.text("script.json");
       const { reasons, script } = schemaRule(state.scriptText);
       state.script = script;
+      // An injected theme wins; otherwise the script's preset selects it.
+      if (script !== null) state.theme ??= themeFor(script.preset ?? DEFAULT_PRESET);
       return reasons;
     },
   },
@@ -456,14 +459,15 @@ export const RULES = [
 // log receives `check: stage <n> <name>` before each stage and `check:
 // snapshot` before the snapshot. sheet renders the contact sheet (tests
 // inject a stub). musicDir is the music library that the music stage and
-// both hashes read. A system error from a read, the hash or the custom
-// index propagates.
+// both hashes read. theme, when given, replaces the one the script's preset
+// selects (themeFor), resolved once stage 1 parses the script. A system
+// error from a read, the hash or the custom index propagates.
 export async function runChecks(
   root,
   {
     probe = kitProbe,
     reveals = REVEALS,
-    theme = KIT_THEME,
+    theme,
     files = projectFiles(root),
     log = () => {},
     sheet = contactSheet,

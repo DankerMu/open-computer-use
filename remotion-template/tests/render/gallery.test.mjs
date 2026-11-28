@@ -41,7 +41,7 @@ import { fixtureScript, fixtureTimeline } from "./fixtures/explainer/fixture.mjs
 
 const TEMPLATE = fileURLToPath(new URL("../..", import.meta.url));
 const FIXTURES = join(TEMPLATE, "tests", "render", "fixtures", "gallery");
-const USAGE = "kit gallery: usage: node bin/gallery.mjs --out <dir>\n";
+const USAGE = "kit gallery: usage: node bin/gallery.mjs --out <dir> [--preset <name>]\n";
 const ROLES = ["entrance-end", "midpoint", "pre-exit"];
 const THEMES = ["light"];
 const PAIRS = [["theme", "sample"], ["placeholder", "max"], ["placeholder", "overflow"]];
@@ -317,9 +317,10 @@ test("each clip is 1920×1080 H.264 at 30 fps with 90 or 60 counted frames, each
   }
 });
 
-test("gallery.json, version 1, lists the catalog and every item in order with relative paths", () => {
+test("gallery.json, version 1, names the explainer preset and lists the catalog and every item in order with relative paths", () => {
   const data = galleryJson();
   assert.equal(data.version, 1);
+  assert.equal(data.preset, "explainer");
   assert.match(data.node, /^v\d+\.\d+\.\d+$/);
   assert.deepEqual(data.themes, THEMES);
   assert.deepEqual(data.candidates, [{ id: "placeholder", kind: "question", source: "tests/render/fixtures/gallery/ok (task 4.1 placeholder)" }]);

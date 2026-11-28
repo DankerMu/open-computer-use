@@ -1,14 +1,22 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 //
-// The explainer kit's theme tokens: one theme, `light`, the user's pick
-// (task 4.6), Onda's 12 brand slots, the installed CJK font only, readable
-// type, and WCAG contrast computed here from the colours themselves.
+// The kit's theme tokens: per preset of src/kit/presets.ts, its pick in
+// gallery/approvals.json (the explainer's is `light`, task 4.6), or its
+// theme candidates while it has none (issue #962); Onda's 12 brand slots,
+// the installed CJK font only, readable type, and WCAG contrast computed
+// here from the colours themselves.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { themes } from "../src/kit/theme.ts";
+import { fileURLToPath } from "node:url";
+import { loadApprovals } from "../bin/gallery-approvals.mjs";
+import { PRESETS } from "../src/kit/presets.ts";
+import * as kit from "../src/kit/theme.ts";
 import { SPRING_SMOOTH, SPRING_SNAPPY } from "../src/kit/onda/motion.ts";
+
+const { themes } = kit;
+const TEMPLATE = fileURLToPath(new URL("..", import.meta.url));
 
 const BRAND_SLOTS = [
   "bg",
@@ -61,12 +69,40 @@ function contrast(foreground, background) {
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 }
 
-test("exactly one theme, light, with the token keys and the 12 brand slots", () => {
-  assert.deepEqual(Object.keys(themes), ["light"]);
-  assert.deepEqual(Object.keys(themes.light).sort(), ["brand", "canvas", "motion", "safeArea", "spacing", "type"]);
+test("per preset: its pick, or its candidates while it has none; the kit holds their union, with the token keys and the 12 brand slots", () => {
+  const { presets } = loadApprovals(TEMPLATE);
+  const union = [];
+  for (const [preset, { themeCandidates }] of Object.entries(PRESETS)) {
+    const pick = presets[preset].theme;
+    if (preset === "explainer") {
+      assert.equal(pick, "light");
+      assert.deepEqual(Object.keys(themes.light).sort(), ["brand", "canvas", "motion", "safeArea", "spacing", "type"]);
+    }
+    if (pick === null) {
+      assert.throws(() => kit.themeFor(preset), { message: `no approved theme for preset ${preset}` }, preset);
+    } else {
+      assert.equal(kit.themeFor(preset), themes[pick], preset);
+    }
+    for (const name of pick === null ? themeCandidates : [pick]) if (!union.includes(name)) union.push(name);
+  }
+  assert.deepEqual(Object.keys(themes), union);
   for (const [name, theme] of CANDIDATES) {
     assert.deepEqual(Object.keys(theme.brand).sort(), [...BRAND_SLOTS].sort(), name);
   }
+});
+
+test("each preset's theme candidates are keys of themes", () => {
+  for (const [preset, { themeCandidates }] of Object.entries(PRESETS)) {
+    for (const name of themeCandidates) assert.ok(Object.hasOwn(themes, name), `${preset}: ${name}`);
+  }
+});
+
+test("themeFor: the explainer's is KIT_THEME, a preset without a pick throws, KIT_THEME stays themes.light", () => {
+  assert.equal(typeof kit.themeFor, "function");
+  assert.equal(kit.themeFor("explainer"), kit.KIT_THEME);
+  assert.equal(kit.KIT_THEME, themes.light);
+  assert.throws(() => kit.themeFor("report"), { message: "no approved theme for preset report" });
+  assert.throws(() => kit.themeFor("constructor"), { message: "no approved theme for preset constructor" });
 });
 
 test("brand colours use #rrggbb or rgba(r, g, b, a)", () => {

@@ -13,12 +13,17 @@
 // component, and a custom index that does not match the script. With music
 // true, the render worker's public/music.wav (bin/music.mjs: looped, ducked
 // and faded at its final level) plays at volume 1 beside the narration.
+// The theme is the script's preset's (themeFor), resolved in the component
+// and in calculateMetadata, which refuses a preset without an approved
+// theme. Until the schema carries `preset` (task 3.2), every script is an
+// explainer.
 
 import React, {useMemo} from 'react';
 import {Audio, Composition, Sequence, staticFile} from 'remotion';
 import {explainerScenes} from '../../../bin/explainer-scenes.mjs';
 import {validateScript} from '../../../bin/script-schema.mjs';
-import type {themes} from '../theme.ts';
+import {DEFAULT_PRESET} from '../presets.ts';
+import {themeFor, type themes} from '../theme.ts';
 import {Captions} from './Captions.tsx';
 import {captionPages} from './captions.ts';
 import {customProblem} from './CustomScene.tsx';
@@ -52,6 +57,7 @@ function fail(message: string): never {
 const isObject = (value: unknown): value is Input => value !== null && typeof value === 'object' && !Array.isArray(value);
 const hasKind = (registry: Registry, kind: string) => Object.prototype.hasOwnProperty.call(registry, kind);
 const scenesOf = (script: Input, timeline: Input) => explainerScenes(script, timeline) as SceneEntry[];
+const themeOf = (script: Input) => themeFor((script.preset as string | undefined) ?? DEFAULT_PRESET);
 
 export const ExplainerBody = ({
 	script,
@@ -94,6 +100,7 @@ function explainerMetadata({script, timeline, music}: ExplainerProps, registry: 
 		const [first, ...rest] = result.errors;
 		fail(rest.length > 0 ? `${first.message} (and ${rest.length} more)` : first.message);
 	}
+	themeOf(result.script);
 	let scenes: SceneEntry[];
 	try {
 		scenes = scenesOf(result.script, timeline);
@@ -112,17 +119,17 @@ function explainerMetadata({script, timeline, music}: ExplainerProps, registry: 
 	return {durationInFrames: timeline.totalFrames as number, props: music === undefined ? props : {...props, music}};
 }
 
-export const ExplainerComposition = ({registry, theme}: {registry: Registry; theme: Theme}) => {
+export const ExplainerComposition = ({registry}: {registry: Registry}) => {
 	const component = useMemo(
 		() =>
 			({script, timeline, music}: ExplainerProps) => (
 				<>
-					<ExplainerBody script={script as Input} timeline={timeline as Input} registry={registry} theme={theme} />
+					<ExplainerBody script={script as Input} timeline={timeline as Input} registry={registry} theme={themeOf(script as Input)} />
 					<Audio src={staticFile('narration.wav')} />
 					{music === true ? <Audio src={staticFile('music.wav')} /> : null}
 				</>
 			),
-		[registry, theme],
+		[registry],
 	);
 	const calculateMetadata = useMemo(
 		() =>

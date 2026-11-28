@@ -32,7 +32,7 @@ const TEMPLATE = fileURLToPath(new URL("..", import.meta.url));
 const GALLERY = join(TEMPLATE, "bin", "gallery.mjs");
 const OK_CATALOG = join(TEMPLATE, "tests", "render", "fixtures", "gallery", "ok", "catalog.ts");
 const RULES = join(TEMPLATE, "src", "kit", "gallery", "catalog-rules.ts");
-const USAGE = "kit gallery: usage: node bin/gallery.mjs --out <dir>\n";
+const USAGE = "kit gallery: usage: node bin/gallery.mjs --out <dir> [--preset <name>]\n";
 
 // The fixture's ok catalog.ts imports ./catalog-rules.ts, which exists only
 // once it is copied over src/kit/gallery/catalog.ts. Loaded here beside a
@@ -255,6 +255,72 @@ test("any argument list but --out <dir> exits 2 with the usage line", () => {
     assert.equal(result.stderr, USAGE, JSON.stringify(args));
     assert.equal(result.stdout, "", JSON.stringify(args));
   }
+});
+
+test("--preset: a missing --out, a repeated option, an option=value and an extra argument exit 2 with the usage line", () => {
+  const cases = [
+    ["--preset", "report"],
+    ["--preset", "explainer"],
+    ["--out", "a", "--out", "b"],
+    ["--preset", "report", "--out", "a", "--preset", "report"],
+    ["--preset=report", "--out", "a"],
+    ["--out", "a", "--preset=report"],
+    ["--out=a", "--preset", "report"],
+    ["--out", "a", "--preset", "report", "x"],
+    ["x", "--out", "a", "--preset", "report"],
+    ["--out", "a", "--preset"],
+    ["--out", "a", "--preset", ""],
+  ];
+  for (const args of cases) {
+    const result = runGallery(args);
+    assert.equal(result.status, 2, JSON.stringify(args));
+    assert.equal(result.stderr, USAGE, JSON.stringify(args));
+    assert.equal(result.stdout, "", JSON.stringify(args));
+  }
+});
+
+test("an unknown preset exits 2 naming it, in either option order, and creates nothing", (t) => {
+  const parent = mkdtempSync(join(tmpdir(), "gallery-preset-"));
+  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  const out = join(parent, "gallery");
+  for (const [args, name] of [
+    [["--out", out, "--preset", "other"], "other"],
+    [["--preset", "other", "--out", out], "other"],
+    [["--out", out, "--preset", "constructor"], "constructor"],
+    [["--out", out, "--preset", "Report"], "Report"],
+  ]) {
+    const result = runGallery(args);
+    assert.equal(result.status, 2, JSON.stringify(args));
+    assert.equal(result.stderr, `kit gallery: unknown preset ${name}\n`, JSON.stringify(args));
+    assert.equal(result.stdout, "", JSON.stringify(args));
+  }
+  assert.deepEqual(readdirSync(parent), []);
+});
+
+test("--preset report exits 1, the report having no candidates, and creates neither --out nor a sibling", (t) => {
+  const parent = mkdtempSync(join(tmpdir(), "gallery-report-"));
+  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  const out = join(parent, "gallery");
+  for (const args of [["--out", out, "--preset", "report"], ["--preset", "report", "--out", out]]) {
+    const result = runGallery(args);
+    assert.equal(result.status, 1, JSON.stringify(args));
+    assert.deepEqual(result.stderr.split("\n").filter((line) => line.startsWith("kit gallery: ")), ["kit gallery: preset report has no candidates"]);
+    assert.equal(result.stdout, "");
+    assert.deepEqual(readdirSync(parent), []);
+  }
+});
+
+test("--preset explainer is the default, accepted before or after --out", (t) => {
+  const parent = mkdtempSync(join(tmpdir(), "gallery-explainer-"));
+  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  const out = join(parent, "gallery");
+  mkdirSync(out);
+  for (const args of [["--out", out, "--preset", "explainer"], ["--preset", "explainer", "--out", out]]) {
+    const result = runGallery(args);
+    assert.equal(result.status, 1, JSON.stringify(args));
+    assert.equal(result.stderr, `kit gallery: ${out}: already exists\n`, JSON.stringify(args));
+  }
+  assert.deepEqual(readdirSync(parent), ["gallery"]);
 });
 
 test("an existing --out is refused with exit 1, untouched, and no sibling appears", (t) => {

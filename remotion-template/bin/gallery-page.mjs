@@ -9,9 +9,17 @@
 // Its export button downloads gallery-decisions.json, version 1, only
 // when a reviewer, a valid YYYY-MM-DD date and a decision for every
 // candidate are set; otherwise the status line says what is missing.
+//
+// One page reviews one preset, gallery.preset (absent: the explainer). The
+// controls use the bare candidate ids. A non-explainer page embeds its
+// preset and each candidate's approval id (src/kit/presets.ts), and its
+// export carries `preset` and those ids; an explainer page embeds and
+// exports neither, as before the gate became per preset.
+
+import { DEFAULT_PRESET, approvalId } from "../src/kit/presets.ts";
 
 const SCRIPT = `
-const {ids, page} = JSON.parse(document.getElementById("gallery-data").textContent);
+const {ids, page, preset, exportIds = ids} = JSON.parse(document.getElementById("gallery-data").textContent);
 const DATE = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/;
 const validDate = (text) => {
   const match = DATE.exec(text);
@@ -25,15 +33,16 @@ document.getElementById("export").addEventListener("click", () => {
   const date = document.getElementById("date").value;
   const decisions = [];
   const undecided = [];
-  for (const id of ids) {
+  ids.forEach((id, i) => {
     const chosen = document.querySelector(\`input[name="decision-\${id}"]:checked\`);
     if (!chosen) {
       undecided.push(id);
-      continue;
+      return;
     }
     const note = document.getElementById(\`note-\${id}\`).value.trim();
-    decisions.push(note === "" ? {id, decision: chosen.value} : {id, decision: chosen.value, note});
-  }
+    const exported = exportIds[i];
+    decisions.push(note === "" ? {id: exported, decision: chosen.value} : {id: exported, decision: chosen.value, note});
+  });
   const missing = [];
   if (reviewer === "") missing.push("a reviewer");
   if (!validDate(date)) missing.push("a date in YYYY-MM-DD form");
@@ -44,7 +53,8 @@ document.getElementById("export").addEventListener("click", () => {
   }
   const picked = document.querySelector('input[name="theme"]:checked');
   const theme = picked && picked.value !== "none" ? picked.value : null;
-  const body = JSON.stringify({version: 1, page, reviewer, date, decisions, theme}, null, 2) + "\\n";
+  const fields = preset === undefined ? {version: 1, page, reviewer, date, decisions, theme} : {version: 1, preset, page, reviewer, date, decisions, theme};
+  const body = JSON.stringify(fields, null, 2) + "\\n";
   const link = document.createElement("a");
   link.href = URL.createObjectURL(new Blob([body], {type: "application/json"}));
   link.download = "gallery-decisions.json";
@@ -102,6 +112,9 @@ const itemsOf = (gallery, candidate) => gallery.items.filter((item) => item.cand
 
 export function renderPage(gallery, pageSha256) {
   const ids = gallery.candidates.map(({ id }) => id);
+  const preset = gallery.preset ?? DEFAULT_PRESET;
+  const data =
+    preset === DEFAULT_PRESET ? { ids, page: pageSha256 } : { ids, page: pageSha256, preset, exportIds: ids.map((id) => approvalId(preset, id)) };
   const parts = [
     "<!DOCTYPE html>",
     '<html lang="en">',
@@ -112,6 +125,7 @@ export function renderPage(gallery, pageSha256) {
     "</head>",
     "<body>",
     "<h1>Explainer kit gallery</h1>",
+    `<p>Preset <code>${esc(preset)}</code>.</p>`,
     `<p>Node ${esc(gallery.node)}. Page <code>${esc(pageSha256)}</code>.</p>`,
     "<p>Watch each sample in the kit's theme and read its probe result. Choose approve, redo or drop for every candidate," +
       " pick a theme or leave it unset, then export the decisions.</p>",
@@ -138,7 +152,7 @@ export function renderPage(gallery, pageSha256) {
     );
   }
   parts.push(
-    `<script type="application/json" id="gallery-data">${scriptJson({ ids, page: pageSha256 })}</script>`,
+    `<script type="application/json" id="gallery-data">${scriptJson(data)}</script>`,
     `<script>${SCRIPT}</script>`,
     "</body>",
     "</html>",

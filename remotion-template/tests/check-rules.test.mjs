@@ -653,6 +653,18 @@ test("runChecks: the passing project runs the snapshot and all nine stages and p
   assert.equal(calls[0].targets[0].props.theme, KIT_THEME);
 });
 
+// Issue #962: the theme is resolved from the script's preset after stage 1;
+// an injected theme still wins.
+test("runChecks: an injected theme wins over the one the script's preset selects", async (t) => {
+  const { probe, calls } = stubProbe();
+  const { sheet } = stubSheet();
+  const injected = { ...themes.light, brand: { ...themes.light.brand } };
+  const { reasons } = await runChecks(customRoot(t), { probe, sheet, files: stubFiles(checkFiles()), theme: injected });
+  assert.deepEqual(reasons, []);
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].targets.every((target) => target.props.theme === injected));
+});
+
 test("runChecks: a schema failure runs no later stage", async (t) => {
   const log = [];
   const files = {
