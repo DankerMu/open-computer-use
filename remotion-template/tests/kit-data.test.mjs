@@ -10,6 +10,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
@@ -46,10 +47,11 @@ async function project(t) {
   return { ...box, root, dataDir: join(root, "data"), put, data };
 }
 
-async function kit(argv, root, box, runner = run) {
+async function kit(argv, root, box, runner = run, extra = {}) {
   let out = "";
   let err = "";
   const code = await runner(argv, {
+    ...extra,
     root,
     videosRoot: box.videos,
     filesRoot: box.files,
@@ -236,6 +238,70 @@ test("a duplicate label after a skipped empty line names the file row", async (t
   assertRefused(box, await box.data("skip.csv"), "skip.csv: row 4: duplicate label 华东, first in row 2");
 });
 
+// --- malformed and large input ---------------------------------------------
+
+test("an unbalanced quote is refused at its record and writes nothing", async (t) => {
+  const box = await project(t);
+  box.put("open.csv", 'a,b\nx,"5 region\ny,2\nz,3\n');
+  assertRefused(box, await box.data("open.csv"), "open.csv: row 2: a quoted cell is not closed");
+  box.put("after.csv", 'a,b\nx,1\ny,"5"z\n');
+  assertRefused(box, await box.data("after.csv"), `after.csv: row 3: ',' expected after '"'`);
+});
+
+test("legal quoting still imports", async (t) => {
+  const box = await project(t);
+  box.put("q.csv", 'a,b\nx,5"\ny,"two\nlines"\nz,"a ""b"" c"\nw,"1,260"\n');
+  const result = await box.data("q.csv");
+  assert.equal(result.code, 0, result.err);
+  const text = (cell) => ({ value: null, text: cell, unit: "" });
+  assert.deepEqual(readTable(box, "q").rows, [
+    { label: "x", cells: [text('5"')] },
+    { label: "y", cells: [text("two\nlines")] },
+    { label: "z", cells: [text('a "b" c')] },
+    { label: "w", cells: [{ value: 1260, text: "1260", unit: "" }] },
+  ]);
+});
+
+test("a CRLF file imports to the same table as its LF twin", async (t) => {
+  const box = await project(t);
+  // Long CJK cells of varying length put line ends and multibyte characters
+  // across the reader's chunk boundaries.
+  const lines = ["地区,销售额,备注", ...Array.from({ length: 49 }, (_, i) => `r${i + 1},"1,${String(i).padStart(3, "0")}",${"华".repeat(300 + 7 * i)}`)];
+  lines.splice(10, 0, "");
+  const lf = Buffer.from(`\uFEFF${lines.join("\n")}\n`, "utf8");
+  const crlf = Buffer.from(`\uFEFF${lines.join("\r\n")}\r\n`, "utf8");
+  assert.ok(lf.length > 8 * 8192);
+  const imported = [];
+  for (const [dir, bytes] of [["lf", lf], ["crlf", crlf]]) {
+    mkdirSync(join(box.files, dir));
+    writeFileSync(join(box.files, dir, "t.csv"), bytes);
+    const result = await box.data(`${dir}/t.csv`);
+    assert.equal(result.code, 0, result.err);
+    const table = readTable(box, "t");
+    assert.equal(table.source.sha256, createHash("sha256").update(bytes).digest("hex"));
+    imported.push({ out: result.out, table: { ...table, source: { ...table.source, sha256: null } } });
+  }
+  assert.deepEqual(imported[1], imported[0]);
+  assert.equal(imported[0].table.rows.length, 49);
+  assert.equal(imported[0].table.rows[48].cells[1].text, "华".repeat(300 + 7 * 48));
+});
+
+test("a file of 200,000 short rows is refused with its full row count", async (t) => {
+  const box = await project(t);
+  box.put("big.csv", csv(["a,b", ...Array.from({ length: 200000 }, (_, i) => `r${i},1`)]));
+  assertRefused(box, await box.data("big.csv"), "big.csv: has 200000 data rows; the limit is 50");
+});
+
+test("a Latin-1 byte after row 51 is still refused as not UTF-8", async (t) => {
+  const box = await project(t);
+  // Long rows put the byte well past the reader's first chunks.
+  const head = Buffer.from(csv(["地区,a", ...Array.from({ length: 58 }, (_, i) => `r${i + 2},${"x".repeat(2000)}`)]), "utf8");
+  assert.ok(head.length > 100000);
+  // File row 60.
+  box.put("late.csv", Buffer.concat([head, Buffer.from("Île,1\n", "latin1")]));
+  assertRefused(box, await box.data("late.csv"), "late.csv: is not UTF-8; save it as CSV UTF-8");
+});
+
 // --- path refusals ----------------------------------------------------------
 
 test("paths outside the files root, symlinks out, directories, absent files and other types are refused", async (t) => {
@@ -323,6 +389,18 @@ test("a misbehaving reader fails the step and writes nothing", async (t) => {
     const result = await kit(["data", "a.csv"], box.root, box, projectRun);
     assertRefused(box, result, `the table reader failed: ${reason}`);
   }
+});
+
+test("a reader still running at the timeout is killed and writes nothing", async (t) => {
+  const box = await project(t);
+  box.put("a.csv", "a,b\nx,1\n");
+  // The stub ignores SIGTERM, so only a hard kill ends it before it sleeps out.
+  writeFileSync(join(box.root, "bin", "read_table.py"), "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(5)\n");
+  const { run: projectRun } = await import(pathToFileURL(join(box.root, "bin", "kit.mjs")).href);
+  const started = Date.now();
+  const result = await kit(["data", "a.csv"], box.root, box, projectRun, { readerTimeoutMs: 200 });
+  assertRefused(box, result, "the table reader failed: timed out after 0.2 seconds");
+  assert.ok(Date.now() - started < 4000, "the reader was not killed at the timeout");
 });
 
 test("a PATH without python3 fails the step and writes nothing", async (t) => {

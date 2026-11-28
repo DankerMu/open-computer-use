@@ -7,7 +7,10 @@
 # prints one line `refusal: <text>` on stderr and exits 1. kit.mjs checks
 # the object's shape and writes data/<table>.json. CSV only, standard
 # library only; needs Python 3.10 or later. Both streams are written as
-# UTF-8 bytes, since -I ignores PYTHONIOENCODING.
+# UTF-8 bytes, since -I ignores PYTHONIOENCODING. The file is streamed: it is
+# hashed as it is read, only the header and the first MAX_DATA_ROWS data rows
+# are kept, and the rest are counted, so memory does not grow with the number
+# of rows; one line is still held whole.
 
 import csv
 import hashlib
@@ -27,6 +30,40 @@ NUMBER = re.compile(r"-?(0|[1-9][0-9]{0,2}(,[0-9]{3})+|[1-9][0-9]*)(\.[0-9]+)?%?
 
 class Refusal(Exception):
     pass
+
+
+class HashingReader(io.RawIOBase):
+    """Reads a binary file and hashes every byte it hands on."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.digest = hashlib.sha256()
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        count = self.raw.readinto(buffer)
+        self.digest.update(memoryview(buffer)[:count])
+        return count
+
+
+class Lines:
+    """Iterates the lines of a text stream; done is True once it has ended."""
+
+    def __init__(self, text):
+        self.text = text
+        self.done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.text.readline()
+        if line == "":
+            self.done = True
+            raise StopIteration
+        return line
 
 
 def parse_cell(text, file, row, column):
@@ -60,28 +97,60 @@ def check_header(file, header):
         first[name] = number
 
 
+def scan_csv(path, file):
+    """Reads the file to its end: (header cells or None, the first
+    MAX_DATA_ROWS data rows, the data row count, sha256). A data row is
+    (1-based file row, stripped cells); a fully empty row is skipped but
+    still counted. A refusal is raised only once the file is read to its end,
+    so undecodable bytes anywhere refuse first."""
+    header = None
+    body = []
+    count = 0
+    records = 0
+    with open(path, "rb", buffering=0) as raw:
+        hashing = HashingReader(raw)
+        # newline="" splits lines as csv expects, on \r, \n and \r\n only,
+        # and keeps a quoted line end; utf-8-sig drops a leading BOM.
+        text = io.TextIOWrapper(io.BufferedReader(hashing), encoding="utf-8-sig", newline="")
+        try:
+            lines = Lines(text)
+            try:
+                for records, record in enumerate(csv.reader(lines, strict=True), 1):
+                    cells = [cell.strip() for cell in record]
+                    if not any(cells):
+                        continue
+                    if header is None:
+                        header = cells
+                        continue
+                    count += 1
+                    if count <= MAX_DATA_ROWS:
+                        body.append((records, cells))
+            except csv.Error as error:
+                # strict=True: an unbalanced quote fails here instead of
+                # swallowing every later row into one cell. Failing after the
+                # last line means a quote still open at the end of the file.
+                if lines.done:
+                    problem = "a quoted cell is not closed"
+                else:
+                    problem = str(error)
+                    while text.read(1 << 16):
+                        pass
+                raise Refusal(f"{file}: row {records + 1}: {problem}") from None
+        except UnicodeDecodeError:
+            raise Refusal(f"{file}: is not UTF-8; save it as CSV UTF-8") from None
+    return header, body, count, hashing.digest.hexdigest()
+
+
 def read_csv(path):
-    data = open(path, "rb").read()
     file = os.path.basename(path)
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise Refusal(f"{file}: is not UTF-8; save it as CSV UTF-8") from None
-    # Rows keep their 1-based file row number; a fully empty row is skipped
-    # but still counted.
-    rows = [
-        (number, [cell.strip() for cell in record])
-        for number, record in enumerate(csv.reader(io.StringIO(text, newline="")), 1)
-    ]
-    rows = [(number, cells) for number, cells in rows if any(cells)]
-    if not rows:
+    header, body, count, sha256 = scan_csv(path, file)
+    if header is None:
         raise Refusal(f"{file}: has no header row")
-    (_, header), body = rows[0], rows[1:]
     check_header(file, header)
-    if not body:
+    if count == 0:
         raise Refusal(f"{file}: has no data row")
-    if len(body) > MAX_DATA_ROWS:
-        raise Refusal(f"{file}: has {len(body)} data rows; the limit is {MAX_DATA_ROWS}")
+    if count > MAX_DATA_ROWS:
+        raise Refusal(f"{file}: has {count} data rows; the limit is {MAX_DATA_ROWS}")
     labels = {}
     table_rows = []
     for number, cells in body:
@@ -98,7 +167,7 @@ def read_csv(path):
         table_rows.append({"label": label, "cells": parsed})
     return {
         "version": 1,
-        "source": {"file": file, "sheet": None, "sha256": hashlib.sha256(data).hexdigest()},
+        "source": {"file": file, "sheet": None, "sha256": sha256},
         "label_header": header[0],
         "columns": header[1:],
         "rows": table_rows,

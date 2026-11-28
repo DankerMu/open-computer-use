@@ -99,16 +99,21 @@ export async function writeAtomic(dir, name, data) {
 
 // --- child processes --------------------------------------------------------
 
-// Runs file with an argument array, never a shell; resolves
-// {exit, stdout, stderr} for any exit status, exit being the exit code or
-// the signal name. A missing binary resolves exit "ENOENT" and an output
-// past maxBuffer exit "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; any other spawn
-// error rejects as itself.
-export function execText(file, args, maxBuffer) {
+// Runs file with an argument array, never a shell, killing it after
+// timeoutMs; resolves {exit, stdout, stderr} for any exit status, exit being
+// the exit code or the signal name. A missing binary resolves exit "ENOENT",
+// an output past maxBuffer exit "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" and a
+// run past timeoutMs exit "ETIMEDOUT"; any other spawn error rejects as
+// itself.
+export function execText(file, args, maxBuffer, timeoutMs) {
+  // SIGKILL, not the default SIGTERM, which a stuck child can catch or ignore.
+  const options = { encoding: "utf8", maxBuffer, timeout: timeoutMs, killSignal: "SIGKILL" };
   return new Promise((resolve, reject) => {
-    execFile(file, args, { encoding: "utf8", maxBuffer }, (error, stdout, stderr) => {
+    execFile(file, args, options, (error, stdout, stderr) => {
       if (error?.code === "ENOENT" || error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") resolve({ exit: error.code, stdout, stderr });
       else if (typeof error?.code === "string") reject(error);
+      // Only the timeout kills the child here: maxBuffer is handled above.
+      else if (error?.killed) resolve({ exit: "ETIMEDOUT", stdout, stderr });
       else resolve({ exit: error === null ? 0 : (error.signal ?? error.code), stdout, stderr });
     });
   });

@@ -33,6 +33,9 @@ const READER = join(dirname(fileURLToPath(import.meta.url)), "read_table.py");
 // A 50-row, 12-column table is far below this; the bound only stops a
 // runaway reader from growing the kit's memory without limit.
 const READER_MAX_BUFFER = 64 * 1024 * 1024;
+// Bounds a hung reader; a 40 MB file streams through it in about 1 s. The
+// entry passes it as io.readerTimeoutMs.
+const READER_TIMEOUT_MS = 60_000;
 
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 
@@ -288,12 +291,14 @@ function tableFrom(parsed) {
   return table.rows.length === 0 ? null : table;
 }
 
-// Runs the reader on one real path; resolves the table, or throws a
-// refusal: the reader's own, or `the table reader failed: <reason>`.
-async function readTable(path) {
+// Runs the reader on one real path, killing it after timeoutMs; resolves the
+// table, or throws a refusal: the reader's own, or
+// `the table reader failed: <reason>`.
+async function readTable(path, timeoutMs) {
   const failed = (reason) => new Refusal(`the table reader failed: ${escapeLine(reason)}`);
-  const { exit, stdout, stderr } = await execText("python3", ["-I", READER, path], READER_MAX_BUFFER);
+  const { exit, stdout, stderr } = await execText("python3", ["-I", READER, path], READER_MAX_BUFFER, timeoutMs);
   if (exit === "ENOENT") throw failed("python3 not found");
+  if (exit === "ETIMEDOUT") throw failed(`timed out after ${timeoutMs / 1000} seconds`);
   if (exit === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") throw failed("bad output");
   if (exit === 0) {
     let table = null;
@@ -323,7 +328,7 @@ async function data(ctx) {
   if (ctx.options.sheet !== undefined) throw new Refusal("--sheet applies only to .xlsx files");
   const name = tableName(basename(given).slice(0, -extension.length));
   if (name === "") throw new Refusal(`${arg}: the file name gives an empty table name`);
-  const table = await readTable(real);
+  const table = await readTable(real, ctx.readerTimeoutMs ?? READER_TIMEOUT_MS);
   const dir = await projectDir(ctx.root, "data");
   const file = `${name}.json`;
   const replaced = (await lstatOrNull(join(dir, file))) !== null;
@@ -378,7 +383,9 @@ const COMMANDS = {
   status: { usage: "node bin/kit.mjs status", args: 0, fromTemplate: false, run: status },
 };
 
-// io: {root, videosRoot, filesRoot, stdout, stderr}; resolves to the exit code.
+// io: {root, videosRoot, filesRoot, stdout, stderr, readerTimeoutMs}; resolves
+// to the exit code. readerTimeoutMs, the table reader's time limit, defaults
+// to READER_TIMEOUT_MS.
 export async function run(argv, io) {
   const [name, ...args] = argv;
   if (!Object.hasOwn(COMMANDS, name ?? "")) {
@@ -421,6 +428,7 @@ if (import.meta.main) {
     root: dirname(dirname(fileURLToPath(import.meta.url))),
     videosRoot: "/home/assistant/videos",
     filesRoot: "/mnt/user-data/files",
+    readerTimeoutMs: READER_TIMEOUT_MS,
     stdout: process.stdout,
     stderr: process.stderr,
   });
