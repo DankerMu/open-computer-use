@@ -18,7 +18,7 @@ export const ITEM_ID = /^[a-z][a-z0-9_]{0,31}$/;
 export const VALUE_TEXT = /^-?[0-9]+(\.[0-9]+)?$/;
 export const OPS = ["sum", "diff", "product", "ratio", "growth", "pp-diff"];
 export const FIGURE_LIMIT = 12;
-export const UNIT = /^(?![\s.．+\p{Pd}−±])[^\p{Nd}]*$/u;
+export const UNIT = /^(?![\s.．+\p{Pd}−±])[^\p{N}]*$/u;
 // Items in data and entries in one `of`, so the walk's depth and every
 // argument list stay bounded.
 export const DATA_LIMIT = 200;
@@ -28,7 +28,9 @@ const PERCENT = "%";
 const POINTS = "个百分点";
 // A `,` or `，` with an ASCII digit before it and exactly three after it.
 const SEPARATOR = /(?<=[0-9])[,，](?=[0-9]{3}(?![0-9]))/g;
-const MAGNITUDE = new Set(["十", "百", "千", "万", "亿", "兆"]);
+// Format characters (zero-width space, soft hyphen, word joiner, BOM …),
+// deleted from a quote before anything else.
+const FORMAT = /\p{Cf}/gu;
 
 const unitName = (unit) => (unit === "" ? "no unit" : escapeLine(unit));
 const isPercentLike = (unit) => unit === PERCENT || unit === POINTS;
@@ -41,8 +43,10 @@ const isPercentLike = (unit) => unit === PERCENT || unit === POINTS;
 // Before the match: no digit, point or sign (a sign the user wrote is never
 // dropped), and no run of grouping characters after a digit (the tail of a
 // grouped number: `1 260`, `1, 260`, `1,26`, `1'260`).
-const CLEAR_BEFORE = /(?<![\p{Nd}.．\p{Pd}−±负])(?<!\p{Nd}[\p{Zs}\t,，'’]+)/uy;
+const CLEAR_BEFORE = /(?<![\p{Nd}.．\p{Pd}−⁻₋±负])(?<!\p{Nd}[\p{Zs}\t,，'’]+)/uy;
 const SPACE_RUN = /[\p{Zs}\t]*/uy;
+// After a non-empty unit, no magnitude, even after whitespace (`3万 亿元`).
+const CLEAR_AFTER_UNIT = /(?![\p{Zs}\t]*[十百千万亿兆])/uy;
 // With no unit, the value must not run on into a longer number or carry a
 // magnitude or percent sign.
 const CLEAR_AFTER_BARE = /(?!\p{Nd}|[.．]\p{Nd}|[\p{Zs}\t]+\p{Nd}|[\p{Zs}\t]*[十百千万亿兆%％‰])/uy;
@@ -60,8 +64,9 @@ function spacesEnd(text, at) {
 
 function quoteHolds(quote, value, unit) {
   if (!VALUE_TEXT.test(value)) return false;
-  if (unit === PERCENT && value === "50" && quote.includes("一半")) return true;
-  const text = quote.replace(SEPARATOR, "");
+  const cleaned = quote.replace(FORMAT, "");
+  if (unit === PERCENT && value === "50" && cleaned.includes("一半")) return true;
+  const text = cleaned.replace(SEPARATOR, "");
   for (let at = text.indexOf(value); at !== -1; at = text.indexOf(value, at + 1)) {
     if (!holdsAt(CLEAR_BEFORE, text, at)) continue;
     const end = at + value.length;
@@ -69,9 +74,8 @@ function quoteHolds(quote, value, unit) {
       if (holdsAt(CLEAR_AFTER_BARE, text, end)) return true;
       continue;
     }
-    // A unit holds no digit, so it never ends in half a surrogate pair.
     const unitAt = spacesEnd(text, end);
-    if (text.startsWith(unit, unitAt) && !MAGNITUDE.has(text[unitAt + unit.length])) return true;
+    if (text.startsWith(unit, unitAt) && holdsAt(CLEAR_AFTER_UNIT, text, unitAt + unit.length)) return true;
   }
   return false;
 }

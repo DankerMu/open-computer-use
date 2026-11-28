@@ -62,7 +62,7 @@ test("the exported patterns, operations and figure limit", () => {
   assert.equal(VALUE_TEXT.source, "^-?[0-9]+(\\.[0-9]+)?$");
   assert.deepEqual(OPS, ["sum", "diff", "product", "ratio", "growth", "pp-diff"]);
   assert.equal(FIGURE_LIMIT, 12);
-  assert.equal(UNIT.source, "^(?![\\s.．+\\p{Pd}−±])[^\\p{Nd}]*$");
+  assert.equal(UNIT.source, "^(?![\\s.．+\\p{Pd}−±])[^\\p{N}]*$");
   assert.equal(UNIT.flags, "u");
   assert.equal(DATA_LIMIT, 200);
   assert.equal(OF_LIMIT, 50);
@@ -182,6 +182,8 @@ test("the quote rule: a digit, point or sign before the value", () => {
   quoteCase("5", "%", "–5%", false);
   quoteCase("5", "%", "负5%", false);
   quoteCase("5", "%", "±5%", false);
+  quoteCase("5", "%", "⁻5%", false);
+  quoteCase("5", "%", "₋5%", false);
   quoteCase("5", "%", "+5%", true);
   quoteCase("260", "万元", "１260万元", false);
   quoteCase("5", "万元", "1．5万元", false);
@@ -216,8 +218,19 @@ test("the quote rule: what follows the value", () => {
   quoteCase("1", "", "1　260", false);
 });
 
+test("the quote rule: format characters are deleted first", () => {
+  // Zero-width space and soft hyphen.
+  for (const mark of ["\u200b", "\u00ad"]) {
+    quoteCase("260", "万元", `1${mark}260万元`, false);
+    quoteCase("1260", "万元", `1${mark}260万元`, true);
+  }
+  quoteCase("1", "", "1\u200b260", false);
+});
+
 test("the quote rule: a magnitude or percent sign after the match", () => {
   quoteCase("3", "万", "规模达3万亿元", false);
+  quoteCase("3", "万", "3万 亿元", false);
+  quoteCase("3", "万", "3万\u3000亿元", false);
   quoteCase("3", "", "规模达3万亿元", false);
   quoteCase("5", "千", "5千万元", false);
   quoteCase("5", "个", "提高5个百分点", false);
@@ -507,7 +520,7 @@ test("a second loop through a reported item is not reported again", () => {
 // --- limits -----------------------------------------------------------------
 
 test("a unit holds no digit and starts with no space, point or sign", () => {
-  for (const unit of ["5万元", ".5万元", " 万元", "-元"]) {
+  for (const unit of ["5万元", ".5万元", " 万元", "-元", "½万元"]) {
     refused([quoted("a", "1", unit, "无")], "a", `data item a: unit ${unit} holds a digit or starts with a space, a point or a sign`);
   }
   for (const unit of ["万元", "%", "个百分点", ""]) assert.equal(displayOf([quoted("a", "1", unit)], "a"), `1${unit}`);
