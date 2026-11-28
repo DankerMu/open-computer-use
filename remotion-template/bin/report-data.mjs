@@ -18,43 +18,44 @@ export const ITEM_ID = /^[a-z][a-z0-9_]{0,31}$/;
 export const VALUE_TEXT = /^-?[0-9]+(\.[0-9]+)?$/;
 export const OPS = ["sum", "diff", "product", "ratio", "growth", "pp-diff"];
 export const FIGURE_LIMIT = 12;
+export const UNIT = /^(?![\s.．+\p{Pd}−±])[^\p{Nd}]*$/u;
+// Items in data and entries in one `of`, so the walk's depth and every
+// argument list stay bounded.
+export const DATA_LIMIT = 200;
+export const OF_LIMIT = 50;
 
 const PERCENT = "%";
 const POINTS = "个百分点";
 // A `,` or `，` with an ASCII digit before it and exactly three after it.
 const SEPARATOR = /(?<=[0-9])[,，](?=[0-9]{3}(?![0-9]))/g;
-const SPACES = new Set([" ", "\t", "　"]);
-// What may not stand before a quoted value, so a written sign is never dropped.
-const NOT_BEFORE = new Set([".", "-", "－", "−"]);
-// A run of these may not stand before it when a digit stands before the
-// run, so the tail of a grouped number (`1 260`, `1,26`, `1, 260`) never
-// matches.
-const GROUPING = new Set([",", "，", ...SPACES]);
+const MAGNITUDE = new Set(["十", "百", "千", "万", "亿", "兆"]);
 
-const isDigit = (c) => c !== undefined && c >= "0" && c <= "9";
 const unitName = (unit) => (unit === "" ? "no unit" : escapeLine(unit));
 const isPercentLike = (unit) => unit === PERCENT || unit === POINTS;
 
 // --- the quote rule ---------------------------------------------------------
 
-function skipSpaces(text, at) {
-  while (SPACES.has(text[at])) at++;
-  return at;
+// Sticky patterns, tried at one position. A digit is \p{Nd}, whitespace is
+// \p{Zs} or a tab, and a grouping character is whitespace, `,`, `，`, `'`
+// or `’`.
+// Before the match: no digit, point or sign (a sign the user wrote is never
+// dropped), and no run of grouping characters after a digit (the tail of a
+// grouped number: `1 260`, `1, 260`, `1,26`, `1'260`).
+const CLEAR_BEFORE = /(?<![\p{Nd}.．\p{Pd}−±负])(?<!\p{Nd}[\p{Zs}\t,，'’]+)/uy;
+const SPACE_RUN = /[\p{Zs}\t]*/uy;
+// With no unit, the value must not run on into a longer number or carry a
+// magnitude or percent sign.
+const CLEAR_AFTER_BARE = /(?!\p{Nd}|[.．]\p{Nd}|[\p{Zs}\t]+\p{Nd}|[\p{Zs}\t]*[十百千万亿兆%％‰])/uy;
+
+function holdsAt(pattern, text, at) {
+  pattern.lastIndex = at;
+  return pattern.test(text);
 }
 
-// With no unit, the value must not run on into a longer number: a digit, a
-// point and a digit, or whitespace and a digit (a space-grouped `1 260`).
-function runsOn(text, end) {
-  if (isDigit(text[end]) || (text[end] === "." && isDigit(text[end + 1]))) return true;
-  const next = skipSpaces(text, end);
-  return next > end && isDigit(text[next]);
-}
-
-// Whether a run of GROUPING characters, after a digit, ends just before at.
-function groupTail(text, at) {
-  let start = at;
-  while (GROUPING.has(text[start - 1])) start--;
-  return start < at && isDigit(text[start - 1]);
+function spacesEnd(text, at) {
+  SPACE_RUN.lastIndex = at;
+  SPACE_RUN.test(text);
+  return SPACE_RUN.lastIndex;
 }
 
 function quoteHolds(quote, value, unit) {
@@ -62,10 +63,15 @@ function quoteHolds(quote, value, unit) {
   if (unit === PERCENT && value === "50" && quote.includes("一半")) return true;
   const text = quote.replace(SEPARATOR, "");
   for (let at = text.indexOf(value); at !== -1; at = text.indexOf(value, at + 1)) {
-    const before = text[at - 1];
-    if (isDigit(before) || NOT_BEFORE.has(before) || groupTail(text, at)) continue;
+    if (!holdsAt(CLEAR_BEFORE, text, at)) continue;
     const end = at + value.length;
-    if (unit === "" ? !runsOn(text, end) : text.startsWith(unit, skipSpaces(text, end))) return true;
+    if (unit === "") {
+      if (holdsAt(CLEAR_AFTER_BARE, text, end)) return true;
+      continue;
+    }
+    // A unit holds no digit, so it never ends in half a surrogate pair.
+    const unitAt = spacesEnd(text, end);
+    if (text.startsWith(unit, unitAt) && !MAGNITUDE.has(text[unitAt + unit.length])) return true;
   }
   return false;
 }
@@ -135,6 +141,7 @@ const OPERATIONS = new Map([
 ]);
 
 function countProblem(op, of) {
+  if (of.length > OF_LIMIT) return `${escapeLine(op)} takes at most ${OF_LIMIT} items, got ${of.length}`;
   if (op === "sum") return of.length >= 2 ? undefined : `sum takes 2 or more items, got ${of.length}`;
   return of.length === 2 ? undefined : `${escapeLine(op)} takes 2 items, got ${of.length}`;
 }
@@ -156,7 +163,7 @@ function derive(item, operands) {
     const text = decimalText(exact, 1);
     return { text: text.endsWith(".0") ? text.slice(0, -2) : text };
   }
-  return { text: decimalText(exact, Math.max(...values.map((v) => v.places))) };
+  return { text: decimalText(exact, values.reduce((most, v) => (v.places > most ? v.places : most), 0)) };
 }
 
 // --- sources ----------------------------------------------------------------
@@ -195,6 +202,9 @@ function operandsProblem({ op, of }, firstIndex) {
 // --- resolveData ------------------------------------------------------------
 
 export function resolveData(data, tables) {
+  if (data.length > DATA_LIMIT) {
+    return { ok: false, errors: [{ index: DATA_LIMIT, id: data[DATA_LIMIT].id, message: `data: has ${data.length} items; the limit is ${DATA_LIMIT}` }] };
+  }
   const firstIndex = new Map();
   data.forEach((item, index) => {
     if (!firstIndex.has(item.id)) firstIndex.set(item.id, index);
@@ -224,6 +234,8 @@ export function resolveData(data, tables) {
   data.forEach((item, index) => {
     if (firstIndex.get(item.id) !== index) {
       fail(index, `is listed twice, at data[${firstIndex.get(item.id)}] and data[${index}]`);
+    } else if (!UNIT.test(item.unit)) {
+      fail(index, `unit ${escapeLine(item.unit)} holds a digit or starts with a space, a point or a sign`);
     } else if (Object.hasOwn(item, "derive")) {
       const problem = operandsProblem(item.derive, firstIndex);
       if (problem) fail(index, problem);
@@ -251,7 +263,7 @@ export function resolveData(data, tables) {
       results[m] = null;
     }
     if (known) return;
-    const start = members.indexOf(Math.min(...members));
+    const start = members.indexOf(members.reduce((least, m) => (m < least ? m : least)));
     const ids = [...members.slice(start), ...members.slice(0, start)].map((m) => escapeLine(data[m].id));
     messages.set(members[start], `data: cycle ${[...ids, ids[0]].join(" → ")}`);
   };

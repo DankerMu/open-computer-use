@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { escapeLine } from "../bin/escape-line.mjs";
 import { escapeLine as schemaEscapeLine } from "../bin/script-schema.mjs";
-import { FIGURE_LIMIT, ITEM_ID, OPS, VALUE_TEXT, derivedLines, resolveData } from "../bin/report-data.mjs";
+import { DATA_LIMIT, FIGURE_LIMIT, ITEM_ID, OF_LIMIT, OPS, UNIT, VALUE_TEXT, derivedLines, resolveData } from "../bin/report-data.mjs";
 
 const Q3 = JSON.parse(readFileSync(new URL("./fixtures/data/q3-销售.json", import.meta.url), "utf8"));
 const TABLES = { "q3-销售": Q3 };
@@ -62,6 +62,10 @@ test("the exported patterns, operations and figure limit", () => {
   assert.equal(VALUE_TEXT.source, "^-?[0-9]+(\\.[0-9]+)?$");
   assert.deepEqual(OPS, ["sum", "diff", "product", "ratio", "growth", "pp-diff"]);
   assert.equal(FIGURE_LIMIT, 12);
+  assert.equal(UNIT.source, "^(?![\\s.．+\\p{Pd}−±])[^\\p{Nd}]*$");
+  assert.equal(UNIT.flags, "u");
+  assert.equal(DATA_LIMIT, 200);
+  assert.equal(OF_LIMIT, 50);
 });
 
 // --- spec scenarios ---------------------------------------------------------
@@ -175,6 +179,12 @@ test("the quote rule: a digit, point or sign before the value", () => {
   quoteCase("5", "%", "−5%", false);
   quoteCase("5", "%", ".5%", false);
   quoteCase("-5", "%", "下降-5%", true);
+  quoteCase("5", "%", "–5%", false);
+  quoteCase("5", "%", "负5%", false);
+  quoteCase("5", "%", "±5%", false);
+  quoteCase("5", "%", "+5%", true);
+  quoteCase("260", "万元", "１260万元", false);
+  quoteCase("5", "万元", "1．5万元", false);
   // A later occurrence counts when an earlier one does not.
   quoteCase("1260", "万元", "去年11260万元，今年1260万元", true);
 });
@@ -187,6 +197,9 @@ test("the quote rule: the tail of a grouped number never matches", () => {
   quoteCase("26", "万元", "1，26万元", false);
   quoteCase("260", "万元", "1  260万元", false);
   quoteCase("260", "万元", "1, 260万元", false);
+  quoteCase("260", "万元", "1\u00a0260万元", false);
+  quoteCase("260", "万元", "1'260万元", false);
+  quoteCase("260", "万元", "1’260万元", false);
   // A separator or space after a non-digit is no group.
   quoteCase("260", "万元", "华东 260万元", true);
   quoteCase("260", "万元", "华东，260万元", true);
@@ -201,6 +214,18 @@ test("the quote rule: what follows the value", () => {
   quoteCase("42", "", "共42.", true);
   quoteCase("1", "", "1 260", false);
   quoteCase("1", "", "1　260", false);
+});
+
+test("the quote rule: a magnitude or percent sign after the match", () => {
+  quoteCase("3", "万", "规模达3万亿元", false);
+  quoteCase("3", "", "规模达3万亿元", false);
+  quoteCase("5", "千", "5千万元", false);
+  quoteCase("5", "个", "提高5个百分点", false);
+  quoteCase("93", "", "93%", false);
+  quoteCase("93", "", "93 ％", false);
+  quoteCase("93", "", "93‰", false);
+  quoteCase("42", "", "42５", false);
+  quoteCase("1260", "万元", "1260万元，同比", true);
 });
 
 test("the quote rule: thousands separators", () => {
@@ -297,6 +322,9 @@ test("one passing case of each operation", () => {
 
 test("arithmetic is exact and keeps the operands' decimal count", () => {
   assert.equal(displayOf([quoted("a", "0.1", ""), quoted("b", "0.2", ""), derived("s", "", "sum", ["a", "b"])], "s"), "0.3");
+  // A double with Math.round gives 1.00元 and 100.4%.
+  assert.equal(displayOf([quoted("a", "2.01", "元"), quoted("p", "50", "%"), derived("x", "元", "product", ["a", "p"])], "x"), "1.01元");
+  assert.equal(displayOf([quoted("a", "1.0045", "元"), quoted("b", "1", "元"), derived("r", "%", "ratio", ["a", "b"])], "r"), "100.5%");
   const items = resolved([quoted("a", "1.50", "亿元"), quoted("b", "2", "亿元"), derived("s", "亿元", "sum", ["a", "b"])]);
   assert.equal(items.s.display, "3.50亿元");
   assert.equal(items.s.text, "3.50");
@@ -477,6 +505,36 @@ test("a second loop through a reported item is not reported again", () => {
 });
 
 // --- limits -----------------------------------------------------------------
+
+test("a unit holds no digit and starts with no space, point or sign", () => {
+  for (const unit of ["5万元", ".5万元", " 万元", "-元"]) {
+    refused([quoted("a", "1", unit, "无")], "a", `data item a: unit ${unit} holds a digit or starts with a space, a point or a sign`);
+  }
+  for (const unit of ["万元", "%", "个百分点", ""]) assert.equal(displayOf([quoted("a", "1", unit)], "a"), `1${unit}`);
+  // After the duplicate check, before the source.
+  assert.deepEqual(errors([quoted("a", "1", "元"), quoted("a", "1", "5元")]), [{ index: 1, id: "a", message: "data item a: is listed twice, at data[0] and data[1]" }]);
+  refused([fromCell("a", "5万元", "q3-xx", "华东", "销售额")], "a", "data item a: unit 5万元 holds a digit or starts with a space, a point or a sign");
+});
+
+test("data holds at most 200 items, and one of at most 50", () => {
+  const many = (count) => Array.from({ length: count }, (_, i) => quoted(`i${i}`, "1", "元"));
+  assert.equal(Object.keys(resolved(many(200))).length, 200);
+  // Nothing else is checked: the failing first item is not reported.
+  const over = [quoted("i0", "1", "元", "无"), ...many(201).slice(1)];
+  assert.deepEqual(errors(over), [{ index: 200, id: "i200", message: "data: has 201 items; the limit is 200" }]);
+  const ids = (count) => Array.from({ length: count }, (_, i) => `i${i}`);
+  assert.equal(displayOf([...many(51), derived("s", "元", "sum", ids(50))], "s"), "50元");
+  refused([...many(51), derived("s", "元", "sum", ids(51))], "s", "data item s: sum takes at most 50 items, got 51");
+  refused([...many(51), derived("g", "%", "growth", ids(51))], "g", "data item g: growth takes at most 50 items, got 51");
+});
+
+test("a 200-deep sum chain resolves", () => {
+  // c198 = sum(c197, one), …, c1 = sum(c0, one), listed deepest first.
+  const chain = Array.from({ length: 198 }, (_, i) => derived(`c${198 - i}`, "元", "sum", [`c${197 - i}`, "one"]));
+  const data = [...chain, quoted("c0", "1", "元"), quoted("one", "1", "元")];
+  assert.equal(data.length, 200);
+  assert.equal(displayOf(data, "c198"), "199元");
+});
 
 test("the 12-code-point limit, for a value item and a derived item", () => {
   assert.equal(displayOf([quoted("s", "1234567890", "万元")], "s"), "1234567890万元");
