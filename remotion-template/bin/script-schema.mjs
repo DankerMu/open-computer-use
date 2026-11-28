@@ -14,6 +14,9 @@
 // survive into the JSON Schema as minLength/maxLength.
 
 import { z } from "zod";
+import { escapeLine } from "./escape-line.mjs";
+
+export { escapeLine };
 
 export const VIDEO = { width: 1920, height: 1080, fps: 30 };
 
@@ -261,18 +264,6 @@ function isMissing(root, path) {
 
 export function fieldPath(path) {
   return path.map((key, i) => (typeof key === "number" ? `[${key}]` : i === 0 ? key : `.${key}`)).join("");
-}
-
-const ESCAPES = { "\n": "\\n", "\t": "\\t", "\r": "\\r" };
-
-// Keeps text on one line: C0, DEL, C1, U+2028 and U+2029 written as
-// escapes. Used alone for a JSON.parse message (V8 bounds it, and its
-// positional form ends with the line and column) and for an ffmpeg reason.
-export function escapeLine(text) {
-  return text.replace(
-    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g,
-    (c) => ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
 }
 
 // Bounds a string echoed into an error (a chapter name, an unknown key): at
