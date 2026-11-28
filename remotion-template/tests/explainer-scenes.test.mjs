@@ -286,6 +286,8 @@ function specifiers(path) {
 test("the modules the bundle imports from bin/ and captions.ts import no node: built-in", () => {
   assert.deepEqual(specifiers("../bin/explainer-scenes.mjs"), ["./script-schema.mjs", "./scene-timing.mjs"]);
   assert.deepEqual(specifiers("../bin/scene-timing.mjs"), []);
-  assert.deepEqual(specifiers("../bin/script-schema.mjs"), ["zod"]);
+  assert.deepEqual(specifiers("../bin/script-schema.mjs"), ["zod", "./escape-line.mjs"]);
+  assert.deepEqual(specifiers("../bin/escape-line.mjs"), []);
+  assert.deepEqual(specifiers("../bin/report-data.mjs"), ["./escape-line.mjs"]);
   assert.deepEqual(specifiers("../src/kit/render/captions.ts"), ["@remotion/captions"]);
 });
