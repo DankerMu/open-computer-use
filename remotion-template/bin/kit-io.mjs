@@ -2,15 +2,20 @@
 // Copyright (c) 2025 Open Computer Use Contributors
 //
 // The file and message helpers every kit subcommand shares: the refusal
-// type, reading and validating script.json, the public/ subdirectories, the
-// atomic write, and the `kit <subcommand>:` stderr prefix. kit.mjs and
-// timeline.mjs both import this module, so there is one copy and no import
-// cycle. Imports only node: built-ins and the schema.
+// type, reading and validating script.json, the project's subdirectories, the
+// atomic write, running a child process, the one-line escape and the
+// `kit <subcommand>:` stderr prefix. kit.mjs and timeline.mjs both import
+// this module, so there is one copy and no import cycle. Imports only node:
+// built-ins and the schema.
 
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { validateScript } from "./script-schema.mjs";
+
+// Keeps a foreign line (a child's stderr, a cell) on one line.
+export { escapeLine } from "./script-schema.mjs";
 
 const SHOWN_ERRORS = 20;
 
@@ -64,11 +69,11 @@ export async function readScript(ctx) {
 
 // --- project files ----------------------------------------------------------
 
-// Creates root/public/<sub> when absent; refuses a symlink or non-directory
+// Creates root/<parts...> when absent; refuses a symlink or non-directory
 // on the way.
-export async function publicDir(root, sub) {
+export async function projectDir(root, ...parts) {
   let path = root;
-  for (const part of ["public", sub]) {
+  for (const part of parts) {
     path = join(path, part);
     const stat = await lstatOrNull(path);
     if (stat === null) await mkdir(path);
@@ -77,6 +82,8 @@ export async function publicDir(root, sub) {
   }
   return path;
 }
+
+export const publicDir = (root, sub) => projectDir(root, "public", sub);
 
 // Writes dir/name through a temporary file in dir and one rename.
 export async function writeAtomic(dir, name, data) {
@@ -88,4 +95,26 @@ export async function writeAtomic(dir, name, data) {
     await rm(temp, { force: true });
     throw thrown;
   }
+}
+
+// --- child processes --------------------------------------------------------
+
+// Runs file with an argument array, never a shell, killing it after
+// timeoutMs; resolves {exit, stdout, stderr} for any exit status, exit being
+// the exit code or the signal name. A missing binary resolves exit "ENOENT",
+// an output past maxBuffer exit "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" and a
+// run past timeoutMs exit "ETIMEDOUT"; any other spawn error rejects as
+// itself.
+export function execText(file, args, maxBuffer, timeoutMs) {
+  // SIGKILL, not the default SIGTERM, which a stuck child can catch or ignore.
+  const options = { encoding: "utf8", maxBuffer, timeout: timeoutMs, killSignal: "SIGKILL" };
+  return new Promise((resolve, reject) => {
+    execFile(file, args, options, (error, stdout, stderr) => {
+      if (error?.code === "ENOENT" || error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") resolve({ exit: error.code, stdout, stderr });
+      else if (typeof error?.code === "string") reject(error);
+      // Only the timeout kills the child here: maxBuffer is handled above.
+      else if (error?.killed) resolve({ exit: "ETIMEDOUT", stdout, stderr });
+      else resolve({ exit: error === null ? 0 : (error.signal ?? error.code), stdout, stderr });
+    });
+  });
 }

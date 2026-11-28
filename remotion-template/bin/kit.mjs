@@ -4,12 +4,13 @@
 // The explainer kit's one command. `node /opt/remotion-template/bin/kit.mjs
 // new <name>` creates a project; inside it, `node bin/kit.mjs <subcommand>`
 // runs every other step. stdout carries only data (a project path, speech
-// calls, an image name); everything else goes to stderr, prefixed with the
-// subcommand. `check` and `render` start background jobs; `status` reports
-// the one started last. Exit codes: 0 success, 1 a refused or failed step,
-// 2 a usage error; `status` also exits 3 while a job runs and 4 when none
-// has run. Imports only node: built-ins and the kit's own modules; no
-// network.
+// calls, an image name, a table summary); everything else goes to stderr,
+// prefixed with the subcommand. `check` and `render` start background jobs;
+// `status` reports the one started last. Exit codes: 0 success, 1 a refused
+// or failed step, 2 a usage error; `status` also exits 3 while a job runs
+// and 4 when none has run. Imports only node: built-ins and the kit's own
+// modules; no network. `data` runs python3 on bin/read_table.py, the only
+// reader of a source table file.
 
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -17,7 +18,7 @@ import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, realpa
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { check } from "./check.mjs";
-import { PROJECT_NAME, Refusal, lstatOrNull, notFound, publicDir, readScript, sayer, writeAtomic } from "./kit-io.mjs";
+import { PROJECT_NAME, Refusal, escapeLine, execText, lstatOrNull, notFound, projectDir, publicDir, readScript, sayer, writeAtomic } from "./kit-io.mjs";
 import { render } from "./render.mjs";
 import { status } from "./status.mjs";
 import { timeline } from "./timeline.mjs";
@@ -26,6 +27,15 @@ import { blockStems } from "./voice-stem.mjs";
 const NOT_COPIED = new Set(["node_modules", "tests", "out", "gallery", ".kit"]);
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp"]);
 const IMAGE_STEM = 60;
+const TABLE_NAME = 40;
+const TABLE_PREVIEW_ROWS = 5;
+const READER = join(dirname(fileURLToPath(import.meta.url)), "read_table.py");
+// A 50-row, 12-column table is far below this; the bound only stops a
+// runaway reader from growing the kit's memory without limit.
+const READER_MAX_BUFFER = 64 * 1024 * 1024;
+// Bounds a hung reader; a 40 MB file streams through it in about 1 s. The
+// entry passes it as io.readerTimeoutMs.
+const READER_TIMEOUT_MS = 60_000;
 
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 
@@ -178,6 +188,24 @@ async function voiceImport(ctx) {
   return missing.length ? 1 : 0;
 }
 
+// --- user files -------------------------------------------------------------
+
+// The real path of a file the user named: a relative path resolves against
+// the files root, and the real path must be a regular file inside it.
+async function userFile(ctx, arg) {
+  const given = isAbsolute(arg) ? arg : resolve(ctx.filesRoot, arg);
+  let real;
+  try {
+    real = await realpath(given);
+  } catch (thrown) {
+    if (notFound(thrown)) throw new Refusal(`${arg}: not found`);
+    throw thrown;
+  }
+  if (!real.startsWith(`${await realpath(ctx.filesRoot)}${sep}`)) throw new Refusal(`${arg}: is outside ${ctx.filesRoot}`);
+  if (!(await lstat(real)).isFile()) throw new Refusal(`${arg}: is not a regular file`);
+  return { given, real };
+}
+
 // --- image ------------------------------------------------------------------
 
 // Steps 1–5 of the fixture's sanitizing order; the result plus `.<ext>`
@@ -194,16 +222,7 @@ function imageStem(stem) {
 
 async function image(ctx) {
   const [arg] = ctx.args;
-  const given = isAbsolute(arg) ? arg : resolve(ctx.filesRoot, arg);
-  let real;
-  try {
-    real = await realpath(given);
-  } catch (thrown) {
-    if (notFound(thrown)) throw new Refusal(`${arg}: not found`);
-    throw thrown;
-  }
-  if (!real.startsWith(`${await realpath(ctx.filesRoot)}${sep}`)) throw new Refusal(`${arg}: is outside ${ctx.filesRoot}`);
-  if (!(await lstat(real)).isFile()) throw new Refusal(`${arg}: is not a regular file`);
+  const { given, real } = await userFile(ctx, arg);
   const extension = extname(given).slice(1).toLowerCase();
   if (!IMAGE_EXTENSIONS.has(extension)) throw new Refusal(`${arg}: is not a .png, .jpg, .jpeg or .webp file`);
   const stem = imageStem(basename(given).slice(0, -(extension.length + 1)));
@@ -223,21 +242,150 @@ async function image(ctx) {
   }
 }
 
+// --- data -------------------------------------------------------------------
+
+// The file stem in lower case, whitespace runs as -, only a-z, 0-9, - and
+// Han characters kept, cut to TABLE_NAME code points.
+function tableName(stem) {
+  const kept = stem
+    .toLowerCase()
+    .replace(/\s+/gu, "-")
+    .replace(/[^a-z0-9\p{Script=Han}-]/gu, "");
+  return [...kept].slice(0, TABLE_NAME).join("");
+}
+
+const isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+const hasKeys = (value, keys) => isObject(value) && Object.keys(value).sort().join() === [...keys].sort().join();
+const isString = (value) => typeof value === "string";
+
+function tableCell(cell) {
+  if (cell === null) return null;
+  if (!hasKeys(cell, ["value", "text", "unit"])) return undefined;
+  const { value, text, unit } = cell;
+  if (!(value === null || Number.isFinite(value)) || !isString(text) || !(unit === "" || unit === "%")) return undefined;
+  return { value, text, unit };
+}
+
+// The reader's table rebuilt in the pinned key order, or null when its shape
+// is not the version 1 table format.
+function tableFrom(parsed) {
+  if (!hasKeys(parsed, ["version", "source", "label_header", "columns", "rows"]) || parsed.version !== 1) return null;
+  const { source, label_header: labelHeader, columns, rows } = parsed;
+  if (!hasKeys(source, ["file", "sheet", "sha256"]) || !isString(source.file) || source.sheet !== null) return null;
+  if (!isString(source.sha256) || !/^[0-9a-f]{64}$/.test(source.sha256) || !isString(labelHeader)) return null;
+  if (!Array.isArray(columns) || columns.length === 0 || !columns.every(isString) || !Array.isArray(rows)) return null;
+  const table = {
+    version: 1,
+    source: { file: source.file, sheet: null, sha256: source.sha256 },
+    label_header: labelHeader,
+    columns: [...columns],
+    rows: [],
+  };
+  for (const row of rows) {
+    if (!hasKeys(row, ["label", "cells"]) || !isString(row.label) || !Array.isArray(row.cells)) return null;
+    if (row.cells.length !== columns.length) return null;
+    const cells = row.cells.map(tableCell);
+    if (cells.includes(undefined)) return null;
+    table.rows.push({ label: row.label, cells });
+  }
+  return table.rows.length === 0 ? null : table;
+}
+
+// Runs the reader on one real path, killing it after timeoutMs; resolves the
+// table, or throws a refusal: the reader's own, or
+// `the table reader failed: <reason>`.
+async function readTable(path, timeoutMs) {
+  const failed = (reason) => new Refusal(`the table reader failed: ${escapeLine(reason)}`);
+  const { exit, stdout, stderr } = await execText("python3", ["-I", READER, path], READER_MAX_BUFFER, timeoutMs);
+  if (exit === "ENOENT") throw failed("python3 not found");
+  if (exit === "ETIMEDOUT") throw failed(`timed out after ${timeoutMs / 1000} seconds`);
+  if (exit === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") throw failed("bad output");
+  if (exit === 0) {
+    let table = null;
+    try {
+      table = tableFrom(JSON.parse(stdout));
+    } catch {
+      // A JSON syntax error is bad output, thrown below.
+    }
+    if (table === null) throw failed("bad output");
+    return table;
+  }
+  if (exit === 1 && stderr.startsWith("refusal: ") && stderr.endsWith("\n")) {
+    throw new Refusal(escapeLine(stderr.slice("refusal: ".length, -1)));
+  }
+  const last = stderr.trimEnd().split("\n").at(-1);
+  throw failed(last === "" ? `python3 exited with ${exit}` : last);
+}
+
+// One tab-separated output line.
+const tabLine = (fields) => `${fields.map(escapeLine).join("\t")}\n`;
+
+async function data(ctx) {
+  const [arg] = ctx.args;
+  const { given, real } = await userFile(ctx, arg);
+  const extension = extname(given);
+  if (extension.toLowerCase() !== ".csv") throw new Refusal(`${arg}: is not a .csv file`);
+  if (ctx.options.sheet !== undefined) throw new Refusal("--sheet applies only to .xlsx files");
+  const name = tableName(basename(given).slice(0, -extension.length));
+  if (name === "") throw new Refusal(`${arg}: the file name gives an empty table name`);
+  const table = await readTable(real, ctx.readerTimeoutMs ?? READER_TIMEOUT_MS);
+  const dir = await projectDir(ctx.root, "data");
+  const file = `${name}.json`;
+  const replaced = (await lstatOrNull(join(dir, file))) !== null;
+  await writeAtomic(dir, file, `${JSON.stringify(table, null, 2)}\n`);
+  ctx.stdout.write(`${name}\n`);
+  ctx.stdout.write(tabLine([table.label_header, ...table.columns]));
+  for (const row of table.rows.slice(0, TABLE_PREVIEW_ROWS)) {
+    ctx.stdout.write(tabLine([row.label, ...row.cells.map((cell) => (cell === null ? "" : `${cell.text}${cell.unit}`))]));
+  }
+  ctx.say(`${replaced ? "replaced" : "wrote"} data/${file}`);
+}
+
 // --- entry ------------------------------------------------------------------
 
+// Reads args left to right for a command that declares options: `--<name>`
+// takes the next token as its value, `--` ends option parsing, any other
+// token starting with `--` is unknown, and every other token is a
+// positional. Returns null for a missing value, a repeated or an unknown
+// option.
+function parseOptions(args, names) {
+  const options = {};
+  const positionals = [];
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i];
+    if (token === "--") {
+      positionals.push(...args.slice(i + 1));
+      break;
+    }
+    if (!token.startsWith("--")) {
+      positionals.push(token);
+      continue;
+    }
+    const name = token.slice(2);
+    if (!names.includes(name) || Object.hasOwn(options, name) || i + 1 === args.length) return null;
+    options[name] = args[++i];
+  }
+  return { args: positionals, options };
+}
+
 // fromTemplate: true runs only at the template root, false only elsewhere.
+// options: the `--<name>` options a command takes; a command without it
+// takes positionals only.
 const COMMANDS = {
   new: { usage: "node /opt/remotion-template/bin/kit.mjs new <name>", args: 1, fromTemplate: true, run: newProject },
   voice: { usage: "node bin/kit.mjs voice", args: 0, fromTemplate: false, run: voice },
   "voice-import": { usage: "node bin/kit.mjs voice-import", args: 0, fromTemplate: false, run: voiceImport },
   image: { usage: 'node bin/kit.mjs image "<path>"', args: 1, fromTemplate: false, run: image },
+  data: { usage: 'node bin/kit.mjs data "<path>" [--sheet <name>]', args: 1, options: ["sheet"], fromTemplate: false, run: data },
   timeline: { usage: "node bin/kit.mjs timeline", args: 0, fromTemplate: false, run: timeline },
   check: { usage: "node bin/kit.mjs check", args: 0, fromTemplate: false, run: check },
   render: { usage: "node bin/kit.mjs render", args: 0, fromTemplate: false, run: render },
   status: { usage: "node bin/kit.mjs status", args: 0, fromTemplate: false, run: status },
 };
 
-// io: {root, videosRoot, filesRoot, stdout, stderr}; resolves to the exit code.
+// io: {root, videosRoot, filesRoot, stdout, stderr, readerTimeoutMs}; resolves
+// to the exit code. readerTimeoutMs, the table reader's time limit, defaults
+// to READER_TIMEOUT_MS.
 export async function run(argv, io) {
   const [name, ...args] = argv;
   if (!Object.hasOwn(COMMANDS, name ?? "")) {
@@ -247,9 +395,15 @@ export async function run(argv, io) {
   }
   const command = COMMANDS[name];
   const say = sayer(io, name);
-  const ctx = { ...io, root: resolve(io.root), args, say };
+  const ctx = { ...io, root: resolve(io.root), args, options: {}, say };
   try {
-    if (args.length !== command.args) throw new Refusal(`usage: ${command.usage}`, 2);
+    if (command.options === undefined) {
+      if (args.length !== command.args) throw new Refusal(`usage: ${command.usage}`, 2);
+    } else {
+      const parsed = parseOptions(args, command.options);
+      if (parsed === null || parsed.args.length !== command.args) throw new Refusal(`usage: ${command.usage}`, 2);
+      Object.assign(ctx, parsed);
+    }
     const template = await isTemplate(ctx.root);
     if (command.fromTemplate && !template) throw new Refusal(`run it from the template: ${command.usage}`, 2);
     if (!command.fromTemplate && template) {
@@ -274,6 +428,7 @@ if (import.meta.main) {
     root: dirname(dirname(fileURLToPath(import.meta.url))),
     videosRoot: "/home/assistant/videos",
     filesRoot: "/mnt/user-data/files",
+    readerTimeoutMs: READER_TIMEOUT_MS,
     stdout: process.stdout,
     stderr: process.stderr,
   });

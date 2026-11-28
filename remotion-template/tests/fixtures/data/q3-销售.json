@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "source": {
+    "file": "q3 销售.csv",
+    "sheet": null,
+    "sha256": "6d8b4ae6c6ceb62efaa4618b6f87281a9110c930de819a103580cfcd4b0133c4"
+  },
+  "label_header": "地区",
+  "columns": [
+    "销售额",
+    "完成率",
+    "备注"
+  ],
+  "rows": [
+    {
+      "label": "华东",
+      "cells": [
+        {
+          "value": 630,
+          "text": "630",
+          "unit": ""
+        },
+        {
+          "value": 93,
+          "text": "93",
+          "unit": "%"
+        },
+        {
+          "value": null,
+          "text": "重点区域",
+          "unit": ""
+        }
+      ]
+    },
+    {
+      "label": "华南",
+      "cells": [
+        {
+          "value": 250,
+          "text": "250",
+          "unit": ""
+        },
+        {
+          "value": 87.5,
+          "text": "87.5",
+          "unit": "%"
+        },
+        null
+      ]
+    },
+    {
+      "label": "华北",
+      "cells": [
+        {
+          "value": 180,
+          "text": "180",
+          "unit": ""
+        },
+        {
+          "value": 78,
+          "text": "78.0",
+          "unit": "%"
+        },
+        {
+          "value": null,
+          "text": "新增门店",
+          "unit": ""
+        }
+      ]
+    },
+    {
+      "label": "华中",
+      "cells": [
+        {
+          "value": 120,
+          "text": "120",
+          "unit": ""
+        },
+        {
+          "value": 65,
+          "text": "65",
+          "unit": "%"
+        },
+        {
+          "value": null,
+          "text": "同比下降",
+          "unit": ""
+        }
+      ]
+    },
+    {
+      "label": "西南",
+      "cells": [
+        {
+          "value": 80,
+          "text": "80",
+          "unit": ""
+        },
+        {
+          "value": 101,
+          "text": "101",
+          "unit": "%"
+        },
+        null
+      ]
+    },
+    {
+      "label": "合计",
+      "cells": [
+        {
+          "value": 1260,
+          "text": "1260",
+          "unit": ""
+        },
+        {
+          "value": 93,
+          "text": "93",
+          "unit": "%"
+        },
+        {
+          "value": null,
+          "text": "五区合计",
+          "unit": ""
+        }
+      ]
+    }
+  ]
+}
