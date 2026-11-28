@@ -114,6 +114,8 @@ test("each listed number format gives its value, text and unit", async (t) => {
       ["percent", fmt(0.93, "0%")],
       ["percent-one", fmt(0.935, "0.0%")],
       ["percent-two", fmt(-0.055, "0.00%")],
+      // Only a decimal x100 gives 101; a float gives 100.49999999999999.
+      ["percent-half", fmt(1.005, "0%")],
     ]),
   );
   const result = await box.data("f.xlsx");
@@ -132,6 +134,7 @@ test("each listed number format gives its value, text and unit", async (t) => {
     percent: num(93, "93", "%"),
     "percent-one": num(93.5, "93.5", "%"),
     "percent-two": num(-5.5, "-5.50", "%"),
+    "percent-half": num(101, "101", "%"),
   });
   // The zero is written without a sign.
   assert.match(readFileSync(join(box.dataDir, "f.json"), "utf8"), /"value": 0,\n\s+"text": "0"/);
@@ -157,8 +160,9 @@ test("other number formats are refused, naming the cell and the format", async (
     ["at.xlsx", fmt(1260, "@"), 'cell B2: number format "@" is not supported'],
     ["r31.xlsx", { value: 1260, format_id: 31 }, "cell B2: built-in number format 31 is not supported"],
     ["r58.xlsx", { value: 1260, format_id: 58 }, "cell B2: built-in number format 58 is not supported"],
-    // openpyxl reads a number under a date format as a datetime, so the
-    // date-or-time refusal, which applies whatever the format, is the one given.
+    // Not a format refusal: openpyxl 3.1.5 turns every number whose style is
+    // a date format (custom, or a built-in id it names such as 14) into a
+    // datetime while parsing, and a datetime is refused whatever its format.
     ["d.xlsx", fmt(45293, "yyyy-mm-dd"), "cell B2 holds a date or time"],
   ]) {
     await assertCellRefused(box, file, cell, line);
@@ -193,6 +197,42 @@ test("strings, saved formula values and a numeric header read as their kinds", a
     c: txt("东区"),
     d: null,
   });
+});
+
+test("with fullCalcOnLoad set, a formula's saved value is stale and refused", async (t) => {
+  const box = await project(t);
+  // As xlsxwriter (and pandas through it) writes a formula: <v>0</v> and the flag.
+  const rows = [["项目", "值"], ["a", 630], ["b", { formula: "B2*2", saved: "0" }]];
+  putXlsx(box, "stale.xlsx", { full_calc_on_load: true, sheets: [{ title: "Sheet1", rows }] });
+  assertRefused(
+    box,
+    await box.data("stale.xlsx"),
+    "stale.xlsx: sheet Sheet1: cell B3 is a formula with no saved value; open the file in Excel and save it",
+  );
+});
+
+test("with fullCalcOnLoad cleared, the same formula imports its saved value", async (t) => {
+  const box = await project(t);
+  const rows = [["项目", "值"], ["a", 630], ["b", { formula: "B2*2", saved: "0" }]];
+  putXlsx(box, "kept.xlsx", { sheets: [{ title: "Sheet1", rows }] });
+  const result = await box.data("kept.xlsx");
+  assert.equal(result.code, 0, result.err);
+  assert.deepEqual(cellsByLabel(readTable(box, "kept")), { a: num(630, "630"), b: num(0, "0") });
+  // The helper's default stands for an Excel-saved file: calcPr without the
+  // attribute, which openpyxl's wb.calculation.fullCalcOnLoad reports as True.
+  const calc = execFileSync(
+    "python3",
+    [
+      "-I",
+      "-c",
+      "import openpyxl, re, sys, zipfile; path = sys.argv[1]\n"
+        + "print('fullCalcOnLoad' in re.search(r'<calcPr[^>]*>', zipfile.ZipFile(path).read('xl/workbook.xml').decode()).group(0))\n"
+        + "print(openpyxl.load_workbook(path).calculation.fullCalcOnLoad)",
+      join(box.files, "kept.xlsx"),
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(calc, "False\nTrue\n");
 });
 
 test("formulas without a saved value, errors, booleans and dates are refused, naming the cell", async (t) => {

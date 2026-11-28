@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import warnings
+import zipfile
 
 MAX_COLUMNS = 12
 MAX_DATA_ROWS = 50
@@ -239,12 +240,13 @@ def number_text(cell, where):
     return number_cell(format(rounded, "f"), unit, where)
 
 
-def xlsx_cell(value, formula, where, data):
+def xlsx_cell(value, formula, where, data, stale):
     """One xlsx cell from the data_only load (value) and the formula load
     (formula). A data cell gives None or {value, text, unit}; a header or
-    label cell gives a string, "" when empty."""
+    label cell gives a string, "" when empty. stale: the workbook sets
+    fullCalcOnLoad, so no formula's saved value can be trusted."""
     cell = f"{where}: cell {value.coordinate}"
-    if formula.data_type == "f" and value.value is None and value.data_type == "n":
+    if formula.data_type == "f" and (stale or (value.value is None and value.data_type == "n")):
         raise Refusal(f"{cell} is a formula with no saved value; open the file in Excel and save it")
     if isinstance(value.value, DATE_TYPES):
         raise Refusal(f"{cell} holds a date or time")
@@ -262,7 +264,7 @@ def xlsx_cell(value, formula, where, data):
     return number if data else f"{number['text']}{number['unit']}"
 
 
-def scan_xlsx(values, formulas, where):
+def scan_xlsx(values, formulas, where, stale):
     """(header strings or None, the first MAX_DATA_ROWS data rows, the data
     row count) of a worksheet, with the sheet's own row numbers; each row runs
     from column A to its last non-empty cell, and fully empty rows are
@@ -273,7 +275,7 @@ def scan_xlsx(values, formulas, where):
     bounds = {"min_row": 1, "max_row": values.max_row, "min_col": 1, "max_col": values.max_column}
     for value_row, formula_row in zip(values.iter_rows(**bounds), formulas.iter_rows(**bounds)):
         cells = [
-            xlsx_cell(value, formula, where, header is not None and column > 0)
+            xlsx_cell(value, formula, where, header is not None and column > 0, stale)
             for column, (value, formula) in enumerate(zip(value_row, formula_row))
         ]
         while cells and cells[-1] in (None, ""):
@@ -296,7 +298,10 @@ def read_xlsx(path, sheet):
     warnings.simplefilter("ignore")
     try:
         import openpyxl
+        from openpyxl.reader.excel import ExcelReader
         from openpyxl.worksheet.worksheet import Worksheet
+        from openpyxl.xml.constants import SHEET_MAIN_NS
+        from openpyxl.xml.functions import fromstring
     except ImportError:
         sys.stderr.buffer.write(b"openpyxl is not installed\n")
         sys.exit(3)
@@ -304,7 +309,16 @@ def read_xlsx(path, sheet):
         data = source.read()
     try:
         formulas = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
-        values = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+        # load_workbook(data_only=True), keeping the reader for its workbook
+        # part name.
+        reader = ExcelReader(io.BytesIO(data), data_only=True)
+        reader.read()
+        values = reader.wb
+        # fullCalcOnLoad as the file writes it: openpyxl's
+        # wb.calculation.fullCalcOnLoad defaults to True when the attribute
+        # is absent, as it is in every Excel-saved file.
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            calc = fromstring(archive.read(reader.parser.workbook_part_name)).find(f"{{{SHEET_MAIN_NS}}}calcPr")
     except Exception:
         # Not a zip, an empty zip, an encrypted file or a broken package.
         raise Refusal(f"{file}: is not a readable .xlsx file") from None
@@ -318,7 +332,10 @@ def read_xlsx(path, sheet):
     merged = sorted(values[title].merged_cells.ranges, key=lambda merge: (merge.min_row, merge.min_col))
     if merged:
         raise Refusal(f"{where}: range {merged[0].coord} is merged")
-    header, body, count = scan_xlsx(values[title], formulas[title], where)
+    # The writer declares its saved values stale (xlsxwriter writes <v>0</v>
+    # for every formula and sets the flag; Excel does not set it on save).
+    stale = calc is not None and calc.get("fullCalcOnLoad") in ("1", "true")
+    header, body, count = scan_xlsx(values[title], formulas[title], where, stale)
     source = {"file": file, "sheet": title, "sha256": hashlib.sha256(data).hexdigest()}
     return build_table(where, source, header, body, count, lambda cell, row, column: cell)
 

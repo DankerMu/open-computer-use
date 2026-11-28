@@ -8,8 +8,12 @@
 #       prints {"formula": [value, data_type], "saved": [value, data_type]}
 #       from a data_only=False and a data_only=True load
 #
-# Spec: {"sheets": [{"title", "rows", "merged", "validation"} |
+# Spec: {"full_calc_on_load": <bool>,
+#        "sheets": [{"title", "rows", "merged", "validation"} |
 #                   {"title", "chart": true}]}
+# openpyxl always writes calcPr fullCalcOnLoad="1"; the helper removes it
+# from xl/workbook.xml, as an Excel-saved file has it unset, unless
+# "full_calc_on_load" is true, as xlsxwriter (and pandas through it) writes.
 # "rows" is a list of rows from sheet row 1, each a list of cells from
 # column A. A cell is null (no cell), a JSON string, number or boolean
 # written by openpyxl, or an object:
@@ -124,6 +128,12 @@ def rewrite(out, wb, spec, raw):
             xml = xml.replace("</worksheet>", f"{VALIDATION}</worksheet>", 1)
         parts[name] = xml.encode("utf-8")
     parts["xl/styles.xml"] = styles.encode("utf-8")
+    if not spec.get("full_calc_on_load"):
+        workbook = parts["xl/workbook.xml"].decode("utf-8")
+        cleared = workbook.replace(' fullCalcOnLoad="1"', "", 1)
+        if cleared == workbook:
+            raise SystemExit('make_xlsx.py: no fullCalcOnLoad="1" in xl/workbook.xml')
+        parts["xl/workbook.xml"] = cleared.encode("utf-8")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, data in parts.items():
             archive.writestr(name, data)
